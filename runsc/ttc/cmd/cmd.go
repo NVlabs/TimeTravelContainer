@@ -15694,6 +15694,18 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 			}
 			return rehydrateCold(true)
 		}
+		// The runtime keeps the capture it made durable, and the branch may
+		// have run on another node since and been captured there: resuming
+		// this one would take the branch back to its older state. The capture
+		// is current only if the image it made here is still the one the
+		// record names, as ensureLocalColdBranch judges a cached image.
+		if b.nodeID != "" && !ttcbundle.ResidentDehydration(*persistentBranch) &&
+			!localGraphCaptureMatches(existingMemoryBranchDir(b.activeDataRoot(), info.ID, "dehydrated", *persistentBranch), *persistentBranch) {
+			if _, err := b.command("timetravel", info.ID, "destroy", target.branch); err != nil {
+				return fmt.Errorf("discarding the superseded capture of %s: %w", target, err)
+			}
+			return rehydrateCold(true)
+		}
 		// The durable record is authoritative across daemon crashes. Reconcile
 		// the process-free runtime record before it recreates the Kernel.
 		action := "unquarantine"
