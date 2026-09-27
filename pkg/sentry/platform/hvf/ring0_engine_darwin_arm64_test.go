@@ -1823,7 +1823,9 @@ func TestCPUboundApplicationDoesNotStarveGoScheduler(t *testing.T) {
 	}
 	defer vm.UnmapStage2(GuestRAMIPAStart, vmm.HostSlabSize)
 	memory := unsafe.Slice((*byte)(unsafe.Pointer(host)), int(vmm.HostSlabSize))
-	binary.LittleEndian.PutUint32(memory, 0x14000000) // b .
+	binary.LittleEndian.PutUint32(memory[0:], 0xd2801588) // movz x8, #172 (getpid)
+	binary.LittleEndian.PutUint32(memory[4:], 0xd4000001) // svc #0
+	binary.LittleEndian.PutUint32(memory[8:], 0x14000000) // b .
 
 	const (
 		spaceID = uint64(95)
@@ -1844,8 +1846,29 @@ func TestCPUboundApplicationDoesNotStarveGoScheduler(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		engine.BeginApplicationResidency()
+		// Warm the entry path until a syscall exit leaves this continuation
+		// resident at EL1. A fresh engine's first entries take a host gate for
+		// each part of the Sentry they first touch, and those host services,
+		// rather than entersyscall at the EL0 boundary, would release the only
+		// P below.
+		registers := &vmm.ARM64State{}
+		for attempt := 1; ring0asm.CurrentEL() == 0; attempt++ {
+			if attempt > 64 {
+				done <- errors.Join(errors.New("syscall exits returned the Sentry to the host in 64 attempts"), engine.EndApplicationResidency())
+				return
+			}
+			registers.PC = codeVA
+			exit, err := engine.RunApplication(context.Background(), vmm.ApplicationState{
+				AddressSpaceID: spaceID,
+				Registers:      registers,
+			})
+			if err != nil || exit.Reason != vmm.ExitSyscall {
+				done <- errors.Join(fmt.Errorf("warming up: exit=%+v", exit), err, engine.EndApplicationResidency())
+				return
+			}
+		}
 		close(entered)
-		registers := &vmm.ARM64State{PC: codeVA}
+		registers.PC = codeVA + 8
 		exit, runErr := engine.RunApplication(context.Background(), vmm.ApplicationState{
 			AddressSpaceID: spaceID,
 			Registers:      registers,
@@ -1856,7 +1879,11 @@ func TestCPUboundApplicationDoesNotStarveGoScheduler(t *testing.T) {
 		}
 		done <- errors.Join(runErr, endErr)
 	}()
-	<-entered
+	select {
+	case <-entered:
+	case err := <-done:
+		t.Fatal(err)
+	}
 	// Closing entered makes this goroutine runnable without yielding the worker.
 	// Reaching this point proves that the KVM-style entersyscall boundary released
 	// the only P while the application continued to execute at EL0.
@@ -1898,7 +1925,9 @@ func TestArchitectedInterruptionPreservesApplicationRegisters(t *testing.T) {
 	}
 	defer vm.UnmapStage2(GuestRAMIPAStart, vmm.HostSlabSize)
 	memory := unsafe.Slice((*byte)(unsafe.Pointer(host)), int(vmm.HostSlabSize))
-	binary.LittleEndian.PutUint32(memory, 0x14000000) // b .
+	binary.LittleEndian.PutUint32(memory, 0x14000000)      // b .
+	binary.LittleEndian.PutUint32(memory[16:], 0xd2801588) // movz x8, #172 (getpid)
+	binary.LittleEndian.PutUint32(memory[20:], 0xd4000001) // svc #0
 
 	const (
 		spaceID    = uint64(96)
@@ -1914,6 +1943,11 @@ func TestArchitectedInterruptionPreservesApplicationRegisters(t *testing.T) {
 		}},
 	})
 
+	// Warm the entry path, so that each single interrupt below reaches an
+	// application that is already at EL0: a fresh engine's first entries take
+	// a host gate for each part of the Sentry they first touch, and under load
+	// that can outlast the interrupter's delivery window.
+	enterResident(t, engine, spaceID, codeVA+16, &vmm.ARM64State{})
 	for iteration := 0; iteration < iterations; iteration++ {
 		registers := &vmm.ARM64State{
 			PC:     codeVA,
