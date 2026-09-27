@@ -1,6 +1,7 @@
 # HVF memory footprint: demand-paged stage 2
 
-*Status: proposal, September 2026. Measurements: Apple M5 Pro, macOS 26.5.2.*
+*Status: in progress, September 2026; phases 1 and 2 of the delivery plan are
+implemented. Measurements: Apple M5 Pro, macOS 26.5.2.*
 
 ## Summary
 
@@ -18,9 +19,21 @@ design below uses them to make the Sentry's footprint track the memory it
 touches, like KVM, subject to one hard constraint: pages that the host
 executes must never enter stage 2.
 
-## Where the memory goes
+Progress, for the same container and sequence:
 
-Idle Sentry, fresh start, `vmmap` dirty memory by region:
+| Build | Idle | After python and tmux, twice each |
+|---|---|---|
+| Before | 308 MiB | 578 MiB |
+| Phase 1: FD-table fix, 1 MiB thread stacks, no checkpoint gofer | 233 MiB | 305 MiB |
+| Phase 2: Sentry image mirrored on first EL1 touch | 109 MiB | 192 MiB |
+
+What remains at idle: Go runtime regions (73 MiB, against a live heap of
+11-20 MiB), the EL1 monitor (17 MiB), thread stacks (5 MiB), copies of the
+image text that EL1 has run (3 MiB), and guest RAM (3 MiB).
+
+## Where the memory went
+
+Idle Sentry before this work, fresh start, `vmmap` dirty memory by region:
 
 | Memory | MiB | Why it is resident |
 |---|---|---|
@@ -58,6 +71,7 @@ stores, and branches with stage 1 disabled. On macOS 26.5.2:
 | Wiring | HVF does not wire mapped pages. |
 | Stage-2 faults | An unmapped IPA exits with EC 0x24 and the IPA, PC left on the faulting instruction. Map and resume: 5.2 us per fault, versus 0.7 us for a plain entry and exit. A write to a read-only mapping is a permission fault, resolved by `hv_vm_protect`. |
 | Map cost | `hv_vm_map` 0.37 us and `hv_vm_unmap` 0.20 us per 16 KiB slab; about 1 us for a 512 MiB range. |
+| Footprint accounting | A page that both the host and the guest have touched counts twice in the task's physical footprint: a 16 MiB region costs 16 MiB when the host writes it and 16 MiB more when the guest then reads it, and `hv_vm_unmap` returns the second 16 MiB. `vmmap` shows only the host's share in its per-region figures. |
 
 ### The hard constraint
 
@@ -76,15 +90,32 @@ page cache; stage 2 must see a copy in memory the host never executes. Guest
 file mappings are safe: VM platforms copy file data into GuestRAM
 (`forcePageCache`, staging), and the Sentry mirror skips file-backed regions.
 
+The engine makes its copies with `mach_vm_read_overwrite`, which may share the
+source's pages copy-on-write. It writes each copied page before `hv_vm_map`;
+without that commit, a guest read of a page still shared with the executable
+would map the executable's own frame. Keep the commit for copies, whatever
+else becomes lazy.
+
 ## Design
 
 Principles, in KVM's terms:
 
-1. **Map lazily.** Stage-2 translations exist only for Sentry memory that EL1
-   touches. For anonymous memory, `hv_vm_map` of the region without a commit
-   gives this directly, since the kernel populates stage 2 on demand. Where a
-   commit is still wanted, do it per 16 KiB slab when a stage-2 fault first
-   reaches the slab, not for the whole region up front.
+1. **Map on first touch.** Stage-2 translations exist only for Sentry memory
+   that EL1 touches. The kernel populates an uncommitted `hv_vm_map` on
+   demand, but the engine cannot rely on that yet: with its mirror mappings
+   left uncommitted, the continuation qualification test
+   (`TestRing0ContinuationTransfer`) fails with a spurious redpill in
+   `ApplicationProbe`, for a reason not yet understood, and the copies above
+   must be committed regardless. The engine instead imports memory when EL1
+   first touches it. The Sentry's stage 1 maps only imported slabs, so an
+   access to any other slab takes the host gate, and the next application
+   entry imports a small window around it, committing it before
+   `hv_vm_map`. A host gate resumes the continuation at host EL0, which
+   ordinary Sentry code tolerates. Code that executes EL1-only instructions
+   after checking that it runs at EL1 does not: the ring0asm bridge, the
+   native runtime hooks, and the guest-critical section of
+   `tryRunResidentMonitor`. The engine imports those, and the data they use,
+   before the first entry.
 2. **Invalidate before the host changes backing.** The Go runtime VM hook is
    the MMU notifier. Before `MADV_FREE_REUSABLE`, `munmap`, or `MAP_FIXED`,
    remove the stage-2 translations (with the existing vCPU rendezvous), then
@@ -97,12 +128,12 @@ Principles, in KVM's terms:
 
 | Memory | Today | Proposed | Expected per family |
 |---|---|---|---|
-| Go runtime regions | Whole region committed; frees suppressed | Mapped without commit; unmapped before release, mapped again on reuse | tracks the live heap: 73 to ~20 MiB idle, and falls after spikes |
-| Thread stacks | 8 MiB committed per mirrored thread | Mapped without commit; 1 MiB stack size | ~2 MiB |
-| Writable image | 81.7 MiB committed | Commit per slab on first stage-2 fault, which keeps file pages out of stage 2 | a few MiB |
-| `__TEXT` | 40.6 MiB private copy per family | One copy per binary UUID in a shared object, mapped read+exec | ~0; 40.6 MiB once per host |
-| `__DATA_CONST`, `__LINKEDIT` | 6 MiB private copies | Copy per slab on first stage-2 fault (contents are slid per process) | ~1-2 MiB |
-| Monitor page-table pool | 16 MiB committed | Mapped without commit | pages in use |
+| Go runtime regions | Whole region imported on first touch; frees suppressed | Imported in windows on first touch; unmapped before release, imported again on reuse | tracks the live heap: 73 to ~20 MiB idle, and falls after spikes |
+| Thread stacks | 1 MiB stacks, each imported whole | Imported in windows | ~2 MiB |
+| Writable image | Imported in 48 KiB windows on first touch (phase 2) | unchanged | under 1 MiB |
+| `__TEXT` | Private copies of 48 KiB windows on first touch (phase 2) | One copy per binary UUID in a shared object, mapped read+exec | ~0; 40.6 MiB once per host |
+| `__DATA_CONST`, `__LINKEDIT` | Private copies of windows on first touch (phase 2) | unchanged (contents are slid per process) | under 1 MiB |
+| Monitor page-table pool | 16 MiB committed | A smaller initial pool; it already grows when exhausted (`MonitorPoolExpander`) | pages in use |
 | Guest RAM | demand-allocated | unchanged | unchanged |
 
 The shared `__TEXT` copy is built once from the Sentry binary and keyed by its
@@ -116,33 +147,39 @@ executes, like today's private copies.
 
 Each phase stands alone and is measured before the next.
 
-1. **Independent fixes.** Stop `FDTable.Remove` from growing the table for
-   descriptors that are not open (a gVisor bug on every platform). Give
+1. **Independent fixes (done).** Stop `FDTable.Remove` from growing the table
+   for descriptors that are not open (a gVisor bug on every platform). Give
    Sentry threads 1 MiB stacks. Stop building the GCS checkpoint gofer into
    the macOS binary.
-2. **Map without commit** for anonymous mirrored regions: runtime (tag 240),
-   stacks, monitor pool. Gate on a qualified macOS version; keep the eager
-   commit elsewhere.
-3. **Release instead of suppress** in the runtime VM hook.
-4. **Lazy image data:** handle stage-2 faults for the writable image and the
-   read-only copies, committing or copying one slab at a time.
+2. **Image on first touch (done).** Import the Sentry image through host
+   gates in 48 KiB windows, instead of whole at bootstrap; give image slabs
+   fixed GPAs; import the guest-only code and data first. Wider windows import
+   more of the image for no measurable speedup: 256 KiB windows leave the
+   idle Sentry at 137 MiB. Single slabs save 5 MiB more but slow a cold
+   python start by 10-15 ms. A fresh VM takes one host gate per window
+   that a code path first touches; the syscall return path takes about 8.
+3. **Runtime regions and stacks on first touch:** import them in windows too.
+   Their guest-only data, such as the objects that the guest-critical section
+   of `tryRunResidentMonitor` reads, must then be imported first as well.
+4. **Release instead of suppress** in the runtime VM hook.
 5. **Shared `__TEXT`.**
 
 ## Open questions
 
-* **macOS 15.** Every observation above is from macOS 26.5.2. Run
-  `hvf_mem_probe` and `hvf_map_probe` on the oldest supported release before
-  phase 2 relies on lazy population there.
+* **macOS 15.** Every observation above is from macOS 26.5.2. Phases 1-3
+  use no new primitive. Run `hvf_mem_probe` and `hvf_map_probe` on the oldest
+  supported release before phase 4 relies on release after `hv_vm_unmap`.
+* **Uncommitted mirror mappings.** Why does the continuation qualification
+  test fail when mirror mappings are not committed first? Committing only on
+  first touch makes this moot for now, but lazy population would also avoid
+  the host gate per window.
 * **Read+exec of shared memory.** Today's private copies are anonymous pages
   mapped read+exec. The shared copy's pages are ordinary memory too, but
   mapping a shared object read+exec has not been measured, and a wrong answer
   panics the host. Qualify it with a minimal, deliberate probe case first.
-* **Stage-2 faults in the ring0 bridge.** Any exit other than the expected
-  calls is fatal today. Phases 2 and 3 need none, because the kernel
-  populates mapped regions itself; phase 4 needs the bridge to resolve an
-  IPA to its host slab and map it from the exit path.
 * **Rendezvous cost of releases.** Scavenger releases now stop all vCPUs.
   Batch them, and release only ranges above a size threshold if needed.
-* **The 50 MiB outside user regions.** Check with `footprint` whether stage-2
-  tables or other HVF kernel structures account for it, and whether lazy
-  mapping shrinks it.
+* **The footprint outside user regions.** The footprint exceeded the sum of
+  `vmmap`'s per-region dirty memory by 53 MiB at idle after phase 1, and by
+  7.5 MiB after phase 2. The double charge above accounts for part of it;
+  attribute the rest.

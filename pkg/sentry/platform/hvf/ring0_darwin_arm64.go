@@ -26,6 +26,7 @@ package hvf
 #include <mach/mach_vm.h>
 #include <mach/vm_statistics.h>
 #include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
 #include <mach-o/loader.h>
 #include <mach/mach_time.h>
 #include <libkern/OSCacheControl.h>
@@ -180,6 +181,68 @@ static int ttc_ring0_main_image(uint64_t address, uint64_t length) {
 	return 0;
 }
 
+// ttc_ring0_main_image_bounds returns the range spanned by the accessible
+// segments of the Sentry image.
+static int ttc_ring0_main_image_bounds(uint64_t *start_out, uint64_t *end_out) {
+	const struct mach_header_64 *header =
+		(const struct mach_header_64 *)_dyld_get_image_header(0);
+	if (header == NULL || header->magic != MH_MAGIC_64) return EINVAL;
+	intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+	uint64_t low = UINT64_MAX;
+	uint64_t high = 0;
+	const uint8_t *command_bytes = (const uint8_t *)(header + 1);
+	for (uint32_t i = 0; i < header->ncmds; ++i) {
+		const struct load_command *command =
+			(const struct load_command *)command_bytes;
+		if (command->cmdsize < sizeof(*command)) return EINVAL;
+		if (command->cmd == LC_SEGMENT_64 &&
+				command->cmdsize >= sizeof(struct segment_command_64)) {
+			const struct segment_command_64 *segment =
+				(const struct segment_command_64 *)command;
+			uint64_t start = segment->vmaddr + (uint64_t)slide;
+			uint64_t end = start + segment->vmsize;
+			if (segment->initprot != VM_PROT_NONE && end > start) {
+				if (start < low) low = start;
+				if (end > high) high = end;
+			}
+		}
+		command_bytes += command->cmdsize;
+	}
+	if (low >= high) return EINVAL;
+	*start_out = low;
+	*end_out = high;
+	return 0;
+}
+
+// Native helpers that execute EL1-only instructions (TPIDR_EL1 reads, HVC)
+// once they have established that they run at EL1 live in these sections,
+// with the data they use. The engine mirrors both before any EL1 entry. It
+// mirrors the rest of the Sentry image when EL1 first touches it, through a
+// host gate, and a host gate inside such a helper would resume it at host EL0
+// with the EL1-only instructions still ahead.
+#define TTC_RING0_GUEST_TEXT \
+	__attribute__((section("__TEXT,__ttc_guest,regular,pure_instructions")))
+#define TTC_RING0_GUEST_DATA __attribute__((section("__DATA,__ttc_guest")))
+
+static uint64_t ttc_ring0_image_section(const char *segment,
+		const char *section, uint64_t *length_out) {
+	const struct mach_header_64 *header =
+		(const struct mach_header_64 *)_dyld_get_image_header(0);
+	unsigned long length = 0;
+	uint8_t *start = header == NULL ? NULL :
+		getsectiondata(header, segment, section, &length);
+	*length_out = start == NULL ? 0 : length;
+	return (uint64_t)(uintptr_t)start;
+}
+
+static uint64_t ttc_ring0_guest_text(uint64_t *length_out) {
+	return ttc_ring0_image_section("__TEXT", "__ttc_guest", length_out);
+}
+
+static uint64_t ttc_ring0_guest_data(uint64_t *length_out) {
+	return ttc_ring0_image_section("__DATA", "__ttc_guest", length_out);
+}
+
 // ttc_ring0_copy_host_memory copies through Mach instead of dereferencing the
 // source directly. Host VM regions may disappear after the region snapshot as
 // the Go runtime grows and scavenges arenas. mach_vm_read_overwrite reports
@@ -217,8 +280,10 @@ struct ttc_ring0_native_domain_slot {
 // readable at both host EL0 and guest EL1, and each slot outlives its bridge's
 // final guest exit, so the callback requires neither a lock nor a live pointer.
 static struct ttc_ring0_native_domain_slot
-		ttc_ring0_native_domains[TTC_RING0_MAX_APPLICATION_VCPUS];
-static _Atomic uint32_t ttc_ring0_native_domain_active_count;
+		ttc_ring0_native_domains[TTC_RING0_MAX_APPLICATION_VCPUS]
+		TTC_RING0_GUEST_DATA;
+static _Atomic uint32_t ttc_ring0_native_domain_active_count
+		TTC_RING0_GUEST_DATA;
 
 struct ttc_runtime_time_query {
 	uint32_t version;
@@ -233,14 +298,14 @@ _Static_assert(sizeof(struct ttc_runtime_time_query) == 24,
 
 static uintptr_t ttc_ring0_strip_instruction_pointer(uintptr_t address);
 
-static uint64_t ttc_ring0_host_cntvct(void) {
+TTC_RING0_GUEST_TEXT static uint64_t ttc_ring0_host_cntvct(void) {
 	uint64_t value;
 	__asm__ volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(value));
 	return value;
 }
 
-static uint64_t ttc_ring0_scale_ticks(uint64_t ticks, uint64_t numer,
-		uint64_t denom) {
+TTC_RING0_GUEST_TEXT static uint64_t ttc_ring0_scale_ticks(uint64_t ticks,
+		uint64_t numer, uint64_t denom) {
 	return (ticks / denom) * numer + ((ticks % denom) * numer) / denom;
 }
 
@@ -249,9 +314,9 @@ static uint64_t ttc_ring0_scale_ticks(uint64_t ticks, uint64_t numer,
 // instruction executes normally and returns one. The native-domain table
 // remains the fast reject so ordinary host clocks do not pay for this probe.
 static uint64_t ttc_ring0_runtime_current_el(void)
-		__attribute__((naked, noinline));
+		__attribute__((naked, noinline)) TTC_RING0_GUEST_TEXT;
 
-static uint64_t ttc_ring0_runtime_current_el(void) {
+TTC_RING0_GUEST_TEXT static uint64_t ttc_ring0_runtime_current_el(void) {
 	__asm__ volatile(
 		"mrs x0, CurrentEL\n"
 		"lsr x0, x0, #2\n"
@@ -262,7 +327,7 @@ static uint64_t ttc_ring0_runtime_current_el(void) {
 // libcCall. On native threads outside hv_vcpu_run it declines so the stock
 // runtime path remains authoritative. During guest execution, TPIDR_EL1 names
 // the permanent vCPU state page containing the VM-wide clock calibration.
-static int32_t ttc_ring0_runtime_time_hook(
+TTC_RING0_GUEST_TEXT static int32_t ttc_ring0_runtime_time_hook(
 		struct ttc_runtime_time_query *query) {
 	uint64_t thread_pointer;
 	__asm__ volatile("mrs %0, tpidrro_el0" : "=r"(thread_pointer));
@@ -335,7 +400,8 @@ static uintptr_t ttc_ring0_runtime_time_hook_address(void) {
 // and never raises SIGILL. A resident EL1 continuation finds its owner-affine
 // domain, prevents cancellation from exporting it inside this native helper,
 // and redpills before libcCall changes stacks or invokes external text.
-static int32_t ttc_ring0_runtime_ensure_host(void *unused) {
+TTC_RING0_GUEST_TEXT static int32_t ttc_ring0_runtime_ensure_host(
+		void *unused) {
 	(void)unused;
 	if (atomic_load_explicit(&ttc_ring0_native_domain_active_count,
 			memory_order_acquire) == 0) return 0;
@@ -2633,6 +2699,40 @@ func ring0HostRegionAt(target uintptr) (ring0HostRegion, bool, error) {
 		externalPager: region.external_pager != 0,
 		mainImage:     C.ttc_ring0_main_image(region.address, region.length) != 0,
 	}, true, nil
+}
+
+// ring0MainImageBounds returns the host range spanned by the accessible
+// segments of the Sentry image.
+func ring0MainImageBounds() (start, end uintptr, err error) {
+	var low, high C.uint64_t
+	if errno := C.ttc_ring0_main_image_bounds(&low, &high); errno != 0 {
+		return 0, 0, fmt.Errorf("reading the Sentry image segments: errno %d", int(errno))
+	}
+	return uintptr(low), uintptr(high), nil
+}
+
+// ring0GuestNativeRanges returns the image sections holding the native
+// helpers that run EL1-only instructions, and the data they use.
+func ring0GuestNativeRanges() ([]vmm.HostRange, error) {
+	var textLength, dataLength C.uint64_t
+	text := C.ttc_ring0_guest_text(&textLength)
+	data := C.ttc_ring0_guest_data(&dataLength)
+	if text == 0 || textLength == 0 || data == 0 || dataLength == 0 {
+		return nil, fmt.Errorf("Sentry image lacks the EL1 helper sections: text=%#x/%#x data=%#x/%#x", uint64(text), uint64(textLength), uint64(data), uint64(dataLength))
+	}
+	return []vmm.HostRange{
+		{Address: uintptr(text), Length: uint64(textLength)},
+		{Address: uintptr(data), Length: uint64(dataLength)},
+	}, nil
+}
+
+// ring0NativeGuestHelpers returns the native helpers that execute EL1-only
+// instructions, which must lie in the section ring0GuestNativeRanges reports.
+func ring0NativeGuestHelpers() []uintptr {
+	return []uintptr{
+		uintptr(C.ttc_ring0_runtime_time_hook_address()),
+		uintptr(C.ttc_ring0_runtime_ensure_host_address()),
+	}
 }
 
 func copyRing0HostMemory(destination, source uintptr, length uint64) error {

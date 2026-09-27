@@ -167,9 +167,12 @@ func TestRing0EngineApplicationRoundTrip(t *testing.T) {
 	var guestWall time.Time
 	// Unrelated Go runtime work, such as a preemption request, can need a
 	// host service at any time, which returns the continuation to the host.
-	// Retry until an entry keeps the continuation at EL1 throughout.
+	// So does the first EL1 execution of each window of the Sentry image,
+	// which is mirrored on first touch; the next entry mirrors it. Retry until
+	// an entry keeps the continuation at EL1 throughout. A fresh engine takes
+	// about as many attempts as this path has image windows.
 	var notResident string
-	for attempt := 0; attempt < 10; attempt++ {
+	for attempt := 0; attempt < 64; attempt++ {
 		if attempt != 0 {
 			time.Sleep(time.Millisecond)
 		}

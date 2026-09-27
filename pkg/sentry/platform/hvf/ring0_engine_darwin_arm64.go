@@ -21,6 +21,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"reflect"
 	"runtime"
 	"sort"
 	"strings"
@@ -42,7 +43,11 @@ const (
 	ring0SentryAddressSpaceID = ^uint64(0) // Sentry mirror and qualification only.
 	ring0HostVALimit          = uint64(1 << 48)
 	ring0HostMirrorGPAStart   = SentryMirrorIPAStart
+	// A demand import maps the slabs within this radius of the one requested.
+	// The Sentry image uses a narrower radius: EL1 touches it sparsely, and
+	// every slab of it imported is a private copy or commit.
 	ring0HostWorkingSetRadius = uint64(256 << 10)
+	ring0HostImageRadius      = uint64(16 << 10)
 	ring0MonitorVCPUID        = 63
 	stateApplicationFP        = 0x3000
 	stateRing0Entry           = 0x3340
@@ -173,6 +178,16 @@ type ring0Engine struct {
 	faultMu           sync.Mutex
 	pendingMirror     map[uintptr]struct{}
 	sentryTTBR0       uint64
+	// imageStart and imageEnd bound the Sentry image, which is mirrored as
+	// EL1 first touches it. Its slabs have fixed GPAs from
+	// ring0HostMirrorGPAStart, so they need no allocation, and other slabs are
+	// allocated upward from dynamicMirrorGPA.
+	imageStart       uintptr
+	imageEnd         uintptr
+	dynamicMirrorGPA uint64
+	// guestOnlyImageSlabs, sorted, are the image slabs mirrored before any EL1
+	// entry; see ring0GuestOnlyImageSlabs.
+	guestOnlyImageSlabs []uintptr
 	// mirrorInitialized is protected by mirrorMu. Once the initial Sentry
 	// working set is installed, refreshHostMirror can ignore host-service gates
 	// that only sampled slabs which are already present. This is essential for
@@ -266,23 +281,39 @@ func NewVMEngine(vmInterface vmm.VM, vcpus int) (vmplatform.VMEngine, error) {
 	if err != nil {
 		return nil, err
 	}
+	imageStart, imageEnd, err := ring0MainImageBounds()
+	if err != nil {
+		return nil, err
+	}
+	imageStart &^= uintptr(vmm.HostSlabSize - 1)
+	imageEnd = (imageEnd + uintptr(vmm.HostSlabSize-1)) &^ uintptr(vmm.HostSlabSize-1)
+	// The image's fixed GPAs precede the allocated ones.
+	dynamicMirrorGPA := ring0HostMirrorGPAStart + uint64(imageEnd-imageStart)
+	guestOnlyImageSlabs, err := ring0GuestOnlyImageSlabs()
+	if err != nil {
+		return nil, err
+	}
 	monitorPool, err := vmplatform.NewWorkerPoolWithIDBase(vm, 1, ring0MonitorVCPUID)
 	if err != nil {
 		return nil, fmt.Errorf("creating HVF ring0 monitor vCPU: %w", err)
 	}
 	e := &ring0Engine{
-		vm:              vm,
-		monitorPool:     monitorPool,
-		concurrency:     vcpus,
-		timeFastpath:    timeFastpath,
-		stage2Slabs:     make(map[uintptr]ring0Stage2Slab),
-		stage1Access:    make(map[uint64]monitorabi.Access),
-		applicationGPAs: make(map[uint64]map[uint64]uint64),
-		nextMirrorGPA:   ring0HostMirrorGPAStart,
-		pendingMirror:   make(map[uintptr]struct{}),
-		cpuIDs:          make([]bool, vcpus),
-		clockStop:       make(chan struct{}),
-		clockDone:       make(chan struct{}),
+		vm:                  vm,
+		monitorPool:         monitorPool,
+		concurrency:         vcpus,
+		timeFastpath:        timeFastpath,
+		stage2Slabs:         make(map[uintptr]ring0Stage2Slab),
+		stage1Access:        make(map[uint64]monitorabi.Access),
+		applicationGPAs:     make(map[uint64]map[uint64]uint64),
+		imageStart:          imageStart,
+		imageEnd:            imageEnd,
+		dynamicMirrorGPA:    dynamicMirrorGPA,
+		guestOnlyImageSlabs: guestOnlyImageSlabs,
+		nextMirrorGPA:       dynamicMirrorGPA,
+		pendingMirror:       make(map[uintptr]struct{}),
+		cpuIDs:              make([]bool, vcpus),
+		clockStop:           make(chan struct{}),
+		clockDone:           make(chan struct{}),
 	}
 	e.realtimeOffsetNS.Store(timeFastpath.realtimeOffsetNS)
 	var expander vmm.MonitorPoolExpander
@@ -376,6 +407,13 @@ func (e *ring0Engine) RunMonitor(ctx context.Context, encoded []byte) ([]byte, e
 // entering the monitor. Any lock contention is delegated to the host path so a
 // resident continuation never parks while holding a guest-only critical
 // section.
+//
+// The guest-critical section must not take a host gate either, so this
+// function's text is mirrored before any EL1 entry (see
+// ring0GuestOnlyImageSlabs). Keeping it out of line keeps the section in that
+// text.
+//
+//go:noinline
 func (e *ring0Engine) tryRunResidentMonitor(ctx context.Context, encoded []byte) ([]byte, bool, error) {
 	if ring0asm.CurrentEL() == 0 {
 		e.monitorResidentFallbackHostEL.Add(1)
@@ -1494,6 +1532,49 @@ func (e *ring0Engine) hostSlabCanMirror(region ring0HostRegion, address uintptr)
 			region.userTag == vmMemoryTTCVM || region.userTag == vmMemoryStack)
 }
 
+// ring0GuestOnlyImageSlabs returns, sorted, the Sentry image slabs that are
+// mirrored before any EL1 entry. EL1 imports the rest of the image when it
+// first touches it, through a host gate that resumes the continuation at host
+// EL0. That is transparent to ordinary Sentry code, but not to a sequence that
+// executes EL1-only instructions once it has found itself at EL1: after a host
+// gate it would execute them at host EL0. Those sequences are the ring0asm
+// bridge, the native helpers in the __ttc_guest sections, and the
+// guest-critical section of tryRunResidentMonitor.
+func ring0GuestOnlyImageSlabs() ([]uintptr, error) {
+	slabs := make(map[uintptr]struct{})
+	native, err := ring0GuestNativeRanges()
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range native {
+		for slab := r.Address &^ uintptr(vmm.HostSlabSize-1); slab < r.Address+uintptr(r.Length); slab += uintptr(vmm.HostSlabSize) {
+			slabs[slab] = struct{}{}
+		}
+	}
+	functions := append(ring0asm.GuestCode(), reflect.ValueOf((*ring0Engine).tryRunResidentMonitor).Pointer())
+	for _, pc := range functions {
+		function := runtime.FuncForPC(pc)
+		if function == nil {
+			return nil, fmt.Errorf("no Go function contains EL1 code address %#x", pc)
+		}
+		// A function spans each slab whose first byte it contains.
+		entry := function.Entry()
+		for slab := entry &^ uintptr(vmm.HostSlabSize-1); ; slab += uintptr(vmm.HostSlabSize) {
+			slabs[slab] = struct{}{}
+			next := runtime.FuncForPC(slab + uintptr(vmm.HostSlabSize))
+			if next == nil || next.Entry() != entry {
+				break
+			}
+		}
+	}
+	sorted := make([]uintptr, 0, len(slabs))
+	for slab := range slabs {
+		sorted = append(sorted, slab)
+	}
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	return sorted, nil
+}
+
 // retireUnenteredApplicationCPU destroys a vCPU that was created by the
 // current owner thread but never crossed the bluepill boundary. Such a vCPU
 // cannot use the signal handler's normal owner-affine retirement path.
@@ -1921,8 +2002,9 @@ func (e *ring0Engine) reapApplicationCPULocked(cpu *ring0ApplicationCPU) {
 	e.wakeApplicationWaitersLocked()
 }
 
-// learnHostGateFault classifies an EL1 data abort that entered the host-service
-// gate and queues the missing Darwin slab for the next bounded mirror refresh.
+// learnHostGateFault classifies an EL1 data abort, or an instruction abort in
+// the Sentry image, that entered the host-service gate and queues the missing
+// Darwin slab for the next bounded mirror refresh.
 // The faulting continuation already resumed at host EL0, so reconciliation can
 // use Mach and Hypervisor.framework without nesting a host operation in EL1.
 func (e *ring0Engine) learnHostGateFault(cpu *ring0ApplicationCPU) {
@@ -1933,8 +2015,12 @@ func (e *ring0Engine) learnHostGateFault(cpu *ring0ApplicationCPU) {
 	if esr == 0 {
 		return
 	}
-	ec := esr >> 26 & 0x3f
-	if ec != 0x25 || far >= ring0HostVALimit {
+	switch ec := esr >> 26 & 0x3f; {
+	case ec == 0x25 && far < ring0HostVALimit:
+	case ec == 0x21 && uintptr(far) >= e.imageStart && uintptr(far) < e.imageEnd:
+		// Instruction aborts elsewhere enter Darwin's libraries, which EL1
+		// never maps.
+	default:
 		return
 	}
 	e.requestHostMirror(uintptr(far))
@@ -2025,26 +2111,32 @@ func (e *ring0Engine) extendHostMirror(ctx context.Context) error {
 			continue
 		}
 		regionEnd := region.address + uintptr(region.length)
-		if region.protection&ring0VMWrite != 0 || region.mainImage {
+		if region.protection&ring0VMWrite != 0 && !region.mainImage {
 			// Go heap and stack spans grow throughout an existing Mach region.
 			// Importing a touched writable region as one run avoids a demand-fault
-			// storm across Sentry objects.
+			// storm across Sentry objects. The image is imported in windows like
+			// read-only memory: most of it, such as Go's FIPS entropy buffer,
+			// is never touched at EL1.
 			for address := region.address; address < regionEnd; address += uintptr(vmm.HostSlabSize) {
 				addSlab(region, address, access, stage2Access)
 			}
 			continue
+		}
+		radius := ring0HostWorkingSetRadius
+		if region.mainImage {
+			radius = ring0HostImageRadius
 		}
 		for requested := range pendingSlabs {
 			if requested < region.address || requested >= regionEnd {
 				continue
 			}
 			windowStart := requested
-			if uint64(requested-region.address) > ring0HostWorkingSetRadius {
-				windowStart -= uintptr(ring0HostWorkingSetRadius)
+			if uint64(requested-region.address) > radius {
+				windowStart -= uintptr(radius)
 			} else {
 				windowStart = region.address
 			}
-			windowEnd := requested + uintptr(vmm.HostSlabSize) + uintptr(ring0HostWorkingSetRadius)
+			windowEnd := requested + uintptr(vmm.HostSlabSize) + uintptr(radius)
 			if windowEnd < requested || windowEnd > regionEnd {
 				windowEnd = regionEnd
 			}
@@ -2226,19 +2318,18 @@ func (e *ring0Engine) refreshHostMirror(ctx context.Context) error {
 				desiredAccess[va] = access
 			}
 		}
-		if region.mainImage {
-			for offset := uint64(0); offset < region.length; offset += vmm.HostSlabSize {
-				addSlab(region.address + uintptr(offset))
-			}
-			continue
-		}
 		regionEnd := region.address + uintptr(region.length)
+		if region.mainImage {
+			// EL1 imports the rest of the image, in windows, when it first
+			// touches it.
+			forEachInRegion(e.guestOnlyImageSlabs, region.address, regionEnd, addSlab)
+		}
 		workingSetIndex := sort.Search(len(workingSetAddresses), func(i int) bool {
 			return workingSetAddresses[i] >= region.address
 		})
 		workingSetRegion := workingSetIndex < len(workingSetAddresses) && workingSetAddresses[workingSetIndex] < regionEnd
 		bootstrapOwned := region.userTag == 240 || region.userTag == 242
-		if region.protection&ring0VMWrite != 0 &&
+		if region.protection&ring0VMWrite != 0 && !region.mainImage &&
 			(workingSetRegion || bootstrap && bootstrapOwned) {
 			// At bootstrap, import each complete explicitly owned region so a
 			// pre-existing Go or VMM object cannot spuriously redpill based on its
@@ -2250,14 +2341,18 @@ func (e *ring0Engine) refreshHostMirror(ctx context.Context) error {
 			continue
 		}
 		forEachInRegion(retainedSlabs, region.address, regionEnd, addSlab)
+		radius := ring0HostWorkingSetRadius
+		if region.mainImage {
+			radius = ring0HostImageRadius
+		}
 		forEachInRegion(workingSetAddresses, region.address, regionEnd, func(address uintptr) {
 			windowStart := address
-			if uint64(address-region.address) > ring0HostWorkingSetRadius {
-				windowStart = address - uintptr(ring0HostWorkingSetRadius)
+			if uint64(address-region.address) > radius {
+				windowStart = address - uintptr(radius)
 			} else {
 				windowStart = region.address
 			}
-			windowEnd := address + uintptr(vmm.HostSlabSize) + uintptr(ring0HostWorkingSetRadius)
+			windowEnd := address + uintptr(vmm.HostSlabSize) + uintptr(radius)
 			if windowEnd < address || windowEnd > regionEnd {
 				windowEnd = regionEnd
 			}
@@ -2428,21 +2523,25 @@ func (e *ring0Engine) mapHostStage2Slabs(addresses []uintptr, desired map[uintpt
 			end++
 		}
 		address := addresses[start]
+		gpa := e.nextMirrorGPA
+		if identity.mainImage {
+			gpa = ring0HostMirrorGPAStart + uint64(address-e.imageStart)
+		}
 		var (
 			lease  *ring0Stage2Lease
 			mapErr error
 		)
 		for {
 			length := uint64(end-start) * vmm.HostSlabSize
-			if e.nextMirrorGPA > GuestRAMIPAStart-length {
+			if !identity.mainImage && gpa > GuestRAMIPAStart-length {
 				return skipped, fmt.Errorf("Sentry host mirror exhausted GPA aperture [%#x, %#x)", uint64(ring0HostMirrorGPAStart), uint64(GuestRAMIPAStart))
 			}
 			lease, mapErr = prepareRing0Stage2Lease(address, length, shadow)
 			if mapErr == nil {
 				if lease.tracked {
-					mapErr = e.vm.mapRing0MirrorStage2Source(uintptr(e.nextMirrorGPA), lease.hostAddress, length, identity.access)
+					mapErr = e.vm.mapRing0MirrorStage2Source(uintptr(gpa), lease.hostAddress, length, identity.access)
 				} else {
-					mapErr = e.vm.mapRing0Stage2Source(uintptr(e.nextMirrorGPA), lease.hostAddress, length, identity.access)
+					mapErr = e.vm.mapRing0Stage2Source(uintptr(gpa), lease.hostAddress, length, identity.access)
 				}
 			}
 			if mapErr == nil || end-start == 1 {
@@ -2460,7 +2559,6 @@ func (e *ring0Engine) mapHostStage2Slabs(addresses []uintptr, desired map[uintpt
 			end = start + 1
 		}
 		length := uint64(end-start) * vmm.HostSlabSize
-		gpa := e.nextMirrorGPA
 		if mapErr != nil {
 			if lease != nil {
 				if err := releaseRing0Stage2Lease(lease); err != nil {
@@ -2478,7 +2576,9 @@ func (e *ring0Engine) mapHostStage2Slabs(addresses []uintptr, desired map[uintpt
 			start = end
 			continue
 		}
-		e.nextMirrorGPA += length
+		if !identity.mainImage {
+			e.nextMirrorGPA += length
+		}
 		lease.refs = end - start
 		for index, mapped := range addresses[start:end] {
 			e.stage2Slabs[mapped] = ring0Stage2Slab{
@@ -2648,12 +2748,13 @@ func (e *ring0Engine) FlushHostExecutionCache(ctx context.Context) error {
 	if err := e.unmapHostStage2Slabs(addresses); err != nil {
 		return err
 	}
-	// Only main-image slabs remain in the mirror aperture, and no stage-1
-	// leaf refers to the GPAs just unmapped. Reuse everything above the
-	// remaining slabs. The allocator otherwise never recycles GPAs, and every
-	// live fork, dehydration, and checkpoint flushes and then re-mirrors the
-	// Sentry working set, so repeated forks exhausted the aperture.
-	next := uint64(ring0HostMirrorGPAStart)
+	// Only main-image slabs, at their fixed GPAs, remain in the mirror
+	// aperture, and no stage-1 leaf refers to the GPAs just unmapped. Reuse
+	// everything above the remaining slabs. The allocator otherwise never
+	// recycles GPAs, and every live fork, dehydration, and checkpoint flushes
+	// and then re-mirrors the Sentry working set, so repeated forks exhausted
+	// the aperture.
+	next := e.dynamicMirrorGPA
 	for _, slab := range e.stage2Slabs {
 		if !slab.canonical && slab.gpa+vmm.HostSlabSize > next {
 			next = slab.gpa + vmm.HostSlabSize

@@ -22,7 +22,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -111,6 +113,169 @@ func TestRequestHostMirrorIgnoresAddressesOutsideSentryVA(t *testing.T) {
 	want := address &^ uintptr(vmm.HostSlabSize-1)
 	if _, ok := engine.pendingMirror[want]; !ok || len(engine.pendingMirror) != 1 {
 		t.Fatalf("valid host mirror request queued %+v, want only %#x", engine.pendingMirror, want)
+	}
+}
+
+func TestLearnHostGateFaultQueuesImageInstructionAborts(t *testing.T) {
+	state := make([]byte, vmm.HostSlabSize)
+	cpu := &ring0ApplicationCPU{vcpu: &hvfVCPU{stateHost: uintptr(unsafe.Pointer(&state[0]))}}
+	engine := &ring0Engine{
+		pendingMirror: make(map[uintptr]struct{}),
+		imageStart:    0x100000000,
+		imageEnd:      0x105000000,
+	}
+	for _, test := range []struct {
+		name string
+		ec   uint64
+		far  uint64
+		want bool
+	}{
+		{name: "data abort", ec: 0x25, far: 0x14000012345, want: true},
+		{name: "image instruction abort", ec: 0x21, far: 0x100004560, want: true},
+		{name: "library instruction abort", ec: 0x21, far: 0x190004560},
+		{name: "SVC", ec: 0x15},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clear(engine.pendingMirror)
+			binary.LittleEndian.PutUint64(state[stateHostGateESR:], test.ec<<26)
+			binary.LittleEndian.PutUint64(state[stateHostGateFAR:], test.far)
+			engine.learnHostGateFault(cpu)
+			_, queued := engine.pendingMirror[uintptr(test.far)&^uintptr(vmm.HostSlabSize-1)]
+			if queued != test.want || len(engine.pendingMirror) > 1 {
+				t.Errorf("host gate EC %#x FAR %#x queued %+v, want queued=%t", test.ec, test.far, engine.pendingMirror, test.want)
+			}
+		})
+	}
+	runtime.KeepAlive(state)
+}
+
+func TestGuestOnlyImageSlabsCoverEL1Sequences(t *testing.T) {
+	slabs, err := ring0GuestOnlyImageSlabs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinned := make(map[uintptr]bool, len(slabs))
+	for _, slab := range slabs {
+		pinned[slab] = true
+	}
+	covered := func(address uintptr) bool {
+		return pinned[address&^uintptr(vmm.HostSlabSize-1)]
+	}
+	for _, pc := range ring0asm.GuestCode() {
+		if function := runtime.FuncForPC(pc); function == nil || !strings.Contains(function.Name(), "/ring0asm.") {
+			t.Errorf("ring0asm guest code %#x lies in %v", pc, function)
+		}
+		if !covered(pc) {
+			t.Errorf("ring0asm guest code %#x is not in a guest-only slab", pc)
+		}
+	}
+	monitorPC := reflect.ValueOf((*ring0Engine).tryRunResidentMonitor).Pointer()
+	if function := runtime.FuncForPC(monitorPC); function == nil || !strings.HasSuffix(function.Name(), ".(*ring0Engine).tryRunResidentMonitor") {
+		t.Errorf("tryRunResidentMonitor's func value %#x lies in %v", monitorPC, function)
+	}
+	if !covered(monitorPC) {
+		t.Errorf("tryRunResidentMonitor %#x is not in a guest-only slab", monitorPC)
+	}
+	native, err := ring0GuestNativeRanges()
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := native[0]
+	for _, helper := range ring0NativeGuestHelpers() {
+		if helper < text.Address || uint64(helper-text.Address) >= text.Length {
+			t.Errorf("native EL1 helper %#x lies outside its section [%#x, %#x)", helper, text.Address, text.Address+uintptr(text.Length))
+		}
+	}
+	for _, r := range native {
+		for address := r.Address; address < r.Address+uintptr(r.Length); address += uintptr(vmm.LogicalPageSize) {
+			if !covered(address) {
+				t.Errorf("native EL1 section byte %#x is not in a guest-only slab", address)
+			}
+		}
+	}
+}
+
+// testImageBSS is Sentry image memory that nothing touches at EL1.
+var testImageBSS [1 << 20]byte
+
+func TestImageMirrorsOnFirstTouch(t *testing.T) {
+	backend := NewBackend()
+	vmInterface, err := backend.CreateVM(context.Background())
+	if err != nil {
+		skipWithoutHypervisor(t, err)
+	}
+	vm := vmInterface.(*hvfVM)
+	defer vm.Close()
+	engineInterface, err := NewVMEngine(vm, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := engineInterface.(*ring0Engine)
+	defer engine.Close()
+
+	for _, slab := range engine.guestOnlyImageSlabs {
+		if _, ok := engine.stage2Slabs[slab]; !ok {
+			t.Errorf("guest-only image slab %#x is not mirrored", slab)
+		}
+	}
+	mirrored := 0
+	for _, slab := range engine.stage2Slabs {
+		if slab.mainImage {
+			mirrored++
+		}
+	}
+	if total := int((engine.imageEnd - engine.imageStart) / uintptr(vmm.HostSlabSize)); mirrored > total/4 {
+		t.Errorf("bootstrap mirrored %d of the image's %d slabs", mirrored, total)
+	}
+
+	slabOf := func(address uintptr) uintptr { return address &^ uintptr(vmm.HostSlabSize-1) }
+	textRegion, ok, err := ring0HostRegionAt(reflect.ValueOf(TestImageMirrorsOnFirstTouch).Pointer())
+	if err != nil || !ok || !textRegion.mainImage || textRegion.protection&ring0VMExecute == 0 {
+		t.Fatalf("image text region = %+v, ok=%t, err=%v", textRegion, ok, err)
+	}
+	var text uintptr
+	for slab := textRegion.address + uintptr(textRegion.length) - uintptr(vmm.HostSlabSize); slab > textRegion.address; slab -= uintptr(vmm.HostSlabSize) {
+		if _, mapped := engine.stage2Slabs[slab]; !mapped {
+			text = slab
+			break
+		}
+	}
+	if text == 0 {
+		t.Fatal("bootstrap mirrored every image text slab")
+	}
+	data := slabOf(uintptr(unsafe.Pointer(&testImageBSS[len(testImageBSS)/2])))
+	if _, mapped := engine.stage2Slabs[data]; mapped {
+		t.Fatalf("bootstrap mirrored untouched image data slab %#x", data)
+	}
+	engine.requestHostMirror(text)
+	engine.requestHostMirror(data)
+	if err := engine.extendHostMirror(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		address uintptr
+		access  vmm.Stage2Access
+	}{
+		{address: text, access: vmm.Stage2Read | vmm.Stage2Execute},
+		{address: data, access: vmm.Stage2Read | vmm.Stage2Write},
+	} {
+		slab, ok := engine.stage2Slabs[test.address]
+		if !ok || !slab.mainImage || slab.access != test.access ||
+			slab.gpa != ring0HostMirrorGPAStart+uint64(test.address-engine.imageStart) {
+			t.Errorf("image slab %#x after first touch = %+v, mirrored=%t; want access %#x at its fixed GPA", test.address, slab, ok, test.access)
+		}
+		if _, ok := engine.stage1Access[uint64(test.address)]; !ok {
+			t.Errorf("image slab %#x has no Sentry stage-1 mapping", test.address)
+		}
+	}
+	// The image is imported in windows, not whole regions.
+	for _, far := range []uintptr{
+		uintptr(unsafe.Pointer(&testImageBSS[0])),
+		uintptr(unsafe.Pointer(&testImageBSS[len(testImageBSS)-1])),
+	} {
+		if _, mapped := engine.stage2Slabs[slabOf(far)]; mapped {
+			t.Errorf("image data slab %#x, beyond the touched window, was mirrored", slabOf(far))
+		}
 	}
 }
 
@@ -2278,10 +2443,13 @@ func skipWithoutHypervisor(t *testing.T, err error) {
 
 // enterResident runs the application at codeVA until its syscall exit leaves
 // the Sentry continuation at EL1. Unrelated Go runtime work can need a host
-// service at any time, which returns the continuation to the host instead.
+// service at any time, which returns the continuation to the host instead, as
+// does the first EL1 execution of each window of the Sentry image, which the
+// next entry mirrors. A fresh engine takes about as many attempts as the
+// syscall return path has image windows.
 func enterResident(t *testing.T, engine *ring0Engine, spaceID, codeVA uint64, registers *vmm.ARM64State) {
 	t.Helper()
-	for attempt := 0; attempt < 10; attempt++ {
+	for attempt := 0; attempt < 64; attempt++ {
 		if attempt != 0 {
 			time.Sleep(time.Millisecond)
 		}
