@@ -6,11 +6,10 @@ MCP packages in this directory.
 
 ## Connection
 
-The default socket is selected in this order:
-
-1. `$TTC_SOCKET`
-2. `$XDG_RUNTIME_DIR/ttc/ttcd.sock`
-3. `/tmp/ttc-$EUID/ttcd.sock`
+A client names the daemon it uses by the daemon's root: the `TTC_ROOT` of a
+standalone ttcd, or the `TTC_LOCAL_ROOT` of a node of a cluster. The daemon's
+socket is `ttcd.sock` in its root. SDK clients take the root explicitly and
+read no environment variables; they have no default daemon.
 
 ttcd accepts clients owned by the same Unix user. Each operation uses a new
 connection.

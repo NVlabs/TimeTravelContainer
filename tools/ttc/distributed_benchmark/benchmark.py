@@ -122,7 +122,6 @@ class Experiment:
         result.update({
             "TTC_ROOT": str(self.data),
             "TTC_LOCAL_ROOT": str(runtime / "data"),
-            "TTC_SOCKET": str(runtime / "run" / "ttcd.sock"),
         })
         result.pop("TTC_DATA_ROOT", None)
         result.pop("TTC_RUNTIME_DIR", None)
@@ -160,11 +159,11 @@ class Experiment:
             "--cluster-push", self.case["push"],
         ]
         node_a = [
-            "--cluster-init", "--listen", "127.0.0.1:27443",
+            "--listen", "127.0.0.1:27443",
             "--node", "node-a", "--advertise", "127.0.0.1:27443",
         ]
         node_b = [
-            "--cluster-join", "127.0.0.1:27443", "--listen", "127.0.0.1:37443",
+            "--listen", "127.0.0.1:37443",
             "--node", "node-b", "--advertise", "127.0.0.1:37443",
         ]
         self.ttc("a", "daemon", "start", *common, *node_a)
@@ -379,8 +378,8 @@ class Experiment:
         # A completed daemon response can precede the final Sentry/gofer reap.
         # Never delete the dedicated roots while one of those children can still
         # flush metadata or hold donated descriptors into them.
-        stopped_a = stopped_a or not (self.runtime_a / "run" / "ttcd.sock").exists()
-        stopped_b = stopped_b or not (self.runtime_b / "run" / "ttcd.sock").exists()
+        stopped_a = stopped_a or not (self.runtime_a / "data" / "ttcd.sock").exists()
+        stopped_b = stopped_b or not (self.runtime_b / "data" / "ttcd.sock").exists()
         if stopped_a and stopped_b:
             # The cluster HTTP server permits an in-flight proxied stop
             # response to drain for up to 30 seconds before forcing close.

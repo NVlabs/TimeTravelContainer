@@ -20,12 +20,14 @@ TTCD=${TTCD:-ttcd}
 TTC_UNSAFE_NO_HOST_ISOLATION=${TTC_UNSAFE_NO_HOST_ISOLATION:-0}
 IMAGE=${TTC_FUSE_TEST_IMAGE:-ubuntu:24.04}
 NAME=${TTC_FUSE_TEST_NAME:-ttc-fuse-lifecycle-$$}
-ROOT=${TTC_FUSE_TEST_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/ttc-fuse-lifecycle.XXXXXX")}
+# macOS gives TMPDIR a trailing slash; a doubled one would differ from the
+# cleaned paths TTC reports.
+tmp=${TMPDIR:-/tmp}
+ROOT=${TTC_FUSE_TEST_ROOT:-$(mktemp -d "${tmp%/}/ttc-fuse.XXXXXX")}
 OWNED_ROOT=1
 if test -n "${TTC_FUSE_TEST_ROOT:-}"; then
 	OWNED_ROOT=0
 fi
-SOCKET=$ROOT/ttcd.sock
 BIN_DIR=$ROOT/bin
 
 test -x "$TTC" || { echo "TTC FUSE lifecycle: TTC is not executable: $TTC" >&2; exit 1; }
@@ -41,10 +43,13 @@ if [ "$(uname -s)" = Darwin ]; then
     "$BIN_DIR/ttcd" >/dev/null
 fi
 TTC=$BIN_DIR/ttc
+# The client finds the daemon through TTC_ROOT, which a node's TTC_LOCAL_ROOT
+# would override.
+unset TTC_LOCAL_ROOT
 export TTC_ROOT=$ROOT/data
 
 ttc() {
-	"$TTC" --daemon-socket "$SOCKET" "$@"
+	"$TTC" "$@"
 }
 
 cleanup() {

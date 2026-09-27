@@ -302,6 +302,9 @@ type distributedSourceRuntime struct {
 	// exports has, by transaction, a function that stops the transaction's
 	// live graph export: one that no target will read.
 	exports sync.Map
+	// rollingForward has the memory origins whose frozen handoffs a
+	// background roll-forward is completing.
+	rollingForward sync.Map
 	// syncedOwners has, by family and branch, the placement generation and
 	// owner that placement reconciliation last brought the family's record in
 	// line with.
@@ -532,11 +535,20 @@ func (r *distributedSourceRuntime) trySourcePoll() (func(), bool) {
 }
 
 func (r *distributedSourceRuntime) scheduleHandoff(fn func()) {
+	r.scheduleHandoffAfter(0, fn)
+}
+
+// scheduleHandoffAfter is scheduleHandoff, delay later. Meanwhile the handoff
+// counts as pending, but holds no worker.
+func (r *distributedSourceRuntime) scheduleHandoffAfter(delay time.Duration, fn func()) {
 	if fn == nil {
 		return
 	}
 	if r == nil {
-		go fn()
+		go func() {
+			time.Sleep(delay)
+			fn()
+		}()
 		return
 	}
 	r.handoffOnce.Do(func() {
@@ -545,6 +557,7 @@ func (r *distributedSourceRuntime) scheduleHandoff(fn func()) {
 	r.handoffCount.Add(1)
 	go func() {
 		defer r.handoffCount.Add(-1)
+		time.Sleep(delay)
 		r.handoffSlots <- struct{}{}
 		defer func() { <-r.handoffSlots }()
 		fn()
@@ -1954,7 +1967,7 @@ func (b *runtimeBackend) exportDistributedGraph(containerID, transactionID strin
 		return cluster.GraphHandoffDescriptor{}, nil, nil, err
 	}
 	defer built()
-	shared := false
+	shared, ledgerFrozen := false, false
 	manifestRelative := filepath.Join("cluster", "memory-manifests", transactionID+".manifest")
 	manifestPath := filepath.Join(b.dataRoot, manifestRelative)
 	defer func() {
@@ -1964,9 +1977,15 @@ func (b *runtimeBackend) exportDistributedGraph(containerID, transactionID strin
 		_ = os.Remove(manifestPath)
 		if shared {
 			_ = b.releaseSharedGraphMemoryRoots(rootNames, rootObjects)
-		} else {
+		} else if !ledgerFrozen {
 			_ = removeSharedPublicationBridgeIntent(b.dataRoot, origin)
 			_ = b.releaseGraphMemoryRoots(rootNames)
+		}
+		if ledgerFrozen {
+			// The handoff cannot be canceled once frozen; complete it, which
+			// releases the capture's roots, rather than discard the capture.
+			b.graphOriginPublisher().rollForwardFrozenOrigin(origin)
+			return
 		}
 		if err := b.discardFailedGraphSnapshot(origin); err != nil && b.stderr != nil {
 			fmt.Fprintf(b.stderr, "ttc: warning: discarding failed live handoff snapshot %d: %v\n", origin, err)
@@ -2049,18 +2068,17 @@ func (b *runtimeBackend) exportDistributedGraph(containerID, transactionID strin
 	if err := b.snapshotShared.PublishHandoff(context.Background(), b.snapshotGraph, origin, b.snapshotData); err != nil {
 		return cluster.GraphHandoffDescriptor{}, nil, nil, fmt.Errorf("publishing live graph snapshot %d: %w", origin, err)
 	}
+	// Hold the origin through the final switch, as publishVolatileGraphOrigin
+	// does: another publication of it, a dependency's or a roll-forward's,
+	// then waits for this one rather than running beside it.
+	unlockOrigin := b.distributedSource.lockSnapshotOrigin(origin)
+	defer unlockOrigin()
 	// Serialize only the short final ledger/authority switch against foreground
 	// captures. The potentially slow shared-pack write above remains outside the
 	// gate. Once a foreground writer owns the gate, it may add references to
 	// this origin; the later freeze will include them in its baseline.
 	finishFinalHandoff := b.distributedSource.beginBackgroundSnapshotWork()
 	defer finishFinalHandoff()
-	ledgerFrozen := false
-	defer func() {
-		if retErr != nil && ledgerFrozen {
-			_ = b.snapshotGraph.UnfreezeSnapshotLedger(origin)
-		}
-	}()
 	if _, _, err := b.snapshotGraph.FreezeSnapshotLedger(origin); err != nil {
 		return cluster.GraphHandoffDescriptor{}, nil, nil, err
 	}
@@ -2198,14 +2216,42 @@ func (b *runtimeBackend) publishMigratedMemoryOrigins(branch ttcbundle.BranchInf
 // short ledger freeze; Raft changes routing only after the shared coordinator
 // has imported the exact provider baseline and catch-up suffix.
 func (b *runtimeBackend) publishVolatileGraphOrigin(origin ttcsnapshot.SnapshotID) error {
-	publisher := &branchPublisher{
+	return b.graphOriginPublisher().publishVolatileGraphOrigin(context.Background(), origin)
+}
+
+// graphOriginPublisher returns the publisher of this node's memory origins.
+func (b *runtimeBackend) graphOriginPublisher() *branchPublisher {
+	return &branchPublisher{
 		sharedRoot: b.dataRoot,
 		nodeID:     b.nodeID, incarnation: b.distributedSource.incarnation,
 		authority: b.distributedSource.authority, graphShared: b.snapshotShared,
 		graph: b.snapshotGraph, graphData: b.snapshotData,
 		sharedRefs: b.sharedReferences, peers: b.distributedSource,
 	}
-	return publisher.publishVolatileGraphOrigin(context.Background(), origin)
+}
+
+// resumeFrozenOriginPublications rolls forward, in the background, the
+// handoffs of this node's memory and filesystem origins that a crash left
+// frozen.
+func resumeFrozenOriginPublications(b *runtimeBackend) {
+	if b == nil || b.snapshotGraph == nil || b.distributedSource == nil || b.distributedSource.authority == nil {
+		return
+	}
+	publisher := b.graphOriginPublisher()
+	for _, origin := range b.snapshotGraph.FrozenSnapshotLedgers() {
+		publisher.rollForwardFrozenOrigin(origin)
+	}
+	// Finding the filesystem origins opens every repository.
+	go func() {
+		origins, err := b.containerStore().FrozenFilesystemOrigins()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ttcd: finding frozen filesystem origin handoffs: %v\n", err)
+			return
+		}
+		for _, origin := range origins {
+			b.rollForwardFrozenFilesystemOrigin(origin)
+		}
+	}()
 }
 
 // publishVolatileFilesystemOrigin transfers one immutable filesystem origin
@@ -2358,12 +2404,117 @@ func (b *runtimeBackend) publishVolatileFilesystemOriginContext(ctx context.Cont
 		return nil
 	})
 	if err != nil {
+		// A handoff that failed after it froze cannot be canceled, and its
+		// repository refuses writes meanwhile: complete it.
+		b.rollForwardFrozenFilesystemOrigin(origin)
 		return err
 	}
 	if !found {
 		return fmt.Errorf("filesystem origin %d is absent from node-local repositories", origin)
 	}
 	return nil
+}
+
+// resumeFrozenFilesystemOrigin rolls forward the handoff of origin, a
+// filesystem origin of this node's whose repository a failed or interrupted
+// handoff left frozen, as resumeFrozenGraphOrigin does a memory origin's. A
+// frozen repository refuses every metadata transaction, so its branches'
+// writes wait for this. The handoff's pack exists, so the roll-forward starts
+// at the freeze: PublishOriginHandoff would first sync metadata, which the
+// freeze refuses.
+func (b *runtimeBackend) resumeFrozenFilesystemOrigin(origin ttcsnapshot.SnapshotID) error {
+	if origin == 0 || b.snapshotShared == nil || b.distributedSource == nil ||
+		b.distributedSource.authority == nil || b.sharedReferences == nil {
+		return errors.New("distributed filesystem publication is unavailable")
+	}
+	unlockOrigin := b.distributedSource.lockSnapshotOrigin(origin)
+	defer unlockOrigin()
+	// Only the exact retry of the operation that recorded a bridge may reuse
+	// it. Without one recorded yet, the handoff proceeds as the origin's own.
+	bridgeIntent, found, err := loadSharedPublicationBridgeIntent(b.dataRoot, origin)
+	if err != nil {
+		return err
+	}
+	if !found {
+		bridgeIntent = sharedPublicationBridgeIntent{Kind: sharedPublicationBridgeOrigin}
+	} else if bridgeIntent.Kind == sharedPublicationBridgePublication {
+		return errFrozenOriginOwned
+	}
+	provider, volatile, terminal, err := snapshotOriginAuthority(b.distributedSource.authority, origin)
+	if err != nil {
+		return err
+	}
+	publisher := &branchPublisher{
+		sharedRoot: b.dataRoot,
+		nodeID:     b.nodeID, incarnation: b.distributedSource.incarnation,
+		authority: b.distributedSource.authority, graphShared: b.snapshotShared,
+		sharedRefs: b.sharedReferences, peers: b.distributedSource,
+	}
+	_, err = b.containerStore().WithFilesystemSnapshotOrigin(origin, func(repository *ttcvolume.Repository) error {
+		if !repository.OriginHandoffFrozen(origin) {
+			return nil
+		}
+		if terminal {
+			// The origin was abandoned or retired: no handoff of it
+			// completes, and no shared ledger counts its references any more.
+			return repository.CancelOriginHandoff(origin)
+		}
+		if volatile && provider.NodeID != b.nodeID {
+			return fmt.Errorf("filesystem origin %d is frozen here but provided by node %q", origin, provider.NodeID)
+		}
+		if _, err := b.snapshotShared.Manifest(origin); err != nil {
+			return fmt.Errorf("reading frozen filesystem origin %d manifest: %w", origin, err)
+		}
+		if volatile {
+			changes, err := repository.FreezeOriginHandoff(origin)
+			if err != nil {
+				return fmt.Errorf("reading filesystem origin %d reference handoff: %w", origin, err)
+			}
+			if err := publisher.publishSharedReferenceLedger(origin, changes, bridgeIntent); err != nil {
+				return fmt.Errorf("transferring filesystem origin %d reference authority: %w", origin, err)
+			}
+			if err := b.distributedSource.authority.PublishSnapshotOrigin(b.nodeID, b.distributedSource.incarnation, uint64(origin)); err != nil {
+				return fmt.Errorf("publishing filesystem origin %d authority: %w", origin, err)
+			}
+		}
+		if err := repository.CompleteOriginHandoff(origin); err != nil {
+			return fmt.Errorf("completing filesystem origin %d handoff: %w", origin, err)
+		}
+		// A graph handoff's bridge lasts until its transaction ends, when the
+		// shared coordinator releases it. The origin's own ends here.
+		if bridgeIntent.Kind == sharedPublicationBridgeOrigin {
+			if err := publisher.releaseSharedPublicationBridge(origin); err != nil {
+				return fmt.Errorf("releasing filesystem origin %d publication bridge: %w", origin, err)
+			}
+		}
+		return nil
+	})
+	return err
+}
+
+// rollForwardFrozenFilesystemOrigin completes, in the background, the
+// handoff of origin, a filesystem origin whose repository a failed or
+// interrupted handoff left frozen, retrying until it completes, as
+// rollForwardFrozenOrigin does a memory origin's.
+func (b *runtimeBackend) rollForwardFrozenFilesystemOrigin(origin ttcsnapshot.SnapshotID) {
+	source := b.distributedSource
+	if source == nil || origin == 0 {
+		return
+	}
+	if _, running := source.rollingForward.LoadOrStore(origin, struct{}{}); running {
+		return
+	}
+	go func() {
+		defer source.rollingForward.Delete(origin)
+		for delay := time.Second; ; delay = min(2*delay, 30*time.Second) {
+			err := b.resumeFrozenFilesystemOrigin(origin)
+			if err == nil || errors.Is(err, errFrozenOriginOwned) {
+				return
+			}
+			fmt.Fprintf(os.Stderr, "ttcd: completing the frozen handoff of filesystem origin %d: %v\n", origin, err)
+			time.Sleep(delay)
+		}
+	}()
 }
 
 type snapshotProviderLookup interface {
@@ -3557,12 +3708,34 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 // Failure before the target acknowledges the switch falls back to ordinary
 // live paging; it never invalidates an already-published target.
 func (b *runtimeBackend) handoffDistributedFork(peer *cluster.Client, sourceContainer, transactionID string, revision uint64, relay *distributedPageRelay) {
+	b.handoffDistributedForkUntil(peer, sourceContainer, transactionID, revision, relay, time.Now().Add(forkHandoffWait))
+}
+
+// distributedHandoffFreezeRetry is how long a graph handoff whose export met a
+// frozen snapshot ledger waits before it exports again.
+const distributedHandoffFreezeRetry = time.Second
+
+// handoffDistributedForkUntil is handoffDistributedFork, which waits out, until
+// deadline, the freezes of the snapshots its export references.
+func (b *runtimeBackend) handoffDistributedForkUntil(peer *cluster.Client, sourceContainer, transactionID string, revision uint64, relay *distributedPageRelay, deadline time.Time) {
 	// A successful handoff makes its transaction-scoped pack and intent
 	// unreachable. Collection must follow the terminal transition here rather
 	// than relying on the daemon's periodic maintenance loop: an elastic source
 	// may stop immediately after its last dependency becomes independent.
 	defer b.distributedSource.scheduleColdCollection(b.collectTerminalColdStorage)
 	handoff, rootNames, rootObjects, err := b.exportDistributedGraph(sourceContainer, transactionID)
+	if err != nil && frozenForAuthorityHandoff(err) && time.Now().Before(deadline) {
+		// The export references a snapshot whose ledger is frozen while its
+		// provider hands it to the shared store, which ends when that
+		// publication does. Export again then, as a fork waits out the same
+		// freeze, rather than leave the target on live paging for good.
+		if _, terminal := b.distributedSource.sourceTransactionTerminalAction(transactionID); !terminal {
+			b.distributedSource.scheduleHandoffAfter(distributedHandoffFreezeRetry, func() {
+				b.handoffDistributedForkUntil(peer, sourceContainer, transactionID, revision, relay, deadline)
+			})
+			return
+		}
+	}
 	if err != nil {
 		// Graph publication is an optimization, but failure leaves the target
 		// dependent on a live source indefinitely. Background monitors do not own

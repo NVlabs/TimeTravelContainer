@@ -17,7 +17,7 @@ Start `ttcd`, then use the client:
 ```ts
 import { Client } from "ttcx";
 
-const ttc = new Client();
+const ttc = new Client("/path/to/ttc-root");
 console.log(await ttc.ping());
 
 (await ttc.pull("alpine:3.20")).check();
@@ -110,10 +110,12 @@ retrying the same mutation.
 the daemon. Use absolute host paths in raw file-oriented commands because
 `ttcd` does not share the client process's working directory.
 
-Set `TTC_SOCKET` or `XDG_RUNTIME_DIR`, or construct
-`new Client({socketPath: "/path/to/ttcd.sock"})`. SDK clients never need
-`TTC_ROOT` or `TTC_LOCAL_ROOT`. They negotiate the public API/features
-reported by `ping`; exact build matching is specific to the official CLI.
+A client takes the root of the daemon to use explicitly, as
+`new Client(root)` or `new Client({root, timeoutMs})`: the `TTC_ROOT` of a
+standalone `ttcd`, or the `TTC_LOCAL_ROOT` of a node of a cluster. It connects
+to `ttcd.sock` there, reads no environment variables, and never accesses the
+daemon's storage. Clients negotiate the public API/features reported by
+`ping`; exact build matching is specific to the official CLI.
 
 ## Develop and test
 

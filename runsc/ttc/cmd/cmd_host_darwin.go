@@ -15,6 +15,7 @@ import (
 	"syscall"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/runsc/ttc/seatbelt"
 )
 
 const defaultRuntimePlatform = "hvf"
@@ -67,12 +68,37 @@ func evaluateCurrentHostCompatibility(release string) (hostKernelCompatibility, 
 
 func currentHostCompatibilityWarning(hostKernelCompatibility) string { return "" }
 
-func preflightDaemonIsolation(unsafeNoHostIsolation bool) error {
-	if !unsafeNoHostIsolation {
-		return fmt.Errorf("native macOS execution requires --unsafe-no-host-isolation")
+// daemonHostIsolationMode names the host isolation of a daemon started without
+// --unsafe-no-host-isolation: the macOS sandbox, Seatbelt, which confines the
+// daemon and every process it starts.
+const daemonHostIsolationMode = "seatbelt"
+
+// daemonNoHostIsolationWarning is the warning of a daemon started with
+// --unsafe-no-host-isolation.
+const daemonNoHostIsolationWarning = "the macOS sandbox, Seatbelt, is disabled; run trusted workloads only"
+
+// preflightDaemonIsolation checks nothing: every macOS kernel has Seatbelt.
+func preflightDaemonIsolation(bool) error { return nil }
+
+// applySeatbelt confines this process to a profile; tests replace it.
+var applySeatbelt = seatbelt.Apply
+
+// enterDaemonHostIsolation confines the daemon, and so every process it
+// starts, to seatbelt.DaemonProfile, unless unsafeNoHostIsolation.
+func enterDaemonHostIsolation(unsafeNoHostIsolation bool) error {
+	if unsafeNoHostIsolation {
+		return nil
+	}
+	if err := applySeatbelt(seatbelt.DaemonProfile); err != nil {
+		return fmt.Errorf("confining ttcd with the macOS sandbox, Seatbelt: %w; restart with --unsafe-no-host-isolation for trusted workloads", err)
 	}
 	return nil
 }
+
+// runscNoHostIsolation reports whether runsc runs its sandboxes without host
+// isolation of its own. On macOS it always does: it has none, and the Seatbelt
+// profile ttcd confines itself to confines them instead.
+func runscNoHostIsolation(bool) bool { return true }
 
 func preflightDaemonExecutable(path string) error {
 	command := exec.Command(path, daemonRootlessProbeArg)
@@ -142,7 +168,10 @@ func createRootlessProbe() error {
 	return fmt.Errorf("Linux user namespaces are unavailable on native macOS: %w", unix.EOPNOTSUPP)
 }
 
-func daemonStatfsIsNFS(statfs *unix.Statfs_t) bool {
+// daemonStatfsNetworkFilesystem returns the name of the network filesystem
+// statfs describes, or "" if it describes a local one: macOS marks every
+// local filesystem MNT_LOCAL.
+func daemonStatfsNetworkFilesystem(statfs *unix.Statfs_t) string {
 	name := make([]byte, 0, len(statfs.Fstypename))
 	for _, c := range statfs.Fstypename {
 		if c == 0 {
@@ -150,7 +179,22 @@ func daemonStatfsIsNFS(statfs *unix.Statfs_t) bool {
 		}
 		name = append(name, byte(c))
 	}
-	return string(name) == "nfs"
+	switch string(name) {
+	case "nfs", "smbfs", "afpfs", "webdav", "cifs", "ftp":
+		return string(name)
+	}
+	if statfs.Flags&unix.MNT_LOCAL == 0 {
+		return string(name)
+	}
+	return ""
+}
+
+// daemonUnixPathMax is the size of sockaddr_un.sun_path, terminator included.
+const daemonUnixPathMax = 104
+
+// readHostBootID returns an identifier of the host's current boot.
+func readHostBootID() (string, error) {
+	return unix.Sysctl("kern.bootsessionuuid")
 }
 
 func checkDaemonPeer(conn net.Conn) error {

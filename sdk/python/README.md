@@ -31,7 +31,7 @@ ttc daemon start
 ```python
 from ttcx import Client
 
-ttc = Client()
+ttc = Client("/path/to/ttc-root")
 print(ttc.ping())
 
 ttc.pull("alpine:3.20").check()
@@ -139,10 +139,12 @@ sending them to `ttcd`. Other raw commands that name host files should likewise
 use absolute paths because the daemon does not share the SDK process's current
 working directory.
 
-Set `TTC_SOCKET` or `XDG_RUNTIME_DIR` as for the CLI, or pass
-`Client("/path/to/ttcd.sock")`. SDK clients never need `TTC_ROOT` or
-`TTC_LOCAL_ROOT`. They negotiate the public API/features reported by `ping`;
-the exact-build restriction applies to the official `ttc` binary, not SDKs.
+A client takes the root of the daemon to use explicitly: the `TTC_ROOT` of a
+standalone `ttcd`, or the `TTC_LOCAL_ROOT` of a node of a cluster. It connects
+to `ttcd.sock` there, reads no environment variables, and never accesses the
+daemon's storage. Clients negotiate the public API/features reported by
+`ping`; the exact-build restriction applies to the official `ttc` binary, not
+SDKs.
 
 ## Test
 

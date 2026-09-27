@@ -20,14 +20,14 @@ NAME=${TTC_PUBLICATION_TEST_NAME:-ttc-publication-restart-$$}
 ROOT=${TTC_PUBLICATION_TEST_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/ttc-publication-restart.XXXXXX")}
 SHARED=$ROOT/shared
 LOCAL=$ROOT/local
-SOCKET=$ROOT/run/ttcd.sock
+SOCKET=$LOCAL/ttcd.sock
 PORT=${TTC_PUBLICATION_TEST_PORT:-29983}
 TOKEN=ttc-publication-restart-$NAME
 COMMAND_TIMEOUT=${TTC_E2E_COMMAND_TIMEOUT:-120s}
 KEEP_ROOT=${TTC_PUBLICATION_TEST_KEEP_ROOT:-}
 PID=
 
-client() { TTC_SOCKET=$SOCKET timeout "$COMMAND_TIMEOUT" "$TTC" "$@"; }
+client() { TTC_LOCAL_ROOT=$LOCAL timeout "$COMMAND_TIMEOUT" "$TTC" "$@"; }
 
 stop_session() {
 	pid=$1
@@ -89,12 +89,13 @@ wait_active() {
 	return 1
 }
 
-mkdir -p "$SHARED" "$LOCAL" "$ROOT/run"
-chmod 700 "$ROOT/run"
+mkdir -p "$SHARED"
+# A daemon's root holds its socket, and must be private.
+mkdir -p -m 700 "$LOCAL"
 TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$LOCAL TTC_CLUSTER_TOKEN=$TOKEN \
-	setsid "$TTCD" --socket "$SOCKET" --node node-a --listen "127.0.0.1:$PORT" \
-	--advertise "127.0.0.1:$PORT" --cluster-init --unsafe-no-host-isolation \
-	>"$ROOT/run/ttcd.log" 2>&1 &
+	setsid "$TTCD" --node node-a --listen "127.0.0.1:$PORT" \
+	--advertise "127.0.0.1:$PORT" --unsafe-no-host-isolation \
+	>"$LOCAL/ttcd.log" 2>&1 &
 PID=$!
 attempt=0
 while test "$attempt" -lt 300; do

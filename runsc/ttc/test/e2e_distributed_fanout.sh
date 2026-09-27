@@ -31,8 +31,8 @@ PID_C=
 
 test "$COUNT" -ge 2
 
-socket() { printf '%s/run-%s/ttcd.sock' "$ROOT" "$1"; }
-client() { node=$1; shift; TTC_SOCKET=$(socket "$node") timeout "$COMMAND_TIMEOUT" "$TTC" "$@"; }
+socket() { printf '%s/local-%s/ttcd.sock' "$LOCAL_BASE" "$1"; }
+client() { node=$1; shift; TTC_LOCAL_ROOT=$LOCAL_BASE/local-$node timeout "$COMMAND_TIMEOUT" "$TTC" "$@"; }
 
 stop_session() {
 	pid=$1
@@ -84,7 +84,7 @@ wait_ready() {
 		if client "$node" node ls >/dev/null 2>&1; then return 0; fi
 		sleep 0.05
 	done
-	tail -100 "$ROOT/run-$node/ttcd.log" >&2 || true
+	tail -100 "$LOCAL_BASE/local-$node/ttcd.log" >&2 || true
 	return 1
 }
 
@@ -92,13 +92,13 @@ start_node() {
 	node=$1
 	port=$2
 	shift 2
-	mkdir -p "$LOCAL_BASE/local-$node" "$ROOT/run-$node"
-	chmod 700 "$ROOT/run-$node"
+	# A daemon's root holds its socket, and must be private.
+	mkdir -p -m 700 "$LOCAL_BASE/local-$node"
 	TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$LOCAL_BASE/local-$node TTC_CLUSTER_TOKEN=$TOKEN \
-		setsid "$TTCD" --socket "$(socket "$node")" --node "node-$node" \
+		setsid "$TTCD" --node "node-$node" \
 		--listen "127.0.0.1:$port" --advertise "127.0.0.1:$port" \
 		--memory-target 64GiB --cluster-lease 15s --unsafe-no-host-isolation "$@" \
-		>"$ROOT/run-$node/ttcd.log" 2>&1 &
+		>"$LOCAL_BASE/local-$node/ttcd.log" 2>&1 &
 	eval "PID_$(printf '%s' "$node" | tr '[:lower:]' '[:upper:]')=$!"
 	wait_ready "$node"
 }
@@ -115,9 +115,9 @@ node_branch_count() {
 }
 
 mkdir -p "$ROOT" "$SHARED"
-start_node a "$PORT_A" --cluster-init
-start_node b "$PORT_B" --cluster-join "127.0.0.1:$PORT_A"
-start_node c "$PORT_C" --cluster-join "127.0.0.1:$PORT_A"
+start_node a "$PORT_A"
+start_node b "$PORT_B"
+start_node c "$PORT_C"
 
 for attempt in $(seq 1 300); do
 	test "$(client a node ls --json | jq 'length')" -eq 3 && break
@@ -230,7 +230,7 @@ wait "$PID_A"
 PID_A=
 
 # Cleanly stopping the whole cluster must retain exactly one restart seed, not
-# delete every Raft database. Restart that final voter without --cluster-init;
+# delete every Raft database: the last voter's. Restart that final voter;
 # startup also exercises a fresh shared-reference-ledger reconstruction.
 test -f "$LOCAL_BASE/local-a/cluster/raft/raft.db"
 test ! -f "$LOCAL_BASE/local-b/cluster/raft/raft.db"

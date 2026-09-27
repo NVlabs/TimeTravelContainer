@@ -3224,6 +3224,65 @@ func TestFilesystemSnapshotOriginsIncludesNamedAndPrivateRepositories(t *testing
 	}
 }
 
+func TestFrozenFilesystemOriginsListsEveryRepositorysFreezes(t *testing.T) {
+	localRoot := t.TempDir()
+	manager, err := ttcvolume.OpenManager(localRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idle, err := manager.CreateWithOrigin("idle", 71)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := idle.Close(); err != nil {
+		t.Fatal(err)
+	}
+	handing, err := manager.CreateWithOrigin("handing", 72)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino, err := handing.CreateRegular(ttcvolume.MainBranch, ttcvolume.RootInode, "payload", 0600, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := handing.WriteAt(ttcvolume.MainBranch, ino, []byte("payload"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := handing.ForkWithOrigins(ttcvolume.MainBranch, "peer", 73, 74); err != nil {
+		t.Fatal(err)
+	}
+	shared, err := ttcsnapshot.OpenSharedPackStore(filepath.Join(t.TempDir(), "shared"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handing.PublishOriginHandoff(context.Background(), shared, 72); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handing.FreezeOriginHandoff(72); err != nil {
+		t.Fatal(err)
+	}
+	if err := handing.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store := Store{Root: t.TempDir(), ActiveRoot: localRoot}
+	frozen, err := store.FrozenFilesystemOrigins()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frozen) != 1 || frozen[0] != 72 {
+		t.Fatalf("frozen filesystem origins = %v, want [72]", frozen)
+	}
+	if _, err := store.WithFilesystemSnapshotOrigin(72, func(repository *ttcvolume.Repository) error {
+		return repository.CompleteOriginHandoff(72)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if frozen, err := store.FrozenFilesystemOrigins(); err != nil || len(frozen) != 0 {
+		t.Fatalf("frozen filesystem origins after completion = %v, %v", frozen, err)
+	}
+}
+
 func TestWithFilesystemSnapshotOriginFindsUniqueRepository(t *testing.T) {
 	localRoot := t.TempDir()
 	manager, err := ttcvolume.OpenManager(localRoot)

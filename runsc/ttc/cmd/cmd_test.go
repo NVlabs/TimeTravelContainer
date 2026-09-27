@@ -4441,7 +4441,7 @@ if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "exec-list" ] && [ "$
 	exit 0
 fi
 
-if [ "$3" = "timetravel" ] && [ "$4" = "--console-socket" ] && [ "$6" = "--console-ready-fd" ] && [ "$7" = "3" ] && [ "$8" = "web" ] && [ "$9" = "console-follow-family" ]; then
+if [ "$3" = "timetravel" ] && [ "$4" = "--console-socket" ] && [ "$6" = "--console-lock" ] && [ "$8" = "--console-ready-fd" ] && [ "$9" = "3" ] && [ "${10}" = "web" ] && [ "${11}" = "console-follow-family" ]; then
 	exec env ` + fakeFollowerSocketEnv + `="$5" ` + fakeFollowerMarkerEnv + `="$0.retention" "` + testBinary(t) + `"
 fi
 if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "ps" ] && [ "$6" = "main" ]; then
@@ -4886,6 +4886,73 @@ esac
 	}
 	if _, err := os.Stat(runsc + ".deleted"); err != nil {
 		t.Fatalf("runtime was not force-deleted: %v", err)
+	}
+}
+
+// A sandbox whose container record is gone, such as with the TTC_ROOT that
+// held it, lists by its ID; rm must remove it.
+func TestRemoveSandboxWithoutRecord(t *testing.T) {
+	dir := t.TempDir()
+	exitedID := "2fee32cac1f1" + strings.Repeat("a", 52)
+	runningID := "2fee7a11ce00" + strings.Repeat("b", 52)
+	// A reaped child's PID names no process.
+	child := exec.Command("true")
+	if err := child.Run(); err != nil {
+		t.Fatal(err)
+	}
+	deleted := filepath.Join(dir, "deleted")
+	runsc := filepath.Join(dir, "runsc")
+	script := `#!/bin/sh
+if [ "$1" != "--root" ] || [ "$2" != "/runtime" ]; then
+	echo "unexpected globals: $*" >&2
+	exit 2
+fi
+shift 2
+case "$1 $2 $3" in
+"list --format=json --sandbox")
+	cat <<'EOF'
+[{"id":"` + exitedID + `","pid":` + strconv.Itoa(child.Process.Pid) + `,"status":"stopped"},{"id":"` + runningID + `","pid":` + strconv.Itoa(os.Getpid()) + `,"status":"running"}]
+EOF
+	;;
+"delete --force "*)
+	echo "$3" >>"` + deleted + `"
+	;;
+*)
+	echo "unexpected command: $*" >&2
+	exit 2
+	;;
+esac
+`
+	if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
+		t.Fatalf("writing fake runsc: %v", err)
+	}
+	dataRoot := filepath.Join(dir, "data")
+	if err := os.MkdirAll(filepath.Join(dataRoot, "containers"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: dataRoot}
+
+	if err := b.remove("2fee", false, false); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Errorf("removing by a prefix of both sandboxes: err=%v, want an ambiguous prefix", err)
+	}
+	if err := b.remove(runningID, false, false); err == nil || !strings.Contains(err.Error(), "--force") {
+		t.Errorf("removing a running sandbox without --force: err=%v, want a request for --force", err)
+	}
+	if err := b.remove(exitedID[:12], false, false); err != nil {
+		t.Errorf("removing an exited sandbox by its short ID: %v", err)
+	}
+	if err := b.destroy(selector{container: runningID, branch: defaultBranchID}, true); err != nil {
+		t.Errorf("force-removing a running sandbox's main branch: %v", err)
+	}
+	if err := b.remove("missing", false, false); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("removing a missing container: err=%v, want %v", err, os.ErrNotExist)
+	}
+	got, err := os.ReadFile(deleted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := exitedID + "\n" + runningID + "\n"; string(got) != want {
+		t.Errorf("deleted sandboxes %q, want %q", got, want)
 	}
 }
 

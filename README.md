@@ -76,9 +76,15 @@ immediately without creating a daemon socket.
 
 The native macOS backend requires Apple Silicon and macOS 15.0 or newer. It
 uses baseline Hypervisor.framework APIs, 4 KiB Linux pages over 16 KiB host
-allocation slabs, and does not boot a Linux VM. This first backend is a trusted
-workload mode: it deliberately omits Linux host namespaces, seccomp, and
-cgroups, and therefore makes no macOS host-security-boundary claim.
+allocation slabs, and does not boot a Linux VM. It omits Linux host
+namespaces, seccomp, and cgroups. Instead, `ttcd` confines itself, and every
+Sentry, gofer, and helper it starts, with the macOS sandbox, Seatbelt. The
+confinement keeps all file and network access, which containers and image pulls
+use, but denies devices, USB ones among them, and the system's services beyond
+those every process uses. Like the user namespace of a rootless Linux sandbox,
+it bounds what code execution in TTC reaches of the host; it is no boundary
+around the user's files or the network. `--unsafe-no-host-isolation` starts the
+daemon unconfined, for trusted workloads only.
 
 Use the installer to build, copy, and ad-hoc sign `ttcd` at its final path. It
 defaults to `../bin`; pass a destination directory as its first argument and
@@ -103,12 +109,12 @@ codesign --force --sign - \
   bin/ttcd
 ```
 
-Start the daemon only with the explicit trusted-mode opt-in. `ttcd` checks
-its own Hypervisor.framework entitlement at startup:
+Start the daemon. `ttcd` checks its own Hypervisor.framework entitlement at
+startup:
 
 ```sh
 export TTC_ROOT="$HOME/.local/share/ttc"
-bin/ttc daemon start --unsafe-no-host-isolation
+bin/ttc daemon start
 ```
 
 TTC_ROOT must name a new-format data root; data roots created by earlier TTC
@@ -190,7 +196,7 @@ For example, Python agents can branch a sandbox directly:
 ```python
 from ttcx import Client
 
-ttc = Client()
+ttc = Client("/path/to/ttc-root")
 ttc.fork("agent@main", "candidate").check()
 result = ttc.exec("agent@candidate", ["sh", "-lc", "make test"])
 result.check()
@@ -257,13 +263,15 @@ Host requirements are deliberately small:
 - (Optional) A delegated cgroup v2 subtree only when hard host CPU or memory
   limits are requested.
 
-`TTC_ROOT` is always explicit. In standalone mode it contains all TTC state.
-Cluster nodes use the same shared `TTC_ROOT` and each set a distinct,
-node-local `TTC_LOCAL_ROOT` for active runtimes and caches. `TTC_SOCKET` may
-override the per-user daemon socket; `--daemon-socket` takes precedence for a
-single client invocation. `ttc` owns its help and command grammar locally, so
-help, completion, and version output do not depend on a running daemon. For
-daemon operations, the official client and daemon builds must match exactly.
+`TTC_ROOT` is always explicit and on a local filesystem. In standalone mode it
+contains all of the daemon's files, including its socket, which `ttc` finds
+there. Cluster nodes use the same shared `TTC_ROOT` and each set a distinct,
+node-local `TTC_LOCAL_ROOT` for their daemon's own files, active runtimes, and
+caches; `ttc` finds a node's daemon in its `TTC_LOCAL_ROOT`. `--daemon-socket`
+takes precedence for a single client invocation. `ttc` owns its help and
+command grammar locally, so help, completion, and version output do not depend
+on a running daemon. For daemon operations, the official client and daemon
+builds must match exactly.
 
 ## Current Limitations
 

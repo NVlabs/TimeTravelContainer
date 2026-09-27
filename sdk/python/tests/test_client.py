@@ -20,7 +20,7 @@ import unittest
 from pathlib import Path
 
 from ttcx import Client, CommandFailed, StreamCancelled, TTCError
-from ttcx.client import API_VERSION, default_socket_path
+from ttcx.client import API_VERSION, socket_path
 
 
 def frame(kind: bytes, payload: bytes = b"") -> bytes:
@@ -78,7 +78,7 @@ class ClientTest(unittest.TestCase):
         with __import__("tempfile").TemporaryDirectory() as directory:
             daemon = MockDaemon(Path(directory) / "ttcd.sock", handler)
             try:
-                self.assertEqual(Client(daemon.path).ping()["version"], API_VERSION)
+                self.assertEqual(Client(directory).ping()["version"], API_VERSION)
             finally:
                 daemon.close()
 
@@ -107,7 +107,7 @@ class ClientTest(unittest.TestCase):
         with __import__("tempfile").TemporaryDirectory() as directory:
             daemon = MockDaemon(Path(directory) / "ttcd.sock", handler)
             try:
-                result = Client(daemon.path).command(["exec", "demo@main", "cat"], input=payload)
+                result = Client(directory).command(["exec", "demo@main", "cat"], input=payload)
                 self.assertEqual(result.status, 7)
                 self.assertEqual(result.stdout, b"partial output")
                 with self.assertRaises(CommandFailed):
@@ -115,15 +115,9 @@ class ClientTest(unittest.TestCase):
             finally:
                 daemon.close()
 
-    def test_default_socket_path_precedence(self):
-        self.assertEqual(
-            default_socket_path({"TTC_SOCKET": "/run/a/custom.sock", "XDG_RUNTIME_DIR": "/run/b"}),
-            "/run/a/custom.sock",
-        )
-        self.assertEqual(
-            default_socket_path({"XDG_RUNTIME_DIR": "/run/b"}),
-            "/run/b/ttc/ttcd.sock",
-        )
+    def test_socket_is_in_the_daemon_root(self):
+        self.assertEqual(Client("/data/ttc").socket_path, "/data/ttc/ttcd.sock")
+        self.assertEqual(socket_path("/local/ttc"), "/local/ttc/ttcd.sock")
 
     def test_terminal_observation_frames_preserve_records(self):
         def handler(conn, _request):
@@ -134,7 +128,7 @@ class ClientTest(unittest.TestCase):
         with __import__("tempfile").TemporaryDirectory() as directory:
             daemon = MockDaemon(Path(directory) / "ttcd.sock", handler)
             try:
-                result = Client(daemon.path).command(["tty", "watch", "demo@main", "--session", "repl"])
+                result = Client(directory).command(["tty", "watch", "demo@main", "--session", "repl"])
                 self.assertEqual(
                     result.stdout,
                     b'{"version":1,"output_bytes":4}\n{"version":1,"output_bytes":9}\n',
@@ -161,7 +155,7 @@ class ClientTest(unittest.TestCase):
         with __import__("tempfile").TemporaryDirectory() as directory:
             daemon = MockDaemon(Path(directory) / "ttcd.sock", handler)
             try:
-                result = Client(daemon.path).fork_many(
+                result = Client(directory).fork_many(
                     "demo@main",
                     ["remote@one", "remote@two"],
                     paused=True,
@@ -182,7 +176,7 @@ class ClientTest(unittest.TestCase):
         with __import__("tempfile").TemporaryDirectory() as directory:
             daemon = MockDaemon(Path(directory) / "ttcd.sock", migrate_handler)
             try:
-                self.assertTrue(Client(daemon.path).migrate("demo@main", "node-b").ok)
+                self.assertTrue(Client(directory).migrate("demo@main", "node-b").ok)
             finally:
                 daemon.close()
 
@@ -194,7 +188,7 @@ class ClientTest(unittest.TestCase):
         with __import__("tempfile").TemporaryDirectory() as directory:
             daemon = MockDaemon(Path(directory) / "ttcd.sock", nodes_handler)
             try:
-                self.assertEqual(Client(daemon.path).nodes()[0]["node_id"], "node-a")
+                self.assertEqual(Client(directory).nodes()[0]["node_id"], "node-a")
             finally:
                 daemon.close()
 
@@ -209,7 +203,7 @@ class ClientTest(unittest.TestCase):
             daemon = MockDaemon(Path(directory) / "ttcd.sock", stop_handler)
             try:
                 self.assertTrue(
-                    Client(daemon.path).stop_node("node-a", policy="migrate").ok
+                    Client(directory).stop_node("node-a", policy="migrate").ok
                 )
             finally:
                 daemon.close()
@@ -226,10 +220,10 @@ class ClientTest(unittest.TestCase):
             daemon = MockDaemon(Path(directory) / "ttcd.sock", handler)
             try:
                 self.assertTrue(
-                    Client(daemon.path).wait("demo@main", condition="durable").ok
+                    Client(directory).wait("demo@main", condition="durable").ok
                 )
                 with self.assertRaisesRegex(ValueError, "condition"):
-                    Client(daemon.path).wait("demo@main", condition="invalid")
+                    Client(directory).wait("demo@main", condition="invalid")
             finally:
                 daemon.close()
 
@@ -252,7 +246,7 @@ class ClientTest(unittest.TestCase):
         with __import__("tempfile").TemporaryDirectory() as directory:
             daemon = MockDaemon(Path(directory) / "ttcd.sock", commit_handler)
             try:
-                result = Client(daemon.path).commit(
+                result = Client(directory).commit(
                     "demo@main",
                     "local/result:latest",
                     author="TTC Harness",
@@ -288,7 +282,7 @@ class ClientTest(unittest.TestCase):
         with __import__("tempfile").TemporaryDirectory() as directory:
             daemon = MockDaemon(Path(directory) / "ttcd.sock", load_handler)
             try:
-                result = Client(daemon.path).load(
+                result = Client(directory).load(
                     archive=archive, platform="linux/amd64", quiet=True
                 )
                 self.assertTrue(result.ok)
@@ -304,7 +298,7 @@ class ClientTest(unittest.TestCase):
         with __import__("tempfile").TemporaryDirectory() as directory:
             daemon = MockDaemon(Path(directory) / "ttcd.sock", save_handler)
             try:
-                result = Client(daemon.path).save(
+                result = Client(directory).save(
                     ["one:latest", "two:test"], output="/srv/images.tar"
                 )
                 self.assertTrue(result.ok)
@@ -326,7 +320,7 @@ class ClientTest(unittest.TestCase):
             daemon = MockDaemon(Path(directory) / "ttcd.sock", handler)
             try:
                 self.assertTrue(
-                    Client(daemon.path)
+                    Client(directory)
                     .checkpoint("demo@main", "state.ttc", compression="none")
                     .ok
                 )
@@ -347,7 +341,7 @@ class ClientTest(unittest.TestCase):
             daemon = MockDaemon(Path(directory) / "ttcd.sock", handler)
             try:
                 seen = []
-                stream = Client(daemon.path).watch_tty(
+                stream = Client(directory).watch_tty(
                     "demo@main", "repl", lambda payload: seen.append(json.loads(payload))
                 )
                 self.assertEqual(stream.wait(), 0)
@@ -374,7 +368,7 @@ class ClientTest(unittest.TestCase):
         with __import__("tempfile").TemporaryDirectory() as directory:
             daemon = MockDaemon(Path(directory) / "ttcd.sock", handler)
             try:
-                stream = Client(daemon.path).attach(
+                stream = Client(directory).attach(
                     "demo@main", exec_session="repl", size=(40, 120)
                 )
                 stream.write("echo hi\n")
@@ -403,7 +397,7 @@ class ClientTest(unittest.TestCase):
         with __import__("tempfile").TemporaryDirectory() as directory:
             daemon = MockDaemon(Path(directory) / "ttcd.sock", handler)
             try:
-                stream = Client(daemon.path).stream(
+                stream = Client(directory).stream(
                     ["exec", "demo@main", "cat"], stdin=True
                 )
                 stream.write(payload)
@@ -425,7 +419,7 @@ class ClientTest(unittest.TestCase):
         with __import__("tempfile").TemporaryDirectory() as directory:
             daemon = MockDaemon(Path(directory) / "ttcd.sock", handler)
             try:
-                stream = Client(daemon.path).stream(
+                stream = Client(directory).stream(
                     ["logs", "--follow", "demo@main"],
                     on_stdout=lambda _payload: (_ for _ in ()).throw(callback_error),
                 )
@@ -440,7 +434,7 @@ class ClientTest(unittest.TestCase):
         with __import__("tempfile").TemporaryDirectory() as directory:
             daemon = MockDaemon(Path(directory) / "ttcd.sock", idle)
             try:
-                stream = Client(daemon.path).stream(
+                stream = Client(directory).stream(
                     ["attach", "demo@main"], stdin=True
                 )
                 stream.close_stdin()

@@ -359,16 +359,14 @@ fn settle_stream(
     true
 }
 
-/// Returns ttcd's default per-user socket path.
-pub fn default_socket_path() -> PathBuf {
-    if let Some(path) = env::var_os("TTC_SOCKET") {
-        return PathBuf::from(path);
-    }
-    if let Some(path) = env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(path).join("ttc").join("ttcd.sock");
-    }
-    let uid = unsafe { libc::geteuid() };
-    env::temp_dir().join(format!("ttc-{uid}")).join("ttcd.sock")
+/// The name of a daemon's socket in its root.
+pub const SOCKET_NAME: &str = "ttcd.sock";
+
+/// Returns the socket of the ttcd whose root is `root`. A daemon's root, the
+/// TTC_ROOT of a standalone ttcd or the TTC_LOCAL_ROOT of a node of a
+/// cluster, identifies it.
+pub fn socket_path(root: impl AsRef<Path>) -> PathBuf {
+    root.as_ref().join(SOCKET_NAME)
 }
 
 #[derive(Clone, Debug)]
@@ -377,16 +375,11 @@ pub struct Client {
     timeout: Duration,
 }
 
-impl Default for Client {
-    fn default() -> Self {
-        Self::new(default_socket_path())
-    }
-}
-
 impl Client {
-    pub fn new(socket_path: impl Into<PathBuf>) -> Self {
+    /// Returns a client of the ttcd whose root is `root`.
+    pub fn new(root: impl AsRef<Path>) -> Self {
         Self {
-            socket_path: socket_path.into(),
+            socket_path: socket_path(root),
             timeout: Duration::from_secs(30),
         }
     }
@@ -1212,14 +1205,27 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::thread;
 
+    // macOS's temporary directory is long: keep the socket's path within the
+    // limit of a Unix socket address.
     fn temporary_socket(name: &str) -> PathBuf {
         let path = env::temp_dir().join(format!(
-            "ttcx-rust-{}-{}-{name}",
-            std::process::id(),
-            random_request_id().unwrap()
+            "ttcx-{}-{name}",
+            &random_request_id().unwrap()[..8]
         ));
         fs::create_dir(&path).unwrap();
         path.join("ttcd.sock")
+    }
+
+    #[test]
+    fn socket_is_in_the_daemon_root() {
+        assert_eq!(
+            socket_path("/data/ttc"),
+            PathBuf::from("/data/ttc/ttcd.sock")
+        );
+        assert_eq!(
+            Client::new("/local/ttc").socket_path(),
+            Path::new("/local/ttc/ttcd.sock")
+        );
     }
 
     fn mock_server<F>(path: &Path, handler: F) -> thread::JoinHandle<()>
@@ -1247,7 +1253,10 @@ mod tests {
             write_frame(&mut stream, b'O', br#"{"version":9}"#).unwrap();
             write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
         });
-        assert_eq!(Client::new(&path).ping().unwrap()["version"], API_VERSION);
+        assert_eq!(
+            Client::new(path.parent().unwrap()).ping().unwrap()["version"],
+            API_VERSION
+        );
         server.join().unwrap();
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
@@ -1260,7 +1269,7 @@ mod tests {
             write_frame(&mut stream, b'S', br#"{"version":1,"output_bytes":9}"#).unwrap();
             write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
         });
-        let result = Client::new(&path)
+        let result = Client::new(path.parent().unwrap())
             .command(["tty", "watch", "demo@main", "--session", "repl"])
             .unwrap();
         assert_eq!(
@@ -1281,7 +1290,7 @@ mod tests {
             );
             write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
         });
-        assert!(Client::new(&path)
+        assert!(Client::new(path.parent().unwrap())
             .wait_for("demo@main", "durable")
             .unwrap()
             .ok());
@@ -1301,7 +1310,9 @@ mod tests {
             write_frame(&mut stream, b'S', br#"{"output_bytes":2}"#).unwrap();
             write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
         });
-        let stream = Client::new(&path).watch_tty("demo@main", "repl").unwrap();
+        let stream = Client::new(path.parent().unwrap())
+            .watch_tty("demo@main", "repl")
+            .unwrap();
         assert_eq!(
             stream.recv().unwrap(),
             StreamEvent::Observation(br#"{"output_bytes":1}"#.to_vec())
@@ -1332,7 +1343,7 @@ mod tests {
             write_frame(&mut socket, b'A', &(payload.len() as u32).to_be_bytes()).unwrap();
             write_frame(&mut socket, b'X', &0u32.to_be_bytes()).unwrap();
         });
-        let stream = Client::new(&path)
+        let stream = Client::new(path.parent().unwrap())
             .attach("demo@main", Some("repl"), true, false, (40, 120))
             .unwrap();
         stream.write(b"echo hi\n").unwrap();
@@ -1361,7 +1372,7 @@ mod tests {
             assert_eq!(received, server_expected);
             write_frame(&mut socket, b'X', &0u32.to_be_bytes()).unwrap();
         });
-        let stream = Client::new(&path)
+        let stream = Client::new(path.parent().unwrap())
             .stream(
                 ["exec", "demo@main", "cat"],
                 StreamOptions {
@@ -1385,7 +1396,7 @@ mod tests {
             let mut byte = [0u8; 1];
             let _ = socket.read(&mut byte);
         });
-        let stream = Client::new(&path)
+        let stream = Client::new(path.parent().unwrap())
             .stream(
                 ["attach", "demo@main"],
                 StreamOptions {
@@ -1428,7 +1439,7 @@ mod tests {
             write_frame(&mut stream, b'E', b"failed\n").unwrap();
             write_frame(&mut stream, b'X', &11u32.to_be_bytes()).unwrap();
         });
-        let result = Client::new(&path)
+        let result = Client::new(path.parent().unwrap())
             .command_with_options(
                 ["exec", "demo@main", "cat"],
                 CommandOptions {
@@ -1462,7 +1473,7 @@ mod tests {
             );
             write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
         });
-        let result = Client::new(&path)
+        let result = Client::new(path.parent().unwrap())
             .fork_many(
                 "demo@main",
                 &["remote@one", "remote@two"],
@@ -1485,7 +1496,9 @@ mod tests {
             );
             write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
         });
-        let result = Client::new(&path).migrate("demo@main", "node-b").unwrap();
+        let result = Client::new(path.parent().unwrap())
+            .migrate("demo@main", "node-b")
+            .unwrap();
         assert!(result.ok());
         server.join().unwrap();
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
@@ -1501,7 +1514,7 @@ mod tests {
             );
             write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
         });
-        let result = Client::new(&path)
+        let result = Client::new(path.parent().unwrap())
             .stop_node("node-a", Some("migrate"))
             .unwrap();
         assert!(result.ok());
@@ -1535,7 +1548,7 @@ mod tests {
             );
             write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
         });
-        let result = Client::new(&path)
+        let result = Client::new(path.parent().unwrap())
             .commit(
                 "demo@main",
                 "local/result:latest",
@@ -1571,7 +1584,7 @@ mod tests {
             assert_eq!(received, b"image archive");
             write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
         });
-        let result = Client::new(&path)
+        let result = Client::new(path.parent().unwrap())
             .load(ImageLoadOptions {
                 archive: Some(b"image archive".to_vec()),
                 platform: Some("linux/amd64".to_owned()),
@@ -1597,7 +1610,7 @@ mod tests {
             );
             write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
         });
-        let result = Client::new(&path)
+        let result = Client::new(path.parent().unwrap())
             .save(
                 &["one:latest", "two:test"],
                 ImageSaveOptions {
@@ -1628,7 +1641,7 @@ mod tests {
             );
             write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
         });
-        let result = Client::new(&path)
+        let result = Client::new(path.parent().unwrap())
             .checkpoint("demo@main", "state.ttc", "none")
             .unwrap();
         assert!(result.ok());

@@ -164,10 +164,11 @@ whole-file materialization, and branch-local filesystem divergence after both
 handoffs. `TTC_DISTRIBUTED_TEST_PORT_A` and
 `TTC_DISTRIBUTED_TEST_PORT_B` select its host listener ports.
 
-`e2e_distributed_source_loss.sh` starts a three-voter cluster, retains a large
-demand-paged memory dependency on node A, then destroys node A before the
-target becomes independent. The surviving quorum must stop and permanently
-mark only the dependent branch `corrupted`; an unrelated branch on node C must
+`e2e_distributed_source_loss.sh` starts a three-node cluster, retains a large
+demand-paged memory dependency on node A, then destroys node A, which holds the
+cluster's authority, before the target becomes independent. The surviving
+nodes must take the authority over, stop and permanently mark only the
+dependent branch `corrupted`; an unrelated branch on node C must
 remain executable. The test also verifies that removal is still available for
 the corrupted branch and reaps every process in the failed node's private test
 root.
@@ -209,6 +210,10 @@ namespaces or chroots. Guest namespaces,
 credentials, procfs, mounts, and filesystem CoW remain implemented by the
 Sentry, but this mode removes host-side defense in depth and must not be used
 for untrusted containers.
+
+macOS has no user namespaces, and needs neither probe nor opt-in: without
+`TTC_UNSAFE_NO_HOST_ISOLATION=1`, the harness's `ttcd` confines itself and its
+Sentries with the macOS sandbox, Seatbelt, as `ttcd` on macOS does by default.
 
 Build and invoke the matrix with:
 
@@ -289,10 +294,11 @@ TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
   "$PWD/runsc/ttc/test/e2e_terminal.sh"
 ```
 
-Omit `TTC_UNSAFE_NO_HOST_ISOLATION=1` on a host where `unshare -Ur /bin/true`
-succeeds. The test uses util-linux `script` and `timeout` on Linux; on macOS it
-uses BSD `script` and Perl as the timeout fallback. Set `TTC_E2E_ROOT` to retain
-terminal transcripts, console logs, and runtime state.
+Omit `TTC_UNSAFE_NO_HOST_ISOLATION=1` on macOS, and on a Linux host where
+`unshare -Ur /bin/true` succeeds. The test uses util-linux `script` and
+`timeout` on Linux; on macOS it uses BSD `script` and Perl as the timeout
+fallback. Set `TTC_E2E_ROOT` to retain terminal transcripts, console logs, and
+runtime state.
 
 ## Docker main-container compatibility
 

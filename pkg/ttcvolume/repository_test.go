@@ -1734,6 +1734,49 @@ func TestOriginHandoffUsesRepositoryWriterFence(t *testing.T) {
 	}
 }
 
+// A frozen handoff is listed until it completes, so that a restarted daemon
+// finds it to complete.
+func TestFrozenOriginHandoffsAreListedUntilComplete(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.CreateWithOrigin("frozen-list", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	ino, err := repository.CreateRegular(MainBranch, RootInode, "payload", 0600, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repository.WriteAt(MainBranch, ino, []byte("payload"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ForkWithOrigins(MainBranch, "peer", 101, 102); err != nil {
+		t.Fatal(err)
+	}
+	shared, err := ttcsnapshot.OpenSharedPackStore(filepath.Join(t.TempDir(), "shared"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.PublishOriginHandoff(context.Background(), shared, 100); err != nil {
+		t.Fatal(err)
+	}
+	if frozen := repository.FrozenOriginHandoffs(); len(frozen) != 0 || repository.OriginHandoffFrozen(100) {
+		t.Fatalf("frozen handoffs before the freeze = %v", frozen)
+	}
+	if _, err := repository.FreezeOriginHandoff(100); err != nil {
+		t.Fatal(err)
+	}
+	if frozen := repository.FrozenOriginHandoffs(); len(frozen) != 1 || frozen[0] != 100 || !repository.OriginHandoffFrozen(100) {
+		t.Fatalf("frozen handoffs = %v, want [100]", frozen)
+	}
+	if err := repository.CompleteOriginHandoff(100); err != nil {
+		t.Fatal(err)
+	}
+	if frozen := repository.FrozenOriginHandoffs(); len(frozen) != 0 || repository.OriginHandoffFrozen(100) {
+		t.Fatalf("frozen handoffs after completion = %v", frozen)
+	}
+}
+
 // A fork that a frozen handoff refuses must leave the source as it was. It
 // used to publish the source's new file object, keep only a construction pin
 // on it and fail; the next process to open the repository took the pin for a

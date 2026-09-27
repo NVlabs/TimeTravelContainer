@@ -2,14 +2,15 @@
 
 `ttc` owns command grammar, help, completion, terminal forwarding, and the
 versioned Unix-socket framing. It does not import daemon execution, image,
-bundle, storage, or Sentry packages. `ttcd` alone interprets `TTC_ROOT` and
-`TTC_LOCAL_ROOT`, owns runtimes and storage, and contains internal copy and
-detached-auto-remove helpers.
+bundle, storage, or Sentry packages. A daemon's root, `TTC_ROOT` or on a node
+of a cluster `TTC_LOCAL_ROOT`, identifies it: `ttc` uses the root only to find
+the daemon's socket, `ttcd.sock` there, and to open the daemon's startup log,
+`ttcd.log`. `ttcd` alone interprets the roots, owns runtimes and storage, and
+contains internal copy and detached-auto-remove helpers.
 
-This boundary also applies to `ttc daemon start`: the client verifies and
-launches its exact-build sibling but does not inspect current or legacy root
-environment variables. `ttcd` validates them before creating runtime or
-storage state.
+`ttc daemon start` verifies and launches its exact-build sibling with the
+socket of the root. `ttcd` validates the roots, including that the socket is
+theirs, before creating runtime or storage state.
 
 The official CLI includes its build ID on daemon requests. A mismatch rejects
 every operation except the minimal `daemon stop` escape hatch. SDKs and MCP
@@ -32,6 +33,6 @@ The split removes 93.26% of the client binary (14.84x smaller). A Bazel
 on its local client package, TTC version metadata, the Go standard library,
 and terminal support.
 
-The end-to-end scripts stage matching `ttc` and `ttcd` siblings, export an
-explicit `TTC_ROOT`, and give the client only a daemon socket. This catches an
-accidental reintroduction of root or runtime forwarding.
+The end-to-end scripts stage matching `ttc` and `ttcd` siblings and export an
+explicit `TTC_ROOT`, and `TTC_LOCAL_ROOT` for a node of a cluster, which both
+the client and the daemon use.

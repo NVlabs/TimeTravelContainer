@@ -7,9 +7,8 @@
 #
 #     https://www.apache.org/licenses/LICENSE-2.0
 
-# Qualifies sequential recovery of a fully stopped multi-voter cluster. The
-# first persistent member must remain alive in an explicit quorum-wait state so
-# an operator can start the second member from the same shell.
+# Qualifies recovery of a whole cluster whose daemons crashed together. Every
+# node starts alike: both restart at once, as the jobs of a batch system would.
 set -eu
 
 TTC=${TTC:-ttc}
@@ -21,8 +20,8 @@ PORT_B=${TTC_CLUSTER_RESTART_PORT_B:-23593}
 TOKEN=ttc-cluster-restart-$NAME
 KEEP_ROOT=${TTC_CLUSTER_RESTART_KEEP_ROOT:-}
 
-socket() { printf '%s/run-%s/ttcd.sock' "$ROOT" "$1"; }
-client() { node=$1; shift; TTC_SOCKET=$(socket "$node") timeout 120s "$TTC" "$@"; }
+socket() { printf '%s/local-%s/ttcd.sock' "$ROOT" "$1"; }
+client() { node=$1; shift; TTC_LOCAL_ROOT=$ROOT/local-$node timeout 120s "$TTC" "$@"; }
 read_counter() {
 	client a exec "$NAME@main" sh -c \
 		'while :; do value=$(cat /counter); case "$value" in ""|*[!0-9]*) sleep 0.01 ;; *) printf "%s\n" "$value"; break ;; esac; done'
@@ -33,7 +32,7 @@ start_node() {
 	port=$2
 	shift 2
 	TTC_ROOT=$ROOT/shared TTC_LOCAL_ROOT=$ROOT/local-$node TTC_CLUSTER_TOKEN=$TOKEN \
-		TTC_SOCKET=$(socket "$node") timeout 60s "$TTC" daemon start \
+		timeout 60s "$TTC" daemon start \
 			--node "node-$node" --listen "127.0.0.1:$port" \
 			--advertise "127.0.0.1:$port" --memory-target 8GiB \
 			--unsafe-no-host-isolation "$@"
@@ -65,13 +64,21 @@ wait_ready() {
 }
 
 restart_cluster() {
-	# Neither start waits for full admission. Both processes remain fenced until
-	# their persistent Raft group elects a leader and commits registration.
-	start_a=$(start_node a "$PORT_A" --cluster-init)
-	printf '%s\n' "$start_a" | grep -q 'waiting for cluster quorum'
-	client a daemon status | jq -e '.state == "starting" and .waiting_for_cluster_quorum == true' >/dev/null
-	start_b=$(start_node b "$PORT_B" --cluster-join "127.0.0.1:$PORT_A")
-	printf '%s\n' "$start_b" | grep -q 'waiting for cluster quorum'
+	# A restarting daemon admits itself only once it reaches every node whose
+	# lease is still active, the other crashed one among them: start both at
+	# once. One takes the authority over, once the crashed holder's counter in
+	# the shared root has stood still.
+	start_node a "$PORT_A" >"$ROOT/start-a.out" 2>&1 &
+	start_a=$!
+	start_node b "$PORT_B" >"$ROOT/start-b.out" 2>&1 &
+	start_b=$!
+	status=0
+	wait "$start_a" || status=$?
+	wait "$start_b" || status=$?
+	if test "$status" -ne 0; then
+		cat "$ROOT/start-a.out" "$ROOT/start-b.out" >&2
+		return "$status"
+	fi
 	wait_ready
 }
 
@@ -92,10 +99,11 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-mkdir -p "$ROOT/shared" "$ROOT/local-a" "$ROOT/local-b" "$ROOT/run-a" "$ROOT/run-b"
-chmod 700 "$ROOT/run-a" "$ROOT/run-b"
-start_node a "$PORT_A" --cluster-init >/dev/null
-start_node b "$PORT_B" --cluster-join "127.0.0.1:$PORT_A" >/dev/null
+mkdir -p "$ROOT/shared"
+# A daemon's root holds its socket, and must be private.
+mkdir -p -m 700 "$ROOT/local-a" "$ROOT/local-b"
+start_node a "$PORT_A" >/dev/null
+start_node b "$PORT_B" >/dev/null
 
 client a pull "$IMAGE" >/dev/null
 client a run -d --node node-a --name "$NAME" --shm-size 64m "$IMAGE" sh -c \

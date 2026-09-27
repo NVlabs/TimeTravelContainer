@@ -1319,7 +1319,7 @@ func (p *branchPublisher) publishVolatileGraphOrigin(ctx context.Context, snapsh
 	ledgerFrozen := false
 	defer func() {
 		if retErr != nil && ledgerFrozen {
-			_ = p.graph.UnfreezeSnapshotLedger(snapshot)
+			p.rollForwardFrozenOrigin(snapshot)
 		}
 	}()
 	if _, _, err := p.graph.FreezeSnapshotLedger(snapshot); err != nil {
@@ -1371,6 +1371,117 @@ func (p *branchPublisher) BeginCompletion(abandon func() bool) (func(), bool) {
 		return func() {}, true
 	}
 	return p.peers.beginBackgroundSnapshotWorkUnless(abandon)
+}
+
+// rollForwardFrozenOrigin completes, in the background, the handoff of
+// snapshot, whose reference ledger a failed or interrupted handoff left
+// frozen, retrying until it completes. The handoff cannot be canceled: its
+// pack's manifest, which no retry replaces, holds the baseline that its
+// recorded mutations follow, and a new handoff would freeze another. At most
+// one roll-forward runs for an origin.
+func (p *branchPublisher) rollForwardFrozenOrigin(snapshot ttcsnapshot.SnapshotID) {
+	if p == nil || p.peers == nil || p.graph == nil || snapshot == 0 {
+		return
+	}
+	if _, running := p.peers.rollingForward.LoadOrStore(snapshot, struct{}{}); running {
+		return
+	}
+	go func() {
+		defer p.peers.rollingForward.Delete(snapshot)
+		for delay := time.Second; p.graph.SnapshotLedgerFrozen(snapshot); delay = min(2*delay, 30*time.Second) {
+			err := p.resumeFrozenGraphOrigin(context.Background(), snapshot)
+			if err == nil || errors.Is(err, errFrozenOriginOwned) {
+				return
+			}
+			fmt.Fprintf(os.Stderr, "ttcd: completing the frozen handoff of snapshot origin %d: %v\n", snapshot, err)
+			time.Sleep(delay)
+		}
+	}()
+}
+
+// errFrozenOriginOwned reports a frozen origin whose handoff belongs to a
+// branch publication, which the publication queue resumes.
+var errFrozenOriginOwned = errors.New("snapshot origin handoff belongs to a branch publication")
+
+// resumeFrozenGraphOrigin rolls forward the handoff of snapshot, an origin of
+// this node's that a crash left frozen at its final barrier. The shared
+// coordinator may already hold the handoff's baseline, so the handoff cannot be
+// canceled; and until it completes, the freeze refuses every new reference to
+// the origin, as a fork or a graph handoff's capture makes. Every step is
+// idempotent, and one that fails leaves the freeze for the next attempt.
+func (p *branchPublisher) resumeFrozenGraphOrigin(ctx context.Context, snapshot ttcsnapshot.SnapshotID) error {
+	if p == nil || snapshot == 0 || p.graph == nil || p.graphShared == nil || p.authority == nil ||
+		p.sharedRefs == nil || p.peers == nil {
+		return errors.New("distributed graph publication is unavailable")
+	}
+	unlock := p.peers.lockSnapshotOrigin(snapshot)
+	defer unlock()
+	if !p.graph.SnapshotLedgerFrozen(snapshot) {
+		return nil
+	}
+	// Only the exact retry of the operation that recorded a bridge may reuse
+	// it. Without one recorded yet, the handoff proceeds as the origin's own.
+	bridgeIntent, found, err := loadSharedPublicationBridgeIntent(p.sharedRoot, snapshot)
+	if err != nil {
+		return err
+	}
+	if !found {
+		bridgeIntent = sharedPublicationBridgeIntent{Kind: sharedPublicationBridgeOrigin}
+	} else if bridgeIntent.Kind == sharedPublicationBridgePublication {
+		return errFrozenOriginOwned
+	}
+	provider, volatile, err := p.authority.SnapshotProvider(uint64(snapshot))
+	if errors.Is(err, os.ErrNotExist) {
+		// The origin was abandoned or retired: no handoff of it completes, and
+		// no shared ledger counts its references any more.
+		return p.graph.UnfreezeSnapshotLedger(snapshot)
+	}
+	if err != nil {
+		return err
+	}
+	if volatile && provider.NodeID != p.nodeID {
+		return fmt.Errorf("snapshot origin %d is frozen here but provided by node %q", snapshot, provider.NodeID)
+	}
+	if _, err := p.graphShared.Manifest(snapshot); err != nil {
+		return fmt.Errorf("reading frozen snapshot origin %d manifest: %w", snapshot, err)
+	}
+	finishHandoff := p.peers.beginBackgroundSnapshotWork()
+	defer finishHandoff()
+	if volatile {
+		changes, _, frozen, err := p.graph.SnapshotLedgerHandoffChanges(snapshot, 0)
+		if err != nil {
+			return err
+		}
+		if !frozen {
+			return fmt.Errorf("snapshot origin %d reference handoff did not freeze", snapshot)
+		}
+		if err := retryGraphReferenceMutation(func(context.Context) error {
+			return p.publishSharedReferenceLedger(snapshot, changes, bridgeIntent)
+		}); err != nil {
+			return fmt.Errorf("transferring snapshot origin %d reference authority: %w", snapshot, err)
+		}
+		if err := p.authority.PublishSnapshotOrigin(p.nodeID, p.incarnation, uint64(snapshot)); err != nil {
+			return fmt.Errorf("publishing snapshot origin %d authority: %w", snapshot, err)
+		}
+	}
+	if record, ok := p.graph.Snapshot(snapshot); ok && record.State == ttcsnapshot.SnapshotSealedVolatile {
+		if err := p.graph.MarkShared(snapshot); err != nil {
+			return err
+		}
+	}
+	if err := p.graph.UnfreezeSnapshotLedger(snapshot); err != nil {
+		return err
+	}
+	// A graph handoff's bridge lasts until its transaction ends, when the
+	// shared coordinator releases it. The origin's own ends here.
+	if bridgeIntent.Kind == sharedPublicationBridgeOrigin {
+		if err := retryGraphReferenceMutation(func(context.Context) error {
+			return p.releaseSharedPublicationBridge(snapshot)
+		}); err != nil {
+			return fmt.Errorf("releasing snapshot origin %d publication bridge: %w", snapshot, err)
+		}
+	}
+	return releasePublishedProviderGraphRoots(p.graph, p.graphData, snapshot)
 }
 
 func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.Result) error {

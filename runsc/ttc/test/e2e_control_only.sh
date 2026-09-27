@@ -25,8 +25,8 @@ fail() {
 	exit 1
 }
 
-socket() { printf '%s/run-%s/ttcd.sock' "$ROOT" "$1"; }
-client() { node=$1; shift; TTC_SOCKET=$(socket "$node") timeout 120s "$TTC" "$@"; }
+socket() { printf '%s/local-%s/ttcd.sock' "$ROOT" "$1"; }
+client() { node=$1; shift; TTC_LOCAL_ROOT=$ROOT/local-$node timeout 120s "$TTC" "$@"; }
 
 stop_session() {
 	pid=$1
@@ -77,13 +77,14 @@ start_compute() {
 	node=$1
 	port=$2
 	shift 2
-	mkdir -p "$ROOT/shared" "$ROOT/local-$node" "$ROOT/run-$node"
-	chmod 700 "$ROOT/run-$node"
+	mkdir -p "$ROOT/shared"
+	# A daemon's root holds its socket, and must be private.
+	mkdir -p -m 700 "$ROOT/local-$node"
 	TTC_ROOT=$ROOT/shared TTC_LOCAL_ROOT=$ROOT/local-$node TTC_CLUSTER_TOKEN=$TOKEN \
-		setsid "$TTCD" --socket "$(socket "$node")" --node "node-$node" \
+		setsid "$TTCD" --node "node-$node" \
 		--listen "127.0.0.1:$port" --advertise "127.0.0.1:$port" \
 		--memory-target 8GiB --unsafe-no-host-isolation "$@" \
-		>"$ROOT/run-$node/ttcd.log" 2>&1 &
+		>"$ROOT/local-$node/ttcd.log" 2>&1 &
 	eval "PID_$(printf '%s' "$node" | tr '[:lower:]' '[:upper:]')=$!"
 	wait_ready "$node"
 }
@@ -96,21 +97,19 @@ branch_owner() {
 
 test -x "$TTC" || fail "TTC is not executable: $TTC"
 test -x "$TTCD" || fail "TTCD is not executable: $TTCD"
-mkdir -p "$ROOT/run-control"
-chmod 700 "$ROOT/run-control"
+mkdir -p -m 700 "$ROOT/local-control"
 
-start_compute a "$PORT_A" --cluster-init
-start_compute b "$PORT_B" --cluster-join "127.0.0.1:$PORT_A"
+start_compute a "$PORT_A"
+start_compute b "$PORT_B"
 for _ in $(seq 1 300); do
 	test "$(client a node ls --json 2>/dev/null | jq 'length' 2>/dev/null || echo 0)" -eq 2 && break
 	sleep 0.05
 done
 test "$(client a node ls --json | jq 'length')" -eq 2 || fail "compute nodes did not converge"
 
-TTC_ROOT=$ROOT/shared TTC_CLUSTER_TOKEN=$TOKEN \
-	setsid "$TTCD" --socket "$(socket control)" --control-only \
-	--cluster-join "127.0.0.1:$PORT_A" --cluster-join "127.0.0.1:$PORT_B" \
-	>"$ROOT/run-control/ttcd.log" 2>&1 &
+TTC_ROOT=$ROOT/shared TTC_LOCAL_ROOT=$ROOT/local-control TTC_CLUSTER_TOKEN=$TOKEN \
+	setsid "$TTCD" --control-only \
+	>"$ROOT/local-control/ttcd.log" 2>&1 &
 PID_CONTROL=$!
 wait_ready control
 client control daemon status | jq -e '.control_only == true' >/dev/null
@@ -130,7 +129,7 @@ test "$(client control ls --json | jq --arg family "$NAME" \
 	'[.[] | select(.name == $family) | .branches[]] | length')" -eq 2 ||
 	fail "private migration branch leaked into inventory"
 
-# The listener is created on the compute seed selected by the gateway. It must
+# The listener is created on the compute node the gateway selected. It must
 # route to the remote owner and continue routing after ownership moves.
 binding=127.0.0.1:$HOST_PORT:8080
 client control port publish "$NAME@main" "$binding" >/dev/null

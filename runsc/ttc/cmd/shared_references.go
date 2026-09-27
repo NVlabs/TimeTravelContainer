@@ -130,7 +130,7 @@ func persistSharedPublicationBridgeIntentWithAuthority(sharedRoot string, intent
 			// terminality can fence a concurrent attempt, so only its exact retry
 			// may reuse the intent. Transaction and branch-publication owners are
 			// safely replaceable only after Raft says they are terminal.
-			if state == nil || current.Kind == sharedPublicationBridgeOrigin || publicationBridgeIntentNeeded(state, current) {
+			if publicationBridgeOwnerLive(state, current) {
 				return fmt.Errorf("snapshot %d publication bridge is owned by a different operation", intent.Snapshot)
 			}
 			return writeDurableJSON(path, intent)
@@ -156,6 +156,29 @@ func removeSharedPublicationBridgeIntent(sharedRoot string, snapshot ttcsnapshot
 	}
 	syncErr := directory.Sync()
 	return errors.Join(syncErr, directory.Close())
+}
+
+// loadSharedPublicationBridgeIntent returns the bridge intent recorded for
+// snapshot, if there is one.
+func loadSharedPublicationBridgeIntent(sharedRoot string, snapshot ttcsnapshot.SnapshotID) (sharedPublicationBridgeIntent, bool, error) {
+	data, err := os.ReadFile(sharedPublicationBridgeIntentPath(sharedRoot, snapshot))
+	if errors.Is(err, os.ErrNotExist) {
+		return sharedPublicationBridgeIntent{}, false, nil
+	}
+	if err != nil {
+		return sharedPublicationBridgeIntent{}, false, err
+	}
+	var intent sharedPublicationBridgeIntent
+	if err := json.Unmarshal(data, &intent); err != nil {
+		return sharedPublicationBridgeIntent{}, false, fmt.Errorf("decoding snapshot %d publication bridge intent: %w", snapshot, err)
+	}
+	if err := intent.validate(); err != nil {
+		return sharedPublicationBridgeIntent{}, false, err
+	}
+	if intent.Snapshot != uint64(snapshot) {
+		return sharedPublicationBridgeIntent{}, false, fmt.Errorf("snapshot %d publication bridge intent names snapshot %d", snapshot, intent.Snapshot)
+	}
+	return intent, true, nil
 }
 
 func loadSharedPublicationBridgeIntents(sharedRoot string) ([]sharedPublicationBridgeIntent, error) {
@@ -208,6 +231,24 @@ func publicationBridgeIntentNeeded(state *cluster.AuthorityState, intent sharedP
 	if state.AbandonedOrigins[intent.Snapshot] {
 		return false
 	}
+	if intent.Kind == sharedPublicationBridgeOrigin {
+		// Origin handoff is performed only after a branch/transfer reference has
+		// already been retained. A rebuild obtains that replacement from node
+		// inventories, so the temporary bridge must not be resurrected.
+		return false
+	}
+	return publicationBridgeOwnerLive(state, intent)
+}
+
+// publicationBridgeOwnerLive reports whether the operation that recorded a
+// bridge may still resume it, which only Raft's record of that operation
+// decides: whether the origin is still volatile does not, as the owner records
+// its bridge before it publishes the origin. An origin handoff has no such
+// record, so its owner is always taken as live.
+func publicationBridgeOwnerLive(state *cluster.AuthorityState, intent sharedPublicationBridgeIntent) bool {
+	if state == nil {
+		return true
+	}
 	switch intent.Kind {
 	case sharedPublicationBridgeTransaction:
 		tx, ok := state.Transactions[intent.Transaction]
@@ -218,11 +259,6 @@ func publicationBridgeIntentNeeded(state *cluster.AuthorityState, intent sharedP
 				return publication.State == cluster.PublicationPreparing || publication.State == cluster.PublicationReady
 			}
 		}
-		return false
-	case sharedPublicationBridgeOrigin:
-		// Origin handoff is performed only after a branch/transfer reference has
-		// already been retained. A rebuild obtains that replacement from node
-		// inventories, so the temporary bridge must not be resurrected.
 		return false
 	default:
 		return true

@@ -16,12 +16,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
+	"gvisor.dev/gvisor/runsc/processutil"
 	"gvisor.dev/gvisor/runsc/ttc/protocol"
 	"gvisor.dev/gvisor/runsc/version"
 )
@@ -57,7 +59,7 @@ func TestQuorumWaitDaemonLifecycle(t *testing.T) {
 	if copyErr != nil || closeErr != nil {
 		t.Fatal(errors.Join(copyErr, closeErr))
 	}
-	command := exec.Command(daemon, "-test.run=TestQuorumWaitHelperProcess", "--", "--socket", socket)
+	command := exec.Command(daemon, "-test.run=TestQuorumWaitHelperProcess")
 	command.Env = append(os.Environ(), "TTC_TEST_QUORUM_WAIT_HELPER=1")
 	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := command.Start(); err != nil {
@@ -68,8 +70,24 @@ func TestQuorumWaitDaemonLifecycle(t *testing.T) {
 		_, _ = command.Process.Wait()
 	}()
 
-	waiting := protocol.DaemonQuorumWait{PID: command.Process.Pid, APIVersion: daemonAPIVersion, BuildID: version.Version()}
+	started, err := processutil.StartTime(command.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A marker of a process that is gone, whose PID another took.
+	waiting := protocol.DaemonQuorumWait{PID: command.Process.Pid, StartTime: started + "0", APIVersion: daemonAPIVersion, BuildID: version.Version()}
 	data, err := json.Marshal(waiting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(protocol.DaemonQuorumWaitPath(socket), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := quorumWaitDaemon(socket); ok {
+		t.Fatalf("quorumWaitDaemon accepted the marker %+v of a process that started at another time", got)
+	}
+	waiting.StartTime = started
+	data, err = json.Marshal(waiting)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +109,9 @@ func TestQuorumWaitDaemonLifecycle(t *testing.T) {
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if status := Run([]string{"--daemon-socket", socket, "daemon", "start"}, strings.NewReader(""), &stdout, &stderr); status != 1 || !strings.Contains(stderr.String(), "does not match") {
+	t.Setenv("TTC_ROOT", directory)
+	t.Setenv("TTC_LOCAL_ROOT", "")
+	if status := Run([]string{"daemon", "start"}, strings.NewReader(""), &stdout, &stderr); status != 1 || !strings.Contains(stderr.String(), "does not match") {
 		t.Fatalf("mismatched start=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
 	}
 	stdout.Reset()
@@ -120,8 +140,10 @@ func TestTerminateStartedDaemonKillsStartupSession(t *testing.T) {
 }
 
 func TestHelpAndCompletionAreOffline(t *testing.T) {
-	socket := filepath.Join(t.TempDir(), "absent.sock")
-	t.Setenv("TTC_SOCKET", socket)
+	root := t.TempDir()
+	socket := protocol.DaemonSocket(root)
+	t.Setenv("TTC_ROOT", root)
+	t.Setenv("TTC_LOCAL_ROOT", "")
 	for _, args := range [][]string{{"--help"}, {"run", "--help"}, {"completion", "bash"}} {
 		var stdout, stderr bytes.Buffer
 		if status := Run(args, strings.NewReader(""), &stdout, &stderr); status != 0 || stdout.Len() == 0 || stderr.Len() != 0 {
@@ -146,13 +168,15 @@ func TestHelpRejectsUnknownCommands(t *testing.T) {
 }
 
 func TestDetailedHelpIsClientLocal(t *testing.T) {
-	t.Setenv("TTC_SOCKET", filepath.Join(t.TempDir(), "absent.sock"))
+	// Help needs no daemon, nor a root to find one by.
+	t.Setenv("TTC_ROOT", "")
+	t.Setenv("TTC_LOCAL_ROOT", "")
 	tests := []struct {
 		args []string
 		want []string
 	}{
 		{[]string{"daemon", "--help"}, []string{"Usage: ttc daemon COMMAND", "Commands:", "request inspect ID"}},
-		{[]string{"daemon", "start", "--help"}, []string{"Usage: ttc daemon start", "TTC_ROOT", "--cluster-init", "--control-only", "512MiB/8GiB", "default: 30s", "does not advertise a TCP endpoint"}},
+		{[]string{"daemon", "start", "--help"}, []string{"Usage: ttc daemon start", "TTC_ROOT", "starts alike", "--control-only", "512MiB/8GiB", "default: 30s", "does not advertise a TCP endpoint"}},
 		{[]string{"help", "daemon", "stop"}, []string{"Usage: ttc daemon stop", "build mismatches"}},
 		{[]string{"image", "--help"}, []string{"Manage Docker/OCI images", "load [OPTIONS]", "rm [OPTIONS]"}},
 		{[]string{"exec", "--help"}, []string{"named detached session", "--session NAME", "--process FILE"}},
@@ -186,14 +210,30 @@ func TestClientRejectsRemovedRootAndDirectOptions(t *testing.T) {
 	}
 }
 
-func TestTTCSocketAndOverride(t *testing.T) {
-	t.Setenv("TTC_SOCKET", "/tmp/from-env.sock")
-	if got := defaultSocket(); got != "/tmp/from-env.sock" {
-		t.Fatalf("defaultSocket=%q", got)
-	}
-	opts, rest, done, err := parseGlobal([]string{"--daemon-socket", "/tmp/from-flag.sock", "ps"}, os.Stdout)
-	if err != nil || done || opts.socket != "/tmp/from-flag.sock" || len(rest) != 1 || rest[0] != "ps" {
-		t.Fatalf("parseGlobal=(%+v, %q, %t, %v)", opts, rest, done, err)
+func TestDaemonSocketIsInItsRoot(t *testing.T) {
+	root := t.TempDir()
+	for _, test := range []struct {
+		name  string
+		env   map[string]string
+		args  []string
+		want  string
+		wantS int
+	}{
+		{name: "standalone", env: map[string]string{"TTC_ROOT": root}, args: []string{"ps"}, want: protocol.DaemonSocket(root), wantS: 1},
+		{name: "cluster node", env: map[string]string{"TTC_ROOT": "/shared", "TTC_LOCAL_ROOT": filepath.Join(root, "local")}, args: []string{"ps"}, want: protocol.DaemonSocket(filepath.Join(root, "local")), wantS: 1},
+		{name: "override", env: map[string]string{"TTC_ROOT": root}, args: []string{"--daemon-socket", filepath.Join(root, "other.sock"), "ps"}, want: filepath.Join(root, "other.sock"), wantS: 1},
+		{name: "unset", env: map[string]string{}, args: []string{"ps"}, want: "TTC_ROOT is not set", wantS: 2},
+		{name: "override of daemon start", env: map[string]string{"TTC_ROOT": root}, args: []string{"--daemon-socket", filepath.Join(root, "other.sock"), "daemon", "start"}, want: "does not apply to daemon start", wantS: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for _, name := range []string{"TTC_ROOT", "TTC_LOCAL_ROOT"} {
+				t.Setenv(name, test.env[name])
+			}
+			var stdout, stderr bytes.Buffer
+			if status := Run(test.args, strings.NewReader(""), &stdout, &stderr); status != test.wantS || !strings.Contains(stderr.String(), test.want) {
+				t.Fatalf("Run(%q): status=%d stderr=%q, want status %d and %q", test.args, status, stderr.String(), test.wantS, test.want)
+			}
+		})
 	}
 }
 
@@ -470,5 +510,21 @@ func TestNormalizeEnvironmentImports(t *testing.T) {
 		if got := normalizeEnvironmentImports(test.args); !reflect.DeepEqual(got, test.want) {
 			t.Errorf("normalizeEnvironmentImports(%q)=%q, want %q", test.args, got, test.want)
 		}
+	}
+}
+
+func TestExplainDaemonExecFailure(t *testing.T) {
+	killed := exec.Command("/bin/sh", "-c", "kill -KILL $$").Run()
+	explained := explainDaemonExecFailure("/nonexistent/ttcd", killed)
+	if runtime.GOOS == "darwin" {
+		if !strings.Contains(explained.Error(), "code signature") || !strings.Contains(explained.Error(), "codesign --force") {
+			t.Errorf("killed ttcd explained as %q, want its code signature and how to sign it", explained)
+		}
+	} else if explained != killed {
+		t.Errorf("killed ttcd explained as %q, want %q", explained, killed)
+	}
+	failed := exec.Command("/bin/sh", "-c", "exit 3").Run()
+	if got := explainDaemonExecFailure("/nonexistent/ttcd", failed); got != failed {
+		t.Errorf("failed ttcd explained as %q, want %q", got, failed)
 	}
 }

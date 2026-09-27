@@ -25,7 +25,7 @@ import {
   CommandFailed,
   StreamCancelled,
   TTCError,
-  defaultSocketPath,
+  daemonSocketPath,
 } from "../src/index.js";
 
 function frame(kind: string, payload: Buffer = Buffer.alloc(0)): Buffer {
@@ -38,7 +38,7 @@ function frame(kind: string, payload: Buffer = Buffer.alloc(0)): Buffer {
 
 async function withServer(
   handler: (socket: Socket, request: Record<string, unknown>, rest: Buffer) => void,
-  run: (path: string) => Promise<void>,
+  run: (root: string) => Promise<void>,
 ): Promise<void> {
   const directory = await mkdtemp(join(tmpdir(), "ttcx-ts-"));
   const path = join(directory, "ttcd.sock");
@@ -59,7 +59,7 @@ async function withServer(
     server.listen(path, resolve);
   });
   try {
-    await run(path);
+    await run(directory);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await rm(directory, { recursive: true, force: true });
@@ -73,8 +73,8 @@ test("ping uses the direct protocol", async () => {
       socket.write(frame("O", Buffer.from('{"version":9}\n')));
       socket.end(frame("X", Buffer.from([0, 0, 0, 0])));
     },
-    async (path) => {
-      assert.equal((await new Client(path).ping()).version, API_VERSION);
+    async (root) => {
+      assert.equal((await new Client(root).ping()).version, API_VERSION);
     },
   );
 });
@@ -114,8 +114,8 @@ test("command streams flow-controlled stdin and preserves status", async () => {
       socket.on("data", consume);
       consume();
     },
-    async (path) => {
-      const result = await new Client(path).command(["exec", "demo@main", "cat"], { input });
+    async (root) => {
+      const result = await new Client(root).command(["exec", "demo@main", "cat"], { input });
       assert.equal(result.status, 9);
       assert.equal(result.stderrText(), "failed\n");
       assert.throws(() => result.check(), CommandFailed);
@@ -123,12 +123,9 @@ test("command streams flow-controlled stdin and preserves status", async () => {
   );
 });
 
-test("default socket environment precedence", () => {
-  assert.equal(
-    defaultSocketPath({ TTC_SOCKET: "/run/a/custom.sock", XDG_RUNTIME_DIR: "/run/b" }),
-    "/run/a/custom.sock",
-  );
-  assert.equal(defaultSocketPath({ XDG_RUNTIME_DIR: "/run/b" }), "/run/b/ttc/ttcd.sock");
+test("socket is in the daemon root", () => {
+  assert.equal(daemonSocketPath("/data/ttc"), "/data/ttc/ttcd.sock");
+  assert.equal(new Client({ root: "/local/ttc" }).socketPath, "/local/ttc/ttcd.sock");
 });
 
 test("terminal observation frames preserve records", async () => {
@@ -138,8 +135,8 @@ test("terminal observation frames preserve records", async () => {
       socket.write(frame("S", Buffer.from('{"version":1,"output_bytes":9}')));
       socket.end(frame("X", Buffer.from([0, 0, 0, 0])));
     },
-    async (path) => {
-      const result = await new Client(path).command([
+    async (root) => {
+      const result = await new Client(root).command([
         "tty", "watch", "demo@main", "--session", "repl",
       ]);
       assert.equal(
@@ -164,8 +161,8 @@ test("batch remote fork uses the current CLI shape", async () => {
       ]);
       socket.end(frame("X", Buffer.alloc(4)));
     },
-    async (path) => {
-      const result = await new Client(path).forkMany(
+    async (root) => {
+      const result = await new Client(root).forkMany(
         "demo@main",
         ["remote@one", "remote@two"],
         { paused: true, node: "node-b" },
@@ -181,8 +178,8 @@ test("elastic cluster helpers use the current CLI shape", async () => {
       assert.deepEqual(request.args, ["migrate", "--node", "node-b", "demo@main"]);
       socket.end(frame("X", Buffer.alloc(4)));
     },
-    async (path) => {
-      assert.equal((await new Client(path).migrate("demo@main", "node-b")).ok, true);
+    async (root) => {
+      assert.equal((await new Client(root).migrate("demo@main", "node-b")).ok, true);
     },
   );
   await withServer(
@@ -191,8 +188,8 @@ test("elastic cluster helpers use the current CLI shape", async () => {
       socket.write(frame("O", Buffer.from('[{"node_id":"node-a","state":"ready"}]\n')));
       socket.end(frame("X", Buffer.alloc(4)));
     },
-    async (path) => {
-      const nodes = await new Client(path).nodes<Array<{ node_id: string }>>();
+    async (root) => {
+      const nodes = await new Client(root).nodes<Array<{ node_id: string }>>();
       assert.equal(nodes[0]?.node_id, "node-a");
     },
   );
@@ -203,8 +200,8 @@ test("elastic cluster helpers use the current CLI shape", async () => {
       ]);
       socket.end(frame("X", Buffer.alloc(4)));
     },
-    async (path) => {
-      assert.equal((await new Client(path).stopNode("node-a", "migrate")).ok, true);
+    async (root) => {
+      assert.equal((await new Client(root).stopNode("node-a", "migrate")).ok, true);
     },
   );
 });
@@ -217,8 +214,8 @@ test("durable wait uses the current CLI shape", async () => {
       ]);
       socket.end(frame("X", Buffer.alloc(4)));
     },
-    async (path) => {
-      assert.equal((await new Client(path).wait(
+    async (root) => {
+      assert.equal((await new Client(root).wait(
         "demo@main", { condition: "durable" },
       )).ok, true);
     },
@@ -241,8 +238,8 @@ test("image helpers use Docker-compatible command shapes", async () => {
       ]);
       socket.end(frame("X", Buffer.alloc(4)));
     },
-    async (path) => {
-      const result = await new Client(path).commit("demo@main", "local/result:latest", {
+    async (root) => {
+      const result = await new Client(root).commit("demo@main", "local/result:latest", {
         author: "TTC Harness",
         message: "prepared",
         changes: ["LABEL timetravel.usage=review"],
@@ -282,8 +279,8 @@ test("image helpers use Docker-compatible command shapes", async () => {
       socket.on("data", consume);
       consume();
     },
-    async (path) => {
-      const result = await new Client(path).load({
+    async (root) => {
+      const result = await new Client(root).load({
         archive,
         platform: "linux/amd64",
         quiet: true,
@@ -299,8 +296,8 @@ test("image helpers use Docker-compatible command shapes", async () => {
       ]);
       socket.end(frame("X", Buffer.alloc(4)));
     },
-    async (path) => {
-      const result = await new Client(path).save(["one:latest", "two:test"], {
+    async (root) => {
+      const result = await new Client(root).save(["one:latest", "two:test"], {
         output: "/srv/images.tar",
       });
       assert.equal(result.ok, true);
@@ -320,8 +317,8 @@ test("checkpoint normalizes the daemon-host path", async () => {
       assert.equal((request.args as string[])[4], resolve("state.ttc"));
       socket.end(frame("X", Buffer.alloc(4)));
     },
-    async (path) => {
-      const result = await new Client(path).checkpoint("demo@main", "state.ttc", "none");
+    async (root) => {
+      const result = await new Client(root).checkpoint("demo@main", "state.ttc", "none");
       assert.equal(result.ok, true);
     },
   );
@@ -336,9 +333,9 @@ test("stream delivers observations as whole objects and reports status", async (
       socket.write(frame("S", Buffer.from('{"version":1,"output_bytes":2}')));
       socket.end(frame("X", Buffer.from([0, 0, 0, 0])));
     },
-    async (path) => {
+    async (root) => {
       const seen: number[] = [];
-      const stream = new Client(path).watchTty("demo@main", "repl", {
+      const stream = new Client(root).watchTty("demo@main", "repl", {
         onObservation: (payload) => seen.push(JSON.parse(payload.toString()).output_bytes),
       });
       assert.equal(await stream.exited, 0);
@@ -381,8 +378,8 @@ test("attach announces a terminal size before sending stdin", async () => {
       socket.on("data", consume);
       consume();
     },
-    async (path) => {
-      const stream = new Client(path).attach("demo@main", {
+    async (root) => {
+      const stream = new Client(root).attach("demo@main", {
         exec: "repl",
         size: { rows: 40, cols: 120 },
       });
@@ -416,8 +413,8 @@ test("stream never closes stdin implicitly", async () => {
         socket.end(frame("X", Buffer.from([0, 0, 0, 0])));
       }, 60);
     },
-    async (path) => {
-      const stream = new Client(path).stream(["attach", "demo@main"], { stdin: true });
+    async (root) => {
+      const stream = new Client(root).stream(["attach", "demo@main"], { stdin: true });
       stream.write("still open\n");
       assert.equal(await stream.exited, 0);
     },
@@ -441,8 +438,8 @@ test("an immediate resize remains behind the request header", async () => {
       socket.on("data", consume);
       consume();
     },
-    async (path) => {
-      const stream = new Client(path).stream(["attach", "demo@main"]);
+    async (root) => {
+      const stream = new Client(root).stream(["attach", "demo@main"]);
       stream.resize(55, 132);
       assert.equal(await stream.exited, 0);
     },
@@ -452,9 +449,9 @@ test("an immediate resize remains behind the request header", async () => {
 test("callback failures reject exited instead of escaping EventEmitter", async () => {
   await withServer(
     (socket) => socket.write(frame("O", Buffer.from("output"))),
-    async (path) => {
+    async (root) => {
       const expected = new Error("handler failed");
-      const stream = new Client(path).stream(["logs", "--follow", "demo@main"], {
+      const stream = new Client(root).stream(["logs", "--follow", "demo@main"], {
         onStdout: () => {
           throw expected;
         },
@@ -467,8 +464,8 @@ test("callback failures reject exited instead of escaping EventEmitter", async (
 test("local close is cancellation and closeStdin rejects later writes", async () => {
   await withServer(
     () => {},
-    async (path) => {
-      const stream = new Client(path).stream(["attach", "demo@main"], { stdin: true });
+    async (root) => {
+      const stream = new Client(root).stream(["attach", "demo@main"], { stdin: true });
       stream.closeStdin();
       assert.throws(() => stream.write("late"), TTCError);
       stream.close();

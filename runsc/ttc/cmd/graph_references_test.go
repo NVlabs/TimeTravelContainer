@@ -212,6 +212,25 @@ func TestGraphReferenceIdentitySurvivesProviderPublication(t *testing.T) {
 	}
 }
 
+// A handoff retried after its branch's rename names the branch by its new
+// name, and must resume the intent it recorded under the old one.
+func TestGraphReferenceIdentitySurvivesRename(t *testing.T) {
+	recorded := graphReferenceIntent{
+		Version: graphReferenceIntentVersion, Transaction: "tx", Operation: "handoff-tx-0000000000000001",
+		Purpose: graphReferencePurposeBranch, Container: "family", Branch: "remote1",
+		Groups: []graphReferenceGroup{{Origin: 1, Roots: []cluster.SnapshotRootBinding{{Slot: 0, Object: "0000000000000001-03-0000000000000001"}}}},
+	}
+	retry := recorded
+	retry.Branch = "renamed"
+	if !graphReferenceIntentEqualIdentity(recorded, retry) {
+		t.Fatal("a retry after the branch's rename was refused its own intent")
+	}
+	retry.Container = "other-family"
+	if graphReferenceIntentEqualIdentity(recorded, retry) {
+		t.Fatal("another family's operation reused the intent's identity")
+	}
+}
+
 func TestGraphReferenceTransferLifetimeFollowsTransaction(t *testing.T) {
 	intent := graphReferenceIntent{Purpose: graphReferencePurposeTransfer, State: "active"}
 	for _, state := range []cluster.TransactionState{cluster.TransactionPreparing, cluster.TransactionTargetPaused, cluster.TransactionPublished, cluster.TransactionDraining, cluster.TransactionFailed} {
@@ -535,6 +554,98 @@ func TestGraphReferenceIntentCrashPrefixes(t *testing.T) {
 				t.Fatalf("released providers=%+v", released)
 			}
 		})
+	}
+}
+
+// testGraphOriginPublisher returns a publisher of a new graph, and the
+// graph's one origin, sealed and rooted. The publisher's authority has no Raft
+// node, which the tests using it never reach.
+func testGraphOriginPublisher(t *testing.T) (*branchPublisher, ttcsnapshot.SnapshotID) {
+	t.Helper()
+	graph, err := ttcsnapshot.Open(filepath.Join(t.TempDir(), "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { graph.Close() })
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := graph.CreateObject(origin, "build/child", ttcsnapshot.ObjectKindFile, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.SetRoot("branch/main", child); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.DeletePin("build/child"); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Seal(origin, ttcsnapshot.SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	return &branchPublisher{
+		sharedRoot: t.TempDir(), nodeID: "node-a", incarnation: "boot-a",
+		authority: &cluster.RaftCatalog{}, graph: graph, graphShared: &ttcsnapshot.SharedPackStore{},
+		sharedRefs: &sharedReferenceService{}, peers: &distributedSourceRuntime{},
+	}, origin
+}
+
+// freezeForBranchPublication freezes origin's ledger as a branch publication
+// does, and records the publication's bridge.
+func freezeForBranchPublication(t *testing.T, publisher *branchPublisher, origin ttcsnapshot.SnapshotID) {
+	t.Helper()
+	if _, _, err := publisher.graph.FreezeSnapshotLedger(origin); err != nil {
+		t.Fatal(err)
+	}
+	if err := persistSharedPublicationBridgeIntent(publisher.sharedRoot, sharedPublicationBridgeIntent{
+		Version: sharedPublicationBridgeIntentVersion, Snapshot: uint64(origin), Kind: sharedPublicationBridgePublication,
+		Family: "family", Branch: "main", PublicationID: "publication", CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestResumeFrozenGraphOriginLeavesABranchPublicationItsOwn(t *testing.T) {
+	publisher, origin := testGraphOriginPublisher(t)
+	if err := publisher.resumeFrozenGraphOrigin(context.Background(), origin); err != nil {
+		t.Fatalf("resuming an origin that is not frozen: %v", err)
+	}
+	freezeForBranchPublication(t, publisher, origin)
+	if err := publisher.resumeFrozenGraphOrigin(context.Background(), origin); !errors.Is(err, errFrozenOriginOwned) {
+		t.Fatalf("resuming a branch publication's origin = %v, want %v", err, errFrozenOriginOwned)
+	}
+	if !publisher.graph.SnapshotLedgerFrozen(origin) {
+		t.Fatal("the resume released a branch publication's freeze")
+	}
+}
+
+// One roll-forward at a time completes an origin's frozen handoff, and it
+// ends once the handoff is not its to complete.
+func TestFrozenOriginRollsForwardOnce(t *testing.T) {
+	publisher, origin := testGraphOriginPublisher(t)
+	freezeForBranchPublication(t, publisher, origin)
+	// Holding the origin keeps the first roll-forward waiting.
+	unlock := publisher.peers.lockSnapshotOrigin(origin)
+	publisher.rollForwardFrozenOrigin(origin)
+	publisher.rollForwardFrozenOrigin(origin)
+	if _, running := publisher.peers.rollingForward.Load(origin); !running {
+		unlock()
+		t.Fatal("no roll-forward is running")
+	}
+	unlock()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, running := publisher.peers.rollingForward.Load(origin); !running {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the roll-forward of a branch publication's origin did not end")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !publisher.graph.SnapshotLedgerFrozen(origin) {
+		t.Fatal("the roll-forward released a branch publication's freeze")
 	}
 }
 

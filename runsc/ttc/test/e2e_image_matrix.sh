@@ -45,7 +45,9 @@ container_id_valid() {
 [ -x "$TTC" ] || fail "TTC is not executable: $TTC"
 [ -n "$TTCD" ] || fail "set TTCD to the matching ttcd binary"
 [ -x "$TTCD" ] || fail "TTCD is not executable: $TTCD"
-if [ "$TTC_UNSAFE_NO_HOST_ISOLATION" != 1 ]; then
+# Rootless Linux sandboxes need user namespaces; macOS confines ttcd with
+# Seatbelt instead.
+if [ "$TTC_UNSAFE_NO_HOST_ISOLATION" != 1 ] && [ "$(uname -s)" = Linux ]; then
   command -v unshare >/dev/null 2>&1 || fail "unshare is required for the rootless prerequisite probe"
   if ! unshare -Ur /bin/true >/dev/null 2>&1; then
     fail "rootless UID/GID mapping is unavailable; enable unprivileged user namespaces or set TTC_UNSAFE_NO_HOST_ISOLATION=1 for trusted workloads"
@@ -60,13 +62,15 @@ fi
 
 owned_root=false
 if [ -z "$TTC_E2E_ROOT" ]; then
-  TTC_E2E_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/ttc-e2e.XXXXXX")
+  # macOS gives TMPDIR a trailing slash; a doubled one would differ from
+  # the cleaned paths TTC reports.
+  tmp=${TMPDIR:-/tmp}
+  TTC_E2E_ROOT=$(mktemp -d "${tmp%/}/ttc-e2e.XXXXXX")
   owned_root=true
 else
   mkdir -p "$TTC_E2E_ROOT"
 fi
 DATA_ROOT="$TTC_E2E_ROOT/data"
-DAEMON_SOCKET="$TTC_E2E_ROOT/ttcd.sock"
 BIN_DIR="$TTC_E2E_ROOT/bin"
 mkdir -p "$BIN_DIR"
 install -m 0755 "$(readlink -f "$TTC")" "$BIN_DIR/ttc"
@@ -79,6 +83,9 @@ if [ "$(uname -s)" = Darwin ]; then
     "$BIN_DIR/ttcd" >/dev/null
 fi
 TTC="$BIN_DIR/ttc"
+# The client finds the daemon through TTC_ROOT, which a node's TTC_LOCAL_ROOT
+# would override.
+unset TTC_LOCAL_ROOT
 export TTC_ROOT="$DATA_ROOT"
 HOST_FIXTURE="$TTC_E2E_ROOT/host-fixture"
 HOST_FIXTURE_TWO="$TTC_E2E_ROOT/host-fixture-two"
@@ -116,7 +123,7 @@ PUBLISHED_PORT=$((20000 + (($$ + 2000) % 30000)))
 CHILD_PUBLISHED_PORT=$((20000 + (($$ + 3000) % 30000)))
 NAT_FIXTURE_PID=
 ttc() {
-  "$TTC" --daemon-socket "$DAEMON_SOCKET" "$@"
+  "$TTC" "$@"
 }
 
 ttc_daemon_start() {

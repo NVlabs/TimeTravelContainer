@@ -48,11 +48,21 @@ type familyFollowerClient struct {
 	gone    chan struct{}
 }
 
+// familyFollowerSocket returns the socket of the console follower of the
+// family whose console directory is dir: in the run directory of the daemon
+// this process runs for, if any, and otherwise in dir.
+func familyFollowerSocket(dir string) string {
+	if run := daemonRunDir(); run != "" {
+		return filepath.Join(run, daemonRunSocketName("f", dir))
+	}
+	return filepath.Join(dir, ttcconsole.FollowerSocketName)
+}
+
 // dialFamilyFollower connects to the console follower of the family whose
 // console directory is dir. The follower's Done notices go to done, and lost
 // runs once the connection ends.
 func dialFamilyFollower(dir string, done func(lock string), lost func(*familyFollowerClient)) (*familyFollowerClient, error) {
-	address, closeDir, err := ttcconsole.SocketAddress(filepath.Join(dir, ttcconsole.FollowerSocketName))
+	address, closeDir, err := ttcconsole.SocketAddress(familyFollowerSocket(dir))
 	if err != nil {
 		return nil, err
 	}

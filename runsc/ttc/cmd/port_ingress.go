@@ -591,10 +591,9 @@ func (b *runtimeBackend) openGuestPortStream(ctx context.Context, target selecto
 	if state != "running" && state != "paused" {
 		return nil, fmt.Errorf("branch %q is %s", resolved.branch, state)
 	}
-	// Unix socket paths are limited to roughly 108 bytes on Linux. TTC roots
-	// are commonly long NFS/Lustre paths, so keep this short-lived rendezvous
-	// socket in the host temporary directory rather than below TTC_LOCAL_ROOT.
-	file, err := os.CreateTemp("", "ttc-port-stream-")
+	// Keep this short-lived rendezvous socket with the daemon's other sockets,
+	// whose short names fit the Unix socket path limit.
+	file, err := os.CreateTemp(daemonRunDir(), "p")
 	if err != nil {
 		return nil, err
 	}

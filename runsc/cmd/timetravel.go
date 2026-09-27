@@ -67,6 +67,7 @@ type TimeTravel struct {
 	consoleYPixels                int
 	consoleReadyFD                int
 	consoleSocket                 string
+	consoleLock                   string
 	checkpointImagePath           string
 	checkpointCompression         CheckpointCompression
 	dehydrationFD                 int
@@ -161,6 +162,7 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&t.consoleYPixels, "y-pixels", 0, "terminal window height in pixels for console-resize")
 	f.IntVar(&t.consoleReadyFD, "console-ready-fd", -1, "internal FD signaled once console-follow-family listens")
 	f.StringVar(&t.consoleSocket, "console-socket", "", "host path of the socket console-follow-family serves ttcd on")
+	f.StringVar(&t.consoleLock, "console-lock", "", "host path of the lock console-follow-family holds for its family (default: beside --console-socket)")
 	f.StringVar(&t.checkpointImagePath, "image-path", "", "directory path for branch checkpoint state")
 	f.Var(newCheckpointCompressionValue(statefile.CompressionLevelDefault, &t.checkpointCompression), "compression", "checkpoint compression: none or flate-best-speed")
 	f.IntVar(&t.dehydrationFD, "dehydration-fd", -1, "inherited file for durable dehydration metadata")
@@ -802,7 +804,7 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		if t.consoleReadyFD >= 0 {
 			ready = os.NewFile(uintptr(t.consoleReadyFD), "console-ready")
 		}
-		err = runFamilyConsoleFollower(cont.Sandbox, cont.ID, t.consoleSocket, ready)
+		err = runFamilyConsoleFollower(cont.Sandbox, cont.ID, t.consoleSocket, t.consoleLock, ready)
 	default:
 		f.Usage()
 		return subcommands.ExitUsageError

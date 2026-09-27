@@ -16,7 +16,60 @@
 
 package cmd
 
-import "testing"
+import (
+	"bytes"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"gvisor.dev/gvisor/runsc/ttc/seatbelt"
+)
+
+func init() {
+	// No test confines the test process itself; TestDaemonConfinesItself
+	// checks what a daemon applies.
+	applySeatbelt = func(string) error { return nil }
+}
+
+func TestDaemonConfinesItself(t *testing.T) {
+	original := applySeatbelt
+	t.Cleanup(func() { applySeatbelt = original })
+	var applied []string
+	applySeatbelt = func(profile string) error {
+		applied = append(applied, profile)
+		return nil
+	}
+	if err := enterDaemonHostIsolation(true); err != nil || len(applied) != 0 {
+		t.Fatalf("daemon without host isolation: err=%v, applied %d profiles, want none", err, len(applied))
+	}
+	if err := enterDaemonHostIsolation(false); err != nil || len(applied) != 1 || applied[0] != seatbelt.DaemonProfile {
+		t.Fatalf("daemon: err=%v, applied %d profiles, want seatbelt.DaemonProfile", err, len(applied))
+	}
+	if got := daemonIsolationMode(false); got != "seatbelt" {
+		t.Errorf("daemonIsolationMode(false) = %q, want seatbelt", got)
+	}
+	// runsc has no host isolation of its own on macOS: the daemon's confines
+	// it.
+	server := &daemonServer{root: "/r"}
+	if opts := server.optionsFromRequest(); !opts.unsafeNoHostIsolation {
+		t.Error("a daemon with host isolation runs runsc with isolation of runsc's own, which macOS lacks")
+	}
+
+	// A daemon that cannot confine itself serves nothing, and touches no root.
+	applySeatbelt = func(string) error { return errors.New("Operation not permitted") }
+	root := shortDaemonTestRoot(t)
+	t.Setenv("TTC_ROOT", root)
+	t.Setenv("TTC_LOCAL_ROOT", "")
+	var stdout, stderr bytes.Buffer
+	if status := RunDaemon(nil, &stdout, &stderr); status != 1 || !strings.Contains(stderr.String(), "--unsafe-no-host-isolation") {
+		t.Fatalf("daemon that cannot confine itself: status=%d stderr=%q", status, stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(root, ".ttc-root-format")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("daemon that cannot confine itself prepared its root: %v", err)
+	}
+}
 
 func TestDarwinHostCompatibilityDoesNotApplyLinuxGSOFallback(t *testing.T) {
 	compatibility, err := evaluateCurrentHostCompatibility("24.6.0")

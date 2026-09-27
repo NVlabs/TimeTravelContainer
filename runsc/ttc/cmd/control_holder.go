@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
+	"gvisor.dev/gvisor/runsc/ttc/protocol"
 )
 
 // A login node's gateway relays commands to the cluster's compute daemons.
@@ -68,7 +69,15 @@ type controlHolder struct {
 	ended   bool
 }
 
-func (h *controlHolder) socket() string { return filepath.Join(h.dir, "ttcd.sock") }
+// controlHolderDir returns the directory of the holder of the gateway whose
+// root is root.
+func controlHolderDir(root string) string { return filepath.Join(root, "holder") }
+
+// controlHolderRoot returns the root of the holder, a daemon, whose directory
+// is dir.
+func controlHolderRoot(dir string) string { return filepath.Join(dir, "local") }
+
+func (h *controlHolder) socket() string { return protocol.DaemonSocket(controlHolderRoot(h.dir)) }
 
 // running reports whether the holder's process runs.
 func (h *controlHolder) running() bool {
@@ -132,7 +141,7 @@ func (h *controlHolder) consider(members map[string]cluster.MemberRecord, livene
 // start starts the holder, afresh: it keeps nothing of its own between runs,
 // but for what the gateway saw of the cluster's counters.
 func (h *controlHolder) start(stillness []cluster.Stillness) error {
-	local := filepath.Join(h.dir, "local")
+	local := controlHolderRoot(h.dir)
 	if err := os.RemoveAll(local); err != nil {
 		return err
 	}

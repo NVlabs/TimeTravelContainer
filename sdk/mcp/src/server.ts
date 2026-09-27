@@ -38,7 +38,7 @@ function jsonResponse(value: unknown): ToolResponse {
   };
 }
 
-export function createServer(client = new Client()): McpServer {
+export function createServer(client: Client): McpServer {
   const server = new McpServer(
     { name: "ttcx-mcp", version: "0.1.0" },
     {

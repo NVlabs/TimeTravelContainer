@@ -29,7 +29,10 @@ const DaemonAPIVersion = 10
 // DaemonQuorumWait is the bounded pre-admission status published by a daemon
 // that has opened its persistent Raft transport but cannot yet regain quorum.
 type DaemonQuorumWait struct {
-	PID        int    `json:"pid"`
+	PID int `json:"pid"`
+	// StartTime is when the process PID names started, which tells the
+	// daemon apart from a process that reused its PID.
+	StartTime  string `json:"start_time"`
 	APIVersion int    `json:"api_version"`
 	BuildID    string `json:"build_id"`
 }

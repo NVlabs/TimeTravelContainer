@@ -197,6 +197,104 @@ func TestSharedPackHandoffUsesDurableBaseline(t *testing.T) {
 	}
 }
 
+// A handoff retried after a failure resumes where the failure left it,
+// frozen: the pack's manifest, which the retry does not replace, holds the
+// baseline that the handoff's recorded mutations follow, and the receiver,
+// importing both, counts exactly the provider's references. Canceling the
+// handoff instead loses its mutations, as the retry freezes a new baseline
+// that the manifest does not hold; so publishers never cancel a handoff once
+// its pack exists.
+func TestSharedPackHandoffRetryResumesTheFrozenHandoff(t *testing.T) {
+	for _, cancel := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cancel=%t", cancel), func(t *testing.T) {
+			directory := t.TempDir()
+			graph, err := Open(filepath.Join(directory, "graph"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer graph.Close()
+			local, err := OpenLocalDataStore(filepath.Join(directory, "local"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			shared, err := OpenSharedPackStore(filepath.Join(directory, "shared"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			origin, err := graph.AllocateWorking()
+			if err != nil {
+				t.Fatal(err)
+			}
+			object, err := graph.CreateObject(origin, "publish/root", ObjectKindMetadata, []byte("metadata"), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := graph.SetRoot("branch/main", object); err != nil {
+				t.Fatal(err)
+			}
+			if err := graph.DeletePin("publish/root"); err != nil {
+				t.Fatal(err)
+			}
+			if err := graph.Seal(origin, SnapshotSealedVolatile); err != nil {
+				t.Fatal(err)
+			}
+			// The first attempt writes the pack, records a mutation, freezes,
+			// and fails.
+			if err := shared.PublishHandoff(context.Background(), graph, origin, local); err != nil {
+				t.Fatal(err)
+			}
+			if err := graph.SetRoot("branch/fork", object); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := graph.FreezeSnapshotLedger(origin); err != nil {
+				t.Fatal(err)
+			}
+			if cancel {
+				if err := graph.UnfreezeSnapshotLedger(origin); err != nil {
+					t.Fatal(err)
+				}
+				if err := graph.DeleteRoot("branch/main"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// The retry, and its receiver.
+			if err := shared.PublishHandoff(context.Background(), graph, origin, local); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := graph.FreezeSnapshotLedger(origin); err != nil {
+				t.Fatal(err)
+			}
+			changes, _, frozen, err := graph.SnapshotLedgerHandoffChanges(origin, 0)
+			if err != nil || !frozen {
+				t.Fatalf("retried handoff changes: frozen=%t err=%v", frozen, err)
+			}
+			manifest, err := shared.Manifest(origin)
+			if err != nil {
+				t.Fatal(err)
+			}
+			objects := make([]Object, len(manifest.Objects))
+			for index, packed := range manifest.Objects {
+				objects[index] = packed.Object
+			}
+			receiver := NewReferenceLedger()
+			if err := receiver.ImportOrigin(origin, objects, manifest.References); err != nil {
+				t.Fatal(err)
+			}
+			if err := receiver.ApplyHandoff(origin, 0, changes); err != nil {
+				t.Fatal(err)
+			}
+			_, provider, err := graph.SnapshotLedger(origin)
+			if err != nil {
+				t.Fatal(err)
+			}
+			received := receiver.Inspect().References
+			if exact := sameObjectReferences(received, provider); exact == cancel {
+				t.Fatalf("receiver references=%+v, provider=%+v: exact=%t after cancel=%t", received, provider, exact, cancel)
+			}
+		})
+	}
+}
+
 func TestSharedPackManifestLastAndTruncation(t *testing.T) {
 	directory := t.TempDir()
 	sharedRoot := filepath.Join(directory, "shared")

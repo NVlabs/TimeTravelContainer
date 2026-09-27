@@ -83,13 +83,16 @@ class Result:
         return self
 
 
-def default_socket_path(env: Mapping[str, str] | None = None) -> str:
-    values = os.environ if env is None else env
-    if socket := values.get("TTC_SOCKET"):
-        return socket
-    if runtime := values.get("XDG_RUNTIME_DIR"):
-        return str(Path(runtime) / "ttc" / "ttcd.sock")
-    return f"/tmp/ttc-{os.geteuid()}/ttcd.sock"
+SOCKET_NAME = "ttcd.sock"
+
+
+def socket_path(root: str | os.PathLike[str]) -> str:
+    """Returns the socket of the ttcd whose root is root.
+
+    A daemon's root, the TTC_ROOT of a standalone ttcd or the TTC_LOCAL_ROOT
+    of a node of a cluster, identifies it.
+    """
+    return os.path.join(os.fspath(root), SOCKET_NAME)
 
 
 def _frame(kind: bytes, payload: bytes = b"") -> bytes:
@@ -310,8 +313,10 @@ class TTCStream:
 class Client:
     """A synchronous, non-interactive ttcd client."""
 
-    def __init__(self, socket_path: str | os.PathLike[str] | None = None, timeout: float = 30.0):
-        self.socket_path = os.fspath(socket_path) if socket_path is not None else default_socket_path()
+    def __init__(self, root: str | os.PathLike[str], timeout: float = 30.0):
+        """Returns a client of the ttcd whose root is root."""
+        self.root = os.fspath(root)
+        self.socket_path = socket_path(self.root)
         self.timeout = timeout
 
     def ping(self, *, timeout: float | None = None) -> dict[str, Any]:

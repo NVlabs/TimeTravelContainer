@@ -12,7 +12,7 @@ From this checkout:
 cd sdk
 npm install
 npm run build --workspace=ttcx-mcp
-node mcp/dist/src/bin.js
+node mcp/dist/src/bin.js --root /path/to/ttc-root
 ```
 
 The server uses stdio transport. Configure an MCP host with a command similar
@@ -23,18 +23,16 @@ to:
   "mcpServers": {
     "ttc": {
       "command": "npx",
-      "args": ["-y", "ttcx-mcp"],
-      "env": {
-        "TTC_SOCKET": "/run/user/1000/ttc/ttcd.sock"
-      }
+      "args": ["-y", "ttcx-mcp", "--root", "/path/to/ttc-root"]
     }
   }
 }
 ```
 
-The environment entry is optional when the host inherits the same
-`TTC_SOCKET` or `XDG_RUNTIME_DIR` used by the TTC client. The MCP server does
-not need access to the daemon's storage roots.
+`--root` is required: the `TTC_ROOT` of a standalone `ttcd`, or the
+`TTC_LOCAL_ROOT` of a node of a cluster. The server connects to `ttcd.sock`
+there; it reads no environment variables and does not access the daemon's
+storage.
 
 ## Tools
 

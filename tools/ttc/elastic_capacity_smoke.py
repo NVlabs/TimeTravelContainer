@@ -146,7 +146,6 @@ def main():
         result.update({
             "TTC_ROOT": str(data),
             "TTC_LOCAL_ROOT": str(runtime / "data"),
-            "TTC_SOCKET": str(runtime / "run" / "ttcd.sock"),
             "TTC_CAPACITY_TEST_ROOT": str(root),
         })
         result.pop("TTC_DATA_ROOT", None)
@@ -162,7 +161,7 @@ def main():
     succeeded = False
     began = time.monotonic()
     try:
-        ttc(runtime_a, "daemon", "start", "--cluster-init", *common,
+        ttc(runtime_a, "daemon", "start", *common,
             "--listen", "127.0.0.1:28443",
             "--advertise", "127.0.0.1:28443", "--node", "node-a",
             "--memory-target", "512GiB",
@@ -195,7 +194,7 @@ def main():
             lambda: json.loads((root / "provider-accepted.json").read_text(encoding="utf-8")),
             timeout=30,
         )
-        ttc(runtime_b, "daemon", "start", "--cluster-join", "127.0.0.1:28443", *common,
+        ttc(runtime_b, "daemon", "start", *common,
             "--listen", "127.0.0.1:38443",
             "--advertise", "127.0.0.1:38443", "--node", "node-b",
             "--memory-target", "2TiB",
@@ -205,7 +204,7 @@ def main():
         request_path = data / "cluster" / "capacity-requests" / "node-a.json"
         wait_for("membership-confirmed outbox consumption", lambda: not request_path.exists())
         wait_for("automatic drain and daemon stop",
-                 lambda: not (runtime_a / "run" / "ttcd.sock").exists(),
+                 lambda: not (runtime_a / "data" / "ttcd.sock").exists(),
                  timeout=args.command_timeout)
         started_a = False
         inspected = json.loads(ttc(runtime_b, "inspect", "capacity-smoke").stdout)[0]
@@ -269,8 +268,8 @@ def main():
             # disappear so that cleanup cannot recreate the test root.
             wait_for(
                 "daemon shutdown",
-                lambda: not (runtime_a / "run" / "ttcd.sock").exists()
-                and not (runtime_b / "run" / "ttcd.sock").exists(),
+                lambda: not (runtime_a / "data" / "ttcd.sock").exists()
+                and not (runtime_b / "data" / "ttcd.sock").exists(),
                 timeout=args.command_timeout,
             )
             time.sleep(1)

@@ -15,8 +15,11 @@
 package sandbox
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestFallbackControlSocketNameIncludesRoot(t *testing.T) {
@@ -32,5 +35,29 @@ func TestFallbackControlSocketNameIncludesRoot(t *testing.T) {
 	// Darwin sockaddr_un.sun_path is 104 bytes including its terminator.
 	if path := filepath.Join("/tmp", a); len(path) >= 104 {
 		t.Fatalf("fallback control socket path is too long for Darwin: %q (%d bytes)", path, len(path))
+	}
+}
+
+func TestControlSocketIsInTTCRunDir(t *testing.T) {
+	const id = "8da24af948821edd95e7f2943c935f5c74726fc6e83fa6f630404072aed87eb5"
+	run, err := os.MkdirTemp("", "ttcrun-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(run) })
+	t.Setenv(ttcRunDirEnv, run)
+	path, fd, err := createControlSocket("/node-a/runsc", id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	if want := filepath.Join(run, ttcControlSocketName("/node-a/runsc", id)); path != want {
+		t.Fatalf("control socket %q, want %q", path, want)
+	}
+	if info, err := os.Stat(path); err != nil || info.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("control socket %q: info=%v err=%v", path, info, err)
+	}
+	if ttcControlSocketName("/node-b/runsc", id) == filepath.Base(path) {
+		t.Fatal("sandboxes of different runsc roots have the same control socket name")
 	}
 }

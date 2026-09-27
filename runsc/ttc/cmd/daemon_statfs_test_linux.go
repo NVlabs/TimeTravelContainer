@@ -27,3 +27,7 @@ func setTestNFSStatfs(statfs *unix.Statfs_t) {
 func setTestLocalStatfs(statfs *unix.Statfs_t) {
 	statfs.Type = unix.TMPFS_MAGIC
 }
+
+func setTestLustreStatfs(statfs *unix.Statfs_t) {
+	statfs.Type = 0x0bd00bd0
+}
