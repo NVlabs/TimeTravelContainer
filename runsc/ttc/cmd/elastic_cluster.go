@@ -4391,6 +4391,66 @@ func (b *runtimeBackend) reclaimOrphanLocalContainerDirs(state *cluster.Authorit
 	return result
 }
 
+// dropSupersededCaptures destroys the captures this node's runtimes keep of
+// dehydrated branches that another node now runs. A runtime keeps the capture
+// it made durable, so the branch can be rehydrated here from memory; once the
+// branch is placed on another node the capture is superseded and holds the
+// branch's memory for nothing, as a later rehydration here would find it out
+// of date (see rehydrate). A runtime left with no branch is removed.
+func (b *runtimeBackend) dropSupersededCaptures(state *cluster.AuthorityState) error {
+	if b.nodeID == "" || state == nil {
+		return nil
+	}
+	elsewhere := make(map[string]map[string]bool)
+	for _, placement := range state.Placements {
+		if placement.OwnerNode == "" || placement.OwnerNode == b.nodeID ||
+			placement.State == cluster.PlacementUnplaced || placement.State == cluster.PlacementCorrupted {
+			continue
+		}
+		physical := placement.PhysicalContainer
+		if physical == "" {
+			physical = placement.FamilyID
+		}
+		if elsewhere[physical] == nil {
+			elsewhere[physical] = make(map[string]bool)
+		}
+		elsewhere[physical][placement.BranchID] = true
+	}
+	if len(elsewhere) == 0 {
+		return nil
+	}
+	runtimes, err := b.listRuntimeFamilies()
+	if err != nil {
+		return err
+	}
+	var result error
+	for _, family := range runtimes {
+		placed := elsewhere[family.ID]
+		if placed == nil {
+			continue
+		}
+		// A runtime a long operation is building or taking down is its own.
+		if _, busy := b.operations.lookup(family.ID); busy {
+			continue
+		}
+		dropped := 0
+		for _, branch := range family.Branches {
+			if branch.State != "dehydrated" || !placed[branch.ID] {
+				continue
+			}
+			if _, err := b.command("timetravel", family.ID, "destroy", branch.ID); err != nil {
+				result = errors.Join(result, fmt.Errorf("dropping the superseded capture of %s@%s: %w", family.ID, branch.ID, err))
+				continue
+			}
+			dropped++
+		}
+		if dropped != 0 && dropped == len(family.Branches) {
+			result = errors.Join(result, b.purgeRuntime(family.ID))
+		}
+	}
+	return result
+}
+
 func localCleanupAuthorityFingerprint(state *cluster.AuthorityState) uint64 {
 	var fingerprint uint64
 	for key, placement := range state.Placements {
@@ -6765,7 +6825,9 @@ func maintainOrphanLocalCacheCleanup(authority *cluster.RaftCatalog, backend *ru
 			if err == nil {
 				fingerprint := localCleanupAuthorityFingerprint(currentState)
 				if !initialized || fingerprint != lastFingerprint {
-					if cleanupErr := backend.reclaimOrphanLocalContainerDirs(currentState); cleanupErr != nil {
+					cleanupErr := backend.reclaimOrphanLocalContainerDirs(currentState)
+					cleanupErr = errors.Join(cleanupErr, backend.dropSupersededCaptures(currentState))
+					if cleanupErr != nil {
 						if stderr != nil {
 							fmt.Fprintf(stderr, "ttcd: warning: reclaiming orphan node-local container caches: %v\n", cleanupErr)
 						}
