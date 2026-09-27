@@ -1731,7 +1731,9 @@ func (p *branchPublisher) publishSharedReferenceLedger(snapshot ttcsnapshot.Snap
 	if intent.CreatedAt.IsZero() {
 		intent.CreatedAt = time.Now().UTC()
 	}
-	state, err := p.authority.AuthorityState()
+	state, err := p.authority.AuthorityStateOf(cluster.AuthorityQuery{
+		Transactions: cluster.All[string](), Publications: cluster.All[string](),
+	})
 	if err != nil {
 		return fmt.Errorf("reading publication bridge authority: %w", err)
 	}
@@ -2680,6 +2682,10 @@ func (b *runtimeBackend) prepareLocalDirectFilesystemSources(info ttcbundle.Cont
 	return sources, cleanup, nil
 }
 
+// coldRootsQuery is the query of the authority records collectColdStorage
+// reads: the branches, whose roots keep their cold manifests.
+var coldRootsQuery = cluster.AuthorityQuery{Branches: cluster.All[string]()}
+
 // collectColdStorage traces every authoritative and pending manifest before
 // reclaiming immutable packs. A grace period protects a publisher between
 // writing its pack and atomically committing its manifest.
@@ -2896,7 +2902,7 @@ func (b *runtimeBackend) collectTerminalColdStorage() {
 	transactions, err := b.transactionCatalog()
 	var authority *cluster.AuthorityState
 	if err == nil && b.distributedSource != nil && b.distributedSource.authority != nil {
-		authority, err = b.distributedSource.authority.AuthorityState()
+		authority, err = b.distributedSource.authority.AuthorityStateOf(coldRootsQuery)
 	}
 	if err == nil {
 		err = collectColdStorage(b.dataRoot, b.activeDataRoot(), b.publicationQueue, transactions, authority)

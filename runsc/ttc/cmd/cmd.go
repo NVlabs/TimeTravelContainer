@@ -6445,7 +6445,7 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 	}
 	authorityContainer, authorityBranch := logicalFamilyID(container), target.branch
 	if b.distributedSource != nil && b.distributedSource.authority != nil {
-		state, err := b.distributedSource.authority.AuthorityState()
+		state, err := b.distributedSource.authority.AuthorityStateOf(cluster.AuthorityQuery{Placements: cluster.All[string]()})
 		if err != nil {
 			return fmt.Errorf("resolving publication authority: %w", err)
 		}

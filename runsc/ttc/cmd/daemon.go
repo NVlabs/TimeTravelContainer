@@ -7222,7 +7222,7 @@ func maintainRepositories(dataRoot, localRoot, runtimeRoot, runsc string, public
 			var authorityState *cluster.AuthorityState
 			var authorityErr error
 			if authority != nil {
-				authorityState, authorityErr = authority.AuthorityState()
+				authorityState, authorityErr = authority.AuthorityStateOf(coldRootsQuery)
 			}
 			if authorityErr != nil && stderr != nil {
 				fmt.Fprintf(stderr, "ttcd: warning: reading authoritative cold roots: %v\n", authorityErr)

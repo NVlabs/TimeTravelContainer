@@ -588,7 +588,9 @@ func (b *runtimeBackend) mutateGraphReferenceGroup(ctx context.Context, intent g
 	current, volatile, err := b.distributedSource.authority.SnapshotProvider(group.Origin)
 	if err != nil {
 		if !retain && errors.Is(err, os.ErrNotExist) {
-			state, stateErr := b.distributedSource.authority.AuthorityState()
+			state, stateErr := b.distributedSource.authority.AuthorityStateOf(cluster.AuthorityQuery{
+				RetiredOrigins: cluster.Only(group.Origin), AbandonedOrigins: cluster.Only(group.Origin),
+			})
 			if stateErr != nil {
 				return stateErr
 			}
@@ -685,7 +687,9 @@ func (b *runtimeBackend) releaseSharedGraphMemoryRoots(roots, objects []string) 
 	if len(roots) != len(objects) {
 		return errors.New("shared memory root names and objects differ in length")
 	}
-	authority, err := b.distributedSource.authority.AuthorityState()
+	authority, err := b.distributedSource.authority.AuthorityStateOf(cluster.AuthorityQuery{
+		Branches: cluster.All[string](), Publications: cluster.All[string](),
+	})
 	if err != nil {
 		return err
 	}

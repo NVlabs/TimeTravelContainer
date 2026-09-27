@@ -2651,7 +2651,7 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 	}
 	var retiredNodes map[string]string
 	if s.distributedSource != nil && s.distributedSource.authority != nil {
-		authority, authorityErr := s.distributedSource.authority.AuthorityState()
+		authority, authorityErr := s.distributedSource.authority.AuthorityStateOf(cluster.AuthorityQuery{RetiredNodes: true})
 		if authorityErr != nil {
 			return true, 1, nil, nil, fmt.Errorf("reading retired node authority before family mutation: %w", authorityErr)
 		}
