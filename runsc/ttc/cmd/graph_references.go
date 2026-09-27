@@ -125,7 +125,8 @@ func (b *runtimeBackend) newGraphReferenceIntentWithPurpose(transaction, operati
 			return graphReferenceIntent{}, "", errors.New("graph reference operation is bound to different roots")
 		}
 		// Provider is a captured routing fence rather than caller identity. Keep
-		// the durable value if authority concurrently changed node -> shared.
+		// the durable value if authority concurrently changed node -> shared,
+		// and the branch name recorded before any rename likewise.
 		return current, path, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return graphReferenceIntent{}, "", err
@@ -136,9 +137,13 @@ func (b *runtimeBackend) newGraphReferenceIntentWithPurpose(transaction, operati
 	return intent, path, nil
 }
 
+// graphReferenceIntentEqualIdentity compares the identities of two intents.
+// The branch's name is not part of one: a rename changes it, as
+// containerHasGraphReferenceIntent allows, and a retry after the rename
+// resumes the intent recorded under the old name.
 func graphReferenceIntentEqualIdentity(a, b graphReferenceIntent) bool {
 	if a.Version != b.Version || a.Transaction != b.Transaction || a.Operation != b.Operation ||
-		a.Purpose != b.Purpose || a.Container != b.Container || a.Branch != b.Branch || len(a.Groups) != len(b.Groups) {
+		a.Purpose != b.Purpose || a.Container != b.Container || len(a.Groups) != len(b.Groups) {
 		return false
 	}
 	for i := range a.Groups {

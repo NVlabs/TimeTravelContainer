@@ -211,6 +211,25 @@ func TestGraphReferenceIdentitySurvivesProviderPublication(t *testing.T) {
 	}
 }
 
+// A handoff retried after its branch's rename names the branch by its new
+// name, and must resume the intent it recorded under the old one.
+func TestGraphReferenceIdentitySurvivesRename(t *testing.T) {
+	recorded := graphReferenceIntent{
+		Version: graphReferenceIntentVersion, Transaction: "tx", Operation: "handoff-tx-0000000000000001",
+		Purpose: graphReferencePurposeBranch, Container: "family", Branch: "remote1",
+		Groups: []graphReferenceGroup{{Origin: 1, Roots: []cluster.SnapshotRootBinding{{Slot: 0, Object: "0000000000000001-03-0000000000000001"}}}},
+	}
+	retry := recorded
+	retry.Branch = "renamed"
+	if !graphReferenceIntentEqualIdentity(recorded, retry) {
+		t.Fatal("a retry after the branch's rename was refused its own intent")
+	}
+	retry.Container = "other-family"
+	if graphReferenceIntentEqualIdentity(recorded, retry) {
+		t.Fatal("another family's operation reused the intent's identity")
+	}
+}
+
 func TestGraphReferenceTransferLifetimeFollowsTransaction(t *testing.T) {
 	intent := graphReferenceIntent{Purpose: graphReferencePurposeTransfer, State: "active"}
 	for _, state := range []cluster.TransactionState{cluster.TransactionPreparing, cluster.TransactionTargetPaused, cluster.TransactionPublished, cluster.TransactionDraining, cluster.TransactionFailed} {
