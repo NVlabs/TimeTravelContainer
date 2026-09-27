@@ -2363,6 +2363,56 @@ func snapshotLedger(state graphState, snapshot SnapshotID) ([]Object, map[string
 	return objects, references, nil
 }
 
+// OriginReferences returns what this graph still references of snapshot, an
+// origin it has handed off, that the shared ledger does not count: its roots
+// and pins in snapshot, named as SnapshotLedger names them, and whether a live
+// object of an origin that is not shared has an edge into snapshot or reads
+// its content from there as a deferred object. The shared ledger counts an
+// edge from a shared origin's object itself.
+func (s *Store) OriginReferences(snapshot SnapshotID) (map[string]ObjectID, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	references := make(map[string]ObjectID)
+	for name, object := range s.state.Roots {
+		if object.Snapshot == snapshot {
+			references["root/"+name] = object
+		}
+	}
+	for name, object := range s.state.Pins {
+		if object.Snapshot == snapshot {
+			references["pin/"+name] = object
+		}
+	}
+	shared := make(map[SnapshotID]bool)
+	for _, parent := range s.state.Objects {
+		if parent.ID.Snapshot == snapshot || parent.State != ObjectLive {
+			continue
+		}
+		parentShared, known := shared[parent.ID.Snapshot]
+		if !known {
+			// An object of an origin this graph has no record of is not the
+			// graph's to count either.
+			record, ok := s.state.Snapshots[snapshotKey(parent.ID.Snapshot)]
+			parentShared = !ok || record.State == SnapshotShared
+			shared[parent.ID.Snapshot] = parentShared
+		}
+		if parentShared {
+			continue
+		}
+		for _, edge := range parent.Children {
+			if edge.Child.Snapshot == snapshot {
+				return references, true
+			}
+		}
+		// A deferred object reads its content from its source until it is
+		// materialized.
+		if parent.Deferred && parent.SourceObject.Snapshot == snapshot {
+			return references, true
+		}
+	}
+	return references, false
+}
+
 // BeginSnapshotLedgerHandoff durably captures the bulk-transfer baseline for
 // one immutable origin. Reference mutations after the baseline are recorded in
 // order until FreezeSnapshotLedger installs the final short barrier. Repeating

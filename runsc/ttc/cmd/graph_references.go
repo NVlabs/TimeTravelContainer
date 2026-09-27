@@ -23,10 +23,12 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
+	"gvisor.dev/gvisor/pkg/ttcvolume"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 )
@@ -36,6 +38,10 @@ const graphReferenceIntentVersion = 2
 const (
 	graphReferencePurposeBranch   = "branch"
 	graphReferencePurposeTransfer = "transfer"
+	// graphReferencePurposeProvider is a node's own claim on an origin it
+	// handed off, which keeps what its graph still references of the origin;
+	// see recordProviderReferences.
+	graphReferencePurposeProvider = "provider"
 )
 
 type graphReferenceIntent struct {
@@ -48,6 +54,9 @@ type graphReferenceIntent struct {
 	State       string                `json:"state"`
 	Groups      []graphReferenceGroup `json:"groups"`
 	CreatedAt   time.Time             `json:"created_at"`
+	// Repository names, for a provider claim, the filesystem repository whose
+	// graph the claim keeps references of; empty, the node's memory graph.
+	Repository string `json:"repository,omitempty"`
 }
 
 type graphReferenceGroup struct {
@@ -76,10 +85,18 @@ func readGraphReferenceIntent(path string) (graphReferenceIntent, error) {
 	if err := decoder.Decode(&intent); err != nil {
 		return graphReferenceIntent{}, err
 	}
-	if intent.Version != graphReferenceIntentVersion || intent.Transaction == "" || intent.Operation == "" ||
-		intent.Container == "" || intent.Branch == "" || len(intent.Groups) == 0 ||
-		(intent.Purpose != graphReferencePurposeBranch && intent.Purpose != graphReferencePurposeTransfer) ||
-		(intent.State != "retaining" && intent.State != "active" && intent.State != "releasing") {
+	valid := intent.Version == graphReferenceIntentVersion && intent.Transaction != "" && intent.Operation != "" &&
+		len(intent.Groups) != 0 && (intent.State == "retaining" || intent.State == "active" || intent.State == "releasing")
+	switch intent.Purpose {
+	case graphReferencePurposeBranch, graphReferencePurposeTransfer:
+		valid = valid && intent.Container != "" && intent.Branch != "" && intent.Repository == ""
+	case graphReferencePurposeProvider:
+		// The node, not a branch, owns a provider claim.
+		valid = valid && intent.Container == "" && intent.Branch == "" && len(intent.Groups) == 1
+	default:
+		valid = false
+	}
+	if !valid {
 		return graphReferenceIntent{}, errors.New("invalid graph reference intent")
 	}
 	return intent, nil
@@ -448,6 +465,14 @@ func (b *runtimeBackend) reconcileDistributedGraphReferences(strictRetain bool) 
 			retryable = errors.Join(retryable, fmt.Errorf("reading graph reference intent %q: %w", entry.Name(), err))
 			continue
 		}
+		if intent.Purpose == graphReferencePurposeProvider {
+			// The handoff that records a provider claim retains it before it
+			// commits, so nothing here must be retained before execution.
+			if err := b.reconcileProviderReferences(path, intent); err != nil {
+				retryable = errors.Join(retryable, fmt.Errorf("reconciling provider claim %q: %w", intent.Operation, err))
+			}
+			continue
+		}
 		tx, txErr := b.distributedSource.transactions.Load(intent.Transaction)
 		branchPresent := false
 		if info, loadErr := b.containerStore().LoadContainer(intent.Container); loadErr == nil {
@@ -635,8 +660,12 @@ func (b *runtimeBackend) mutateGraphReferenceGroup(ctx context.Context, intent g
 // Descendant operations have fresh, unguessable operation identities and can
 // mutate only their exact retained root names, so cluster membership and the
 // immutable object bindings are their authority. Transfer intents remain
-// transaction-fenced even though their operation carries a prefix.
+// transaction-fenced even though their operation carries a prefix. A provider
+// claim has no transaction; its unguessable operation is its authority too.
 func graphReferenceAuthorizationTransaction(intent graphReferenceIntent) string {
+	if intent.Purpose == graphReferencePurposeProvider {
+		return ""
+	}
 	if intent.Purpose == graphReferencePurposeBranch && intent.Operation != intent.Transaction {
 		prefix := "handoff-" + intent.Transaction + "-"
 		if !strings.HasPrefix(intent.Operation, prefix) {
@@ -764,4 +793,343 @@ func newGraphReferenceOperation() (string, error) {
 
 func graphReferenceOperationForBranch(_ ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) string {
 	return branch.DistributedGraphReferenceOperation
+}
+
+// providerOwnReference reports whether a reference that a graph holds of an
+// origin it handed off is the graph's own: a claim that a consumer holds here
+// is the consumer's to keep, and the shared ledger counts a bridge edge.
+func providerOwnReference(name string) bool {
+	return !strings.HasPrefix(name, "root/remote/") && !strings.HasPrefix(name, "root/bridge/")
+}
+
+// providerReferencesNeeded reports whether a graph still references an origin
+// it handed off, given what OriginReferences returned of it.
+func providerReferencesNeeded(references map[string]ttcsnapshot.ObjectID, edges bool) bool {
+	if edges {
+		return true
+	}
+	for name := range references {
+		if providerOwnReference(name) {
+			return true
+		}
+	}
+	return false
+}
+
+// providerReferencePrefix begins the operation of every provider claim on
+// origin for the graph of repository, or the memory graph's when it is empty.
+func providerReferencePrefix(origin ttcsnapshot.SnapshotID, repository string) string {
+	graph := "memory"
+	if repository != "" {
+		digest := sha256.Sum256([]byte(repository))
+		graph = fmt.Sprintf("%x", digest[:8])
+	}
+	return fmt.Sprintf("provider-%016x-%s-", uint64(origin), graph)
+}
+
+// recordProviderReferences records this node's claim on origin, which it is
+// handing off, for what its graph still references of the origin: the memory
+// graph's, or the filesystem repository's at repository. references are the
+// graph's references of the origin, which the handoff has frozen.
+//
+// The handoff moves the counting of the origin's references to the shared
+// ledger, which counts the origin's published branches by their roots in Raft
+// and other nodes' branches by their claims. This node's other live branches
+// it would count by nothing: the ledger would collect a fork base they still
+// share, and their next publication, whose objects have edges into it, would
+// fail to import. Whatever the graph references of the origin later, it
+// reaches from these roots and pins, so the claim keeps them until the graph
+// references nothing of the origin; see reconcileProviderReferences.
+// retainProviderReferences retains the claim before the handoff commits.
+//
+// It returns the claim's path, or "" when the graph has no roots or pins of
+// the origin. A retried handoff finds the claim it recorded.
+func (p *branchPublisher) recordProviderReferences(origin ttcsnapshot.SnapshotID, repository string, references map[string]ttcsnapshot.ObjectID) (string, error) {
+	if p == nil || p.sharedRefs == nil || p.sharedRefs.localRoot == "" || origin == 0 {
+		return "", errors.New("provider reference claims are unavailable")
+	}
+	objects := make(map[string]struct{})
+	for name, object := range references {
+		if providerOwnReference(name) && object.Snapshot == origin {
+			objects[object.String()] = struct{}{}
+		}
+	}
+	if len(objects) == 0 {
+		return "", nil
+	}
+	sorted := make([]string, 0, len(objects))
+	for object := range objects {
+		sorted = append(sorted, object)
+	}
+	sort.Strings(sorted)
+	var groups []graphReferenceGroup
+	for slot, object := range sorted {
+		// A group is one retain request, which carries at most 4096 roots.
+		if slot%4096 == 0 {
+			groups = append(groups, graphReferenceGroup{Origin: uint64(origin), Provider: p.nodeID})
+		}
+		group := &groups[len(groups)-1]
+		group.Roots = append(group.Roots, cluster.SnapshotRootBinding{Slot: uint32(slot), Object: object})
+	}
+	prefix := providerReferencePrefix(origin, repository)
+	directory := filepath.Join(p.sharedRefs.localRoot, "graph-references")
+	entries, err := os.ReadDir(directory)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), prefix) || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		path := filepath.Join(directory, entry.Name())
+		existing, err := readGraphReferenceIntent(path)
+		if err != nil {
+			return "", err
+		}
+		if existing.State != "releasing" && existing.Repository == repository && sameGraphReferenceRoots(existing.Groups, groups) {
+			return path, nil
+		}
+	}
+	id, err := newDaemonRequestID()
+	if err != nil {
+		return "", err
+	}
+	operation := prefix + id
+	path, err := graphReferenceIntentPath(p.sharedRefs.localRoot, operation)
+	if err != nil {
+		return "", err
+	}
+	intent := graphReferenceIntent{
+		Version: graphReferenceIntentVersion, Transaction: operation, Operation: operation,
+		Purpose: graphReferencePurposeProvider, State: "retaining", Groups: groups,
+		CreatedAt: time.Now().UTC(), Repository: repository,
+	}
+	if err := writeDurableJSON(path, &intent); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// keepProviderReferences records and retains this node's claim on origin,
+// which it is handing off, for what a graph still references of it: the
+// filesystem repository's at repository, or the memory graph's when it is
+// empty. references are the graph's references of origin, which the handoff
+// has frozen. It runs after the shared ledger imported origin and before the
+// handoff commits.
+//
+// Other nodes' claims on origin, which they retained here while this node
+// provided it, move to the shared ledger with it: they release them there
+// once it is shared.
+func (p *branchPublisher) keepProviderReferences(origin ttcsnapshot.SnapshotID, repository string, references map[string]ttcsnapshot.ObjectID) error {
+	path, err := p.recordProviderReferences(origin, repository, references)
+	if err != nil {
+		return fmt.Errorf("recording this node's claim on snapshot origin %d: %w", origin, err)
+	}
+	if err := p.retainProviderReferences(path); err != nil {
+		return fmt.Errorf("retaining this node's claim on snapshot origin %d: %w", origin, err)
+	}
+	consumers := make(map[string]ttcsnapshot.ObjectID)
+	for name, object := range references {
+		if root := strings.TrimPrefix(name, "root/"); root != name && consumerClaimRoot(root, origin) {
+			consumers[root] = object
+		}
+	}
+	if len(consumers) == 0 {
+		return nil
+	}
+	if err := retryGraphReferenceMutation(func(ctx context.Context) error {
+		return p.retainAtSharedLedger(ctx, origin, consumers)
+	}); err != nil {
+		return fmt.Errorf("moving other nodes' claims on snapshot origin %d to the shared ledger: %w", origin, err)
+	}
+	return nil
+}
+
+// consumerClaimRoot reports whether root, a root of a provider's graph, is
+// another node's claim on origin, as graphReferenceRoots names one.
+func consumerClaimRoot(root string, origin ttcsnapshot.SnapshotID) bool {
+	parts := strings.Split(root, "/")
+	if len(parts) != 4 || parts[0] != "remote" || parts[1] != fmt.Sprint(uint64(origin)) || parts[2] == "" || len(parts[3]) != 8 {
+		return false
+	}
+	_, err := strconv.ParseUint(parts[3], 16, 32)
+	return err == nil
+}
+
+// sameGraphReferenceRoots reports whether two claims' groups bind the same
+// roots of the same origins.
+func sameGraphReferenceRoots(a, b []graphReferenceGroup) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Origin != b[i].Origin || len(a[i].Roots) != len(b[i].Roots) {
+			return false
+		}
+		for j := range a[i].Roots {
+			if a[i].Roots[j] != b[i].Roots[j] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// retainProviderReferences retains, at the shared ledger, the claim at path
+// that recordProviderReferences recorded, if any. The ledger has imported the
+// origin with this node's references to it, which the coordinator releases
+// once the handoff commits: so this must precede the commit, while this node
+// still provides the origin, which authorizes it.
+func (p *branchPublisher) retainProviderReferences(path string) error {
+	if path == "" {
+		return nil
+	}
+	intent, err := readGraphReferenceIntent(path)
+	if err != nil {
+		return err
+	}
+	if intent.State == "active" {
+		return nil
+	}
+	return retryGraphReferenceMutation(func(ctx context.Context) error {
+		// As resumeGraphReferenceRetain does, keep each attempt and its local
+		// transition on one side of an inventory observation.
+		p.sharedRefs.claimMu.Lock()
+		defer p.sharedRefs.claimMu.Unlock()
+		return advanceGraphReferenceRetain(path, &intent, func(group graphReferenceGroup) error {
+			return p.retainProviderGroup(ctx, intent.Operation, group)
+		})
+	})
+}
+
+func (p *branchPublisher) retainProviderGroup(ctx context.Context, operation string, group graphReferenceGroup) error {
+	origin := ttcsnapshot.SnapshotID(group.Origin)
+	roots, err := graphReferenceRoots(origin, operation, group.Roots)
+	if err != nil {
+		return err
+	}
+	return p.retainAtSharedLedger(ctx, origin, roots)
+}
+
+// retainAtSharedLedger retains roots of origin at the shared ledger, which has
+// imported the origin, while this node still provides the origin: the
+// coordinator takes them as it takes a publication bridge from the provider.
+func (p *branchPublisher) retainAtSharedLedger(ctx context.Context, origin ttcsnapshot.SnapshotID, roots map[string]ttcsnapshot.ObjectID) error {
+	if p.authority == nil {
+		return errors.New("shared reference authority is unavailable")
+	}
+	lease, err := p.authority.SharedGCLease()
+	if err != nil {
+		return err
+	}
+	if lease.Generation == 0 || !time.Now().Before(lease.ExpiresAt) {
+		return errors.New("shared reference coordinator has no active lease")
+	}
+	names := make([]string, 0, len(roots))
+	for name := range roots {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	if lease.NodeID == p.nodeID && lease.Incarnation == p.incarnation {
+		return p.sharedRefs.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
+			return applySharedRootMutation(ledger, names, roots, "retain", true)
+		})
+	}
+	if p.peers == nil {
+		return errors.New("cluster peer routing is unavailable")
+	}
+	peer, err := p.peers.peer(lease.NodeID, false)
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		object := roots[name]
+		digest := sha256.Sum256([]byte(name + "\x00" + object.String()))
+		if err := peer.ApplySharedSnapshotReference(ctx, uint64(origin), fmt.Sprintf("provider-retain-%x", digest[:12]), name, object.String(), true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// providerCheck is when a provider claim's graph is to be checked next, and
+// the wait after that check if it finds the claim still needed.
+type providerCheck struct {
+	next     time.Time
+	interval time.Duration
+}
+
+// reconcileProviderReferences releases the provider claim at path once its
+// graph references nothing of the claim's origin, checking a claim that is
+// still needed ever less often, up to every two minutes: checking a
+// repository's reads its whole graph. It forgets a claim whose handoff was
+// canceled.
+func (b *runtimeBackend) reconcileProviderReferences(path string, intent graphReferenceIntent) error {
+	if intent.State == "releasing" {
+		return b.releaseDistributedGraphReferences(intent.Operation)
+	}
+	origin := ttcsnapshot.SnapshotID(intent.Groups[0].Origin)
+	_, volatile, terminal, err := snapshotOriginAuthority(b.distributedSource.authority, origin)
+	if err != nil {
+		return err
+	}
+	if terminal {
+		b.distributedSource.providerChecks.Delete(intent.Operation)
+		return b.releaseDistributedGraphReferences(intent.Operation)
+	}
+	if volatile {
+		if _, _, frozen, err := b.providerGraphReferences(intent.Repository, origin); err != nil || frozen {
+			return err
+		}
+		// The handoff was canceled before it committed, and the origin's
+		// references are this node's alone again. What the claim retained at
+		// the shared ledger, which no inventory reports any more, the
+		// coordinator releases once the origin is shared.
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	if intent.State == "retaining" {
+		return b.resumeGraphReferenceRetain(path, &intent)
+	}
+	now := time.Now()
+	check := providerCheck{}
+	if value, ok := b.distributedSource.providerChecks.Load(intent.Operation); ok {
+		check = value.(providerCheck)
+		if now.Before(check.next) {
+			return nil
+		}
+	}
+	references, edges, _, err := b.providerGraphReferences(intent.Repository, origin)
+	if err != nil {
+		return err
+	}
+	if providerReferencesNeeded(references, edges) {
+		check.interval = min(max(2*check.interval, 5*time.Second), 2*time.Minute)
+		check.next = now.Add(check.interval)
+		b.distributedSource.providerChecks.Store(intent.Operation, check)
+		return nil
+	}
+	b.distributedSource.providerChecks.Delete(intent.Operation)
+	return b.releaseDistributedGraphReferences(intent.Operation)
+}
+
+// providerGraphReferences returns what the graph of the repository at
+// repository, or the memory graph when it is empty, still references of
+// origin, as OriginReferences returns it, and whether origin's handoff is
+// frozen there. A repository that is gone references nothing.
+func (b *runtimeBackend) providerGraphReferences(repository string, origin ttcsnapshot.SnapshotID) (map[string]ttcsnapshot.ObjectID, bool, bool, error) {
+	if repository == "" {
+		if b.snapshotGraph == nil {
+			return nil, false, false, nil
+		}
+		references, edges := b.snapshotGraph.OriginReferences(origin)
+		return references, edges, b.snapshotGraph.SnapshotLedgerFrozen(origin), nil
+	}
+	references, edges, frozen, err := ttcvolume.ReadOriginReferences(repository, origin)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, false, nil
+	}
+	return references, edges, frozen, err
 }

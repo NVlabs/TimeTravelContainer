@@ -867,6 +867,39 @@ func (r *Repository) OriginHandoffFrozen(origin ttcsnapshot.SnapshotID) bool {
 	return r.graph.SnapshotLedgerFrozen(origin)
 }
 
+// Path returns the repository's directory, or "" for a repository opened by
+// a donated descriptor.
+func (r *Repository) Path() string {
+	return r.path
+}
+
+// OriginReferences returns what this repository still references of origin,
+// an origin it has handed off, that the shared ledger does not count, as
+// ttcsnapshot.Store.OriginReferences does.
+func (r *Repository) OriginReferences(origin ttcsnapshot.SnapshotID) (map[string]ttcsnapshot.ObjectID, bool) {
+	return r.graph.OriginReferences(origin)
+}
+
+// ReadOriginReferences returns, of the repository at path, what
+// OriginReferences returns, and whether origin's handoff is frozen. It reads
+// the repository's graph without opening the repository, whose open recovers
+// it, as a reader beside the repository's runtime and its other users must
+// not. It returns an error satisfying os.ErrNotExist when path has no
+// repository.
+func ReadOriginReferences(path string, origin ttcsnapshot.SnapshotID) (map[string]ttcsnapshot.ObjectID, bool, bool, error) {
+	dir := filepath.Join(path, "graph")
+	if _, err := os.Stat(dir); err != nil {
+		return nil, false, false, err
+	}
+	graph, err := ttcsnapshot.OpenExternallyCoordinated(dir)
+	if err != nil {
+		return nil, false, false, err
+	}
+	references, edges := graph.OriginReferences(origin)
+	frozen := graph.SnapshotLedgerFrozen(origin)
+	return references, edges, frozen, graph.Close()
+}
+
 // CompleteOriginHandoff changes the local graph into a non-authoritative
 // shared cache view after Raft has committed the provider-to-shared switch.
 func (r *Repository) CompleteOriginHandoff(origin ttcsnapshot.SnapshotID) error {

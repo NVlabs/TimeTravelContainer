@@ -89,6 +89,12 @@ func TestGraphReferenceAuthorizationTransaction(t *testing.T) {
 			},
 			want: "fork-1",
 		},
+		{
+			name: "provider claim",
+			intent: graphReferenceIntent{
+				Purpose: graphReferencePurposeProvider, Transaction: "provider-1", Operation: "provider-1",
+			},
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got := graphReferenceAuthorizationTransaction(test.intent); got != test.want {
@@ -422,6 +428,106 @@ func TestSnapshotReferenceInventoryReservesEveryUnreleasedGroup(t *testing.T) {
 	}
 	if len(claims) != 2 || claims[0].Origin != 1 || claims[1].Origin != 2 || claims[0].Operation != intent.Operation || len(claims[0].Roots) != 1 || claims[0].Roots[0] != intent.Groups[0].Roots[0] || claims[1].Roots[0] != intent.Groups[1].Roots[0] {
 		t.Fatalf("claims=%+v, want unreleased origins 1 and 2", claims)
+	}
+}
+
+func TestProviderClaimKeepsTheNodesOwnReferences(t *testing.T) {
+	localRoot := t.TempDir()
+	service := &sharedReferenceService{localRoot: localRoot, nodeID: "node-a", incarnation: "boot-a"}
+	publisher := &branchPublisher{nodeID: "node-a", sharedRefs: service}
+	object := func(text string) ttcsnapshot.ObjectID {
+		id, err := ttcsnapshot.ParseObjectID(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	live := object("0000000000000007-03-0000000000000001")
+	pinned := object("0000000000000007-03-0000000000000002")
+	references := map[string]ttcsnapshot.ObjectID{
+		// Two live branches forked from one another share their roots.
+		"root/memory/branch/a/resource-0000": live,
+		"root/memory/branch/b/resource-0000": live,
+		"pin/observe/reader":                 pinned,
+		// A consumer keeps its own claim, and the ledger counts bridge edges.
+		"root/remote/7/branch-op/00000000":                      pinned,
+		"root/bridge/edge/0000000000000009-03-0000000000000001": pinned,
+	}
+	path, err := publisher.recordProviderReferences(7, "", references)
+	if err != nil || path == "" {
+		t.Fatalf("recordProviderReferences = %q, %v", path, err)
+	}
+	intent, err := readGraphReferenceIntent(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []cluster.SnapshotRootBinding{{Slot: 0, Object: live.String()}, {Slot: 1, Object: pinned.String()}}
+	if intent.Purpose != graphReferencePurposeProvider || intent.State != "retaining" || len(intent.Groups) != 1 ||
+		intent.Groups[0].Origin != 7 || intent.Groups[0].Provider != "node-a" || fmt.Sprint(intent.Groups[0].Roots) != fmt.Sprint(want) {
+		t.Fatalf("claim = %+v, want the two own objects of origin 7", intent)
+	}
+	if graphReferenceAuthorizationTransaction(intent) != "" {
+		t.Fatal("a provider claim names a transaction to authorize")
+	}
+	// A retried handoff finds the claim it recorded.
+	if again, err := publisher.recordProviderReferences(7, "", references); err != nil || again != path {
+		t.Fatalf("recording again = %q, %v; want %q", again, err, path)
+	}
+	// A repository's claim on the same origin is another.
+	if other, err := publisher.recordProviderReferences(7, "/repositories/rootfs", references); err != nil || other == "" || other == path {
+		t.Fatalf("repository claim = %q, %v", other, err)
+	}
+	inventory, err := service.SnapshotReferenceInventory(context.Background(), "coordinator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inventory.Claims) != 2 || inventory.Claims[0].Origin != 7 || inventory.Claims[1].Origin != 7 {
+		t.Fatalf("inventory claims = %+v, want both claims on origin 7", inventory.Claims)
+	}
+	// A graph with no references of its own claims nothing.
+	if none, err := publisher.recordProviderReferences(8, "", map[string]ttcsnapshot.ObjectID{
+		"root/remote/8/branch-op/00000000": object("0000000000000008-03-0000000000000001"),
+	}); err != nil || none != "" {
+		t.Fatalf("claim without own references = %q, %v", none, err)
+	}
+}
+
+func TestProviderReferencesNeeded(t *testing.T) {
+	object := ttcsnapshot.ObjectID{Snapshot: 7}
+	for _, test := range []struct {
+		name       string
+		references map[string]ttcsnapshot.ObjectID
+		edges      bool
+		want       bool
+	}{
+		{name: "nothing"},
+		{name: "a consumer's claim", references: map[string]ttcsnapshot.ObjectID{"root/remote/7/op/00000000": object}},
+		{name: "a bridge edge", references: map[string]ttcsnapshot.ObjectID{"root/bridge/edge/x/0001": object}},
+		{name: "a root", references: map[string]ttcsnapshot.ObjectID{"root/memory/branch/a/resource-0000": object}, want: true},
+		{name: "a pin", references: map[string]ttcsnapshot.ObjectID{"pin/observe/x": object}, want: true},
+		{name: "an edge", edges: true, want: true},
+	} {
+		if got := providerReferencesNeeded(test.references, test.edges); got != test.want {
+			t.Errorf("%s: providerReferencesNeeded = %t, want %t", test.name, got, test.want)
+		}
+	}
+}
+
+func TestConsumerClaimRoot(t *testing.T) {
+	for root, want := range map[string]bool{
+		"remote/7/branch-op/00000000": true,
+		"remote/7/branch-op/0000000a": true,
+		// A live export's capture roots are no claim.
+		"remote/7/tx/resource-0000":         false,
+		"remote/8/branch-op/00000000":       false,
+		"remote/7/branch-op/0000000g":       false,
+		"remote/7//00000000":                false,
+		"memory/branch/a/resource-0000":     false,
+		"remote/7/branch-op/00000000/extra": false,
+	} {
+		if got := consumerClaimRoot(root, 7); got != want {
+			t.Errorf("consumerClaimRoot(%q, 7) = %t, want %t", root, got, want)
+		}
 	}
 }
 

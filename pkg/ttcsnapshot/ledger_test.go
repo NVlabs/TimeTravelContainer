@@ -593,6 +593,94 @@ func TestSnapshotLedgerCapturesForeignParentEdges(t *testing.T) {
 	}
 }
 
+func TestOriginReferencesAfterHandoff(t *testing.T) {
+	graph, err := Open(filepath.Join(t.TempDir(), "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	first, _ := graph.AllocateWorking()
+	child, err := graph.CreateObject(first, "child-pin", ObjectKindFile, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.SetRoot("branch/live", child); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Seal(first, SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	// A later capture of the live branch, not handed off yet.
+	second, _ := graph.AllocateWorking()
+	if _, err := graph.CreateObject(second, "capture-pin", ObjectKindInode, nil, []Edge{{Slot: 1, Child: child}}); err != nil {
+		t.Fatal(err)
+	}
+	// An origin handed off with the first, whose edge the shared ledger counts.
+	third, _ := graph.AllocateWorking()
+	if _, err := graph.CreateObject(third, "shared-pin", ObjectKindInode, nil, []Edge{{Slot: 2, Child: child}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, origin := range []SnapshotID{second, third} {
+		if err := graph.Seal(origin, SnapshotSealedVolatile); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, origin := range []SnapshotID{first, third} {
+		if err := graph.MarkShared(origin); err != nil {
+			t.Fatal(err)
+		}
+	}
+	references, edges := graph.OriginReferences(first)
+	if len(references) != 2 || references["root/branch/live"] != child || references["pin/child-pin"] != child || !edges {
+		t.Fatalf("OriginReferences = %v, %t; want the root, the pin and an edge", references, edges)
+	}
+	if err := graph.DeleteRoots([]string{"branch/live"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.DeletePin("child-pin"); err != nil {
+		t.Fatal(err)
+	}
+	if references, edges := graph.OriginReferences(first); len(references) != 0 || !edges {
+		t.Fatalf("OriginReferences = %v, %t; want only the capture's edge", references, edges)
+	}
+	// The capture's object, no longer referenced, is not live.
+	if err := graph.DeletePin("capture-pin"); err != nil {
+		t.Fatal(err)
+	}
+	if references, edges := graph.OriginReferences(first); len(references) != 0 || edges {
+		t.Fatalf("OriginReferences = %v, %t; want nothing", references, edges)
+	}
+}
+
+func TestOriginReferencesSeeDeferredSources(t *testing.T) {
+	graph, err := Open(filepath.Join(t.TempDir(), "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	first, _ := graph.AllocateWorking()
+	source, err := graph.CreateObject(first, "source-pin", ObjectKindMetadata, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Seal(first, SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.MarkShared(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.DeletePin("source-pin"); err != nil {
+		t.Fatal(err)
+	}
+	catalog, _ := graph.AllocateWorking()
+	if _, err := graph.ImportDeferredFilesystemRoot(catalog, "filesystem/imported", "repository:root:2", source); err != nil {
+		t.Fatal(err)
+	}
+	if references, edges := graph.OriginReferences(first); len(references) != 0 || !edges {
+		t.Fatalf("OriginReferences = %v, %t; want the deferred root's source", references, edges)
+	}
+}
+
 func TestSnapshotLedgerFinalBarrierIsDurableAndOriginScoped(t *testing.T) {
 	directory := filepath.Join(t.TempDir(), "graph")
 	graph, err := Open(directory)

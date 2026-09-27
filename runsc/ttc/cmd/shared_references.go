@@ -1090,7 +1090,12 @@ func (s *sharedReferenceService) ApplySharedSnapshotReference(_ context.Context,
 		return fmt.Errorf("shared reference object %s does not belong to snapshot %d", object, snapshotID)
 	}
 	wantPrefix := fmt.Sprintf("root/publication-bridge/%016x/", snapshotID)
-	if !strings.HasPrefix(name, wantPrefix) {
+	// The volatile provider also retains the claims on the snapshot this way,
+	// its own and those other nodes retained with it, before its handoff
+	// commits (keepProviderReferences). A claim is released as any other is,
+	// by its bindings.
+	claim := retain && strings.HasPrefix(name, fmt.Sprintf("remote/%d/", snapshotID))
+	if !strings.HasPrefix(name, wantPrefix) && !claim {
 		return fmt.Errorf("invalid publication bridge name %q for snapshot %d", name, snapshotID)
 	}
 	if retain {

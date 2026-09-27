@@ -309,6 +309,9 @@ type distributedSourceRuntime struct {
 	// owner that placement reconciliation last brought the family's record in
 	// line with.
 	syncedOwners sync.Map
+	// providerChecks has, by operation, the providerCheck of each provider
+	// claim that its last check found still needed.
+	providerChecks sync.Map
 	// parked has, by container ID, a count of the times this daemon parked
 	// runtime memory backings of the container: see noteParked.
 	parkedMu sync.Mutex
@@ -2106,6 +2109,10 @@ func (b *runtimeBackend) exportDistributedGraph(containerID, transactionID strin
 	}); err != nil {
 		return cluster.GraphHandoffDescriptor{}, nil, nil, fmt.Errorf("publishing live graph reference ledger: %w", err)
 	}
+	references, _ := b.snapshotGraph.OriginReferences(origin)
+	if err := publisher.keepProviderReferences(origin, "", references); err != nil {
+		return cluster.GraphHandoffDescriptor{}, nil, nil, err
+	}
 	if err := b.distributedSource.authority.PublishSnapshotOrigin(b.nodeID, b.distributedSource.incarnation, uint64(origin)); err != nil {
 		return cluster.GraphHandoffDescriptor{}, nil, nil, fmt.Errorf("publishing live graph authority: %w", err)
 	}
@@ -2392,6 +2399,10 @@ func (b *runtimeBackend) publishVolatileFilesystemOriginContext(ctx context.Cont
 		if err := publisher.publishSharedReferenceLedger(origin, changes, bridgeIntent); err != nil {
 			return fmt.Errorf("transferring filesystem origin %d reference authority: %w", origin, err)
 		}
+		references, _ := repository.OriginReferences(origin)
+		if err := publisher.keepProviderReferences(origin, repository.Path(), references); err != nil {
+			return err
+		}
 		if err := b.distributedSource.authority.PublishSnapshotOrigin(b.nodeID, b.distributedSource.incarnation, uint64(origin)); err != nil {
 			return fmt.Errorf("publishing filesystem origin %d authority: %w", origin, err)
 		}
@@ -2472,6 +2483,10 @@ func (b *runtimeBackend) resumeFrozenFilesystemOrigin(origin ttcsnapshot.Snapsho
 			}
 			if err := publisher.publishSharedReferenceLedger(origin, changes, bridgeIntent); err != nil {
 				return fmt.Errorf("transferring filesystem origin %d reference authority: %w", origin, err)
+			}
+			references, _ := repository.OriginReferences(origin)
+			if err := publisher.keepProviderReferences(origin, repository.Path(), references); err != nil {
+				return err
 			}
 			if err := b.distributedSource.authority.PublishSnapshotOrigin(b.nodeID, b.distributedSource.incarnation, uint64(origin)); err != nil {
 				return fmt.Errorf("publishing filesystem origin %d authority: %w", origin, err)

@@ -1339,6 +1339,10 @@ func (p *branchPublisher) publishVolatileGraphOrigin(ctx context.Context, snapsh
 	}); err != nil {
 		return fmt.Errorf("transferring snapshot origin %d reference authority: %w", snapshot, err)
 	}
+	references, _ := p.graph.OriginReferences(snapshot)
+	if err := p.keepProviderReferences(snapshot, "", references); err != nil {
+		return err
+	}
 	if err := p.authority.PublishSnapshotOrigin(p.nodeID, p.incarnation, uint64(snapshot)); err != nil {
 		return fmt.Errorf("publishing snapshot origin %d authority: %w", snapshot, err)
 	}
@@ -1460,6 +1464,10 @@ func (p *branchPublisher) resumeFrozenGraphOrigin(ctx context.Context, snapshot 
 		}); err != nil {
 			return fmt.Errorf("transferring snapshot origin %d reference authority: %w", snapshot, err)
 		}
+		references, _ := p.graph.OriginReferences(snapshot)
+		if err := p.keepProviderReferences(snapshot, "", references); err != nil {
+			return err
+		}
 		if err := p.authority.PublishSnapshotOrigin(p.nodeID, p.incarnation, uint64(snapshot)); err != nil {
 			return fmt.Errorf("publishing snapshot origin %d authority: %w", snapshot, err)
 		}
@@ -1534,6 +1542,10 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 				if err := p.publishSharedReferenceLedger(snapshot, changes, bridgeIntent); err != nil {
 					return fmt.Errorf("transferring snapshot origin %d reference authority: %w", branch.SnapshotID, err)
 				}
+				references, _ := p.graph.OriginReferences(snapshot)
+				if err := p.keepProviderReferences(snapshot, "", references); err != nil {
+					return err
+				}
 				handoffOrigins = append(handoffOrigins, branch.SnapshotID)
 			}
 		}
@@ -1578,6 +1590,11 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 					if err := p.publishSharedReferenceLedger(origin, changes, bridgeIntent); err != nil {
 						repository.Close()
 						return fmt.Errorf("transferring filesystem snapshot origin %d reference authority: %w", origin, err)
+					}
+					references, _ := repository.OriginReferences(origin)
+					if err := p.keepProviderReferences(origin, repository.Path(), references); err != nil {
+						repository.Close()
+						return err
 					}
 					handoffOrigins = append(handoffOrigins, encodedOrigin)
 				}
