@@ -5414,6 +5414,35 @@ func (s Store) FilesystemSnapshotOrigins() (map[ttcsnapshot.SnapshotID]struct{},
 	return origins, nil
 }
 
+// FrozenFilesystemOrigins returns, in order, the filesystem origins whose
+// reference handoffs are frozen in any named or container repository.
+func (s Store) FrozenFilesystemOrigins() ([]ttcsnapshot.SnapshotID, error) {
+	manager, err := ttcvolume.OpenManager(s.activeRoot())
+	if err != nil {
+		return nil, err
+	}
+	paths, err := s.repositoryPaths(manager)
+	if err != nil {
+		return nil, err
+	}
+	var origins []ttcsnapshot.SnapshotID
+	for path := range paths {
+		repository, err := manager.OpenPrivate(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("opening repository %q for frozen origin inventory: %w", path, err)
+		}
+		origins = append(origins, repository.FrozenOriginHandoffs()...)
+		if err := repository.Close(); err != nil {
+			return nil, fmt.Errorf("closing repository %q after frozen origin inventory: %w", path, err)
+		}
+	}
+	sort.Slice(origins, func(i, j int) bool { return origins[i] < origins[j] })
+	return origins, nil
+}
+
 // PrepareFilesystemRetirementOrigins converts all surviving node-local
 // filesystem generations into immutable publication roots. Runtime fencing is
 // a precondition enforced by the node-retirement state machine; keeping the

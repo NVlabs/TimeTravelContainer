@@ -2215,7 +2215,8 @@ func (b *runtimeBackend) graphOriginPublisher() *branchPublisher {
 }
 
 // resumeFrozenOriginPublications rolls forward, in the background, the
-// handoffs of this node's memory origins that a crash left frozen.
+// handoffs of this node's memory and filesystem origins that a crash left
+// frozen.
 func resumeFrozenOriginPublications(b *runtimeBackend) {
 	if b == nil || b.snapshotGraph == nil || b.distributedSource == nil || b.distributedSource.authority == nil {
 		return
@@ -2224,6 +2225,17 @@ func resumeFrozenOriginPublications(b *runtimeBackend) {
 	for _, origin := range b.snapshotGraph.FrozenSnapshotLedgers() {
 		publisher.rollForwardFrozenOrigin(origin)
 	}
+	// Finding the filesystem origins opens every repository.
+	go func() {
+		origins, err := b.containerStore().FrozenFilesystemOrigins()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ttcd: finding frozen filesystem origin handoffs: %v\n", err)
+			return
+		}
+		for _, origin := range origins {
+			b.rollForwardFrozenFilesystemOrigin(origin)
+		}
+	}()
 }
 
 // publishVolatileFilesystemOrigin transfers one immutable filesystem origin
@@ -2376,12 +2388,117 @@ func (b *runtimeBackend) publishVolatileFilesystemOriginContext(ctx context.Cont
 		return nil
 	})
 	if err != nil {
+		// A handoff that failed after it froze cannot be canceled, and its
+		// repository refuses writes meanwhile: complete it.
+		b.rollForwardFrozenFilesystemOrigin(origin)
 		return err
 	}
 	if !found {
 		return fmt.Errorf("filesystem origin %d is absent from node-local repositories", origin)
 	}
 	return nil
+}
+
+// resumeFrozenFilesystemOrigin rolls forward the handoff of origin, a
+// filesystem origin of this node's whose repository a failed or interrupted
+// handoff left frozen, as resumeFrozenGraphOrigin does a memory origin's. A
+// frozen repository refuses every metadata transaction, so its branches'
+// writes wait for this. The handoff's pack exists, so the roll-forward starts
+// at the freeze: PublishOriginHandoff would first sync metadata, which the
+// freeze refuses.
+func (b *runtimeBackend) resumeFrozenFilesystemOrigin(origin ttcsnapshot.SnapshotID) error {
+	if origin == 0 || b.snapshotShared == nil || b.distributedSource == nil ||
+		b.distributedSource.authority == nil || b.sharedReferences == nil {
+		return errors.New("distributed filesystem publication is unavailable")
+	}
+	unlockOrigin := b.distributedSource.lockSnapshotOrigin(origin)
+	defer unlockOrigin()
+	// Only the exact retry of the operation that recorded a bridge may reuse
+	// it. Without one recorded yet, the handoff proceeds as the origin's own.
+	bridgeIntent, found, err := loadSharedPublicationBridgeIntent(b.dataRoot, origin)
+	if err != nil {
+		return err
+	}
+	if !found {
+		bridgeIntent = sharedPublicationBridgeIntent{Kind: sharedPublicationBridgeOrigin}
+	} else if bridgeIntent.Kind == sharedPublicationBridgePublication {
+		return errFrozenOriginOwned
+	}
+	provider, volatile, terminal, err := snapshotOriginAuthority(b.distributedSource.authority, origin)
+	if err != nil {
+		return err
+	}
+	publisher := &branchPublisher{
+		sharedRoot: b.dataRoot,
+		nodeID:     b.nodeID, incarnation: b.distributedSource.incarnation,
+		authority: b.distributedSource.authority, graphShared: b.snapshotShared,
+		sharedRefs: b.sharedReferences, peers: b.distributedSource,
+	}
+	_, err = b.containerStore().WithFilesystemSnapshotOrigin(origin, func(repository *ttcvolume.Repository) error {
+		if !repository.OriginHandoffFrozen(origin) {
+			return nil
+		}
+		if terminal {
+			// The origin was abandoned or retired: no handoff of it
+			// completes, and no shared ledger counts its references any more.
+			return repository.CancelOriginHandoff(origin)
+		}
+		if volatile && provider.NodeID != b.nodeID {
+			return fmt.Errorf("filesystem origin %d is frozen here but provided by node %q", origin, provider.NodeID)
+		}
+		if _, err := b.snapshotShared.Manifest(origin); err != nil {
+			return fmt.Errorf("reading frozen filesystem origin %d manifest: %w", origin, err)
+		}
+		if volatile {
+			changes, err := repository.FreezeOriginHandoff(origin)
+			if err != nil {
+				return fmt.Errorf("reading filesystem origin %d reference handoff: %w", origin, err)
+			}
+			if err := publisher.publishSharedReferenceLedger(origin, changes, bridgeIntent); err != nil {
+				return fmt.Errorf("transferring filesystem origin %d reference authority: %w", origin, err)
+			}
+			if err := b.distributedSource.authority.PublishSnapshotOrigin(b.nodeID, b.distributedSource.incarnation, uint64(origin)); err != nil {
+				return fmt.Errorf("publishing filesystem origin %d authority: %w", origin, err)
+			}
+		}
+		if err := repository.CompleteOriginHandoff(origin); err != nil {
+			return fmt.Errorf("completing filesystem origin %d handoff: %w", origin, err)
+		}
+		// A graph handoff's bridge lasts until its transaction ends, when the
+		// shared coordinator releases it. The origin's own ends here.
+		if bridgeIntent.Kind == sharedPublicationBridgeOrigin {
+			if err := publisher.releaseSharedPublicationBridge(origin); err != nil {
+				return fmt.Errorf("releasing filesystem origin %d publication bridge: %w", origin, err)
+			}
+		}
+		return nil
+	})
+	return err
+}
+
+// rollForwardFrozenFilesystemOrigin completes, in the background, the
+// handoff of origin, a filesystem origin whose repository a failed or
+// interrupted handoff left frozen, retrying until it completes, as
+// rollForwardFrozenOrigin does a memory origin's.
+func (b *runtimeBackend) rollForwardFrozenFilesystemOrigin(origin ttcsnapshot.SnapshotID) {
+	source := b.distributedSource
+	if source == nil || origin == 0 {
+		return
+	}
+	if _, running := source.rollingForward.LoadOrStore(origin, struct{}{}); running {
+		return
+	}
+	go func() {
+		defer source.rollingForward.Delete(origin)
+		for delay := time.Second; ; delay = min(2*delay, 30*time.Second) {
+			err := b.resumeFrozenFilesystemOrigin(origin)
+			if err == nil || errors.Is(err, errFrozenOriginOwned) {
+				return
+			}
+			fmt.Fprintf(os.Stderr, "ttcd: completing the frozen handoff of filesystem origin %d: %v\n", origin, err)
+			time.Sleep(delay)
+		}
+	}()
 }
 
 type snapshotProviderLookup interface {

@@ -851,6 +851,18 @@ func (r *Repository) FreezeOriginHandoff(origin ttcsnapshot.SnapshotID) ([]ttcsn
 	return changes, err
 }
 
+// FrozenOriginHandoffs returns, in order, the origins whose reference
+// handoffs are frozen. Until each completes, the repository refuses metadata
+// transactions, so its branches' writes wait.
+func (r *Repository) FrozenOriginHandoffs() []ttcsnapshot.SnapshotID {
+	return r.graph.FrozenSnapshotLedgers()
+}
+
+// OriginHandoffFrozen reports whether origin's reference handoff is frozen.
+func (r *Repository) OriginHandoffFrozen(origin ttcsnapshot.SnapshotID) bool {
+	return r.graph.SnapshotLedgerFrozen(origin)
+}
+
 // CompleteOriginHandoff changes the local graph into a non-authoritative
 // shared cache view after Raft has committed the provider-to-shared switch.
 func (r *Repository) CompleteOriginHandoff(origin ttcsnapshot.SnapshotID) error {
