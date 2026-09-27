@@ -574,6 +574,34 @@ func TestDaemonRejectsUnsupportedRuntimePlatform(t *testing.T) {
 	}
 }
 
+// A graph handoff that found an inherited load not yet durable is reinstalled
+// until it succeeds, but not more often than once an interval: each attempt
+// starts a relay. Any other failure is final.
+func TestGraphHandoffAwaitingAnInheritedLoadIsReinstalled(t *testing.T) {
+	if !graphHandoffAwaitsInheritedLoad("inherited distributed memory load is not durable yet") {
+		t.Error("a handoff awaiting an inherited load is not retried")
+	}
+	if graphHandoffAwaitsInheritedLoad("inherited distributed memory load failed before graph handoff: EIO") {
+		t.Error("a handoff whose inherited load failed is retried")
+	}
+	r := &daemonTargetRuntime{backend: &runtimeBackend{dataRoot: t.TempDir()}}
+	tx := &cluster.Transaction{
+		Identity:     cluster.ForkIdentity{TransactionID: "fork-1", TargetContainer: "family"},
+		GraphHandoff: &cluster.GraphHandoffDescriptor{GraphSnapshot: 1},
+	}
+	// The target is missing, so an attempt fails.
+	if err := r.reinstallGraphHandoffEventually(context.Background(), tx); err == nil {
+		t.Fatal("reinstalling the handoff of a missing target succeeded")
+	}
+	if err := r.reinstallGraphHandoffEventually(context.Background(), tx); err != nil {
+		t.Fatalf("a handoff was reinstalled again within the interval: %v", err)
+	}
+	r.handoffReinstalls.Store(tx.Identity.TransactionID, time.Now().Add(-graphHandoffReinstallInterval))
+	if err := r.reinstallGraphHandoffEventually(context.Background(), tx); err == nil {
+		t.Fatal("a handoff was not reinstalled once the interval passed")
+	}
+}
+
 func TestDaemonRootMustBeOnALocalFilesystem(t *testing.T) {
 	original := daemonStatfs
 	t.Cleanup(func() { daemonStatfs = original })

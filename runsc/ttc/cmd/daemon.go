@@ -996,6 +996,9 @@ type daemonTargetRuntime struct {
 	// still make progress concurrently up to the per-family serialization in
 	// lockTarget.
 	independence sync.Map
+	// handoffReinstalls has, by transaction, when its graph handoff, which
+	// awaits an inherited load, was last reinstalled.
+	handoffReinstalls sync.Map
 }
 
 const dependencyMonitorConcurrency = 2
@@ -1786,6 +1789,34 @@ func (r *daemonTargetRuntime) waitGraphHandoff(ctx context.Context, tx *cluster.
 	}
 }
 
+// graphHandoffInheritedLoadNotDurable is the error of a Sentry's graph
+// handoff that found a load its branch inherited from another transaction not
+// yet durable.
+const graphHandoffInheritedLoadNotDurable = "inherited distributed memory load is not durable yet"
+
+// graphHandoffReinstallInterval bounds how often a graph handoff that awaits
+// an inherited load is reinstalled: each attempt starts a relay.
+const graphHandoffReinstallInterval = time.Second
+
+// graphHandoffAwaitsInheritedLoad reports whether a graph handoff that failed
+// with message only awaits an inherited load, whose own handoff makes it
+// durable: reinstalled then, the handoff succeeds.
+func graphHandoffAwaitsInheritedLoad(message string) bool {
+	return strings.Contains(message, graphHandoffInheritedLoadNotDurable)
+}
+
+// reinstallGraphHandoffEventually reinstalls tx's graph handoff unless it was
+// reinstalled less than graphHandoffReinstallInterval ago. The caller holds
+// the target's lock.
+func (r *daemonTargetRuntime) reinstallGraphHandoffEventually(ctx context.Context, tx *cluster.Transaction) error {
+	now := time.Now()
+	if last, ok := r.handoffReinstalls.Load(tx.Identity.TransactionID); ok && now.Sub(last.(time.Time)) < graphHandoffReinstallInterval {
+		return nil
+	}
+	r.handoffReinstalls.Store(tx.Identity.TransactionID, now)
+	return r.handoffLocked(ctx, tx, *tx.GraphHandoff)
+}
+
 // refreshDistributedGraphHandoffsAtStartup replaces every retained target's
 // immutable-memory relay before the node is admitted for new work. Snapshot
 // identity is unchanged; only unresolved page faults are redirected to a new
@@ -1951,8 +1982,18 @@ func (r *daemonTargetRuntime) MarkIndependent(ctx context.Context, tx *cluster.T
 			return errors.New("graph memory handoff is still in progress")
 		}
 		if status.Error != "" {
-			return fmt.Errorf("graph memory handoff failed: %s", status.Error)
+			if !graphHandoffAwaitsInheritedLoad(status.Error) {
+				return fmt.Errorf("graph memory handoff failed: %s", status.Error)
+			}
+			// The handoff found that a load the branch inherited from another
+			// transaction was not yet durable, which that transaction's own
+			// handoff makes it. Reinstall it until it succeeds.
+			if err := r.reinstallGraphHandoffEventually(ctx, tx); err != nil {
+				return fmt.Errorf("reinstalling graph memory handoff that awaits an inherited load: %w", err)
+			}
+			return errors.New("graph memory handoff awaits an inherited load and is still in progress")
 		}
+		r.handoffReinstalls.Delete(tx.Identity.TransactionID)
 	} else if branch.DependentMemoryBytes != 0 {
 		output, err := r.backend.command("timetravel", info.ID, "distributed-dependency", branch.ID)
 		if err != nil {
