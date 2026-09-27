@@ -619,6 +619,17 @@ func (fs *filesystem) persistDiskWriteMetadataRaw(inode *inode) error {
 	return nil
 }
 
+// diskInodeReaped reports whether err, from the repository about node, says
+// that node is gone because it was destroyed meanwhile. A flush takes the dirty
+// inodes before it updates them, and the last reference to an unlinked inode
+// may be dropped in between, which reaps the inode from the repository: its
+// metadata and data no longer matter.
+func diskInodeReaped(node *inode, err error) bool {
+	// The low half of the count is the real references; a concurrent
+	// TryIncRef adds a speculative one above it, even to a destroyed inode.
+	return errors.Is(err, stdfs.ErrNotExist) && int32(node.refs.ReadRefs()) == 0
+}
+
 // flushDiskWriteMetadata publishes metadata deferred by ordinary regular-file
 // writes. liveForkFiles contains every live regular file, including unlinked
 // files that remain reachable through an open description.
@@ -664,15 +675,26 @@ func (fs *filesystem) flushDiskWriteMetadataRaw() error {
 		})
 		node.mu.Unlock()
 	}
-	if len(pending) == 0 {
-		return nil
-	}
-	updates := make([]ttcvolume.Inode, len(pending))
-	for idx := range pending {
-		updates[idx] = pending[idx].metadata
-	}
-	if err := fs.diskVolume.Repository.UpdateMetadataBatch(fs.diskVolume.Branch, updates); err != nil {
-		return fmt.Errorf("updating inode metadata batch: %w", err)
+	for len(pending) != 0 {
+		updates := make([]ttcvolume.Inode, len(pending))
+		for idx := range pending {
+			updates[idx] = pending[idx].metadata
+		}
+		err := fs.diskVolume.Repository.UpdateMetadataBatch(fs.diskVolume.Branch, updates)
+		if err == nil {
+			break
+		}
+		// Update the others without the inodes reaped since they were taken.
+		live := pending[:0]
+		for _, update := range pending {
+			if !diskInodeReaped(update.inode, err) {
+				live = append(live, update)
+			}
+		}
+		if len(live) == len(pending) {
+			return fmt.Errorf("updating inode metadata batch: %w", err)
+		}
+		pending = live
 	}
 	for _, update := range pending {
 		fs.finishDiskInodeMetadata(update.inode, update.generation)
@@ -696,7 +718,7 @@ func (fs *filesystem) syncDiskData() error {
 	}
 	fs.liveForkMu.Unlock()
 	for _, file := range files {
-		if err := fs.diskVolume.Repository.SyncData(fs.diskVolume.Branch, file.inode.ino, false); err != nil {
+		if err := fs.diskVolume.Repository.SyncData(fs.diskVolume.Branch, file.inode.ino, false); err != nil && !diskInodeReaped(&file.inode, err) {
 			return diskVolumeError("sync regular-file data", err)
 		}
 	}

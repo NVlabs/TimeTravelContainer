@@ -493,6 +493,73 @@ func TestDiskVolumeReapedOrphanLeavesNoSaveCache(t *testing.T) {
 	}
 }
 
+func TestDiskVolumeFlushSkipsAnInodeReapedAfterItWasTaken(t *testing.T) {
+	manager, err := ttcvolume.OpenManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := manager.Create("reaped-flush-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	fs := &filesystem{
+		diskVolume:    &diskVolumeState{Repository: repository, Branch: ttcvolume.MainBranch},
+		diskInodes:    make(map[uint64]*inode),
+		liveForkFiles: make(map[*regularFile]struct{}),
+	}
+	fs.inodesUsed.Store(2)
+	newFile := func(name string) *regularFile {
+		ino, err := repository.CreateRegular(ttcvolume.MainBranch, ttcvolume.RootInode, name, 0600, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		file := &regularFile{}
+		file.inode.fs = fs
+		file.inode.impl = file
+		file.inode.ino = ino
+		file.inode.mode.Store(uint32(linux.S_IFREG | 0600))
+		file.inode.nlink.Store(1)
+		file.inode.refs.InitRefs()
+		file.diskMmap.SetFD(-1)
+		fs.diskInodes[ino] = &file.inode
+		fs.liveForkFiles[file] = struct{}{}
+		return file
+	}
+	// A file replaced by a rename, as `mv new name` replaces it, whose last
+	// reference is dropped: the repository reaps it.
+	replaced := newFile("replaced")
+	if err := repository.Unlink(ttcvolume.MainBranch, ttcvolume.RootInode, "replaced"); err != nil {
+		t.Fatal(err)
+	}
+	replaced.inode.nlink.Store(0)
+	replaced.inode.decRef(contexttest.Context(t))
+	// A flush took it as dirty just before, beside a live file it must update.
+	kept := newFile("kept")
+	kept.inode.mode.Store(uint32(linux.S_IFREG | 0640))
+	fs.markDiskInodeDirty(&kept.inode)
+	fs.markDiskInodeDirty(&replaced.inode)
+	fs.markDiskFileDirty(replaced)
+	if err := fs.flushDiskWriteMetadata(); err != nil {
+		t.Fatalf("flushDiskWriteMetadata with a reaped inode: %v", err)
+	}
+	if meta, err := repository.Inode(ttcvolume.MainBranch, kept.inode.ino); err != nil || meta.Mode != 0640 {
+		t.Fatalf("live inode after the flush: mode %o, %v; want 0640", meta.Mode, err)
+	}
+	// A live inode the repository lacks is still an error.
+	lost := newFile("lost")
+	if err := repository.Unlink(ttcvolume.MainBranch, ttcvolume.RootInode, "lost"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ReapOrphan(ttcvolume.MainBranch, lost.inode.ino); err != nil {
+		t.Fatal(err)
+	}
+	fs.markDiskInodeDirty(&lost.inode)
+	if err := fs.flushDiskWriteMetadata(); err == nil {
+		t.Fatal("flushDiskWriteMetadata of a live inode the repository lacks succeeded")
+	}
+}
+
 func TestDiskNamespaceSavePrunesClosedPathsAndRestoresSource(t *testing.T) {
 	fs := &filesystem{diskVolume: &diskVolumeState{}}
 	newDir := func() *directory {

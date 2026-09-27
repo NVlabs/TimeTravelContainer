@@ -401,7 +401,7 @@ func (rf *regularFile) flushDiskMetadataRawLocked() error {
 	if generation == 0 {
 		return nil
 	}
-	if err := rf.inode.fs.persistDiskWriteMetadataRaw(&rf.inode); err != nil {
+	if err := rf.inode.fs.persistDiskWriteMetadataRaw(&rf.inode); err != nil && !diskInodeReaped(&rf.inode, err) {
 		return err
 	}
 	rf.inode.fs.finishDiskFileMetadata(rf, generation)
