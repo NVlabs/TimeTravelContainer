@@ -12186,13 +12186,6 @@ type runtimeSandboxState struct {
 	Status string `json:"status"`
 }
 
-// runtimeStopped reports whether output, of runsc's state, says the container
-// has stopped.
-func runtimeStopped(output []byte) bool {
-	var state runtimeSandboxState
-	return json.Unmarshal(output, &state) == nil && state.Status == "stopped"
-}
-
 // listRuntimeSandboxes reads only runsc's host-side state. It deliberately
 // does not contact a Sentry control server, so teardown can still discover and
 // force-delete a sandbox whose branch RPC endpoint is unavailable.
@@ -15639,8 +15632,7 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 		})
 	}
 	if persistentBranch.State == "dehydrated" {
-		stateOutput, stateErr := b.command("state", info.ID)
-		if stateErr != nil {
+		if _, stateErr := b.command("state", info.ID); stateErr != nil {
 			if ttcbundle.ResidentDehydration(*persistentBranch) {
 				return b.lostResidentDehydration(target, info)
 			}
@@ -15672,25 +15664,33 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 		if err := json.Unmarshal(output, &runtimeBranches); err != nil {
 			return fmt.Errorf("decoding runtime branches: %w", err)
 		}
-		present := false
+		present, activePeer := false, false
 		for _, runtimeBranch := range runtimeBranches {
 			if runtimeBranch.ID == target.branch {
 				present = true
-				break
+			} else if runtimeBranch.State == "running" || runtimeBranch.State == "paused" {
+				activePeer = true
 			}
+		}
+		// A runtime that runs no branch any more, whose container stopped with
+		// the last branch that ran here, can run none again: runsc refuses exec
+		// and the like on a stopped container, and a peer restore needs a live
+		// branch to restore beside. Its Sentry may still be exiting and answer,
+		// as a stale shell's does not, or keep the captures of other dehydrated
+		// branches. Make those durable, remove it, and rebuild from the image.
+		rebuild := func() error {
+			if err := b.persistResidentDehydrations(info, nil); err != nil {
+				return err
+			}
+			_, _ = b.command("delete", "--force", info.ID)
+			return rehydrateCold(false)
 		}
 		if !present {
 			if ttcbundle.ResidentDehydration(*persistentBranch) {
 				return b.lostResidentDehydration(target, info)
 			}
-			// A runtime that runs no branch any more, whose container stopped
-			// with the last branch that ran here, can run none again: runsc
-			// refuses exec and the like on a stopped container. Its Sentry may
-			// still be exiting and answer, as a stale shell's does not. Remove
-			// it and rebuild from the durable image.
-			if len(runtimeBranches) == 0 && runtimeStopped(stateOutput) {
-				_, _ = b.command("delete", "--force", info.ID)
-				return rehydrateCold(false)
+			if !activePeer {
+				return rebuild()
 			}
 			return rehydrateCold(true)
 		}
@@ -15704,11 +15704,8 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 			if _, err := b.command("timetravel", info.ID, "destroy", target.branch); err != nil {
 				return fmt.Errorf("discarding the superseded capture of %s: %w", target, err)
 			}
-			// A runtime whose only branch the capture was has none to
-			// restore the branch beside: rebuild it.
-			if len(runtimeBranches) == 1 {
-				_, _ = b.command("delete", "--force", info.ID)
-				return rehydrateCold(false)
+			if !activePeer {
+				return rebuild()
 			}
 			return rehydrateCold(true)
 		}

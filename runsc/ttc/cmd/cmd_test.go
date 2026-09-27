@@ -4362,19 +4362,6 @@ exit 0
 	}
 }
 
-func TestRuntimeStopped(t *testing.T) {
-	for output, want := range map[string]bool{
-		`{"ociVersion":"1.0.2","id":"family","pid":0,"status":"stopped","bundle":"/b"}`: true,
-		`{"ociVersion":"1.0.2","id":"family","pid":7,"status":"running","bundle":"/b"}`: false,
-		`{"id":"family","status":"created"}`:                                            false,
-		`not json`:                                                                      false,
-	} {
-		if got := runtimeStopped([]byte(output)); got != want {
-			t.Errorf("runtimeStopped(%s) = %t, want %t", output, got, want)
-		}
-	}
-}
-
 func TestRuntimeDiagnostics(t *testing.T) {
 	dataRoot := t.TempDir()
 	b := &runtimeBackend{dataRoot: dataRoot}
