@@ -7,10 +7,8 @@
 #
 #     https://www.apache.org/licenses/LICENSE-2.0
 
-# Qualifies recovery of a whole cluster whose daemons crashed together. A
-# restarted daemon remains alive in an explicit quorum-wait state, so that an
-# operator can start the other from the same shell, until one of them takes the
-# authority over from the crashed one.
+# Qualifies recovery of a whole cluster whose daemons crashed together. Every
+# node starts alike: both restart at once, as the jobs of a batch system would.
 set -eu
 
 TTC=${TTC:-ttc}
@@ -66,14 +64,21 @@ wait_ready() {
 }
 
 restart_cluster() {
-	# Neither start waits for full admission. Both daemons remain fenced until
-	# one takes the authority over, once the crashed holder's counter in the
-	# shared root has stood still, and commits their registration.
-	start_a=$(start_node a "$PORT_A")
-	printf '%s\n' "$start_a" | grep -q 'waiting for cluster quorum'
-	client a daemon status | jq -e '.state == "starting" and .waiting_for_cluster_quorum == true' >/dev/null
-	start_b=$(start_node b "$PORT_B")
-	printf '%s\n' "$start_b" | grep -q 'waiting for cluster quorum'
+	# A restarting daemon admits itself only once it reaches every node whose
+	# lease is still active, the other crashed one among them: start both at
+	# once. One takes the authority over, once the crashed holder's counter in
+	# the shared root has stood still.
+	start_node a "$PORT_A" >"$ROOT/start-a.out" 2>&1 &
+	start_a=$!
+	start_node b "$PORT_B" >"$ROOT/start-b.out" 2>&1 &
+	start_b=$!
+	status=0
+	wait "$start_a" || status=$?
+	wait "$start_b" || status=$?
+	if test "$status" -ne 0; then
+		cat "$ROOT/start-a.out" "$ROOT/start-b.out" >&2
+		return "$status"
+	fi
 	wait_ready
 }
 
