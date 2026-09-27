@@ -97,6 +97,7 @@ go_test(
         "daemon_statfs_test_linux.go",
         "daemon_terminal_test.go",
         "daemon_test.go",
+        "distributed_publish_test.go",
         "elastic_capacity_test.go",
         "elastic_cluster_test.go",
         "events_test.go",

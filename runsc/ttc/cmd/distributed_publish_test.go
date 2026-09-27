@@ -80,7 +80,7 @@ func TestSnapshotOriginAuthorityDistinguishesTombstones(t *testing.T) {
 
 func TestProviderBaselineReleaseWaitsForSharedAuthority(t *testing.T) {
 	object := ttcsnapshot.ObjectID{Snapshot: 17, Kind: ttcsnapshot.ObjectKindMetadata, Ordinal: 1}
-	state := &cluster.AuthorityState{VolatileOrigins: map[uint64]cluster.SnapshotProvider{17: {NodeID: "node-a"}}}
+	state := &cluster.AuthorityState{VolatileOrigins: map[uint64]cluster.SnapshotOriginProvider{17: {NodeID: "node-a"}}}
 	for _, name := range []string{"root/filesystem/branch-a", "pin/open/branch-a"} {
 		if providerBaselineCanBeReleased(state, name, object) {
 			t.Fatalf("volatile provider baseline %q was releasable", name)
@@ -89,7 +89,7 @@ func TestProviderBaselineReleaseWaitsForSharedAuthority(t *testing.T) {
 		if !providerBaselineCanBeReleased(state, name, object) {
 			t.Fatalf("shared provider baseline %q was not releasable", name)
 		}
-		state.VolatileOrigins[17] = cluster.SnapshotProvider{NodeID: "node-a"}
+		state.VolatileOrigins[17] = cluster.SnapshotOriginProvider{NodeID: "node-a"}
 	}
 	delete(state.VolatileOrigins, 17)
 	for _, name := range []string{"remote/17/operation/00000000", "edge/parent/0000", "root/bridge/edge/parent/0000", "root/cold/memory"} {
@@ -111,7 +111,7 @@ func TestInactiveGraphReferenceReconciliationReleasesOnlyFencedClaims(t *testing
 	}
 	desired := map[string]ttcsnapshot.ObjectID{"remote/17/live/00000000": sharedLive}
 	state := cluster.NewAuthorityState()
-	state.VolatileOrigins[19] = cluster.SnapshotProvider{NodeID: "provider"}
+	state.VolatileOrigins[19] = cluster.SnapshotOriginProvider{NodeID: "provider"}
 	mutations, err := inactiveGraphReferenceMutations(state, current, desired)
 	if err != nil {
 		t.Fatal(err)
@@ -121,8 +121,8 @@ func TestInactiveGraphReferenceReconciliationReleasesOnlyFencedClaims(t *testing
 	}
 	ledger := ttcsnapshot.NewReferenceLedger()
 	objects := []ttcsnapshot.Object{
-		{ID: sharedDead, Kind: sharedDead.Kind, State: ttcsnapshot.ObjectLive},
-		{ID: sharedLive, Kind: sharedLive.Kind, State: ttcsnapshot.ObjectLive},
+		{ID: sharedDead, State: ttcsnapshot.ObjectLive},
+		{ID: sharedLive, State: ttcsnapshot.ObjectLive},
 	}
 	if err := ledger.ImportOrigin(sharedDead.Snapshot, objects, map[string]ttcsnapshot.ObjectID{
 		"remote/17/dead/00000000":    sharedDead,
@@ -193,7 +193,7 @@ func TestProviderBaselineReferencesAreOriginScoped(t *testing.T) {
 	for _, origin := range []ttcsnapshot.SnapshotID{11, 13} {
 		root := ttcsnapshot.ObjectID{Snapshot: origin, Kind: ttcsnapshot.ObjectKindMetadata, Ordinal: 1}
 		references := providerBaselineReferences(origin, map[string]ttcsnapshot.ObjectID{providerName: root})
-		if err := ledger.ImportOrigin(origin, []ttcsnapshot.Object{{ID: root, Kind: ttcsnapshot.ObjectKindMetadata, State: ttcsnapshot.ObjectLive}}, references); err != nil {
+		if err := ledger.ImportOrigin(origin, []ttcsnapshot.Object{{ID: root, State: ttcsnapshot.ObjectLive}}, references); err != nil {
 			t.Fatalf("import origin %d: %v", origin, err)
 		}
 		wantName := providerBaselineReferenceName(origin, providerName)
@@ -213,7 +213,7 @@ func TestProviderBaselineReferencesAreOriginScoped(t *testing.T) {
 func TestManifestReferenceLivenessFollowsParentAuthority(t *testing.T) {
 	state := &cluster.AuthorityState{
 		NextSnapshotID:   64,
-		VolatileOrigins:  map[uint64]cluster.SnapshotProvider{},
+		VolatileOrigins:  map[uint64]cluster.SnapshotOriginProvider{},
 		AbandonedOrigins: map[uint64]bool{},
 		RetiredOrigins:   map[uint64]cluster.SharedPackRetirement{},
 	}
@@ -247,7 +247,7 @@ func TestPublicationBridgePinsProviderRootsAcrossHandoff(t *testing.T) {
 	shared := ttcsnapshot.NewReferenceLedger()
 	origin := ttcsnapshot.SnapshotID(17)
 	root := ttcsnapshot.ObjectID{Snapshot: origin, Kind: ttcsnapshot.ObjectKindMetadata, Ordinal: 1}
-	objects := []ttcsnapshot.Object{{ID: root, Kind: ttcsnapshot.ObjectKindMetadata, State: ttcsnapshot.ObjectLive}}
+	objects := []ttcsnapshot.Object{{ID: root, State: ttcsnapshot.ObjectLive}}
 	baseline := map[string]ttcsnapshot.ObjectID{"root/branch/main": root}
 	if err := provider.ImportOrigin(origin, objects, baseline); err != nil {
 		t.Fatal(err)
@@ -362,7 +362,7 @@ func TestPublicationBridgeIntentAdoptsTerminalTransaction(t *testing.T) {
 		Kind: sharedPublicationBridgeOrigin, CreatedAt: old.CreatedAt.Add(time.Second),
 	}
 	state := cluster.NewAuthorityState()
-	state.VolatileOrigins[old.Snapshot] = cluster.SnapshotProvider{NodeID: "node-a"}
+	state.VolatileOrigins[old.Snapshot] = cluster.SnapshotOriginProvider{NodeID: "node-a"}
 	state.Transactions[old.Transaction] = cluster.Transaction{State: cluster.TransactionPublished}
 	if err := persistSharedPublicationBridgeIntentWithAuthority(root, replacement, state); err == nil {
 		t.Fatal("live transaction bridge was adopted")
@@ -480,11 +480,50 @@ func TestDistributedHandoffSchedulerCapsConcurrentWork(t *testing.T) {
 	}
 }
 
+// A handoff scheduled for later is pending meanwhile, so that retirement waits
+// for it, but leaves every worker to the handoffs scheduled now.
+func TestDelayedHandoffHoldsNoWorker(t *testing.T) {
+	runtime := &distributedSourceRuntime{}
+	delayed := make(chan struct{})
+	runtime.scheduleHandoffAfter(200*time.Millisecond, func() { close(delayed) })
+	if pending := runtime.handoffCount.Load(); pending != 1 {
+		t.Fatalf("%d handoffs pending, want the delayed one", pending)
+	}
+	started := make(chan struct{}, distributedHandoffConcurrency)
+	release := make(chan struct{})
+	for i := 0; i < distributedHandoffConcurrency; i++ {
+		runtime.scheduleHandoff(func() {
+			started <- struct{}{}
+			<-release
+		})
+	}
+	for i := 0; i < distributedHandoffConcurrency; i++ {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatalf("%d of %d handoffs scheduled now started while a delayed one waited", i, distributedHandoffConcurrency)
+		}
+	}
+	close(release)
+	select {
+	case <-delayed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the delayed handoff never ran")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for runtime.handoffCount.Load() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d handoffs still pending after all ran", runtime.handoffCount.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestDistributedSourceMonitorPollingIsBounded(t *testing.T) {
 	runtime := &distributedSourceRuntime{}
-	finishes := make([]func(), 256)
-	for i := range finishes {
-		finishes[i] = runtime.beginSourceMonitor()
+	finish := make(chan struct{})
+	for range 256 {
+		runtime.scheduleSourceMonitor(func() { <-finish })
 	}
 	if got := runtime.sourceMonitorInterval(); got != 16*time.Second {
 		t.Fatalf("256-monitor interval=%s, want 16s", got)
@@ -508,11 +547,13 @@ func TestDistributedSourceMonitorPollingIsBounded(t *testing.T) {
 		release()
 	}
 	second()
-	for _, finish := range finishes {
-		finish()
-	}
-	if got := runtime.monitorCount.Load(); got != 0 {
-		t.Fatalf("monitor count=%d, want 0", got)
+	close(finish)
+	deadline := time.Now().Add(5 * time.Second)
+	for runtime.monitorCount.Load() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("monitor count=%d, want 0", runtime.monitorCount.Load())
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
