@@ -91,6 +91,13 @@ func TestSharedPackPublicationAndRandomAccess(t *testing.T) {
 	if extents != 3 {
 		t.Fatalf("bulk object has %d extents, want 3", extents)
 	}
+	// A caller's manifest is its own: the reads below go by the store's.
+	for index := range manifest.Objects {
+		manifest.Objects[index].Object.BulkLength++
+		for extent := range manifest.Objects[index].Extents {
+			manifest.Objects[index].Extents[extent].Offset++
+		}
+	}
 	reader, length, err := shared.Fetch(context.Background(), id)
 	if err != nil {
 		t.Fatal(err)

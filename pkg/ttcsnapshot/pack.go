@@ -205,7 +205,7 @@ func (store *SharedPackStore) publish(ctx context.Context, graph *Store, snapsho
 		_ = syscall.Flock(int(lease.Fd()), syscall.LOCK_UN)
 		_ = lease.Close()
 	}()
-	if _, err := store.Manifest(snapshot); err == nil {
+	if _, err := store.manifest(snapshot); err == nil {
 		// The manifest is the immutable authority point. Provider reference
 		// counts may already have moved to the shared ledger, so a post-handoff
 		// retry must not compare them with the former local graph.
@@ -489,6 +489,17 @@ func cloneManifest(manifest *SnapshotManifest) *SnapshotManifest {
 // Manifest opens and structurally validates an authoritative manifest and its
 // pack headers without reading bulk data.
 func (store *SharedPackStore) Manifest(snapshot SnapshotID) (*SnapshotManifest, error) {
+	manifest, err := store.manifest(snapshot)
+	if err != nil {
+		return nil, err
+	}
+	return cloneManifest(manifest), nil
+}
+
+// manifest is Manifest without the copy, for the callers here that only read
+// it: copying a memory image's manifest, of thousands of objects, for each of
+// its thousands of chunks made reading them quadratic.
+func (store *SharedPackStore) manifest(snapshot SnapshotID) (*SnapshotManifest, error) {
 	path := filepath.Join(store.snapshotDirectory(snapshot), sharedManifestName)
 	file, err := os.Open(path)
 	if err != nil {
@@ -501,7 +512,7 @@ func (store *SharedPackStore) Manifest(snapshot SnapshotID) (*SnapshotManifest, 
 	}
 	store.mu.Lock()
 	if cached, ok := store.manifests[snapshot]; ok && cached.manifest != nil && cached.info != nil && os.SameFile(cached.info, info) && cached.info.Size() == info.Size() && cached.info.ModTime().Equal(info.ModTime()) {
-		result := cloneManifest(cached.manifest)
+		result := cached.manifest
 		store.mu.Unlock()
 		file.Close()
 		return result, nil
@@ -523,9 +534,9 @@ func (store *SharedPackStore) Manifest(snapshot SnapshotID) (*SnapshotManifest, 
 		return nil, err
 	}
 	store.mu.Lock()
-	store.manifests[snapshot] = cachedSharedManifest{manifest: cloneManifest(&manifest), info: info}
+	store.manifests[snapshot] = cachedSharedManifest{manifest: &manifest, info: info}
 	store.mu.Unlock()
-	return cloneManifest(&manifest), nil
+	return &manifest, nil
 }
 
 func packedObjectByID(manifest *SnapshotManifest, id ObjectID) (PackedObject, bool) {
@@ -542,7 +553,7 @@ func packedObjectByID(manifest *SnapshotManifest, id ObjectID) (PackedObject, bo
 // It is the shared-storage counterpart of Store.ResolveObject and is used by
 // lazy filesystem catalogs.
 func (store *SharedPackStore) Object(id ObjectID) (Object, error) {
-	manifest, err := store.Manifest(id.Snapshot)
+	manifest, err := store.manifest(id.Snapshot)
 	if err != nil {
 		return Object{}, err
 	}
@@ -564,7 +575,7 @@ func (store *SharedPackStore) Objects(ids []ObjectID) (map[ObjectID]Object, erro
 		bySnapshot[id.Snapshot] = append(bySnapshot[id.Snapshot], id)
 	}
 	for snapshot, group := range bySnapshot {
-		manifest, err := store.Manifest(snapshot)
+		manifest, err := store.manifest(snapshot)
 		if err != nil {
 			return nil, err
 		}
@@ -597,7 +608,7 @@ func (store *SharedPackStore) ReadObjectRange(ctx context.Context, id ObjectID, 
 		_ = syscall.Flock(int(lease.Fd()), syscall.LOCK_UN)
 		_ = lease.Close()
 	}()
-	manifest, err := store.Manifest(id.Snapshot)
+	manifest, err := store.manifest(id.Snapshot)
 	if err != nil {
 		return 0, err
 	}
@@ -869,7 +880,7 @@ func (store *SharedPackStore) Fetch(ctx context.Context, id ObjectID) (io.ReadCl
 	if err != nil {
 		return nil, 0, err
 	}
-	manifest, err := store.Manifest(id.Snapshot)
+	manifest, err := store.manifest(id.Snapshot)
 	if err != nil {
 		syscall.Flock(int(lease.Fd()), syscall.LOCK_UN)
 		lease.Close()

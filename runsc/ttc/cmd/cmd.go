@@ -16302,12 +16302,17 @@ func (b *runtimeBackend) openGraphMemoryRestore(capture boot.BranchDehydrateInfo
 	// faults depend on the lifetime of the control daemon that rehydrated it.
 	shared := b.snapshotShared != nil
 	if shared {
+		ids := make([]ttcsnapshot.ObjectID, 0, len(missing))
+		for id := range missing {
+			ids = append(ids, id)
+		}
+		stored, err := b.snapshotShared.Objects(ids)
+		shared = err == nil
 		for id, object := range missing {
-			stored, err := b.snapshotShared.Object(id)
-			if err != nil || stored.BulkLength != object.BulkLength {
-				shared = false
+			if !shared {
 				break
 			}
+			shared = stored[id].BulkLength == object.BulkLength
 		}
 	}
 	if shared {

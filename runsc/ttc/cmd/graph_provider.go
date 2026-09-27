@@ -572,16 +572,7 @@ func (b *runtimeBackend) lazyImmutableSnapshotCatalog(ctx context.Context, roots
 			if b.snapshotShared == nil {
 				return ttcsnapshot.Object{}, errors.New("shared snapshot repository is unavailable")
 			}
-			manifest, err := b.snapshotShared.Manifest(id.Snapshot)
-			if err != nil {
-				return ttcsnapshot.Object{}, err
-			}
-			for _, packed := range manifest.Objects {
-				if packed.Object.ID == id {
-					return packed.Object, nil
-				}
-			}
-			return ttcsnapshot.Object{}, os.ErrNotExist
+			return b.snapshotShared.Object(id)
 		}
 		if provider.NodeID == b.nodeID {
 			return ttcsnapshot.Object{}, fmt.Errorf("local node owns snapshot %d but has no sealed graph metadata", id.Snapshot)
