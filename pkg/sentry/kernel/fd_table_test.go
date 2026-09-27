@@ -15,6 +15,7 @@
 package kernel
 
 import (
+	"math"
 	"runtime"
 	"testing"
 
@@ -103,6 +104,33 @@ func TestFDTableMany(t *testing.T) {
 		fdTable.Remove(ctx, i)
 		if fds, err := fdTable.NewFDs(ctx, 0, []*vfs.FileDescription{fd}, FDFlags{}); err != nil || fds[0] != i {
 			t.Fatalf("Allocated %v FDs but wanted to allocate %v: %v", i, maxFD, err)
+		}
+	})
+}
+
+// Removing an FD that is not open leaves the table as it was, however large
+// the FD: tmux's close(0x7fffffff) used to grow it to 32 MiB.
+func TestFDTableRemoveOfUnopenedFDDoesNotGrow(t *testing.T) {
+	runTest(t, func(ctx context.Context, fdTable *FDTable, fd *vfs.FileDescription, _ *limits.LimitSet) {
+		if _, err := fdTable.NewFDs(ctx, 0, []*vfs.FileDescription{fd}, FDFlags{}); err != nil {
+			t.Fatal(err)
+		}
+		before := fdTable.CurrentMaxFDs()
+		for _, unopened := range []int32{1, fdsPerBucket + 1, MaxFdLimit - 1, math.MaxInt32} {
+			if file := fdTable.Remove(ctx, unopened); file != nil {
+				t.Fatalf("Remove(%d) of an unopened FD returned a file", unopened)
+			}
+			if after := fdTable.CurrentMaxFDs(); after != before {
+				t.Fatalf("Remove(%d) of an unopened FD grew the table from %d to %d FDs", unopened, before, after)
+			}
+		}
+		if slice := *fdTable.slice.Load(); len(slice) > 0 && slice[0].Load() == nil {
+			t.Fatal("the bucket of the open FD disappeared")
+		}
+		if file := fdTable.Remove(ctx, 0); file == nil {
+			t.Fatal("Remove(0) did not return the open file")
+		} else {
+			file.DecRef(ctx)
 		}
 	})
 }

@@ -99,6 +99,12 @@ func (f *FDTable) set(fd int32, file *vfs.FileDescription, flags FDFlags) *vfs.F
 	bucketN := fd >> fdsPerBucketShift
 	// Grow the table as required.
 	if length := len(*slicePtr); int(bucketN) >= length {
+		if file == nil {
+			// Nothing beyond the table can be cleared. Growing it to cover fd
+			// would allocate for nothing: close(0x7fffffff), which tmux calls,
+			// grew it to 32 MiB.
+			return nil
+		}
 		newLen := int(bucketN) + 1
 		if newLen < 2*length {
 			// Ensure the table at least doubles in size without going over the limit.
@@ -116,6 +122,9 @@ func (f *FDTable) set(fd int32, file *vfs.FileDescription, flags FDFlags) *vfs.F
 
 	bucket := slice[bucketN].Load()
 	if bucket == nil {
+		if file == nil {
+			return nil
+		}
 		bucket = &descriptorBucket{}
 		slice[bucketN].Store(bucket)
 	}
