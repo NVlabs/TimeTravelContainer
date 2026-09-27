@@ -1,6 +1,6 @@
 # HVF memory footprint: demand-paged stage 2
 
-*Status: in progress, September 2026; phases 1-3 of the delivery plan are
+*Status: in progress, September 2026; phases 1-4 of the delivery plan are
 implemented. Measurements: Apple M5 Pro, macOS 26.5.2.*
 
 ## Summary
@@ -27,10 +27,12 @@ Progress, for the same container and sequence:
 | Phase 1: FD-table fix, 1 MiB thread stacks, no checkpoint gofer | 233 MiB | 305 MiB |
 | Phase 2: Sentry image mirrored on first EL1 touch | 109 MiB | 192 MiB |
 | Phase 3: monitor page-table pool grown on demand | 93 MiB | 176 MiB |
+| Phase 4: Go runtime regions mirrored on first EL1 touch | 55 MiB | 137 MiB |
 
-What remains at idle: Go runtime regions (72 MiB, against a live heap of
-11-20 MiB), thread stacks (5 MiB), copies of the image text that EL1 has run
-(3 MiB), guest RAM (3 MiB), and the rest of the EL1 monitor (2 MiB).
+What remains at idle: Go runtime regions (33 MiB: the live heap of 11-20
+MiB, memory the scavenger has not yet returned, and runtime metadata), thread
+stacks (5 MiB), copies of the image text that EL1 has run (3 MiB), guest RAM
+(3 MiB), and the rest of the EL1 monitor (2 MiB).
 
 A busy guest adds a second large cost: GuestRAM keeps a `guestFrame`, a
 mapping set, and two index entries for every 4 KiB guest frame, about 300
@@ -135,9 +137,9 @@ Principles, in KVM's terms:
 
 | Memory | Today | Proposed | Expected per family |
 |---|---|---|---|
-| Go runtime regions | Whole region imported on first touch; frees suppressed | Imported in windows on first touch; unmapped before release, imported again on reuse | tracks the live heap: 73 to ~20 MiB idle, and falls after spikes |
+| Go runtime regions | Imported in 2 MiB windows on first touch (phase 4); frees of mirrored windows suppressed | Unmapped before release, imported again on reuse | tracks the live heap, and falls after spikes |
 | Thread stacks | 1 MiB stacks, each imported whole | Imported in windows | ~2 MiB |
-| Writable image | Imported in 48 KiB windows on first touch (phase 2) | unchanged | under 1 MiB |
+| Writable image | Imported in 528 KiB windows on first touch (phases 2 and 4) | unchanged | about 1 MiB |
 | `__TEXT` | Private copies of 48 KiB windows on first touch (phase 2) | One copy per binary UUID in a shared object, mapped read+exec | ~0; 40.6 MiB once per host |
 | `__DATA_CONST`, `__LINKEDIT` | Private copies of windows on first touch (phase 2) | unchanged (contents are slid per process) | under 1 MiB |
 | Monitor page-table pool | 2 MiB, doubled on demand (phase 3) | unchanged | under twice the pages in use, or 16 MiB more |
@@ -170,9 +172,15 @@ Each phase stands alone and is measured before the next.
    rather than 16, and double it on exhaustion through the existing
    expansion protocol. An idle Sentry uses 0.8 MiB of it and `apt-get update`
    1.5 MiB.
-4. **Runtime regions and stacks on first touch:** import them in windows too.
-   Their guest-only data, such as the objects that the guest-critical section
-   of `tryRunResidentMonitor` reads, must then be imported first as well.
+4. **Runtime regions on first touch (done).** Import the Go runtime's regions
+   in 2 MiB windows too; a heap arena is 64 MiB, while the live heap is a few
+   MiB. The guest-critical section of `tryRunResidentMonitor` now reads the
+   heap before it starts and probes the stack its calls use, so neither can
+   take a host gate inside it. The allocator's frontier moves through the
+   heap, so windows narrower than 2 MiB cost more host gates; the writable
+   image, where the runtime's hot globals live, went back to 528 KiB windows
+   for the same reason. Timings match phase 2's. Stacks are still imported
+   whole: the native runtime hooks run on them.
 5. **Release instead of suppress** in the runtime VM hook.
 6. **Compact GuestRAM frame metadata.** Not HVF-specific, but only VM
    platforms keep it.

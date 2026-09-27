@@ -1520,7 +1520,7 @@ func TestApplicationSyscallBurstStaysInGuest(t *testing.T) {
 	var beforeResidentMonitor ring0BridgeStats
 	var responseBytes []byte
 	direct := false
-	for attempt := 0; attempt < 20 && !direct; attempt++ {
+	for attempt := 0; attempt < 64 && !direct; attempt++ {
 		if ring0asm.CurrentEL() == 0 {
 			// Let the runtime finish the work that needed the host.
 			time.Sleep(time.Millisecond)
@@ -1537,7 +1537,9 @@ func TestApplicationSyscallBurstStaysInGuest(t *testing.T) {
 			direct = true
 		case 0:
 			// An unrelated runtime host service can export this continuation
-			// during allocation-free command preparation. Re-enter and retry the
+			// during allocation-free command preparation, as can the first EL1
+			// touch of each window of the Sentry image and heap along this path,
+			// about 20 of them in a fresh engine. Re-enter and retry the
 			// already-idempotent mapping to exercise the direct transaction.
 		default:
 			t.Fatalf("two-slab executable monitor mutation used %d cache-sync HVCs: before=%+v after=%+v", delta, beforeResidentMonitor, stats)

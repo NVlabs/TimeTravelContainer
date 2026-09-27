@@ -44,10 +44,13 @@ const (
 	ring0HostVALimit          = uint64(1 << 48)
 	ring0HostMirrorGPAStart   = SentryMirrorIPAStart
 	// A demand import maps the slabs within this radius of the one requested.
-	// The Sentry image uses a narrower radius: EL1 touches it sparsely, and
-	// every slab of it imported is a private copy or commit.
+	// The Sentry image's read-only segments, mostly code, use a narrower
+	// radius: EL1 runs little of it, and every slab imported is a private
+	// copy. The Go runtime's regions use a wider one, since the heap's
+	// allocation frontier moves through them.
 	ring0HostWorkingSetRadius = uint64(256 << 10)
 	ring0HostImageRadius      = uint64(16 << 10)
+	ring0HostRuntimeRadius    = uint64(1 << 20)
 	ring0MonitorVCPUID        = 63
 	stateApplicationFP        = 0x3000
 	stateRing0Entry           = 0x3340
@@ -67,6 +70,16 @@ const (
 	stateRealtimeOffsetNS       = 0x3388
 	stateGuestCritical          = 0x3390
 	applicationResidencyQuantum = time.Millisecond
+)
+
+// Darwin VM tags of the host memory that the Sentry mirror may import: the
+// patched Go runtime's mappings, the native bridge's, ttc_mmap_anon's (VM
+// memory such as GuestRAM and the monitor), and pthread stacks.
+const (
+	vmMemoryTTCRuntime = uint32(240)
+	vmMemoryTTCBridge  = uint32(241)
+	vmMemoryTTCVM      = uint32(242)
+	vmMemoryStack      = uint32(30)
 )
 
 // MaxApplicationVCPUs is the number of HVF vCPU IDs available to application
@@ -516,6 +529,12 @@ func (e *ring0Engine) tryRunResidentMonitor(ctx context.Context, encoded []byte)
 		}
 		return nil, true, err
 	}
+	// The guest-critical section below must not take a host gate either: the
+	// heap and stack it uses may not be mirrored yet. Read the heap here, and
+	// touch the stack that its calls use.
+	monitorEntry := monitorCodeVA + cpu.vcpu.monitor.commandCallOffset
+	stateVA := cpu.vcpu.stateVA
+	ring0asm.ProbeStack()
 	critical := (*uint64)(unsafe.Add(unsafe.Pointer(cpu.vcpu.stateHost), stateGuestCritical))
 	atomic.StoreUint64(critical, 1)
 	// A cancellation may have safely exported this Go continuation while it
@@ -538,10 +557,7 @@ func (e *ring0Engine) tryRunResidentMonitor(ctx context.Context, encoded []byte)
 			return nil, true, fmt.Errorf("HVF native bridge rejected a validated executable GuestRAM range")
 		}
 	}
-	ring0asm.RunMonitorGuest(
-		monitorCodeVA+cpu.vcpu.monitor.commandCallOffset,
-		cpu.vcpu.stateVA,
-	)
+	ring0asm.RunMonitorGuest(monitorEntry, stateVA)
 	atomic.StoreUint64(critical, 0)
 	if vmLocked {
 		e.vm.mu.Unlock()
@@ -1521,12 +1537,6 @@ func (e *ring0Engine) hostSlabCanMirror(region ring0HostRegion, address uintptr)
 	if _, _, ok := e.vm.canonicalGPAForHost(address); ok {
 		return true
 	}
-	const (
-		vmMemoryTTCRuntime = uint32(240)
-		vmMemoryTTCBridge  = uint32(241)
-		vmMemoryTTCVM      = uint32(242)
-		vmMemoryStack      = uint32(30)
-	)
 	return !region.externalPager &&
 		(region.userTag == vmMemoryTTCRuntime || region.userTag == vmMemoryTTCBridge ||
 			region.userTag == vmMemoryTTCVM || region.userTag == vmMemoryStack)
@@ -2111,20 +2121,23 @@ func (e *ring0Engine) extendHostMirror(ctx context.Context) error {
 			continue
 		}
 		regionEnd := region.address + uintptr(region.length)
-		if region.protection&ring0VMWrite != 0 && !region.mainImage {
-			// Go heap and stack spans grow throughout an existing Mach region.
-			// Importing a touched writable region as one run avoids a demand-fault
-			// storm across Sentry objects. The image is imported in windows like
-			// read-only memory: most of it, such as Go's FIPS entropy buffer,
-			// is never touched at EL1.
+		if region.protection&ring0VMWrite != 0 && !region.mainImage && region.userTag != vmMemoryTTCRuntime {
+			// Stacks grow throughout an existing Mach region, and importing one
+			// as a whole avoids a demand-fault storm. The image and the Go
+			// runtime's regions are imported in windows like read-only memory:
+			// EL1 touches little of either. A Go heap arena is 64 MiB, while
+			// the live heap is a few MiB, and most of the image, such as Go's
+			// FIPS entropy buffer, is never touched at EL1.
 			for address := region.address; address < regionEnd; address += uintptr(vmm.HostSlabSize) {
 				addSlab(region, address, access, stage2Access)
 			}
 			continue
 		}
 		radius := ring0HostWorkingSetRadius
-		if region.mainImage {
+		if region.mainImage && region.protection&ring0VMWrite == 0 {
 			radius = ring0HostImageRadius
+		} else if region.userTag == vmMemoryTTCRuntime {
+			radius = ring0HostRuntimeRadius
 		}
 		for requested := range pendingSlabs {
 			if requested < region.address || requested >= regionEnd {
@@ -2328,13 +2341,13 @@ func (e *ring0Engine) refreshHostMirror(ctx context.Context) error {
 			return workingSetAddresses[i] >= region.address
 		})
 		workingSetRegion := workingSetIndex < len(workingSetAddresses) && workingSetAddresses[workingSetIndex] < regionEnd
-		bootstrapOwned := region.userTag == 240 || region.userTag == 242
-		if region.protection&ring0VMWrite != 0 && !region.mainImage &&
-			(workingSetRegion || bootstrap && bootstrapOwned) {
-			// At bootstrap, import each complete explicitly owned region so a
-			// pre-existing Go or VMM object cannot spuriously redpill based on its
-			// placement. Demand mapping retains the narrower working-set rule for
-			// tagged mappings created after bootstrap.
+		if region.protection&ring0VMWrite != 0 && !region.mainImage && region.userTag != vmMemoryTTCRuntime &&
+			(workingSetRegion || bootstrap && region.userTag == vmMemoryTTCVM) {
+			// At bootstrap, import each complete VM region so a pre-existing VMM
+			// object cannot redpill based on its placement. Go runtime regions,
+			// like the image, are imported in windows as EL1 touches them.
+			// Demand mapping retains the narrower working-set rule for tagged
+			// mappings created after bootstrap.
 			for offset := uint64(0); offset < region.length; offset += vmm.HostSlabSize {
 				addSlab(region.address + uintptr(offset))
 			}
@@ -2342,8 +2355,10 @@ func (e *ring0Engine) refreshHostMirror(ctx context.Context) error {
 		}
 		forEachInRegion(retainedSlabs, region.address, regionEnd, addSlab)
 		radius := ring0HostWorkingSetRadius
-		if region.mainImage {
+		if region.mainImage && region.protection&ring0VMWrite == 0 {
 			radius = ring0HostImageRadius
+		} else if region.userTag == vmMemoryTTCRuntime {
+			radius = ring0HostRuntimeRadius
 		}
 		forEachInRegion(workingSetAddresses, region.address, regionEnd, func(address uintptr) {
 			windowStart := address

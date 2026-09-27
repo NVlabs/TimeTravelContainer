@@ -206,6 +206,14 @@ TEXT ·CurrentELTrapAddress(SB),NOSPLIT,$0-8
 	MOVD R0, ret+0(FP)
 	RET
 
+// ProbeStack writes the 512 bytes of stack below its caller's frame. A
+// guest-critical sequence probes the stack its calls will use first, so that
+// a host gate for a stack slab not yet mirrored happens before the sequence.
+TEXT ·ProbeStack(SB),$512-0
+	MOVD ZR, 8(RSP)
+	MOVD ZR, 504(RSP)
+	RET
+
 // guestCodeBodies stores the entry of each assembly body above that may
 // execute at EL1. These are the ABI0 symbols; Go callers reach them through
 // generated ABIInternal wrappers, which GuestCode reports separately.

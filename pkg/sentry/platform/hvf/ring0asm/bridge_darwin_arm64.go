@@ -110,6 +110,9 @@ func EnsureHostTrapAddress() uintptr
 // CurrentSP returns the current Go stack pointer.
 func CurrentSP() uintptr
 
+// ProbeStack writes the 512 bytes of stack below its caller's frame.
+func ProbeStack()
+
 // CurrentEL returns 0 at Darwin EL0 and 1 for a resident Sentry continuation
 // at guest EL1. The EL0 MRS is handled as a controlled SIGILL before any vCPU
 // is created or accessed.
