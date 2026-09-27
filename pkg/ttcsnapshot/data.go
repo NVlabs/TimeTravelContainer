@@ -58,6 +58,103 @@ type LocalDataStore struct {
 	// make durable.
 	namesMu       sync.Mutex
 	unsyncedNames map[string]unsyncedName
+	// chunkCache makes sweeps keep, within memoryChunkCacheTarget, memory
+	// chunks their graph no longer holds: those of origins the graph does not
+	// hold as its own, whose images the shared store has, and which a restore
+	// on this node reads again rather than fetch. A publication releases its
+	// node's roots of the image it hands to the shared store, and rehydrating
+	// the branch on the node then fetched every chunk back. The oldest are
+	// removed first.
+	chunkCache bool
+	// chunkCacheLimit, if nonzero, replaces memoryChunkCacheTarget, for tests.
+	chunkCacheLimit int64
+}
+
+// EnableMemoryChunkCache makes sweeps keep memory chunks of origins their
+// graph does not hold as its own, as a node's cache of shared images.
+func (store *LocalDataStore) EnableMemoryChunkCache() {
+	store.gcMu.Lock()
+	defer store.gcMu.Unlock()
+	store.chunkCache = true
+}
+
+// memoryChunkCacheTarget bounds the cached chunks a sweep keeps: an eighth of
+// the store's filesystem, as a node's image cache takes a quarter, from
+// 256 MiB to 32 GiB, and no more than a quarter of its free space, which
+// other stores on the filesystem may be caching into.
+func (store *LocalDataStore) memoryChunkCacheTarget() uint64 {
+	var stat unix.Statfs_t
+	var err error
+	if store.rootFD != nil {
+		err = unix.Fstatfs(int(store.rootFD.Fd()), &stat)
+	} else {
+		err = unix.Statfs(store.root, &stat)
+	}
+	if err != nil {
+		return 0
+	}
+	capacity := stat.Blocks * uint64(stat.Bsize)
+	target := capacity / 8
+	const (
+		minimum = uint64(256 << 20)
+		maximum = uint64(32 << 30)
+	)
+	if target < minimum && capacity >= minimum {
+		target = minimum
+	}
+	return min(target, maximum, stat.Bavail*uint64(stat.Bsize)/4)
+}
+
+// cachedChunk is a memory chunk a sweep keeps though its graph no longer
+// holds it.
+type cachedChunk struct {
+	id ObjectID
+	// name is the chunk's file, relative to the store's root descriptor if it
+	// has one.
+	name     string
+	modified int64
+	bytes    int64
+}
+
+// keepsAsCache reports whether a sweep keeps id, which graph does not hold,
+// as a cached chunk: a memory chunk of an origin graph does not hold as its
+// own.
+func (store *LocalDataStore) keepsAsCache(graph *Store, id ObjectID) bool {
+	if !store.chunkCache || id.Kind != ObjectKindMemoryChunk {
+		return false
+	}
+	snapshot, ok := graph.Snapshot(id.Snapshot)
+	return !ok || snapshot.State == SnapshotShared
+}
+
+// evictCachedChunks removes the oldest of chunks until those left fit the
+// cache's bound, each with remove.
+func (store *LocalDataStore) evictCachedChunks(chunks []cachedChunk, remove func(string) error) (int, error) {
+	if len(chunks) == 0 {
+		return 0, nil
+	}
+	limit := store.chunkCacheLimit
+	if limit == 0 {
+		limit = int64(store.memoryChunkCacheTarget())
+	}
+	var total int64
+	for _, chunk := range chunks {
+		total += chunk.bytes
+	}
+	sort.Slice(chunks, func(i, j int) bool { return chunks[i].modified < chunks[j].modified })
+	removed := 0
+	for _, chunk := range chunks {
+		if total <= limit {
+			break
+		}
+		store.forgetUnsyncedName(chunk.id)
+		if err := remove(chunk.name); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return removed, err
+		}
+		total -= chunk.bytes
+		removed++
+	}
+	return removed, nil
 }
 
 type unsyncedName struct {
@@ -1148,7 +1245,7 @@ func (store *LocalDataStore) quarantineRelative(relative string) error {
 // repository descriptor. It intentionally never follows symlinks. Unknown
 // non-directory entries are quarantined just like the path-backed collector,
 // while empty implementation-owned shard directories are removed bottom-up.
-func (store *LocalDataStore) reclaimRelative(graph *Store, relative string) (removed, quarantined int, err error) {
+func (store *LocalDataStore) reclaimRelative(graph *Store, relative string, cache *[]cachedChunk) (removed, quarantined int, err error) {
 	directory, err := store.openRelative(relative, unix.O_RDONLY|unix.O_DIRECTORY, 0)
 	if errors.Is(err, unix.ENOENT) {
 		return 0, 0, nil
@@ -1171,7 +1268,7 @@ func (store *LocalDataStore) reclaimRelative(graph *Store, relative string) (rem
 			return removed, quarantined, err
 		}
 		if stat.Mode&unix.S_IFMT == unix.S_IFDIR {
-			r, q, err := store.reclaimRelative(graph, child)
+			r, q, err := store.reclaimRelative(graph, child, cache)
 			removed += r
 			quarantined += q
 			if err != nil {
@@ -1201,6 +1298,10 @@ func (store *LocalDataStore) reclaimRelative(graph *Store, relative string) (rem
 		if _, ok := graph.Object(id); ok {
 			continue
 		}
+		if store.keepsAsCache(graph, id) {
+			*cache = append(*cache, cachedChunk{id: id, name: child, modified: stat.Mtim.Nano(), bytes: stat.Blocks * 512})
+			continue
+		}
 		store.forgetUnsyncedName(id)
 		if err := unix.Unlinkat(int(store.rootFD.Fd()), child, 0); err != nil && !errors.Is(err, unix.ENOENT) {
 			return removed, quarantined, err
@@ -1222,9 +1323,10 @@ func (store *LocalDataStore) ReclaimUnreferenced(graph *Store) (removed, quarant
 		return 0, 0, err
 	}
 	defer syscall.Flock(int(store.gcLock.Fd()), syscall.LOCK_UN)
+	var cache []cachedChunk
 	if store.rootFD != nil {
 		for _, kind := range []string{"pages", "memory-chunks", "files"} {
-			r, q, reclaimErr := store.reclaimRelative(graph, kind)
+			r, q, reclaimErr := store.reclaimRelative(graph, kind, &cache)
 			removed += r
 			quarantined += q
 			if reclaimErr != nil {
@@ -1234,7 +1336,10 @@ func (store *LocalDataStore) ReclaimUnreferenced(graph *Store) (removed, quarant
 				return removed, quarantined, err
 			}
 		}
-		return removed, quarantined, nil
+		evicted, err := store.evictCachedChunks(cache, func(name string) error {
+			return unix.Unlinkat(int(store.rootFD.Fd()), name, 0)
+		})
+		return removed + evicted, quarantined, err
 	}
 	quarantine := filepath.Join(store.root, "quarantine")
 	for _, kind := range []string{"pages", "memory-chunks", "files"} {
@@ -1279,6 +1384,16 @@ func (store *LocalDataStore) ReclaimUnreferenced(graph *Store) (removed, quarant
 			if _, ok := graph.Object(id); ok {
 				return nil
 			}
+			if store.keepsAsCache(graph, id) {
+				if info, err := entry.Info(); err == nil {
+					var blocks int64
+					if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+						blocks = stat.Blocks
+					}
+					cache = append(cache, cachedChunk{id: id, name: path, modified: info.ModTime().UnixNano(), bytes: blocks * 512})
+					return nil
+				}
+			}
 			store.forgetUnsyncedName(id)
 			if err := os.Remove(path); err != nil {
 				// A second LocalDataStore handle may have completed the same
@@ -1305,5 +1420,6 @@ func (store *LocalDataStore) ReclaimUnreferenced(graph *Store) (removed, quarant
 			return removed, quarantined, err
 		}
 	}
-	return removed, quarantined, nil
+	evicted, err := store.evictCachedChunks(cache, os.Remove)
+	return removed + evicted, quarantined, err
 }

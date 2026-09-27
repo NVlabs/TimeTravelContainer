@@ -6225,6 +6225,9 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 		if err != nil {
 			return fmt.Errorf("opening shared snapshot packs: %w", err)
 		}
+		// The node keeps the memory chunks of images the shared store has, as
+		// it keeps their image layers.
+		snapshotData.EnableMemoryChunkCache()
 	}
 	if err := validatePersistedMemoryGraph(ttcbundle.Store{Root: dataRoot, ActiveRoot: localRoot}); err != nil {
 		return fmt.Errorf("validating snapshot-graph branch records: %w", err)

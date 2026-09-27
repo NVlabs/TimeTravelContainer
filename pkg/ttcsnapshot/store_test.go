@@ -2631,3 +2631,80 @@ func TestRandomGraphReferenceAndReplayModel(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A cluster node's store keeps, within its bound, the memory chunks its graph
+// released of origins it does not hold as its own, whose images the shared
+// store has; the oldest go first. It removes the chunks of its graph's own
+// origins, and every other kind of object, as before.
+func TestReclaimUnreferencedKeepsCachedChunks(t *testing.T) {
+	for _, byDescriptor := range []bool{false, true} {
+		graph := openTestStore(t)
+		root := filepath.Join(t.TempDir(), "objects")
+		data, err := OpenLocalDataStore(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if byDescriptor {
+			directory, err := os.Open(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err = OpenLocalDataStoreFD(directory)
+			directory.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		data.EnableMemoryChunkCache()
+		own, err := graph.AllocateWorking()
+		if err != nil {
+			t.Fatal(err)
+		}
+		shared := own + 100
+		now := time.Now()
+		path := func(id ObjectID) string {
+			relative, err := objectRelativePath(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return filepath.Join(root, relative)
+		}
+		install := func(id ObjectID, age time.Duration) {
+			if err := data.Install(id, strings.NewReader("chunk"), 5); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chtimes(path(id), now.Add(-age), now.Add(-age)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		exists := func(id ObjectID) bool {
+			_, err := os.Stat(path(id))
+			return err == nil
+		}
+		older := ObjectID{Snapshot: shared, Kind: ObjectKindMemoryChunk, Ordinal: 1}
+		newer := ObjectID{Snapshot: shared, Kind: ObjectKindMemoryChunk, Ordinal: 2}
+		ownChunk := ObjectID{Snapshot: own, Kind: ObjectKindMemoryChunk, Ordinal: 1}
+		sharedFile := ObjectID{Snapshot: shared, Kind: ObjectKindFile, Ordinal: 3}
+		install(older, 2*time.Hour)
+		install(newer, time.Hour)
+		install(ownChunk, 0)
+		install(sharedFile, 0)
+		if removed, _, err := data.ReclaimUnreferenced(graph); err != nil || removed != 2 {
+			t.Fatalf("reclaim removed %d, %v; want the own origin's chunk and the file", removed, err)
+		}
+		if !exists(older) || !exists(newer) || exists(ownChunk) || exists(sharedFile) {
+			t.Fatalf("kept older %t newer %t own %t file %t; want only the shared chunks", exists(older), exists(newer), exists(ownChunk), exists(sharedFile))
+		}
+		info, err := os.Stat(path(newer))
+		if err != nil {
+			t.Fatal(err)
+		}
+		data.chunkCacheLimit = info.Sys().(*syscall.Stat_t).Blocks * 512
+		if removed, _, err := data.ReclaimUnreferenced(graph); err != nil || removed != 1 || exists(older) || !exists(newer) {
+			t.Fatalf("over its bound, reclaim removed %d, %v, kept older %t newer %t; want the older gone", removed, err, exists(older), exists(newer))
+		}
+		if err := data.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
