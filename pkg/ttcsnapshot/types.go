@@ -277,9 +277,12 @@ func validateObject(object Object) error {
 		}
 		seen[edge.Slot] = struct{}{}
 	}
-	sort.Slice(object.Children, func(i, j int) bool {
-		return object.Children[i].Slot < object.Children[j].Slot
-	})
+	// Sort edges only when they are not sorted: objects a graph's cached state
+	// shares are never written.
+	bySlot := func(i, j int) bool { return object.Children[i].Slot < object.Children[j].Slot }
+	if !sort.SliceIsSorted(object.Children, bySlot) {
+		sort.Slice(object.Children, bySlot)
+	}
 	return nil
 }
 

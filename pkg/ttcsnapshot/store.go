@@ -716,6 +716,7 @@ func (s *Store) rememberHead() error {
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.cacheStateLocked()
 	var err error
 	if s.journal != nil {
 		err = s.journal.Close()
@@ -901,6 +902,225 @@ func (s *Store) loadCurrentGeneration(repairTail bool) error {
 	return s.loadGeneration(head, repairTail)
 }
 
+// graphStates keeps, for the graphs this process has closed, the state each
+// had, with the generation and journal position it reflects. A filesystem
+// repository is opened afresh for each operation on it, and each open decoded
+// and validated its whole graph again, 1.8 s for a graph of 200,000 objects,
+// five times in one rehydration. An open that finds the generation's
+// checkpoint unchanged starts from the cached state, and replays only the
+// journal after it.
+var graphStates = graphStateCache{entries: make(map[graphFileIdentity]*cachedGraphState)}
+
+// graphStateCacheObjects bounds the objects of the cached states.
+const graphStateCacheObjects = 1 << 19
+
+// graphFileIdentity identifies a file of a graph, or its directory.
+type graphFileIdentity struct {
+	dev, ino    uint64
+	size, mtime int64
+}
+
+func fileIdentityAt(dirFD int, name string) (graphFileIdentity, error) {
+	var stat unix.Stat_t
+	if err := unix.Fstatat(dirFD, name, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return graphFileIdentity{}, err
+	}
+	return graphFileIdentity{dev: uint64(stat.Dev), ino: stat.Ino, size: stat.Size, mtime: stat.Mtim.Sec*1e9 + stat.Mtim.Nsec}, nil
+}
+
+// directoryIdentity identifies the store's directory; its size and time,
+// which its files' creation changes, are left out.
+func (s *Store) directoryIdentity() (graphFileIdentity, error) {
+	identity, err := fileIdentityAt(int(s.dirFD.Fd()), ".")
+	identity.size, identity.mtime = 0, 0
+	return identity, err
+}
+
+type cachedGraphState struct {
+	generation uint64
+	checkpoint graphFileIdentity
+	// journal is the journal's device and inode.
+	journal           graphFileIdentity
+	checkpointBytes   int64
+	checkpointObjects int
+	journalEnd        int64
+	// state is never written: a Store takes a copy of it.
+	state graphState
+	used  uint64
+}
+
+type graphStateCache struct {
+	mu sync.Mutex
+	// entries holds a state per graph directory.
+	entries map[graphFileIdentity]*cachedGraphState
+	objects int
+	uses    uint64
+}
+
+func (c *graphStateCache) get(directory graphFileIdentity, generation uint64, checkpoint graphFileIdentity) (*cachedGraphState, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[directory]
+	if !ok || entry.generation != generation || entry.checkpoint != checkpoint {
+		return nil, false
+	}
+	c.uses++
+	entry.used = c.uses
+	return entry, true
+}
+
+func (c *graphStateCache) put(directory graphFileIdentity, entry *cachedGraphState) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if previous, ok := c.entries[directory]; ok {
+		c.objects -= len(previous.state.Objects)
+		delete(c.entries, directory)
+	}
+	if len(entry.state.Objects) > graphStateCacheObjects {
+		return
+	}
+	c.uses++
+	entry.used = c.uses
+	c.entries[directory] = entry
+	c.objects += len(entry.state.Objects)
+	for c.objects > graphStateCacheObjects {
+		var oldest graphFileIdentity
+		var oldestEntry *cachedGraphState
+		for key, candidate := range c.entries {
+			if oldestEntry == nil || candidate.used < oldestEntry.used {
+				oldest, oldestEntry = key, candidate
+			}
+		}
+		c.objects -= len(oldestEntry.state.Objects)
+		delete(c.entries, oldest)
+	}
+}
+
+// shareGraphState returns a copy of state with maps of its own. Its objects
+// share their data and edges with state's, which no transaction writes in
+// place; its handoffs, whose mutations are appended to, are copied whole.
+func shareGraphState(state *graphState) graphState {
+	next := graphState{
+		Version: state.Version, Sequence: state.Sequence, NextSnapshot: state.NextSnapshot,
+		Snapshots: make(map[string]Snapshot, len(state.Snapshots)),
+		Objects:   make(map[string]Object, len(state.Objects)),
+		Roots:     make(map[string]ObjectID, len(state.Roots)),
+		Pins:      make(map[string]ObjectID, len(state.Pins)),
+		Frozen:    make(map[string]bool, len(state.Frozen)),
+		Handoffs:  make(map[string]SnapshotLedgerHandoff, len(state.Handoffs)),
+	}
+	for key, value := range state.Snapshots {
+		next.Snapshots[key] = value
+	}
+	for key, value := range state.Objects {
+		next.Objects[key] = value
+	}
+	for key, value := range state.Roots {
+		next.Roots[key] = value
+	}
+	for key, value := range state.Pins {
+		next.Pins[key] = value
+	}
+	for key, value := range state.Frozen {
+		next.Frozen[key] = value
+	}
+	for key, value := range state.Handoffs {
+		next.Handoffs[key] = cloneSnapshotLedgerHandoff(value)
+	}
+	return next
+}
+
+// cacheStateLocked records the store's state in graphStates.
+func (s *Store) cacheStateLocked() {
+	if s.poisoned != nil || s.journal == nil || s.dirFD == nil {
+		return
+	}
+	directory, err := s.directoryIdentity()
+	if err != nil {
+		return
+	}
+	checkpoint, err := fileIdentityAt(int(s.dirFD.Fd()), graphCheckpointName(s.generation))
+	if err != nil {
+		return
+	}
+	journal, err := fileIdentityAt(int(s.dirFD.Fd()), graphJournalName(s.generation))
+	if err != nil {
+		return
+	}
+	journal.size, journal.mtime = 0, 0
+	graphStates.put(directory, &cachedGraphState{
+		generation: s.generation, checkpoint: checkpoint, journal: journal, checkpointBytes: s.checkpointBytes,
+		checkpointObjects: s.checkpointObjects, journalEnd: s.journalEnd, state: shareGraphState(&s.state),
+	})
+}
+
+// loadCachedGeneration loads the generation head names from the state cached
+// of it, if its checkpoint is the one cached, and replays the journal after the
+// cached position.
+func (s *Store) loadCachedGeneration(head graphHead, repairTail bool) (bool, error) {
+	directory, err := s.directoryIdentity()
+	if err != nil {
+		return false, nil
+	}
+	checkpoint, err := fileIdentityAt(int(s.dirFD.Fd()), graphCheckpointName(head.Generation))
+	if err != nil {
+		return false, nil
+	}
+	cached, ok := graphStates.get(directory, head.Generation, checkpoint)
+	if !ok {
+		return false, nil
+	}
+	journal, err := s.openFile(graphJournalName(head.Generation), unix.O_RDWR, 0600)
+	if err != nil {
+		return false, nil
+	}
+	header := make([]byte, len(journalHeader))
+	var stat unix.Stat_t
+	statErr := unix.Fstat(int(journal.Fd()), &stat)
+	if _, readErr := journal.ReadAt(header, 0); readErr != nil || statErr != nil || string(header) != journalHeader ||
+		uint64(stat.Dev) != cached.journal.dev || stat.Ino != cached.journal.ino || stat.Size < cached.journalEnd {
+		journal.Close()
+		return false, nil
+	}
+	previous := s.journal
+	previousState := s.state
+	previousGeneration := s.generation
+	previousEnd := s.journalEnd
+	previousPoisoned := s.poisoned
+	s.state = shareGraphState(&cached.state)
+	s.journal = journal
+	s.generation = head.Generation
+	s.journalEnd = cached.journalEnd
+	s.rebuildDeferredObjectsLocked()
+	s.rebuildMemoryIndexesLocked()
+	restore := func() {
+		s.journal = previous
+		s.state = previousState
+		s.generation = previousGeneration
+		s.journalEnd = previousEnd
+		s.poisoned = previousPoisoned
+		s.rebuildDeferredObjectsLocked()
+		s.rebuildMemoryIndexesLocked()
+		journal.Close()
+	}
+	if err := s.replayJournalSuffix(repairTail); err != nil {
+		// The cached state and the journal disagree, or the journal is
+		// damaged: load from the checkpoint, which reports it.
+		restore()
+		return false, nil
+	}
+	if err := s.rememberHead(); err != nil {
+		restore()
+		return false, err
+	}
+	if previous != nil {
+		_ = previous.Close()
+	}
+	s.checkpointBytes = cached.checkpointBytes
+	s.checkpointObjects = cached.checkpointObjects
+	return true, nil
+}
+
 func (s *Store) loadGeneration(head graphHead, repairTail bool) error {
 	checkpointName := graphCheckpointName(head.Generation)
 	journalName := graphJournalName(head.Generation)
@@ -908,6 +1128,9 @@ func (s *Store) loadGeneration(head graphHead, repairTail bool) error {
 		if err := s.regularFile(name); err != nil {
 			return fmt.Errorf("validating selected TTC snapshot graph file %q: %w", name, err)
 		}
+	}
+	if loaded, err := s.loadCachedGeneration(head, repairTail); err != nil || loaded {
+		return err
 	}
 	data, err := s.readFile(checkpointName)
 	if err != nil {

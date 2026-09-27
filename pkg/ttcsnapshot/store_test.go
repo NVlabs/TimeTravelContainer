@@ -2708,3 +2708,129 @@ func TestReclaimUnreferencedKeepsCachedChunks(t *testing.T) {
 		}
 	}
 }
+
+// A graph reopened by the process that closed it starts from the state it
+// cached and replays only what was journaled after, and the result is the
+// graph a full load gives; a journal shorter than the cached position, or a
+// new generation, loads in full.
+func TestGraphReopenFromCachedState(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "graph")
+	forget := func() {
+		graphStates.mu.Lock()
+		defer graphStates.mu.Unlock()
+		graphStates.entries = make(map[graphFileIdentity]*cachedGraphState)
+		graphStates.objects = 0
+	}
+	open := func() *Store {
+		t.Helper()
+		graph, err := OpenExternallyCoordinated(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := graph.BeginExternalTransaction(); err != nil {
+			t.Fatal(err)
+		}
+		return graph
+	}
+	closeGraph := func(graph *Store) {
+		t.Helper()
+		if err := graph.EndExternalTransaction(); err != nil {
+			t.Fatal(err)
+		}
+		if err := graph.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	graph := open()
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 20; index++ {
+		if _, err := graph.CreateObject(origin, fmt.Sprintf("build/%d", index), ObjectKindFile, []byte{byte(index)}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := graph.CheckpointExternallyCoordinated(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := graph.CreateObject(origin, "build/after-checkpoint", ObjectKindFile, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	closeGraph(graph)
+
+	// A second handle appends while it is open; a third opens from the cached
+	// state and replays what the second appended.
+	second := open()
+	if _, err := second.CreateObject(origin, "build/second", ObjectKindFile, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.EndExternalTransaction(); err != nil {
+		t.Fatal(err)
+	}
+	// Read without a transaction, whose start would replay the journal too.
+	third, err := OpenExternallyCoordinated(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cached := third.Inspect()
+	if err := third.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+	forget()
+	full := open()
+	if !reflect.DeepEqual(full.Inspect(), cached) {
+		t.Fatal("the graph opened from the cached state differs from a full load")
+	}
+	closeGraph(full)
+
+	// With the checkpoint's bytes damaged but its identity kept, an open that
+	// succeeds read the cached state.
+	head, err := os.ReadFile(filepath.Join(dir, headFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var current graphHead
+	if err := json.Unmarshal(head, &current); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := filepath.Join(dir, graphCheckpointName(current.Generation))
+	info, err := os.Stat(checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(checkpoint, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt([]byte("#"), 0); err != nil {
+		t.Fatal(err)
+	}
+	file.Close()
+	if err := os.Chtimes(checkpoint, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	fromCache, err := OpenExternallyCoordinated(dir)
+	if err != nil {
+		t.Fatalf("opening over a damaged checkpoint with its identity kept: %v", err)
+	}
+	if !reflect.DeepEqual(fromCache.Inspect(), cached) {
+		t.Fatal("the graph opened over a damaged checkpoint did not come from the cached state")
+	}
+	if err := fromCache.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A journal shorter than the cached position loads in full, and so
+	// reports the damaged checkpoint.
+	journal := filepath.Join(dir, graphJournalName(current.Generation))
+	if err := os.Truncate(journal, int64(len(journalHeader))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenExternallyCoordinated(dir); err == nil {
+		t.Fatal("a journal cut below the cached position was not loaded in full")
+	}
+}
