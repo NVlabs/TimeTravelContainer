@@ -653,6 +653,72 @@ func TestRemoteDescriptorReadsCatalogAndFilesFromSharedPacks(t *testing.T) {
 	finishTestRemote(t, target, serverErr)
 }
 
+// A lazily imported branch reads and becomes independent of a source the
+// process reads itself, as it does of one served over a stream.
+func TestLocalObjectSourceServesSharedPacks(t *testing.T) {
+	sourceManager := openTestManager(t)
+	source, err := sourceManager.Create("source-local")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	ino, err := source.CreateRegular(MainBranch, RootInode, "artifact", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("read in process\n"), 90000)
+	if n, _, err := source.WriteAt(MainBranch, ino, payload, 0); err != nil || n != len(payload) {
+		t.Fatalf("WriteAt: %d, %v", n, err)
+	}
+	if err := source.Fork(MainBranch, "sealed"); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := source.DescribeRemoteSnapshot("sealed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared, err := ttcsnapshot.OpenSharedPackStore(filepath.Join(t.TempDir(), "shared"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, snapshot := range source.graph.Inspect().Snapshots {
+		if snapshot.State != ttcsnapshot.SnapshotWorking {
+			if err := shared.Publish(context.Background(), source.graph, snapshot.ID, source.data); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	targetManager := openTestManager(t)
+	target, err := targetManager.ImportPrivateRemoteDescriptorWithOrigins(filepath.Join(targetManager.root, "target-local"), "target-local", descriptor, "imported", 100, 101)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	catalog := testSharedCatalog{store: shared}
+	key := RemoteSourceKey(sha256.Sum256([]byte("rootfs-upper")))
+	if err := target.AttachLocalObjectSource(RemoteObjectSource{Key: key, Reader: catalog, Catalog: catalog}, "imported"); err != nil {
+		t.Fatal(err)
+	}
+	if got := readAll(t, target, "imported", ino); !bytes.Equal([]byte(got), payload) {
+		t.Fatal("the local source returned different contents")
+	}
+	if err := target.MaterializeRemoteObjects(); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := target.BranchRemoteSourceObjects("imported"); err != nil || len(pending) != 0 {
+		t.Fatalf("objects left pending: %v, %v", pending, err)
+	}
+	target.remoteMu.Lock()
+	attached := len(target.remotes)
+	target.remoteMu.Unlock()
+	if attached != 0 {
+		t.Fatalf("%d sources still attached after materialization", attached)
+	}
+	if got := readAll(t, target, "imported", ino); !bytes.Equal([]byte(got), payload) {
+		t.Fatal("the materialized file differs")
+	}
+}
+
 func TestPrepareBranchPublicationSealsLazyCatalog(t *testing.T) {
 	sourceManager := openTestManager(t)
 	source, err := sourceManager.Create("source")

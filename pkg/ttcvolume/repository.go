@@ -1429,7 +1429,7 @@ func (r *Repository) Close() error {
 	for _, remote := range remotes {
 		remote.users.Wait()
 		remote.mu.Lock()
-		remoteErr = errors.Join(remoteErr, remote.conn.Close())
+		remoteErr = errors.Join(remoteErr, remote.close())
 		remote.mu.Unlock()
 	}
 	var graphErr error

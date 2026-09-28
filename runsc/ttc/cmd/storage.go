@@ -125,6 +125,28 @@ func (r *sharedSnapshotObjectReader) RemoteObject(id ttcsnapshot.ObjectID) (ttcs
 	return object, nil
 }
 
+// newSharedFilesystemSource returns the source a shared filesystem relay
+// serves, for the process to read itself: the tree below root in store, and
+// the origins its publication made.
+func newSharedFilesystemSource(store *ttcsnapshot.SharedPackStore, root, sourceName string, origins []uint64) (ttcvolume.RemoteObjectSource, error) {
+	if store == nil {
+		return ttcvolume.RemoteObjectSource{}, errors.New("shared snapshot packs are unavailable")
+	}
+	reader, err := newSharedSnapshotObjectReader(store, root)
+	if err != nil {
+		return ttcvolume.RemoteObjectSource{}, err
+	}
+	reader.allowedOrigins = make(map[ttcsnapshot.SnapshotID]struct{}, len(origins))
+	for _, origin := range origins {
+		if origin == 0 {
+			return ttcvolume.RemoteObjectSource{}, errors.New("shared filesystem source contains zero origin")
+		}
+		reader.allowedOrigins[ttcsnapshot.SnapshotID(origin)] = struct{}{}
+	}
+	key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(sourceName)))
+	return ttcvolume.RemoteObjectSource{Key: key, Reader: reader, Catalog: reader}, nil
+}
+
 type coldFilesystemRelays struct {
 	token   ttcvolume.RemoteToken
 	clients []*os.File
@@ -584,25 +606,17 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 			return ttcstorage.Result{}, fmt.Errorf("opening active repository %q: %w", config.Source, err)
 		}
 		physicalBranch := repositoryPhysicalBranch(config, intent.FilesystemBranch)
-		var relayClient *os.File
 		if prior, ok := priorFilesystems[config.Source]; ok {
-			var token ttcvolume.RemoteToken
-			if _, err := rand.Read(token[:]); err != nil {
-				repository.Close()
-				return ttcstorage.Result{}, err
+			// The publisher reads the shared packs itself: what a runtime reaches
+			// through a relay process, it reads in process, as the relay would.
+			source, err := newSharedFilesystemSource(p.graphShared, prior.Root.Root, config.Source, prior.Origins)
+			if err == nil {
+				err = repository.AttachLocalObjectSource(source, physicalBranch)
 			}
-			client, _, err := startSharedFilesystemRelay(p.sharedRoot, prior.Root.Root, config.Source, prior.Origins, token)
 			if err != nil {
-				repository.Close()
-				return ttcstorage.Result{}, fmt.Errorf("starting shared filesystem resolver for %q: %w", config.Source, err)
-			}
-			key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(config.Source)))
-			if err := repository.AttachRemoteObjectSource(client, token, key, physicalBranch); err != nil {
-				client.Close()
 				repository.Close()
 				return ttcstorage.Result{}, fmt.Errorf("attaching shared filesystem resolver for %q: %w", config.Source, err)
 			}
-			relayClient = client
 		}
 		descriptor, snapshotErr := repository.DescribeRemoteSnapshot(physicalBranch)
 		origins, originsErr := repository.PrepareBranchPublication(physicalBranch)
@@ -613,11 +627,6 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 			}
 		}
 		closeErr := repository.Close()
-		if relayClient != nil {
-			if err := relayClient.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
-				closeErr = errors.Join(closeErr, err)
-			}
-		}
 		if snapshotErr != nil || closeErr != nil {
 			return ttcstorage.Result{}, errors.Join(snapshotErr, closeErr)
 		}

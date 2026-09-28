@@ -318,9 +318,12 @@ func writeRemoteFailure(writer io.Writer, request remoteHeader, message string) 
 }
 
 type remoteObjectClient struct {
-	mu          sync.Mutex
-	users       sync.WaitGroup
+	mu    sync.Mutex
+	users sync.WaitGroup
+	// conn is the stream to the source; local, instead, a source read in
+	// this process.
 	conn        io.ReadWriteCloser
+	local       *RemoteObjectSource
 	terminalErr error
 	token       RemoteToken
 	source      RemoteSourceKey
@@ -440,6 +443,22 @@ func (r *Repository) AttachRemoteObjectSource(conn io.ReadWriteCloser, token Rem
 	if r == nil || conn == nil {
 		return errors.New("remote filesystem source requires repository and connection")
 	}
+	return r.attachObjectSource(&remoteObjectClient{conn: conn, token: token, source: source}, branchID)
+}
+
+// AttachLocalObjectSource attaches source, which this process reads itself,
+// as AttachRemoteObjectSource attaches one served over a stream: a manager
+// reading shared packs needs no relay process, protocol and encoding
+// between, which took a quarter of the time of making a lazily imported
+// tree of 100,000 files independent. source serves by Reader and Catalog.
+func (r *Repository) AttachLocalObjectSource(source RemoteObjectSource, branchID string) error {
+	if r == nil || source.Reader == nil || source.Catalog == nil {
+		return errors.New("local filesystem source requires repository, reader and catalog")
+	}
+	return r.attachObjectSource(&remoteObjectClient{local: &source, source: source.Key}, branchID)
+}
+
+func (r *Repository) attachObjectSource(remote *remoteObjectClient, branchID string) error {
 	// A source attachment changes the resolver set consumed by the
 	// repository-wide independence barrier. Serialize the two operations so a
 	// concurrent sibling migration cannot have its newly attached catalog
@@ -450,7 +469,8 @@ func (r *Repository) AttachRemoteObjectSource(conn io.ReadWriteCloser, token Rem
 	if err != nil {
 		return err
 	}
-	remote := &remoteObjectClient{conn: conn, token: token, source: source, next: 1, complete: make(map[string]bool), objects: make(map[string]int64), sources: make(map[string]string), repository: r, branchID: branchID, catalog: branch.RemoteCatalog}
+	remote.next, remote.complete, remote.objects, remote.sources = 1, make(map[string]bool), make(map[string]int64), make(map[string]string)
+	remote.repository, remote.branchID, remote.catalog = r, branchID, branch.RemoteCatalog
 	if branch.RemoteCatalog != "" {
 		if branch.RemoteCatalogSnapshot == 0 {
 			return errors.New("remote filesystem branch has no catalog expansion origin")
@@ -532,7 +552,7 @@ func (r *Repository) AttachRemoteObjectSource(conn io.ReadWriteCloser, token Rem
 		r.remoteByObject[localObject] = remote
 	}
 	if len(remote.objects) == 0 {
-		return conn.Close()
+		return remote.close()
 	}
 	r.remotes[remote] = struct{}{}
 	return nil
@@ -717,7 +737,7 @@ func (r *Repository) materializeRemoteObjects() error {
 			// added after the detach pass.
 			remote.users.Wait()
 			remote.mu.Lock()
-			closeErr = errors.Join(closeErr, remote.conn.Close())
+			closeErr = errors.Join(closeErr, remote.close())
 			remote.mu.Unlock()
 		}
 		return closeErr
@@ -877,7 +897,26 @@ func (r *Repository) materializeRemoteObjectsPassLocked() ([]remoteMaterializati
 	return nil, remotes, nil
 }
 
+// close closes the client's stream, if it has one. Once others may use the
+// client, c.mu must be held.
+func (c *remoteObjectClient) close() error {
+	if c.conn == nil {
+		return nil
+	}
+	return c.conn.Close()
+}
+
 func (c *remoteObjectClient) pullMetadata(id ttcsnapshot.ObjectID) (ttcsnapshot.Object, error) {
+	if c.local != nil {
+		object, err := c.local.Catalog.RemoteObject(id)
+		if err != nil {
+			return ttcsnapshot.Object{}, err
+		}
+		if object.ID != id {
+			return ttcsnapshot.Object{}, fmt.Errorf("local filesystem metadata identifies %s, want %s", object.ID, id)
+		}
+		return object, nil
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	payload, err := c.request(remoteMetadataPull, id.String(), 0, 0)
@@ -1049,6 +1088,17 @@ func (c *remoteObjectClient) pull(object string, offset uint64, length uint32) (
 	c.repository.remoteMu.Unlock()
 	if !validObjectID(remoteObject) || len(remoteObject) > 40 {
 		return nil, fmt.Errorf("invalid object ID %q", object)
+	}
+	if c.local != nil {
+		payload := make([]byte, length)
+		n, err := c.local.Reader.ReadObjectRange(remoteObject, payload, int64(offset))
+		if err != nil && !(errors.Is(err, io.EOF) && n == len(payload)) {
+			return nil, err
+		}
+		if n != len(payload) {
+			return nil, fmt.Errorf("short filesystem object read: %d/%d", n, len(payload))
+		}
+		return payload, nil
 	}
 	return c.request(remotePull, remoteObject, offset, length)
 }
