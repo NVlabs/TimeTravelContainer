@@ -3161,7 +3161,8 @@ func runRemove(args []string, stdout, stderr io.Writer, backend backend) error {
 	if fs.NArg() == 0 {
 		return errors.New("usage: ttc rm [--force] [--volumes] (CONTAINER|CONTAINER@BRANCH) [TARGET...]")
 	}
-	removeAll := func() error {
+	// removeAll removes the targets, but for those removed already.
+	removeAll := func(removed map[selector]bool) error {
 		for _, value := range fs.Args() {
 			if strings.Contains(value, "@") {
 				if *volumes {
@@ -3171,8 +3172,10 @@ func runRemove(args []string, stdout, stderr io.Writer, backend backend) error {
 				if err != nil {
 					return fmt.Errorf("invalid target %q: %w", value, err)
 				}
-				if err := backend.destroy(target, *force); err != nil {
-					return err
+				if !removed[target] {
+					if err := backend.destroy(target, *force); err != nil {
+						return err
+					}
 				}
 				fmt.Fprintln(stdout, target)
 				continue
@@ -3185,9 +3188,104 @@ func runRemove(args []string, stdout, stderr io.Writer, backend backend) error {
 		return nil
 	}
 	if runtime, ok := backend.(*runtimeBackend); ok && fs.NArg() > 1 {
-		return runtime.removingBranches(removeAll)
+		return runtime.removingBranches(func() error {
+			var removed map[selector]bool
+			if !*volumes {
+				var targets []selector
+				for _, value := range fs.Args() {
+					if target, err := parseSelector(value); err == nil && strings.Contains(value, "@") {
+						targets = append(targets, target)
+					}
+				}
+				var err error
+				if removed, err = runtime.removeWholeContainers(targets, *force); err != nil {
+					return err
+				}
+			}
+			return removeAll(removed)
+		})
 	}
-	return removeAll()
+	return removeAll(nil)
+}
+
+// removeWholeContainers removes, each at once, the containers of targets whose
+// branches the targets all name, when no branch of the container's family is
+// placed anywhere else, and returns the targets it removed with them. A
+// cluster removes a family branch by branch, and removing a branch that is not
+// its container's last collected its filesystem in its runtime first, 4 s for
+// a branch of 100,000 files, only for the container's storage to go whole with
+// its last branch.
+func (b *runtimeBackend) removeWholeContainers(targets []selector, force bool) (map[selector]bool, error) {
+	if b.dataRoot == "" {
+		return nil, nil
+	}
+	byContainer := make(map[string]map[string]selector)
+	var containers []string
+	for _, target := range targets {
+		branches := byContainer[target.container]
+		if branches == nil {
+			branches = make(map[string]selector)
+			byContainer[target.container] = branches
+			containers = append(containers, target.container)
+		}
+		branches[target.branch] = target
+	}
+	removed := make(map[selector]bool)
+	for _, container := range containers {
+		branches := byContainer[container]
+		info, err := b.containerStore().LoadContainer(container)
+		if err != nil || len(branches) < 2 || len(info.Branches) != len(branches) ||
+			info.IsDistributedPhysicalRuntime() || logicalFamilyID(info) != info.ID {
+			continue
+		}
+		named := true
+		for _, branch := range info.Branches {
+			if _, ok := branches[branch.ID]; !ok {
+				named = false
+				break
+			}
+		}
+		if !named {
+			continue
+		}
+		if placed, err := b.familyPlacedBeyond(info.ID, branches); err != nil {
+			return removed, err
+		} else if placed {
+			continue
+		}
+		if err := b.remove(info.ID, force, false); err != nil {
+			return removed, err
+		}
+		for branch, target := range branches {
+			if err := b.removeLogicalBranchPlacement(info.ID, branch); err != nil {
+				return removed, err
+			}
+			removed[target] = true
+		}
+	}
+	return removed, nil
+}
+
+// familyPlacedBeyond reports whether a placement of the family names a branch
+// that branches does not.
+func (b *runtimeBackend) familyPlacedBeyond(familyID string, branches map[string]selector) (bool, error) {
+	if b.nodeID == "" {
+		return false, nil
+	}
+	placements, err := b.placementCatalog()
+	if err != nil {
+		return false, err
+	}
+	records, err := placements.ListFamily(familyID)
+	if err != nil {
+		return false, err
+	}
+	for _, record := range records {
+		if _, ok := branches[record.BranchID]; !ok {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func runAutoRemoveNow(args []string, backend backend) error {
