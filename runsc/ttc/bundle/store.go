@@ -3592,14 +3592,11 @@ func (s Store) CommitActiveRepositoryRestoreIDs(name string) error {
 		return err
 	}
 	for i := range repositories {
-		repository, err := ttcvolume.OpenRepository(repositories[i].Path, ttcvolume.CopyMode(repositories[i].CopyMode))
+		info, err := ttcvolume.ReadRepositoryInfo(repositories[i].Path)
 		if err != nil {
-			return fmt.Errorf("opening restored repository %q: %w", repositories[i].Source, err)
+			return fmt.Errorf("reading restored repository %q: %w", repositories[i].Source, err)
 		}
-		repositories[i].RestoreID = repository.Info().ID
-		if err := repository.Close(); err != nil {
-			return fmt.Errorf("closing restored repository %q: %w", repositories[i].Source, err)
-		}
+		repositories[i].RestoreID = info.ID
 	}
 	return s.WriteActiveRepositoryMap(info.ID, repositories)
 }

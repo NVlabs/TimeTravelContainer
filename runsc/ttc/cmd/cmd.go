@@ -14862,15 +14862,11 @@ func (b *runtimeBackend) allocateFilesystemForkOrigins(containerID string, child
 	assignments := make([]boot.FilesystemOriginAssignment, 0, len(configs))
 	seen := make(map[string]struct{}, len(configs))
 	for _, config := range configs {
-		repository, err := ttcvolume.OpenRepository(config.Path, ttcvolume.CopyMode(config.CopyMode))
+		info, err := ttcvolume.ReadRepositoryInfo(config.Path)
 		if err != nil {
 			return nil, finish, errors.Join(err, finish(false))
 		}
-		repositoryID := repository.Info().ID
-		closeErr := repository.Close()
-		if closeErr != nil {
-			return nil, finish, errors.Join(closeErr, finish(false))
-		}
+		repositoryID := info.ID
 		if _, ok := seen[repositoryID]; ok {
 			continue
 		}

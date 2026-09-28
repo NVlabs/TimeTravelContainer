@@ -1270,6 +1270,20 @@ func (m *Manager) openPath(path string, info VolumeInfo) (*Repository, error) {
 	return &Repository{path: path, dir: dir, copyMode: m.capability.Mode, info: info, graph: graph, data: data}, nil
 }
 
+// ReadRepositoryInfo returns what Info returns of the repository at path,
+// without opening the repository: an open loads its whole graph, seconds for
+// one of 100,000 files.
+func ReadRepositoryInfo(path string) (VolumeInfo, error) {
+	var info VolumeInfo
+	if err := readJSON(filepath.Join(path, "volume.json"), &info); err != nil {
+		return VolumeInfo{}, err
+	}
+	if !validID(info.ID) {
+		return VolumeInfo{}, fmt.Errorf("invalid repository identity %q", info.ID)
+	}
+	return info, nil
+}
+
 // OpenRepositoryFD opens a repository from an already-open O_DIRECTORY file.
 // The descriptor is duplicated, so the caller retains ownership of dir.
 func OpenRepositoryFD(dir *os.File, mode CopyMode) (*Repository, error) {
