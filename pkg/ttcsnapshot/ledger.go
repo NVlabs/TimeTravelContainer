@@ -465,6 +465,8 @@ type ReferenceLedger struct {
 	journal  *os.File
 	sequence uint64
 	poisoned error
+	// checkpointBytes is the size of the checkpoint last written or read.
+	checkpointBytes int64
 }
 
 // NewReferenceLedger returns an empty owner ledger.
@@ -538,6 +540,7 @@ func (ledger *ReferenceLedger) loadCheckpoint() error {
 	}
 	ledger.state = cloneReferenceLedgerState(checkpoint.State)
 	ledger.sequence = checkpoint.Sequence
+	ledger.checkpointBytes = int64(len(data))
 	return nil
 }
 
@@ -1006,6 +1009,7 @@ func (ledger *ReferenceLedger) Checkpoint() error {
 	if err := writeReferenceLedgerAtomic(ledger.dir, "ledger.checkpoint", ".ledger-checkpoint-", data); err != nil {
 		return err
 	}
+	ledger.checkpointBytes = int64(len(data))
 	if err := writeReferenceLedgerAtomic(ledger.dir, "ledger.log", ".ledger-log-", []byte(referenceLedgerHeader)); err != nil {
 		return err
 	}
@@ -1063,6 +1067,17 @@ func (ledger *ReferenceLedger) JournalBytes() int64 {
 		return 0
 	}
 	return info.Size()
+}
+
+// CheckpointDue reports whether the journal has grown to at least minimum
+// bytes and to the size of the last checkpoint: a checkpoint costs in
+// proportion to the whole ledger, and replaying the journal then costs at
+// most as much as reading the checkpoint.
+func (ledger *ReferenceLedger) CheckpointDue(minimum int64) bool {
+	journal := ledger.JournalBytes()
+	ledger.mu.RLock()
+	defer ledger.mu.RUnlock()
+	return journal >= max(minimum, ledger.checkpointBytes)
 }
 
 // Close releases a durable ledger. It is harmless for an in-memory ledger.

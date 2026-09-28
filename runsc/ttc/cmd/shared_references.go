@@ -1046,7 +1046,7 @@ func (s *sharedReferenceService) withLedger(fn func(*ttcsnapshot.ReferenceLedger
 	// while converging back to a tiny live graph. Bound restart time and local
 	// scratch growth by checkpointing the resulting state once the WAL reaches
 	// the same scale as other snapshot-graph journals.
-	if s.ledger.JournalBytes() >= sharedReferenceLedgerCheckpointBytes {
+	if s.ledger.CheckpointDue(sharedReferenceLedgerCheckpointBytes) {
 		return s.ledger.Checkpoint()
 	}
 	return nil
@@ -1069,17 +1069,22 @@ func (s *sharedReferenceService) ImportSharedSnapshot(_ context.Context, peer st
 	if err := s.authorizeProvider(peer, snapshotID); err != nil {
 		return fmt.Errorf("authorizing provider: %w", err)
 	}
-	manifest, err := s.packs.Manifest(ttcsnapshot.SnapshotID(snapshotID))
-	if err != nil {
+	var objects []ttcsnapshot.Object
+	var references map[string]ttcsnapshot.ObjectID
+	origin := ttcsnapshot.SnapshotID(snapshotID)
+	// The ledger copies what it keeps.
+	if err := s.packs.ViewManifest(origin, func(manifest *ttcsnapshot.SnapshotManifest) error {
+		objects = make([]ttcsnapshot.Object, len(manifest.Objects))
+		for index, packed := range manifest.Objects {
+			objects[index] = packed.Object
+		}
+		references = providerBaselineReferences(origin, manifest.References)
+		return nil
+	}); err != nil {
 		return fmt.Errorf("reading shared pack manifest: %w", err)
 	}
-	objects := make([]ttcsnapshot.Object, len(manifest.Objects))
-	for index, packed := range manifest.Objects {
-		objects[index] = packed.Object
-	}
 	return s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
-		origin := ttcsnapshot.SnapshotID(snapshotID)
-		if err := ledger.ImportOrigin(origin, objects, providerBaselineReferences(origin, manifest.References)); err != nil {
+		if err := ledger.ImportOrigin(origin, objects, references); err != nil {
 			return fmt.Errorf("importing origin into reference ledger: %w", err)
 		}
 		return nil

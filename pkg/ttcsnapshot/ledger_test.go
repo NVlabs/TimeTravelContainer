@@ -1198,6 +1198,57 @@ func TestReferenceLedgerRefusedMutationChangesNothing(t *testing.T) {
 	}
 }
 
+// A ledger's checkpoint is due once its journal has grown to the minimum and
+// to the size of its last checkpoint, written or read.
+func TestReferenceLedgerCheckpointDueGrowsWithTheLedger(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "ledger")
+	ledger, err := OpenReferenceLedger(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { ledger.Close() }()
+	objects := []Object{ledgerObject(7, 1, ObjectKindMemoryChunk), ledgerObject(7, 2, ObjectKindMemoryChunk)}
+	references := map[string]ObjectID{"root/a": objects[0].ID, "root/b": objects[1].ID}
+	if err := ledger.ImportOrigin(7, objects, references); err != nil {
+		t.Fatal(err)
+	}
+	journal := ledger.JournalBytes()
+	if !ledger.CheckpointDue(journal) || ledger.CheckpointDue(journal+1) {
+		t.Fatalf("with no checkpoint, a checkpoint of a %d-byte journal is due only at a minimum up to it", journal)
+	}
+	if err := ledger.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := ledger.checkpointBytes
+	if checkpoint == 0 {
+		t.Fatal("the checkpoint's size was not kept")
+	}
+	if ledger.CheckpointDue(1) {
+		t.Fatalf("a checkpoint is due over a %d-byte journal", ledger.JournalBytes())
+	}
+	for index := 0; ledger.JournalBytes() < checkpoint; index++ {
+		if ledger.CheckpointDue(1) {
+			t.Fatalf("a checkpoint is due over a %d-byte journal, under the last checkpoint's %d bytes", ledger.JournalBytes(), checkpoint)
+		}
+		name := fmt.Sprintf("root/due-%d", index)
+		if err := ledger.ApplyReference("retain-"+name, name, objects[0].ID, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !ledger.CheckpointDue(1) {
+		t.Fatalf("no checkpoint is due over a %d-byte journal, over the last checkpoint's %d bytes", ledger.JournalBytes(), checkpoint)
+	}
+	if err := ledger.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if ledger, err = OpenReferenceLedger(directory); err != nil {
+		t.Fatal(err)
+	}
+	if ledger.checkpointBytes != checkpoint {
+		t.Fatalf("a reopened ledger's checkpoint is %d bytes, want %d", ledger.checkpointBytes, checkpoint)
+	}
+}
+
 // checkLedgerIndexes fails unless the ledger's indexes of its objects are
 // what the objects make them.
 func checkLedgerIndexes(t *testing.T, ledger *ReferenceLedger) {

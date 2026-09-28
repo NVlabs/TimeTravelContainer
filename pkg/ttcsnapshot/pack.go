@@ -526,6 +526,16 @@ func (store *SharedPackStore) Manifest(snapshot SnapshotID) (*SnapshotManifest, 
 	return cloneManifest(manifest), nil
 }
 
+// ViewManifest calls view with snapshot's manifest, as Manifest returns it
+// but not copied: view must neither change it nor keep any part of it.
+func (store *SharedPackStore) ViewManifest(snapshot SnapshotID, view func(*SnapshotManifest) error) error {
+	manifest, err := store.manifest(snapshot)
+	if err != nil {
+		return err
+	}
+	return view(manifest)
+}
+
 // CheckManifest opens and validates snapshot's manifest, as Manifest does,
 // for callers that only need to know that the snapshot is committed: it does
 // not copy the manifest, of perhaps hundreds of thousands of objects.
