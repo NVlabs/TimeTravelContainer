@@ -4210,18 +4210,10 @@ func branchThreadGroup(k *kernel.Kernel, cid string, tgid kernel.ThreadID) (*ker
 		return tg, nil
 	}
 
-	var initTG *kernel.ThreadGroup
-	var initID kernel.ThreadID
-	for _, tg := range k.TaskSet().Root.ThreadGroups() {
-		if tg.Leader().ContainerID() != cid {
-			continue
-		}
-		id := k.RootPIDNamespace().IDOfThreadGroup(tg)
-		if initTG == nil || id < initID {
-			initTG = tg
-			initID = id
-		}
-	}
+	// A child the init reaps meanwhile must not pass for it: a console push
+	// and a wait that took one for the init reported the branch exited, with
+	// the child's status, while its init ran on.
+	initTG := k.RootPIDNamespace().LowestThreadGroupOfContainer(cid)
 	if initTG == nil {
 		// Kernel retains GlobalInit after PID 1 has left the live PID table so
 		// external waiters can continue to observe its terminal status. This is

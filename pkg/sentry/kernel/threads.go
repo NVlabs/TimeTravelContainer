@@ -464,6 +464,27 @@ func (ns *PIDNamespace) NumTasksPerContainer(cid string) int {
 	return tasks
 }
 
+// LowestThreadGroupOfContainer returns the thread group with the lowest ID in
+// ns among those whose leader belongs to the container with ID cid, or nil if
+// there is none. It reads the thread groups and their IDs together: a thread
+// group reaped between a snapshot of ThreadGroups and IDOfThreadGroup has ID
+// 0 by then, lower than any live one.
+func (ns *PIDNamespace) LowestThreadGroupOfContainer(cid string) *ThreadGroup {
+	ns.owner.mu.RLock()
+	defer ns.owner.mu.RUnlock()
+	var lowest *ThreadGroup
+	var lowestID ThreadID
+	for tg, id := range ns.tgids {
+		if tg.leader == nil || tg.leader.ContainerID() != cid {
+			continue
+		}
+		if lowest == nil || id < lowestID {
+			lowest, lowestID = tg, id
+		}
+	}
+	return lowest
+}
+
 // ThreadGroups returns a snapshot of the thread groups in ns.
 func (ns *PIDNamespace) ThreadGroups() []*ThreadGroup {
 	return ns.ThreadGroupsAppend(nil)

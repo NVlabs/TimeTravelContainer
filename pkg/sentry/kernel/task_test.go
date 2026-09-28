@@ -93,3 +93,26 @@ func TestTaskCPU(t *testing.T) {
 	}
 
 }
+
+// A container's lowest thread group is found among the thread groups the
+// namespace holds, with the IDs it holds them by, so one reaped meanwhile is
+// neither found nor taken for the lowest.
+func TestLowestThreadGroupOfContainer(t *testing.T) {
+	ns := &PIDNamespace{owner: &TaskSet{}, tgids: make(map[*ThreadGroup]ThreadID)}
+	add := func(cid string, id ThreadID) *ThreadGroup {
+		tg := &ThreadGroup{threadGroupNode: threadGroupNode{leader: &Task{containerID: cid}}}
+		ns.tgids[tg] = id
+		return tg
+	}
+	add("other", 1)
+	init := add("c", 2)
+	add("c", 9)
+	reaped := add("c", 5)
+	delete(ns.tgids, reaped)
+	if got := ns.LowestThreadGroupOfContainer("c"); got != init {
+		t.Errorf("LowestThreadGroupOfContainer(c) = %p, want the init %p", got, init)
+	}
+	if got := ns.LowestThreadGroupOfContainer("none"); got != nil {
+		t.Errorf("LowestThreadGroupOfContainer(none) = %p, want nil", got)
+	}
+}
