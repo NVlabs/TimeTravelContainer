@@ -372,11 +372,22 @@ func (store *SharedPackStore) publish(ctx context.Context, graph *Store, snapsho
 	if err := store.validateManifest(&manifest); err != nil {
 		return fmt.Errorf("validating snapshot %d manifest before commit: %w", snapshot, err)
 	}
-	if err := writeAtomicJSON(filepath.Join(directory, sharedManifestName), manifest); err != nil {
+	path := filepath.Join(directory, sharedManifestName)
+	created, err := writeAtomicJSON(path, manifest)
+	if err != nil {
 		return err
+	}
+	// The publisher reads the manifest next, to commit it: spare it decoding
+	// the manifest it has.
+	var written os.FileInfo
+	if created {
+		written, _ = os.Stat(path)
 	}
 	store.mu.Lock()
 	store.forgetManifestLocked(snapshot)
+	if written != nil {
+		store.cacheManifestLocked(snapshot, cachedSharedManifest{manifest: &manifest, info: written})
+	}
 	store.mu.Unlock()
 	return nil
 }
@@ -428,11 +439,13 @@ func (store *SharedPackStore) resolveDeferredForPublication(graph *Store, local 
 	return Object{}, publicationBulkSource{}, errors.New("deferred object has no source identity")
 }
 
-func writeAtomicJSON(path string, value any) error {
+// writeAtomicJSON writes value at path unless something is there already. It
+// reports whether it wrote it.
+func writeAtomicJSON(path string, value any) (bool, error) {
 	directory := filepath.Dir(path)
 	temporary, err := os.CreateTemp(directory, ".manifest-")
 	if err != nil {
-		return err
+		return false, err
 	}
 	temporaryPath := temporary.Name()
 	defer os.Remove(temporaryPath)
@@ -440,21 +453,23 @@ func writeAtomicJSON(path string, value any) error {
 	encoder.SetEscapeHTML(false)
 	if err := encoder.Encode(value); err != nil {
 		temporary.Close()
-		return err
+		return false, err
 	}
 	if err := temporary.Sync(); err != nil {
 		temporary.Close()
-		return err
+		return false, err
 	}
 	if err := temporary.Close(); err != nil {
-		return err
+		return false, err
 	}
+	created := true
 	if err := os.Link(temporaryPath, path); err != nil {
 		if !errors.Is(err, fs.ErrExist) {
-			return err
+			return false, err
 		}
+		created = false
 	}
-	return syncDirectory(directory)
+	return created, syncDirectory(directory)
 }
 
 func replaceAtomicJSON(path string, value any) error {
@@ -509,6 +524,14 @@ func (store *SharedPackStore) Manifest(snapshot SnapshotID) (*SnapshotManifest, 
 		return nil, err
 	}
 	return cloneManifest(manifest), nil
+}
+
+// CheckManifest opens and validates snapshot's manifest, as Manifest does,
+// for callers that only need to know that the snapshot is committed: it does
+// not copy the manifest, of perhaps hundreds of thousands of objects.
+func (store *SharedPackStore) CheckManifest(snapshot SnapshotID) error {
+	_, err := store.manifest(snapshot)
+	return err
 }
 
 // manifest is Manifest without the copy, for the callers here that only read

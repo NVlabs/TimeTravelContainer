@@ -737,7 +737,7 @@ func (b *runtimeBackend) releaseSharedGraphMemoryRoots(roots, objects []string) 
 		// corresponding shared-ledger baseline. Removal may be retrying after it
 		// already reclaimed the former, so do not invent a shared release.
 		if b.snapshotShared != nil {
-			if _, err := b.snapshotShared.Manifest(id.Snapshot); errors.Is(err, os.ErrNotExist) {
+			if err := b.snapshotShared.CheckManifest(id.Snapshot); errors.Is(err, os.ErrNotExist) {
 				continue
 			} else if err != nil {
 				return err

@@ -2175,7 +2175,7 @@ func (b *runtimeBackend) publishGraphManifestDependencies(manifest ttcchunk.Mani
 			return fmt.Errorf("resolving chunk origin %d: %w", origin, err)
 		}
 		if !volatile {
-			if _, err := b.snapshotShared.Manifest(origin); err != nil {
+			if err := b.snapshotShared.CheckManifest(origin); err != nil {
 				return fmt.Errorf("shared chunk origin %d has no pack: %w", origin, err)
 			}
 			continue
@@ -2297,7 +2297,7 @@ func (b *runtimeBackend) publishVolatileFilesystemOriginContext(ctx context.Cont
 		return err
 	}
 	if !volatile {
-		if _, err := b.snapshotShared.Manifest(origin); err != nil {
+		if err := b.snapshotShared.CheckManifest(origin); err != nil {
 			return fmt.Errorf("filesystem origin %d has neither volatile nor shared authority: %w", origin, err)
 		}
 		return nil
@@ -2330,7 +2330,7 @@ func (b *runtimeBackend) publishVolatileFilesystemOriginContext(ctx context.Cont
 			return fmt.Errorf("resolving filesystem origin %d dependency %d: %w", origin, dependency, err)
 		}
 		if !dependencyVolatile {
-			if _, err := b.snapshotShared.Manifest(dependency); err != nil {
+			if err := b.snapshotShared.CheckManifest(dependency); err != nil {
 				return fmt.Errorf("filesystem dependency %d has shared authority without a manifest: %w", dependency, err)
 			}
 			continue
@@ -2356,7 +2356,7 @@ func (b *runtimeBackend) publishVolatileFilesystemOriginContext(ctx context.Cont
 		return err
 	}
 	if !volatile {
-		_, err := b.snapshotShared.Manifest(origin)
+		err := b.snapshotShared.CheckManifest(origin)
 		return err
 	}
 	if provider.NodeID != b.nodeID {
@@ -2374,7 +2374,7 @@ func (b *runtimeBackend) publishVolatileFilesystemOriginContext(ctx context.Cont
 		return err
 	}
 	if !volatile {
-		_, err := b.snapshotShared.Manifest(origin)
+		err := b.snapshotShared.CheckManifest(origin)
 		return err
 	}
 	if provider.NodeID != b.nodeID {
@@ -2487,7 +2487,7 @@ func (b *runtimeBackend) resumeFrozenFilesystemOrigin(origin ttcsnapshot.Snapsho
 		if volatile && provider.NodeID != b.nodeID {
 			return fmt.Errorf("filesystem origin %d is frozen here but provided by node %q", origin, provider.NodeID)
 		}
-		if _, err := b.snapshotShared.Manifest(origin); err != nil {
+		if err := b.snapshotShared.CheckManifest(origin); err != nil {
 			return fmt.Errorf("reading frozen filesystem origin %d manifest: %w", origin, err)
 		}
 		if volatile {

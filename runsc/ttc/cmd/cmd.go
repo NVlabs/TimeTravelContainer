@@ -13733,7 +13733,7 @@ func (b *runtimeBackend) validateExternalGraphRoots(snapshotID uint64, roots, ob
 			if b.snapshotShared == nil {
 				return errors.New("shared snapshot repository is unavailable")
 			}
-			if _, err := b.snapshotShared.Manifest(origin); err != nil {
+			if err := b.snapshotShared.CheckManifest(origin); err != nil {
 				return fmt.Errorf("opening shared memory origin %d: %w", origin, err)
 			}
 		}
@@ -13868,7 +13868,7 @@ func (b *runtimeBackend) cloneGraphControlRoot(sourceRoot, sourceObject string, 
 		if b.snapshotShared == nil {
 			return "", errors.New("shared snapshot repository is unavailable")
 		}
-		if _, err := b.snapshotShared.Manifest(id.Snapshot); err != nil {
+		if err := b.snapshotShared.CheckManifest(id.Snapshot); err != nil {
 			return "", fmt.Errorf("opening shared control origin %d: %w", id.Snapshot, err)
 		}
 	}
@@ -14928,7 +14928,7 @@ func (b *runtimeBackend) discardFailedGraphSnapshot(origin ttcsnapshot.SnapshotI
 		return fmt.Errorf("failed snapshot origin %d is owned by node %q, not %q", origin, provider.NodeID, node)
 	}
 	if !volatile && !abandoned && b.snapshotShared != nil {
-		if _, manifestErr := b.snapshotShared.Manifest(origin); manifestErr == nil {
+		if manifestErr := b.snapshotShared.CheckManifest(origin); manifestErr == nil {
 			if record, ok := b.snapshotGraph.Snapshot(origin); ok && record.State != ttcsnapshot.SnapshotShared {
 				if err := b.snapshotGraph.MarkShared(origin); err != nil {
 					return fmt.Errorf("finishing shared state for snapshot origin %d: %w", origin, err)

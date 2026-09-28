@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -859,6 +860,31 @@ func TestSharedPackManifestCacheIsBounded(t *testing.T) {
 		largest = max(largest, info.Size())
 		origins = append(origins, origin)
 	}
+	// The publisher keeps the manifest it wrote, the one a reader decodes.
+	reader, err := OpenSharedPackStore(shared.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, origin := range origins {
+		shared.mu.Lock()
+		published, ok := shared.manifests[origin]
+		shared.mu.Unlock()
+		if !ok {
+			t.Fatalf("the publisher of %d did not keep its manifest", origin)
+		}
+		decoded, err := reader.Manifest(origin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(cloneManifest(published.manifest), decoded) {
+			t.Fatalf("published manifest of %d\n%+v\ndecodes as\n%+v", origin, published.manifest, decoded)
+		}
+	}
+	shared.mu.Lock()
+	for _, origin := range origins {
+		shared.forgetManifestLocked(origin)
+	}
+	shared.mu.Unlock()
 	shared.manifestLimit = 2 * largest
 	cached := func(want ...SnapshotID) {
 		t.Helper()

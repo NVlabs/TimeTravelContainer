@@ -497,7 +497,7 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 				return ttcstorage.Result{}, errors.New("existing cold manifest has an incomplete filesystem snapshot")
 			}
 			for _, origin := range filesystem.Origins {
-				if _, err := p.graphShared.Manifest(ttcsnapshot.SnapshotID(origin)); err != nil {
+				if err := p.graphShared.CheckManifest(ttcsnapshot.SnapshotID(origin)); err != nil {
 					return ttcstorage.Result{}, fmt.Errorf("validating published filesystem origin %d: %w", origin, err)
 				}
 			}
@@ -922,7 +922,7 @@ func (p *branchPublisher) CaptureAvailable(intent ttcstorage.Intent) (bool, erro
 				return false, nil
 			}
 			if record.State == ttcsnapshot.SnapshotShared {
-				if _, err := p.graphShared.Manifest(snapshot); err != nil {
+				if err := p.graphShared.CheckManifest(snapshot); err != nil {
 					if errors.Is(err, os.ErrNotExist) {
 						return false, nil
 					}
@@ -1202,7 +1202,7 @@ func (p *branchPublisher) publishGraphDependencies(ctx context.Context, snapshot
 		// A concurrent idempotent publisher may have completed and reclaimed the
 		// provider metadata after the initial authority read.
 		if _, volatile, authorityErr := p.authority.SnapshotProvider(uint64(snapshot)); authorityErr == nil && !volatile {
-			_, manifestErr := p.graphShared.Manifest(snapshot)
+			manifestErr := p.graphShared.CheckManifest(snapshot)
 			return manifestErr
 		}
 		return err
@@ -1253,7 +1253,7 @@ func (p *branchPublisher) ensureGraphOriginShared(ctx context.Context, snapshot 
 		return err
 	}
 	if !volatile {
-		if _, err := p.graphShared.Manifest(snapshot); err != nil {
+		if err := p.graphShared.CheckManifest(snapshot); err != nil {
 			return fmt.Errorf("snapshot origin %d has shared authority without a manifest: %w", snapshot, err)
 		}
 		return nil
@@ -1276,7 +1276,7 @@ func (p *branchPublisher) ensureGraphOriginShared(ctx context.Context, snapshot 
 	} else if volatile {
 		return fmt.Errorf("node %q returned before snapshot origin %d became shared", provider.NodeID, snapshot)
 	}
-	if _, err := p.graphShared.Manifest(snapshot); err != nil {
+	if err := p.graphShared.CheckManifest(snapshot); err != nil {
 		return fmt.Errorf("opening remotely published snapshot origin %d: %w", snapshot, err)
 	}
 	return nil
@@ -1292,7 +1292,7 @@ func (p *branchPublisher) publishVolatileGraphOrigin(ctx context.Context, snapsh
 		return err
 	}
 	if !volatile {
-		if _, err := p.graphShared.Manifest(snapshot); err != nil {
+		if err := p.graphShared.CheckManifest(snapshot); err != nil {
 			return fmt.Errorf("snapshot origin %d has neither volatile nor shared authority: %w", snapshot, err)
 		}
 		return nil
@@ -1312,7 +1312,7 @@ func (p *branchPublisher) publishVolatileGraphOrigin(ctx context.Context, snapsh
 		return err
 	}
 	if !volatile {
-		if _, err := p.graphShared.Manifest(snapshot); err != nil {
+		if err := p.graphShared.CheckManifest(snapshot); err != nil {
 			return fmt.Errorf("snapshot origin %d has shared authority without a manifest: %w", snapshot, err)
 		}
 		return nil
@@ -1460,7 +1460,7 @@ func (p *branchPublisher) resumeFrozenGraphOrigin(ctx context.Context, snapshot 
 	if volatile && provider.NodeID != p.nodeID {
 		return fmt.Errorf("snapshot origin %d is frozen here but provided by node %q", snapshot, provider.NodeID)
 	}
-	if _, err := p.graphShared.Manifest(snapshot); err != nil {
+	if err := p.graphShared.CheckManifest(snapshot); err != nil {
 		return fmt.Errorf("reading frozen snapshot origin %d manifest: %w", snapshot, err)
 	}
 	finishHandoff := p.peers.beginBackgroundSnapshotWork()
@@ -1586,7 +1586,7 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 			}
 			for _, encodedOrigin := range filesystem.Origins {
 				origin := ttcsnapshot.SnapshotID(encodedOrigin)
-				if _, err := p.graphShared.Manifest(origin); err != nil {
+				if err := p.graphShared.CheckManifest(origin); err != nil {
 					repository.Close()
 					return fmt.Errorf("validating filesystem snapshot origin %d: %w", origin, err)
 				}
@@ -2299,7 +2299,7 @@ func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, bra
 		if b.snapshotShared == nil {
 			return errors.New("shared graph snapshot repository is unavailable")
 		}
-		if _, err := b.snapshotShared.Manifest(ttcsnapshot.SnapshotID(manifest.MemorySnapshot)); err != nil {
+		if err := b.snapshotShared.CheckManifest(ttcsnapshot.SnapshotID(manifest.MemorySnapshot)); err != nil {
 			return fmt.Errorf("opening shared graph memory snapshot: %w", err)
 		}
 		return nil
