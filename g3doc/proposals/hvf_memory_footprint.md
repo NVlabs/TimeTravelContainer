@@ -1,7 +1,7 @@
 # HVF memory footprint: demand-paged stage 2
 
-*Status: in progress, September 2026; phases 1-6 of the delivery plan are
-implemented. Measurements: Apple M5 Pro, macOS 26.5.2.*
+*Status: in progress, September 2026; phases 1-6 and 8 of the delivery plan
+are implemented. Measurements: Apple M5 Pro, macOS 26.5.2.*
 
 ## Summary
 
@@ -165,7 +165,7 @@ Principles, in KVM's terms:
 | Memory | Today | Proposed | Expected per family |
 |---|---|---|---|
 | Go runtime regions | Imported in 2 MiB windows on first touch (phase 4); unmapped before release, mapped again on reuse (phase 5) | unchanged | tracks the live heap, and falls after spikes |
-| Thread stacks | 1 MiB stacks, each imported whole | Imported in windows | ~2 MiB |
+| Thread stacks | Imported from the top, in windows on first touch (phase 8) | unchanged | ~2 MiB |
 | Writable image | Imported in 528 KiB windows on first touch (phases 2 and 4) | unchanged | about 1 MiB |
 | `__TEXT` | Private copies of 48 KiB windows on first touch (phase 2) | One copy per binary UUID in a shared object, mapped read+exec | ~0; 40.6 MiB once per host |
 | `__DATA_CONST`, `__LINKEDIT` | Private copies of windows on first touch (phase 2) | unchanged (contents are slid per process) | under 1 MiB |
@@ -206,8 +206,8 @@ Each phase stands alone and is measured before the next.
    take a host gate inside it. The allocator's frontier moves through the
    heap, so windows narrower than 2 MiB cost more host gates; the writable
    image, where the runtime's hot globals live, went back to 528 KiB windows
-   for the same reason. Timings match phase 2's. Stacks are still imported
-   whole: the native runtime hooks run on them.
+   for the same reason. Timings match phase 2's. Stacks were still imported
+   whole until phase 8: the native runtime hooks run on them.
 5. **Release instead of suppress (done).** Before the scavenger's
    `MADV_FREE_REUSABLE` of a mirrored range, the runtime VM hook unmaps it
    from stage 2 under the vCPU rendezvous, and leaves it dormant until
@@ -226,8 +226,14 @@ Each phase stands alone and is measured before the next.
    the task blocks, instead of destroying it, so blocking I/O stops growing
    Hypervisor.framework's page tables and paying for vCPU creation. The
    hard part is retiring a parked vCPU, which only its owner thread can do.
-8. **Mirror stacks on first touch**, or release their unused part; the
-   native runtime hooks that run on them need a stack probe first.
+8. **Stacks on first touch (done).** Import the top 80 KiB of a thread's
+   stack, and the rest in windows as EL1 touches it, rather than all of it. At
+   EL1 it holds only the Go runtime's frames; goroutines run on stacks in the
+   heap. The native runtime hooks run on it, called through `asmcgocall`, so
+   each probes 512 bytes below its frame before it checks where it runs: a
+   host gate for a stack slab not yet mirrored then happens before its
+   EL1-only instructions. In eight rounds of four forks with gdb in each, the
+   stacks of 40 threads cost 2 MiB rather than 28.
 9. **Compact GuestRAM frame metadata.** Not HVF-specific, but only VM
    platforms keep it.
 10. **Writable-layer metadata.** Not HVF-specific: the Sentry keeps TTC volume

@@ -49,10 +49,13 @@ const (
 	// The Sentry image's read-only segments, mostly code, use a narrower
 	// radius: EL1 runs little of it, and every slab imported is a private
 	// copy. The Go runtime's regions use a wider one, since the heap's
-	// allocation frontier moves through them.
+	// allocation frontier moves through them. A thread's stack uses a narrow
+	// one too: at EL1 it holds only the Go runtime's frames, which fit in the
+	// 16 KiB system stack that Go gives a thread on Linux.
 	ring0HostWorkingSetRadius = uint64(256 << 10)
 	ring0HostImageRadius      = uint64(16 << 10)
 	ring0HostRuntimeRadius    = uint64(1 << 20)
+	ring0HostStackRadius      = uint64(64 << 10)
 	ring0MonitorVCPUID        = 63
 	stateApplicationFP        = 0x3000
 	stateRing0Entry           = 0x3340
@@ -1339,13 +1342,14 @@ retryApplication:
 		if stackSlab <= ^uintptr(0)-uintptr(vmm.HostSlabSize) {
 			e.requestHostMirror(stackSlab + uintptr(vmm.HostSlabSize))
 		}
-		g, m, p, mcache, g0, g0StackLo, g0StackHi, gsignal, gsignalStackLo, gsignalStackHi := hosttid.RuntimePointers()
+		g, m, p, mcache, g0, _, g0StackHi, gsignal, gsignalStackLo, gsignalStackHi := hosttid.RuntimePointers()
 		e.requestHostMirror(g)
 		e.requestHostMirror(m)
 		e.requestHostMirror(p)
 		e.requestHostMirror(mcache)
 		e.requestHostMirror(g0)
-		e.requestHostMirror(g0StackLo)
+		// EL1 uses only the top of the thread's stack, where the runtime's
+		// frames are; see ring0HostStackRadius.
 		if g0StackHi != 0 {
 			e.requestHostMirror(g0StackHi - 1)
 		}
@@ -2189,13 +2193,14 @@ func (e *ring0Engine) extendHostMirror(ctx context.Context) error {
 			continue
 		}
 		regionEnd := region.address + uintptr(region.length)
-		if region.protection&ring0VMWrite != 0 && !region.mainImage && region.userTag != vmMemoryTTCRuntime {
-			// Stacks grow throughout an existing Mach region, and importing one
-			// as a whole avoids a demand-fault storm. The image and the Go
-			// runtime's regions are imported in windows like read-only memory:
-			// EL1 touches little of either. A Go heap arena is 64 MiB, while
-			// the live heap is a few MiB, and most of the image, such as Go's
-			// FIPS entropy buffer, is never touched at EL1.
+		if region.protection&ring0VMWrite != 0 && !region.mainImage && region.userTag != vmMemoryTTCRuntime && region.userTag != vmMemoryStack {
+			// The bridge's and the VM's own regions are imported whole. The
+			// image, the Go runtime's regions, and thread stacks are imported in
+			// windows like read-only memory: EL1 touches little of any. A Go heap
+			// arena is 64 MiB, while the live heap is a few MiB; most of the
+			// image, such as Go's FIPS entropy buffer, is never touched at EL1;
+			// and a thread's 1 MiB stack holds only runtime frames at EL1, since
+			// goroutines run on stacks in the heap.
 			for address := region.address; address < regionEnd; address += uintptr(vmm.HostSlabSize) {
 				addSlab(region, address, access, stage2Access)
 			}
@@ -2206,6 +2211,8 @@ func (e *ring0Engine) extendHostMirror(ctx context.Context) error {
 			radius = ring0HostImageRadius
 		} else if region.userTag == vmMemoryTTCRuntime {
 			radius = ring0HostRuntimeRadius
+		} else if region.userTag == vmMemoryStack {
+			radius = ring0HostStackRadius
 		}
 		for requested := range pendingSlabs {
 			if requested < region.address || requested >= regionEnd {
@@ -2410,12 +2417,12 @@ func (e *ring0Engine) refreshHostMirror(ctx context.Context) error {
 		})
 		workingSetRegion := workingSetIndex < len(workingSetAddresses) && workingSetAddresses[workingSetIndex] < regionEnd
 		if region.protection&ring0VMWrite != 0 && !region.mainImage && region.userTag != vmMemoryTTCRuntime &&
-			(workingSetRegion || bootstrap && region.userTag == vmMemoryTTCVM) {
+			region.userTag != vmMemoryStack && (workingSetRegion || bootstrap && region.userTag == vmMemoryTTCVM) {
 			// At bootstrap, import each complete VM region so a pre-existing VMM
-			// object cannot redpill based on its placement. Go runtime regions,
-			// like the image, are imported in windows as EL1 touches them.
-			// Demand mapping retains the narrower working-set rule for tagged
-			// mappings created after bootstrap.
+			// object cannot redpill based on its placement. Go runtime regions
+			// and thread stacks, like the image, are imported in windows as EL1
+			// touches them. Demand mapping retains the narrower working-set rule
+			// for tagged mappings created after bootstrap.
 			for offset := uint64(0); offset < region.length; offset += vmm.HostSlabSize {
 				addSlab(region.address + uintptr(offset))
 			}
@@ -2427,6 +2434,8 @@ func (e *ring0Engine) refreshHostMirror(ctx context.Context) error {
 			radius = ring0HostImageRadius
 		} else if region.userTag == vmMemoryTTCRuntime {
 			radius = ring0HostRuntimeRadius
+		} else if region.userTag == vmMemoryStack {
+			radius = ring0HostStackRadius
 		}
 		forEachInRegion(workingSetAddresses, region.address, regionEnd, func(address uintptr) {
 			windowStart := address

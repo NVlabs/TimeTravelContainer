@@ -298,6 +298,13 @@ _Static_assert(sizeof(struct ttc_runtime_time_query) == 24,
 
 static uintptr_t ttc_ring0_strip_instruction_pointer(uintptr_t address);
 
+// ttc_ring0_probe_stack reads the stack 512 bytes below the current frame.
+// EL1 mirrors a thread's stack in windows as it touches it, through a host
+// gate, so a native helper probes the stack its EL1-only sequence uses before
+// finding out whether it runs at EL1.
+#define ttc_ring0_probe_stack() \
+	((void)*(volatile const uint8_t *)((uintptr_t)__builtin_frame_address(0) - 512))
+
 TTC_RING0_GUEST_TEXT static uint64_t ttc_ring0_host_cntvct(void) {
 	uint64_t value;
 	__asm__ volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(value));
@@ -329,6 +336,7 @@ TTC_RING0_GUEST_TEXT static uint64_t ttc_ring0_runtime_current_el(void) {
 // the permanent vCPU state page containing the VM-wide clock calibration.
 TTC_RING0_GUEST_TEXT static int32_t ttc_ring0_runtime_time_hook(
 		struct ttc_runtime_time_query *query) {
+	ttc_ring0_probe_stack();
 	uint64_t thread_pointer;
 	__asm__ volatile("mrs %0, tpidrro_el0" : "=r"(thread_pointer));
 	struct ttc_ring0_native_domain_slot *domain = NULL;
@@ -405,6 +413,7 @@ TTC_RING0_GUEST_TEXT static int32_t ttc_ring0_runtime_ensure_host(
 	(void)unused;
 	if (atomic_load_explicit(&ttc_ring0_native_domain_active_count,
 			memory_order_acquire) == 0) return 0;
+	ttc_ring0_probe_stack();
 	uint64_t thread_pointer;
 	__asm__ volatile("mrs %0, tpidrro_el0" : "=r"(thread_pointer));
 	struct ttc_ring0_native_domain_slot *domain = NULL;
