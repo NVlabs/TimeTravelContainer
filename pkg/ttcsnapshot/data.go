@@ -1303,16 +1303,11 @@ func (store *LocalDataStore) reclaimRelative(graph *Store, relative string, cach
 	if readErr != nil || closeErr != nil {
 		return 0, 0, errors.Join(readErr, closeErr)
 	}
+	// The directory's entries carry their types: a file is looked at only if
+	// it is kept, and stating each one took as long as removing it.
 	for _, entry := range entries {
 		child := filepath.Join(relative, entry.Name())
-		var stat unix.Stat_t
-		if err := unix.Fstatat(int(store.rootFD.Fd()), child, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-			if errors.Is(err, unix.ENOENT) {
-				continue
-			}
-			return removed, quarantined, err
-		}
-		if stat.Mode&unix.S_IFMT == unix.S_IFDIR {
+		if entry.IsDir() {
 			r, q, err := store.reclaimRelative(graph, child, cache)
 			removed += r
 			quarantined += q
@@ -1333,7 +1328,7 @@ func (store *LocalDataStore) reclaimRelative(graph *Store, relative string, cach
 		}
 		name := strings.TrimSuffix(entry.Name(), ".data")
 		id, parseErr := ParseObjectID(name)
-		if parseErr != nil || name == entry.Name() || stat.Mode&unix.S_IFMT != unix.S_IFREG {
+		if parseErr != nil || name == entry.Name() || !entry.Type().IsRegular() {
 			if err := store.quarantineRelative(child); err != nil {
 				return removed, quarantined, err
 			}
@@ -1344,6 +1339,13 @@ func (store *LocalDataStore) reclaimRelative(graph *Store, relative string, cach
 			continue
 		}
 		if store.keepsAsCache(graph, id) {
+			var stat unix.Stat_t
+			if err := unix.Fstatat(int(store.rootFD.Fd()), child, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+				if errors.Is(err, unix.ENOENT) {
+					continue
+				}
+				return removed, quarantined, err
+			}
 			*cache = append(*cache, cachedChunk{id: id, name: child, modified: stat.Mtim.Nano(), bytes: stat.Blocks * 512})
 			continue
 		}

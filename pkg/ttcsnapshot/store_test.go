@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -2778,6 +2779,73 @@ func TestReclaimUnreferencedKeepsCachedChunks(t *testing.T) {
 		}
 		if err := data.Close(); err != nil {
 			t.Fatal(err)
+		}
+	}
+}
+
+// Reclaiming by descriptor tells files from directories by their entries:
+// an unreferenced object goes, a temporary goes, a stray name or a symbolic
+// link is quarantined, and a referenced object stays.
+func TestReclaimUnreferencedByDescriptorClassifiesEntries(t *testing.T) {
+	graph := openTestStore(t)
+	root := filepath.Join(t.TempDir(), "objects")
+	if _, err := OpenLocalDataStore(root); err != nil {
+		t.Fatal(err)
+	}
+	directory, err := os.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := OpenLocalDataStoreFD(directory)
+	directory.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept, err := graph.CreateObject(origin, "root/kept", ObjectKindFile, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gone := ObjectID{Snapshot: origin, Kind: ObjectKindFile, Ordinal: 100}
+	for _, id := range []ObjectID{kept, gone} {
+		if err := data.Install(id, strings.NewReader("bytes"), 5); err != nil {
+			t.Fatal(err)
+		}
+	}
+	relative, err := objectRelativePath(gone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directoryPath := filepath.Join(root, filepath.Dir(relative))
+	stray := filepath.Join(directoryPath, "stray")
+	temporary := filepath.Join(directoryPath, ".object-1")
+	link := filepath.Join(directoryPath, ObjectID{Snapshot: origin, Kind: ObjectKindFile, Ordinal: 101}.key()+".data")
+	for _, path := range []string{stray, temporary} {
+		if err := os.WriteFile(path, []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(stray, link); err != nil {
+		t.Fatal(err)
+	}
+	removed, quarantined, err := data.ReclaimUnreferenced(graph)
+	if err != nil || removed != 2 || quarantined != 2 {
+		t.Fatalf("reclaim=(%d,%d,%v), want the unreferenced object and the temporary removed, the stray and the link quarantined", removed, quarantined, err)
+	}
+	keptRelative, err := objectRelativePath(kept)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, keptRelative)); err != nil {
+		t.Fatalf("referenced object: %v", err)
+	}
+	for _, path := range []string{filepath.Join(root, relative), stray, temporary, link} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s remains: %v", path, err)
 		}
 	}
 }
