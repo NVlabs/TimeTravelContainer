@@ -18,10 +18,12 @@ package unet
 
 import (
 	"io"
+	"os"
 	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/hostthread"
 )
 
 // Darwin rejects a nonblocking AF_UNIX stream sendmsg whose payload exceeds
@@ -54,32 +56,74 @@ func limitDarwinSendmsgBuffers(bufs [][]byte) [][]byte {
 	return limited
 }
 
-func (s *Socket) wait(write bool) error {
-	for {
-		fd := s.fd.Load()
-		if fd < 0 {
-			return errClosing
-		}
-		events := []unix.PollFd{
-			{Fd: fd, Events: unix.POLLIN},
-			{Fd: int32(s.efd.FD()), Events: unix.POLLIN},
-		}
-		if write {
-			events[0].Events = unix.POLLOUT
-		}
-		if _, err := unix.Poll(events, -1); err == unix.EINTR {
-			continue
-		} else if err != nil {
-			return err
-		}
-		if events[1].Revents&unix.POLLIN != 0 {
-			return errClosing
-		}
-		return nil
+// socketPoller waits for a Socket to become ready through Go's network
+// poller, which parks the waiting goroutine rather than block a host thread
+// in poll(2). A thread blocked in a system call can't retire the HVF vCPU it
+// keeps (see pkg/hostthread), and a server's goroutines wait on their sockets
+// for as long as their clients stay silent. The poller watches a
+// close-on-exec duplicate of the socket's descriptor, since an os.File owns
+// the descriptor it holds, while Release hands the Socket's own back.
+type socketPoller struct {
+	file *os.File
+	conn syscall.RawConn
+}
+
+func newSocketPoller(fd int) (socketPoller, error) {
+	dup, err := unix.FcntlInt(uintptr(fd), unix.F_DUPFD_CLOEXEC, 0)
+	if err != nil {
+		return socketPoller{}, err
 	}
+	// The descriptors share the socket's non-blocking mode, so os.NewFile
+	// registers the duplicate with the network poller. Nothing may call its
+	// Fd method, which would make the socket blocking.
+	file := os.NewFile(uintptr(dup), "unet")
+	conn, err := file.SyscallConn()
+	if err != nil {
+		file.Close()
+		return socketPoller{}, err
+	}
+	return socketPoller{file: file, conn: conn}, nil
+}
+
+// close wakes every waiter, which then reports errClosing.
+func (p *socketPoller) close() error {
+	return p.file.Close()
+}
+
+// wait blocks until the socket is ready for reading or writing, depending on
+// the value of write.
+//
+// Returns errClosing if the Socket is in the process of closing.
+func (s *Socket) wait(write bool) error {
+	events := int16(unix.POLLIN)
+	if write {
+		events = unix.POLLOUT
+	}
+	// The poller forgets earlier readiness when a wait begins, so check the
+	// socket itself first: the operation that found it not ready ran before.
+	ready := func(fd uintptr) bool {
+		polled := []unix.PollFd{{Fd: int32(fd), Events: events}}
+		n, err := unix.Poll(polled, 0)
+		return err != nil || n != 0
+	}
+	var err error
+	if write {
+		err = s.poller.conn.Write(ready)
+	} else {
+		err = s.poller.conn.Read(ready)
+	}
+	if err != nil {
+		if s.fd.Load() < 0 {
+			return errClosing
+		}
+		return err
+	}
+	return nil
 }
 
 func (r *SocketReader) ReadVec(bufs [][]byte) (int, error) {
+	// The socket is non-blocking, and waits block no host thread.
+	defer hostthread.SetSyscallsEnd(hostthread.SetSyscallsEnd(true))
 	length := 0
 	for _, buf := range bufs {
 		length += len(buf)
@@ -188,6 +232,8 @@ func (r *SocketReader) retainReceivedFDs(control []byte, capacity int, recvFlags
 }
 
 func (w *SocketWriter) WriteVec(bufs [][]byte) (int, error) {
+	// The socket is non-blocking, and waits block no host thread.
+	defer hostthread.SetSyscallsEnd(hostthread.SetSyscallsEnd(true))
 	if w.race != nil {
 		w.race.Add(1)
 	}

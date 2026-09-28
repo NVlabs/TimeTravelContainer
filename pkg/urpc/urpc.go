@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/fd"
+	"gvisor.dev/gvisor/pkg/hostthread"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/unet"
@@ -340,7 +341,11 @@ func (s *Server) handleOne(client *unet.Socket) error {
 
 	// Call the method.
 	re := reflect.New(rm.resultType.Elem())
+	// A method's host system calls may block for as long as it likes, unless
+	// it declares otherwise with hostthread.SyscallsEnd.
+	previous := hostthread.SetSyscallsEnd(false)
 	rValues := rm.fn.Call([]reflect.Value{rm.rcvr, na, re})
+	hostthread.SetSyscallsEnd(previous)
 	if errVal := rValues[0].Interface(); errVal != nil {
 		result.Err = errVal.(error).Error()
 		return marshal(client, &result, nil)
@@ -470,6 +475,9 @@ func (s *Server) Handle(client *unet.Socket) error {
 func (s *Server) StartHandling(client *unet.Socket) {
 	s.clientRegister(client)
 	go func() { // S/R-SAFE: out of scope
+		// The server's own host system calls, on the client's non-blocking
+		// socket and to close descriptors, end.
+		hostthread.SyscallsEnd()
 		defer s.clientUnregister(client)
 		s.handleRegistered(client)
 	}()

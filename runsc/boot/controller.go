@@ -38,6 +38,7 @@ import (
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/fspath"
+	"gvisor.dev/gvisor/pkg/hostthread"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/control"
@@ -723,9 +724,20 @@ func (cm *containerManager) DestroySubcontainer(cid *string, _ *struct{}) error 
 	return cm.l.destroySubcontainer(*cid)
 }
 
+// syscallsEnd declares that the calling RPC method's host system calls end,
+// so that the thread running it may keep a parked HVF vCPU across them; see
+// pkg/hostthread. Those of the methods that call it do, being file I/O,
+// gofer requests, and imports of descriptors, apart from contended TTC
+// repository locks and donated connections, which withdraw the declaration
+// while they wait. urpc restores its own setting when a method returns.
+func syscallsEnd() {
+	hostthread.SyscallsEnd()
+}
+
 // ExecuteAsync starts running a command on a created or running sandbox. It
 // returns the PID of the new process.
 func (cm *containerManager) ExecuteAsync(args *control.ExecArgs, pid *int32) error {
+	syscallsEnd()
 	log.Debugf("containerManager.ExecuteAsync, cid: %s, args: %+v", args.ContainerID, args)
 	tgid, err := cm.l.executeAsync(args)
 	if err != nil {
@@ -1176,6 +1188,7 @@ func (cm *containerManager) Resume(_, _ *struct{}) error {
 
 // ForkBranch creates an in-memory child branch.
 func (cm *containerManager) ForkBranch(args *ForkBranchArgs, out *BranchInfo) error {
+	syscallsEnd()
 	info, err := cm.l.family.Fork(args)
 	if err != nil {
 		return err
@@ -1537,6 +1550,7 @@ func (cm *containerManager) DestroyBranch(args *BranchArgs, _ *struct{}) error {
 // roots. This is reserved for logical branch deletion; stop and migration use
 // DestroyBranch so that the filesystem can be restarted or handed off.
 func (cm *containerManager) DestroyBranchAndReclaim(args *BranchArgs, _ *struct{}) error {
+	syscallsEnd()
 	return cm.l.family.DestroyAndReclaim(args.ID)
 }
 
@@ -1587,6 +1601,7 @@ func (cm *containerManager) ExecSessions(args *ExecSessionsArgs, out *[]ExecSess
 
 // ExecWait waits for a managed exec session.
 func (cm *containerManager) ExecWait(args *ExecWaitArgs, waitStatus *uint32) error {
+	syscallsEnd()
 	if args == nil || len(args.FilePayload.Files) != 1 {
 		return fmt.Errorf("exec wait requires one client-liveness file")
 	}
@@ -1612,6 +1627,7 @@ func (cm *containerManager) ExecSignal(args *ExecSessionArgs, _ *struct{}) error
 // ConsolePush pushes a process's console, in the background, to the one file
 // given.
 func (cm *containerManager) ConsolePush(args *ConsolePushArgs, _ *struct{}) error {
+	syscallsEnd()
 	if len(args.FilePayload.Files) != 1 {
 		return fmt.Errorf("console push received %d files, want its output", len(args.FilePayload.Files))
 	}

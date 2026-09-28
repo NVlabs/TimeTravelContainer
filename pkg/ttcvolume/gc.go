@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/hostthread"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
 
@@ -82,14 +83,14 @@ func (r *Repository) GarbageCollectActive() (collected bool, result error) {
 		if err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
 			// flock upgrades are not guaranteed to retain the old shared lock
 			// after a failed conversion. Reacquire it before returning.
-			relockErr := unix.Flock(fd, unix.LOCK_SH)
+			relockErr := hostthread.Flock(fd, unix.LOCK_SH)
 			if errors.Is(err, unix.EWOULDBLOCK) {
 				return relockErr
 			}
 			return errors.Join(fmt.Errorf("upgrading repository lifecycle lock: %w", err), relockErr)
 		}
 		defer func() {
-			innerErr = errors.Join(innerErr, unix.Flock(fd, unix.LOCK_SH))
+			innerErr = errors.Join(innerErr, hostthread.Flock(fd, unix.LOCK_SH))
 		}()
 		if err := r.garbageCollectLocked(); err != nil {
 			return err

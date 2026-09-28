@@ -120,7 +120,7 @@ func (store *LocalDataStore) WithGraphMutation(mutate func() error) error {
 	}
 	store.gcMu.RLock()
 	defer store.gcMu.RUnlock()
-	if err := syscall.Flock(int(store.gcLock.Fd()), syscall.LOCK_SH); err != nil {
+	if err := hostthread.Flock(int(store.gcLock.Fd()), syscall.LOCK_SH); err != nil {
 		return err
 	}
 	defer syscall.Flock(int(store.gcLock.Fd()), syscall.LOCK_UN)
@@ -1221,7 +1221,7 @@ func (store *LocalDataStore) ReclaimUnreferenced(graph *Store) (removed, quarant
 	if store.gcLock == nil {
 		return 0, 0, errors.New("TTC bulk-object store is closed")
 	}
-	if err := syscall.Flock(int(store.gcLock.Fd()), syscall.LOCK_EX); err != nil {
+	if err := hostthread.Flock(int(store.gcLock.Fd()), syscall.LOCK_EX); err != nil {
 		return 0, 0, err
 	}
 	defer syscall.Flock(int(store.gcLock.Fd()), syscall.LOCK_UN)

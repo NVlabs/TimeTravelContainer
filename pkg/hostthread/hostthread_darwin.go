@@ -16,16 +16,45 @@
 
 package hostthread
 
-import _ "unsafe" // Required for go:linkname.
+import (
+	_ "unsafe" // Required for go:linkname.
 
-// SyscallsEnd records that the calling goroutine's host system calls all
+	"golang.org/x/sys/unix"
+)
+
+// SetSyscallsEnd sets whether the calling goroutine's host system calls all
 // end, rather than block for as long as, say, a peer stays silent: those on
 // non-blocking descriptors do, as do file I/O and requests to a gofer. A
 // thread that keeps an HVF vCPU parked, which only the thread can retire,
 // retires it before any other goroutine's system call, in case the call
 // never returns; it keeps it across these.
 //
+// It returns the previous setting, so that code can declare only its own
+// calls:
+//
+//	defer hostthread.SetSyscallsEnd(hostthread.SetSyscallsEnd(true))
+//
 // It requires the Go runtime patched by tools/go_darwin_vm_hooks.patch.
 //
-//go:linkname SyscallsEnd runtime.ttcSetSyscallsEnd
-func SyscallsEnd()
+//go:linkname SetSyscallsEnd runtime.ttcSetSyscallsEnd
+func SetSyscallsEnd(end bool) bool
+
+// SyscallsEnd records that all of the calling goroutine's host system calls
+// end; see SetSyscallsEnd.
+func SyscallsEnd() {
+	SetSyscallsEnd(true)
+}
+
+// Flock is flock(2) for a goroutine whose other system calls end: a lock that
+// another process holds may take as long as that process likes, so a
+// contended acquisition blocks as a system call that may not end.
+func Flock(fd int, how int) error {
+	if how&(unix.LOCK_NB|unix.LOCK_UN) == 0 {
+		err := unix.Flock(fd, how|unix.LOCK_NB)
+		if err != unix.EWOULDBLOCK {
+			return err
+		}
+		defer SetSyscallsEnd(SetSyscallsEnd(false))
+	}
+	return unix.Flock(fd, how)
+}

@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "go_library")
+load("//tools:defs.bzl", "go_library", "go_test")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -13,4 +13,13 @@ go_library(
         "hostthread_other.go",
     ],
     visibility = ["//:sandbox"],
+    deps = ["@org_golang_x_sys//unix:go_default_library"],
+)
+
+go_test(
+    name = "hostthread_test",
+    size = "small",
+    srcs = ["hostthread_darwin_test.go"],
+    library = ":hostthread",
+    deps = ["@org_golang_x_sys//unix:go_default_library"],
 )

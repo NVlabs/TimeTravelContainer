@@ -31,6 +31,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"gvisor.dev/gvisor/pkg/hostthread"
 )
 
 const (
@@ -824,7 +826,7 @@ func (store *SharedPackStore) acquireSnapshotLease(snapshot SnapshotID, operatio
 	if err != nil {
 		return nil, err
 	}
-	if err := syscall.Flock(int(directory.Fd()), operation); err != nil {
+	if err := hostthread.Flock(int(directory.Fd()), operation); err != nil {
 		directory.Close()
 		return nil, err
 	}

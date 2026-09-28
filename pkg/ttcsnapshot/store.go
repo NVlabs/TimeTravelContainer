@@ -34,6 +34,7 @@ import (
 	"syscall"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/hostthread"
 )
 
 const (
@@ -357,7 +358,7 @@ func open(dir string, externallyCoordinated bool) (*Store, error) {
 		deferredLoads: make(map[string]*deferredLoad), memoryTableSeed: maphash.MakeSeed(),
 	}
 	if externallyCoordinated {
-		if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		if err := hostthread.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
 			store.Close()
 			return nil, err
 		}
@@ -382,7 +383,7 @@ func (s *Store) Reload() error {
 		return fmt.Errorf("TTC snapshot graph requires reopen after an uncertain journal commit: %w", s.poisoned)
 	}
 	if s.externallyCoordinated && !s.externalTransaction {
-		if err := syscall.Flock(int(s.lock.Fd()), syscall.LOCK_SH); err != nil {
+		if err := hostthread.Flock(int(s.lock.Fd()), syscall.LOCK_SH); err != nil {
 			return err
 		}
 		defer syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN)
@@ -421,7 +422,7 @@ func (s *Store) ReloadForWrite() error {
 	if s.poisoned != nil {
 		return fmt.Errorf("TTC snapshot graph requires reopen after an uncertain journal commit: %w", s.poisoned)
 	}
-	if err := syscall.Flock(int(s.lock.Fd()), syscall.LOCK_EX); err != nil {
+	if err := hostthread.Flock(int(s.lock.Fd()), syscall.LOCK_EX); err != nil {
 		return err
 	}
 	defer syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN)
@@ -465,7 +466,7 @@ func (s *Store) BeginExternalTransaction() error {
 	if s.poisoned != nil {
 		return fmt.Errorf("TTC snapshot graph requires reopen after an uncertain journal commit: %w", s.poisoned)
 	}
-	if err := syscall.Flock(int(s.lock.Fd()), syscall.LOCK_EX); err != nil {
+	if err := hostthread.Flock(int(s.lock.Fd()), syscall.LOCK_EX); err != nil {
 		return err
 	}
 	if err := s.reloadForExternalWriteLocked(); err != nil {
@@ -521,7 +522,7 @@ func (s *Store) beginImplicitExternalMutationLocked() (bool, error) {
 	if !s.externallyCoordinated || s.externalTransaction {
 		return false, nil
 	}
-	if err := syscall.Flock(int(s.lock.Fd()), syscall.LOCK_EX); err != nil {
+	if err := hostthread.Flock(int(s.lock.Fd()), syscall.LOCK_EX); err != nil {
 		return false, err
 	}
 	if err := s.reloadForExternalWriteLocked(); err != nil {
@@ -3327,7 +3328,7 @@ func (s *Store) CheckpointExternallyCoordinated() error {
 	}
 	acquired := false
 	if !s.externalTransaction {
-		if err := syscall.Flock(int(s.lock.Fd()), syscall.LOCK_EX); err != nil {
+		if err := hostthread.Flock(int(s.lock.Fd()), syscall.LOCK_EX); err != nil {
 			return err
 		}
 		acquired = true

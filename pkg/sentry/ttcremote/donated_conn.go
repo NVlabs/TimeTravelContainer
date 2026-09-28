@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/hostthread"
 )
 
 type donatedTCPAddr string
@@ -37,6 +38,8 @@ type donatedTCPConn struct {
 }
 
 func (c *donatedTCPConn) Read(dst []byte) (int, error) {
+	// A read, and a wait, last as long as the peer stays silent.
+	defer hostthread.SetSyscallsEnd(hostthread.SetSyscallsEnd(false))
 	for {
 		n, err := c.file.Read(dst)
 		if n != 0 || !isWouldBlock(err) {
@@ -49,6 +52,8 @@ func (c *donatedTCPConn) Read(dst []byte) (int, error) {
 }
 
 func (c *donatedTCPConn) Write(src []byte) (int, error) {
+	// A write, and a wait, last as long as the peer doesn't read.
+	defer hostthread.SetSyscallsEnd(hostthread.SetSyscallsEnd(false))
 	for {
 		n, err := c.file.Write(src)
 		if n != 0 || !isWouldBlock(err) {

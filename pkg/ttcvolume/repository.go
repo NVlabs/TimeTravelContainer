@@ -39,6 +39,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/hostthread"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
 
@@ -1303,7 +1304,7 @@ func OpenRepositoryFD(dir *os.File, mode CopyMode) (*Repository, error) {
 		return nil, fmt.Errorf("opening donated repository lifecycle lock: %w", err)
 	}
 	repo.activeLock = os.NewFile(uintptr(activeFD), "ttc-volume-active")
-	if err := unix.Flock(activeFD, unix.LOCK_SH); err != nil {
+	if err := hostthread.Flock(activeFD, unix.LOCK_SH); err != nil {
 		repo.Close()
 		return nil, fmt.Errorf("locking donated repository lifecycle: %w", err)
 	}
@@ -1516,7 +1517,7 @@ func (r *Repository) withLock(fn func() error) (result error) {
 		}
 		r.lockFile = lock
 	}
-	if err := unix.Flock(int(r.lockFile.Fd()), unix.LOCK_EX); err != nil {
+	if err := hostthread.Flock(int(r.lockFile.Fd()), unix.LOCK_EX); err != nil {
 		return err
 	}
 	defer unix.Flock(int(r.lockFile.Fd()), unix.LOCK_UN)

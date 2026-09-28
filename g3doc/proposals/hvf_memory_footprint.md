@@ -88,7 +88,7 @@ Sentry's own allocation, and collects twice so that pools let go. Eight rounds
 of four forks, gdb in each, and their removal leave the Sentry at 114 to 136
 MiB four seconds after each round, from 102 MiB before the first. The page
 tables of vCPU churn were nearly all the difference, 32 MiB after the eighth
-round, and 5 MiB after phase 7, which leaves the Sentry at 112 MiB.
+round, and 2 MiB after phase 7, which leaves the Sentry at 113 MiB.
 
 ## Where the memory went
 
@@ -271,10 +271,16 @@ Each phase stands alone and is measured before the next.
    unless the goroutine declares that its system calls end
    (`hostthread.SyscallsEnd`): task goroutines, whose system calls are file
    I/O and gofer requests, the NAT relay, on non-blocking sockets, the
-   timekeepers, and snapshot `fsync` workers. The remaining churn is the
-   control plane's: eight rounds of four forks, gdb in each, and their removal
-   create 308 vCPUs, leaving 5 MiB of page tables, mostly for urpc handlers,
-   which may block indefinitely.
+   timekeepers, and snapshot `fsync` workers. urpc handlers waited for
+   requests in unet's `poll`, so each retired the vCPU of whatever thread it
+   ran on: eight rounds of four forks, gdb in each, and their removal created
+   308 vCPUs. unet now waits through Go's network poller on Darwin, which
+   parks the goroutine rather than block a thread; urpc's own system calls are
+   declared to end, and so are those of the RPC methods that forks, execs, and
+   removals use, except for waits on other processes: a contended `flock` of a
+   TTC repository, which ttcd and other Sentries share, and I/O on donated
+   connections. The eight rounds now create 73 vCPUs and leave 2 MiB of page
+   tables.
 8. **Stacks on first touch (done).** Import the top 80 KiB of a thread's
    stack, and the rest in windows as EL1 touches it, rather than all of it. At
    EL1 it holds only the Go runtime's frames; goroutines run on stacks in the
@@ -306,11 +312,6 @@ Each phase stands alone and is measured before the next.
   panics the host. Qualify it with a minimal, deliberate probe case first.
 * **Rendezvous cost of releases.** Scavenger releases now stop all vCPUs.
   Batch them, and release only ranges above a size threshold if needed.
-* **Control-plane vCPU churn.** urpc handlers still make a thread retire its
-  parked vCPU before each system call, about 40 times for a round of four
-  forks and their removal. Their waits for the next request could go through
-  Go's network poller instead of `poll`; each handler would then have to be
-  shown to make no system call that blocks indefinitely.
 * **Returning a spike on a busy Sentry.** Phase 6 trims only an idle one. A
   busy Sentry still returns its heap only as the scavenger paces it.
 * **The footprint outside user regions** is the double charge and
