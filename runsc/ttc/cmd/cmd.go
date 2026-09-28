@@ -14631,6 +14631,21 @@ func (b *runtimeBackend) reconcileInterruptedClusterMemoryGraph() error {
 
 func reconcileInterruptedMemoryGraph(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, sealState ttcsnapshot.SnapshotState) error {
 	inspection := graph.Inspect()
+	// A capture holds the pages it shares with sealed origins under pins
+	// until its trees refer to them. Those of a capture that did not finish
+	// would keep the origins referenced for good.
+	var held []string
+	for name := range inspection.Pins {
+		if ttcchunk.IsHeldPagePin(name) {
+			held = append(held, name)
+		}
+	}
+	sort.Strings(held)
+	if len(held) != 0 {
+		if err := ttcchunk.ReleaseHeldPagePins(graph, held); err != nil {
+			return fmt.Errorf("releasing interrupted memory capture holds: %w", err)
+		}
+	}
 	working := make(map[ttcsnapshot.SnapshotID]struct{})
 	for _, snapshot := range inspection.Snapshots {
 		if snapshot.State == ttcsnapshot.SnapshotWorking {
@@ -14647,7 +14662,7 @@ func reconcileInterruptedMemoryGraph(graph *ttcsnapshot.Store, data *ttcsnapshot
 		}
 	}
 	for name, object := range inspection.Pins {
-		if _, ok := working[object.Snapshot]; ok {
+		if _, ok := working[object.Snapshot]; ok && !ttcchunk.IsHeldPagePin(name) {
 			pins = append(pins, name)
 		}
 	}

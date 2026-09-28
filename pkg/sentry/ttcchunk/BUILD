@@ -30,7 +30,10 @@ go_library(
 go_test(
     name = "ttcchunk_test",
     size = "small",
-    srcs = ["chunk_test.go"],
+    srcs = [
+        "chunk_test.go",
+        "graph_test.go",
+    ],
     library = ":ttcchunk",
     deps = [
         "//pkg/hostarch",

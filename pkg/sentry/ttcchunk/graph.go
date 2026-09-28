@@ -24,9 +24,11 @@ import (
 	"io/fs"
 	"math/bits"
 	"os"
+	"path"
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
@@ -157,6 +159,43 @@ type importedMapping struct {
 // of memory.
 const graphTablesPerTransaction = 128
 
+// heldPinComponent names the pins under which a capture holds the pages it
+// shares with other origins until its trees refer to them:
+// <rootPrefix>/held/<chunk>.
+const heldPinComponent = "held"
+
+// IsHeldPagePin reports whether name is a pin under which a capture held pages
+// it shared with another origin. Only the capture needs it, so one that
+// outlives its capture's import was left by a process that stopped during it.
+func IsHeldPagePin(name string) bool {
+	parent, chunk := path.Split(name)
+	if !strings.HasSuffix(parent, "/"+heldPinComponent+"/") {
+		return false
+	}
+	_, err := ttcsnapshot.ParseObjectID(chunk)
+	return err == nil
+}
+
+// ReleaseHeldPagePins deletes pins under which a capture held pages it shared
+// with other origins. An origin whose reference ledger is frozen while it is
+// handed off refuses the deletion until the handoff ends, which may be after
+// the capture: the pins are then deleted in the background once it has, so
+// that they don't keep the origin's pages referenced for good. If that fails
+// otherwise, IsHeldPagePin identifies the pins when the process next starts.
+func ReleaseHeldPagePins(graph *ttcsnapshot.Store, pins []string) error {
+	err := graph.DeletePins(pins)
+	if !errors.Is(err, ttcsnapshot.ErrSnapshotLedgerFrozen) {
+		return err
+	}
+	go func() {
+		for delay := 10 * time.Millisecond; errors.Is(err, ttcsnapshot.ErrSnapshotLedgerFrozen); delay = min(2*delay, 5*time.Second) {
+			time.Sleep(delay)
+			err = graph.DeletePins(pins)
+		}
+	}()
+	return nil
+}
+
 // importCapture installs manifest's pages into graph under rootPrefix, one
 // memory tree per resource. Pages the graph already holds, by the identity the
 // guest's memory manager gave them, are shared rather than stored again, and
@@ -177,7 +216,7 @@ func importCapture(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, o
 	var pins []string
 	defer func() {
 		if len(pins) != 0 {
-			if err := graph.DeletePins(pins); err != nil && retErr == nil {
+			if err := ReleaseHeldPagePins(graph, pins); err != nil && retErr == nil {
 				retErr = fmt.Errorf("releasing the memory pages a capture shares: %w", err)
 			}
 		}
@@ -210,7 +249,7 @@ func importCapture(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, o
 			identities = append(identities, object.slots[index].identity)
 		}
 	}
-	locations, held, err := graph.HoldMemoryPages(rootPrefix+"/held", identities, reusableStates...)
+	locations, held, err := graph.HoldMemoryPages(rootPrefix+"/"+heldPinComponent, identities, reusableStates...)
 	if err != nil {
 		return GraphImportResult{}, err
 	}
