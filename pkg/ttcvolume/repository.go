@@ -1305,6 +1305,8 @@ func OpenRepositoryFD(dir *os.File, mode CopyMode) (*Repository, error) {
 		repo.Close()
 		return nil, fmt.Errorf("opening donated repository snapshot graph: %w", err)
 	}
+	// A runtime's collection after a branch's removal frees data by name.
+	repo.graph.RecordCollectedBulk()
 	dataFD, openErr := unix.Openat(int(repo.dir.Fd()), "data", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if openErr != nil {
 		repo.Close()

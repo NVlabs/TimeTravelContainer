@@ -2860,6 +2860,87 @@ func TestReclaimUnreferencedByDescriptorClassifiesEntries(t *testing.T) {
 	}
 }
 
+// A Store that records its collection hands the objects with data it
+// deleted to ReclaimCollected, which removes their data by name and leaves
+// every other file, whatever it is, to ReclaimUnreferenced.
+func TestReclaimCollectedRemovesWhatCollectionFreed(t *testing.T) {
+	for _, byDescriptor := range []bool{false, true} {
+		graph := openTestStore(t)
+		graph.RecordCollectedBulk()
+		root := filepath.Join(t.TempDir(), "objects")
+		data, err := OpenLocalDataStore(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if byDescriptor {
+			directory, err := os.Open(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err = OpenLocalDataStoreFD(directory)
+			directory.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		origin, err := graph.AllocateWorking()
+		if err != nil {
+			t.Fatal(err)
+		}
+		freed, err := graph.CreateObject(origin, "root/freed", ObjectKindFile, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		kept, err := graph.CreateObject(origin, "root/kept", ObjectKindFile, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stray := ObjectID{Snapshot: origin, Kind: ObjectKindFile, Ordinal: 1000}
+		for _, id := range []ObjectID{freed, kept, stray} {
+			if err := data.Install(id, strings.NewReader("bytes"), 5); err != nil {
+				t.Fatal(err)
+			}
+		}
+		exists := func(id ObjectID) bool {
+			relative, err := objectRelativePath(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = os.Stat(filepath.Join(root, relative))
+			return err == nil
+		}
+		if err := graph.DeletePins([]string{"root/freed"}); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			collected, err := graph.Collect(1024)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if collected == 0 {
+				break
+			}
+		}
+		ids := graph.TakeCollectedBulk()
+		if len(ids) != 1 || ids[0] != freed {
+			t.Fatalf("collected %v, want %s", ids, freed)
+		}
+		if again := graph.TakeCollectedBulk(); len(again) != 0 {
+			t.Fatalf("taken twice: %v", again)
+		}
+		if removed, err := data.ReclaimCollected(graph, ids); err != nil || removed != 1 {
+			t.Fatalf("reclaimed %d, %v; want 1", removed, err)
+		}
+		if exists(freed) || !exists(kept) || !exists(stray) {
+			t.Fatalf("freed %t kept %t stray %t; want only the freed object gone", exists(freed), exists(kept), exists(stray))
+		}
+		if removed, _, err := data.ReclaimUnreferenced(graph); err != nil || removed != 1 || exists(stray) {
+			t.Fatalf("the whole reading removed %d, %v, stray %t; want the stray gone", removed, err, exists(stray))
+		}
+		data.Close()
+	}
+}
+
 // A graph reopened by the process that closed it starts from the state it
 // cached and replays only what was journaled after, and the result is the
 // graph a full load gives; a journal shorter than the cached position, or a

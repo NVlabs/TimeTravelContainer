@@ -1377,6 +1377,47 @@ func (store *LocalDataStore) reclaimRelative(graph *Store, relative string, cach
 	return removed, quarantined, nil
 }
 
+// ReclaimCollected removes the data of objects graph's collection deleted,
+// as TakeCollectedBulk returns them: what ReclaimUnreferenced would find of
+// one collection, without reading every object's directory, which cost as
+// much as removing a branch of 100,000 files each time a fork of it went. It
+// leaves what only a whole reading finds, such as a crash's leftovers, to
+// ReclaimUnreferenced. Callers serialize it with graph/data commits.
+func (store *LocalDataStore) ReclaimCollected(graph *Store, ids []ObjectID) (removed int, err error) {
+	store.gcMu.Lock()
+	defer store.gcMu.Unlock()
+	if store.gcLock == nil {
+		return 0, errors.New("TTC bulk-object store is closed")
+	}
+	if err := syscall.Flock(int(store.gcLock.Fd()), syscall.LOCK_EX); err != nil {
+		return 0, err
+	}
+	defer syscall.Flock(int(store.gcLock.Fd()), syscall.LOCK_UN)
+	for _, id := range ids {
+		if _, ok := graph.Object(id); ok || store.keepsAsCache(graph, id) {
+			continue
+		}
+		relative, err := objectRelativePath(id)
+		if err != nil {
+			return removed, err
+		}
+		store.forgetUnsyncedName(id)
+		if store.rootFD != nil {
+			err = unix.Unlinkat(int(store.rootFD.Fd()), relative, 0)
+		} else {
+			err = os.Remove(filepath.Join(store.root, relative))
+		}
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return removed, err
+		}
+		removed++
+	}
+	return removed, nil
+}
+
 // ReclaimUnreferenced removes complete bulk objects absent from graph and
 // quarantines unknown names. Callers serialize it with graph/data commits.
 func (store *LocalDataStore) ReclaimUnreferenced(graph *Store) (removed, quarantined int, err error) {

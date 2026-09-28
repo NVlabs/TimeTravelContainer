@@ -362,6 +362,11 @@ type Store struct {
 	// object that is gone, and scans again before it reports nothing left.
 	collectQueue  []string
 	collectQueued map[string]struct{}
+	// collectedBulk holds, once RecordCollectedBulk asked for it, the objects
+	// with standalone bulk data collection has deleted since
+	// TakeCollectedBulk last returned them.
+	recordCollected bool
+	collectedBulk   []ObjectID
 }
 
 type deferredResolver struct {
@@ -3220,7 +3225,19 @@ func (s *Store) commitReleaseLocked(ops []journalOp, touched map[string]Object) 
 	for _, key := range collected {
 		ops = append(ops, journalOp{DeleteObject: key})
 	}
-	return s.commitLockedWithMaterializedReferences(ops, touched)
+	if err := s.commitLockedWithMaterializedReferences(ops, touched); err != nil {
+		return err
+	}
+	if s.recordCollected {
+		for _, key := range collected {
+			if id, err := parseObjectKey(key); err == nil {
+				if _, err := objectKindName(id.Kind); err == nil {
+					s.collectedBulk = append(s.collectedBulk, id)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // collectReleasedLocked collects the objects in queue that a release left
@@ -3637,6 +3654,7 @@ func (s *Store) collectBatchLocked(limit, referenceLimit int) (int, error) {
 		return object, ok
 	}
 	collected := 0
+	var bulk []ObjectID
 	for len(s.collectQueue) != 0 && collected < limit && len(touched) < referenceLimit {
 		key := s.collectQueue[0]
 		s.collectQueue = s.collectQueue[1:]
@@ -3664,6 +3682,9 @@ func (s *Store) collectBatchLocked(limit, referenceLimit int) (int, error) {
 		}
 		delete(touched, key)
 		deleted[key] = struct{}{}
+		if _, err := objectKindName(object.ID.Kind); err == nil {
+			bulk = append(bulk, object.ID)
+		}
 		collected++
 	}
 	if collected == 0 {
@@ -3692,7 +3713,31 @@ func (s *Store) collectBatchLocked(limit, referenceLimit int) (int, error) {
 	if err := s.commitLockedWithMaterializedReferences(ops, references); err != nil {
 		return 0, err
 	}
+	if s.recordCollected {
+		s.collectedBulk = append(s.collectedBulk, bulk...)
+	}
 	return collected, nil
+}
+
+// RecordCollectedBulk makes the Store record, for TakeCollectedBulk, the
+// objects with standalone bulk data its collection deletes. Its user must
+// take them after each collection.
+func (s *Store) RecordCollectedBulk() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.recordCollected = true
+}
+
+// TakeCollectedBulk returns the objects with standalone bulk data that this
+// Store's collection has deleted since the last call, as RecordCollectedBulk
+// asked. Once the collection is durable, their data may go, found by name
+// rather than by reading every object's directory.
+func (s *Store) TakeCollectedBulk() []ObjectID {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ids := s.collectedBulk
+	s.collectedBulk = nil
+	return ids
 }
 
 // CollectEmptySnapshots removes origins that own no graph objects and are not

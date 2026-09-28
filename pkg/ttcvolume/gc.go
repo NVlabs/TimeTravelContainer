@@ -64,7 +64,7 @@ func (r *Repository) GarbageCollect() error {
 		_ = unix.Flock(int(active.Fd()), unix.LOCK_UN)
 		_ = active.Close()
 	}()
-	return r.withLock(r.garbageCollectLocked)
+	return r.withLock(func() error { return r.garbageCollectLocked(true) })
 }
 
 // GarbageCollectActive performs collection from a descriptor-backed runtime
@@ -91,7 +91,7 @@ func (r *Repository) GarbageCollectActive() (collected bool, result error) {
 		defer func() {
 			innerErr = errors.Join(innerErr, unix.Flock(fd, unix.LOCK_SH))
 		}()
-		if err := r.garbageCollectLocked(); err != nil {
+		if err := r.garbageCollectLocked(false); err != nil {
 			return err
 		}
 		collected = true
@@ -113,7 +113,11 @@ func (r *Repository) branchNamesLocked() ([]string, error) {
 	return names, nil
 }
 
-func (r *Repository) garbageCollectLocked() error {
+// garbageCollectLocked collects what no branch reaches. A full collection
+// reads every data object's name to find what to remove; otherwise only the
+// data of what this collection freed goes, as after a runtime's branch
+// removal, and a manager's full collection later finds the rest.
+func (r *Repository) garbageCollectLocked(full bool) error {
 	if err := r.flushAllMetadataBatchesLocked(); err != nil {
 		return fmt.Errorf("publishing metadata before garbage collection: %w", err)
 	}
@@ -169,7 +173,12 @@ func (r *Repository) garbageCollectLocked() error {
 	if err := r.graph.Sync(); err != nil {
 		return err
 	}
-	_, _, err = r.data.ReclaimUnreferenced(r.graph)
+	collected := r.graph.TakeCollectedBulk()
+	if full {
+		_, _, err = r.data.ReclaimUnreferenced(r.graph)
+	} else {
+		_, err = r.data.ReclaimCollected(r.graph, collected)
+	}
 	if err != nil {
 		return err
 	}
