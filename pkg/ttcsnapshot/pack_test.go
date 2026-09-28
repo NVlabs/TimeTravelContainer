@@ -823,6 +823,51 @@ func TestSharedPackManifestsEnumeratesOnlyCommittedOrigins(t *testing.T) {
 
 // A store keeps the manifests it has read decoded only within its bound, the
 // least recently used forgotten first.
+// A view opens a snapshot's manifest once, for all the objects it reads of
+// the snapshot.
+func TestSharedPackViewOpensEachManifestOnce(t *testing.T) {
+	shared, err := OpenSharedPackStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	graph := openTestStore(t)
+	data, err := OpenLocalDataStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := graph.CreateObject(origin, "root/first", ObjectKindMetadata, []byte("first"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := graph.CreateObject(origin, "root/second", ObjectKindMetadata, []byte("second"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Seal(origin, SnapshotSealedLocal); err != nil {
+		t.Fatal(err)
+	}
+	if err := shared.Publish(context.Background(), graph, origin, data); err != nil {
+		t.Fatal(err)
+	}
+	view := shared.View()
+	if object, err := view.Object(first); err != nil || string(object.Data) != "first" {
+		t.Fatalf("view object: %+v, %v", object, err)
+	}
+	if err := os.Remove(filepath.Join(shared.snapshotDirectory(origin), sharedManifestName)); err != nil {
+		t.Fatal(err)
+	}
+	if object, err := view.Object(second); err != nil || string(object.Data) != "second" {
+		t.Fatalf("view object after its manifest was read: %+v, %v", object, err)
+	}
+	if _, err := shared.Object(second); err == nil {
+		t.Fatal("the store read an object of a removed manifest")
+	}
+}
+
 func TestSharedPackManifestCacheIsBounded(t *testing.T) {
 	shared, err := OpenSharedPackStore(t.TempDir())
 	if err != nil {

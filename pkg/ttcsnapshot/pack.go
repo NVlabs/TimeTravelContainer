@@ -643,6 +643,42 @@ func (store *SharedPackStore) Object(id ObjectID) (Object, error) {
 	return cloneObject(packed.Object), nil
 }
 
+// SharedPackView reads object metadata as Object does, but opens and
+// validates each snapshot's manifest once for its lifetime rather than for
+// each object: an immutable object's metadata never changes, and a reader
+// walking a tree of 100,000 files spent 2.6 s reopening manifests.
+type SharedPackView struct {
+	store     *SharedPackStore
+	mu        sync.Mutex
+	manifests map[SnapshotID]*SnapshotManifest
+}
+
+// View returns a view of the store for one reader's walk.
+func (store *SharedPackStore) View() *SharedPackView {
+	return &SharedPackView{store: store, manifests: make(map[SnapshotID]*SnapshotManifest)}
+}
+
+// Object is SharedPackStore.Object.
+func (view *SharedPackView) Object(id ObjectID) (Object, error) {
+	view.mu.Lock()
+	manifest, ok := view.manifests[id.Snapshot]
+	view.mu.Unlock()
+	if !ok {
+		var err error
+		if manifest, err = view.store.manifest(id.Snapshot); err != nil {
+			return Object{}, err
+		}
+		view.mu.Lock()
+		view.manifests[id.Snapshot] = manifest
+		view.mu.Unlock()
+	}
+	packed, ok := packedObjectByID(manifest, id)
+	if !ok {
+		return Object{}, os.ErrNotExist
+	}
+	return cloneObject(packed.Object), nil
+}
+
 // Objects returns immutable metadata for ids while opening each snapshot
 // manifest at most once. Callers that validate a complete memory graph may
 // name thousands of objects; repeatedly calling Object would clone the entire

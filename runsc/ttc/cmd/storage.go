@@ -34,7 +34,9 @@ import (
 )
 
 type sharedSnapshotObjectReader struct {
-	store          *ttcsnapshot.SharedPackStore
+	store *ttcsnapshot.SharedPackStore
+	// view serves the reader's metadata.
+	view           *ttcsnapshot.SharedPackView
 	mu             sync.Mutex
 	allowed        map[ttcsnapshot.ObjectID]struct{}
 	allowedOrigins map[ttcsnapshot.SnapshotID]struct{}
@@ -48,7 +50,7 @@ func newSharedSnapshotObjectReader(store *ttcsnapshot.SharedPackStore, root stri
 	if err != nil {
 		return nil, err
 	}
-	return &sharedSnapshotObjectReader{store: store, allowed: map[ttcsnapshot.ObjectID]struct{}{id: {}}, unexpanded: []ttcsnapshot.ObjectID{id}}, nil
+	return &sharedSnapshotObjectReader{store: store, view: store.View(), allowed: map[ttcsnapshot.ObjectID]struct{}{id: {}}, unexpanded: []ttcsnapshot.ObjectID{id}}, nil
 }
 
 // authorize reports whether id is in the tree the reader serves: the root,
@@ -70,7 +72,7 @@ func (r *sharedSnapshotObjectReader) authorize(id ttcsnapshot.ObjectID) bool {
 	for len(r.unexpanded) != 0 {
 		next := r.unexpanded[len(r.unexpanded)-1]
 		r.unexpanded = r.unexpanded[:len(r.unexpanded)-1]
-		object, err := r.store.Object(next)
+		object, err := r.view.Object(next)
 		if err != nil {
 			continue
 		}
@@ -115,7 +117,7 @@ func (r *sharedSnapshotObjectReader) RemoteObject(id ttcsnapshot.ObjectID) (ttcs
 	if !r.authorize(id) {
 		return ttcsnapshot.Object{}, os.ErrPermission
 	}
-	object, err := r.store.Object(id)
+	object, err := r.view.Object(id)
 	if err != nil {
 		return ttcsnapshot.Object{}, err
 	}
