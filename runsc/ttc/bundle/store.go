@@ -33,6 +33,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode"
@@ -5793,7 +5794,42 @@ func (s Store) RemoveActiveContainerState(id string) error {
 		_ = os.Remove(tombstone)
 		return fmt.Errorf("removing node-local state of container %q: %w", id, err)
 	}
+	if backgroundRemovals.enabled.Load() && s.removeAllPath == nil {
+		backgroundRemovals.pending.Add(1)
+		go func() {
+			defer backgroundRemovals.pending.Done()
+			backgroundRemovals.mu.Lock()
+			defer backgroundRemovals.mu.Unlock()
+			if err := os.RemoveAll(tombstone); err != nil {
+				log.Warningf("Deleting the removed node-local state of container %q: %v", id, err)
+			}
+		}()
+		return nil
+	}
 	return s.removeAll(tombstone)
+}
+
+// backgroundRemovals, once enabled, has RemoveActiveContainerState delete the
+// state it moves away after it returns, one deletion at a time.
+var backgroundRemovals struct {
+	enabled atomic.Bool
+	pending sync.WaitGroup
+	mu      sync.Mutex
+}
+
+// RemoveInBackground makes RemoveActiveContainerState, in this process, delete
+// the node-local state it moves out of the namespace after it returns. A
+// family's node-local state holds its branches' repositories, and deleting
+// 200,000 files took 2 s of a 3 s removal. State a process had not deleted
+// when it stopped is left for SweepRemovedActiveContainerState.
+func RemoveInBackground() {
+	backgroundRemovals.enabled.Store(true)
+}
+
+// WaitForBackgroundRemovals waits for the deletions RemoveInBackground left to
+// run in the background.
+func WaitForBackgroundRemovals() {
+	backgroundRemovals.pending.Wait()
 }
 
 // SweepRemovedActiveContainerState deletes the node-local state that

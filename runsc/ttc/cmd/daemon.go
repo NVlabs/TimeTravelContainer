@@ -6367,6 +6367,9 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 	_, recoveryErr := recoveryStore.RecoverContainerRemovals()
 	recoveryErr = errors.Join(recoveryErr, recoveryStore.SweepRemovedActiveContainerState())
 	unlockRecovery()
+	// Removals from now on delete what they move away after they return; the
+	// sweep above finds what a stopped daemon had not deleted.
+	ttcbundle.RemoveInBackground()
 	if recoveryErr != nil && stderr != nil {
 		fmt.Fprintf(stderr, "ttcd: warning: recovering removed containers: %v\n", recoveryErr)
 	}
