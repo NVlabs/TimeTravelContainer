@@ -3395,6 +3395,76 @@ func TestRemoveBranchFilesystemsDeletesFinalDistributedVolumeMaterialization(t *
 	}
 }
 
+// The runtime removes a branch of a family-private repository before the
+// daemon cleans up after it. The daemon learns from the branch pointers what
+// is left to do, without opening the repository: here its graph is unreadable.
+func TestRemoveBranchFilesystemsReadsBranchPointers(t *testing.T) {
+	shared := t.TempDir()
+	local := t.TempDir()
+	manager, err := ttcvolume.OpenManager(local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	containerID := "pointers"
+	path := filepath.Join(local, "containers", containerID, "rootfs-upper")
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	repository, err := manager.CreatePrivate(path, "rootfs-upper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scoped := ttcvolume.ScopedBranchID(containerID, "gone")
+	if err := repository.Fork(ttcvolume.MainBranch, scoped); err != nil {
+		t.Fatal(err)
+	}
+	// What the runtime's removal of the branch leaves.
+	if err := repository.RemoveBranch(scoped); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "graph", "graph.head"), []byte("unreadable"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	bundleDir := filepath.Join(shared, "containers", containerID, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	encodedRepositories, err := json.Marshal([]specutils.TTCVolumeRepository{{
+		Source: specutils.TTCRootfsUpperSource, Path: path, Branch: ttcvolume.MainBranch,
+		CopyMode: string(ttcvolume.CopyModeFull), Private: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(bundleDir, "config.json"), &specs.Spec{Annotations: map[string]string{
+		specutils.AnnotationTTCVolumeRepositories: string(encodedRepositories),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	gone := BranchInfo{ID: "gone", FilesystemBranch: scoped, State: "exited"}
+	main := BranchInfo{ID: "main", FilesystemBranch: ttcvolume.MainBranch, State: "exited"}
+	info := ContainerInfo{ID: containerID, Name: containerID, BundleDir: bundleDir, Branches: []BranchInfo{main, gone}}
+	if err := writeCurrentContainerFixture(filepath.Join(shared, "containers", containerID, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	store := Store{Root: shared, ActiveRoot: local}
+	if err := store.RemoveBranchFilesystems(containerID, gone); err != nil {
+		t.Fatalf("removing a branch the runtime removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(path, "branches", ttcvolume.MainBranch+".json")); err != nil {
+		t.Fatalf("the remaining branch: %v", err)
+	}
+	if err := store.RemoveBranchFilesystems(containerID, main); err != nil {
+		t.Fatalf("removing the last branch: %v", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the repository of no branch remains: %v", err)
+	}
+}
+
 func TestRemoveBranchFilesystemsAcceptsAlreadyReclaimedActiveRepository(t *testing.T) {
 	shared := t.TempDir()
 	local := t.TempDir()

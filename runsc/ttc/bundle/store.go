@@ -5279,6 +5279,26 @@ func (s Store) RemoveBranchFilesystems(name string, branch BranchInfo) error {
 			// and therefore take the normal removal path.
 			continue
 		}
+		// The runtime removes a branch and collects what only it held before
+		// the daemon cleans up after it, unless the branch was the last. Opening
+		// the repository loads its whole graph, 6 s for one of 100,000 files,
+		// where its branch pointers tell what is left to do.
+		ownedWhole := repositoryCanonicalBranchBelongsToFamily(config) || physicalDistributedRuntime
+		if branches, err := manager.PrivateBranches(path); err == nil {
+			removed := !slices.Contains(branches, repositoryBranch)
+			if removed && len(branches) != 0 {
+				// Collection ran with the removal, or a later pass makes it: a
+				// daemon's collection waits while a runtime has the repository.
+				continue
+			}
+			if ownedWhole && (removed || len(branches) == 1) {
+				// The repository's last branch goes, and the repository with it.
+				if err := manager.RemovePrivate(path); err != nil {
+					return fmt.Errorf("removing final private repository %q: %w", config.Source, err)
+				}
+				continue
+			}
+		}
 		repository, err := manager.OpenPrivate(path)
 		if err != nil {
 			// Runtime eviction and active-tier reclamation may win the race with
@@ -5304,16 +5324,14 @@ func (s Store) RemoveBranchFilesystems(name string, branch BranchInfo) error {
 		// volume survives in the source/target authority, not in this obsolete
 		// node-local repository. Ordinary family removal must still preserve a
 		// named volume's canonical main pointer.
-		removeRepository := errors.Is(removeErr, ttcvolume.ErrFinalBranch) &&
-			(repositoryCanonicalBranchBelongsToFamily(config) || physicalDistributedRuntime)
+		removeRepository := errors.Is(removeErr, ttcvolume.ErrFinalBranch) && ownedWhole
 		if removeRepository {
 			removeErr = nil
 		}
 		if removeErr == nil {
 			if !removeRepository {
 				removeErr = repository.GarbageCollect()
-				if errors.Is(removeErr, ttcvolume.ErrEmptyRepository) &&
-					(repositoryCanonicalBranchBelongsToFamily(config) || physicalDistributedRuntime) {
+				if errors.Is(removeErr, ttcvolume.ErrEmptyRepository) && ownedWhole {
 					// The Sentry may have committed its own branch-pointer
 					// deletion before daemon-side artifact cleanup begins. An
 					// empty family-private repository is therefore the same

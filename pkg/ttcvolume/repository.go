@@ -1135,6 +1135,31 @@ func (m *Manager) OpenPrivate(path string) (*Repository, error) {
 	return repository, nil
 }
 
+// PrivateBranches returns the IDs of the branches of the private repository
+// at path, from their pointers, without opening the repository: an open loads
+// its whole graph, seconds for one of 100,000 files. It returns an error
+// satisfying os.ErrNotExist when path has no repository.
+func (m *Manager) PrivateBranches(path string) ([]string, error) {
+	path = filepath.Clean(path)
+	relative, err := filepath.Rel(m.root, path)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return nil, fmt.Errorf("private repository path %q is outside data root %q", path, m.root)
+	}
+	entries, err := os.ReadDir(filepath.Join(path, "branches"))
+	if err != nil {
+		return nil, err
+	}
+	var branches []string
+	for _, entry := range entries {
+		id, ok := strings.CutSuffix(entry.Name(), ".json")
+		if !ok || entry.IsDir() || validateName(id, "branch") != nil {
+			continue
+		}
+		branches = append(branches, id)
+	}
+	return branches, nil
+}
+
 // List returns all valid snapshot-graph-era volumes.
 func (m *Manager) List() ([]VolumeInfo, error) {
 	entries, err := os.ReadDir(m.volumes)
