@@ -163,6 +163,12 @@ func (r *Repository) garbageCollectLocked() error {
 	if _, err := r.graph.CollectEmptySnapshots(workingSnapshots); err != nil {
 		return err
 	}
+	// A repository's graph commits are durable only at a sync: make the
+	// collection so before removing what it collected, which a crash must not
+	// bring back without its data.
+	if err := r.graph.Sync(); err != nil {
+		return err
+	}
 	_, _, err = r.data.ReclaimUnreferenced(r.graph)
 	if err != nil {
 		return err
@@ -182,5 +188,12 @@ func (r *Repository) garbageCollectLocked() error {
 		}
 	}
 	r.dirtyMu.Unlock()
-	return r.graph.CheckpointExternallyCoordinated()
+	// A checkpoint costs in proportion to the whole graph: take one when the
+	// journal has outgrown the last, as at other durability boundaries, not
+	// after every collection. Removing a branch of 100,000 files spent 1 s
+	// encoding the rest of the graph.
+	if r.graph.CheckpointDue(reclaimJournalBytes) {
+		return r.graph.CheckpointExternallyCoordinated()
+	}
+	return nil
 }

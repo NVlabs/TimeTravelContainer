@@ -2151,8 +2151,10 @@ func TestGarbageCollectBoundsRepeatedBranchChurn(t *testing.T) {
 	if stats := repository.graph.Stats(); stats.Roots != 1 || stats.Reclaiming != 0 || stats.Snapshots > 2 {
 		t.Fatalf("graph after churn=%+v, want the parentless main root, at most two live origins, and no reclaiming objects", stats)
 	}
-	if info, err := os.Stat(graphJournalPath(t, repository.path)); err != nil || info.Size() != int64(len("TTCSGJ2\n")) {
-		t.Fatalf("compacted graph journal: info=%v err=%v", info, err)
+	// Collection checkpoints the graph only once its journal has outgrown the
+	// last checkpoint, as other durability boundaries do.
+	if info, err := os.Stat(graphJournalPath(t, repository.path)); err != nil || info.Size() >= reclaimJournalBytes {
+		t.Fatalf("graph journal after churn: info=%v err=%v, want under %d bytes", info, err, reclaimJournalBytes)
 	}
 	repository.metadataMu.Lock()
 	metadataEntries := len(repository.metadata)
