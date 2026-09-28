@@ -17,6 +17,7 @@
 package pgalloc
 
 import (
+	"reflect"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -131,6 +132,59 @@ func TestLogicalPageIDsAllocationAndOffsetReuse(t *testing.T) {
 		t.Fatalf("recycled offset reused a retired identity: old=%+v new=%+v", id0, recycledID)
 	}
 	f.DecRef(recycled)
+}
+
+// A holder that takes pages over to write them in place gives them new content
+// versions under the same logical pages, as a copy would, and only if it holds
+// them alone: a capture may hold their bytes under the versions they had.
+func TestOwnForWriteRenewsVersions(t *testing.T) {
+	f := newLogicalPageTestMemoryFile()
+	fr, err := f.findAllocatableAndMarkUsed(&allocState{
+		length: 3 * page,
+		opts:   AllocOpts{Dir: BottomUp},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identities := func() (pages []LogicalPageID, versions []PageVersionID) {
+		for offset := fr.Start; offset < fr.End; offset += page {
+			id, version, ok := f.LogicalPageVersionAt(offset)
+			if !ok {
+				t.Fatalf("page at %#x has no identity", offset)
+			}
+			pages, versions = append(pages, id), append(versions, version)
+		}
+		return pages, versions
+	}
+	pages, versions := identities()
+
+	f.IncRef(fr, 0)
+	if f.OwnForWrite(fr) {
+		t.Fatal("OwnForWrite took over pages another reference holds")
+	}
+	if gotPages, gotVersions := identities(); !reflect.DeepEqual(gotPages, pages) || !reflect.DeepEqual(gotVersions, versions) {
+		t.Fatalf("refused OwnForWrite changed identities: %+v %+v, want %+v %+v", gotPages, gotVersions, pages, versions)
+	}
+	f.DecRef(fr)
+
+	if !f.OwnForWrite(fr) {
+		t.Fatal("OwnForWrite refused pages held alone")
+	}
+	gotPages, gotVersions := identities()
+	if !reflect.DeepEqual(gotPages, pages) {
+		t.Fatalf("OwnForWrite changed logical pages: %+v, want %+v", gotPages, pages)
+	}
+	for index, version := range gotVersions {
+		for _, old := range versions {
+			if version == old {
+				t.Fatalf("page %d kept version %+v", index, version)
+			}
+		}
+		if index != 0 && version.Sequence != gotVersions[index-1].Sequence+1 {
+			t.Fatalf("renewed versions are not contiguous: %+v", gotVersions)
+		}
+	}
+	f.DecRef(fr)
 }
 
 func TestLogicalPageChunkCoordinates(t *testing.T) {

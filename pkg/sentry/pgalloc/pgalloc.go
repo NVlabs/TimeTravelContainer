@@ -1571,9 +1571,61 @@ func (f *MemoryFile) decommitOrManuallyZero(fr memmap.FileRange) {
 //
 // Preconditions: At least one reference must be held on all pages in fr.
 func (f *MemoryFile) HasUniqueRef(fr memmap.FileRange) bool {
-	hasUniqueRef := true
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.hasUniqueRefLocked(fr)
+}
+
+// OwnForWrite is HasUniqueRef for a caller that, if it holds the only
+// reference on fr, is about to write fr's pages in place: it then gives them
+// new content versions under their logical identities. A capture made while
+// another holder shared them may hold their bytes under their current
+// versions, and a later capture that found a page by its version would take
+// those bytes for whatever the page holds by then.
+//
+// Preconditions: At least one reference must be held on all pages in fr.
+func (f *MemoryFile) OwnForWrite(fr memmap.FileRange) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.hasUniqueRefLocked(fr) {
+		return false
+	}
+	f.renewPageVersionsLocked(fr)
+	return true
+}
+
+// renewPageVersionsLocked gives fr's pages new content versions, keeping their
+// logical identities. A page without an identity gets a new one.
+//
+// Preconditions: f.mu must be locked.
+func (f *MemoryFile) renewPageVersionsLocked(fr memmap.FileRange) {
+	if pages := fr.Length() / hostarch.PageSize; pages > math.MaxUint64-f.nextPageVersion {
+		panic(fmt.Sprintf("page version sequence exhausted for %v", fr))
+	}
+	runs := f.logicalPageRangesLocked(fr)
+	f.logicalPages.RemoveRange(fr)
+	cursor := fr.Start
+	for _, run := range runs {
+		if run.Range.Start != cursor {
+			f.assignLogicalPagesLocked(memmap.FileRange{Start: cursor, End: run.Range.Start})
+		}
+		f.logicalPages.InsertRange(run.Range, logicalPageInfo{
+			Allocator:            run.First.Allocator,
+			FirstSequence:        run.First.Sequence,
+			VersionAllocator:     f.logicalAllocator,
+			FirstVersionSequence: f.nextPageVersion,
+		})
+		f.nextPageVersion += run.Range.Length() / hostarch.PageSize
+		cursor = run.Range.End
+	}
+	if cursor != fr.End {
+		f.assignLogicalPagesLocked(memmap.FileRange{Start: cursor, End: fr.End})
+	}
+}
+
+// Preconditions: f.mu must be locked.
+func (f *MemoryFile) hasUniqueRefLocked(fr memmap.FileRange) bool {
+	hasUniqueRef := true
 	f.forEachChunk(fr, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
 		unfree := &f.unfreeSmall
 		if chunk.huge {

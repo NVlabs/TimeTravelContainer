@@ -774,8 +774,10 @@ func (mm *MemoryManager) isPMACopyOnWriteLocked(vseg vmaIterator, pseg pmaIterat
 	// If we have the only reference on private memory to be copied, just take
 	// ownership of it instead of copying. If we do hold the only reference,
 	// additional references can only be taken by mm.Fork(), which is excluded
-	// by mm.activeMu, so this isn't racy.
-	if mm.mf.HasUniqueRef(pseg.fileRange()) {
+	// by mm.activeMu, so this isn't racy. Its pages take new content versions,
+	// as a copy's would: a capture may have recorded their bytes while they
+	// were shared.
+	if mm.mf.OwnForWrite(pseg.fileRange()) {
 		pma.needCOW = false
 		// pma.private => pma.translatePerms == hostarch.AnyAccess
 		vma := vseg.ValuePtr()
