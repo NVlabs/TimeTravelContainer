@@ -10,9 +10,16 @@ import (
 	"syscall"
 
 	"github.com/moby/sys/capability"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/runsc/specutils"
 )
+
+// startSandboxProcess starts the Sentry in its namespaces.
+func startSandboxProcess(cmd *exec.Cmd, nss []specs.LinuxNamespace) error {
+	return specutils.StartInNS(cmd, nss)
+}
 
 func directIOFlag() int { return unix.O_DIRECT }
 

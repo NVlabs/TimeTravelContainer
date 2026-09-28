@@ -19,6 +19,7 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/hostarch",
+        "//pkg/hostthread",
         "//pkg/ttcsnapshot",
         "@org_golang_x_sys//unix:go_default_library",
     ],

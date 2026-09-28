@@ -49,12 +49,12 @@ var (
 	hvfRuntimeVMHookCalls = metric.MustCreateNewUint64Metric(
 		"/platform/hvf/runtime_vm/calls",
 		metric.Uint64Metadata{Cumulative: true, Description: "Number of Darwin Go runtime VM notifier callbacks."})
-	hvfRuntimeSuppressedFreeCount = metric.MustCreateNewUint64Metric(
-		"/platform/hvf/runtime_vm/suppressed_free_count",
-		metric.Uint64Metadata{Cumulative: true, Description: "Number of Go runtime FREE_REUSABLE operations suppressed to retain live HVF backing."})
-	hvfRuntimeSuppressedFreeBytes = metric.MustCreateNewUint64Metric(
-		"/platform/hvf/runtime_vm/suppressed_free_bytes",
-		metric.Uint64Metadata{Cumulative: true, Description: "Bytes in Go runtime FREE_REUSABLE operations suppressed to retain live HVF backing."})
+	hvfRuntimeReleasedCount = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/runtime_vm/released_count",
+		metric.Uint64Metadata{Cumulative: true, Description: "Number of Go runtime FREE_REUSABLE operations that unmapped live HVF backing so that Darwin could reclaim it."})
+	hvfRuntimeReleasedBytes = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/runtime_vm/released_bytes",
+		metric.Uint64Metadata{Cumulative: true, Description: "Bytes in Go runtime FREE_REUSABLE operations that unmapped live HVF backing so that Darwin could reclaim it."})
 	hvfRuntimeSuppressedReuseCount = metric.MustCreateNewUint64Metric(
 		"/platform/hvf/runtime_vm/suppressed_reuse_count",
 		metric.Uint64Metadata{Cumulative: true, Description: "Number of unnecessary Go runtime FREE_REUSE operations suppressed for live HVF backing."})
@@ -121,6 +121,24 @@ var (
 	hvfMonitorApplicationProtectPages = metric.MustCreateNewUint64Metric(
 		"/platform/hvf/monitor/application_protect_pages",
 		metric.Uint64Metadata{Cumulative: true, Description: "Application 4K pages successfully protected by EL1 monitor commands."})
+	hvfVCPUsCreated = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/vcpu/created",
+		metric.Uint64Metadata{Cumulative: true, Description: "Number of application vCPUs created."})
+	hvfVCPUsReused = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/vcpu/reused",
+		metric.Uint64Metadata{Cumulative: true, Description: "Number of residencies that took the vCPU parked on their host thread instead of creating one."})
+	hvfVCPURetirementsRequested = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/vcpu/retirements_requested",
+		metric.Uint64Metadata{Cumulative: true, Description: "Number of parked vCPUs whose host threads were asked to retire them."})
+	hvfVCPUsRetiredBeforeSyscall = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/vcpu/retired_before_syscall",
+		metric.Uint64Metadata{Cumulative: true, Description: "Number of parked vCPUs that their host threads retired before a system call of another goroutine."})
+	hvfVCPUsRetiredAtExit = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/vcpu/retired_at_exit",
+		metric.Uint64Metadata{Cumulative: true, Description: "Number of parked vCPUs that their host threads retired as they exited."})
+	hvfVCPUsRetiredOnRequest = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/vcpu/retired_on_request",
+		metric.Uint64Metadata{Cumulative: true, Description: "Number of parked vCPUs that their host threads retired on request, at a safe point."})
 )
 
 func publishRing0RuntimeMetrics(engine *ring0Engine) {
@@ -135,8 +153,8 @@ func publishRing0RuntimeMetrics(engine *ring0Engine) {
 	hvfRendezvousVCPUExitTargets.Set(stats.rendezvousVCPUExitTargets)
 	hvfRendezvousFailures.Set(stats.rendezvousFailures)
 	hvfRuntimeVMHookCalls.Set(stats.runtimeVMHookCalls)
-	hvfRuntimeSuppressedFreeCount.Set(stats.suppressedFreeCount)
-	hvfRuntimeSuppressedFreeBytes.Set(stats.suppressedFreeBytes)
+	hvfRuntimeReleasedCount.Set(stats.releasedCount)
+	hvfRuntimeReleasedBytes.Set(stats.releasedBytes)
 	hvfRuntimeSuppressedReuseCount.Set(stats.suppressedReuseCount)
 	hvfRuntimeSuppressedReuseBytes.Set(stats.suppressedReuseBytes)
 	hvfRuntimeSuppressedUnmapCount.Set(stats.suppressedUnmapCount)
@@ -159,4 +177,10 @@ func publishRing0RuntimeMetrics(engine *ring0Engine) {
 	hvfMonitorApplicationMapPages.Set(engine.monitorApplicationMapPages.Load())
 	hvfMonitorApplicationUnmapPages.Set(engine.monitorApplicationUnmapPages.Load())
 	hvfMonitorApplicationProtectPages.Set(engine.monitorApplicationProtectPages.Load())
+	hvfVCPUsCreated.Set(engine.vcpusCreated.Load())
+	hvfVCPUsReused.Set(engine.vcpusReused.Load())
+	hvfVCPURetirementsRequested.Set(engine.vcpusRetirementsRequested.Load())
+	hvfVCPUsRetiredBeforeSyscall.Set(stats.parkedRetiredBeforeSyscall)
+	hvfVCPUsRetiredAtExit.Set(stats.parkedRetiredAtExit)
+	hvfVCPUsRetiredOnRequest.Set(stats.parkedRetiredOnRequest)
 }

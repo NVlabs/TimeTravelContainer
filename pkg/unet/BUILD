@@ -18,6 +18,7 @@ go_library(
     deps = [
         "//pkg/atomicbitops",
         "//pkg/eventfd",
+        "//pkg/hostthread",
         "//pkg/sync",
         "@org_golang_x_sys//unix:go_default_library",
     ],
@@ -29,6 +30,7 @@ go_test(
     srcs = [
         "fd_count_darwin_test.go",
         "fd_count_linux_test.go",
+        "unet_darwin_test.go",
         "unet_test.go",
     ],
     library = ":unet",

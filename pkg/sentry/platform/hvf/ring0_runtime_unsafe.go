@@ -42,3 +42,20 @@ func ring0SetVMMemoryHooks(version uint32, ensureHost, callback uintptr) int32
 //
 //go:linkname ring0SetRuntimeTimeHook runtime.ttcSetRuntimeTimeHook
 func ring0SetRuntimeTimeHook(version uint32, callback uintptr) int32
+
+// ring0SetThreadHooks installs the owner-thread safe points supplied by
+// tools/go_darwin_vm_hooks.patch, which retire parked vCPUs.
+//
+//go:linkname ring0SetThreadHooks runtime.ttcSetThreadHooks
+func ring0SetThreadHooks(version uint32, safePoint, beforeSyscall uintptr, pending *uint32) int32
+
+// ring0SetThreadParked records whether the calling thread keeps a parked
+// vCPU, which it must retire before a system call.
+//
+//go:linkname ring0SetThreadParked runtime.ttcSetThreadParked
+func ring0SetThreadParked(parked bool)
+
+// ring0WakeIdleThreads brings idle threads to a safe point.
+//
+//go:linkname ring0WakeIdleThreads runtime.ttcWakeIdleThreads
+func ring0WakeIdleThreads()

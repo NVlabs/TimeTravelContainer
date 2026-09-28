@@ -367,21 +367,24 @@ func (v *hvfVM) PrepareMonitorPoolExpansion(ctx context.Context) (vmm.MonitorPoo
 	if len(m.pools) == 0 || !m.pools[len(m.pools)-1].accepted {
 		return vmm.MonitorPoolExpansion{}, fmt.Errorf("another monitor pool expansion is pending")
 	}
-	gpa := monitorPoolGPA + uint64(len(m.pools))*monitorPoolLength
-	if gpa > SentryMirrorIPAStart-monitorPoolLength {
+	// Pool regions are contiguous in the aperture below the Sentry mirror.
+	last := m.pools[len(m.pools)-1]
+	gpa := last.gpa + last.length
+	length := min(gpa-monitorPoolGPA, monitorPoolMaxExpansion, SentryMirrorIPAStart-gpa)
+	if length == 0 {
 		return vmm.MonitorPoolExpansion{}, fmt.Errorf("private EL1 monitor pool aperture is exhausted")
 	}
-	host, err := (hostMemory{}).Reserve(monitorPoolLength)
+	host, err := (hostMemory{}).Reserve(length)
 	if err != nil {
 		return vmm.MonitorPoolExpansion{}, err
 	}
-	if err := v.mapStage2Locked(gpa, host, monitorPoolLength, vmm.Stage2Read|vmm.Stage2Write); err != nil {
-		_ = (hostMemory{}).Release(host, monitorPoolLength)
+	if err := v.mapStage2Locked(gpa, host, length, vmm.Stage2Read|vmm.Stage2Write); err != nil {
+		_ = (hostMemory{}).Release(host, length)
 		return vmm.MonitorPoolExpansion{}, err
 	}
-	m.mapped = append(m.mapped, monitorStage2Mapping{gpa: gpa, length: monitorPoolLength})
-	m.pools = append(m.pools, monitorPoolMemory{host: host, gpa: gpa, length: monitorPoolLength})
-	return vmm.MonitorPoolExpansion{GPA: gpa, Length: monitorPoolLength}, nil
+	m.mapped = append(m.mapped, monitorStage2Mapping{gpa: gpa, length: length})
+	m.pools = append(m.pools, monitorPoolMemory{host: host, gpa: gpa, length: length})
+	return vmm.MonitorPoolExpansion{GPA: gpa, Length: length}, nil
 }
 
 func (v *hvfVM) CompleteMonitorPoolExpansion(expansion vmm.MonitorPoolExpansion, accepted bool) error {

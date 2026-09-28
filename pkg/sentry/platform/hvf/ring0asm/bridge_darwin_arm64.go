@@ -19,7 +19,10 @@
 // Clang as platform assembly.
 package ring0asm
 
-import "unsafe"
+import (
+	"reflect"
+	"unsafe"
+)
 
 func bluepillTrap()
 
@@ -107,6 +110,9 @@ func EnsureHostTrapAddress() uintptr
 // CurrentSP returns the current Go stack pointer.
 func CurrentSP() uintptr
 
+// ProbeStack writes the 512 bytes of stack below its caller's frame.
+func ProbeStack()
+
 // CurrentEL returns 0 at Darwin EL0 and 1 for a resident Sentry continuation
 // at guest EL1. The EL0 MRS is handled as a controlled SIGILL before any vCPU
 // is created or accessed.
@@ -114,3 +120,26 @@ func CurrentEL() uint64
 
 // CurrentELTrapAddress returns the MRS instruction used by CurrentEL.
 func CurrentELTrapAddress() uintptr
+
+// guestCodeBodyCount is the number of entries guestCodeBodies stores.
+const guestCodeBodyCount = 13
+
+func guestCodeBodies(bodies *[guestCodeBodyCount]uintptr)
+
+// GuestCode returns the entry of every function in this package that may
+// execute at EL1, including the ABI wrappers through which Go calls the
+// assembly. Several of them execute EL1-only instructions, so the Sentry
+// mirror must contain all of them before any EL1 entry.
+func GuestCode() []uintptr {
+	var bodies [guestCodeBodyCount]uintptr
+	guestCodeBodies(&bodies)
+	code := bodies[:]
+	for _, function := range []any{
+		Bluepill, SwitchApplicationGuest, RunMonitorGuest, SyncGuestCode,
+		SyncGuestCodeRanges, Yield, EnsureHost, Probe, ApplicationProbe,
+		HostSVCGetpid, CurrentSP, CurrentEL,
+	} {
+		code = append(code, reflect.ValueOf(function).Pointer())
+	}
+	return code
+}

@@ -7953,6 +7953,54 @@ func TestReconcileInterruptedMemoryGraphSealsOnlyReferencedResidue(t *testing.T)
 	}
 }
 
+func TestReconcileInterruptedMemoryGraphReleasesCaptureHolds(t *testing.T) {
+	root := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(root, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(root, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	object, err := graph.CreateObject(origin, "capture/object", ttcsnapshot.ObjectKindMetadata, []byte("object"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.SetRoot("branch/root", object); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.DeletePin("capture/object"); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Seal(origin, ttcsnapshot.SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	// A capture of another origin that shared the object, and did not finish,
+	// left its hold. No origin is working.
+	held := "remote/9/fork-1/held/" + object.String()
+	if err := graph.SetPin(held, object); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := reconcileInterruptedMemoryGraph(graph, data, ttcsnapshot.SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	if graph.HasPin(held) {
+		t.Fatal("an interrupted capture's hold on a sealed origin survived reconciliation")
+	}
+	if got, ok := graph.Root("branch/root"); !ok || got != object {
+		t.Fatalf("root = %v, %t; want %v", got, ok, object)
+	}
+}
+
 // A kernel that accounts swap to cgroups gives a memory cgroup memory.swap.max
 // beside memory.max; one that does not gives only memory.max. With neither, as
 // on cgroup v1, runsc decides.

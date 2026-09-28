@@ -24,6 +24,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/eventfd"
+	"gvisor.dev/gvisor/pkg/hostthread"
 	"gvisor.dev/gvisor/pkg/sync"
 )
 
@@ -71,6 +72,10 @@ type Socket struct {
 	// efd is immutable and remains valid until Close/Release.
 	efd eventfd.Eventfd
 
+	// poller waits for the socket to become ready where the platform
+	// supports it; see wait.
+	poller socketPoller
+
 	// race is an atomic variable used to avoid triggering the race
 	// detector. See comment in SocketPair below.
 	race *atomicbitops.Int32
@@ -91,10 +96,16 @@ func NewSocket(fd int) (*Socket, error) {
 	if err != nil {
 		return nil, err
 	}
+	poller, err := newSocketPoller(fd)
+	if err != nil {
+		efd.Close()
+		return nil, err
+	}
 
 	return &Socket{
-		fd:  atomicbitops.FromInt32(int32(fd)),
-		efd: efd,
+		fd:     atomicbitops.FromInt32(int32(fd)),
+		efd:    efd,
+		poller: poller,
 	}, nil
 }
 
@@ -103,6 +114,9 @@ func NewSocket(fd int) (*Socket, error) {
 func (s *Socket) finish() error {
 	// Signal any blocked or future polls.
 	if err := s.efd.Notify(); err != nil {
+		return err
+	}
+	if err := s.poller.close(); err != nil {
 		return err
 	}
 
@@ -508,6 +522,8 @@ func (s *ServerSocket) Accept() (*Socket, error) {
 		return nil, unix.EBADF
 	}
 	defer s.socket.gate.Leave()
+	// The socket is non-blocking, and waits block no host thread.
+	defer hostthread.SetSyscallsEnd(hostthread.SetSyscallsEnd(true))
 
 	for {
 		nfd, _, err := unix.Accept(fd)

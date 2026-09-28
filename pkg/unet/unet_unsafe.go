@@ -23,6 +23,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// socketPoller is unused on Linux, where wait blocks in ppoll.
+type socketPoller struct{}
+
+func newSocketPoller(int) (socketPoller, error) { return socketPoller{}, nil }
+
+func (socketPoller) close() error { return nil }
+
 // wait blocks until the socket FD is ready for reading or writing, depending
 // on the value of write.
 //

@@ -73,6 +73,7 @@ go_library(
         "//pkg/context",
         "//pkg/errors/linuxerr",
         "//pkg/gohacks",
+        "//pkg/hostthread",
         "//pkg/sync",
         "//pkg/waiter",
     ],

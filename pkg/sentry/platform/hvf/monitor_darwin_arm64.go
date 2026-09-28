@@ -187,7 +187,6 @@ const (
 	monitorMaxVCPUs               = 64
 	monitorStatesLength           = uint64(monitorMaxVCPUs) * vmm.HostSlabSize
 	monitorPoolGPA                = uint64(0x00200000)
-	monitorPoolLength             = uint64(16 << 20)
 	monitorCodeVA                 = uint64(0xffff000000000000)
 	monitorControlVA              = monitorCodeVA + monitorCodeCapacity
 	monitorStatesVA               = monitorControlVA + vmm.HostSlabSize
@@ -222,6 +221,16 @@ const (
 	monitorHVCCommand             = 0x71
 	monitorHVCInternal            = 0x7f
 	arm64SPSRAlwaysRES0           = uint64(0xffffffff0cdfe020)
+)
+
+// The page-table pool starts small, since it is committed memory. Its first
+// region also holds the monitor's own tables for the whole pool aperture,
+// about 0.5 MiB; with those, an idle Sentry uses under 1 MiB, and apt-get
+// about 1.5 MiB. Each expansion doubles the pool, adding at most
+// monitorPoolMaxExpansion.
+const (
+	monitorPoolInitialLength = uint64(2 << 20)
+	monitorPoolMaxExpansion  = uint64(16 << 20)
 )
 
 func validApplicationPState(pstate uint64) bool {
@@ -314,7 +323,7 @@ func newMonitorMemory(vm *hvfVM) (*monitorMemory, error) {
 	if m.statesHost, err = alloc.Reserve(monitorStatesLength); err != nil {
 		return nil, err
 	}
-	if m.poolHost, err = alloc.Reserve(monitorPoolLength); err != nil {
+	if m.poolHost, err = alloc.Reserve(monitorPoolInitialLength); err != nil {
 		return nil, err
 	}
 	for _, region := range []struct {
@@ -324,7 +333,7 @@ func newMonitorMemory(vm *hvfVM) (*monitorMemory, error) {
 		{m.codeHost, monitorCodeCapacity},
 		{m.controlHost, vmm.HostSlabSize},
 		{m.statesHost, monitorStatesLength},
-		{m.poolHost, monitorPoolLength},
+		{m.poolHost, monitorPoolInitialLength},
 	} {
 		if err := alloc.Commit(region.address, region.length); err != nil {
 			return nil, fmt.Errorf("committing EL1 monitor host memory: %w", err)
@@ -344,14 +353,14 @@ func newMonitorMemory(vm *hvfVM) (*monitorMemory, error) {
 		return nil, err
 	}
 	m.mapped = append(m.mapped, monitorStage2Mapping{monitorStatesGPA, monitorStatesLength})
-	if err := vm.mapStage2Locked(monitorPoolGPA, m.poolHost, monitorPoolLength, vmm.Stage2Read|vmm.Stage2Write); err != nil {
+	if err := vm.mapStage2Locked(monitorPoolGPA, m.poolHost, monitorPoolInitialLength, vmm.Stage2Read|vmm.Stage2Write); err != nil {
 		return nil, err
 	}
-	m.mapped = append(m.mapped, monitorStage2Mapping{monitorPoolGPA, monitorPoolLength})
+	m.mapped = append(m.mapped, monitorStage2Mapping{monitorPoolGPA, monitorPoolInitialLength})
 	m.pools = append(m.pools, monitorPoolMemory{
 		host:     m.poolHost,
 		gpa:      monitorPoolGPA,
-		length:   monitorPoolLength,
+		length:   monitorPoolInitialLength,
 		accepted: true,
 	})
 	C.ttc_monitor_init_control(
@@ -359,7 +368,7 @@ func newMonitorMemory(vm *hvfVM) (*monitorMemory, error) {
 		C.uint64_t(monitorCodeGPA), C.uint64_t(monitorCodeVA), C.uint64_t(m.codeLength),
 		C.uint64_t(monitorControlGPA), C.uint64_t(monitorControlVA),
 		C.uint64_t(monitorStatesGPA), C.uint64_t(monitorStatesVA), C.uint64_t(monitorMaxVCPUs),
-		C.uint64_t(monitorPoolGPA), C.uint64_t(monitorPoolVA), C.uint64_t(monitorPoolLength),
+		C.uint64_t(monitorPoolGPA), C.uint64_t(monitorPoolVA), C.uint64_t(monitorPoolInitialLength),
 		C.uint64_t(SentryMirrorIPAStart-monitorPoolGPA),
 	)
 	cleanup = false

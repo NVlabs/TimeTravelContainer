@@ -32,6 +32,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/hostthread"
 )
 
 // syncParallelism bounds the fsyncs one durability fence runs at once.
@@ -216,7 +217,7 @@ func (store *LocalDataStore) WithGraphMutation(mutate func() error) error {
 	}
 	store.gcMu.RLock()
 	defer store.gcMu.RUnlock()
-	if err := syscall.Flock(int(store.gcLock.Fd()), syscall.LOCK_SH); err != nil {
+	if err := hostthread.Flock(int(store.gcLock.Fd()), syscall.LOCK_SH); err != nil {
 		return err
 	}
 	defer syscall.Flock(int(store.gcLock.Fd()), syscall.LOCK_UN)
@@ -1054,6 +1055,7 @@ func (store *LocalDataStore) SyncObjects(ids []ObjectID) error {
 	group.SetLimit(syncParallelism)
 	for _, id := range ids {
 		group.Go(func() error {
+			hostthread.SyscallsEnd()
 			file, err := store.Open(id, -1)
 			if err != nil {
 				return err
@@ -1147,6 +1149,7 @@ func (store *LocalDataStore) syncDirectoriesDeepestFirst(directories map[string]
 		group.SetLimit(syncParallelism)
 		for _, directory := range levels[depth] {
 			group.Go(func() error {
+				hostthread.SyscallsEnd()
 				if store.rootFD != nil {
 					return store.syncRelativeDirectory(directory)
 				}
@@ -1389,7 +1392,7 @@ func (store *LocalDataStore) ReclaimCollected(graph *Store, ids []ObjectID) (rem
 	if store.gcLock == nil {
 		return 0, errors.New("TTC bulk-object store is closed")
 	}
-	if err := syscall.Flock(int(store.gcLock.Fd()), syscall.LOCK_EX); err != nil {
+	if err := hostthread.Flock(int(store.gcLock.Fd()), syscall.LOCK_EX); err != nil {
 		return 0, err
 	}
 	defer syscall.Flock(int(store.gcLock.Fd()), syscall.LOCK_UN)
@@ -1426,7 +1429,7 @@ func (store *LocalDataStore) ReclaimUnreferenced(graph *Store) (removed, quarant
 	if store.gcLock == nil {
 		return 0, 0, errors.New("TTC bulk-object store is closed")
 	}
-	if err := syscall.Flock(int(store.gcLock.Fd()), syscall.LOCK_EX); err != nil {
+	if err := hostthread.Flock(int(store.gcLock.Fd()), syscall.LOCK_EX); err != nil {
 		return 0, 0, err
 	}
 	defer syscall.Flock(int(store.gcLock.Fd()), syscall.LOCK_UN)

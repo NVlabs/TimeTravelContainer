@@ -48,6 +48,7 @@ go_library(
     visibility = ["//pkg/sentry:internal"],
     deps = [
         "//pkg/hostarch",
+        "//pkg/hostthread",
         "//pkg/hosttid",
         "//pkg/log",
         "//pkg/metric",
@@ -69,6 +70,7 @@ go_test(
         darwin = [
             "backend_darwin_arm64_test.go",
             "ring0_engine_darwin_arm64_test.go",
+            "ring0_parking_darwin_arm64_test.go",
         ],
         linux = [],
     ),

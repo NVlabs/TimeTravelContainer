@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/hostthread"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
@@ -286,6 +287,8 @@ func (t *Timekeeper) startUpdater(params *VDSOParamPage) {
 	go func() { // S/R-SAFE: stopped during save.
 		defer t.wg.Done()
 		defer t.timer.Stop()
+		// It reads host clocks.
+		hostthread.SyscallsEnd()
 		for {
 			// wait until next tick or if parked until addRef is called
 			select {

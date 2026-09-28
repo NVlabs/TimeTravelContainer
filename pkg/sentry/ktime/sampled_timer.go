@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/hostthread"
 	"gvisor.dev/gvisor/pkg/state"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/waiter"
@@ -267,6 +268,8 @@ func (t *SampledTimer) SetClock(c SampledClock, s Setting) {
 }
 
 func (t *SampledTimer) runGoroutine() {
+	// It reads host clocks.
+	hostthread.SyscallsEnd()
 	for {
 		select {
 		case <-t.kicker.C:

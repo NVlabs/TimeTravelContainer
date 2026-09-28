@@ -1465,7 +1465,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	donation.LogDonations(cmd)
 	log.Debugf("Starting sandbox: %s %v", cmd.Path, cmd.Args)
 	log.Debugf("SysProcAttr: %+v", cmd.SysProcAttr)
-	if err := specutils.StartInNS(cmd, nss); err != nil {
+	if err := startSandboxProcess(cmd, nss); err != nil {
 		err := fmt.Errorf("starting sandbox: %v", err)
 		// If the sandbox failed to start, it may be because the binary
 		// permissions were incorrect. Check the bits and return a more helpful

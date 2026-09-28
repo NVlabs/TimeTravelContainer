@@ -21,7 +21,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"reflect"
 	"runtime"
+	"runtime/debug"
+	"runtime/metrics"
 	"sort"
 	"strings"
 	"sync"
@@ -31,7 +34,9 @@ import (
 	"unsafe"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/hostthread"
 	"gvisor.dev/gvisor/pkg/hosttid"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/platform/hvf/ring0asm"
 	"gvisor.dev/gvisor/pkg/sentry/platform/vmplatform"
 	"gvisor.dev/gvisor/pkg/sentry/platform/vmplatform/monitorabi"
@@ -42,7 +47,17 @@ const (
 	ring0SentryAddressSpaceID = ^uint64(0) // Sentry mirror and qualification only.
 	ring0HostVALimit          = uint64(1 << 48)
 	ring0HostMirrorGPAStart   = SentryMirrorIPAStart
+	// A demand import maps the slabs within this radius of the one requested.
+	// The Sentry image's read-only segments, mostly code, use a narrower
+	// radius: EL1 runs little of it, and every slab imported is a private
+	// copy. The Go runtime's regions use a wider one, since the heap's
+	// allocation frontier moves through them. A thread's stack uses a narrow
+	// one too: at EL1 it holds only the Go runtime's frames, which fit in the
+	// 16 KiB system stack that Go gives a thread on Linux.
 	ring0HostWorkingSetRadius = uint64(256 << 10)
+	ring0HostImageRadius      = uint64(16 << 10)
+	ring0HostRuntimeRadius    = uint64(1 << 20)
+	ring0HostStackRadius      = uint64(64 << 10)
 	ring0MonitorVCPUID        = 63
 	stateApplicationFP        = 0x3000
 	stateRing0Entry           = 0x3340
@@ -62,6 +77,27 @@ const (
 	stateRealtimeOffsetNS       = 0x3388
 	stateGuestCritical          = 0x3390
 	applicationResidencyQuantum = time.Millisecond
+	// ring0IdleTrimDelay is how long neither applications nor the Sentry may
+	// be busy before the engine returns the Sentry's memory to Darwin; see
+	// trimIdleMemory.
+	ring0IdleTrimDelay = 2 * time.Second
+	// ring0IdleBusyAllocation is how much the Sentry must allocate between two
+	// observations of trimIdleMemory, 250ms apart, to be busy while no
+	// application runs, as when it removes a branch.
+	ring0IdleBusyAllocation = uint64(1 << 20)
+	// ring0IdleTrimAllocation is how much the Sentry must allocate while no
+	// application runs to be worth trimming again.
+	ring0IdleTrimAllocation = uint64(32 << 20)
+)
+
+// Darwin VM tags of the host memory that the Sentry mirror may import: the
+// patched Go runtime's mappings, the native bridge's, ttc_mmap_anon's (VM
+// memory such as GuestRAM and the monitor), and pthread stacks.
+const (
+	vmMemoryTTCRuntime = uint32(240)
+	vmMemoryTTCBridge  = uint32(241)
+	vmMemoryTTCVM      = uint32(242)
+	vmMemoryStack      = uint32(30)
 )
 
 // MaxApplicationVCPUs is the number of HVF vCPU IDs available to application
@@ -77,7 +113,20 @@ type ring0ApplicationCPU struct {
 	applicationActive atomic.Bool
 	entryActive       atomic.Bool
 	admissionHandoff  atomic.Bool
-	residentSince     time.Time
+	// residentSince is when the current residency began. It changes only
+	// when the owner thread unparks the vCPU, under cpuMu.
+	residentSince time.Time
+	// parked is set while the owner thread keeps the vCPU with no residency
+	// using it; see parkCurrentApplicationCPU. Only the owner thread changes
+	// it, under cpuMu. parkedAt, and retirementCounted, whether the vCPU's
+	// retirement is counted in ring0Engine.parkedRetirements, are protected
+	// by cpuMu.
+	parked            atomic.Bool
+	parkedAt          time.Time
+	retirementCounted bool
+	// entries counts application entries. Only the owner thread increments it,
+	// so the syscall path touches no shared cache line for it.
+	entries atomic.Uint64
 
 	// tlbFullSync is the ring0Engine.mmuSequence at the vCPU's last full
 	// local TLB flush, and tlbSpaceSync maps address spaces to the sequence
@@ -173,6 +222,20 @@ type ring0Engine struct {
 	faultMu           sync.Mutex
 	pendingMirror     map[uintptr]struct{}
 	sentryTTBR0       uint64
+	// imageStart and imageEnd bound the Sentry image, which is mirrored as
+	// EL1 first touches it. Its slabs have fixed GPAs from
+	// ring0HostMirrorGPAStart, so they need no allocation, and other slabs are
+	// allocated upward from dynamicMirrorGPA.
+	imageStart       uintptr
+	imageEnd         uintptr
+	dynamicMirrorGPA uint64
+	// guestOnlyImageSlabs, sorted, are the image slabs mirrored before any EL1
+	// entry; see ring0GuestOnlyImageSlabs.
+	guestOnlyImageSlabs []uintptr
+	// idle and heapAllocs belong to the runtime clock updater, which calls
+	// trimIdleMemory.
+	idle       ring0IdleTracker
+	heapAllocs []metrics.Sample
 	// mirrorInitialized is protected by mirrorMu. Once the initial Sentry
 	// working set is installed, refreshHostMirror can ignore host-service gates
 	// that only sampled slabs which are already present. This is essential for
@@ -211,10 +274,23 @@ type ring0Engine struct {
 	applicationWaiters atomic.Int64
 
 	// applicationCPUs counts owner-affine vCPU residencies, including tasks
-	// that are between application entries in host Sentry. It is diagnostic
-	// state only; applicationWaiters drives admission handoff so a fully leased
-	// but uncontended pool retains its syscall-fast residencies.
+	// that are between application entries in host Sentry, but not parked
+	// vCPUs. It is diagnostic state only; applicationWaiters drives admission
+	// handoff so a fully leased but uncontended pool retains its syscall-fast
+	// residencies.
 	applicationCPUs atomic.Int64
+
+	// parkedCPUs counts parked vCPUs, and parkedRetirements those whose owner
+	// threads have been asked to retire them, which the Go runtime's safe
+	// points read through setParkedRetirements. Both are protected by cpuMu.
+	parkedCPUs        int
+	parkedRetirements int
+	// vcpusCreated counts the vCPUs created, vcpusReused the residencies that
+	// took a parked vCPU instead, and vcpusRetirementsRequested the parked
+	// vCPUs whose owner threads were asked to retire them.
+	vcpusCreated              atomic.Uint64
+	vcpusReused               atomic.Uint64
+	vcpusRetirementsRequested atomic.Uint64
 
 	// Monitor-path counters distinguish the inexpensive resident EL1 path from
 	// the host path whose surrounding redpill, worker handoff, and re-entry are
@@ -266,23 +342,44 @@ func NewVMEngine(vmInterface vmm.VM, vcpus int) (vmplatform.VMEngine, error) {
 	if err != nil {
 		return nil, err
 	}
+	imageStart, imageEnd, err := ring0MainImageBounds()
+	if err != nil {
+		return nil, err
+	}
+	imageStart &^= uintptr(vmm.HostSlabSize - 1)
+	imageEnd = (imageEnd + uintptr(vmm.HostSlabSize-1)) &^ uintptr(vmm.HostSlabSize-1)
+	// The image's fixed GPAs precede the allocated ones.
+	dynamicMirrorGPA := ring0HostMirrorGPAStart + uint64(imageEnd-imageStart)
+	guestOnlyImageSlabs, err := ring0GuestOnlyImageSlabs()
+	if err != nil {
+		return nil, err
+	}
 	monitorPool, err := vmplatform.NewWorkerPoolWithIDBase(vm, 1, ring0MonitorVCPUID)
 	if err != nil {
 		return nil, fmt.Errorf("creating HVF ring0 monitor vCPU: %w", err)
 	}
+	heapAllocs := []metrics.Sample{{Name: "/gc/heap/allocs:bytes"}}
+	metrics.Read(heapAllocs)
+	heapAllocated := heapAllocs[0].Value.Uint64()
 	e := &ring0Engine{
-		vm:              vm,
-		monitorPool:     monitorPool,
-		concurrency:     vcpus,
-		timeFastpath:    timeFastpath,
-		stage2Slabs:     make(map[uintptr]ring0Stage2Slab),
-		stage1Access:    make(map[uint64]monitorabi.Access),
-		applicationGPAs: make(map[uint64]map[uint64]uint64),
-		nextMirrorGPA:   ring0HostMirrorGPAStart,
-		pendingMirror:   make(map[uintptr]struct{}),
-		cpuIDs:          make([]bool, vcpus),
-		clockStop:       make(chan struct{}),
-		clockDone:       make(chan struct{}),
+		vm:                  vm,
+		monitorPool:         monitorPool,
+		concurrency:         vcpus,
+		timeFastpath:        timeFastpath,
+		stage2Slabs:         make(map[uintptr]ring0Stage2Slab),
+		stage1Access:        make(map[uint64]monitorabi.Access),
+		applicationGPAs:     make(map[uint64]map[uint64]uint64),
+		imageStart:          imageStart,
+		imageEnd:            imageEnd,
+		dynamicMirrorGPA:    dynamicMirrorGPA,
+		guestOnlyImageSlabs: guestOnlyImageSlabs,
+		nextMirrorGPA:       dynamicMirrorGPA,
+		pendingMirror:       make(map[uintptr]struct{}),
+		idle:                ring0IdleTracker{allocated: heapAllocated, reported: heapAllocated},
+		heapAllocs:          heapAllocs,
+		cpuIDs:              make([]bool, vcpus),
+		clockStop:           make(chan struct{}),
+		clockDone:           make(chan struct{}),
 	}
 	e.realtimeOffsetNS.Store(timeFastpath.realtimeOffsetNS)
 	var expander vmm.MonitorPoolExpander
@@ -376,6 +473,13 @@ func (e *ring0Engine) RunMonitor(ctx context.Context, encoded []byte) ([]byte, e
 // entering the monitor. Any lock contention is delegated to the host path so a
 // resident continuation never parks while holding a guest-only critical
 // section.
+//
+// The guest-critical section must not take a host gate either, so this
+// function's text is mirrored before any EL1 entry (see
+// ring0GuestOnlyImageSlabs). Keeping it out of line keeps the section in that
+// text.
+//
+//go:noinline
 func (e *ring0Engine) tryRunResidentMonitor(ctx context.Context, encoded []byte) ([]byte, bool, error) {
 	if ring0asm.CurrentEL() == 0 {
 		e.monitorResidentFallbackHostEL.Add(1)
@@ -478,6 +582,12 @@ func (e *ring0Engine) tryRunResidentMonitor(ctx context.Context, encoded []byte)
 		}
 		return nil, true, err
 	}
+	// The guest-critical section below must not take a host gate either: the
+	// heap and stack it uses may not be mirrored yet. Read the heap here, and
+	// touch the stack that its calls use.
+	monitorEntry := monitorCodeVA + cpu.vcpu.monitor.commandCallOffset
+	stateVA := cpu.vcpu.stateVA
+	ring0asm.ProbeStack()
 	critical := (*uint64)(unsafe.Add(unsafe.Pointer(cpu.vcpu.stateHost), stateGuestCritical))
 	atomic.StoreUint64(critical, 1)
 	// A cancellation may have safely exported this Go continuation while it
@@ -500,10 +610,7 @@ func (e *ring0Engine) tryRunResidentMonitor(ctx context.Context, encoded []byte)
 			return nil, true, fmt.Errorf("HVF native bridge rejected a validated executable GuestRAM range")
 		}
 	}
-	ring0asm.RunMonitorGuest(
-		monitorCodeVA+cpu.vcpu.monitor.commandCallOffset,
-		cpu.vcpu.stateVA,
-	)
+	ring0asm.RunMonitorGuest(monitorEntry, stateVA)
 	atomic.StoreUint64(critical, 0)
 	if vmLocked {
 		e.vm.mu.Unlock()
@@ -599,6 +706,16 @@ func (e *ring0Engine) entryBlocked(addressSpaceID uint64) bool {
 // EL0, so it can execute the monitor command directly without a worker handoff
 // or another owner qualification. The next application entry reloads all
 // Linux registers from the shared state page.
+//
+// Only a residency uses the vCPU this way, not a parked vCPU: that serves the
+// thread's next residency, and the thread may retire it at any libc call. A
+// task parks its vCPU before handling a fault that may block, and then moves
+// between threads like any goroutine.
+//
+// Preconditions: the calling goroutine is locked to its thread until it
+// releases the vCPU. Otherwise it could move to another thread, from which
+// Hypervisor.framework rejects the vCPU, and a residency on the thread it
+// left could take the vCPU meanwhile.
 func (e *ring0Engine) pinCurrentIdleApplicationCPU() *ring0ApplicationCPU {
 	value, ok := e.cpusByTID.Load(hosttid.Current())
 	if !ok {
@@ -608,7 +725,7 @@ func (e *ring0Engine) pinCurrentIdleApplicationCPU() *ring0ApplicationCPU {
 	if !cpu.tryPin() {
 		return nil
 	}
-	if e.closed.Load() || cpu.retiring.Load() || cpu.applicationActive.Load() || cpu.entryActive.Load() || cpu.bridge.inGuest() || cpu.bridge.destroyed() {
+	if e.closed.Load() || cpu.parked.Load() || cpu.retiring.Load() || cpu.applicationActive.Load() || cpu.entryActive.Load() || cpu.bridge.inGuest() || cpu.bridge.destroyed() {
 		e.releaseApplicationCPU(cpu)
 		return nil
 	}
@@ -631,14 +748,19 @@ func (e *ring0Engine) runMonitorCommand(ctx context.Context, encoded []byte) ([]
 		}
 	}
 	var response []byte
+	// Keep the goroutine on the thread whose vCPU it may use; see
+	// pinCurrentIdleApplicationCPU. A residency's is locked to it already.
+	runtime.LockOSThread()
 	if cpu := e.pinCurrentIdleApplicationCPU(); cpu != nil {
 		var err error
 		response, err = cpu.vcpu.RunMonitor(ctx, encoded)
 		e.releaseApplicationCPU(cpu)
+		runtime.UnlockOSThread()
 		if err != nil {
 			return nil, err
 		}
 	} else {
+		runtime.UnlockOSThread()
 		value, err := e.monitorPool.Do(ctx, func(ctx context.Context, vcpu vmm.VCPU) (any, error) {
 			return vcpu.RunMonitor(ctx, encoded)
 		})
@@ -1140,16 +1262,117 @@ func init() {
 // retained across the application's syscall exit and the corresponding Sentry
 // syscall handling instead of reconstructing a vCPU on every entry.
 func (*ring0Engine) BeginApplicationResidency() {
+	// A task's host system calls, such as file I/O and gofer requests, end.
+	// So a thread need not retire its parked vCPU before them, as when the
+	// task loads a binary to execute after parking the vCPU.
+	hostthread.SyscallsEnd()
 	runtime.LockOSThread()
 }
 
-// EndApplicationResidency returns the current Sentry continuation to host EL0,
-// retires its owner-affine vCPU, and releases the host thread. vmplatform calls
-// this immediately before a Linux task blocks, stops, execs, or exits.
+// EndApplicationResidency returns the current Sentry continuation to host EL0
+// and releases the host thread, which keeps its owner-affine vCPU parked for
+// the next residency on it. vmplatform calls this immediately before a Linux
+// task blocks, stops, execs, or exits.
 func (e *ring0Engine) EndApplicationResidency() (retErr error) {
 	defer runtime.UnlockOSThread()
-	retErr = e.retireCurrentApplicationCPU()
-	return retErr
+	if e.parkCurrentApplicationCPU() {
+		return nil
+	}
+	return e.retireCurrentApplicationCPU()
+}
+
+// parkCurrentApplicationCPU keeps the calling thread's vCPU with no residency
+// using it, so that the next residency on the thread, of whichever task,
+// takes it instead of creating one. A task ends its residency whenever it
+// blocks, and every vCPU that Hypervisor.framework creates and destroys grows
+// the process's page tables by about 13 KiB, up to about 32 MiB that it never
+// returns; creating one also takes tens of microseconds, or a millisecond
+// under contention.
+//
+// Only the owner thread can destroy the vCPU, and not in a signal handler. So
+// the thread retires it itself: before a system call, which may block it for
+// as long as it likes, when it exits, or when the engine asks it to, at its
+// next libc call, which the Go runtime's scheduler makes whenever it looks
+// for work; see ring0WakeIdleThreads for idle threads.
+//
+// It reports false if the vCPU must be retired instead: when the engine is
+// closing, when the bridge failed, or when residencies wait for a vCPU ID.
+func (e *ring0Engine) parkCurrentApplicationCPU() bool {
+	if ring0asm.CurrentEL() != 0 {
+		// Without a destroy request, the redpill keeps the vCPU.
+		ring0asm.EnsureHost()
+	}
+	tid := hosttid.Current()
+	e.cpuMu.Lock()
+	defer e.cpuMu.Unlock()
+	cpu := e.findApplicationCPUByTIDLocked(tid)
+	if cpu == nil || cpu.parked.Load() {
+		return true
+	}
+	if e.closed.Load() || len(e.cpuWaiters) != 0 || cpu.retiring.Load() ||
+		cpu.bridge.destroyed() || cpu.bridge.inGuest() || cpu.bridge.errorStatus() != 0 {
+		return false
+	}
+	cpu.applicationActive.Store(false)
+	cpu.admissionHandoff.Store(false)
+	cpu.parked.Store(true)
+	cpu.parkedAt = time.Now()
+	e.parkedCPUs++
+	e.applicationCPUs.Add(-1)
+	cpu.bridge.park()
+	return true
+}
+
+// unparkLocked makes the calling thread's parked vCPU serve a residency again.
+//
+// Preconditions: e.cpuMu is locked, and the calling thread owns cpu.
+func (e *ring0Engine) unparkLocked(cpu *ring0ApplicationCPU) {
+	cpu.bridge.unpark()
+	cpu.parked.Store(false)
+	cpu.residentSince = time.Now()
+	e.parkedCPUs--
+	e.applicationCPUs.Add(1)
+	e.vcpusReused.Add(1)
+}
+
+// requestParkedRetirementsLocked asks the owner threads of up to n parked
+// vCPUs, least recently parked first, to retire them, and returns how many it
+// asked. The caller must then call ring0WakeIdleThreads, without cpuMu.
+//
+// Preconditions: e.cpuMu is locked.
+func (e *ring0Engine) requestParkedRetirementsLocked(n int) int {
+	requested := 0
+	for ; requested < n; requested++ {
+		var oldest *ring0ApplicationCPU
+		for _, cpu := range e.cpusByID {
+			if cpu == nil || !cpu.parked.Load() || cpu.retirementCounted || cpu.bridge.destroyed() {
+				continue
+			}
+			if oldest == nil || cpu.parkedAt.Before(oldest.parkedAt) {
+				oldest = cpu
+			}
+		}
+		if oldest == nil {
+			break
+		}
+		e.requestParkedRetirementLocked(oldest)
+	}
+	return requested
+}
+
+// requestParkedRetirementLocked asks cpu's owner thread to retire it.
+//
+// Preconditions: e.cpuMu is locked, and cpu is parked.
+func (e *ring0Engine) requestParkedRetirementLocked(cpu *ring0ApplicationCPU) {
+	if cpu.retirementCounted {
+		return
+	}
+	cpu.retiring.Store(true)
+	cpu.bridge.requestDestroy()
+	cpu.retirementCounted = true
+	e.parkedRetirements++
+	setParkedRetirements(e.parkedRetirements)
+	e.vcpusRetirementsRequested.Add(1)
 }
 
 // retireCurrentApplicationCPU destroys the vCPU owned by the calling host
@@ -1168,6 +1391,17 @@ func (e *ring0Engine) retireCurrentApplicationCPU() (retErr error) {
 	if !cpu.tryPin() {
 		e.cpuMu.Unlock()
 		return nil
+	}
+	if cpu.parked.Load() {
+		// The calling thread owns the parked vCPU, so it retires it here.
+		cpu.retiring.Store(true)
+		if !cpu.bridge.destroyed() {
+			cpu.bridge.retireParked()
+		}
+		e.cpuMu.Unlock()
+		retErr = cpu.bridge.error(fmt.Sprintf("retiring parked HVF ring0 vCPU %d", cpu.vcpu.id))
+		e.releaseApplicationCPU(cpu)
+		return retErr
 	}
 	cpu.applicationActive.Store(false)
 	cpu.retiring.Store(true)
@@ -1216,6 +1450,7 @@ func (e *ring0Engine) RunApplication(ctx context.Context, application vmm.Applic
 }
 
 func (e *ring0Engine) runApplicationCPU(ctx context.Context, application vmm.ApplicationState, cpu *ring0ApplicationCPU, release bool) (retExit vmm.Exit, retErr error) {
+	cpu.entries.Add(1)
 	defer func() {
 		if retErr == nil || errors.Is(retErr, context.Canceled) {
 			return
@@ -1273,13 +1508,14 @@ retryApplication:
 		if stackSlab <= ^uintptr(0)-uintptr(vmm.HostSlabSize) {
 			e.requestHostMirror(stackSlab + uintptr(vmm.HostSlabSize))
 		}
-		g, m, p, mcache, g0, g0StackLo, g0StackHi, gsignal, gsignalStackLo, gsignalStackHi := hosttid.RuntimePointers()
+		g, m, p, mcache, g0, _, g0StackHi, gsignal, gsignalStackLo, gsignalStackHi := hosttid.RuntimePointers()
 		e.requestHostMirror(g)
 		e.requestHostMirror(m)
 		e.requestHostMirror(p)
 		e.requestHostMirror(mcache)
 		e.requestHostMirror(g0)
-		e.requestHostMirror(g0StackLo)
+		// EL1 uses only the top of the thread's stack, where the runtime's
+		// frames are; see ring0HostStackRadius.
 		if g0StackHi != 0 {
 			e.requestHostMirror(g0StackHi - 1)
 		}
@@ -1483,15 +1719,52 @@ func (e *ring0Engine) hostSlabCanMirror(region ring0HostRegion, address uintptr)
 	if _, _, ok := e.vm.canonicalGPAForHost(address); ok {
 		return true
 	}
-	const (
-		vmMemoryTTCRuntime = uint32(240)
-		vmMemoryTTCBridge  = uint32(241)
-		vmMemoryTTCVM      = uint32(242)
-		vmMemoryStack      = uint32(30)
-	)
 	return !region.externalPager &&
 		(region.userTag == vmMemoryTTCRuntime || region.userTag == vmMemoryTTCBridge ||
 			region.userTag == vmMemoryTTCVM || region.userTag == vmMemoryStack)
+}
+
+// ring0GuestOnlyImageSlabs returns, sorted, the Sentry image slabs that are
+// mirrored before any EL1 entry. EL1 imports the rest of the image when it
+// first touches it, through a host gate that resumes the continuation at host
+// EL0. That is transparent to ordinary Sentry code, but not to a sequence that
+// executes EL1-only instructions once it has found itself at EL1: after a host
+// gate it would execute them at host EL0. Those sequences are the ring0asm
+// bridge, the native helpers in the __ttc_guest sections, and the
+// guest-critical section of tryRunResidentMonitor.
+func ring0GuestOnlyImageSlabs() ([]uintptr, error) {
+	slabs := make(map[uintptr]struct{})
+	native, err := ring0GuestNativeRanges()
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range native {
+		for slab := r.Address &^ uintptr(vmm.HostSlabSize-1); slab < r.Address+uintptr(r.Length); slab += uintptr(vmm.HostSlabSize) {
+			slabs[slab] = struct{}{}
+		}
+	}
+	functions := append(ring0asm.GuestCode(), reflect.ValueOf((*ring0Engine).tryRunResidentMonitor).Pointer())
+	for _, pc := range functions {
+		function := runtime.FuncForPC(pc)
+		if function == nil {
+			return nil, fmt.Errorf("no Go function contains EL1 code address %#x", pc)
+		}
+		// A function spans each slab whose first byte it contains.
+		entry := function.Entry()
+		for slab := entry &^ uintptr(vmm.HostSlabSize-1); ; slab += uintptr(vmm.HostSlabSize) {
+			slabs[slab] = struct{}{}
+			next := runtime.FuncForPC(slab + uintptr(vmm.HostSlabSize))
+			if next == nil || next.Entry() != entry {
+				break
+			}
+		}
+	}
+	sorted := make([]uintptr, 0, len(slabs))
+	for slab := range slabs {
+		sorted = append(sorted, slab)
+	}
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	return sorted, nil
 }
 
 // retireUnenteredApplicationCPU destroys a vCPU that was created by the
@@ -1526,7 +1799,7 @@ retry:
 	// with reapApplicationCPULocked's 0 -> -1 retirement transition.
 	if cached, ok := e.cpusByTID.Load(tid); ok {
 		cpu := cached.(*ring0ApplicationCPU)
-		if cpu.tryPin() {
+		if !cpu.parked.Load() && cpu.tryPin() {
 			if !e.closed.Load() && !cpu.bridge.destroyed() {
 				cpu.applicationActive.Store(true)
 				return cpu, false, nil
@@ -1559,6 +1832,11 @@ retry:
 		return nil, false, errRing0EngineClosed
 	}
 	if cpu := e.findApplicationCPUByTIDLocked(tid); cpu != nil {
+		if cpu.parked.Load() && cpu.retiring.Load() && !cpu.bridge.destroyed() {
+			// Its retirement was requested, and this thread owns it: retire it
+			// here, and admit this residency like any other.
+			cpu.bridge.retireParked()
+		}
 		if cpu.bridge.destroyed() {
 			if cpu.uses.Load() != 0 {
 				e.cpuMu.Unlock()
@@ -1568,6 +1846,9 @@ retry:
 			e.reapApplicationCPULocked(cpu)
 			e.cpuMu.Unlock()
 			goto retry
+		}
+		if cpu.parked.Load() {
+			e.unparkLocked(cpu)
 		}
 		if !cpu.tryPin() {
 			e.cpuMu.Unlock()
@@ -1608,7 +1889,21 @@ retry:
 		admissible = admissible && waiterIndex < e.freeApplicationIDsLocked()
 	}
 	if !admissible {
+		// Parked vCPUs hold IDs that no residency uses: ask their owner
+		// threads to retire as many as the waiters up to this one need,
+		// beyond the free IDs and the retirements already asked for.
+		needed := waiterIndex + 1 - e.freeApplicationIDsLocked() - e.parkedRetirements
+		requested := 0
+		if needed > 0 {
+			requested = e.requestParkedRetirementsLocked(needed)
+		}
+		// A thread takes a while to retire its vCPU if it is in a system call
+		// that ends, such as a gofer request. Then preempt an incumbent too.
+		kick := needed > requested || time.Since(waitStarted) >= 10*time.Millisecond
 		e.cpuMu.Unlock()
+		if requested != 0 {
+			ring0WakeIdleThreads()
+		}
 		// Admission pressure must preempt a CPU-bound incumbent as well as a
 		// syscall-heavy one. Without this kick, a task that never exits EL0 can
 		// retain the final owner-affine vCPU indefinitely while every later exec
@@ -1618,7 +1913,7 @@ retry:
 		// guest admission when the first kick was attempted. Reissue at a bounded
 		// rate until the architected application exit is acknowledged; a single
 		// RequestExit is not persistent across an inactive hv_vcpu_run interval.
-		if enqueued || lastWaiterKick.IsZero() || time.Since(lastWaiterKick) >= time.Millisecond {
+		if kick && (enqueued || lastWaiterKick.IsZero() || time.Since(lastWaiterKick) >= time.Millisecond) {
 			if err := e.kickOneApplicationEntry(); err != nil {
 				return nil, false, err
 			}
@@ -1677,6 +1972,7 @@ retry:
 		return nil, false, err
 	}
 	e.installRuntimeClockFastpath(vcpu)
+	e.vcpusCreated.Add(1)
 	cpu := &ring0ApplicationCPU{vcpu: vcpu, bridge: bridge, tid: tid, residentSince: time.Now()}
 	cpu.uses.Store(1)
 	cpu.applicationActive.Store(true)
@@ -1719,8 +2015,9 @@ func (e *ring0Engine) runRuntimeClockUpdater() {
 		select {
 		case <-e.clockStop:
 			return
-		case <-refresh.C:
+		case now := <-refresh.C:
 			publishRing0RuntimeMetrics(e)
+			e.trimIdleMemory(now)
 			calibration, err := calibrateRing0TimeFastpath(e.timeFastpath.vtimerOffset)
 			if err != nil || calibration.clockGettimePC != e.timeFastpath.clockGettimePC ||
 				calibration.machAbsolutePC != e.timeFastpath.machAbsolutePC ||
@@ -1735,6 +2032,76 @@ func (e *ring0Engine) runRuntimeClockUpdater() {
 			e.unpinApplicationCPUs(cpus)
 		}
 	}
+}
+
+// trimIdleMemory returns the Sentry's memory to Darwin once neither
+// applications nor the Sentry have been busy for ring0IdleTrimDelay. Darwin
+// charges a page twice to the process footprint once both the host and EL1
+// have touched it, and the Go runtime returns free heap only gradually,
+// keeping up to its GC goal, twice the live heap. So after a burst, the
+// Sentry's footprint stays far above what it uses. Dropping the Sentry mirror
+// removes the second charge, and lets the runtime then release its free heap
+// without a vCPU rendezvous for each range. The next application entry
+// mirrors its working set again, through host gates, as after a checkpoint.
+//
+// The Sentry's own work can leave as much garbage as an application's with no
+// application running: removing a branch releases its kernel, and rewrites
+// the snapshot graph of the family's writable layer.
+func (e *ring0Engine) trimIdleMemory(now time.Time) {
+	var entries uint64
+	active := false
+	cpus := e.pinApplicationCPUs()
+	for _, cpu := range cpus {
+		entries += cpu.entries.Load()
+		active = active || cpu.applicationActive.Load()
+	}
+	e.unpinApplicationCPUs(cpus)
+	metrics.Read(e.heapAllocs)
+	if !e.idle.observe(entries, e.heapAllocs[0].Value.Uint64(), active, now) {
+		return
+	}
+	if err := e.FlushHostExecutionCache(context.Background()); err != nil {
+		log.Warningf("Trimming the idle HVF Sentry mirror: %v", err)
+		return
+	}
+	// What sync.Pools hold survives a collection, and they can hold much: the
+	// buffer in which encoding/json writes a snapshot graph is 16 MiB once a
+	// container has installed gdb. So collect twice.
+	runtime.GC()
+	debug.FreeOSMemory()
+}
+
+// ring0IdleTracker decides when applications and the Sentry have gone idle.
+type ring0IdleTracker struct {
+	// entries and allocated are the application entry count and the bytes the
+	// Sentry had allocated at the last observation, and since is when either
+	// last showed activity. ran is whether an application has run since the
+	// last report, and reported is allocated at the last report.
+	entries   uint64
+	allocated uint64
+	since     time.Time
+	ran       bool
+	reported  uint64
+}
+
+// observe records the total application entry count, the bytes the Sentry
+// has allocated, and whether any application runs, at now. It reports true
+// once neither has been busy for ring0IdleTrimDelay, if applications have run
+// or the Sentry has allocated ring0IdleTrimAllocation since the last report.
+func (t *ring0IdleTracker) observe(entries, allocated uint64, active bool, now time.Time) bool {
+	if active || entries != t.entries {
+		t.ran = true
+		t.since = now
+	} else if allocated-t.allocated >= ring0IdleBusyAllocation {
+		t.since = now
+	}
+	t.entries, t.allocated = entries, allocated
+	if now.Sub(t.since) < ring0IdleTrimDelay || (!t.ran && allocated-t.reported < ring0IdleTrimAllocation) {
+		return false
+	}
+	t.ran = false
+	t.reported = allocated
+	return true
 }
 
 // writeApplicationWaitDiagnostic records backend-owned admission state only
@@ -1834,8 +2201,8 @@ func (e *ring0Engine) ShouldYieldApplicationResidency() bool {
 	if e.applicationWaiters.Load() == 0 {
 		return false
 	}
-	// residentSince is immutable once the CPU is published, so this runs on
-	// every syscall exit under contention without taking cpuMu.
+	// residentSince changes only when this thread unparks the vCPU, so this
+	// runs on every syscall exit under contention without taking cpuMu.
 	cached, ok := e.cpusByTID.Load(hosttid.Current())
 	return ok && time.Since(cached.(*ring0ApplicationCPU).residentSince) >= applicationResidencyQuantum
 }
@@ -1908,21 +2275,33 @@ func (e *ring0Engine) reapDestroyedCPUsLocked() {
 
 func (e *ring0Engine) reapApplicationCPULocked(cpu *ring0ApplicationCPU) {
 	id := cpu.vcpu.id
+	// The owner thread of a parked vCPU retires it before a system call or
+	// when it exits, without a request.
+	parked := cpu.parked.Load()
 	if id < 0 || id >= len(e.cpusByID) || e.cpusByID[id] != cpu ||
-		!cpu.retiring.Load() || !cpu.bridge.destroyed() || !cpu.uses.CompareAndSwap(0, -1) {
+		!(cpu.retiring.Load() || parked) || !cpu.bridge.destroyed() || !cpu.uses.CompareAndSwap(0, -1) {
 		return
 	}
 	e.learnHostGateFault(cpu)
 	e.cpusByTID.Delete(cpu.tid)
 	e.cpuIDs[id] = false
 	e.cpusByID[id] = nil
-	e.applicationCPUs.Add(-1)
+	if parked {
+		e.parkedCPUs--
+		if cpu.retirementCounted {
+			e.parkedRetirements--
+			setParkedRetirements(e.parkedRetirements)
+		}
+	} else {
+		e.applicationCPUs.Add(-1)
+	}
 	cpu.bridge.close()
 	e.wakeApplicationWaitersLocked()
 }
 
-// learnHostGateFault classifies an EL1 data abort that entered the host-service
-// gate and queues the missing Darwin slab for the next bounded mirror refresh.
+// learnHostGateFault classifies an EL1 data abort, or an instruction abort in
+// the Sentry image, that entered the host-service gate and queues the missing
+// Darwin slab for the next bounded mirror refresh.
 // The faulting continuation already resumed at host EL0, so reconciliation can
 // use Mach and Hypervisor.framework without nesting a host operation in EL1.
 func (e *ring0Engine) learnHostGateFault(cpu *ring0ApplicationCPU) {
@@ -1933,8 +2312,12 @@ func (e *ring0Engine) learnHostGateFault(cpu *ring0ApplicationCPU) {
 	if esr == 0 {
 		return
 	}
-	ec := esr >> 26 & 0x3f
-	if ec != 0x25 || far >= ring0HostVALimit {
+	switch ec := esr >> 26 & 0x3f; {
+	case ec == 0x25 && far < ring0HostVALimit:
+	case ec == 0x21 && uintptr(far) >= e.imageStart && uintptr(far) < e.imageEnd:
+		// Instruction aborts elsewhere enter Darwin's libraries, which EL1
+		// never maps.
+	default:
 		return
 	}
 	e.requestHostMirror(uintptr(far))
@@ -2025,26 +2408,38 @@ func (e *ring0Engine) extendHostMirror(ctx context.Context) error {
 			continue
 		}
 		regionEnd := region.address + uintptr(region.length)
-		if region.protection&ring0VMWrite != 0 || region.mainImage {
-			// Go heap and stack spans grow throughout an existing Mach region.
-			// Importing a touched writable region as one run avoids a demand-fault
-			// storm across Sentry objects.
+		if region.protection&ring0VMWrite != 0 && !region.mainImage && region.userTag != vmMemoryTTCRuntime && region.userTag != vmMemoryStack {
+			// The bridge's and the VM's own regions are imported whole. The
+			// image, the Go runtime's regions, and thread stacks are imported in
+			// windows like read-only memory: EL1 touches little of any. A Go heap
+			// arena is 64 MiB, while the live heap is a few MiB; most of the
+			// image, such as Go's FIPS entropy buffer, is never touched at EL1;
+			// and a thread's 1 MiB stack holds only runtime frames at EL1, since
+			// goroutines run on stacks in the heap.
 			for address := region.address; address < regionEnd; address += uintptr(vmm.HostSlabSize) {
 				addSlab(region, address, access, stage2Access)
 			}
 			continue
+		}
+		radius := ring0HostWorkingSetRadius
+		if region.mainImage && region.protection&ring0VMWrite == 0 {
+			radius = ring0HostImageRadius
+		} else if region.userTag == vmMemoryTTCRuntime {
+			radius = ring0HostRuntimeRadius
+		} else if region.userTag == vmMemoryStack {
+			radius = ring0HostStackRadius
 		}
 		for requested := range pendingSlabs {
 			if requested < region.address || requested >= regionEnd {
 				continue
 			}
 			windowStart := requested
-			if uint64(requested-region.address) > ring0HostWorkingSetRadius {
-				windowStart -= uintptr(ring0HostWorkingSetRadius)
+			if uint64(requested-region.address) > radius {
+				windowStart -= uintptr(radius)
 			} else {
 				windowStart = region.address
 			}
-			windowEnd := requested + uintptr(vmm.HostSlabSize) + uintptr(ring0HostWorkingSetRadius)
+			windowEnd := requested + uintptr(vmm.HostSlabSize) + uintptr(radius)
 			if windowEnd < requested || windowEnd > regionEnd {
 				windowEnd = regionEnd
 			}
@@ -2226,38 +2621,45 @@ func (e *ring0Engine) refreshHostMirror(ctx context.Context) error {
 				desiredAccess[va] = access
 			}
 		}
-		if region.mainImage {
-			for offset := uint64(0); offset < region.length; offset += vmm.HostSlabSize {
-				addSlab(region.address + uintptr(offset))
-			}
-			continue
-		}
 		regionEnd := region.address + uintptr(region.length)
+		if region.mainImage {
+			// EL1 imports the rest of the image, in windows, when it first
+			// touches it.
+			forEachInRegion(e.guestOnlyImageSlabs, region.address, regionEnd, addSlab)
+		}
 		workingSetIndex := sort.Search(len(workingSetAddresses), func(i int) bool {
 			return workingSetAddresses[i] >= region.address
 		})
 		workingSetRegion := workingSetIndex < len(workingSetAddresses) && workingSetAddresses[workingSetIndex] < regionEnd
-		bootstrapOwned := region.userTag == 240 || region.userTag == 242
-		if region.protection&ring0VMWrite != 0 &&
-			(workingSetRegion || bootstrap && bootstrapOwned) {
-			// At bootstrap, import each complete explicitly owned region so a
-			// pre-existing Go or VMM object cannot spuriously redpill based on its
-			// placement. Demand mapping retains the narrower working-set rule for
-			// tagged mappings created after bootstrap.
+		if region.protection&ring0VMWrite != 0 && !region.mainImage && region.userTag != vmMemoryTTCRuntime &&
+			region.userTag != vmMemoryStack && (workingSetRegion || bootstrap && region.userTag == vmMemoryTTCVM) {
+			// At bootstrap, import each complete VM region so a pre-existing VMM
+			// object cannot redpill based on its placement. Go runtime regions
+			// and thread stacks, like the image, are imported in windows as EL1
+			// touches them. Demand mapping retains the narrower working-set rule
+			// for tagged mappings created after bootstrap.
 			for offset := uint64(0); offset < region.length; offset += vmm.HostSlabSize {
 				addSlab(region.address + uintptr(offset))
 			}
 			continue
 		}
 		forEachInRegion(retainedSlabs, region.address, regionEnd, addSlab)
+		radius := ring0HostWorkingSetRadius
+		if region.mainImage && region.protection&ring0VMWrite == 0 {
+			radius = ring0HostImageRadius
+		} else if region.userTag == vmMemoryTTCRuntime {
+			radius = ring0HostRuntimeRadius
+		} else if region.userTag == vmMemoryStack {
+			radius = ring0HostStackRadius
+		}
 		forEachInRegion(workingSetAddresses, region.address, regionEnd, func(address uintptr) {
 			windowStart := address
-			if uint64(address-region.address) > ring0HostWorkingSetRadius {
-				windowStart = address - uintptr(ring0HostWorkingSetRadius)
+			if uint64(address-region.address) > radius {
+				windowStart = address - uintptr(radius)
 			} else {
 				windowStart = region.address
 			}
-			windowEnd := address + uintptr(vmm.HostSlabSize) + uintptr(ring0HostWorkingSetRadius)
+			windowEnd := address + uintptr(vmm.HostSlabSize) + uintptr(radius)
 			if windowEnd < address || windowEnd > regionEnd {
 				windowEnd = regionEnd
 			}
@@ -2428,21 +2830,25 @@ func (e *ring0Engine) mapHostStage2Slabs(addresses []uintptr, desired map[uintpt
 			end++
 		}
 		address := addresses[start]
+		gpa := e.nextMirrorGPA
+		if identity.mainImage {
+			gpa = ring0HostMirrorGPAStart + uint64(address-e.imageStart)
+		}
 		var (
 			lease  *ring0Stage2Lease
 			mapErr error
 		)
 		for {
 			length := uint64(end-start) * vmm.HostSlabSize
-			if e.nextMirrorGPA > GuestRAMIPAStart-length {
+			if !identity.mainImage && gpa > GuestRAMIPAStart-length {
 				return skipped, fmt.Errorf("Sentry host mirror exhausted GPA aperture [%#x, %#x)", uint64(ring0HostMirrorGPAStart), uint64(GuestRAMIPAStart))
 			}
 			lease, mapErr = prepareRing0Stage2Lease(address, length, shadow)
 			if mapErr == nil {
 				if lease.tracked {
-					mapErr = e.vm.mapRing0MirrorStage2Source(uintptr(e.nextMirrorGPA), lease.hostAddress, length, identity.access)
+					mapErr = e.vm.mapRing0MirrorStage2Source(uintptr(gpa), lease.hostAddress, length, identity.access)
 				} else {
-					mapErr = e.vm.mapRing0Stage2Source(uintptr(e.nextMirrorGPA), lease.hostAddress, length, identity.access)
+					mapErr = e.vm.mapRing0Stage2Source(uintptr(gpa), lease.hostAddress, length, identity.access)
 				}
 			}
 			if mapErr == nil || end-start == 1 {
@@ -2460,7 +2866,6 @@ func (e *ring0Engine) mapHostStage2Slabs(addresses []uintptr, desired map[uintpt
 			end = start + 1
 		}
 		length := uint64(end-start) * vmm.HostSlabSize
-		gpa := e.nextMirrorGPA
 		if mapErr != nil {
 			if lease != nil {
 				if err := releaseRing0Stage2Lease(lease); err != nil {
@@ -2478,7 +2883,9 @@ func (e *ring0Engine) mapHostStage2Slabs(addresses []uintptr, desired map[uintpt
 			start = end
 			continue
 		}
-		e.nextMirrorGPA += length
+		if !identity.mainImage {
+			e.nextMirrorGPA += length
+		}
 		lease.refs = end - start
 		for index, mapped := range addresses[start:end] {
 			e.stage2Slabs[mapped] = ring0Stage2Slab{
@@ -2648,12 +3055,13 @@ func (e *ring0Engine) FlushHostExecutionCache(ctx context.Context) error {
 	if err := e.unmapHostStage2Slabs(addresses); err != nil {
 		return err
 	}
-	// Only main-image slabs remain in the mirror aperture, and no stage-1
-	// leaf refers to the GPAs just unmapped. Reuse everything above the
-	// remaining slabs. The allocator otherwise never recycles GPAs, and every
-	// live fork, dehydration, and checkpoint flushes and then re-mirrors the
-	// Sentry working set, so repeated forks exhausted the aperture.
-	next := uint64(ring0HostMirrorGPAStart)
+	// Only main-image slabs, at their fixed GPAs, remain in the mirror
+	// aperture, and no stage-1 leaf refers to the GPAs just unmapped. Reuse
+	// everything above the remaining slabs. The allocator otherwise never
+	// recycles GPAs, and every live fork, dehydration, and checkpoint flushes
+	// and then re-mirrors the Sentry working set, so repeated forks exhausted
+	// the aperture.
+	next := e.dynamicMirrorGPA
 	for _, slab := range e.stage2Slabs {
 		if !slab.canonical && slab.gpa+vmm.HostSlabSize > next {
 			next = slab.gpa + vmm.HostSlabSize
@@ -2926,6 +3334,7 @@ func (e *ring0Engine) Close() (retErr error) {
 	// Wait for the release acknowledgement before destroying the VM epoch.
 	deadline := time.Now().Add(5 * time.Second)
 	lastExitRequest := make(map[*ring0ApplicationCPU]time.Time)
+	var lastParkedWake time.Time
 	for {
 		e.cpuMu.Lock()
 		e.reapDestroyedCPUsLocked()
@@ -2937,8 +3346,21 @@ func (e *ring0Engine) Close() (retErr error) {
 		remaining := e.pinApplicationCPUs()
 		var requestErr error
 		var waitDetail string
+		wakeParked := false
 		for _, cpu := range remaining {
 			if cpu.bridge.destroyed() {
+				continue
+			}
+			if cpu.parked.Load() {
+				e.cpuMu.Lock()
+				if cpu.parked.Load() {
+					e.requestParkedRetirementLocked(cpu)
+				}
+				e.cpuMu.Unlock()
+				if time.Since(lastParkedWake) >= 10*time.Millisecond {
+					wakeParked = true
+				}
+				waitDetail = fmt.Sprintf("parked vCPU=%d destroyed=%t", cpu.vcpu.id, cpu.bridge.destroyed())
 				continue
 			}
 			cpu.retiring.Store(true)
@@ -2970,6 +3392,10 @@ func (e *ring0Engine) Close() (retErr error) {
 			lastExitRequest[cpu] = time.Now()
 		}
 		e.unpinApplicationCPUs(remaining)
+		if wakeParked {
+			ring0WakeIdleThreads()
+			lastParkedWake = time.Now()
+		}
 		if requestErr != nil {
 			return requestErr
 		}
