@@ -10,6 +10,7 @@ go_library(
     srcs = [
         "btree.go",
 		"catalog.go",
+        "checkpoint_json.go",
         "data.go",
 		"deferred.go",
         "filesystem.go",
@@ -37,6 +38,7 @@ go_test(
     size = "small",
     srcs = [
 		"catalog_test.go",
+        "checkpoint_json_test.go",
 		"deferred_test.go",
 		"filesystem_json_test.go",
 		"hosttree_test.go",

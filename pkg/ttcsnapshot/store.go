@@ -1136,8 +1136,8 @@ func (s *Store) loadGeneration(head graphHead, repairTail bool) error {
 	if err != nil {
 		return fmt.Errorf("reading TTC snapshot graph generation %d checkpoint: %w", head.Generation, err)
 	}
-	var state graphState
-	if err := json.Unmarshal(data, &state); err != nil {
+	state, err := decodeGraphCheckpoint(data)
+	if err != nil {
 		return fmt.Errorf("decoding TTC snapshot graph checkpoint: %w", err)
 	}
 	if err := validateGraphState(&state); err != nil {
@@ -3793,7 +3793,7 @@ func (s *Store) compactGenerationLocked() error {
 		return errors.New("TTC snapshot graph generation space exhausted")
 	}
 	nextGeneration := s.generation + 1
-	data, err := json.Marshal(s.state)
+	data, err := encodeGraphCheckpoint(&s.state)
 	if err != nil {
 		return err
 	}
