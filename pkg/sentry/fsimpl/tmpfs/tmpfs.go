@@ -616,15 +616,18 @@ func (fs *filesystem) Release(ctx context.Context) {
 		fs.unregisterMaterializationHook()
 		fs.unregisterMaterializationHook = nil
 	}
-	if err := fs.flushDiskWriteMetadata(); err != nil {
-		ctx.Warningf("flushing TTC volume metadata during filesystem release: %v", err)
-	}
-	if fs.diskVolume != nil {
-		if err := fs.syncDiskData(); err != nil {
-			ctx.Warningf("syncing TTC volume data during filesystem release: %v", err)
+	// The writes of a branch being deleted need not become durable.
+	if fs.diskVolume == nil || !fs.diskVolume.Repository.Discarding(fs.diskVolume.Branch) {
+		if err := fs.flushDiskWriteMetadata(); err != nil {
+			ctx.Warningf("flushing TTC volume metadata during filesystem release: %v", err)
 		}
-		if err := fs.diskVolume.Repository.SyncMetadata(); err != nil {
-			ctx.Warningf("syncing TTC volume metadata during filesystem release: %v", err)
+		if fs.diskVolume != nil {
+			if err := fs.syncDiskData(); err != nil {
+				ctx.Warningf("syncing TTC volume data during filesystem release: %v", err)
+			}
+			if err := fs.diskVolume.Repository.SyncMetadata(); err != nil {
+				ctx.Warningf("syncing TTC volume metadata during filesystem release: %v", err)
+			}
 		}
 	}
 	fs.vfsfs.VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)

@@ -659,6 +659,7 @@ type SandboxFamily struct {
 	configureNetwork               func(*kernel.Kernel, inet.Stack) error
 	onLoaderKernelChanged          func(*kernel.Kernel, *watchdog.Watchdog)
 	forgetFilesystemBranch         func(string)
+	discardFilesystemBranch        func(string)
 	reclaimFilesystemBranch        func(string) error
 }
 
@@ -708,6 +709,10 @@ type SandboxFamilyOptions struct {
 	// ForgetFilesystemBranch releases process-local TTC repository caches once
 	// a branch becomes process-free but remains a live family member.
 	ForgetFilesystemBranch func(string)
+	// DiscardFilesystemBranch declares, before a branch's Kernel is released,
+	// that ReclaimFilesystemBranch will follow: the filesystem's teardown need
+	// not make the branch's writes durable.
+	DiscardFilesystemBranch func(string)
 	// ReclaimFilesystemBranch removes the persistent filesystem root after a
 	// branch Kernel and all of its open file descriptions have been released.
 	// It also performs runtime-side graph collection when this is the only
@@ -772,6 +777,7 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 		configureNetwork:               opts.ConfigureNetwork,
 		onLoaderKernelChanged:          opts.OnLoaderKernelChanged,
 		forgetFilesystemBranch:         opts.ForgetFilesystemBranch,
+		discardFilesystemBranch:        opts.DiscardFilesystemBranch,
 		reclaimFilesystemBranch:        opts.ReclaimFilesystemBranch,
 		defaultStarted:                 make(chan struct{}),
 		distributedSessions:            make(map[string]*distributedForkSession),
@@ -3048,6 +3054,9 @@ func (f *SandboxFamily) destroy(id string, reclaimFilesystem bool) error {
 
 	if dog != nil {
 		dog.Stop()
+	}
+	if reclaimFilesystem && f.discardFilesystemBranch != nil {
+		f.discardFilesystemBranch(b.filesystemBranch)
 	}
 	b.k.TransferDistributedForkMemorySources(remoteSourceTarget)
 	b.k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))

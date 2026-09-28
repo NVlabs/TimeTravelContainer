@@ -351,6 +351,9 @@ type Repository struct {
 
 	branchMu    sync.Mutex
 	branchCache map[string]cachedBranch
+	// discarding holds the branches DiscardBranch marked. It is protected by
+	// branchMu.
+	discarding map[string]struct{}
 	// remoteLifecycleMu serializes source attachment, repository-wide
 	// materialization, and close. A restore pin does not retain this mutex:
 	// AttachRemoteObjectSource must remain able to install the incoming sources.
@@ -1892,11 +1895,42 @@ func (r *Repository) RemoveBranch(id string) error {
 // another Sentry has the same repository open; daemon-side cleanup remains an
 // idempotent fallback.
 func (r *Repository) RemoveBranchAndCollect(id string) error {
+	// Whether or not the branch goes, its name may come back.
+	defer r.endDiscard(id)
 	if err := r.RemoveBranch(id); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	_, err := r.GarbageCollectActive()
 	return err
+}
+
+// DiscardBranch declares that the runtime is about to delete branch id with
+// RemoveBranchAndCollect. Until then, tearing down the branch's filesystem
+// need not make its writes durable, and the inodes the teardown releases are
+// not orphans to reap one by one: the branch goes whole. Deleting a branch of
+// 100,000 files otherwise synced and looked up each of them first.
+func (r *Repository) DiscardBranch(id string) {
+	r.branchMu.Lock()
+	defer r.branchMu.Unlock()
+	if r.discarding == nil {
+		r.discarding = make(map[string]struct{})
+	}
+	r.discarding[id] = struct{}{}
+}
+
+// Discarding reports whether branch id is being deleted, as DiscardBranch
+// declared.
+func (r *Repository) Discarding(id string) bool {
+	r.branchMu.Lock()
+	defer r.branchMu.Unlock()
+	_, ok := r.discarding[id]
+	return ok
+}
+
+func (r *Repository) endDiscard(id string) {
+	r.branchMu.Lock()
+	defer r.branchMu.Unlock()
+	delete(r.discarding, id)
 }
 
 // ForgetBranch releases process-local caches for a branch whose Kernel has
@@ -1929,6 +1963,9 @@ func (r *Repository) ForgetBranch(id string) {
 func (r *Repository) ReapOrphan(branchID string, ino uint64) error {
 	if ino == rootInode {
 		return errors.New("cannot reap the root inode")
+	}
+	if r.Discarding(branchID) {
+		return nil
 	}
 	return r.withLock(func() error {
 		branch, err := r.readBranch(branchID)

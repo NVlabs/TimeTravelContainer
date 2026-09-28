@@ -962,6 +962,11 @@ func New(args Args) (*Loader, error) {
 				volume.repository.ForgetBranch(branch)
 			}
 		},
+		DiscardFilesystemBranch: func(branch string) {
+			for _, volume := range l.ttcVolumeRepositories {
+				volume.repository.DiscardBranch(branch)
+			}
+		},
 		ReclaimFilesystemBranch: func(branch string) error {
 			var result error
 			for source, volume := range l.ttcVolumeRepositories {

@@ -2999,6 +2999,89 @@ func TestWriteLayerTarPreservesVirtualMetadata(t *testing.T) {
 	}
 }
 
+// A runtime deleting a branch marks it discarding first: its teardown then
+// reaps no orphans one by one, as the branch goes whole. The mark ends with
+// the removal, whether or not that succeeds, so a new branch of the same name
+// reaps its orphans again.
+func TestDiscardedBranchGoesWhole(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("discard")
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := repository.Directory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := OpenRepositoryFD(directory, CopyModeFull)
+	directory.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	orphan := func() uint64 {
+		t.Helper()
+		if err := runtime.Fork(MainBranch, "doomed"); err != nil {
+			t.Fatal(err)
+		}
+		ino, err := runtime.CreateRegular("doomed", RootInode, "open-and-unlinked", 0644, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		write(t, runtime, "doomed", ino, "orphaned", 0)
+		if err := runtime.Unlink("doomed", RootInode, "open-and-unlinked"); err != nil {
+			t.Fatal(err)
+		}
+		return ino
+	}
+	ino := orphan()
+	runtime.DiscardBranch("doomed")
+	if err := runtime.ReapOrphan("doomed", ino); err != nil {
+		t.Fatal(err)
+	}
+	if inode, err := runtime.Inode("doomed", ino); err != nil || inode.Nlink != 0 {
+		t.Fatalf("a discarding branch's orphan: %+v, %v; want it left for the removal", inode, err)
+	}
+	if err := runtime.RemoveBranchAndCollect("doomed"); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.Discarding("doomed") {
+		t.Fatal("the removed branch is still discarding")
+	}
+	if _, err := runtime.Branch("doomed"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("removed branch: %v", err)
+	}
+	ino = orphan()
+	if err := runtime.ReapOrphan("doomed", ino); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.Inode("doomed", ino); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the reused name's orphan was not reaped: %v", err)
+	}
+
+	// A path-backed repository cannot collect as a runtime does: the removal
+	// fails, and the mark ends all the same.
+	manager2 := openTestManager(t)
+	path, err := manager2.Create("discard-path")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer path.Close()
+	if err := path.Fork(MainBranch, "doomed"); err != nil {
+		t.Fatal(err)
+	}
+	path.DiscardBranch("doomed")
+	if err := path.RemoveBranchAndCollect("doomed"); err == nil {
+		t.Fatal("a path-backed repository collected as a runtime")
+	}
+	if path.Discarding("doomed") {
+		t.Fatal("a failed removal left the branch discarding")
+	}
+}
+
 func TestRandomForkHardlinkOrphanAndNameReuse(t *testing.T) {
 	type branchModel struct {
 		entries map[string]uint64
