@@ -17,10 +17,11 @@
 //
 // A sidecar is resolved on disk in a "gvisor-bin/" directory located next to
 // the main binary.
-// TODO(gvisor.dev/issue/13718): Each binary is also embedded in this package
-// itself, which can be extracted and exec'd when the on-disk copy is not
-// available. This will go away after some time in order to lighten up the
-// size of the runsc binary.
+// TODO(gvisor.dev/issue/13718): A binary may declare an embedded copy of a
+// sidecar to run when the on-disk copy is not available. TTC's builds embed
+// none: the GCS checkpoint gofer and the metric server serve deployments TTC
+// has none of, and embedding them cost ttcd tens of megabytes. A sidecar that
+// is not on disk reports that it is unavailable.
 //
 // # Release enforcement
 //
