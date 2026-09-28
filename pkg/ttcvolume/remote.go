@@ -4,6 +4,7 @@
 package ttcvolume
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -365,6 +366,14 @@ func (r *Repository) prepareDeferredFileObject(id ttcsnapshot.ObjectID, size int
 	}
 	if local, err := r.deferredObjectLocal(id, size); err != nil || local {
 		return err
+	}
+	if size == 0 {
+		// An empty file has no bytes to fetch: install it here, not through
+		// its source, and retire any marker an earlier look left.
+		if err := r.replaceRemoteObject(id, id.String(), bytes.NewReader(nil), 0); err != nil {
+			return err
+		}
+		return r.retireRemoteObjectPending(id.String())
 	}
 	return r.registerDeferredFileObject(id, size, catalog, sourceID)
 }

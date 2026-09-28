@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -2450,6 +2451,78 @@ func TestLocalDataStoreReplaceDeferredIsAtomic(t *testing.T) {
 	file.Close()
 	if err != nil || !bytes.Equal(got, replacement) {
 		t.Fatalf("replacement bytes=%d err=%v", len(got), err)
+	}
+}
+
+// An empty object is created in place, without a temporary file, in a store
+// with a host path and in one with only a directory descriptor. Installing it
+// again finds it there; replacing an object with an empty one replaces it
+// whatever it held.
+func TestLocalDataStoreEmptyObjects(t *testing.T) {
+	for _, descriptor := range []bool{false, true} {
+		root := filepath.Join(t.TempDir(), "objects")
+		data, err := OpenLocalDataStore(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if descriptor {
+			data.Close()
+			directory, err := os.Open(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if data, err = OpenLocalDataStoreFD(directory); err != nil {
+				t.Fatal(err)
+			}
+			directory.Close()
+		}
+		empty := func(id ObjectID) {
+			t.Helper()
+			file, err := data.Open(id, 0)
+			if err != nil {
+				t.Fatalf("descriptor %t: %v", descriptor, err)
+			}
+			file.Close()
+		}
+		installed := ObjectID{Snapshot: 1, Kind: ObjectKindFile, Ordinal: 1}
+		for i := 0; i < 2; i++ {
+			if err := data.Install(installed, bytes.NewReader(nil), 0); err != nil {
+				t.Fatalf("descriptor %t: installing an empty object (%d): %v", descriptor, i, err)
+			}
+			empty(installed)
+		}
+		replaced := ObjectID{Snapshot: 1, Kind: ObjectKindFile, Ordinal: 2}
+		for i := 0; i < 2; i++ {
+			if err := data.ReplaceDeferred(replaced, bytes.NewReader(nil), 0); err != nil {
+				t.Fatalf("descriptor %t: replacing with an empty object (%d): %v", descriptor, i, err)
+			}
+			empty(replaced)
+		}
+		full := ObjectID{Snapshot: 1, Kind: ObjectKindFile, Ordinal: 3}
+		if err := data.InstallDeferred(full, bytes.NewReader([]byte("previous")), 8); err != nil {
+			t.Fatal(err)
+		}
+		if err := data.Install(full, bytes.NewReader(nil), 0); err == nil {
+			t.Fatalf("descriptor %t: installed an empty object over a full one", descriptor)
+		}
+		if err := data.ReplaceDeferred(full, bytes.NewReader(nil), 0); err != nil {
+			t.Fatalf("descriptor %t: replacing a full object with an empty one: %v", descriptor, err)
+		}
+		empty(full)
+		objects := 0
+		if err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+			if err != nil || entry.IsDir() || entry.Name() == ".gc.lock" {
+				return err
+			}
+			if strings.HasPrefix(entry.Name(), ".") {
+				return fmt.Errorf("temporary file %s left", path)
+			}
+			objects++
+			return nil
+		}); err != nil || objects != 3 {
+			t.Fatalf("descriptor %t: %d objects, %v", descriptor, objects, err)
+		}
+		data.Close()
 	}
 }
 

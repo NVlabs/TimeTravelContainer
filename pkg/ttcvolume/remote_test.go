@@ -1017,6 +1017,79 @@ func TestDeferredFileRegisteredAfterItsFetch(t *testing.T) {
 	}
 }
 
+// An empty deferred file has no bytes to fetch: preparing it installs it at
+// once, neither registered with its source nor marked pending.
+func TestEmptyDeferredFileNeedsNoSource(t *testing.T) {
+	sourceManager := openTestManager(t)
+	source, err := sourceManager.Create("source-empty")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	emptyIno, err := source.CreateRegular(MainBranch, RootInode, "empty", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fullIno, err := source.CreateRegular(MainBranch, RootInode, "full", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("fetched from its source\n")
+	if n, _, err := source.WriteAt(MainBranch, fullIno, payload, 0); err != nil || n != len(payload) {
+		t.Fatalf("WriteAt: %d, %v", n, err)
+	}
+	if err := source.Fork(MainBranch, "sealed"); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := source.DescribeRemoteSnapshot("sealed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetManager := openTestManager(t)
+	target, err := targetManager.ImportPrivateRemoteDescriptorWithOrigins(filepath.Join(targetManager.root, "target-empty"), "target-empty", descriptor, "imported", 100, 101)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	serverErr := attachTestRemote(t, source, target, "sealed", "imported", nil)
+	inode, err := target.Inode("imported", emptyIno)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := ttcsnapshot.ParseObjectID(inode.Object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, deferred := target.graph.DeferredSource(id); !deferred {
+		t.Fatalf("imported empty file object %s is not deferred", id)
+	}
+	if err := target.prepareDeferredInode(&inode); err != nil {
+		t.Fatal(err)
+	}
+	target.remoteMu.Lock()
+	registered := target.remoteByObject[inode.Object] != nil
+	target.remoteMu.Unlock()
+	if registered {
+		t.Fatal("an empty file was registered with its source")
+	}
+	if pending, err := target.remoteObjectPending(inode.Object); err != nil || pending {
+		t.Fatalf("an empty file is pending: %t, %v", pending, err)
+	}
+	if local, err := target.deferredObjectLocal(id, 0); err != nil || !local {
+		t.Fatalf("an empty file is not local: %t, %v", local, err)
+	}
+	finishTestRemote(t, target, serverErr)
+	if got := readAll(t, target, "imported", emptyIno); got != "" {
+		t.Fatalf("empty file reads %q", got)
+	}
+	if got := readAll(t, target, "imported", fullIno); got != string(payload) {
+		t.Fatalf("full file reads %q", got)
+	}
+	if pending, err := target.BranchRemoteSourceObjects("imported"); err != nil || len(pending) != 0 {
+		t.Fatalf("objects left pending: %v, %v", pending, err)
+	}
+}
+
 func TestRemoteDescriptorPreservesDiffBase(t *testing.T) {
 	sourceManager := openTestManager(t)
 	source, err := sourceManager.Create("source-diff")

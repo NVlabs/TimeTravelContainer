@@ -504,6 +504,12 @@ func (store *LocalDataStore) replaceDeferred(id ObjectID, source io.Reader, leng
 	if length < 0 {
 		return errors.New("negative TTC bulk-object length")
 	}
+	if length == 0 {
+		// Commonly nothing holds its name yet.
+		if created, err := store.createEmpty(id); err != nil || created {
+			return err
+		}
+	}
 	relative, err := objectRelativePath(id)
 	if err != nil {
 		return err
@@ -629,32 +635,71 @@ func (store *LocalDataStore) install(id ObjectID, source io.Reader, length int64
 	})
 }
 
-// installEmptyRelative publishes the empty object at relative. Its name,
-// created exclusively, publishes it whole: it needs no temporary file.
-func (store *LocalDataStore) installEmptyRelative(relative string, durable bool) error {
-	file, err := store.createRelative(relative, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL, 0600)
-	if errors.Is(err, unix.EEXIST) {
-		existing, openErr := store.openRelative(relative, unix.O_RDONLY, 0)
-		if openErr != nil {
-			return openErr
-		}
-		info, statErr := existing.Stat()
-		closeErr := existing.Close()
-		if statErr != nil || closeErr != nil || info.Size() != 0 {
-			return fmt.Errorf("existing immutable object %q has unexpected length: %w", relative, errors.Join(statErr, closeErr))
-		}
-		return nil
+// createEmpty creates the empty object id exclusively: its name publishes it
+// whole, without a temporary file. It reports false if something holds the
+// name already.
+func (store *LocalDataStore) createEmpty(id ObjectID) (bool, error) {
+	relative, err := objectRelativePath(id)
+	if err != nil {
+		return false, err
 	}
+	var file *os.File
+	if store.rootFD != nil {
+		file, err = store.createRelative(relative, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL, 0600)
+	} else {
+		destination, pathErr := store.objectPath(id)
+		if pathErr != nil {
+			return false, pathErr
+		}
+		for attempt := 0; ; attempt++ {
+			// Reclamation may remove an emptied directory, as createRelative
+			// says.
+			file, err = os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+			if !errors.Is(err, fs.ErrNotExist) || attempt == 3 {
+				break
+			}
+			if err := os.MkdirAll(filepath.Dir(destination), 0700); err != nil {
+				return false, err
+			}
+		}
+	}
+	if errors.Is(err, fs.ErrExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, file.Close()
+}
+
+// installEmpty publishes the empty object id, which may be there already.
+func (store *LocalDataStore) installEmpty(id ObjectID, durable bool) error {
+	created, err := store.createEmpty(id)
 	if err != nil {
 		return err
 	}
-	if err := file.Close(); err != nil {
-		return err
+	if !created {
+		existing, err := store.Open(id, 0)
+		if err != nil {
+			return fmt.Errorf("existing immutable object: %w", err)
+		}
+		return existing.Close()
 	}
-	if durable {
+	if !durable {
+		return nil
+	}
+	if store.rootFD != nil {
+		relative, err := objectRelativePath(id)
+		if err != nil {
+			return err
+		}
 		return store.syncRelativeDirectory(filepath.Dir(relative))
 	}
-	return nil
+	destination, err := store.objectPath(id)
+	if err != nil {
+		return err
+	}
+	return syncDirectory(filepath.Dir(destination))
 }
 
 // installWith atomically publishes id, which fill writes into an empty
@@ -663,15 +708,15 @@ func (store *LocalDataStore) installWith(id ObjectID, length int64, durable bool
 	if length < 0 {
 		return errors.New("negative TTC bulk-object length")
 	}
+	if length == 0 {
+		return store.installEmpty(id, durable)
+	}
 	relative, err := objectRelativePath(id)
 	if err != nil {
 		return err
 	}
 	if store.rootFD != nil {
 		directory := filepath.Dir(relative)
-		if length == 0 {
-			return store.installEmptyRelative(relative, durable)
-		}
 		temporary, temporaryName, err := store.createRelativeTemporary(directory, ".object-")
 		if err != nil {
 			return err
