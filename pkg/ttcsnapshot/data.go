@@ -32,6 +32,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/hostthread"
 )
 
 // syncParallelism bounds the fsyncs one durability fence runs at once.
@@ -893,6 +894,7 @@ func (store *LocalDataStore) SyncObjects(ids []ObjectID) error {
 	group.SetLimit(syncParallelism)
 	for _, id := range ids {
 		group.Go(func() error {
+			hostthread.SyscallsEnd()
 			file, err := store.Open(id, -1)
 			if err != nil {
 				return err
@@ -986,6 +988,7 @@ func (store *LocalDataStore) syncDirectoriesDeepestFirst(directories map[string]
 		group.SetLimit(syncParallelism)
 		for _, directory := range levels[depth] {
 			group.Go(func() error {
+				hostthread.SyscallsEnd()
 				if store.rootFD != nil {
 					return store.syncRelativeDirectory(directory)
 				}

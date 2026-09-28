@@ -386,6 +386,7 @@ go_library(
         "//pkg/fspath",
         "//pkg/goid",
         "//pkg/hostarch",
+        "//pkg/hostthread",
         "//pkg/log",
         "//pkg/marshal",
         "//pkg/marshal/primitive",

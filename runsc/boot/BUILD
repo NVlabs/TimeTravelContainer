@@ -63,6 +63,7 @@ go_library(
         "//pkg/fsutil",
         "//pkg/gomaxprocs",
         "//pkg/hostarch",
+        "//pkg/hostthread",
         "//pkg/log",
         "//pkg/memutil",
         "//pkg/metric",

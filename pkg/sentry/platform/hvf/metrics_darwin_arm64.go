@@ -121,6 +121,24 @@ var (
 	hvfMonitorApplicationProtectPages = metric.MustCreateNewUint64Metric(
 		"/platform/hvf/monitor/application_protect_pages",
 		metric.Uint64Metadata{Cumulative: true, Description: "Application 4K pages successfully protected by EL1 monitor commands."})
+	hvfVCPUsCreated = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/vcpu/created",
+		metric.Uint64Metadata{Cumulative: true, Description: "Number of application vCPUs created."})
+	hvfVCPUsReused = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/vcpu/reused",
+		metric.Uint64Metadata{Cumulative: true, Description: "Number of residencies that took the vCPU parked on their host thread instead of creating one."})
+	hvfVCPURetirementsRequested = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/vcpu/retirements_requested",
+		metric.Uint64Metadata{Cumulative: true, Description: "Number of parked vCPUs whose host threads were asked to retire them."})
+	hvfVCPUsRetiredBeforeSyscall = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/vcpu/retired_before_syscall",
+		metric.Uint64Metadata{Cumulative: true, Description: "Number of parked vCPUs that their host threads retired before a system call of another goroutine."})
+	hvfVCPUsRetiredAtExit = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/vcpu/retired_at_exit",
+		metric.Uint64Metadata{Cumulative: true, Description: "Number of parked vCPUs that their host threads retired as they exited."})
+	hvfVCPUsRetiredOnRequest = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/vcpu/retired_on_request",
+		metric.Uint64Metadata{Cumulative: true, Description: "Number of parked vCPUs that their host threads retired on request, at a safe point."})
 )
 
 func publishRing0RuntimeMetrics(engine *ring0Engine) {
@@ -159,4 +177,10 @@ func publishRing0RuntimeMetrics(engine *ring0Engine) {
 	hvfMonitorApplicationMapPages.Set(engine.monitorApplicationMapPages.Load())
 	hvfMonitorApplicationUnmapPages.Set(engine.monitorApplicationUnmapPages.Load())
 	hvfMonitorApplicationProtectPages.Set(engine.monitorApplicationProtectPages.Load())
+	hvfVCPUsCreated.Set(engine.vcpusCreated.Load())
+	hvfVCPUsReused.Set(engine.vcpusReused.Load())
+	hvfVCPURetirementsRequested.Set(engine.vcpusRetirementsRequested.Load())
+	hvfVCPUsRetiredBeforeSyscall.Set(stats.parkedRetiredBeforeSyscall)
+	hvfVCPUsRetiredAtExit.Set(stats.parkedRetiredAtExit)
+	hvfVCPUsRetiredOnRequest.Set(stats.parkedRetiredOnRequest)
 }

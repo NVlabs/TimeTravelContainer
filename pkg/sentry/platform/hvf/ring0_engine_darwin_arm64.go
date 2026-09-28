@@ -34,6 +34,7 @@ import (
 	"unsafe"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/hostthread"
 	"gvisor.dev/gvisor/pkg/hosttid"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/platform/hvf/ring0asm"
@@ -112,7 +113,17 @@ type ring0ApplicationCPU struct {
 	applicationActive atomic.Bool
 	entryActive       atomic.Bool
 	admissionHandoff  atomic.Bool
-	residentSince     time.Time
+	// residentSince is when the current residency began. It changes only
+	// when the owner thread unparks the vCPU, under cpuMu.
+	residentSince time.Time
+	// parked is set while the owner thread keeps the vCPU with no residency
+	// using it; see parkCurrentApplicationCPU. Only the owner thread changes
+	// it, under cpuMu. parkedAt, and retirementCounted, whether the vCPU's
+	// retirement is counted in ring0Engine.parkedRetirements, are protected
+	// by cpuMu.
+	parked            atomic.Bool
+	parkedAt          time.Time
+	retirementCounted bool
 	// entries counts application entries. Only the owner thread increments it,
 	// so the syscall path touches no shared cache line for it.
 	entries atomic.Uint64
@@ -263,10 +274,23 @@ type ring0Engine struct {
 	applicationWaiters atomic.Int64
 
 	// applicationCPUs counts owner-affine vCPU residencies, including tasks
-	// that are between application entries in host Sentry. It is diagnostic
-	// state only; applicationWaiters drives admission handoff so a fully leased
-	// but uncontended pool retains its syscall-fast residencies.
+	// that are between application entries in host Sentry, but not parked
+	// vCPUs. It is diagnostic state only; applicationWaiters drives admission
+	// handoff so a fully leased but uncontended pool retains its syscall-fast
+	// residencies.
 	applicationCPUs atomic.Int64
+
+	// parkedCPUs counts parked vCPUs, and parkedRetirements those whose owner
+	// threads have been asked to retire them, which the Go runtime's safe
+	// points read through setParkedRetirements. Both are protected by cpuMu.
+	parkedCPUs        int
+	parkedRetirements int
+	// vcpusCreated counts the vCPUs created, vcpusReused the residencies that
+	// took a parked vCPU instead, and vcpusRetirementsRequested the parked
+	// vCPUs whose owner threads were asked to retire them.
+	vcpusCreated              atomic.Uint64
+	vcpusReused               atomic.Uint64
+	vcpusRetirementsRequested atomic.Uint64
 
 	// Monitor-path counters distinguish the inexpensive resident EL1 path from
 	// the host path whose surrounding redpill, worker handoff, and re-entry are
@@ -1223,16 +1247,117 @@ func init() {
 // retained across the application's syscall exit and the corresponding Sentry
 // syscall handling instead of reconstructing a vCPU on every entry.
 func (*ring0Engine) BeginApplicationResidency() {
+	// A task's host system calls, such as file I/O and gofer requests, end.
+	// So a thread need not retire its parked vCPU before them, as when the
+	// task loads a binary to execute after parking the vCPU.
+	hostthread.SyscallsEnd()
 	runtime.LockOSThread()
 }
 
-// EndApplicationResidency returns the current Sentry continuation to host EL0,
-// retires its owner-affine vCPU, and releases the host thread. vmplatform calls
-// this immediately before a Linux task blocks, stops, execs, or exits.
+// EndApplicationResidency returns the current Sentry continuation to host EL0
+// and releases the host thread, which keeps its owner-affine vCPU parked for
+// the next residency on it. vmplatform calls this immediately before a Linux
+// task blocks, stops, execs, or exits.
 func (e *ring0Engine) EndApplicationResidency() (retErr error) {
 	defer runtime.UnlockOSThread()
-	retErr = e.retireCurrentApplicationCPU()
-	return retErr
+	if e.parkCurrentApplicationCPU() {
+		return nil
+	}
+	return e.retireCurrentApplicationCPU()
+}
+
+// parkCurrentApplicationCPU keeps the calling thread's vCPU with no residency
+// using it, so that the next residency on the thread, of whichever task,
+// takes it instead of creating one. A task ends its residency whenever it
+// blocks, and every vCPU that Hypervisor.framework creates and destroys grows
+// the process's page tables by about 13 KiB, up to about 32 MiB that it never
+// returns; creating one also takes tens of microseconds, or a millisecond
+// under contention.
+//
+// Only the owner thread can destroy the vCPU, and not in a signal handler. So
+// the thread retires it itself: before a system call, which may block it for
+// as long as it likes, when it exits, or when the engine asks it to, at its
+// next libc call, which the Go runtime's scheduler makes whenever it looks
+// for work; see ring0WakeIdleThreads for idle threads.
+//
+// It reports false if the vCPU must be retired instead: when the engine is
+// closing, when the bridge failed, or when residencies wait for a vCPU ID.
+func (e *ring0Engine) parkCurrentApplicationCPU() bool {
+	if ring0asm.CurrentEL() != 0 {
+		// Without a destroy request, the redpill keeps the vCPU.
+		ring0asm.EnsureHost()
+	}
+	tid := hosttid.Current()
+	e.cpuMu.Lock()
+	defer e.cpuMu.Unlock()
+	cpu := e.findApplicationCPUByTIDLocked(tid)
+	if cpu == nil || cpu.parked.Load() {
+		return true
+	}
+	if e.closed.Load() || len(e.cpuWaiters) != 0 || cpu.retiring.Load() ||
+		cpu.bridge.destroyed() || cpu.bridge.inGuest() || cpu.bridge.errorStatus() != 0 {
+		return false
+	}
+	cpu.applicationActive.Store(false)
+	cpu.admissionHandoff.Store(false)
+	cpu.parked.Store(true)
+	cpu.parkedAt = time.Now()
+	e.parkedCPUs++
+	e.applicationCPUs.Add(-1)
+	cpu.bridge.park()
+	return true
+}
+
+// unparkLocked makes the calling thread's parked vCPU serve a residency again.
+//
+// Preconditions: e.cpuMu is locked, and the calling thread owns cpu.
+func (e *ring0Engine) unparkLocked(cpu *ring0ApplicationCPU) {
+	cpu.bridge.unpark()
+	cpu.parked.Store(false)
+	cpu.residentSince = time.Now()
+	e.parkedCPUs--
+	e.applicationCPUs.Add(1)
+	e.vcpusReused.Add(1)
+}
+
+// requestParkedRetirementsLocked asks the owner threads of up to n parked
+// vCPUs, least recently parked first, to retire them, and returns how many it
+// asked. The caller must then call ring0WakeIdleThreads, without cpuMu.
+//
+// Preconditions: e.cpuMu is locked.
+func (e *ring0Engine) requestParkedRetirementsLocked(n int) int {
+	requested := 0
+	for ; requested < n; requested++ {
+		var oldest *ring0ApplicationCPU
+		for _, cpu := range e.cpusByID {
+			if cpu == nil || !cpu.parked.Load() || cpu.retirementCounted || cpu.bridge.destroyed() {
+				continue
+			}
+			if oldest == nil || cpu.parkedAt.Before(oldest.parkedAt) {
+				oldest = cpu
+			}
+		}
+		if oldest == nil {
+			break
+		}
+		e.requestParkedRetirementLocked(oldest)
+	}
+	return requested
+}
+
+// requestParkedRetirementLocked asks cpu's owner thread to retire it.
+//
+// Preconditions: e.cpuMu is locked, and cpu is parked.
+func (e *ring0Engine) requestParkedRetirementLocked(cpu *ring0ApplicationCPU) {
+	if cpu.retirementCounted {
+		return
+	}
+	cpu.retiring.Store(true)
+	cpu.bridge.requestDestroy()
+	cpu.retirementCounted = true
+	e.parkedRetirements++
+	setParkedRetirements(e.parkedRetirements)
+	e.vcpusRetirementsRequested.Add(1)
 }
 
 // retireCurrentApplicationCPU destroys the vCPU owned by the calling host
@@ -1251,6 +1376,17 @@ func (e *ring0Engine) retireCurrentApplicationCPU() (retErr error) {
 	if !cpu.tryPin() {
 		e.cpuMu.Unlock()
 		return nil
+	}
+	if cpu.parked.Load() {
+		// The calling thread owns the parked vCPU, so it retires it here.
+		cpu.retiring.Store(true)
+		if !cpu.bridge.destroyed() {
+			cpu.bridge.retireParked()
+		}
+		e.cpuMu.Unlock()
+		retErr = cpu.bridge.error(fmt.Sprintf("retiring parked HVF ring0 vCPU %d", cpu.vcpu.id))
+		e.releaseApplicationCPU(cpu)
+		return retErr
 	}
 	cpu.applicationActive.Store(false)
 	cpu.retiring.Store(true)
@@ -1648,7 +1784,7 @@ retry:
 	// with reapApplicationCPULocked's 0 -> -1 retirement transition.
 	if cached, ok := e.cpusByTID.Load(tid); ok {
 		cpu := cached.(*ring0ApplicationCPU)
-		if cpu.tryPin() {
+		if !cpu.parked.Load() && cpu.tryPin() {
 			if !e.closed.Load() && !cpu.bridge.destroyed() {
 				cpu.applicationActive.Store(true)
 				return cpu, false, nil
@@ -1681,6 +1817,11 @@ retry:
 		return nil, false, errRing0EngineClosed
 	}
 	if cpu := e.findApplicationCPUByTIDLocked(tid); cpu != nil {
+		if cpu.parked.Load() && cpu.retiring.Load() && !cpu.bridge.destroyed() {
+			// Its retirement was requested, and this thread owns it: retire it
+			// here, and admit this residency like any other.
+			cpu.bridge.retireParked()
+		}
 		if cpu.bridge.destroyed() {
 			if cpu.uses.Load() != 0 {
 				e.cpuMu.Unlock()
@@ -1690,6 +1831,9 @@ retry:
 			e.reapApplicationCPULocked(cpu)
 			e.cpuMu.Unlock()
 			goto retry
+		}
+		if cpu.parked.Load() {
+			e.unparkLocked(cpu)
 		}
 		if !cpu.tryPin() {
 			e.cpuMu.Unlock()
@@ -1730,7 +1874,21 @@ retry:
 		admissible = admissible && waiterIndex < e.freeApplicationIDsLocked()
 	}
 	if !admissible {
+		// Parked vCPUs hold IDs that no residency uses: ask their owner
+		// threads to retire as many as the waiters up to this one need,
+		// beyond the free IDs and the retirements already asked for.
+		needed := waiterIndex + 1 - e.freeApplicationIDsLocked() - e.parkedRetirements
+		requested := 0
+		if needed > 0 {
+			requested = e.requestParkedRetirementsLocked(needed)
+		}
+		// A thread takes a while to retire its vCPU if it is in a system call
+		// that ends, such as a gofer request. Then preempt an incumbent too.
+		kick := needed > requested || time.Since(waitStarted) >= 10*time.Millisecond
 		e.cpuMu.Unlock()
+		if requested != 0 {
+			ring0WakeIdleThreads()
+		}
 		// Admission pressure must preempt a CPU-bound incumbent as well as a
 		// syscall-heavy one. Without this kick, a task that never exits EL0 can
 		// retain the final owner-affine vCPU indefinitely while every later exec
@@ -1740,7 +1898,7 @@ retry:
 		// guest admission when the first kick was attempted. Reissue at a bounded
 		// rate until the architected application exit is acknowledged; a single
 		// RequestExit is not persistent across an inactive hv_vcpu_run interval.
-		if enqueued || lastWaiterKick.IsZero() || time.Since(lastWaiterKick) >= time.Millisecond {
+		if kick && (enqueued || lastWaiterKick.IsZero() || time.Since(lastWaiterKick) >= time.Millisecond) {
 			if err := e.kickOneApplicationEntry(); err != nil {
 				return nil, false, err
 			}
@@ -1799,6 +1957,7 @@ retry:
 		return nil, false, err
 	}
 	e.installRuntimeClockFastpath(vcpu)
+	e.vcpusCreated.Add(1)
 	cpu := &ring0ApplicationCPU{vcpu: vcpu, bridge: bridge, tid: tid, residentSince: time.Now()}
 	cpu.uses.Store(1)
 	cpu.applicationActive.Store(true)
@@ -2101,15 +2260,26 @@ func (e *ring0Engine) reapDestroyedCPUsLocked() {
 
 func (e *ring0Engine) reapApplicationCPULocked(cpu *ring0ApplicationCPU) {
 	id := cpu.vcpu.id
+	// The owner thread of a parked vCPU retires it before a system call or
+	// when it exits, without a request.
+	parked := cpu.parked.Load()
 	if id < 0 || id >= len(e.cpusByID) || e.cpusByID[id] != cpu ||
-		!cpu.retiring.Load() || !cpu.bridge.destroyed() || !cpu.uses.CompareAndSwap(0, -1) {
+		!(cpu.retiring.Load() || parked) || !cpu.bridge.destroyed() || !cpu.uses.CompareAndSwap(0, -1) {
 		return
 	}
 	e.learnHostGateFault(cpu)
 	e.cpusByTID.Delete(cpu.tid)
 	e.cpuIDs[id] = false
 	e.cpusByID[id] = nil
-	e.applicationCPUs.Add(-1)
+	if parked {
+		e.parkedCPUs--
+		if cpu.retirementCounted {
+			e.parkedRetirements--
+			setParkedRetirements(e.parkedRetirements)
+		}
+	} else {
+		e.applicationCPUs.Add(-1)
+	}
 	cpu.bridge.close()
 	e.wakeApplicationWaitersLocked()
 }
@@ -3149,6 +3319,7 @@ func (e *ring0Engine) Close() (retErr error) {
 	// Wait for the release acknowledgement before destroying the VM epoch.
 	deadline := time.Now().Add(5 * time.Second)
 	lastExitRequest := make(map[*ring0ApplicationCPU]time.Time)
+	var lastParkedWake time.Time
 	for {
 		e.cpuMu.Lock()
 		e.reapDestroyedCPUsLocked()
@@ -3160,8 +3331,21 @@ func (e *ring0Engine) Close() (retErr error) {
 		remaining := e.pinApplicationCPUs()
 		var requestErr error
 		var waitDetail string
+		wakeParked := false
 		for _, cpu := range remaining {
 			if cpu.bridge.destroyed() {
+				continue
+			}
+			if cpu.parked.Load() {
+				e.cpuMu.Lock()
+				if cpu.parked.Load() {
+					e.requestParkedRetirementLocked(cpu)
+				}
+				e.cpuMu.Unlock()
+				if time.Since(lastParkedWake) >= 10*time.Millisecond {
+					wakeParked = true
+				}
+				waitDetail = fmt.Sprintf("parked vCPU=%d destroyed=%t", cpu.vcpu.id, cpu.bridge.destroyed())
 				continue
 			}
 			cpu.retiring.Store(true)
@@ -3193,6 +3377,10 @@ func (e *ring0Engine) Close() (retErr error) {
 			lastExitRequest[cpu] = time.Now()
 		}
 		e.unpinApplicationCPUs(remaining)
+		if wakeParked {
+			ring0WakeIdleThreads()
+			lastParkedWake = time.Now()
+		}
 		if requestErr != nil {
 			return requestErr
 		}

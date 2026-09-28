@@ -623,6 +623,87 @@ static struct ttc_ring0_bridge *ttc_ring0_bridges;
 static struct ttc_ring0_bridge *ttc_ring0_free_bridges;
 static struct ttc_ring0_mirror_mapping *ttc_ring0_mirror_mappings;
 
+// A thread keeps its vCPU between residencies, parked, so that the next task
+// to run on the thread need not create one; see parkCurrentApplicationCPU.
+// Only the thread can destroy it, so it retires it itself: before any system
+// call that may block it indefinitely, when it exits, and at a libc call once
+// the engine has requested retirement. ttc_ring0_parked_retirements, set by
+// the engine, counts the requests outstanding; the Go runtime calls
+// ttc_ring0_runtime_safe_point before each libc call while it is nonzero.
+static _Thread_local struct ttc_ring0_bridge *ttc_ring0_parked_bridge;
+static _Atomic uint32_t ttc_ring0_parked_retirements;
+// Parked vCPUs retired, by the reason their owner threads retired them.
+static _Atomic uint64_t ttc_ring0_parked_retired_before_syscall;
+static _Atomic uint64_t ttc_ring0_parked_retired_at_exit;
+static _Atomic uint64_t ttc_ring0_parked_retired_on_request;
+
+static void ttc_ring0_park_bridge(struct ttc_ring0_bridge *bridge) {
+	ttc_ring0_parked_bridge = bridge;
+}
+
+static void ttc_ring0_unpark_bridge(struct ttc_ring0_bridge *bridge) {
+	if (ttc_ring0_parked_bridge == bridge) ttc_ring0_parked_bridge = NULL;
+}
+
+// ttc_ring0_retire_parked_bridge destroys a parked vCPU. It must run on the
+// vCPU's owner thread, outside signal handlers.
+static void ttc_ring0_retire_parked_bridge(struct ttc_ring0_bridge *bridge) {
+	if (ttc_ring0_parked_bridge == bridge) ttc_ring0_parked_bridge = NULL;
+	hv_return_t status = hv_vcpu_destroy(bridge->vcpu);
+	if (status != HV_SUCCESS) {
+		atomic_store_explicit(&bridge->error, (uint32_t)status,
+				memory_order_release);
+	}
+	atomic_store_explicit(&bridge->in_guest, 0, memory_order_release);
+	// This is the final bridge access. Release pairs with the engine's
+	// acquire before it recycles the vCPU ID and frees bridge.
+	atomic_store_explicit(&bridge->destroyed, 1, memory_order_release);
+}
+
+static void ttc_ring0_set_parked_retirements(uint32_t count) {
+	atomic_store_explicit(&ttc_ring0_parked_retirements, count,
+			memory_order_release);
+}
+
+static uint32_t *ttc_ring0_parked_retirements_address(void) {
+	return (uint32_t *)&ttc_ring0_parked_retirements;
+}
+
+// ttc_ring0_runtime_safe_point retires the calling thread's parked vCPU if
+// the engine requested it, and returns nonzero if it did.
+static int32_t ttc_ring0_runtime_safe_point(void *unused) {
+	(void)unused;
+	struct ttc_ring0_bridge *bridge = ttc_ring0_parked_bridge;
+	if (bridge == NULL || atomic_load_explicit(&bridge->destroy_requested,
+			memory_order_acquire) == 0) return 0;
+	ttc_ring0_retire_parked_bridge(bridge);
+	atomic_fetch_add_explicit(&ttc_ring0_parked_retired_on_request, 1,
+			memory_order_relaxed);
+	return 1;
+}
+
+// ttc_ring0_runtime_before_syscall retires the calling thread's parked vCPU
+// before a system call, which may block the thread for as long as it likes.
+static int32_t ttc_ring0_runtime_before_syscall(void *unused) {
+	(void)unused;
+	struct ttc_ring0_bridge *bridge = ttc_ring0_parked_bridge;
+	if (bridge == NULL) return 0;
+	ttc_ring0_retire_parked_bridge(bridge);
+	atomic_fetch_add_explicit(&ttc_ring0_parked_retired_before_syscall, 1,
+			memory_order_relaxed);
+	return 1;
+}
+
+static uintptr_t ttc_ring0_runtime_safe_point_address(void) {
+	return ttc_ring0_strip_instruction_pointer(
+			(uintptr_t)&ttc_ring0_runtime_safe_point);
+}
+
+static uintptr_t ttc_ring0_runtime_before_syscall_address(void) {
+	return ttc_ring0_strip_instruction_pointer(
+			(uintptr_t)&ttc_ring0_runtime_before_syscall);
+}
+
 static uint64_t ttc_ring0_monotonic_ns(void) {
 	struct timespec now;
 	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
@@ -655,6 +736,9 @@ enum ttc_ring0_runtime_stat_index {
 	TTC_RING0_STAT_RUNTIME_SUPPRESSED_REUSE_BYTES,
 	TTC_RING0_STAT_RUNTIME_SUPPRESSED_UNMAP_COUNT,
 	TTC_RING0_STAT_RUNTIME_SUPPRESSED_UNMAP_BYTES,
+	TTC_RING0_STAT_PARKED_RETIRED_BEFORE_SYSCALL,
+	TTC_RING0_STAT_PARKED_RETIRED_AT_EXIT,
+	TTC_RING0_STAT_PARKED_RETIRED_ON_REQUEST,
 	TTC_RING0_STAT_COUNT,
 };
 
@@ -693,6 +777,12 @@ static void ttc_ring0_runtime_stats(uint64_t *stats, size_t count) {
 			&ttc_ring0_runtime_suppressed_unmap_count, memory_order_relaxed);
 	stats[TTC_RING0_STAT_RUNTIME_SUPPRESSED_UNMAP_BYTES] = atomic_load_explicit(
 			&ttc_ring0_runtime_suppressed_unmap_bytes, memory_order_relaxed);
+	stats[TTC_RING0_STAT_PARKED_RETIRED_BEFORE_SYSCALL] = atomic_load_explicit(
+			&ttc_ring0_parked_retired_before_syscall, memory_order_relaxed);
+	stats[TTC_RING0_STAT_PARKED_RETIRED_AT_EXIT] = atomic_load_explicit(
+			&ttc_ring0_parked_retired_at_exit, memory_order_relaxed);
+	stats[TTC_RING0_STAT_PARKED_RETIRED_ON_REQUEST] = atomic_load_explicit(
+			&ttc_ring0_parked_retired_on_request, memory_order_relaxed);
 }
 
 static struct ttc_ring0_bridge *ttc_ring0_bridge_storage_acquire(void) {
@@ -1280,6 +1370,13 @@ static int32_t ttc_ring0_runtime_vm_hook(
 	if (mutation->operation == TTC_RUNTIME_VM_STACK_SUSPEND ||
 			mutation->operation == TTC_RUNTIME_VM_STACK_RESUME) {
 		if (mutation->phase != TTC_RUNTIME_VM_BEFORE) return EINVAL;
+		if (mutation->operation == TTC_RUNTIME_VM_STACK_SUSPEND &&
+				ttc_ring0_parked_bridge != NULL) {
+			// The thread is exiting, and it alone can destroy its vCPU.
+			ttc_ring0_retire_parked_bridge(ttc_ring0_parked_bridge);
+			atomic_fetch_add_explicit(&ttc_ring0_parked_retired_at_exit, 1,
+					memory_order_relaxed);
+		}
 		int status = pthread_mutex_lock(&ttc_ring0_mutation_mu);
 		if (status != 0) return status;
 		bool suspend = mutation->operation == TTC_RUNTIME_VM_STACK_SUSPEND;
@@ -2801,28 +2898,43 @@ func installRing0RuntimeVMMemoryHook() error {
 	if status := ring0SetRuntimeTimeHook(1, timeHook); status != 0 {
 		return fmt.Errorf("installing Darwin runtime time hook ABI v1: status %d", status)
 	}
+	if status := ring0SetThreadHooks(1,
+		uintptr(C.ttc_ring0_runtime_safe_point_address()),
+		uintptr(C.ttc_ring0_runtime_before_syscall_address()),
+		(*uint32)(unsafe.Pointer(C.ttc_ring0_parked_retirements_address()))); status != 0 {
+		return fmt.Errorf("installing Darwin runtime thread hooks ABI v1: status %d", status)
+	}
 	return nil
 }
 
-const ring0RuntimeStatCount = 16
+// setParkedRetirements publishes how many parked vCPUs the engine has asked
+// their owner threads to retire.
+func setParkedRetirements(count int) {
+	C.ttc_ring0_set_parked_retirements(C.uint32_t(count))
+}
+
+const ring0RuntimeStatCount = 19
 
 type ring0RuntimeStats struct {
-	rendezvousCount           uint64
-	runtimeRendezvousRequests uint64
-	rendezvousDrainTotalNS    uint64
-	rendezvousDrainMaxNS      uint64
-	rendezvousPauseTotalNS    uint64
-	rendezvousPauseMaxNS      uint64
-	rendezvousVCPUExitCalls   uint64
-	rendezvousVCPUExitTargets uint64
-	rendezvousFailures        uint64
-	runtimeVMHookCalls        uint64
-	releasedCount             uint64
-	releasedBytes             uint64
-	suppressedReuseCount      uint64
-	suppressedReuseBytes      uint64
-	suppressedUnmapCount      uint64
-	suppressedUnmapBytes      uint64
+	rendezvousCount            uint64
+	runtimeRendezvousRequests  uint64
+	rendezvousDrainTotalNS     uint64
+	rendezvousDrainMaxNS       uint64
+	rendezvousPauseTotalNS     uint64
+	rendezvousPauseMaxNS       uint64
+	rendezvousVCPUExitCalls    uint64
+	rendezvousVCPUExitTargets  uint64
+	rendezvousFailures         uint64
+	runtimeVMHookCalls         uint64
+	releasedCount              uint64
+	releasedBytes              uint64
+	suppressedReuseCount       uint64
+	suppressedReuseBytes       uint64
+	suppressedUnmapCount       uint64
+	suppressedUnmapBytes       uint64
+	parkedRetiredBeforeSyscall uint64
+	parkedRetiredAtExit        uint64
+	parkedRetiredOnRequest     uint64
 }
 
 func readRing0RuntimeStats() ring0RuntimeStats {
@@ -2830,22 +2942,25 @@ func readRing0RuntimeStats() ring0RuntimeStats {
 	C.ttc_ring0_runtime_stats(
 		(*C.uint64_t)(unsafe.Pointer(&values[0])), C.size_t(len(values)))
 	return ring0RuntimeStats{
-		rendezvousCount:           values[0],
-		runtimeRendezvousRequests: values[1],
-		rendezvousDrainTotalNS:    values[2],
-		rendezvousDrainMaxNS:      values[3],
-		rendezvousPauseTotalNS:    values[4],
-		rendezvousPauseMaxNS:      values[5],
-		rendezvousVCPUExitCalls:   values[6],
-		rendezvousVCPUExitTargets: values[7],
-		rendezvousFailures:        values[8],
-		runtimeVMHookCalls:        values[9],
-		releasedCount:             values[10],
-		releasedBytes:             values[11],
-		suppressedReuseCount:      values[12],
-		suppressedReuseBytes:      values[13],
-		suppressedUnmapCount:      values[14],
-		suppressedUnmapBytes:      values[15],
+		rendezvousCount:            values[0],
+		runtimeRendezvousRequests:  values[1],
+		rendezvousDrainTotalNS:     values[2],
+		rendezvousDrainMaxNS:       values[3],
+		rendezvousPauseTotalNS:     values[4],
+		rendezvousPauseMaxNS:       values[5],
+		rendezvousVCPUExitCalls:    values[6],
+		rendezvousVCPUExitTargets:  values[7],
+		rendezvousFailures:         values[8],
+		runtimeVMHookCalls:         values[9],
+		releasedCount:              values[10],
+		releasedBytes:              values[11],
+		suppressedReuseCount:       values[12],
+		suppressedReuseBytes:       values[13],
+		suppressedUnmapCount:       values[14],
+		suppressedUnmapBytes:       values[15],
+		parkedRetiredBeforeSyscall: values[16],
+		parkedRetiredAtExit:        values[17],
+		parkedRetiredOnRequest:     values[18],
 	}
 }
 
@@ -2920,6 +3035,25 @@ func (b *ring0Bridge) destroyed() bool {
 func (b *ring0Bridge) markDestroyed() {
 	atomic.StoreUint32((*uint32)(unsafe.Add(unsafe.Pointer(b.pointer), ring0BridgeInGuestOffset)), 0)
 	atomic.StoreUint32((*uint32)(unsafe.Add(unsafe.Pointer(b.pointer), ring0BridgeDestroyedOffset)), 1)
+}
+
+// park records that the calling thread, which owns b's vCPU, keeps it with
+// no residency using it.
+func (b *ring0Bridge) park() {
+	C.ttc_ring0_park_bridge(b.pointer)
+	ring0SetThreadParked(true)
+}
+
+// unpark records that a residency on the calling thread uses b's vCPU again.
+func (b *ring0Bridge) unpark() {
+	C.ttc_ring0_unpark_bridge(b.pointer)
+	ring0SetThreadParked(false)
+}
+
+// retireParked destroys b's parked vCPU. The calling thread must own it.
+func (b *ring0Bridge) retireParked() {
+	C.ttc_ring0_retire_parked_bridge(b.pointer)
+	ring0SetThreadParked(false)
 }
 
 func (b *ring0Bridge) requestDestroy() {

@@ -1,8 +1,90 @@
+diff --git a/src/runtime/os_darwin.go b/src/runtime/os_darwin.go
+--- a/src/runtime/os_darwin.go
++++ b/src/runtime/os_darwin.go
+@@ -16,6 +16,13 @@
+ 	cond        pthreadcond
+ 	count       int
+ 
++	// ttcSemaReady is set, atomically, once mutex and cond are initialized;
++	// see ttcWakeIdleThreads.
++	ttcSemaReady uint32
++	// ttcParked is set while the thread keeps a vCPU that no residency uses;
++	// see ttcRuntimeBeforeSyscall. Only the thread itself accesses it.
++	ttcParked uint32
++
+ 	// address of errno variable for this thread.
+ 	// This is an optimization to avoid calling libc_error
+ 	// on every syscall_rawsyscalln.
+@@ -39,6 +46,7 @@
+ 	if err := pthread_cond_init(&mp.cond, nil); err != 0 {
+ 		throw("pthread_cond_init")
+ 	}
++	ttcSemaCreated(mp)
+ }
+ 
+ //go:nosplit
+@@ -346,6 +354,7 @@
+ 	}
+ 	minitSignalMask()
+ 	getg().m.procid = uint64(pthread_self())
++	ttcVMMemoryStack(ttcVMMemoryStackResume)
+ 	libc_error_addr(&getg().m.errnoAddr)
+ }
+ 
+@@ -353,6 +362,7 @@
+ //
+ //go:nosplit
+ func unminit() {
++	ttcVMMemoryStack(ttcVMMemoryStackSuspend)
+ 	// iOS does not support alternate signal stack.
+ 	// See minit.
+ 	if !(GOOS == "ios" && GOARCH == "arm64") {
+diff --git a/src/runtime/proc.go b/src/runtime/proc.go
+--- a/src/runtime/proc.go
++++ b/src/runtime/proc.go
+@@ -4525,6 +4525,7 @@
+ 	gp.bubble = nil
+ 	gp.fipsOnlyBypass = false
+ 	gp.secret = 0
++	gp.ttcSyscallsEnd = false
+ 
+ 	if gcBlackenEnabled != 0 && gp.gcAssistBytes > 0 {
+ 		// Flush assist credit to the global pool. This gives
+diff --git a/src/runtime/runtime2.go b/src/runtime/runtime2.go
+--- a/src/runtime/runtime2.go
++++ b/src/runtime/runtime2.go
+@@ -595,6 +595,10 @@
+ 	// valgrindStackID is used to track what memory is used for stacks when a program is
+ 	// built with the "valgrind" build tag, otherwise it is unused.
+ 	valgrindStackID uintptr
++
++	// ttcSyscallsEnd is set if the goroutine's system calls all end; see
++	// ttcRuntimeBeforeSyscall.
++	ttcSyscallsEnd bool
+ }
+ 
+ // gTrackingPeriod is the number of transitions out of _Grunning between
 diff --git a/src/runtime/sys_darwin.go b/src/runtime/sys_darwin.go
-index c847aa1..26d9cd1 100644
 --- a/src/runtime/sys_darwin.go
 +++ b/src/runtime/sys_darwin.go
-@@ -199,5 +199,20 @@ func osinit_hack() {
+@@ -35,6 +35,7 @@
+ //go:nosplit
+ //go:uintptrkeepalive
+ func syscall_syscalln(fn uintptr, args ...uintptr) (r1, r2, err uintptr) {
++	ttcRuntimeBeforeSyscall()
+ 	entersyscall()
+ 	r1, r2, err = syscall_rawsyscalln(fn, args...)
+ 	exitsyscall()
+@@ -80,6 +81,7 @@
+ 		f1                     float64
+ 		r1                     uintptr
+ 	}{fn, a1, a2, a3, a4, a5, f1, r1}
++	ttcRuntimeBeforeSyscall()
+ 	entersyscall()
+ 	libcCall(unsafe.Pointer(abi.FuncPCABI0(syscall_x509)), unsafe.Pointer(&args))
+ 	exitsyscall()
+@@ -198,6 +200,21 @@
+ //
  //go:nosplit
  func mmap(addr unsafe.Pointer, n uintptr, prot, flags, fd int32, off uint32) (unsafe.Pointer, int) {
 +	// Darwin accepts VM_MAKE_TAG in mmap's fd argument for MAP_ANON. Mark
@@ -23,7 +105,7 @@ index c847aa1..26d9cd1 100644
  	args := struct {
  		addr            unsafe.Pointer
  		n               uintptr
-@@ -207,22 +222,51 @@ func mmap(addr unsafe.Pointer, n uintptr, prot, flags, fd int32, off uint32) (un
+@@ -207,6 +224,10 @@
  		ret2            int
  	}{addr, n, prot, flags, fd, off, nil, 0}
  	libcCall(unsafe.Pointer(abi.FuncPCABI0(mmap_trampoline)), unsafe.Pointer(&args))
@@ -34,10 +116,11 @@ index c847aa1..26d9cd1 100644
  	return args.ret1, args.ret2
  }
  func mmap_trampoline()
- 
+@@ -214,7 +235,19 @@
  //go:nosplit
  //go:cgo_unsafe_args
  func munmap(addr unsafe.Pointer, n uintptr) {
+-	libcCall(unsafe.Pointer(abi.FuncPCABI0(munmap_trampoline)), unsafe.Pointer(&addr))
 +	mutation := ttcVMMemoryMutation{
 +		version:   ttcVMMemoryMutationVersion,
 +		operation: ttcVMMemoryMunmap,
@@ -46,7 +129,6 @@ index c847aa1..26d9cd1 100644
 +		length:    n,
 +	}
 +	ttcVMMemoryCall(&mutation)
--	libcCall(unsafe.Pointer(abi.FuncPCABI0(munmap_trampoline)), unsafe.Pointer(&addr))
 +	if mutation.disposition == ttcVMMemoryProceed {
 +		libcCall(unsafe.Pointer(abi.FuncPCABI0(munmap_trampoline)), unsafe.Pointer(&addr))
 +	}
@@ -55,10 +137,11 @@ index c847aa1..26d9cd1 100644
  	KeepAlive(addr) // Just for consistency. Hopefully addr is not a Go address.
  }
  func munmap_trampoline()
- 
+@@ -222,7 +255,20 @@
  //go:nosplit
  //go:cgo_unsafe_args
  func madvise(addr unsafe.Pointer, n uintptr, flags int32) {
+-	libcCall(unsafe.Pointer(abi.FuncPCABI0(madvise_trampoline)), unsafe.Pointer(&addr))
 +	mutation := ttcVMMemoryMutation{
 +		version:   ttcVMMemoryMutationVersion,
 +		operation: ttcVMMemoryMadvise,
@@ -68,7 +151,6 @@ index c847aa1..26d9cd1 100644
 +		flags:     flags,
 +	}
 +	ttcVMMemoryCall(&mutation)
--	libcCall(unsafe.Pointer(abi.FuncPCABI0(madvise_trampoline)), unsafe.Pointer(&addr))
 +	if mutation.disposition == ttcVMMemoryProceed {
 +		libcCall(unsafe.Pointer(abi.FuncPCABI0(madvise_trampoline)), unsafe.Pointer(&addr))
 +	}
@@ -77,81 +159,43 @@ index c847aa1..26d9cd1 100644
  	KeepAlive(addr) // Just for consistency. Hopefully addr is not a Go address.
  }
  func madvise_trampoline()
-@@ -302,21 +342,24 @@
+@@ -302,6 +348,9 @@
  //go:nosplit
  //go:cgo_unsafe_args
--func nanotime1() int64 {
--	var r struct {
--		t            int64  // raw timer
--		numer, denom uint32 // conversion factors. nanoseconds = t * numer / denom.
--	}
--	libcCall(unsafe.Pointer(abi.FuncPCABI0(nanotime_trampoline)), unsafe.Pointer(&r))
--	// Note: Apple seems unconcerned about overflow here. See
--	// https://developer.apple.com/library/content/qa/qa1398/_index.html
--	// Note also, numer == denom == 1 is common.
--	t := r.t
--	if r.numer != 1 {
--		t *= int64(r.numer)
--	}
--	if r.denom != 1 {
--		t /= int64(r.denom)
--	}
--	return t
--}
-+func nanotime1() int64 {
+ func nanotime1() int64 {
 +	if seconds, nanoseconds, ok := ttcRuntimeTimeCall(ttcRuntimeTimeMonotonic); ok {
 +		return seconds*1000000000 + int64(nanoseconds)
 +	}
-+	var r struct {
-+		t            int64  // raw timer
-+		numer, denom uint32 // conversion factors. nanoseconds = t * numer / denom.
-+	}
-+	libcCall(unsafe.Pointer(abi.FuncPCABI0(nanotime_trampoline)), unsafe.Pointer(&r))
-+	// Note: Apple seems unconcerned about overflow here. See
-+	// https://developer.apple.com/library/content/qa/qa1398/_index.html
-+	// Note also, numer == denom == 1 is common.
-+	t := r.t
-+	if r.numer != 1 {
-+		t *= int64(r.numer)
-+	}
-+	if r.denom != 1 {
-+		t /= int64(r.denom)
-+	}
-+	return t
-+}
- func nanotime_trampoline()
-@@ -332,9 +375,12 @@
- //go:linkname walltime
+ 	var r struct {
+ 		t            int64  // raw timer
+ 		numer, denom uint32 // conversion factors. nanoseconds = t * numer / denom.
+@@ -333,6 +382,9 @@
  //go:nosplit
  //go:cgo_unsafe_args
--func walltime() (int64, int32) {
--	var t timespec
--	libcCall(unsafe.Pointer(abi.FuncPCABI0(walltime_trampoline)), unsafe.Pointer(&t))
--	return t.tv_sec, int32(t.tv_nsec)
--}
-+func walltime() (int64, int32) {
+ func walltime() (int64, int32) {
 +	if seconds, nanoseconds, ok := ttcRuntimeTimeCall(ttcRuntimeTimeWall); ok {
 +		return seconds, nanoseconds
 +	}
-+	var t timespec
-+	libcCall(unsafe.Pointer(abi.FuncPCABI0(walltime_trampoline)), unsafe.Pointer(&t))
-+	return t.tv_sec, int32(t.tv_nsec)
-+}
- func walltime_trampoline()
-diff --git a/src/runtime/os_darwin.go b/src/runtime/os_darwin.go
-index 81141f8..5f12b2d 100644
---- a/src/runtime/os_darwin.go
-+++ b/src/runtime/os_darwin.go
-@@ -349,0 +350 @@ func minit() {
-+	ttcVMMemoryStack(ttcVMMemoryStackResume)
-@@ -356,0 +358 @@ func unminit() {
-+	ttcVMMemoryStack(ttcVMMemoryStackSuspend)
+ 	var t timespec
+ 	libcCall(unsafe.Pointer(abi.FuncPCABI0(walltime_trampoline)), unsafe.Pointer(&t))
+ 	return t.tv_sec, int32(t.tv_nsec)
+diff --git a/src/runtime/sys_libc.go b/src/runtime/sys_libc.go
+--- a/src/runtime/sys_libc.go
++++ b/src/runtime/sys_libc.go
+@@ -18,6 +18,8 @@
+ //
+ //go:nosplit
+ func libcCall(fn, arg unsafe.Pointer) int32 {
++	ttcRuntimeEnsureHost()
++	ttcRuntimeSafePoint()
+ 	// Leave caller's PC/SP/G around for traceback.
+ 	gp := getg()
+ 	var mp *m
 diff --git a/src/runtime/ttc_vm_darwin.go b/src/runtime/ttc_vm_darwin.go
 new file mode 100644
-index 0000000..e1d4c90
 --- /dev/null
 +++ b/src/runtime/ttc_vm_darwin.go
-@@ -0,0 +1,196 @@
+@@ -0,0 +1,331 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -348,19 +392,146 @@ index 0000000..e1d4c90
 +	}
 +	return query.seconds, query.nanoseconds, status == 1
 +}
-diff --git a/src/runtime/sys_libc.go b/src/runtime/sys_libc.go
-index 6913903..a2968bc 100644
---- a/src/runtime/sys_libc.go
-+++ b/src/runtime/sys_libc.go
-@@ -20 +20,2 @@
- func libcCall(fn, arg unsafe.Pointer) int32 {
-+	ttcRuntimeEnsureHost()
++
++// Owner-thread safe points. A Hypervisor.framework vCPU can be destroyed only
++// by the thread that created it, and not from a signal handler, while TTC
++// keeps a vCPU on its thread between the residencies of different tasks. To
++// retire such a vCPU, TTC makes a pending request visible through
++// *ttcSafePointPending, and every thread then calls ttcSafePointCallback
++// before its next libc call. The scheduler makes libc calls whenever it looks
++// for work, so a thread running Go code reaches one soon; ttcWakeIdleThreads
++// brings idle threads to one. A thread blocked in a system call reaches none,
++// so a thread that keeps a vCPU retires it, through ttcSyscallCallback, before
++// any system call that may not end; see ttcSetSyscallsEnd.
++const ttcThreadHooksVersion = 1
++
++var (
++	ttcSafePointCallback uintptr
++	ttcSyscallCallback   uintptr
++	ttcSafePointPending  uintptr // *uint32
++)
++
++// ttcSetThreadHooks installs TTC's C-ABI callbacks and the counter of pending
++// requests that enables the safe point. Each callback returns nonzero if it
++// retired the calling thread's vCPU. Like the other hooks, they are installed
++// once for the life of the process.
++//
++//go:linkname ttcSetThreadHooks
++//go:nosplit
++func ttcSetThreadHooks(version uint32, safePoint, beforeSyscall uintptr, pending *uint32) int32 {
++	if version != ttcThreadHooksVersion {
++		return 1
++	}
++	if safePoint == 0 || beforeSyscall == 0 || pending == nil {
++		return 2
++	}
++	installed := atomic.Loaduintptr(&ttcSafePointCallback)
++	if installed != 0 {
++		if installed == safePoint && atomic.Loaduintptr(&ttcSyscallCallback) == beforeSyscall &&
++			atomic.Loaduintptr(&ttcSafePointPending) == uintptr(unsafe.Pointer(pending)) {
++			return 0
++		}
++		return 3
++	}
++	atomic.Storeuintptr(&ttcSafePointPending, uintptr(unsafe.Pointer(pending)))
++	atomic.Storeuintptr(&ttcSyscallCallback, beforeSyscall)
++	atomic.Storeuintptr(&ttcSafePointCallback, safePoint)
++	return 0
++}
++
++// ttcRuntimeSafePoint calls TTC's safe-point callback while requests are
++// pending. It runs before a libc call, possibly without a P or with runtime
++// locks held, so the callback must not call back into Go. It is skipped in
++// signal handlers, where Hypervisor.framework may not be called.
++//
++//go:nosplit
++func ttcRuntimeSafePoint() {
++	pending := atomic.Loaduintptr(&ttcSafePointPending)
++	if pending == 0 || atomic.Load((*uint32)(unsafe.Pointer(pending))) == 0 {
++		return
++	}
++	gp := getg()
++	if gp == nil || gp.m == nil || gp == gp.m.gsignal {
++		return
++	}
++	if callback := atomic.Loaduintptr(&ttcSafePointCallback); callback != 0 &&
++		asmcgocall(unsafe.Pointer(callback), nil) != 0 {
++		gp.m.ttcParked = 0
++	}
++}
++
++// ttcSetThreadParked records whether the calling thread keeps a vCPU that no
++// residency uses.
++//
++//go:linkname ttcSetThreadParked
++//go:nosplit
++func ttcSetThreadParked(parked bool) {
++	if parked {
++		getg().m.ttcParked = 1
++	} else {
++		getg().m.ttcParked = 0
++	}
++}
++
++// ttcSetSyscallsEnd records that the calling goroutine's system calls all
++// end, such as those of a goroutine that uses only non-blocking descriptors.
++//
++//go:linkname ttcSetSyscallsEnd
++//go:nosplit
++func ttcSetSyscallsEnd() {
++	getg().ttcSyscallsEnd = true
++}
++
++// ttcRuntimeBeforeSyscall makes a thread that keeps a vCPU retire it before a
++// system call that may block the thread indefinitely, since only the thread
++// itself can. Goroutines whose system calls all end are exempt.
++//
++//go:nosplit
++func ttcRuntimeBeforeSyscall() {
++	gp := getg()
++	mp := gp.m
++	if mp.ttcParked == 0 || gp.ttcSyscallsEnd {
++		return
++	}
++	mp.ttcParked = 0
++	if callback := atomic.Loaduintptr(&ttcSyscallCallback); callback != 0 {
++		asmcgocall(unsafe.Pointer(callback), nil)
++	}
++}
++
++// ttcSemaCreated publishes that mp's semaphore can be signaled.
++//
++//go:nosplit
++func ttcSemaCreated(mp *m) {
++	atomic.Store(&mp.ttcSemaReady, 1)
++}
++
++// ttcWakeIdleThreads brings threads that sleep, in semasleep or in the
++// network poller, to a safe point without granting them anything. semasleep
++// waits until its count is positive, so a signal of its condition variable
++// alone makes it only wait again, which is a libc call; a woken poller looks
++// for work again. Like NumCgoCall, it walks allm without sched.lock: an M
++// that exits stays in memory.
++//
++//go:linkname ttcWakeIdleThreads
++func ttcWakeIdleThreads() {
++	for mp := (*m)(atomic.Loadp(unsafe.Pointer(&allm))); mp != nil; mp = mp.alllink {
++		if atomic.Load(&mp.ttcSemaReady) == 0 {
++			continue
++		}
++		pthread_mutex_lock(&mp.mutex)
++		pthread_cond_signal(&mp.cond)
++		pthread_mutex_unlock(&mp.mutex)
++	}
++	if netpollinited() {
++		netpollBreak()
++	}
++}
 diff --git a/src/runtime/ttc_vm_openbsd.go b/src/runtime/ttc_vm_openbsd.go
 new file mode 100644
-index 0000000..c6f37b5
 --- /dev/null
 +++ b/src/runtime/ttc_vm_openbsd.go
-@@ -0,0 +1,12 @@
+@@ -0,0 +1,16 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -373,3 +544,7 @@ index 0000000..c6f37b5
 +// both operating systems.
 +//go:nosplit
 +func ttcRuntimeEnsureHost() {}
++
++// ttcRuntimeSafePoint is a no-op outside Darwin.
++//go:nosplit
++func ttcRuntimeSafePoint() {}

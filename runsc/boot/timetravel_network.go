@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/hostthread"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netfilter"
 	sentrynetstack "gvisor.dev/gvisor/pkg/sentry/socket/netstack"
@@ -254,6 +255,9 @@ func (r *proxyRealm) relay(a, b net.Conn, lifetime time.Duration) {
 	r.wg.Add(2)
 	copyOneWay := func(dst, src net.Conn) {
 		defer r.wg.Done()
+		// Its host system calls are on the host connection, which Go's network
+		// poller keeps non-blocking.
+		hostthread.SyscallsEnd()
 		_, _ = io.Copy(dst, src)
 		closePair()
 	}

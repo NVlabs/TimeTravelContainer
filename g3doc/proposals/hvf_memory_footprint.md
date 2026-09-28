@@ -1,7 +1,7 @@
 # HVF memory footprint: demand-paged stage 2
 
-*Status: in progress, September 2026; phases 1-6 and 8 of the delivery plan
-are implemented. Measurements: Apple M5 Pro, macOS 26.5.2.*
+*Status: in progress, September 2026; phases 1-8 of the delivery plan are
+implemented. Measurements: Apple M5 Pro, macOS 26.5.2.*
 
 ## Summary
 
@@ -60,11 +60,19 @@ and did not fall at all before it. At that point:
 The Sentry ran 217 garbage collections in the 68 s install. Phase 6 trims the
 idle Sentry, bringing the footprint to 230 MiB two seconds after apt exits.
 
-vCPU churn has a cost of its own. An owner-affine vCPU is destroyed whenever
-its task blocks, and created again when it runs, over 2,000 times while 400
-MiB passes through a pipe. Every `hv_vcpu_create` and `hv_vcpu_destroy` pair
-grows the process's page tables by about 13 KiB, up to a plateau of about 32
-MiB per process that never shrinks, even after `hv_vm_destroy`.
+vCPU churn has a cost of its own. An owner-affine vCPU was destroyed
+whenever its task blocked, and created again when it ran, over 5,000 times
+while 400 MiB passed through a pipe. Every `hv_vcpu_create` and
+`hv_vcpu_destroy` pair grows the process's page tables by about 13 KiB, up to
+a plateau of about 32 MiB per process that never shrinks, even after
+`hv_vm_destroy`. Phase 7 keeps each thread's vCPU between residencies:
+
+| Workload | vCPUs created before | after | Page tables after | Time before | after |
+|---|---|---|---|---|---|
+| 400 MiB through a pipe | 5,596 | 8 | 0.9 MiB | 0.40 s | 0.26 s |
+| 300 process spawns | 1,559 | 15 | 1.1 MiB | 0.70 s | 0.58 s |
+| `apt-get install --reinstall gdb` | 2,041 | 45 | 1.8 MiB | 8.6 s | 6-7 s |
+| gdb running itself | 267 | 14 | 1.1 MiB | 1.0 s | 0.8 s |
 
 Removing branches must return their memory too, since a family's branches
 share its Sentry. Take a container with gdb installed, run gdb in it, fork it
@@ -79,8 +87,8 @@ document for which `encoding/json` grows a 16 MiB buffer, then keeps it in a
 Sentry's own allocation, and collects twice so that pools let go. Eight rounds
 of four forks, gdb in each, and their removal leave the Sentry at 114 to 136
 MiB four seconds after each round, from 102 MiB before the first. The page
-tables of vCPU churn are nearly all the difference: 1 MiB before the first
-round, 32 MiB after the eighth.
+tables of vCPU churn were nearly all the difference, 32 MiB after the eighth
+round, and 5 MiB after phase 7, which leaves the Sentry at 112 MiB.
 
 ## Where the memory went
 
@@ -122,7 +130,8 @@ stores, and branches with stage 1 disabled. On macOS 26.5.2:
 | Wiring | HVF does not wire mapped pages. |
 | Stage-2 faults | An unmapped IPA exits with EC 0x24 and the IPA, PC left on the faulting instruction. Map and resume: 5.2 us per fault, versus 0.7 us for a plain entry and exit. A write to a read-only mapping is a permission fault, resolved by `hv_vm_protect`. |
 | Map cost | `hv_vm_map` 0.37 us and `hv_vm_unmap` 0.20 us per 16 KiB slab; about 1 us for a 512 MiB range. |
-| vCPU lifetimes | Each `hv_vcpu_create` and `hv_vcpu_destroy` pair grows the task's page tables by about 13 KiB, on the same thread or a new one, until they plateau at about 32 MiB. Neither destroying the vCPUs, destroying the VM, nor idle time returns them. |
+| vCPU lifetimes | Each `hv_vcpu_create` and `hv_vcpu_destroy` pair grows the task's page tables by about 13 KiB, on the same thread or a new one, until they plateau at about 32 MiB. Neither destroying the vCPUs, destroying the VM, nor idle time returns them. On one thread, a create takes 13-22 us and a destroy 7-9 us; 32 threads creating at once take about 1 ms each. |
+| vCPU ownership | A thread owns at most one vCPU (a second `hv_vcpu_create` returns `HV_BUSY`), and only it can destroy the vCPU (another thread gets `HV_BAD_ARGUMENT`). `hv_vm_destroy` returns `HV_BUSY` while any vCPU exists, and a process has one VM at a time. An idle vCPU costs about 95 KiB. |
 | Footprint accounting | A page that both the host and the guest have touched counts twice in the task's physical footprint: a 16 MiB region costs 16 MiB when the host writes it and 16 MiB more when the guest then reads it, and `hv_vm_unmap` returns the second 16 MiB. `vmmap` shows only the host's share in its per-region figures. |
 
 ### The hard constraint
@@ -242,10 +251,27 @@ Each phase stands alone and is measured before the next.
    ms apart, keeps it busy, and 32 MiB allocated since the last trim is worth
    another, which is what removing a branch does. The trim collects twice,
    since what a `sync.Pool` holds survives one collection.
-7. **Keep vCPUs across residencies.** Park a task's vCPU on its thread when
-   the task blocks, instead of destroying it, so blocking I/O stops growing
-   Hypervisor.framework's page tables and paying for vCPU creation. The
-   hard part is retiring a parked vCPU, which only its owner thread can do.
+7. **Keep vCPUs across residencies (done).** When a residency ends, the thread
+   keeps its vCPU, parked, and the next residency on the thread, of any task,
+   takes it. Nearly every vCPU the engine created had been on a thread whose
+   residency ended moments before; the workloads above ran on 7 to 21 threads.
+   A parked vCPU holds a vCPU ID, and the epoch rollover must destroy every
+   vCPU before it can destroy the VM, so the engine must be able to retire one
+   on demand, though only its thread can, and not from a signal handler. The
+   patched Go runtime provides the thread's safe points: while retirements are
+   pending, every thread calls TTC before each libc call, which the scheduler
+   makes whenever it looks for work, and TTC wakes idle threads, which sleep
+   in a condition-variable loop that tolerates spurious wakeups, to reach one.
+   A thread blocked in a system call reaches none, and some Sentry goroutines
+   block in one indefinitely, such as the urpc server's `poll`. So a thread
+   retires its parked vCPU when it exits, and before a goroutine's system call
+   unless the goroutine declares that its system calls end
+   (`hostthread.SyscallsEnd`): task goroutines, whose system calls are file
+   I/O and gofer requests, the NAT relay, on non-blocking sockets, the
+   timekeepers, and snapshot `fsync` workers. The remaining churn is the
+   control plane's: eight rounds of four forks, gdb in each, and their removal
+   create 308 vCPUs, leaving 5 MiB of page tables, mostly for urpc handlers,
+   which may block indefinitely.
 8. **Stacks on first touch (done).** Import the top 80 KiB of a thread's
    stack, and the rest in windows as EL1 touches it, rather than all of it. At
    EL1 it holds only the Go runtime's frames; goroutines run on stacks in the
@@ -277,6 +303,11 @@ Each phase stands alone and is measured before the next.
   panics the host. Qualify it with a minimal, deliberate probe case first.
 * **Rendezvous cost of releases.** Scavenger releases now stop all vCPUs.
   Batch them, and release only ranges above a size threshold if needed.
+* **Control-plane vCPU churn.** urpc handlers still make a thread retire its
+  parked vCPU before each system call, about 40 times for a round of four
+  forks and their removal. Their waits for the next request could go through
+  Go's network poller instead of `poll`; each handler would then have to be
+  shown to make no system call that blocks indefinitely.
 * **Returning a spike on a busy Sentry.** Phase 6 trims only an idle one. A
   busy Sentry still returns its heap only as the scavenger paces it.
 * **The footprint outside user regions** is the double charge and
