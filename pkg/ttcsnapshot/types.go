@@ -22,7 +22,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 )
 
@@ -149,26 +148,34 @@ func parseObjectKey(key string) (ObjectID, error) {
 	if len(key) != 36 || key[16] != '-' || key[19] != '-' {
 		return ObjectID{}, fmt.Errorf("invalid TTC object key %q", key)
 	}
-	snapshot, err := strconv.ParseUint(key[0:16], 16, 64)
-	if err != nil {
-		return ObjectID{}, fmt.Errorf("invalid TTC object key %q: %w", key, err)
-	}
-	kind, err := strconv.ParseUint(key[17:19], 16, 8)
-	if err != nil {
-		return ObjectID{}, fmt.Errorf("invalid TTC object key %q: %w", key, err)
-	}
-	ordinal, err := strconv.ParseUint(key[20:36], 16, 64)
-	if err != nil {
-		return ObjectID{}, fmt.Errorf("invalid TTC object key %q: %w", key, err)
+	// Lower-case hex digits of these widths are exactly the canonical form.
+	snapshot, snapshotOK := parseLowerHex(key[0:16])
+	kind, kindOK := parseLowerHex(key[17:19])
+	ordinal, ordinalOK := parseLowerHex(key[20:36])
+	if !snapshotOK || !kindOK || !ordinalOK {
+		return ObjectID{}, fmt.Errorf("non-canonical TTC object key %q", key)
 	}
 	id := ObjectID{Snapshot: SnapshotID(snapshot), Kind: ObjectKind(kind), Ordinal: ordinal}
 	if err := id.validate(); err != nil {
 		return ObjectID{}, err
 	}
-	if id.key() != key {
-		return ObjectID{}, fmt.Errorf("non-canonical TTC object key %q", key)
-	}
 	return id, nil
+}
+
+// parseLowerHex parses digits, lower-case hex ones only.
+func parseLowerHex(digits string) (uint64, bool) {
+	var value uint64
+	for i := 0; i < len(digits); i++ {
+		switch c := digits[i]; {
+		case '0' <= c && c <= '9':
+			value = value<<4 | uint64(c-'0')
+		case 'a' <= c && c <= 'f':
+			value = value<<4 | uint64(c-'a'+10)
+		default:
+			return 0, false
+		}
+	}
+	return value, true
 }
 
 // SnapshotState is the authority state of one local snapshot origin.
