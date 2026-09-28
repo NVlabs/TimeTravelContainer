@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 )
 
 // AttachDeferredResolver attaches the transient data-plane resolver for one
@@ -309,7 +310,7 @@ func (s *Store) resolveDeferredLockedAfter(id ObjectID, ordinalFloor uint64) (Ob
 	for key := range touched {
 		keys = append(keys, key)
 	}
-	sortStrings(keys)
+	slices.Sort(keys)
 	ops := make([]journalOp, 0, len(keys)+2)
 	for _, key := range keys {
 		child := touched[key]
@@ -328,12 +329,4 @@ func (s *Store) resolveDeferredLockedAfter(id ObjectID, ordinalFloor uint64) (Ob
 	finished = true
 	finishLoad(nil)
 	return cloneObject(object), true, snapshot.NextOrdinal, nil
-}
-
-func sortStrings(values []string) {
-	for i := 1; i < len(values); i++ {
-		for j := i; j > 0 && values[j] < values[j-1]; j-- {
-			values[j], values[j-1] = values[j-1], values[j]
-		}
-	}
 }
