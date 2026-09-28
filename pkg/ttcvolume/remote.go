@@ -4,7 +4,6 @@
 package ttcvolume
 
 import (
-	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -367,16 +366,18 @@ func (r *Repository) prepareDeferredFileObject(id ttcsnapshot.ObjectID, size int
 	if size < 0 || object.ID.Kind != ttcsnapshot.ObjectKindFile || object.BulkLength != uint64(size) || sourceID.Kind != ttcsnapshot.ObjectKindFile {
 		return fmt.Errorf("deferred file %s metadata disagrees with length %d", id, size)
 	}
-	if local, err := r.deferredObjectLocal(id, size); err != nil || local {
-		return err
-	}
 	if size == 0 {
-		// An empty file has no bytes to fetch: install it here, not through
-		// its source, and retire any marker an earlier look left.
-		if err := r.replaceRemoteObject(id, id.String(), bytes.NewReader(nil), 0); err != nil {
+		// An empty file has no bytes to fetch: install it here, if it is not
+		// here yet, rather than through its source, and retire any marker an
+		// earlier look left. No file was bound to one absent, and one present
+		// is complete: no runtime state needs invalidating.
+		if _, err := r.data.InstallEmptyDeferred(id); err != nil {
 			return err
 		}
 		return r.retireRemoteObjectPending(id.String())
+	}
+	if local, err := r.deferredObjectLocal(id, size); err != nil || local {
+		return err
 	}
 	return r.registerDeferredFileObject(id, size, catalog, sourceID)
 }

@@ -487,6 +487,25 @@ func (store *LocalDataStore) InstallDeferred(id ObjectID, source io.Reader, leng
 	return nil
 }
 
+// InstallEmptyDeferred is InstallDeferred for an empty object: it creates
+// it if it is absent, and reports whether it did. An existing one is checked
+// empty, as it must be.
+func (store *LocalDataStore) InstallEmptyDeferred(id ObjectID) (bool, error) {
+	created, err := store.createEmpty(id)
+	if err != nil {
+		return false, err
+	}
+	if created {
+		store.noteUnsyncedName(id)
+		return true, nil
+	}
+	existing, err := store.Open(id, 0)
+	if err != nil {
+		return false, fmt.Errorf("existing immutable object: %w", err)
+	}
+	return false, existing.Close()
+}
+
 // ReplaceDeferred writes a complete cache object and atomically replaces any
 // incomplete placeholder for id. It is intentionally non-durable: distributed
 // cache contents are disposable and can be fetched again after a crash.

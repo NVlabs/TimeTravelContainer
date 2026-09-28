@@ -2499,12 +2499,22 @@ func TestLocalDataStoreEmptyObjects(t *testing.T) {
 			}
 			empty(replaced)
 		}
+		deferred := ObjectID{Snapshot: 1, Kind: ObjectKindFile, Ordinal: 4}
+		for i, want := range []bool{true, false} {
+			if created, err := data.InstallEmptyDeferred(deferred); err != nil || created != want {
+				t.Fatalf("descriptor %t: installing an empty deferred object (%d): created %t, %v", descriptor, i, created, err)
+			}
+			empty(deferred)
+		}
 		full := ObjectID{Snapshot: 1, Kind: ObjectKindFile, Ordinal: 3}
 		if err := data.InstallDeferred(full, bytes.NewReader([]byte("previous")), 8); err != nil {
 			t.Fatal(err)
 		}
 		if err := data.Install(full, bytes.NewReader(nil), 0); err == nil {
 			t.Fatalf("descriptor %t: installed an empty object over a full one", descriptor)
+		}
+		if _, err := data.InstallEmptyDeferred(full); err == nil {
+			t.Fatalf("descriptor %t: found a full object an empty one", descriptor)
 		}
 		if err := data.ReplaceDeferred(full, bytes.NewReader(nil), 0); err != nil {
 			t.Fatalf("descriptor %t: replacing a full object with an empty one: %v", descriptor, err)
@@ -2520,7 +2530,7 @@ func TestLocalDataStoreEmptyObjects(t *testing.T) {
 			}
 			objects++
 			return nil
-		}); err != nil || objects != 3 {
+		}); err != nil || objects != 4 {
 			t.Fatalf("descriptor %t: %d objects, %v", descriptor, objects, err)
 		}
 		data.Close()
