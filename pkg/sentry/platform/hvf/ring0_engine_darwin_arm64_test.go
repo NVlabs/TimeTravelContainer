@@ -281,27 +281,42 @@ func TestImageMirrorsOnFirstTouch(t *testing.T) {
 }
 
 func TestIdleTrackerReportsOnceAfterActivity(t *testing.T) {
+	const mib = uint64(1 << 20)
 	start := time.Unix(1000, 0)
-	tracker := ring0IdleTracker{trimmed: true}
+	tracker := ring0IdleTracker{allocated: 100 * mib, reported: 100 * mib}
 	for i, step := range []struct {
-		entries uint64
-		active  bool
-		after   time.Duration
-		want    bool
+		entries   uint64
+		allocated uint64
+		active    bool
+		after     time.Duration
+		want      bool
 	}{
-		{entries: 0, after: 10 * time.Second}, // Nothing has run yet.
-		{entries: 5, after: 11 * time.Second}, // Activity.
-		{entries: 5, after: 12 * time.Second}, // Idle, but not long enough.
-		{entries: 5, after: 13*time.Second + time.Millisecond, want: true},
-		{entries: 5, after: 20 * time.Second},               // Already reported.
-		{entries: 5, active: true, after: 21 * time.Second}, // A long application run.
-		{entries: 5, after: 22 * time.Second},               // Idle again.
-		{entries: 5, after: 24*time.Second + time.Millisecond, want: true},
-		{entries: 3, after: 25 * time.Second}, // vCPUs retired: activity.
-		{entries: 3, after: 27*time.Second + time.Millisecond, want: true},
+		{entries: 0, allocated: 100 * mib, after: 10 * time.Second}, // Nothing has run yet.
+		{entries: 5, allocated: 110 * mib, after: 11 * time.Second}, // Activity.
+		{entries: 5, allocated: 110 * mib, after: 12 * time.Second}, // Idle, but not long enough.
+		{entries: 5, allocated: 110 * mib, after: 13*time.Second + time.Millisecond, want: true},
+		{entries: 5, allocated: 110 * mib, after: 20 * time.Second},               // Already reported.
+		{entries: 5, allocated: 110 * mib, active: true, after: 21 * time.Second}, // A long application run.
+		{entries: 5, allocated: 110 * mib, after: 22 * time.Second},               // Idle again.
+		{entries: 5, allocated: 110 * mib, after: 24*time.Second + time.Millisecond, want: true},
+		{entries: 3, allocated: 110 * mib, after: 25 * time.Second}, // vCPUs retired: activity.
+		{entries: 3, allocated: 110 * mib, after: 27*time.Second + time.Millisecond, want: true},
+		// The Sentry's own work, such as removing a branch, with no
+		// application running.
+		{entries: 3, allocated: 130 * mib, after: 28 * time.Second}, // Busy.
+		{entries: 3, allocated: 130 * mib, after: 31 * time.Second}, // Idle, but 20MiB is not worth a trim.
+		{entries: 3, allocated: 150 * mib, after: 32 * time.Second}, // Busy again: 40MiB in all.
+		{entries: 3, allocated: 150 * mib, after: 33 * time.Second}, // Idle, but not long enough.
+		{entries: 3, allocated: 150 * mib, after: 34*time.Second + time.Millisecond, want: true},
+		{entries: 3, allocated: 150 * mib, after: 40 * time.Second}, // Already reported.
+		// Allocating less than ring0IdleBusyAllocation between observations
+		// is idle, but counts toward ring0IdleTrimAllocation.
+		{entries: 3, allocated: 181 * mib, after: 41 * time.Second}, // Busy.
+		{entries: 3, allocated: 181*mib + mib/2, after: 42 * time.Second},
+		{entries: 3, allocated: 182 * mib, after: 43*time.Second + time.Millisecond, want: true},
 	} {
-		if got := tracker.observe(step.entries, step.active, start.Add(step.after)); got != step.want {
-			t.Errorf("step %d: observe(%d, %t, +%s) = %t, want %t", i, step.entries, step.active, step.after, got, step.want)
+		if got := tracker.observe(step.entries, step.allocated, step.active, start.Add(step.after)); got != step.want {
+			t.Errorf("step %d: observe(%d, %d, %t, +%s) = %t, want %t", i, step.entries, step.allocated, step.active, step.after, got, step.want)
 		}
 	}
 }

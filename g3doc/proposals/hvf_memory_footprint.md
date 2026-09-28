@@ -66,6 +66,22 @@ MiB passes through a pipe. Every `hv_vcpu_create` and `hv_vcpu_destroy` pair
 grows the process's page tables by about 13 KiB, up to a plateau of about 32
 MiB per process that never shrinks, even after `hv_vm_destroy`.
 
+Removing branches must return their memory too, since a family's branches
+share its Sentry. Take a container with gdb installed, run gdb in it, fork it
+four times, quit gdb in every branch, and remove the four forks. Without
+phases 1 to 6, the Sentry's footprint went from 633 MiB with gdb running to
+790 MiB, and did not fall. With them it left 286 MiB, down to 195 MiB only
+after two and a half minutes: the trim followed only applications, and
+removing a branch runs none. The Sentry releases the branch's kernel and
+rewrites the snapshot graph of the family's writable layer, a 9 MiB JSON
+document for which `encoding/json` grows a 16 MiB buffer, then keeps it in a
+`sync.Pool`; about 50 MiB of garbage per branch. The trim now also follows the
+Sentry's own allocation, and collects twice so that pools let go. Eight rounds
+of four forks, gdb in each, and their removal leave the Sentry at 114 to 136
+MiB four seconds after each round, from 102 MiB before the first. The page
+tables of vCPU churn are nearly all the difference: 1 MiB before the first
+round, 32 MiB after the eighth.
+
 ## Where the memory went
 
 Idle Sentry before this work, fresh start, `vmmap` dirty memory by region:
@@ -222,6 +238,10 @@ Each phase stands alone and is measured before the next.
    engine drops the Sentry mirror, as a checkpoint does, and returns all free
    Go heap to Darwin. Without the mirror, the release needs no vCPU
    rendezvous. The next application entry mirrors its working set again.
+   The Sentry's own work counts too: allocating 1 MiB between two looks, 250
+   ms apart, keeps it busy, and 32 MiB allocated since the last trim is worth
+   another, which is what removing a branch does. The trim collects twice,
+   since what a `sync.Pool` holds survives one collection.
 7. **Keep vCPUs across residencies.** Park a task's vCPU on its thread when
    the task blocks, instead of destroying it, so blocking I/O stops growing
    Hypervisor.framework's page tables and paying for vCPU creation. The

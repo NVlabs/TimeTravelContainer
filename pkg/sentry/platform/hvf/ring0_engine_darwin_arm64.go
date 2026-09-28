@@ -24,6 +24,7 @@ import (
 	"reflect"
 	"runtime"
 	"runtime/debug"
+	"runtime/metrics"
 	"sort"
 	"strings"
 	"sync"
@@ -75,9 +76,17 @@ const (
 	stateRealtimeOffsetNS       = 0x3388
 	stateGuestCritical          = 0x3390
 	applicationResidencyQuantum = time.Millisecond
-	// ring0IdleTrimDelay is how long no application may run before the
-	// engine returns the Sentry's memory to Darwin; see trimIdleMemory.
+	// ring0IdleTrimDelay is how long neither applications nor the Sentry may
+	// be busy before the engine returns the Sentry's memory to Darwin; see
+	// trimIdleMemory.
 	ring0IdleTrimDelay = 2 * time.Second
+	// ring0IdleBusyAllocation is how much the Sentry must allocate between two
+	// observations of trimIdleMemory, 250ms apart, to be busy while no
+	// application runs, as when it removes a branch.
+	ring0IdleBusyAllocation = uint64(1 << 20)
+	// ring0IdleTrimAllocation is how much the Sentry must allocate while no
+	// application runs to be worth trimming again.
+	ring0IdleTrimAllocation = uint64(32 << 20)
 )
 
 // Darwin VM tags of the host memory that the Sentry mirror may import: the
@@ -212,8 +221,10 @@ type ring0Engine struct {
 	// guestOnlyImageSlabs, sorted, are the image slabs mirrored before any EL1
 	// entry; see ring0GuestOnlyImageSlabs.
 	guestOnlyImageSlabs []uintptr
-	// idle belongs to the runtime clock updater, which calls trimIdleMemory.
-	idle ring0IdleTracker
+	// idle and heapAllocs belong to the runtime clock updater, which calls
+	// trimIdleMemory.
+	idle       ring0IdleTracker
+	heapAllocs []metrics.Sample
 	// mirrorInitialized is protected by mirrorMu. Once the initial Sentry
 	// working set is installed, refreshHostMirror can ignore host-service gates
 	// that only sampled slabs which are already present. This is essential for
@@ -323,6 +334,9 @@ func NewVMEngine(vmInterface vmm.VM, vcpus int) (vmplatform.VMEngine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("creating HVF ring0 monitor vCPU: %w", err)
 	}
+	heapAllocs := []metrics.Sample{{Name: "/gc/heap/allocs:bytes"}}
+	metrics.Read(heapAllocs)
+	heapAllocated := heapAllocs[0].Value.Uint64()
 	e := &ring0Engine{
 		vm:                  vm,
 		monitorPool:         monitorPool,
@@ -337,7 +351,8 @@ func NewVMEngine(vmInterface vmm.VM, vcpus int) (vmplatform.VMEngine, error) {
 		guestOnlyImageSlabs: guestOnlyImageSlabs,
 		nextMirrorGPA:       dynamicMirrorGPA,
 		pendingMirror:       make(map[uintptr]struct{}),
-		idle:                ring0IdleTracker{trimmed: true},
+		idle:                ring0IdleTracker{allocated: heapAllocated, reported: heapAllocated},
+		heapAllocs:          heapAllocs,
 		cpuIDs:              make([]bool, vcpus),
 		clockStop:           make(chan struct{}),
 		clockDone:           make(chan struct{}),
@@ -1845,15 +1860,19 @@ func (e *ring0Engine) runRuntimeClockUpdater() {
 	}
 }
 
-// trimIdleMemory returns the Sentry's memory to Darwin once no application
-// has run for ring0IdleTrimDelay. Darwin charges a page twice to the process
-// footprint once both the host and EL1 have touched it, and the Go runtime
-// returns free heap only gradually, keeping up to its GC goal, twice the live
-// heap. So after a burst, the Sentry's footprint stays far above what it
-// uses. Dropping the Sentry mirror removes the second charge, and lets the
-// runtime then release its free heap without a vCPU rendezvous for each
-// range. The next application entry mirrors its working set again, through
-// host gates, as after a checkpoint.
+// trimIdleMemory returns the Sentry's memory to Darwin once neither
+// applications nor the Sentry have been busy for ring0IdleTrimDelay. Darwin
+// charges a page twice to the process footprint once both the host and EL1
+// have touched it, and the Go runtime returns free heap only gradually,
+// keeping up to its GC goal, twice the live heap. So after a burst, the
+// Sentry's footprint stays far above what it uses. Dropping the Sentry mirror
+// removes the second charge, and lets the runtime then release its free heap
+// without a vCPU rendezvous for each range. The next application entry
+// mirrors its working set again, through host gates, as after a checkpoint.
+//
+// The Sentry's own work can leave as much garbage as an application's with no
+// application running: removing a branch releases its kernel, and rewrites
+// the snapshot graph of the family's writable layer.
 func (e *ring0Engine) trimIdleMemory(now time.Time) {
 	var entries uint64
 	active := false
@@ -1863,40 +1882,51 @@ func (e *ring0Engine) trimIdleMemory(now time.Time) {
 		active = active || cpu.applicationActive.Load()
 	}
 	e.unpinApplicationCPUs(cpus)
-	if !e.idle.observe(entries, active, now) {
+	metrics.Read(e.heapAllocs)
+	if !e.idle.observe(entries, e.heapAllocs[0].Value.Uint64(), active, now) {
 		return
 	}
 	if err := e.FlushHostExecutionCache(context.Background()); err != nil {
 		log.Warningf("Trimming the idle HVF Sentry mirror: %v", err)
 		return
 	}
+	// What sync.Pools hold survives a collection, and they can hold much: the
+	// buffer in which encoding/json writes a snapshot graph is 16 MiB once a
+	// container has installed gdb. So collect twice.
+	runtime.GC()
 	debug.FreeOSMemory()
 }
 
-// ring0IdleTracker decides when applications have gone idle.
+// ring0IdleTracker decides when applications and the Sentry have gone idle.
 type ring0IdleTracker struct {
-	// entries is the application entry count last observed, since when it
-	// has not changed, and trimmed is whether observe has reported idleness
-	// since then.
-	entries uint64
-	since   time.Time
-	trimmed bool
+	// entries and allocated are the application entry count and the bytes the
+	// Sentry had allocated at the last observation, and since is when either
+	// last showed activity. ran is whether an application has run since the
+	// last report, and reported is allocated at the last report.
+	entries   uint64
+	allocated uint64
+	since     time.Time
+	ran       bool
+	reported  uint64
 }
 
-// observe records the total application entry count, and whether any
-// application runs, at now. It reports true once applications that have run
-// have then been idle for ring0IdleTrimDelay.
-func (t *ring0IdleTracker) observe(entries uint64, active bool, now time.Time) bool {
+// observe records the total application entry count, the bytes the Sentry
+// has allocated, and whether any application runs, at now. It reports true
+// once neither has been busy for ring0IdleTrimDelay, if applications have run
+// or the Sentry has allocated ring0IdleTrimAllocation since the last report.
+func (t *ring0IdleTracker) observe(entries, allocated uint64, active bool, now time.Time) bool {
 	if active || entries != t.entries {
-		t.entries = entries
+		t.ran = true
 		t.since = now
-		t.trimmed = false
+	} else if allocated-t.allocated >= ring0IdleBusyAllocation {
+		t.since = now
+	}
+	t.entries, t.allocated = entries, allocated
+	if now.Sub(t.since) < ring0IdleTrimDelay || (!t.ran && allocated-t.reported < ring0IdleTrimAllocation) {
 		return false
 	}
-	if t.trimmed || now.Sub(t.since) < ring0IdleTrimDelay {
-		return false
-	}
-	t.trimmed = true
+	t.ran = false
+	t.reported = allocated
 	return true
 }
 
