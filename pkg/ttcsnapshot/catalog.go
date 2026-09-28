@@ -18,7 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
-	"sort"
+	"slices"
 	"sync"
 )
 
@@ -256,7 +256,7 @@ func ResolveImmutableCatalog(roots []ObjectID, load func(SnapshotID) ([]Object, 
 	for _, object := range all {
 		objects = append(objects, object)
 	}
-	sort.Slice(objects, func(i, j int) bool { return objects[i].ID.key() < objects[j].ID.key() })
+	slices.SortFunc(objects, func(a, b Object) int { return compareObjectIDs(a.ID, b.ID) })
 	return NewImmutableCatalog(objects)
 }
 

@@ -25,6 +25,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -586,7 +587,7 @@ func (store *SharedPackStore) forgetManifestLocked(snapshot SnapshotID) {
 
 func packedObjectByID(manifest *SnapshotManifest, id ObjectID) (PackedObject, bool) {
 	index := sort.Search(len(manifest.Objects), func(index int) bool {
-		return manifest.Objects[index].Object.ID.key() >= id.key()
+		return compareObjectIDs(manifest.Objects[index].Object.ID, id) >= 0
 	})
 	if index == len(manifest.Objects) || manifest.Objects[index].Object.ID != id {
 		return PackedObject{}, false
@@ -841,9 +842,7 @@ func (store *SharedPackStore) validateManifest(manifest *SnapshotManifest) error
 			return fmt.Errorf("shared object %s baseline has %d references, manifest records %d", object.ID, counts[object.ID.key()], object.Refs)
 		}
 	}
-	sort.Slice(manifest.Objects, func(i, j int) bool {
-		return manifest.Objects[i].Object.ID.key() < manifest.Objects[j].Object.ID.key()
-	})
+	slices.SortFunc(manifest.Objects, func(a, b PackedObject) int { return compareObjectIDs(a.Object.ID, b.Object.ID) })
 	return nil
 }
 
@@ -999,7 +998,7 @@ func (store *SharedPackStore) Compact(snapshot SnapshotID, objects []Object, ref
 		old[object.Object.ID.key()] = object
 	}
 	objects = append([]Object(nil), objects...)
-	sort.Slice(objects, func(i, j int) bool { return objects[i].ID.key() < objects[j].ID.key() })
+	slices.SortFunc(objects, func(a, b Object) int { return compareObjectIDs(a.ID, b.ID) })
 	for _, object := range objects {
 		packed, ok := old[object.ID.key()]
 		if !ok || object.ID.Snapshot != snapshot || object.State != ObjectLive || packed.Object.BulkLength != object.BulkLength {

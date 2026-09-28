@@ -2741,9 +2741,7 @@ func (s *Store) SnapshotObjects(snapshot SnapshotID) ([]Object, error) {
 			objects = append(objects, cloneObject(object))
 		}
 	}
-	sort.Slice(objects, func(i, j int) bool {
-		return objects[i].ID.key() < objects[j].ID.key()
-	})
+	slices.SortFunc(objects, func(a, b Object) int { return compareObjectIDs(a.ID, b.ID) })
 	return objects, nil
 }
 
@@ -2772,7 +2770,7 @@ func snapshotLedger(state graphState, snapshot SnapshotID) ([]Object, map[string
 			objects = append(objects, cloneObject(object))
 		}
 	}
-	sort.Slice(objects, func(i, j int) bool { return objects[i].ID.key() < objects[j].ID.key() })
+	slices.SortFunc(objects, func(a, b Object) int { return compareObjectIDs(a.ID, b.ID) })
 	references := snapshotReferences(state, snapshot)
 	counts := make(map[string]uint64, len(objects))
 	for _, parent := range objects {
@@ -3905,7 +3903,7 @@ func ReachableObjects(catalog ObjectCatalog, roots []ObjectID) ([]Object, error)
 	for _, object := range objects {
 		result = append(result, object)
 	}
-	sort.Slice(result, func(i, j int) bool { return result[i].ID.key() < result[j].ID.key() })
+	slices.SortFunc(result, func(a, b Object) int { return compareObjectIDs(a.ID, b.ID) })
 	return result, nil
 }
 
@@ -3979,7 +3977,7 @@ func (s *Store) Inspect() Inspection {
 	for _, object := range s.state.Objects {
 		result.Objects = append(result.Objects, cloneObject(object))
 	}
-	sort.Slice(result.Objects, func(i, j int) bool { return result.Objects[i].ID.key() < result.Objects[j].ID.key() })
+	slices.SortFunc(result.Objects, func(a, b Object) int { return compareObjectIDs(a.ID, b.ID) })
 	return result
 }
 
