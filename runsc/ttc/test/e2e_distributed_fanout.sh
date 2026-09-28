@@ -114,6 +114,17 @@ node_branch_count() {
 		'[.[] | select(.name == $name) | .branches[] | select(.node_id == $node)] | length'
 }
 
+# The cluster keeps its Raft log in its shared root, as the authority of its
+# latest epoch, and no node keeps one in its local root.
+authority_log_retained() {
+	authority=$SHARED/cluster/authority
+	latest=$(ls "$authority/epochs" | sort | tail -n 1)
+	test -n "$latest"
+	test -f "$authority/$latest/prepared"
+	test -f "$authority/$latest/raft/raft.db"
+	test -z "$(find "$LOCAL_BASE"/local-? -path '*/cluster/raft/raft.db' -print -quit)"
+}
+
 mkdir -p "$ROOT" "$SHARED"
 start_node a "$PORT_A"
 start_node b "$PORT_B"
@@ -229,12 +240,10 @@ client a node stop node-a --stop-all >/dev/null
 wait "$PID_A"
 PID_A=
 
-# Cleanly stopping the whole cluster must retain exactly one restart seed, not
-# delete every Raft database: the last voter's. Restart that final voter;
-# startup also exercises a fresh shared-reference-ledger reconstruction.
-test -f "$LOCAL_BASE/local-a/cluster/raft/raft.db"
-test ! -f "$LOCAL_BASE/local-b/cluster/raft/raft.db"
-test ! -f "$LOCAL_BASE/local-c/cluster/raft/raft.db"
+# Cleanly stopping the whole cluster must retain its Raft log to restart from.
+# Restart a node, which takes the authority; startup also exercises a fresh
+# shared-reference-ledger reconstruction.
+authority_log_retained
 start_node a "$PORT_A"
 test "$(client a ls --json | jq 'length')" -eq 0
 for attempt in $(seq 1 600); do
@@ -245,7 +254,7 @@ test -z "$(find "$SHARED/snapshot-packs/snapshots" -mindepth 1 -maxdepth 1 -type
 client a node stop node-a --stop-all >/dev/null
 wait "$PID_A"
 PID_A=
-test -f "$LOCAL_BASE/local-a/cluster/raft/raft.db"
+authority_log_retained
 
 SUCCESS=1
 echo "TTC $COUNT-branch distributed fanout and retirement lifecycle passed"
