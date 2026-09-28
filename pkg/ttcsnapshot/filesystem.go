@@ -430,8 +430,8 @@ func buildFilesystemMutationBatched(store *Store, origin SnapshotID, rootName st
 		if !ok || object.ID.Kind != ObjectKindInode {
 			return InodeRecord{}, fmt.Errorf("inode object %s is unavailable", id)
 		}
-		var inode InodeRecord
-		if err := json.Unmarshal(object.Data, &inode); err != nil {
+		inode, err := decodeInodeRecord(object.Data)
+		if err != nil {
 			return InodeRecord{}, err
 		}
 		return inode, nil
@@ -1033,8 +1033,8 @@ func (s *Store) ExclusiveFile(rootName string, number uint64) (ObjectID, bool, e
 	if !ok || inodeID.Kind != ObjectKindInode {
 		return ObjectID{}, false, nil
 	}
-	var inode InodeRecord
-	if err := json.Unmarshal(inodeObject.Data, &inode); err != nil {
+	inode, err := decodeInodeRecord(inodeObject.Data)
+	if err != nil {
 		return ObjectID{}, false, err
 	}
 	if inode.File.IsZero() {
@@ -1105,8 +1105,8 @@ func filesystemInodeObjects(rootID ObjectID, number uint64, objectFor func(Objec
 	if !exists || object.ID.Kind != ObjectKindInode {
 		return InodeRecord{}, false, errors.New("inode tree references non-inode object")
 	}
-	var inode InodeRecord
-	if err := json.Unmarshal(object.Data, &inode); err != nil {
+	inode, err := decodeInodeRecord(object.Data)
+	if err != nil {
 		return InodeRecord{}, false, err
 	}
 	return inode, true, nil
@@ -1157,11 +1157,11 @@ func filesystemLookupObjects(rootID ObjectID, parent uint64, name string, object
 		return DirectoryEntryRecord{}, ok, err
 	}
 	object, exists := objectFor(id)
-	var entry DirectoryEntryRecord
 	if !exists || object.ID.Kind != ObjectKindMetadata {
-		return entry, false, errors.New("directory tree references non-metadata object")
+		return DirectoryEntryRecord{}, false, errors.New("directory tree references non-metadata object")
 	}
-	if err := json.Unmarshal(object.Data, &entry); err != nil {
+	entry, err := decodeDirectoryEntryRecord(object.Data)
+	if err != nil {
 		return entry, false, err
 	}
 	return entry, true, nil
@@ -1231,8 +1231,8 @@ func filesystemDirectoryObjects(rootID ObjectID, parent uint64, objectFor func(O
 			if !ok || value.ID.Kind != ObjectKindMetadata {
 				return fmt.Errorf("directory tree references missing or invalid object %s", node.children[index].key())
 			}
-			var entry DirectoryEntryRecord
-			if err := json.Unmarshal(value.Data, &entry); err != nil {
+			entry, err := decodeDirectoryEntryRecord(value.Data)
+			if err != nil {
 				return err
 			}
 			result = append(result, entry)
@@ -1288,8 +1288,8 @@ func filesystemRecordsObjects(rootID ObjectID, objectFor func(ObjectID) (Object,
 		if !ok || object.ID.Kind != ObjectKindInode {
 			return nil, nil, fmt.Errorf("inode tree references missing or invalid object %s", id.key())
 		}
-		var inode InodeRecord
-		if err := json.Unmarshal(object.Data, &inode); err != nil {
+		inode, err := decodeInodeRecord(object.Data)
+		if err != nil {
 			return nil, nil, err
 		}
 		inodes = append(inodes, inode)
@@ -1305,8 +1305,8 @@ func filesystemRecordsObjects(rootID ObjectID, objectFor func(ObjectID) (Object,
 			if !ok || entryObject.ID.Kind != ObjectKindMetadata {
 				return nil, nil, fmt.Errorf("directory tree references missing or invalid object %s", entryID.key())
 			}
-			var entry DirectoryEntryRecord
-			if err := json.Unmarshal(entryObject.Data, &entry); err != nil {
+			entry, err := decodeDirectoryEntryRecord(entryObject.Data)
+			if err != nil {
 				return nil, nil, err
 			}
 			entries = append(entries, entry)

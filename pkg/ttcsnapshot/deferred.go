@@ -15,7 +15,6 @@
 package ttcsnapshot
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -125,8 +124,8 @@ func translateDeferredFilesystemData(source Object, children map[string]ObjectID
 	if source.ID.Kind != ObjectKindInode {
 		return data, nil
 	}
-	var inode InodeRecord
-	if err := json.Unmarshal(data, &inode); err != nil {
+	inode, err := decodeInodeRecord(data)
+	if err != nil {
 		return nil, err
 	}
 	translate := func(id ObjectID) (ObjectID, error) {
@@ -139,7 +138,6 @@ func translateDeferredFilesystemData(source Object, children map[string]ObjectID
 		}
 		return mapped, nil
 	}
-	var err error
 	if inode.File, err = translate(inode.File); err != nil {
 		return nil, err
 	}

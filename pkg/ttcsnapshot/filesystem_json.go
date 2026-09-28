@@ -96,6 +96,22 @@ func (r InodeRecord) MarshalJSON() ([]byte, error) {
 	return json.Marshal(encoded)
 }
 
+// decodeInodeRecord decodes an inode object's record. json.Unmarshal would
+// scan the record twice before this type's UnmarshalJSON scans it twice
+// again: a third of the time of walking a lazily imported tree.
+func decodeInodeRecord(data []byte) (InodeRecord, error) {
+	var inode InodeRecord
+	err := inode.UnmarshalJSON(data)
+	return inode, err
+}
+
+// decodeDirectoryEntryRecord is decodeInodeRecord for a directory entry.
+func decodeDirectoryEntryRecord(data []byte) (DirectoryEntryRecord, error) {
+	var entry DirectoryEntryRecord
+	err := entry.UnmarshalJSON(data)
+	return entry, err
+}
+
 // UnmarshalJSON implements json.Unmarshaler.
 func (r *InodeRecord) UnmarshalJSON(data []byte) error {
 	var decoded inodeRecordJSON
