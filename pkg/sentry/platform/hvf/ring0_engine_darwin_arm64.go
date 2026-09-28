@@ -706,6 +706,16 @@ func (e *ring0Engine) entryBlocked(addressSpaceID uint64) bool {
 // EL0, so it can execute the monitor command directly without a worker handoff
 // or another owner qualification. The next application entry reloads all
 // Linux registers from the shared state page.
+//
+// Only a residency uses the vCPU this way, not a parked vCPU: that serves the
+// thread's next residency, and the thread may retire it at any libc call. A
+// task parks its vCPU before handling a fault that may block, and then moves
+// between threads like any goroutine.
+//
+// Preconditions: the calling goroutine is locked to its thread until it
+// releases the vCPU. Otherwise it could move to another thread, from which
+// Hypervisor.framework rejects the vCPU, and a residency on the thread it
+// left could take the vCPU meanwhile.
 func (e *ring0Engine) pinCurrentIdleApplicationCPU() *ring0ApplicationCPU {
 	value, ok := e.cpusByTID.Load(hosttid.Current())
 	if !ok {
@@ -715,7 +725,7 @@ func (e *ring0Engine) pinCurrentIdleApplicationCPU() *ring0ApplicationCPU {
 	if !cpu.tryPin() {
 		return nil
 	}
-	if e.closed.Load() || cpu.retiring.Load() || cpu.applicationActive.Load() || cpu.entryActive.Load() || cpu.bridge.inGuest() || cpu.bridge.destroyed() {
+	if e.closed.Load() || cpu.parked.Load() || cpu.retiring.Load() || cpu.applicationActive.Load() || cpu.entryActive.Load() || cpu.bridge.inGuest() || cpu.bridge.destroyed() {
 		e.releaseApplicationCPU(cpu)
 		return nil
 	}
@@ -738,14 +748,19 @@ func (e *ring0Engine) runMonitorCommand(ctx context.Context, encoded []byte) ([]
 		}
 	}
 	var response []byte
+	// Keep the goroutine on the thread whose vCPU it may use; see
+	// pinCurrentIdleApplicationCPU. A residency's is locked to it already.
+	runtime.LockOSThread()
 	if cpu := e.pinCurrentIdleApplicationCPU(); cpu != nil {
 		var err error
 		response, err = cpu.vcpu.RunMonitor(ctx, encoded)
 		e.releaseApplicationCPU(cpu)
+		runtime.UnlockOSThread()
 		if err != nil {
 			return nil, err
 		}
 	} else {
+		runtime.UnlockOSThread()
 		value, err := e.monitorPool.Do(ctx, func(ctx context.Context, vcpu vmm.VCPU) (any, error) {
 			return vcpu.RunMonitor(ctx, encoded)
 		})
@@ -2186,8 +2201,8 @@ func (e *ring0Engine) ShouldYieldApplicationResidency() bool {
 	if e.applicationWaiters.Load() == 0 {
 		return false
 	}
-	// residentSince is immutable once the CPU is published, so this runs on
-	// every syscall exit under contention without taking cpuMu.
+	// residentSince changes only when this thread unparks the vCPU, so this
+	// runs on every syscall exit under contention without taking cpuMu.
 	cached, ok := e.cpusByTID.Load(hosttid.Current())
 	return ok && time.Since(cached.(*ring0ApplicationCPU).residentSince) >= applicationResidencyQuantum
 }

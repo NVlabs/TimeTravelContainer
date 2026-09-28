@@ -326,3 +326,63 @@ func TestThreadExitRetiresParkedVCPU(t *testing.T) {
 	}
 	p.close(t)
 }
+
+func TestMonitorCommandLeavesParkedVCPU(t *testing.T) {
+	p := newParkingTestEngine(t, 2)
+	command, err := monitorabi.MarshalCommand(monitorabi.Command{
+		Sequence:       1,
+		Opcode:         monitorabi.OpcodeApply,
+		AddressSpaceID: p.spaceID,
+		Operations: []monitorabi.Operation{{
+			Type:   monitorabi.OperationMap,
+			Access: monitorabi.AccessRead,
+			VA:     p.codeVA + vmm.LogicalPageSize,
+			GPA:    GuestRAMIPAStart + vmm.LogicalPageSize,
+			Length: vmm.LogicalPageSize,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		if err := p.residency(); err != nil {
+			result <- err
+			return
+		}
+		// A task parks its vCPU before it handles a fault that may block,
+		// and then changes its page tables from whichever thread it runs on.
+		// That thread's parked vCPU must not serve the change: the task may
+		// have found it before moving to another thread, from which
+		// Hypervisor.framework rejects the vCPU.
+		if cpu := p.engine.pinCurrentIdleApplicationCPU(); cpu != nil {
+			p.engine.releaseApplicationCPU(cpu)
+			result <- fmt.Errorf("a goroutine outside a residency took its thread's parked vCPU %d", cpu.vcpu.id)
+			return
+		}
+		responseBytes, err := p.engine.RunMonitor(context.Background(), command)
+		if err != nil {
+			result <- fmt.Errorf("changing page tables with the thread's vCPU parked: %w", err)
+			return
+		}
+		if response, err := monitorabi.UnmarshalResponse(responseBytes); err != nil || response.Status != monitorabi.StatusOK {
+			result <- fmt.Errorf("monitor response=%+v err=%v", response, err)
+			return
+		}
+		if live, parked := p.counts(); live != 1 || parked != 1 {
+			result <- fmt.Errorf("after the page-table change: %d vCPUs, %d parked, want the vCPU parked", live, parked)
+			return
+		}
+		// The thread's next residency takes the vCPU.
+		result <- p.residency()
+	}()
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	if created, reused := p.engine.vcpusCreated.Load(), p.engine.vcpusReused.Load(); created != 1 || reused != 1 {
+		t.Errorf("two residencies on one thread created %d vCPUs and reused %d, want 1 and 1", created, reused)
+	}
+	p.close(t)
+}

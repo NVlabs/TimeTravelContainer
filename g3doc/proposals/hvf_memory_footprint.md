@@ -253,7 +253,10 @@ Each phase stands alone and is measured before the next.
    since what a `sync.Pool` holds survives one collection.
 7. **Keep vCPUs across residencies (done).** When a residency ends, the thread
    keeps its vCPU, parked, and the next residency on the thread, of any task,
-   takes it. Nearly every vCPU the engine created had been on a thread whose
+   takes it, and only a residency: a goroutine outside one, such as a task
+   that parked its vCPU to handle a fault that may block, sends page-table
+   changes to the monitor's pool, since it may move to another thread
+   meanwhile. Nearly every vCPU the engine created had been on a thread whose
    residency ended moments before; the workloads above ran on 7 to 21 threads.
    A parked vCPU holds a vCPU ID, and the epoch rollover must destroy every
    vCPU before it can destroy the VM, so the engine must be able to retire one
