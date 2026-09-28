@@ -1750,8 +1750,11 @@ func (r *Repository) recoverGraphState() error {
 		}
 		// Recovery has already paid the cost of replaying the selected WAL. Seal
 		// that work into a compact generation before making the repository
-		// available, otherwise every daemon/Sentry reopen repeats the same replay.
-		if r.graph.JournalBytes() >= reclaimJournalBytes {
+		// available, otherwise every daemon/Sentry reopen repeats the same replay;
+		// but only once the journal has outgrown the last checkpoint, as at other
+		// boundaries. A new generation costs in proportion to the whole graph,
+		// here and again in a runtime holding the repository, which reloads it.
+		if r.graph.CheckpointDue(reclaimJournalBytes) {
 			if err := r.graph.CheckpointExternallyCoordinated(); err != nil {
 				return fmt.Errorf("compacting recovered repository journal: %w", err)
 			}
