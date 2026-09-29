@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -1145,7 +1146,33 @@ func (ledger *ReferenceLedger) Close() error {
 }
 
 func edgeReferenceName(parent ObjectID, slot uint16) string {
-	return fmt.Sprintf("edge/%s/%04x", parent.key(), slot)
+	const digits = "0123456789abcdef"
+	name := make([]byte, 0, len("edge/")+36+5)
+	name = append(name, "edge/"...)
+	name = append(name, parent.key()...)
+	return string(append(name, '/', digits[slot>>12], digits[slot>>8&15], digits[slot>>4&15], digits[slot&15]))
+}
+
+// parseEdgeReferenceName returns the parent and slot of the edge that name,
+// as edgeReferenceName writes it, names.
+func parseEdgeReferenceName(name string) (ObjectID, uint16, bool) {
+	rest, ok := strings.CutPrefix(name, "edge/")
+	if !ok {
+		return ObjectID{}, 0, false
+	}
+	key, slotText, ok := strings.Cut(rest, "/")
+	if !ok {
+		return ObjectID{}, 0, false
+	}
+	parent, err := parseObjectKey(key)
+	if err != nil {
+		return ObjectID{}, 0, false
+	}
+	slot, err := strconv.ParseUint(slotText, 16, 16)
+	if err != nil || edgeReferenceName(parent, uint16(slot)) != name {
+		return ObjectID{}, 0, false
+	}
+	return parent, uint16(slot), true
 }
 
 func edgeOperationName(parent ObjectID, slot uint16, retain bool) string {
@@ -1310,14 +1337,30 @@ func (state *referenceLedgerState) importOrigin(origin SnapshotID, objects []Obj
 		}
 		state.putObject(object.ID.key(), object)
 	}
+	// An edge of the import may replace a named reference bridging it, which
+	// only the parents named by one can have: naming each edge to look for
+	// one named 300,000 edges for a branch of 100,000 files.
+	bridgedParents := make(map[ObjectID]struct{})
+	for name := range state.References {
+		if parent, _, ok := parseEdgeReferenceName(name); ok {
+			bridgedParents[parent] = struct{}{}
+		}
+	}
 	for _, input := range objects {
 		parent := state.Objects[input.ID.key()]
+		_, parentBridged := bridgedParents[parent.ID]
 		for _, edge := range parent.Children {
-			if state.owns(edge.Child) {
-				child, ok := state.Objects[edge.Child.key()]
-				if !ok || child.State != ObjectLive || child.Refs == math.MaxUint64 {
-					return fmt.Errorf("object %s references unavailable owned child %s", parent.ID, edge.Child)
+			if !state.owns(edge.Child) {
+				if err := state.enqueue(parent.ID, edge, true); err != nil {
+					return err
 				}
+				continue
+			}
+			child, ok := state.Objects[edge.Child.key()]
+			if !ok || child.State != ObjectLive || child.Refs == math.MaxUint64 {
+				return fmt.Errorf("object %s references unavailable owned child %s", parent.ID, edge.Child)
+			}
+			if parentBridged {
 				bridge := edgeReferenceName(parent.ID, edge.Slot)
 				if bridged, ok := state.References[bridge]; ok {
 					if bridged != edge.Child {
@@ -1326,35 +1369,46 @@ func (state *referenceLedgerState) importOrigin(origin SnapshotID, objects []Obj
 					// Replace the external named reference with the now-internal
 					// structural edge. The child's count is unchanged.
 					state.deleteReference(bridge)
-				} else {
-					child.Refs++
-					state.putObject(edge.Child.key(), child)
+					continue
 				}
-			} else if err := state.enqueue(parent.ID, edge, true); err != nil {
-				return err
 			}
+			child.Refs++
+			state.putObject(edge.Child.key(), child)
 		}
 	}
-	internalIncoming := make(map[string]ObjectID)
 	for _, parent := range state.Objects {
-		if !state.owns(parent.ID) {
+		if parent.ID.Snapshot == origin || !state.owns(parent.ID) {
 			continue
 		}
 		for _, edge := range parent.Children {
 			if edge.Child.Snapshot == origin {
-				name := edgeReferenceName(parent.ID, edge.Slot)
-				internalIncoming[name] = edge.Child
-				if parent.ID.Snapshot != origin {
-					child, ok := state.Objects[edge.Child.key()]
-					if !ok || child.Refs == math.MaxUint64 {
-						return fmt.Errorf("owned parent %s references unavailable imported child %s", parent.ID, edge.Child)
-					}
-					child.State = ObjectLive
-					child.Refs++
-					state.putObject(edge.Child.key(), child)
+				child, ok := state.Objects[edge.Child.key()]
+				if !ok || child.Refs == math.MaxUint64 {
+					return fmt.Errorf("owned parent %s references unavailable imported child %s", parent.ID, edge.Child)
 				}
+				child.State = ObjectLive
+				child.Refs++
+				state.putObject(edge.Child.key(), child)
 			}
 		}
+	}
+	// internalIncoming returns the imported object an owned parent's edge
+	// that name names selects.
+	internalIncoming := func(name string) (ObjectID, bool) {
+		id, slot, ok := parseEdgeReferenceName(name)
+		if !ok || !state.owns(id) {
+			return ObjectID{}, false
+		}
+		parent, ok := state.Objects[id.key()]
+		if !ok {
+			return ObjectID{}, false
+		}
+		for _, edge := range parent.Children {
+			if edge.Slot == slot && edge.Child.Snapshot == origin {
+				return edge.Child, true
+			}
+		}
+		return ObjectID{}, false
 	}
 	names := make([]string, 0, len(references))
 	for name := range references {
@@ -1366,7 +1420,7 @@ func (state *referenceLedgerState) importOrigin(origin SnapshotID, objects []Obj
 		if strings.HasPrefix(name, "root/bridge/edge/") {
 			effectiveName = strings.TrimPrefix(name, "root/bridge/")
 		}
-		if internal, ok := internalIncoming[effectiveName]; ok {
+		if internal, ok := internalIncoming(effectiveName); ok {
 			if references[name] != internal {
 				return fmt.Errorf("incoming edge baseline %q selects %s, want %s", effectiveName, references[name], internal)
 			}

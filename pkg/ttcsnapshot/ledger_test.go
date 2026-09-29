@@ -1675,3 +1675,30 @@ func TestEncodeReferenceLedgerCheckpoint(t *testing.T) {
 		}
 	}
 }
+
+// An edge's reference name parses back to its parent and slot; no other
+// name does.
+func TestEdgeReferenceNames(t *testing.T) {
+	random := rand.New(rand.NewSource(10))
+	for round := 0; round < 1000; round++ {
+		parent := ObjectID{Snapshot: SnapshotID(1 + random.Uint64()%1000), Kind: ObjectKindMetadata, Ordinal: 1 + random.Uint64()}
+		slot := uint16(random.Intn(1 << 16))
+		name := edgeReferenceName(parent, slot)
+		if name != fmt.Sprintf("edge/%s/%04x", parent.key(), slot) {
+			t.Fatalf("edge %s/%d is named %q", parent, slot, name)
+		}
+		if gotParent, gotSlot, ok := parseEdgeReferenceName(name); !ok || gotParent != parent || gotSlot != slot {
+			t.Fatalf("%q parses to %s/%d (%t), want %s/%d", name, gotParent, gotSlot, ok, parent, slot)
+		}
+	}
+	key := ObjectID{Snapshot: 1, Kind: ObjectKindMetadata, Ordinal: 2}.key()
+	for _, name := range []string{
+		"", "edge/", "edge/" + key, "edge/" + key + "/", "edge/" + key + "/00a", "edge/" + key + "/000A",
+		"edge/" + key + "/00001", "edge/" + key + "/000a/", "root/" + key + "/000a", "edge/x/000a",
+		"edge/" + key + "0/000a",
+	} {
+		if _, _, ok := parseEdgeReferenceName(name); ok {
+			t.Fatalf("%q parsed as an edge's name", name)
+		}
+	}
+}
