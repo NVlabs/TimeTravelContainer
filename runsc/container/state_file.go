@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package container
 
 import (
@@ -98,7 +101,7 @@ func Load(rootDir string, id FullID, opts LoadOpts) (*Container, error) {
 			// Preserve error so that callers can distinguish 'not found' errors.
 			return nil, err
 		}
-		return nil, fmt.Errorf("reading container metadata file %q: %v", state.statePath(), err)
+		return nil, fmt.Errorf("reading container metadata file %q: %w", state.statePath(), err)
 	}
 	c.Sandbox.SetRootDir(rootDir)
 
