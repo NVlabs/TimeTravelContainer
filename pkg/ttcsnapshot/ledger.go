@@ -795,7 +795,13 @@ func (ledger *ReferenceLedger) journalLocked(record referenceLedgerRecord) error
 	if err != nil {
 		return err
 	}
-	err = writeFull(ledger.journal, encoded)
+	return ledger.appendLocked(encoded, record.Sequence)
+}
+
+// appendLocked durably appends encoded, the record of sequence, to the
+// journal.
+func (ledger *ReferenceLedger) appendLocked(encoded []byte, sequence uint64) error {
+	err := writeFull(ledger.journal, encoded)
 	if err == nil {
 		err = ledger.journal.Sync()
 	}
@@ -803,7 +809,7 @@ func (ledger *ReferenceLedger) journalLocked(record referenceLedgerRecord) error
 		ledger.poisoned = err
 		return err
 	}
-	ledger.sequence = record.Sequence
+	ledger.sequence = sequence
 	return nil
 }
 
@@ -839,9 +845,23 @@ func (ledger *ReferenceLedger) journalChunkedImportLocked(origin SnapshotID, obj
 	for _, name := range names {
 		named = append(named, ledgerNamedReference{Name: name, Object: references[name]})
 	}
-	records := []referenceLedgerRecord{{ImportBegin: &ledgerImportBeginRecord{
+	// Each record is encoded once, with the sequence it takes: they are
+	// journaled in the order they are made.
+	var encoded [][]byte
+	encode := func(record referenceLedgerRecord) ([]byte, error) {
+		if uint64(len(encoded)) >= math.MaxUint64-ledger.sequence {
+			return nil, errors.New("reference ledger sequence exhausted")
+		}
+		record.Sequence = ledger.sequence + uint64(len(encoded)) + 1
+		return encodeReferenceLedgerRecord(record)
+	}
+	begin, err := encode(referenceLedgerRecord{ImportBegin: &ledgerImportBeginRecord{
 		Origin: origin, Objects: uint64(len(objects)), References: uint64(len(named)),
-	}}}
+	}})
+	if err != nil {
+		return err
+	}
+	encoded = append(encoded, begin)
 	appendBatches := func(total int, makeRecord func(offset, end int) referenceLedgerRecord) error {
 		for offset := 0; offset < total; {
 			end := offset + 256
@@ -849,12 +869,9 @@ func (ledger *ReferenceLedger) journalChunkedImportLocked(origin SnapshotID, obj
 				end = total
 			}
 			for {
-				record := makeRecord(offset, end)
-				// MaxUint64 has the widest JSON representation of Sequence, so
-				// a record that fits this preview also fits its real sequence.
-				record.Sequence = math.MaxUint64
-				if _, err := encodeReferenceLedgerRecord(record); err == nil {
-					records = append(records, record)
+				data, err := encode(makeRecord(offset, end))
+				if err == nil {
+					encoded = append(encoded, data)
 					offset = end
 					break
 				} else if end-offset == 1 {
@@ -879,21 +896,8 @@ func (ledger *ReferenceLedger) journalChunkedImportLocked(origin SnapshotID, obj
 	}); err != nil {
 		return err
 	}
-	commit := referenceLedgerRecord{ImportCommit: &ledgerImportCommitRecord{Origin: origin}}
-	if uint64(len(records))+1 > math.MaxUint64-ledger.sequence {
-		return errors.New("reference ledger sequence exhausted")
-	}
-	encoded := make([][]byte, 0, len(records)+1)
-	for index := range records {
-		records[index].Sequence = ledger.sequence + uint64(index) + 1
-		data, err := encodeReferenceLedgerRecord(records[index])
-		if err != nil {
-			return err
-		}
-		encoded = append(encoded, data)
-	}
-	commit.Sequence = ledger.sequence + uint64(len(records)) + 1
-	commitData, err := encodeReferenceLedgerRecord(commit)
+	commitSequence := ledger.sequence + uint64(len(encoded)) + 1
+	commitData, err := encode(referenceLedgerRecord{ImportCommit: &ledgerImportCommitRecord{Origin: origin}})
 	if err != nil {
 		return err
 	}
@@ -915,7 +919,7 @@ func (ledger *ReferenceLedger) journalChunkedImportLocked(origin SnapshotID, obj
 		ledger.poisoned = err
 		return err
 	}
-	ledger.sequence = commit.Sequence
+	ledger.sequence = commitSequence
 	return nil
 }
 
@@ -1204,13 +1208,7 @@ func (ledger *ReferenceLedger) importLocked(origin SnapshotID, objects []Object,
 	ledger.state.begin()
 	err := ledger.state.importOrigin(origin, objects, references)
 	if err == nil && ledger.journal != nil {
-		record := referenceLedgerRecord{Import: &ledgerImportRecord{Origin: origin, Objects: objects, References: references}}
-		record.Sequence = ledger.sequence + 1
-		if _, encodeErr := encodeReferenceLedgerRecord(record); encodeErr == nil {
-			err = ledger.journalLocked(record)
-		} else {
-			err = ledger.journalChunkedImportLocked(origin, objects, references)
-		}
+		err = ledger.journalImportLocked(origin, objects, references)
 	}
 	if err != nil {
 		ledger.state.rollback()
@@ -1218,6 +1216,34 @@ func (ledger *ReferenceLedger) importLocked(origin SnapshotID, objects []Object,
 	}
 	ledger.state.commit()
 	return nil
+}
+
+// minimalObjectJSON is the length of the shortest object encoding/json
+// writes.
+var minimalObjectJSON = func() int {
+	data, err := json.Marshal(Object{})
+	if err != nil {
+		panic(err)
+	}
+	return len(data)
+}()
+
+// journalImportLocked journals an import in one record or, if it is too
+// large for one, in a chunked sequence. An import of more objects than a
+// record holds at their shortest is not encoded whole first, only to be found
+// too large: that took 0.5 s for 300,000 objects.
+func (ledger *ReferenceLedger) journalImportLocked(origin SnapshotID, objects []Object, references map[string]ObjectID) error {
+	if ledger.sequence == math.MaxUint64 {
+		return errors.New("reference ledger sequence exhausted")
+	}
+	if len(objects) <= maxReferenceLedgerRecord/minimalObjectJSON {
+		record := referenceLedgerRecord{Import: &ledgerImportRecord{Origin: origin, Objects: objects, References: references}}
+		record.Sequence = ledger.sequence + 1
+		if encoded, err := encodeReferenceLedgerRecord(record); err == nil {
+			return ledger.appendLocked(encoded, record.Sequence)
+		}
+	}
+	return ledger.journalChunkedImportLocked(origin, objects, references)
 }
 
 func (state *referenceLedgerState) importOrigin(origin SnapshotID, objects []Object, references map[string]ObjectID) error {

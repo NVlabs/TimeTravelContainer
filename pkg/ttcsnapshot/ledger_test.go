@@ -398,6 +398,43 @@ func TestReferenceLedgerLargeImportIsBoundedAtomicAndDurable(t *testing.T) {
 	}
 }
 
+// An import of more objects than a record holds at their shortest goes to
+// the journal in chunks, which replay.
+func TestReferenceLedgerImportOfManyObjectsIsChunked(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "ledger")
+	objects := make([]Object, maxReferenceLedgerRecord/minimalObjectJSON+1)
+	references := make(map[string]ObjectID, len(objects))
+	for index := range objects {
+		objects[index] = ledgerObject(73, uint64(index+1), ObjectKindMetadata)
+		references[fmt.Sprintf("root/many/%d", index)] = objects[index].ID
+	}
+	ledger, err := OpenReferenceLedger(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.ImportOrigin(73, objects, references); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(directory, "ledger.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if frames := len(referenceLedgerFrameOffsets(t, data)) - 1; frames < 4 {
+		t.Fatalf("the import used %d frames, want begin, payload, and commit", frames)
+	}
+	reopened, err := OpenReferenceLedger(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got := len(reopened.Inspect().Objects); got != len(objects) {
+		t.Fatalf("replayed objects=%d, want %d", got, len(objects))
+	}
+}
+
 func TestReferenceLedgerIncompleteLargeImportRollsBack(t *testing.T) {
 	source := filepath.Join(t.TempDir(), "source")
 	objects, references := largeLedgerImport(t, 72)
