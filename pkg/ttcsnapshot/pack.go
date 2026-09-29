@@ -856,8 +856,10 @@ func (store *SharedPackStore) validateManifest(manifest *SnapshotManifest) error
 			return err
 		}
 	}
-	seen := make(map[string]struct{}, len(manifest.Objects))
-	objects := make(map[string]Object, len(manifest.Objects))
+	// The objects' references, recorded and found, by ID rather than by key:
+	// keys were 2 million strings for a manifest of 300,000 objects.
+	type references struct{ recorded, found uint64 }
+	objects := make(map[ObjectID]references, len(manifest.Objects))
 	for _, packed := range manifest.Objects {
 		if err := validateObject(packed.Object); err != nil {
 			return err
@@ -865,11 +867,10 @@ func (store *SharedPackStore) validateManifest(manifest *SnapshotManifest) error
 		if packed.Object.ID.Snapshot != manifest.Snapshot {
 			return fmt.Errorf("object %s is in the wrong snapshot manifest", packed.Object.ID.key())
 		}
-		if _, exists := seen[packed.Object.ID.key()]; exists {
+		if _, exists := objects[packed.Object.ID]; exists {
 			return fmt.Errorf("shared manifest repeats object %s", packed.Object.ID.key())
 		}
-		seen[packed.Object.ID.key()] = struct{}{}
-		objects[packed.Object.ID.key()] = packed.Object
+		objects[packed.Object.ID] = references{recorded: packed.Object.Refs}
 		var length uint64
 		for _, extent := range packed.Extents {
 			pack, ok := packs[extent.Pack]
@@ -890,27 +891,30 @@ func (store *SharedPackStore) validateManifest(manifest *SnapshotManifest) error
 		if object.Snapshot != manifest.Snapshot {
 			return fmt.Errorf("shared manifest reference %q selects foreign object %s", name, object)
 		}
-		if _, ok := objects[object.key()]; !ok {
+		if _, ok := objects[object]; !ok {
 			return fmt.Errorf("shared manifest reference %q selects absent object %s", name, object)
 		}
 	}
-	counts := make(map[string]uint64, len(objects))
 	for _, packed := range manifest.Objects {
 		for _, edge := range packed.Object.Children {
 			if edge.Child.Snapshot == manifest.Snapshot {
-				if _, ok := objects[edge.Child.key()]; !ok {
+				counted, ok := objects[edge.Child]
+				if !ok {
 					return fmt.Errorf("shared object %s selects absent same-origin child %s", packed.Object.ID, edge.Child)
 				}
-				counts[edge.Child.key()]++
+				counted.found++
+				objects[edge.Child] = counted
 			}
 		}
 	}
 	for _, object := range manifest.References {
-		counts[object.key()]++
+		counted := objects[object]
+		counted.found++
+		objects[object] = counted
 	}
-	for _, object := range objects {
-		if counts[object.ID.key()] != object.Refs {
-			return fmt.Errorf("shared object %s baseline has %d references, manifest records %d", object.ID, counts[object.ID.key()], object.Refs)
+	for id, counted := range objects {
+		if counted.found != counted.recorded {
+			return fmt.Errorf("shared object %s baseline has %d references, manifest records %d", id, counted.found, counted.recorded)
 		}
 	}
 	slices.SortFunc(manifest.Objects, func(a, b PackedObject) int { return compareObjectIDs(a.Object.ID, b.Object.ID) })

@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 )
@@ -959,4 +960,76 @@ func TestSharedPackManifestCacheIsBounded(t *testing.T) {
 	read(b)
 	read(a)
 	cached(a, b)
+}
+
+// validateManifest takes a consistent manifest in any order, and sorts it;
+// it refuses each inconsistency.
+func TestValidateManifest(t *testing.T) {
+	store, err := OpenSharedPackStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const snapshot = SnapshotID(3)
+	directory := store.snapshotDirectory(snapshot)
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	pack, err := os.Create(filepath.Join(directory, packName(0)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writePackHeader(pack, snapshot, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := pack.Truncate(2 * sharedPackAlignment); err != nil {
+		t.Fatal(err)
+	}
+	pack.Close()
+	root := ObjectID{Snapshot: snapshot, Kind: ObjectKindMetadata, Ordinal: 1}
+	inode := ObjectID{Snapshot: snapshot, Kind: ObjectKindInode, Ordinal: 2}
+	file := ObjectID{Snapshot: snapshot, Kind: ObjectKindFile, Ordinal: 3}
+	foreign := ObjectID{Snapshot: snapshot + 1, Kind: ObjectKindFile, Ordinal: 3}
+	consistent := func() SnapshotManifest {
+		return SnapshotManifest{
+			Version: sharedPackVersion, Snapshot: snapshot,
+			Packs: []PackInfo{{Number: 0, Size: 2 * sharedPackAlignment}},
+			Objects: []PackedObject{
+				{Object: Object{ID: file, State: ObjectLive, Refs: 1, BulkLength: 10}, Extents: []PackExtent{{Pack: 0, Offset: sharedPackAlignment, Length: 10}}},
+				{Object: Object{ID: inode, State: ObjectLive, Refs: 1, Children: []Edge{{Slot: 0, Child: file}, {Slot: 1, Child: foreign}}}},
+				{Object: Object{ID: root, State: ObjectLive, Refs: 2, Children: []Edge{{Slot: 0, Child: inode}}}},
+			},
+			References: map[string]ObjectID{"filesystem/main": root, "pin/main": root},
+		}
+	}
+	byID := func(a, b PackedObject) int { return compareObjectIDs(a.Object.ID, b.Object.ID) }
+	manifest := consistent()
+	slices.SortFunc(manifest.Objects, func(a, b PackedObject) int { return byID(b, a) })
+	if err := store.validateManifest(&manifest); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.IsSortedFunc(manifest.Objects, byID) {
+		t.Fatalf("the manifest's objects are not sorted: %+v", manifest.Objects)
+	}
+	for name, corrupt := range map[string]func(*SnapshotManifest){
+		"repeated object": func(m *SnapshotManifest) { m.Objects = append(m.Objects, m.Objects[0]) },
+		"foreign object": func(m *SnapshotManifest) {
+			m.Objects[0].Object.ID = foreign
+			m.Objects[1].Object.Children = m.Objects[1].Object.Children[1:]
+		},
+		"absent child":        func(m *SnapshotManifest) { m.Objects = m.Objects[1:] },
+		"too few references":  func(m *SnapshotManifest) { m.Objects[2].Object.Refs = 3 },
+		"too many references": func(m *SnapshotManifest) { m.Objects[2].Object.Refs = 1 },
+		"absent reference": func(m *SnapshotManifest) {
+			m.References["pin/main"] = ObjectID{Snapshot: snapshot, Kind: ObjectKindMetadata, Ordinal: 9}
+		},
+		"foreign reference":      func(m *SnapshotManifest) { m.References["pin/main"] = foreign },
+		"extent beyond its pack": func(m *SnapshotManifest) { m.Objects[0].Extents[0].Offset = 2 * sharedPackAlignment },
+		"short extents":          func(m *SnapshotManifest) { m.Objects[0].Object.BulkLength = 11 },
+	} {
+		manifest := consistent()
+		corrupt(&manifest)
+		if err := store.validateManifest(&manifest); err == nil {
+			t.Errorf("%s: the manifest was taken", name)
+		}
+	}
 }
