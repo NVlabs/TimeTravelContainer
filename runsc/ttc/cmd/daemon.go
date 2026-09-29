@@ -7638,12 +7638,15 @@ func writeDaemonBufferedResult(conn net.Conn, writeMu *sync.Mutex, stdout, stder
 // commandReconciledFamilies returns the families whose placements the
 // reconciliation after a successful command must bring in line with this
 // node's runtimes: those the command resolved, if it changes only the
-// families it names, or none, which stands for every family.
+// families it names, or, as run, the family it creates; or none, which
+// stands for every family.
 func commandReconciledFamilies(args []string, b *runtimeBackend) []string {
-	if name := daemonCommandName(args); !familyScopedCommands[name] && name != "migrate" {
+	switch name := daemonCommandName(args); {
+	case familyScopedCommands[name], name == "migrate", name == "run":
+		return b.resolvedFamilies.list()
+	default:
 		return nil
 	}
-	return b.resolvedFamilies.list()
 }
 
 func daemonCommandNeedsMutationLock(args []string) bool {

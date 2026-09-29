@@ -6395,8 +6395,9 @@ type runtimeBackend struct {
 	lockFamily          func(id string) func()
 	lockSharedLifecycle func() func()
 	// resolvedFamilies, if not nil, collects the logical families the
-	// request resolves: those a command that changes only the families it
-	// names acts on, and the placement reconciliation after it covers.
+	// request resolves, or creates as run does: those a command that changes
+	// only those families acts on, and the placement reconciliation after it
+	// covers.
 	resolvedFamilies *familySet
 	publicationQueue    *ttcstorage.Queue
 	snapshotGraph       *ttcsnapshot.Store
@@ -7626,6 +7627,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 		return containerRunResult{}, errors.Join(err, finishFilesystemOrigins(false))
 	}
 	id := prepared.Container.ID
+	b.resolvedFamilies.add(id)
 	target := selector{container: id, branch: defaultBranchID}
 	reservation, err := b.reserveNewContainerPlacement(prepared.Container)
 	if err != nil {
