@@ -1428,8 +1428,29 @@ func validateGraphState(state *graphState) error {
 	return nil
 }
 
+// snapshotKey returns id in 16 hexadecimal digits, as %016x formats it.
 func snapshotKey(id SnapshotID) string {
-	return fmt.Sprintf("%016x", uint64(id))
+	var key [16]byte
+	appendHex(key[:0], uint64(id), 16)
+	return string(key[:])
+}
+
+// appendObjectKey appends id's key, as key returns it.
+func appendObjectKey(out []byte, id ObjectID) []byte {
+	out = appendHex(out, uint64(id.Snapshot), 16)
+	out = append(out, '-')
+	out = appendHex(out, uint64(id.Kind), 2)
+	out = append(out, '-')
+	return appendHex(out, id.Ordinal, 16)
+}
+
+// appendHex appends the digits lowest of value in hexadecimal, zero-padded.
+func appendHex(out []byte, value uint64, digits int) []byte {
+	const hex = "0123456789abcdef"
+	for shift := 4 * (digits - 1); shift >= 0; shift -= 4 {
+		out = append(out, hex[value>>shift&15])
+	}
+	return out
 }
 
 func (s *Store) replayJournal(repairTail bool) error {

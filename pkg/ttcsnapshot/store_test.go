@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -3353,5 +3354,33 @@ func TestInconsistentCheckpointIsRefused(t *testing.T) {
 	if reopened, err := Open(dir); err == nil {
 		reopened.Close()
 		t.Fatal("a checkpoint with a wrong reference count was taken")
+	}
+}
+
+// Snapshot keys and object paths are built as fmt and filepath built them.
+func TestSnapshotKeysAndObjectPaths(t *testing.T) {
+	random := rand.New(rand.NewSource(11))
+	for round := 0; round < 2000; round++ {
+		id := ObjectID{Snapshot: SnapshotID(random.Uint64()), Ordinal: random.Uint64(), Kind: []ObjectKind{ObjectKindFile, ObjectKindPage, ObjectKindMemoryChunk}[random.Intn(3)]}
+		if round%3 == 0 {
+			id.Snapshot, id.Ordinal = SnapshotID(1+random.Intn(300)), uint64(1+random.Intn(300))
+		}
+		if got, want := snapshotKey(id.Snapshot), fmt.Sprintf("%016x", uint64(id.Snapshot)); got != want {
+			t.Fatalf("snapshotKey(%d) = %q, want %q", id.Snapshot, got, want)
+		}
+		name, err := objectKindName(id.Kind)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := filepath.Join(name, fmt.Sprintf("%016x", uint64(id.Snapshot)), fmt.Sprintf("%02x", byte(id.Ordinal)), id.key()+".data")
+		if got, err := objectRelativePath(id); err != nil || got != want {
+			t.Fatalf("objectRelativePath(%s) = %q, %v; want %q", id, got, err, want)
+		}
+		if got := string(appendObjectKey(nil, id)); got != id.key() {
+			t.Fatalf("appendObjectKey(%s) = %q, want %q", id, got, id.key())
+		}
+	}
+	if _, err := objectRelativePath(ObjectID{Snapshot: 1, Ordinal: 1, Kind: ObjectKindMetadata}); err == nil {
+		t.Fatal("a metadata object has a data path")
 	}
 }
