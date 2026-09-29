@@ -1242,7 +1242,9 @@ func (s *Store) loadGeneration(head graphHead, repairTail bool) error {
 	if err != nil {
 		return fmt.Errorf("decoding TTC snapshot graph checkpoint: %w", err)
 	}
-	if err := validateGraphState(&state); err != nil {
+	// replayJournal validates the graph it makes of the checkpoint, whole:
+	// validating the checkpoint's as well took 0.5 s for 300,000 objects.
+	if err := validateGraphStateShape(&state); err != nil {
 		return fmt.Errorf("invalid TTC snapshot graph checkpoint: %w", err)
 	}
 	journal, err := s.openFile(journalName, unix.O_RDWR, 0600)
@@ -1299,12 +1301,21 @@ func (s *Store) rebuildDeferredObjectsLocked() {
 	}
 }
 
-func validateGraphState(state *graphState) error {
+// validateGraphStateShape checks what applying a journal record to state
+// relies on: its header and its maps.
+func validateGraphStateShape(state *graphState) error {
 	if state == nil || state.Version != formatVersion || state.NextSnapshot == 0 {
 		return errors.New("invalid graph state header")
 	}
 	if state.Snapshots == nil || state.Objects == nil || state.Roots == nil || state.Pins == nil || state.Frozen == nil || state.Handoffs == nil {
 		return errors.New("graph state has nil maps")
+	}
+	return nil
+}
+
+func validateGraphState(state *graphState) error {
+	if err := validateGraphStateShape(state); err != nil {
+		return err
 	}
 	nextOrdinals := make(map[SnapshotID]uint64, len(state.Snapshots))
 	for key, snapshot := range state.Snapshots {
@@ -1455,6 +1466,11 @@ func (s *Store) replayJournal(repairTail bool) error {
 		}
 		if n != len(lengthBuffer) {
 			if !repairTail {
+				// What the complete records made of the checkpoint is
+				// validated, as below.
+				if err := validateGraphState(&s.state); err != nil {
+					return fmt.Errorf("validating TTC snapshot graph after journal replay: %w", err)
+				}
 				_, seekErr := s.journal.Seek(0, io.SeekEnd)
 				return seekErr
 			}
@@ -1475,6 +1491,11 @@ func (s *Store) replayJournal(repairTail bool) error {
 		}
 		if n != len(data) {
 			if !repairTail {
+				// What the complete records made of the checkpoint is
+				// validated, as below.
+				if err := validateGraphState(&s.state); err != nil {
+					return fmt.Errorf("validating TTC snapshot graph after journal replay: %w", err)
+				}
 				_, seekErr := s.journal.Seek(0, io.SeekEnd)
 				return seekErr
 			}

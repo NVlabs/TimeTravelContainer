@@ -3304,3 +3304,54 @@ func TestGraphReopenKeepsIndexes(t *testing.T) {
 		t.Fatalf("indexes of %d deferred objects and %d pages, want 2 and 2", len(rebuilt.deferredObjects), len(rebuilt.memoryPages))
 	}
 }
+
+// A checkpoint that decodes but whose graph is inconsistent is refused, as
+// its journal's replay validates the graph whole.
+func TestInconsistentCheckpointIsRefused(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "graph")
+	graph, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := graph.CreateObject(origin, "build/one", ObjectKindFile, []byte{1}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Close(); err != nil {
+		t.Fatal(err)
+	}
+	head, err := os.ReadFile(filepath.Join(dir, headFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var current graphHead
+	if err := json.Unmarshal(head, &current); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, graphCheckpointName(current.Generation))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	damaged := bytes.Replace(data, []byte(`"Refs":1`), []byte(`"Refs":2`), 1)
+	if bytes.Equal(damaged, data) {
+		t.Fatal("the checkpoint has no reference count to change")
+	}
+	if err := os.WriteFile(path, damaged, 0600); err != nil {
+		t.Fatal(err)
+	}
+	graphStates.mu.Lock()
+	graphStates.entries = make(map[graphFileIdentity]*cachedGraphState)
+	graphStates.objects = 0
+	graphStates.mu.Unlock()
+	if reopened, err := Open(dir); err == nil {
+		reopened.Close()
+		t.Fatal("a checkpoint with a wrong reference count was taken")
+	}
+}
