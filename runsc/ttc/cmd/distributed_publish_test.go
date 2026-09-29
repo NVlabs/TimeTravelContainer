@@ -138,18 +138,30 @@ func TestSnapshotOriginAuthorityDistinguishesTombstones(t *testing.T) {
 
 func TestProviderBaselineReleaseWaitsForSharedAuthority(t *testing.T) {
 	object := ttcsnapshot.ObjectID{Snapshot: 17, Kind: ttcsnapshot.ObjectKindMetadata, Ordinal: 1}
-	state := &cluster.AuthorityState{VolatileOrigins: map[uint64]cluster.SnapshotOriginProvider{17: {NodeID: "node-a"}}}
+	state := &cluster.AuthorityState{
+		NextSnapshotID:  64,
+		VolatileOrigins: map[uint64]cluster.SnapshotOriginProvider{17: {NodeID: "node-a"}},
+		SharedOrigins:   map[uint64]bool{},
+	}
+	publish := func() {
+		delete(state.VolatileOrigins, 17)
+		state.SharedOrigins[17] = true
+	}
 	for _, name := range []string{"root/filesystem/branch-a", "pin/open/branch-a"} {
 		if providerBaselineCanBeReleased(state, name, object) {
 			t.Fatalf("volatile provider baseline %q was releasable", name)
 		}
-		delete(state.VolatileOrigins, 17)
+		publish()
 		if !providerBaselineCanBeReleased(state, name, object) {
 			t.Fatalf("shared provider baseline %q was not releasable", name)
 		}
+		delete(state.SharedOrigins, 17)
+		if providerBaselineCanBeReleased(state, name, object) {
+			t.Fatalf("dead provider baseline %q was releasable", name)
+		}
 		state.VolatileOrigins[17] = cluster.SnapshotOriginProvider{NodeID: "node-a"}
 	}
-	delete(state.VolatileOrigins, 17)
+	publish()
 	for _, name := range []string{"remote/17/operation/00000000", "edge/parent/0000", "root/bridge/edge/parent/0000", "root/cold/memory"} {
 		if providerBaselineCanBeReleased(state, name, object) {
 			t.Fatalf("non-provider reference %q was releasable", name)
@@ -270,10 +282,10 @@ func TestProviderBaselineReferencesAreOriginScoped(t *testing.T) {
 
 func TestManifestReferenceLivenessFollowsParentAuthority(t *testing.T) {
 	state := &cluster.AuthorityState{
-		NextSnapshotID:   64,
-		VolatileOrigins:  map[uint64]cluster.SnapshotOriginProvider{},
-		AbandonedOrigins: map[uint64]bool{},
-		RetiredOrigins:   map[uint64]cluster.SharedPackRetirement{},
+		NextSnapshotID:  64,
+		VolatileOrigins: map[uint64]cluster.SnapshotOriginProvider{},
+		SharedOrigins:   map[uint64]bool{17: true},
+		RetiredOrigins:  map[uint64]cluster.SharedPackRetirement{},
 	}
 	parent := ttcsnapshot.ObjectID{Snapshot: 17, Kind: ttcsnapshot.ObjectKindMemoryNode, Ordinal: 3}
 	edge := "edge/" + parent.String() + "/0004"
@@ -282,11 +294,11 @@ func TestManifestReferenceLivenessFollowsParentAuthority(t *testing.T) {
 			t.Fatalf("live reference %q = (%t, %v), want (true, nil)", name, live, err)
 		}
 	}
-	state.AbandonedOrigins[17] = true
+	// Neither volatile nor shared: abandoned, or retired.
+	delete(state.SharedOrigins, 17)
 	if live, err := manifestReferenceIsLive(state, edge); err != nil || live {
-		t.Fatalf("abandoned parent edge = (%t, %v), want (false, nil)", live, err)
+		t.Fatalf("dead parent edge = (%t, %v), want (false, nil)", live, err)
 	}
-	delete(state.AbandonedOrigins, 17)
 	state.RetiredOrigins[17] = cluster.SharedPackRetirement{SnapshotID: 17, GCGeneration: 1, RetiredAt: time.Unix(1, 0)}
 	if live, err := manifestReferenceIsLive(state, edge); err != nil || live {
 		t.Fatalf("retired parent edge = (%t, %v), want (false, nil)", live, err)

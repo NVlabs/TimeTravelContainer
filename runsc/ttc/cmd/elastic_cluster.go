@@ -7073,15 +7073,31 @@ func maintainSharedGCCoordinator(authority *cluster.AuthorityCatalog, packs *ttc
 			}
 			retirements, err := authority.RetiredSharedSnapshots()
 			if err == nil && maintenanceErr == nil {
+				// Each retirement is completed, and then forgotten: the
+				// authority keeps only those to complete, not every origin
+				// ever retired.
+				var completed []uint64
 				for _, retirement := range retirements {
+					snapshot := ttcsnapshot.SnapshotID(retirement.SnapshotID)
 					var err error
 					if references != nil {
-						err = references.completeRetirement(ttcsnapshot.SnapshotID(retirement.SnapshotID))
-					} else {
-						_, err = packs.CompleteRetirement(ttcsnapshot.SnapshotID(retirement.SnapshotID))
+						err = references.completeRetirement(snapshot)
+					} else if busy, completeErr := packs.CompleteRetirement(snapshot); completeErr != nil {
+						err = completeErr
+					} else if busy {
+						err = fmt.Errorf("shared snapshot %d still has an active reader lease", snapshot)
 					}
-					if err != nil && stderr != nil {
-						fmt.Fprintf(stderr, "ttcd: warning: completing retirement of shared snapshot %d: %v\n", retirement.SnapshotID, err)
+					if err != nil {
+						if stderr != nil {
+							fmt.Fprintf(stderr, "ttcd: warning: completing retirement of shared snapshot %d: %v\n", retirement.SnapshotID, err)
+						}
+						continue
+					}
+					completed = append(completed, retirement.SnapshotID)
+				}
+				if len(completed) != 0 {
+					if err := authority.ForgetSharedRetirements(held, completed); err != nil && stderr != nil {
+						fmt.Fprintf(stderr, "ttcd: warning: forgetting %d completed shared snapshot retirements: %v\n", len(completed), err)
 					}
 				}
 			}

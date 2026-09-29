@@ -174,8 +174,8 @@ func TestAuthoritySnapshotOriginAllocationAndPublish(t *testing.T) {
 	if _, ok := state.VolatileOrigins[3]; ok {
 		t.Fatal("abandoned snapshot retained a volatile provider")
 	}
-	if !state.AbandonedOrigins[3] {
-		t.Fatal("abandoned snapshot has no permanent authority tombstone")
+	if !state.OriginDead(3) || !state.SharedOrigins[2] || state.OriginDead(1) {
+		t.Fatalf("origins 1, 2 and 3 are dead: %t, %t, %t; want volatile, shared and abandoned", state.OriginDead(1), state.OriginDead(2), state.OriginDead(3))
 	}
 	publishAbandoned, err := NewAuthorityCommand("publish-abandoned-3", at.Add(4*time.Second), AuthoritySnapshotPublish, abandon)
 	if err != nil {
@@ -260,6 +260,27 @@ func TestAuthoritySharedGCLeaseFencesGenerations(t *testing.T) {
 	}
 	if result := state.Apply(latePublish); result.Err() == nil {
 		t.Fatal("late publisher resurrected a retired origin")
+	}
+	// Once its deletion completes, shared GC forgets the retirement, and the
+	// origin stays dead.
+	applyAuthorityForTest(t, state, "gc-forget", at.Add(15*time.Second), AuthoritySharedGCForget, AuthoritySharedGCPayload{
+		NodeID: "node-b", Incarnation: "incarnation-b", Generation: second.Generation, SnapshotIDs: []uint64{allocation.First},
+	})
+	if _, pending := state.RetiredOrigins[allocation.First]; pending || !state.OriginDead(allocation.First) {
+		t.Fatalf("forgotten retirement: pending %t, dead %t; want dead and not pending", pending, state.OriginDead(allocation.First))
+	}
+	for _, kind := range []AuthorityCommandKind{AuthoritySnapshotPublish, AuthoritySharedGCRetire} {
+		payload := any(AuthoritySnapshotPayload{NodeID: "node-b", Incarnation: "incarnation-b", SnapshotID: allocation.First})
+		if kind == AuthoritySharedGCRetire {
+			payload = AuthoritySharedGCPayload{NodeID: "node-b", Incarnation: "incarnation-b", Generation: second.Generation, SnapshotID: allocation.First}
+		}
+		command, err := NewAuthorityCommand("gc-after-forget-"+string(kind), at.Add(15*time.Second), kind, payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result := state.Apply(command); result.Err() == nil {
+			t.Fatalf("%s of a forgotten retirement succeeded", kind)
+		}
 	}
 	applyAuthorityForTest(t, state, "gc-release-b", at.Add(16*time.Second), AuthoritySharedGCRelease, AuthoritySharedGCPayload{
 		NodeID: "node-b", Incarnation: "incarnation-b", Generation: second.Generation,
@@ -590,6 +611,7 @@ func TestAuthorityPublicationIdentityPreventsLateResurrection(t *testing.T) {
 	at := time.Unix(3000, 0).UTC()
 	state := NewAuthorityState()
 	state.NextSnapshotID = 8
+	state.SharedOrigins[7] = true
 	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at.Add(-time.Second))
 	created := decodeAuthorityResultForTest[PlacementRecord](t, applyAuthorityForTest(t, state, "place", at, AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
 		FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main",
@@ -801,6 +823,7 @@ func TestAuthorityDiscardDehydratedMemoryPreservesFilesystem(t *testing.T) {
 	at := time.Unix(3550, 0).UTC()
 	state := NewAuthorityState()
 	state.NextSnapshotID = 8
+	state.SharedOrigins[7] = true
 	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at.Add(-time.Second))
 	created := decodeAuthorityResultForTest[PlacementRecord](t, applyAuthorityForTest(t, state, "place", at, AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
 		FamilyID: "family", BranchID: "cold", PhysicalContainer: "physical", PhysicalBranch: "cold",
@@ -1147,7 +1170,7 @@ func TestAuthorityRemovalAbandonsProviderOrigins(t *testing.T) {
 		NodeID: node.NodeID, Incarnation: node.Incarnation, Revision: node.Revision,
 	})
 	for id := allocation.First; id < allocation.First+uint64(allocation.Count); id++ {
-		if _, ok := state.VolatileOrigins[id]; !ok || state.AbandonedOrigins[id] {
+		if _, ok := state.VolatileOrigins[id]; !ok || state.OriginDead(id) {
 			t.Fatalf("expiry gave up volatile origin %d", id)
 		}
 	}
@@ -1159,8 +1182,8 @@ func TestAuthorityRemovalAbandonsProviderOrigins(t *testing.T) {
 		t.Fatal("expired provider remains in membership after removal")
 	}
 	for id := allocation.First; id < allocation.First+uint64(allocation.Count); id++ {
-		if _, ok := state.VolatileOrigins[id]; ok || !state.AbandonedOrigins[id] {
-			t.Fatalf("removed provider's origin %d lacks abandonment fence", id)
+		if !state.OriginDead(id) {
+			t.Fatalf("removed provider's origin %d is not abandoned", id)
 		}
 	}
 	if _, err := RestoreAuthorityState(mustAuthoritySnapshotForTest(t, state)); err != nil {

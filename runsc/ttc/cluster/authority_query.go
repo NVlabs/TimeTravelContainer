@@ -14,15 +14,15 @@ import (
 // sent only those. Every read has the state's counters, its cluster policy
 // and its shared-GC lease.
 type AuthorityQuery struct {
-	Nodes            Keys[string] `json:"nodes,omitzero"`
-	RetiredNodes     bool         `json:"retired_nodes,omitempty"`
-	Placements       Keys[string] `json:"placements,omitzero"`
-	Transactions     Keys[string] `json:"transactions,omitzero"`
-	Branches         Keys[string] `json:"branches,omitzero"`
-	Publications     Keys[string] `json:"publications,omitzero"`
-	VolatileOrigins  Keys[uint64] `json:"volatile_origins,omitzero"`
-	AbandonedOrigins Keys[uint64] `json:"abandoned_origins,omitzero"`
-	RetiredOrigins   Keys[uint64] `json:"retired_origins,omitzero"`
+	Nodes           Keys[string] `json:"nodes,omitzero"`
+	RetiredNodes    bool         `json:"retired_nodes,omitempty"`
+	Placements      Keys[string] `json:"placements,omitzero"`
+	Transactions    Keys[string] `json:"transactions,omitzero"`
+	Branches        Keys[string] `json:"branches,omitzero"`
+	Publications    Keys[string] `json:"publications,omitzero"`
+	VolatileOrigins Keys[uint64] `json:"volatile_origins,omitzero"`
+	SharedOrigins   Keys[uint64] `json:"shared_origins,omitzero"`
+	RetiredOrigins  Keys[uint64] `json:"retired_origins,omitzero"`
 	// Family, if set, keeps of the placements, branches and publications
 	// selected only those of this family.
 	Family string `json:"family,omitempty"`
@@ -47,7 +47,13 @@ func Only[K comparable](keys ...K) Keys[K] { return Keys[K]{Keys: keys} }
 var WholeAuthority = AuthorityQuery{
 	Nodes: All[string](), RetiredNodes: true, Placements: All[string](), Transactions: All[string](),
 	Branches: All[string](), Publications: All[string](),
-	VolatileOrigins: All[uint64](), AbandonedOrigins: All[uint64](), RetiredOrigins: All[uint64](),
+	VolatileOrigins: All[uint64](), SharedOrigins: All[uint64](), RetiredOrigins: All[uint64](),
+}
+
+// OriginsQuery is the query of what the authority says of the snapshot
+// origins with these IDs: see AuthorityState.OriginDead.
+func OriginsQuery(ids ...uint64) AuthorityQuery {
+	return AuthorityQuery{VolatileOrigins: Only(ids...), SharedOrigins: Only(ids...), RetiredOrigins: Only(ids...)}
 }
 
 func selectRecords[K comparable, V any](records map[K]V, keys Keys[K]) map[K]V {
@@ -117,7 +123,7 @@ func (s *AuthorityState) view(query AuthorityQuery) *AuthorityState {
 	view.Branches = ofFamily(selectRecords(s.Branches, query.Branches), query.Family)
 	view.Publications = ofFamily(selectRecords(s.Publications, query.Publications), query.Family)
 	view.VolatileOrigins = selectRecords(s.VolatileOrigins, query.VolatileOrigins)
-	view.AbandonedOrigins = selectRecords(s.AbandonedOrigins, query.AbandonedOrigins)
+	view.SharedOrigins = selectRecords(s.SharedOrigins, query.SharedOrigins)
 	view.RetiredOrigins = selectRecords(s.RetiredOrigins, query.RetiredOrigins)
 	return &view
 }

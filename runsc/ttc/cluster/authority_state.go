@@ -25,8 +25,8 @@ const (
 	// AuthorityFormatVersion is the durable authority-state format. It is
 	// deliberately independent from the peer data-plane protocol version.
 	// Version 11 is the first kept in the authority log, which names terms
-	// epochs.
-	AuthorityFormatVersion = 11
+	// epochs; version 12 keeps the shared snapshot origins, not the dead ones.
+	AuthorityFormatVersion = 12
 	maxRememberedRequests  = 65536
 	maxSharedGCLease       = 30 * time.Second
 )
@@ -81,6 +81,7 @@ const (
 	AuthoritySharedGCRenew         AuthorityCommandKind = "shared-gc-renew"
 	AuthoritySharedGCRelease       AuthorityCommandKind = "shared-gc-release"
 	AuthoritySharedGCRetire        AuthorityCommandKind = "shared-gc-retire-origin"
+	AuthoritySharedGCForget        AuthorityCommandKind = "shared-gc-forget-retirements"
 )
 
 // AuthorityCommand is the sole mutation envelope the authority logs. IssuedAt is
@@ -240,20 +241,26 @@ type AuthorityState struct {
 	// HolderObservedAt is populated only on a linearizable read response. It is
 	// zero in the applied state and snapshots, and lets remote readers convert
 	// lease deadlines without assuming wall-clock synchronization.
-	HolderObservedAt time.Time                          `json:"holder_observed_at,omitempty"`
-	ClusterPolicy    ClusterRuntimePolicy               `json:"cluster_policy,omitempty"`
-	Nodes            map[string]NodeRecord              `json:"nodes,omitempty"`
-	RetiredNodes     map[string]string                  `json:"retired_nodes,omitempty"`
-	Placements       map[string]PlacementRecord         `json:"placements,omitempty"`
-	Transactions     map[string]Transaction             `json:"transactions,omitempty"`
-	Branches         map[string]BranchAuthority         `json:"branches,omitempty"`
-	Publications     map[string]PublicationRecord       `json:"publications,omitempty"`
-	VolatileOrigins  map[uint64]SnapshotOriginProvider  `json:"volatile_origins,omitempty"`
-	AbandonedOrigins map[uint64]bool                    `json:"abandoned_origins,omitempty"`
-	SharedGC         SharedGCLease                      `json:"shared_gc,omitempty"`
-	RetiredOrigins   map[uint64]SharedPackRetirement    `json:"retired_origins,omitempty"`
-	Requests         map[string]appliedAuthorityRequest `json:"requests,omitempty"`
-	RequestOrder     []string                           `json:"request_order,omitempty"`
+	HolderObservedAt time.Time                    `json:"holder_observed_at,omitempty"`
+	ClusterPolicy    ClusterRuntimePolicy         `json:"cluster_policy,omitempty"`
+	Nodes            map[string]NodeRecord        `json:"nodes,omitempty"`
+	RetiredNodes     map[string]string            `json:"retired_nodes,omitempty"`
+	Placements       map[string]PlacementRecord   `json:"placements,omitempty"`
+	Transactions     map[string]Transaction       `json:"transactions,omitempty"`
+	Branches         map[string]BranchAuthority   `json:"branches,omitempty"`
+	Publications     map[string]PublicationRecord `json:"publications,omitempty"`
+	// A snapshot origin the authority allocated is volatile, its
+	// provider's, until it is published to the shared root, and shared then
+	// until shared GC retires it; or dead, once abandoned or retired. Only the
+	// volatile and shared ones are kept: see OriginDead.
+	VolatileOrigins map[uint64]SnapshotOriginProvider `json:"volatile_origins,omitempty"`
+	SharedOrigins   map[uint64]bool                   `json:"shared_origins,omitempty"`
+	SharedGC        SharedGCLease                     `json:"shared_gc,omitempty"`
+	// RetiredOrigins has the retirements whose deletion shared GC has yet to
+	// complete, which it then forgets.
+	RetiredOrigins map[uint64]SharedPackRetirement    `json:"retired_origins,omitempty"`
+	Requests       map[string]appliedAuthorityRequest `json:"requests,omitempty"`
+	RequestOrder   []string                           `json:"request_order,omitempty"`
 }
 
 // NewAuthorityState creates an empty cluster state.
@@ -261,6 +268,20 @@ func NewAuthorityState() *AuthorityState {
 	state := &AuthorityState{Version: AuthorityFormatVersion, NextSnapshotID: 1, NextSharedGCGeneration: 1}
 	state.initMaps()
 	return state
+}
+
+// OriginDead reports whether snapshot origin id, which the authority
+// allocated, can never be read again: its provider abandoned it, or shared
+// GC retired it. A view answers only for the origins its query named among
+// both the volatile and the shared ones; see OriginsQuery.
+func (s *AuthorityState) OriginDead(id uint64) bool {
+	if id == 0 || id >= s.NextSnapshotID {
+		return false
+	}
+	if _, volatile := s.VolatileOrigins[id]; volatile {
+		return false
+	}
+	return !s.SharedOrigins[id]
 }
 
 func (s *AuthorityState) initMaps() {
@@ -285,8 +306,8 @@ func (s *AuthorityState) initMaps() {
 	if s.VolatileOrigins == nil {
 		s.VolatileOrigins = make(map[uint64]SnapshotOriginProvider)
 	}
-	if s.AbandonedOrigins == nil {
-		s.AbandonedOrigins = make(map[uint64]bool)
+	if s.SharedOrigins == nil {
+		s.SharedOrigins = make(map[uint64]bool)
 	}
 	if s.RetiredOrigins == nil {
 		s.RetiredOrigins = make(map[uint64]SharedPackRetirement)
@@ -452,7 +473,6 @@ func (s *AuthorityState) cloneMutationMaps(kind AuthorityCommandKind) {
 			// Registering another incarnation abandons the origins the
 			// previous one provided.
 			s.VolatileOrigins = cloneAuthorityMap(s.VolatileOrigins)
-			s.AbandonedOrigins = cloneAuthorityMap(s.AbandonedOrigins)
 		}
 		s.Transactions = cloneAuthorityMap(s.Transactions)
 		s.Branches = cloneAuthorityMap(s.Branches)
@@ -465,7 +485,6 @@ func (s *AuthorityState) cloneMutationMaps(kind AuthorityCommandKind) {
 		s.Placements = cloneAuthorityMap(s.Placements)
 		s.Publications = cloneAuthorityMap(s.Publications)
 		s.VolatileOrigins = cloneAuthorityMap(s.VolatileOrigins)
-		s.AbandonedOrigins = cloneAuthorityMap(s.AbandonedOrigins)
 	case AuthorityNodeRemove:
 		s.Nodes = cloneAuthorityMap(s.Nodes)
 		s.RetiredNodes = cloneAuthorityMap(s.RetiredNodes)
@@ -476,7 +495,6 @@ func (s *AuthorityState) cloneMutationMaps(kind AuthorityCommandKind) {
 		s.Placements = cloneAuthorityMap(s.Placements)
 		s.Publications = cloneAuthorityMap(s.Publications)
 		s.VolatileOrigins = cloneAuthorityMap(s.VolatileOrigins)
-		s.AbandonedOrigins = cloneAuthorityMap(s.AbandonedOrigins)
 	case AuthorityClusterPolicySet:
 		// ClusterPolicy is copied by value with AuthorityState.
 	case AuthorityPlacementCreate, AuthorityPlacementBegin, AuthorityPlacementAdopt, AuthorityPlacementRecover,
@@ -510,6 +528,7 @@ func (s *AuthorityState) cloneMutationMaps(kind AuthorityCommandKind) {
 			s.Placements = cloneAuthorityMap(s.Placements)
 			// A commit publishes the origins its snapshot names.
 			s.VolatileOrigins = cloneAuthorityMap(s.VolatileOrigins)
+			s.SharedOrigins = cloneAuthorityMap(s.SharedOrigins)
 		}
 	case AuthorityBranchCorrupt, AuthorityBranchInherit, AuthorityBranchDiscardMemory, AuthorityBranchRemoveCorrupted:
 		s.Branches = cloneAuthorityMap(s.Branches)
@@ -517,10 +536,15 @@ func (s *AuthorityState) cloneMutationMaps(kind AuthorityCommandKind) {
 		s.Publications = cloneAuthorityMap(s.Publications)
 	case AuthoritySnapshotAllocate, AuthoritySnapshotAbandon, AuthoritySnapshotPublish:
 		s.VolatileOrigins = cloneAuthorityMap(s.VolatileOrigins)
-		s.AbandonedOrigins = cloneAuthorityMap(s.AbandonedOrigins)
+		if kind == AuthoritySnapshotPublish {
+			s.SharedOrigins = cloneAuthorityMap(s.SharedOrigins)
+		}
 	case AuthoritySharedGCAcquire, AuthoritySharedGCRenew, AuthoritySharedGCRelease:
 		// SharedGC is copied by value with AuthorityState.
 	case AuthoritySharedGCRetire:
+		s.SharedOrigins = cloneAuthorityMap(s.SharedOrigins)
+		s.RetiredOrigins = cloneAuthorityMap(s.RetiredOrigins)
+	case AuthoritySharedGCForget:
 		s.RetiredOrigins = cloneAuthorityMap(s.RetiredOrigins)
 	}
 }
@@ -677,6 +701,8 @@ type AuthoritySharedGCPayload struct {
 	Generation          uint64
 	Lease               time.Duration
 	SnapshotID          uint64
+	// SnapshotIDs names the retirements a forget forgets.
+	SnapshotIDs []uint64 `json:",omitempty"`
 }
 
 // AuthorityMigrationCutoverPayload joins the transaction and placement CASes
@@ -738,7 +764,7 @@ func (s *AuthorityState) apply(command AuthorityCommand) (json.RawMessage, error
 		return s.applyBranch(command)
 	case AuthoritySnapshotAllocate, AuthoritySnapshotAbandon, AuthoritySnapshotPublish:
 		return s.applySnapshot(command)
-	case AuthoritySharedGCAcquire, AuthoritySharedGCRenew, AuthoritySharedGCRelease, AuthoritySharedGCRetire:
+	case AuthoritySharedGCAcquire, AuthoritySharedGCRenew, AuthoritySharedGCRelease, AuthoritySharedGCRetire, AuthoritySharedGCForget:
 		return s.applySharedGC(command)
 	default:
 		return nil, fmt.Errorf("unknown authority command %q", command.Kind)
@@ -822,11 +848,11 @@ func (s *AuthorityState) applySharedGC(command AuthorityCommand) (json.RawMessag
 		if _, volatile := s.VolatileOrigins[p.SnapshotID]; volatile {
 			return nil, errors.New("cannot retire a volatile snapshot origin")
 		}
-		if s.AbandonedOrigins[p.SnapshotID] {
-			return nil, errors.New("cannot retire an abandoned snapshot origin")
-		}
 		if retirement, retired := s.RetiredOrigins[p.SnapshotID]; retired {
 			return authorityValue(retirement)
+		}
+		if !s.SharedOrigins[p.SnapshotID] {
+			return nil, errors.New("cannot retire a dead snapshot origin")
 		}
 		for _, branch := range s.Branches {
 			if !branch.Corrupted && branch.Roots.MemorySnapshot == p.SnapshotID {
@@ -839,8 +865,20 @@ func (s *AuthorityState) applySharedGC(command AuthorityCommand) (json.RawMessag
 			}
 		}
 		retirement := SharedPackRetirement{SnapshotID: p.SnapshotID, GCGeneration: p.Generation, RetiredAt: command.IssuedAt}
+		delete(s.SharedOrigins, p.SnapshotID)
 		s.RetiredOrigins[p.SnapshotID] = retirement
 		return authorityValue(retirement)
+	case AuthoritySharedGCForget:
+		if p.Lease != 0 || p.Generation == 0 || p.SnapshotID != 0 || len(p.SnapshotIDs) == 0 ||
+			s.SharedGC.NodeID != p.NodeID || s.SharedGC.Incarnation != p.Incarnation || s.SharedGC.Generation != p.Generation ||
+			!command.IssuedAt.Before(s.SharedGC.ExpiresAt) {
+			return nil, errors.New("forgetting shared GC retirements lacks a current lease")
+		}
+		// What is forgotten is dead: neither volatile nor shared.
+		for _, id := range p.SnapshotIDs {
+			delete(s.RetiredOrigins, id)
+		}
+		return authorityValue(len(p.SnapshotIDs))
 	default:
 		panic("unreachable")
 	}
@@ -873,39 +911,35 @@ func (s *AuthorityState) applySnapshot(command AuthorityCommand) (json.RawMessag
 		if p.SnapshotID == 0 || p.SnapshotID >= s.NextSnapshotID || p.Count != 0 {
 			return nil, errors.New("invalid snapshot abandonment request")
 		}
-		if s.AbandonedOrigins[p.SnapshotID] {
-			return authorityValue(SnapshotOriginProvider{SnapshotID: p.SnapshotID})
-		}
 		provider, ok := s.VolatileOrigins[p.SnapshotID]
 		if !ok {
+			if s.OriginDead(p.SnapshotID) {
+				return authorityValue(SnapshotOriginProvider{SnapshotID: p.SnapshotID})
+			}
 			return nil, errors.New("snapshot origin is already published")
 		}
 		if provider.NodeID != p.NodeID {
 			return nil, errors.New("snapshot origin is owned by another provider")
 		}
 		delete(s.VolatileOrigins, p.SnapshotID)
-		s.AbandonedOrigins[p.SnapshotID] = true
 		return authorityValue(SnapshotOriginProvider{SnapshotID: p.SnapshotID})
 	case AuthoritySnapshotPublish:
 		if p.SnapshotID == 0 || p.SnapshotID >= s.NextSnapshotID || p.Count != 0 {
 			return nil, errors.New("invalid snapshot publication request")
 		}
-		if _, retired := s.RetiredOrigins[p.SnapshotID]; retired {
-			return nil, errors.New("snapshot origin is permanently retired")
-		}
-		if s.AbandonedOrigins[p.SnapshotID] {
-			return nil, errors.New("snapshot origin was abandoned")
-		}
 		provider, ok := s.VolatileOrigins[p.SnapshotID]
 		if !ok {
-			// Idempotent retries after a committed node-to-shared handoff see the
-			// same absence that readers interpret as shared authority.
-			return authorityValue(SnapshotOriginProvider{SnapshotID: p.SnapshotID})
+			if s.SharedOrigins[p.SnapshotID] {
+				// A retry after the node-to-shared handoff committed.
+				return authorityValue(SnapshotOriginProvider{SnapshotID: p.SnapshotID})
+			}
+			return nil, errors.New("snapshot origin was abandoned or retired")
 		}
 		if provider.NodeID != p.NodeID {
 			return nil, errors.New("snapshot origin is owned by another provider")
 		}
 		delete(s.VolatileOrigins, p.SnapshotID)
+		s.SharedOrigins[p.SnapshotID] = true
 		return authorityValue(SnapshotOriginProvider{SnapshotID: p.SnapshotID})
 	default:
 		panic("unreachable")
@@ -1426,11 +1460,9 @@ func (s *AuthorityState) invalidateNodeIncarnation(nodeID, incarnation string, i
 	// node removal is possible and a replacement incarnation cannot publish
 	// objects allocated by its predecessor.
 	for id, provider := range s.VolatileOrigins {
-		if provider.NodeID != nodeID {
-			continue
+		if provider.NodeID == nodeID {
+			delete(s.VolatileOrigins, id)
 		}
-		delete(s.VolatileOrigins, id)
-		s.AbandonedOrigins[id] = true
 	}
 }
 
@@ -2038,11 +2070,8 @@ func (s *AuthorityState) validateSnapshotRootAuthority(roots DurableRoots) error
 	if roots.MemorySnapshot >= s.NextSnapshotID {
 		return errors.New("durable memory snapshot was not allocated")
 	}
-	if _, retired := s.RetiredOrigins[roots.MemorySnapshot]; retired {
-		return errors.New("durable memory snapshot is permanently retired")
-	}
-	if s.AbandonedOrigins[roots.MemorySnapshot] {
-		return errors.New("durable memory snapshot was abandoned")
+	if s.OriginDead(roots.MemorySnapshot) {
+		return errors.New("durable memory snapshot was abandoned or retired")
 	}
 	return nil
 }
@@ -2163,6 +2192,7 @@ func (s *AuthorityState) applyPublication(command AuthorityCommand) (json.RawMes
 		s.Branches[branchKey] = current
 		for _, origin := range p.SnapshotOrigins {
 			delete(s.VolatileOrigins, origin)
+			s.SharedOrigins[origin] = true
 		}
 	case AuthorityPublicationFail:
 		if p.Failure == "" || record.State == PublicationCommitted || record.State == PublicationCanceled {
@@ -2621,15 +2651,12 @@ func RestoreAuthorityState(data []byte) (*AuthorityState, error) {
 			return nil, errors.New("authority snapshot has invalid volatile origin")
 		}
 	}
-	for id, abandoned := range state.AbandonedOrigins {
-		if !abandoned || id == 0 || id >= state.NextSnapshotID {
-			return nil, errors.New("authority snapshot has invalid abandoned origin")
+	for id, shared := range state.SharedOrigins {
+		if !shared || id == 0 || id >= state.NextSnapshotID {
+			return nil, errors.New("authority snapshot has invalid shared origin")
 		}
 		if _, volatile := state.VolatileOrigins[id]; volatile {
-			return nil, errors.New("authority snapshot marks an origin volatile and abandoned")
-		}
-		if _, retired := state.RetiredOrigins[id]; retired {
-			return nil, errors.New("authority snapshot marks an origin abandoned and retired")
+			return nil, errors.New("authority snapshot marks an origin volatile and shared")
 		}
 	}
 	for id, retirement := range state.RetiredOrigins {
@@ -2637,8 +2664,8 @@ func RestoreAuthorityState(data []byte) (*AuthorityState, error) {
 			retirement.GCGeneration >= state.NextSharedGCGeneration || retirement.RetiredAt.IsZero() {
 			return nil, errors.New("authority snapshot has invalid shared-pack retirement")
 		}
-		if _, volatile := state.VolatileOrigins[id]; volatile {
-			return nil, errors.New("authority snapshot marks an origin volatile and retired")
+		if !state.OriginDead(id) {
+			return nil, errors.New("authority snapshot retires a live origin")
 		}
 	}
 	if lease := state.SharedGC; lease.NodeID != "" {

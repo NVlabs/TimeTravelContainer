@@ -592,22 +592,17 @@ func (b *runtimeBackend) mutateGraphReferenceGroup(ctx context.Context, intent g
 	current, volatile, err := b.distributedSource.authority.SnapshotProvider(group.Origin)
 	if err != nil {
 		if !retain && errors.Is(err, os.ErrNotExist) {
-			state, stateErr := b.distributedSource.authority.AuthorityStateOf(cluster.AuthorityQuery{
-				RetiredOrigins: cluster.Only(group.Origin), AbandonedOrigins: cluster.Only(group.Origin),
-			})
+			state, stateErr := b.distributedSource.authority.AuthorityStateOf(cluster.OriginsQuery(group.Origin))
 			if stateErr != nil {
 				return stateErr
 			}
-			if _, retired := state.RetiredOrigins[group.Origin]; retired {
+			if state.OriginDead(group.Origin) {
 				// Reference-ledger release precedes marking the local intent
 				// complete. A crash after the release may allow the zero-count
 				// origin to retire first; retirement is an irreversible,
-				// generation-fenced acknowledgement of that release.
-				return nil
-			}
-			if state.AbandonedOrigins[group.Origin] {
-				// An unpublished origin can have no surviving reference. A
-				// release retry after its abandonment is therefore complete.
+				// generation-fenced acknowledgement of that release. And an
+				// unpublished origin can have no surviving reference: a release
+				// retry after its abandonment is complete too.
 				return nil
 			}
 		}

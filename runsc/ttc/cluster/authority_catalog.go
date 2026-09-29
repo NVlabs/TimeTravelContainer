@@ -291,19 +291,11 @@ func (c *AuthorityCatalog) PublishSnapshotOrigin(node, incarnation string, snaps
 // SnapshotProvider returns the exact volatile provider. found=false means the
 // origin must resolve from its committed shared manifest.
 func (c *AuthorityCatalog) SnapshotProvider(snapshotID uint64) (provider SnapshotOriginProvider, found bool, err error) {
-	state, err := c.query(AuthorityQuery{
-		VolatileOrigins: Only(snapshotID), AbandonedOrigins: Only(snapshotID), RetiredOrigins: Only(snapshotID),
-	})
+	state, err := c.query(OriginsQuery(snapshotID))
 	if err != nil {
 		return SnapshotOriginProvider{}, false, err
 	}
-	if snapshotID == 0 || snapshotID >= state.NextSnapshotID {
-		return SnapshotOriginProvider{}, false, os.ErrNotExist
-	}
-	if _, retired := state.RetiredOrigins[snapshotID]; retired {
-		return SnapshotOriginProvider{}, false, os.ErrNotExist
-	}
-	if state.AbandonedOrigins[snapshotID] {
+	if snapshotID == 0 || snapshotID >= state.NextSnapshotID || state.OriginDead(snapshotID) {
 		return SnapshotOriginProvider{}, false, os.ErrNotExist
 	}
 	provider, found = state.VolatileOrigins[snapshotID]
@@ -364,8 +356,9 @@ func (c *AuthorityCatalog) SharedGCLease() (SharedGCLease, error) {
 	return state.SharedGC, nil
 }
 
-// RetiredSharedSnapshots returns permanently fenced origins in stable order.
-// Coordinators use this to resume physical deletion after a crash.
+// RetiredSharedSnapshots returns, in stable order, the retirements whose
+// deletion is yet to complete: a coordinator completes and forgets them,
+// resuming the deletion of one that crashed.
 func (c *AuthorityCatalog) RetiredSharedSnapshots() ([]SharedPackRetirement, error) {
 	state, err := c.query(AuthorityQuery{RetiredOrigins: All[uint64]()})
 	if err != nil {
@@ -377,6 +370,14 @@ func (c *AuthorityCatalog) RetiredSharedSnapshots() ([]SharedPackRetirement, err
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].SnapshotID < result[j].SnapshotID })
 	return result, nil
+}
+
+// ForgetSharedRetirements forgets the retirements of snapshots, whose
+// deletion is complete; they stay dead.
+func (c *AuthorityCatalog) ForgetSharedRetirements(lease SharedGCLease, snapshots []uint64) error {
+	return applyAuthorityNoValue(c, time.Now().UTC(), AuthoritySharedGCForget, AuthoritySharedGCPayload{
+		NodeID: lease.NodeID, Incarnation: lease.Incarnation, Generation: lease.Generation, SnapshotIDs: snapshots,
+	})
 }
 
 // EnsurePublicationPreparing commits the user-visible lifecycle transition

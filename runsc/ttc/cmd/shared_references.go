@@ -221,7 +221,7 @@ func publicationBridgeIntentNeeded(state *cluster.AuthorityState, intent sharedP
 	if _, volatile := state.VolatileOrigins[intent.Snapshot]; volatile {
 		return false
 	}
-	if state.AbandonedOrigins[intent.Snapshot] {
+	if state.OriginDead(intent.Snapshot) {
 		return false
 	}
 	if intent.Kind == sharedPublicationBridgeOrigin {
@@ -267,7 +267,7 @@ func snapshotOriginsQuery() cluster.AuthorityQuery {
 // withSnapshotOrigins adds the snapshot origins' records to query.
 func withSnapshotOrigins(query cluster.AuthorityQuery) cluster.AuthorityQuery {
 	query.VolatileOrigins = cluster.All[uint64]()
-	query.AbandonedOrigins = cluster.All[uint64]()
+	query.SharedOrigins = cluster.All[uint64]()
 	query.RetiredOrigins = cluster.All[uint64]()
 	return query
 }
@@ -327,19 +327,6 @@ func (s *sharedReferenceService) SnapshotReferenceInventory(_ context.Context, _
 	}
 	s.claimMu.Lock()
 	defer s.claimMu.Unlock()
-	retired := make(map[uint64]struct{})
-	if s.authority != nil {
-		state, err := s.authority.AuthorityStateOf(cluster.AuthorityQuery{RetiredOrigins: cluster.All[uint64](), AbandonedOrigins: cluster.All[uint64]()})
-		if err != nil {
-			return nil, fmt.Errorf("reading retired snapshot origins: %w", err)
-		}
-		for origin := range state.RetiredOrigins {
-			retired[origin] = struct{}{}
-		}
-		for origin := range state.AbandonedOrigins {
-			retired[origin] = struct{}{}
-		}
-	}
 	dir := filepath.Join(s.localRoot, "graph-references")
 	entries, err := os.ReadDir(dir)
 	if errors.Is(err, os.ErrNotExist) {
@@ -348,7 +335,8 @@ func (s *sharedReferenceService) SnapshotReferenceInventory(_ context.Context, _
 	if err != nil {
 		return nil, err
 	}
-	var claims []cluster.SnapshotReferenceClaim
+	var intents []graphReferenceIntent
+	named := make(map[uint64]struct{})
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue
@@ -357,7 +345,30 @@ func (s *sharedReferenceService) SnapshotReferenceInventory(_ context.Context, _
 		if err != nil {
 			return nil, fmt.Errorf("reading reference claim %q: %w", entry.Name(), err)
 		}
-		claims = append(claims, snapshotReferenceClaims(intent, retired)...)
+		intents = append(intents, intent)
+		for _, group := range intent.Groups {
+			named[group.Origin] = struct{}{}
+		}
+	}
+	dead := make(map[uint64]struct{})
+	if s.authority != nil && len(named) != 0 {
+		origins := make([]uint64, 0, len(named))
+		for origin := range named {
+			origins = append(origins, origin)
+		}
+		state, err := s.authority.AuthorityStateOf(cluster.OriginsQuery(origins...))
+		if err != nil {
+			return nil, fmt.Errorf("reading the claimed snapshot origins: %w", err)
+		}
+		for _, origin := range origins {
+			if state.OriginDead(origin) {
+				dead[origin] = struct{}{}
+			}
+		}
+	}
+	var claims []cluster.SnapshotReferenceClaim
+	for _, intent := range intents {
+		claims = append(claims, snapshotReferenceClaims(intent, dead)...)
 	}
 	sort.Slice(claims, func(i, j int) bool {
 		if claims[i].Origin != claims[j].Origin {
@@ -368,7 +379,7 @@ func (s *sharedReferenceService) SnapshotReferenceInventory(_ context.Context, _
 	return &cluster.SnapshotReferenceInventory{NodeID: s.nodeID, Incarnation: s.incarnation, Claims: claims}, nil
 }
 
-func snapshotReferenceClaims(intent graphReferenceIntent, retired map[uint64]struct{}) []cluster.SnapshotReferenceClaim {
+func snapshotReferenceClaims(intent graphReferenceIntent, dead map[uint64]struct{}) []cluster.SnapshotReferenceClaim {
 	claims := make([]cluster.SnapshotReferenceClaim, 0, len(intent.Groups))
 	for _, group := range intent.Groups {
 		if group.Released {
@@ -380,8 +391,9 @@ func snapshotReferenceClaims(intent graphReferenceIntent, retired map[uint64]str
 		// origin. Reporting the stale local intent as a live claim would then
 		// make every future ledger rebuild reject the retired origin, while
 		// the release cannot finish without an active ledger. Retirement is
-		// irreversible proof that this release was already applied.
-		if _, done := retired[group.Origin]; done {
+		// irreversible proof that this release was already applied, and an
+		// abandoned origin has no references.
+		if _, done := dead[group.Origin]; done {
 			continue
 		}
 		claims = append(claims, cluster.SnapshotReferenceClaim{
@@ -440,16 +452,17 @@ func (s *sharedReferenceService) activeSharedClaimReferences(state *cluster.Auth
 			return nil, fmt.Errorf("snapshot reference inventory identity is %v/%v, want %s/%s", inventoryNodeID(inventory), inventoryIncarnation(inventory), node.NodeID, node.Incarnation)
 		}
 		for _, claim := range inventory.Claims {
-			if state.AbandonedOrigins[claim.Origin] {
+			if _, retired := state.RetiredOrigins[claim.Origin]; retired {
+				return nil, fmt.Errorf("node %s claims retired snapshot origin %d", node.NodeID, claim.Origin)
+			}
+			if state.OriginDead(claim.Origin) {
+				// Abandoned, or retired and deleted since the node read it.
 				continue
 			}
 			if _, volatile := state.VolatileOrigins[claim.Origin]; volatile {
 				continue
 			}
 			origin := ttcsnapshot.SnapshotID(claim.Origin)
-			if _, retired := state.RetiredOrigins[claim.Origin]; retired {
-				return nil, fmt.Errorf("node %s claims retired snapshot origin %d", node.NodeID, claim.Origin)
-			}
 			roots, err := graphReferenceRoots(origin, claim.Operation, claim.Roots)
 			if err != nil {
 				return nil, fmt.Errorf("validating node %s reference claim: %w", node.NodeID, err)
@@ -494,9 +507,9 @@ func (s *sharedReferenceService) drainOutbox(ctx context.Context, limit int) (in
 		}
 		for offset := 0; offset < len(pending); {
 			outbound := pending[offset]
-			if state.AbandonedOrigins[uint64(outbound.Child.Snapshot)] {
+			if state.OriginDead(uint64(outbound.Child.Snapshot)) {
 				if outbound.Retain {
-					return delivered, fmt.Errorf("cannot retain abandoned snapshot origin %d", outbound.Child.Snapshot)
+					return delivered, fmt.Errorf("cannot retain abandoned or retired snapshot origin %d", outbound.Child.Snapshot)
 				}
 				delivered++
 				offset++
@@ -509,7 +522,7 @@ func (s *sharedReferenceService) drainOutbox(ctx context.Context, limit int) (in
 					mutations := make([]ttcsnapshot.SnapshotReferenceMutation, 0, len(pending)-offset)
 					for end = offset; end < len(pending); end++ {
 						candidate := pending[end]
-						if state.AbandonedOrigins[uint64(candidate.Child.Snapshot)] {
+						if state.OriginDead(uint64(candidate.Child.Snapshot)) {
 							break
 						}
 						if _, candidateVolatile := state.VolatileOrigins[uint64(candidate.Child.Snapshot)]; candidateVolatile {
@@ -647,13 +660,7 @@ func manifestReferenceIsLive(state *cluster.AuthorityState, name string) (bool, 
 	if state == nil || uint64(parent.Snapshot) >= state.NextSnapshotID {
 		return false, fmt.Errorf("incoming edge reference %q names unallocated parent origin %d", name, parent.Snapshot)
 	}
-	if state.AbandonedOrigins[uint64(parent.Snapshot)] {
-		return false, nil
-	}
-	if _, retired := state.RetiredOrigins[uint64(parent.Snapshot)]; retired {
-		return false, nil
-	}
-	return true, nil
+	return !state.OriginDead(uint64(parent.Snapshot)), nil
 }
 
 func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*ttcsnapshot.ReferenceLedger, error) {
@@ -706,7 +713,7 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 			if _, volatile := state.VolatileOrigins[uint64(root.Snapshot)]; volatile {
 				continue
 			}
-			if state.AbandonedOrigins[uint64(root.Snapshot)] {
+			if state.OriginDead(uint64(root.Snapshot)) {
 				continue
 			}
 			if coldFilesystemReferences[root.Snapshot] == nil {
@@ -723,7 +730,7 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 	}
 	for _, branch := range state.Branches {
 		_, memoryVolatile := state.VolatileOrigins[branch.Roots.MemorySnapshot]
-		if !branch.Corrupted && branch.Roots.MemorySnapshot != 0 && !memoryVolatile && !state.AbandonedOrigins[branch.Roots.MemorySnapshot] {
+		if !branch.Corrupted && branch.Roots.MemorySnapshot != 0 && !memoryVolatile && !state.OriginDead(branch.Roots.MemorySnapshot) {
 			origin := ttcsnapshot.SnapshotID(branch.Roots.MemorySnapshot)
 			manifest, err := s.packs.Manifest(origin)
 			if err != nil {
@@ -757,7 +764,7 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 			continue
 		}
 		_, memoryVolatile := state.VolatileOrigins[publication.CandidateRoots.MemorySnapshot]
-		if publication.CandidateRoots.MemorySnapshot != 0 && !memoryVolatile && !state.AbandonedOrigins[publication.CandidateRoots.MemorySnapshot] {
+		if publication.CandidateRoots.MemorySnapshot != 0 && !memoryVolatile && !state.OriginDead(publication.CandidateRoots.MemorySnapshot) {
 			origin := ttcsnapshot.SnapshotID(publication.CandidateRoots.MemorySnapshot)
 			manifest, err := s.packs.Manifest(origin)
 			if err != nil {
@@ -829,9 +836,10 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 	imported := make(map[ttcsnapshot.SnapshotID]struct{}, len(manifests))
 	for _, manifest := range manifests {
 		if _, retired := state.RetiredOrigins[uint64(manifest.Snapshot)]; retired {
+			// The coordinator completes its deletion; see RetiredSharedSnapshots.
 			continue
 		}
-		if state.AbandonedOrigins[uint64(manifest.Snapshot)] {
+		if state.OriginDead(uint64(manifest.Snapshot)) {
 			busy, discardErr := s.packs.DiscardHandoff(manifest.Snapshot)
 			if discardErr != nil {
 				return fail(fmt.Errorf("discarding abandoned snapshot origin %d: %w", manifest.Snapshot, discardErr))
@@ -1294,7 +1302,7 @@ func providerBaselineCanBeReleased(state *cluster.AuthorityState, name string, o
 		return false
 	}
 	_, volatile := state.VolatileOrigins[uint64(object.Snapshot)]
-	return !volatile && !state.AbandonedOrigins[uint64(object.Snapshot)]
+	return !volatile && !state.OriginDead(uint64(object.Snapshot))
 }
 
 // coldBranchReferenceIdentity makes a durable branch root activation unique.
@@ -1326,7 +1334,7 @@ func (s *sharedReferenceService) authoritativeColdReferences(state *cluster.Auth
 		if snapshot == 0 {
 			return
 		}
-		if _, volatile := state.VolatileOrigins[snapshot]; !volatile && !state.AbandonedOrigins[snapshot] {
+		if _, volatile := state.VolatileOrigins[snapshot]; !volatile && !state.OriginDead(snapshot) {
 			origin := ttcsnapshot.SnapshotID(snapshot)
 			if memory[origin] == nil {
 				memory[origin] = make(map[string]struct{})
@@ -1354,7 +1362,7 @@ func (s *sharedReferenceService) authoritativeColdReferences(state *cluster.Auth
 			if _, volatile := state.VolatileOrigins[uint64(root.Snapshot)]; volatile {
 				continue
 			}
-			if state.AbandonedOrigins[uint64(root.Snapshot)] {
+			if state.OriginDead(uint64(root.Snapshot)) {
 				continue
 			}
 			nameHash := sha256.Sum256([]byte(identity + "\x00" + filesystem.Root.Source + "\x00" + root.String()))
@@ -1564,10 +1572,7 @@ func inactiveGraphReferenceMutations(state *cluster.AuthorityState, current, des
 		if _, volatile := state.VolatileOrigins[uint64(object.Snapshot)]; volatile {
 			continue
 		}
-		if state.AbandonedOrigins[uint64(object.Snapshot)] {
-			continue
-		}
-		if _, retired := state.RetiredOrigins[uint64(object.Snapshot)]; retired {
+		if state.OriginDead(uint64(object.Snapshot)) {
 			continue
 		}
 		names = append(names, name)
@@ -1621,7 +1626,8 @@ func (s *sharedReferenceService) reconcilePublicationBridgeIntents() error {
 		return err
 	}
 	for _, intent := range intents {
-		if state.AbandonedOrigins[intent.Snapshot] {
+		if _, retired := state.RetiredOrigins[intent.Snapshot]; !retired && state.OriginDead(intent.Snapshot) {
+			// Abandoned; or retired, and deleted.
 			origin := ttcsnapshot.SnapshotID(intent.Snapshot)
 			busy, discardErr := s.packs.DiscardHandoff(origin)
 			if discardErr != nil {
@@ -1764,14 +1770,8 @@ func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease clu
 		if err := ctx.Err(); err != nil {
 			return collected, err
 		}
-		encoded := uint64(origin)
-		if encoded >= state.NextSnapshotID || state.AbandonedOrigins[encoded] {
-			continue
-		}
-		if _, volatile := state.VolatileOrigins[encoded]; volatile {
-			continue
-		}
-		if _, retired := state.RetiredOrigins[encoded]; retired {
+		// Only a shared origin's pack is compacted.
+		if !state.SharedOrigins[uint64(origin)] {
 			continue
 		}
 		var live map[ttcsnapshot.ObjectID]struct{}
@@ -1856,7 +1856,16 @@ func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease clu
 				continue
 			}
 		}
-		if state.AbandonedOrigins[uint64(snapshot)] {
+		if _, retired := state.RetiredOrigins[uint64(snapshot)]; retired {
+			// Resume a crash after the irreversible authority fence. In particular,
+			// the ledger and physical pack may independently have completed
+			// their idempotent cleanup steps.
+			if err := s.completeRetirement(snapshot); err != nil {
+				return collected, err
+			}
+			continue
+		}
+		if state.OriginDead(uint64(snapshot)) {
 			// A provider-to-shared handoff imports the immutable graph before
 			// changing its routing authority. Cancellation may permanently
 			// abandon the still-volatile origin in that interval. The publisher
@@ -1864,15 +1873,6 @@ func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease clu
 			// must also forget its now-empty imported ledger origin. A rebuilt
 			// coordinator naturally omits abandoned origins.
 			if err := s.completeAbandonment(snapshot); err != nil {
-				return collected, err
-			}
-			continue
-		}
-		if _, retired := state.RetiredOrigins[uint64(snapshot)]; retired {
-			// Resume a crash after the irreversible authority fence. In particular,
-			// the ledger and physical pack may independently have completed
-			// their idempotent cleanup steps.
-			if err := s.completeRetirement(snapshot); err != nil {
 				return collected, err
 			}
 			continue
@@ -1895,14 +1895,14 @@ func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease clu
 			if err != nil {
 				return collected, err
 			}
-			if latest.AbandonedOrigins[uint64(snapshot)] {
-				if err := s.completeAbandonment(snapshot); err != nil {
+			if _, retired := latest.RetiredOrigins[uint64(snapshot)]; retired {
+				if err := s.completeRetirement(snapshot); err != nil {
 					return collected, err
 				}
 				continue
 			}
-			if _, retired := latest.RetiredOrigins[uint64(snapshot)]; retired {
-				if err := s.completeRetirement(snapshot); err != nil {
+			if latest.OriginDead(uint64(snapshot)) {
+				if err := s.completeAbandonment(snapshot); err != nil {
 					return collected, err
 				}
 				continue
@@ -2029,8 +2029,9 @@ func sharedPackNeedsCompaction(manifest *ttcsnapshot.SnapshotManifest, live map[
 func (s *sharedReferenceService) completeRetirement(snapshot ttcsnapshot.SnapshotID) error {
 	// The authority has already made the origin unreachable to new readers. Forget the
 	// logical origin durably before deleting its bytes. If the daemon crashes
-	// between these steps, RetiredOrigins is the permanent recovery work list;
-	// deleting bytes first instead leaves a live ledger origin with no pack.
+	// between these steps, RetiredOrigins is the recovery work list, until the
+	// retirement is forgotten once complete; deleting bytes first instead
+	// leaves a live ledger origin with no pack.
 	if err := s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
 		return ledger.RetireOrigin(snapshot)
 	}); err != nil {
