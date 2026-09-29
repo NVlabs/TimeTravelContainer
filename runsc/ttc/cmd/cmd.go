@@ -307,8 +307,8 @@ cluster whose shared root TTC_ROOT is, with its own TTC_LOCAL_ROOT. Every node
 starts alike: it holds the cluster's authority, or joins the node that does.
 
 --control-only starts an outbound-only login-node gateway. It accepts commands
-on the socket in its TTC_LOCAL_ROOT but advertises no TCP endpoint, joins no
-Raft group, and accepts no container placement. It finds the cluster's compute
+on the socket in its TTC_LOCAL_ROOT but advertises no TCP endpoint, registers
+no node, and accepts no container placement. It finds the cluster's compute
 nodes in TTC_ROOT, the cluster's shared root.`,
 			"events":       "Usage: ttc events [--json] [-f|--follow] [--since TIME] [--until TIME] [--filter KEY=VALUE]",
 			"pause":        "Usage: ttc pause TARGET [TARGET...]",
@@ -5065,8 +5065,8 @@ func waitForDurableBranch(target selector, backend backend) waitResult {
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		// runtimeBackend implements both interfaces in every mode. Select Raft
-		// authority only for clustered storage; in standalone mode TTC_ROOT is
+		// runtimeBackend implements both interfaces in every mode. Select the
+		// cluster authority only for clustered storage; in standalone mode TTC_ROOT is
 		// the authoritative store and a local capture is already durable. Merely
 		// testing the authority interface here made standalone waits poll a
 		// deliberately inapplicable method forever.
@@ -5082,7 +5082,7 @@ func waitForDurableBranch(target selector, backend backend) waitResult {
 			if durable {
 				return waitResult{}
 			}
-			// A clustered backend's Raft catalog is the complete lifecycle and
+			// A clustered backend's authority catalog is the complete lifecycle and
 			// publication authority. Its persistent family view may deliberately
 			// omit a transaction-scoped physical branch while publication is in
 			// progress, so consulting inspect here can turn a normal pending state
@@ -6053,7 +6053,7 @@ func (b *runtimeBackend) finalizeColdStopAuthority(target selector, previousStat
 	if b == nil || b.distributedSource == nil || b.distributedSource.authority == nil {
 		return false, nil
 	}
-	// Resolve through Raft as well as the shared store. A publication may be
+	// Resolve through the authority as well as the shared store. A publication may be
 	// authoritative before NFS directory and negative-entry caches on this
 	// control node expose the family by name.
 	info, err := b.resolveContainer(target.container)
@@ -6088,7 +6088,7 @@ func (b *runtimeBackend) authoritativeBranchDurable(target selector) (bool, erro
 	if b == nil || b.distributedSource == nil || b.distributedSource.authority == nil {
 		return false, nil
 	}
-	// Resolve through Raft as well as the shared store. A publication may be
+	// Resolve through the authority as well as the shared store. A publication may be
 	// authoritative before NFS directory and negative-entry caches on this
 	// control node expose the family by name.
 	info, err := b.resolveContainer(target.container)
@@ -6111,7 +6111,7 @@ func (b *runtimeBackend) authoritativeBranchDurable(target selector) (bool, erro
 	}
 	if branch.PublicationID == "" {
 		// A stopped dehydrated branch deliberately drops its memory root and
-		// terminal publication history in one Raft transition. Its filesystem
+		// terminal publication history in one authority transition. Its filesystem
 		// root remains authoritative, and an unplaced generation proves that no
 		// mutable runtime can still supersede it. Do not require dead transaction
 		// metadata merely to report this stable state as durable.
@@ -6539,7 +6539,7 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 		var found bool
 		authorityContainer, authorityBranch, found = logicalPlacementForPhysicalRuntime(state, container.ID, target.branch)
 		if !found {
-			return fmt.Errorf("physical branch %s has no unique logical Raft placement", target)
+			return fmt.Errorf("physical branch %s has no unique logical authority placement", target)
 		}
 	}
 	publicationID, err := store.NewBranchPublicationID()
@@ -6668,7 +6668,7 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 	// The replacement is visible only after its complete hidden capture exists.
 	// Promptly cancel a same-node predecessor; a predecessor owned by another
 	// node observes the identity fence and terminates through the ordinary queue
-	// supersession path. CaptureAvailable also fences its Raft authority before
+	// supersession path. CaptureAvailable also fences its authority before
 	// authorizing this publication.
 	if previous.PublicationID != "" {
 		_ = b.publicationQueue.CancelPending(target.container, target.branch, previous.PublicationID)
@@ -6690,7 +6690,7 @@ func persistentBranchInfoFromStore(store ttcbundle.Store, target selector) (ttcb
 	return persistentBranchInfo(info, target.branch)
 }
 
-// logicalFamilyID returns the cluster identity used by Raft. A branch that
+// logicalFamilyID returns the cluster identity used by the authority. A branch that
 // has migrated may be materialized in a node-local container whose physical
 // ID differs from the family ID; physical IDs must never escape into the
 // control-plane state machine.
@@ -6713,7 +6713,7 @@ func (b *runtimeBackend) resolveContainer(identifier string) (ttcbundle.Containe
 	info, err := store.LoadContainer(identifier)
 	if err != nil {
 		if placements, placementErr := b.placementCatalog(); placementErr == nil {
-			// Branch-scoped operations need the Raft family identity before they
+			// Branch-scoped operations need the authority's family identity before they
 			// resolve the exact physical runtime below; they do not need the
 			// canonical shared catalog record. A multi-node family removal may
 			// legitimately delete that record with its final canonical physical
@@ -6731,7 +6731,7 @@ func (b *runtimeBackend) resolveContainer(identifier string) (ttcbundle.Containe
 // shared catalog record that contains its durable node-local/cold metadata.
 //
 // A distributed fork may place a branch in a physical container whose ID is
-// deliberately hidden from the user. While the branch is live, Raft placement
+// deliberately hidden from the user. While the branch is live, authority placement
 // names that physical container. Durable publication makes the branch
 // unplaced and clears execution identity, but commands such as cp, rehydrate,
 // and fork-from-dehydrated must still find its immutable publication record.
@@ -6754,7 +6754,7 @@ func (b *runtimeBackend) resolveDistributedPersistentBranch(logical ttcbundle.Co
 			return logical, branchID, nil
 		}
 	}
-	// Once Raft commits publication, its filesystem root is the canonical
+	// Once authority commands publication, its filesystem root is the canonical
 	// ancestry-independent locator. Following the manifest avoids an NFS
 	// directory scan and disambiguates stale physical incarnations left by
 	// repeated migrations. It also closes the cutover race where placement is
@@ -6783,7 +6783,7 @@ func (b *runtimeBackend) resolveDistributedPersistentBranch(logical ttcbundle.Co
 	for _, container := range containers {
 		for _, branch := range container.Branches {
 			// A migrated runtime's physical branch is a transaction ID. Once
-			// publication commits, Raft deliberately clears physical placement,
+			// publication commits, the authority deliberately clears physical placement,
 			// so the immutable publication ID is the only ancestry-independent
 			// locator for its cold record. Match the logical name only when no
 			// authoritative publication identity is available.
@@ -6884,7 +6884,7 @@ func (b *runtimeBackend) resolveSelector(target selector) (selector, ttcbundle.C
 				if physicalBranch == "" {
 					physicalBranch = target.branch
 				}
-				// Migration keeps the stable logical selector in Raft, but the
+				// Migration keeps the stable logical selector in the authority, but the
 				// target Sentry uses the transaction ID as its physical branch.
 				// This distinction also exists when the target Sentry already hosts
 				// another branch of the family, so comparing only container IDs
@@ -6906,7 +6906,7 @@ func (b *runtimeBackend) resolveSelector(target selector) (selector, ttcbundle.C
 					return target, physical, nil
 				}
 				// Publication commit deliberately removes physical placement from
-				// Raft: a cold branch has no execution owner. Its immutable
+				// the authority: a cold branch has no execution owner. Its immutable
 				// publication identity is then the only authoritative way to select
 				// among the physical records retained by repeated migrations. Never
 				// let an older family record win merely because it also contains a
@@ -10052,7 +10052,7 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 // projectContainerAuthority removes stale ownership and lifecycle fields from
 // the shared physical materialization before it is exposed by inspect. A
 // clustered container.json is deliberately not rewritten on every migration;
-// listFamilies has already merged Raft placement and branch authority into
+// listFamilies has already merged authority placement and branch authority into
 // family, so it is the single public source for these duplicated summary
 // fields. Branch details were projected above by logicalPersistentBranchInfos.
 func projectContainerAuthority(container *ttcbundle.ContainerInfo, family *Family) {
@@ -10098,7 +10098,7 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 		}
 	}
 	// Fence asynchronous publication while the runtime and its local graph are
-	// still intact. Raft atomically chooses cancellation or completed durable
+	// still intact. The authority atomically chooses cancellation or completed durable
 	// publication; either outcome is safe to remove after the queue drains.
 	if b.publicationQueue != nil {
 		for _, branch := range info.Branches {
@@ -10182,7 +10182,7 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 			return fmt.Errorf("releasing distributed runtime memory backing %s for %s: %w", backing.ID, info.Name, err)
 		}
 	}
-	// Resolve shared-ledger references while Raft still identifies local
+	// Resolve shared-ledger references while the authority still identifies local
 	// provider origins. Local collection may abandon an empty volatile origin;
 	// after that absence deliberately means "read from shared" to consumers.
 	// Both steps take time in proportion to the family's memory and storage,
@@ -10278,12 +10278,12 @@ func (b *runtimeBackend) removeContainerPlacements(info ttcbundle.ContainerInfo)
 // removeLogicalBranchPlacement commits deletion of one user-visible branch.
 //
 // Most placement cleanup can recover the logical identity from the physical
-// container and branch recorded in Raft. A durable publication deliberately
+// container and branch recorded in the authority. A durable publication deliberately
 // clears that physical identity when it makes a branch unplaced, however. At
 // that point the lifecycle command's original selector is the only exact
 // logical identity available. Treating the published physical container as
 // authoritative made removal appear to succeed while leaving its unplaced
-// Raft record behind.
+// authority record behind.
 func (b *runtimeBackend) removeLogicalBranchPlacement(familyID, branchID string) error {
 	if b.nodeID == "" {
 		return nil
@@ -10339,12 +10339,12 @@ func (b *runtimeBackend) distributedFamilyHasPeerPlacement(familyID, branchID st
 }
 
 // removeCorruptedBranch removes a branch whose execution authority has
-// already been permanently fenced by Raft. Corruption intentionally clears
+// already been permanently fenced by the authority. Corruption intentionally clears
 // OwnerNode and every physical runtime identity: contacting the former owner
 // would both violate that fence and make rm wait for a process that is known
 // to be gone.
 //
-// The operation is idempotent across crashes. Raft is changed first; a retry
+// The operation is idempotent across crashes. The authority is changed first; a retry
 // can reconstruct the transaction match from the logical selector and finish
 // pruning the shared family catalog even though the placement no longer
 // exists. The family record itself remains until the coordinator has removed
@@ -10398,7 +10398,7 @@ func (b *runtimeBackend) removeCorruptedBranch(target selector) error {
 }
 
 // removeDistributedFamilyRecord deletes the canonical, non-executing family
-// record after every Raft placement has been removed through its exact
+// record after every authority placement has been removed through its exact
 // physical branch. A family whose canonical container hosted the final branch
 // is already absent, making this operation naturally idempotent.
 func (b *runtimeBackend) removeDistributedFamilyRecord(containerID string, volumes bool) error {
@@ -10431,7 +10431,7 @@ func (b *runtimeBackend) removeDistributedFamilyRecord(containerID string, volum
 		}
 		for _, candidate := range containers {
 			if candidate.ID != info.ID {
-				// With no remaining Raft placement, this is an inert physical
+				// With no remaining authority placement, this is an inert physical
 				// catalog left by a completed migration, canceled fork, or lost
 				// runtime. Per-node cleanup has already fenced and removed any
 				// corresponding local shell; prune the shared identity now.
@@ -10464,7 +10464,7 @@ func (b *runtimeBackend) removeDistributedFamilyRecord(containerID string, volum
 }
 
 // reclaimRemovedFamilyLocal drops node-local runtime shells and cache entries
-// only after Raft proves that the logical family has no placements anywhere.
+// only after the authority proves that the logical family has no placements anywhere.
 // physicalIDs are captured before the shared family catalog is removed, so a
 // remote node never has to infer ownership from an already-deleted record.
 func (b *runtimeBackend) reclaimRemovedFamilyLocal(familyID string, physicalIDs []string) error {
@@ -11546,8 +11546,8 @@ func (b *runtimeBackend) unpublishPort(target selector, binding ttcbundle.PortBi
 
 // usesEphemeralPortIngress reports whether published ports belong only to the
 // daemon process that accepted the request. Cluster ingress is deliberately
-// node-local: each accepted connection resolves the branch's current Raft
-// placement, so it follows migration without rewriting container metadata.
+// node-local: each accepted connection resolves the branch's current
+// placement in the authority, so it follows migration without rewriting container metadata.
 // Standalone TTC has no placement catalog and therefore persists bindings in
 // the container record so daemon reconciliation can restore their listeners.
 func (b *runtimeBackend) usesEphemeralPortIngress() bool {
@@ -11817,7 +11817,7 @@ func (b *runtimeBackend) listFamiliesOf(familyID string) ([]Family, error) {
 	}
 	// Resolve physical migration identities before constructing the persistent
 	// view. A target imported into an existing Sentry is stored under a private
-	// transaction branch name, even though Raft exposes only the stable logical
+	// transaction branch name, even though the authority exposes only the stable logical
 	// name. The private name must never enter user-facing inventory.
 	if !placementsRead {
 		readPlacements()
@@ -11833,7 +11833,7 @@ func (b *runtimeBackend) listFamiliesOf(familyID string) ([]Family, error) {
 	byID := make(map[string]Family, len(containers)+len(runtimeFamilies))
 	for _, container := range containers {
 		if container.IsDistributedPhysicalRuntime() {
-			// Per-node target records are addressed through Raft placement. They
+			// Per-node target records are addressed through authority placement. They
 			// must not appear as additional user-visible families.
 			continue
 		}
@@ -11910,7 +11910,7 @@ func (b *runtimeBackend) listFamiliesOf(familyID string) ([]Family, error) {
 		}
 	}
 	if b.distributedSource != nil && b.distributedSource.authority != nil {
-		// In clustered TTC, Raft is the existence authority for every logical
+		// In clustered TTC, the authority decides existence for every logical
 		// branch, including cold/unplaced ones. container.json is a physical
 		// materialization record and can lag a rename or removal on another node;
 		// retaining names absent from the placement snapshot manufactures zombie
@@ -11943,12 +11943,12 @@ func (b *runtimeBackend) listFamiliesOf(familyID string) ([]Family, error) {
 				physicalID := family.ID
 				family.ID = placements[0].FamilyID
 				// Unmapped runtime branches are paused sparse providers from an
-				// older migration incarnation or provisional targets whose Raft
+				// older migration incarnation or provisional targets whose
 				// placement has not committed. They are implementation state, not
 				// additional user-visible branches.
 				family.Branches = visiblePhysicalRuntimeBranches(family.Branches, placements, physicalID)
 			} else if physicalRuntime {
-				// Raft only retains the current physical placement for a logical
+				// The authority only retains the current physical placement for a logical
 				// branch. A completed migration's source runtime can therefore
 				// remain visible to runsc briefly while its asynchronous cleanup
 				// is retrying. It is internal implementation state, never a new
@@ -12057,7 +12057,7 @@ func (b *runtimeBackend) listFamiliesOf(familyID string) ([]Family, error) {
 			byID[id] = family
 		}
 	}
-	// In clustered TTC, Raft is the lifecycle authority. Shared container JSON
+	// In clustered TTC, the authority decides lifecycle. Shared container JSON
 	// is a materialization catalog and may lag a lease-expiry or migration
 	// decision; never let it make a fenced/corrupted branch appear runnable.
 	if b.nodeID != "" && b.distributedSource != nil && b.distributedSource.authority != nil {
@@ -12113,8 +12113,9 @@ func branchesInPlacementSnapshot(branches []Branch, placements []cluster.Placeme
 	return filtered
 }
 
-// mergeAuthoritativeBranch projects one Raft branch record into the public
-// family view. Raft is the existence and lifecycle authority in a cluster, so
+// mergeAuthoritativeBranch projects one authority branch record into the
+// public family view. The authority decides existence and lifecycle in a
+// cluster, so
 // an unplaced migrated branch must be synthesized even when its durable bytes
 // live in a hidden transaction-scoped container. Requiring a matching entry in
 // the logical family's container.json made cold migrated branches disappear
@@ -12239,7 +12240,7 @@ func enrichPersistentBranchDiagnostics(family *Family) {
 			case "exited", "stopped", "failed":
 				branch.InitState = "exited"
 			case "running", "paused":
-				// Raft lifecycle and placement are authoritative after a remote
+				// The authority lifecycle and placement are authoritative after a remote
 				// fork or migration. A control-only node may not have a local
 				// Sentry from which to enrich these fields, but a branch cannot
 				// commit either state without a live PID 1 on its owner.
@@ -12566,7 +12567,7 @@ func persistentBranches(infos []ttcbundle.BranchInfo) []Branch {
 
 // logicalPersistentBranchInfos removes transaction-scoped migration branch
 // names from a user-facing persistent view. A physical migration branch is
-// visible only through the Raft placement that currently maps it to a stable
+// visible only through the authority placement that currently maps it to a stable
 // logical identity. Superseded physical branches are provider/cleanup state and
 // remain hidden even while their local metadata genuinely still exists.
 func logicalPersistentBranchInfos(infos []ttcbundle.BranchInfo, placements []cluster.PlacementRecord, offlineOwners map[string]bool, physicalContainer string) []ttcbundle.BranchInfo {
@@ -14180,12 +14181,12 @@ func (b *runtimeBackend) abandonEmptyVolatileMemoryOrigins() (int, error) {
 // reconcileVolatileSnapshotOrigins removes provider-directory entries whose
 // authoritative local graph no longer exists. Snapshot IDs are cluster-wide,
 // so a single union of the memory graph and filesystem repository graphs is
-// sufficient; Raft deliberately does not need page- or file-level state.
+// sufficient; the authority deliberately does not need page- or file-level state.
 //
 // Lifecycle mutations and this reconciliation share the daemon data-root
 // lock. Thus an origin allocated for an in-progress mutation cannot be
 // mistaken for crash residue between allocation and graph adoption. Any
-// uncommitted shared handoff is discarded before Raft forgets its provider, so
+// uncommitted shared handoff is discarded before the authority forgets its provider, so
 // absence from the provider directory never exposes canceled bytes as shared
 // authority.
 func (b *runtimeBackend) reconcileVolatileSnapshotOrigins() (int, error) {
@@ -14199,8 +14200,8 @@ func (b *runtimeBackend) reconcileVolatileSnapshotOrigins() (int, error) {
 	if node == "" || b.distributedSource.incarnation == "" {
 		return 0, errors.New("cluster snapshot reconciliation lacks node incarnation")
 	}
-	// Snapshot-provider mutations are fenced to the current Raft leader term.
-	// A node may remain healthy across a leadership change while its periodic
+	// Snapshot-provider mutations are fenced to the current authority holder term.
+	// A node may remain healthy across a takeover while its periodic
 	// heartbeat has not yet renewed that term. Reconcile synchronously so an
 	// otherwise successful branch removal cannot fail in this transient window.
 	if _, err := b.renewDistributedExecutionAuthority(); err != nil {
@@ -14242,7 +14243,7 @@ func (b *runtimeBackend) reconcileVolatileSnapshotOrigins() (int, error) {
 		// to adopt, is building by the time this returns.
 		b.distributedSource.awaitOriginAllocations()
 	}
-	// The stale origins are independent, and each costs rechecks and a Raft
+	// The stale origins are independent, and each costs rechecks and an authority
 	// proposal: several go at once, and the authority commits theirs together.
 	work := make(chan uint64)
 	errs := make([]error, min(len(stale), staleOriginWorkers))
@@ -14457,7 +14458,7 @@ func (b *runtimeBackend) discard(target selector) error {
 	}
 	// Retiring PublicationID below is the physical CAS that prevents a stale
 	// worker from replaying this branch's preceding lifecycle. First wait out an
-	// exact in-flight queue worker so its committed Raft roots and data-plane
+	// exact in-flight queue worker so its committed roots and data-plane
 	// cleanup reach a terminal boundary. Otherwise daemon drain would retain an
 	// intent whose next retry can only report "publication identity changed".
 	if branch.PublicationID != "" && b.publicationQueue != nil {
@@ -14622,7 +14623,7 @@ func (b *runtimeBackend) deleteRuntimeIfProcessFree(info ttcbundle.ContainerInfo
 
 // allocateGraphSnapshotOrigin keeps the core graph independent of its ID
 // allocator. Standalone roots allocate locally; clustered roots first commit
-// the globally unique origin and exact volatile provider through Raft. The
+// the globally unique origin and exact volatile provider in the authority. The
 // origin is building, and cleanup of empty origins leaves it alone, until
 // the capture calls built, once it is over.
 func (b *runtimeBackend) allocateGraphSnapshotOrigin() (_ ttcsnapshot.SnapshotID, _ ttcsnapshot.SnapshotState, built func(), _ error) {
@@ -14648,14 +14649,14 @@ func (b *runtimeBackend) allocateGraphSnapshotOrigin() (_ ttcsnapshot.SnapshotID
 	}
 	b.distributedSource.allocating.RUnlock()
 	if err != nil {
-		return 0, "", nil, fmt.Errorf("allocating Raft snapshot origin: %w", err)
+		return 0, "", nil, fmt.Errorf("allocating snapshot origin: %w", err)
 	}
 	if built == nil {
-		return 0, "", nil, fmt.Errorf("raft returned invalid snapshot allocation %+v", allocation)
+		return 0, "", nil, fmt.Errorf("the authority returned invalid snapshot allocation %+v", allocation)
 	}
 	if err := b.snapshotGraph.AdoptWorking(origin); err != nil {
 		built()
-		return 0, "", nil, fmt.Errorf("adopting Raft snapshot origin %d: %w", origin, err)
+		return 0, "", nil, fmt.Errorf("adopting snapshot origin %d: %w", origin, err)
 	}
 	return origin, ttcsnapshot.SnapshotSealedVolatile, built, nil
 }
@@ -14735,7 +14736,7 @@ func (b *runtimeBackend) reconcileInterruptedClusterMemoryGraph() error {
 		}
 	}
 	// Empty provider origins are abandoned by the ordinary volatile-origin
-	// reconciliation after this node transitions from joining to ready. Raft
+	// reconciliation after this node transitions from joining to ready. The authority
 	// intentionally rejects execution-authority mutations while joining.
 	return nil
 }
@@ -14823,7 +14824,7 @@ func reconcileInterruptedMemoryGraph(graph *ttcsnapshot.Store, data *ttcsnapshot
 
 // newFilesystemOriginScope returns a bundle allocator and a completion
 // function. A failed bundle preparation abandons every otherwise-unreachable
-// Raft allocation without reusing its ID; success transfers those origins to
+// origin the authority allocated, without reusing its ID; success transfers those origins to
 // the created repositories.
 func (b *runtimeBackend) newFilesystemOriginScope() (func(uint32) ([]ttcsnapshot.SnapshotID, error), func(bool) error) {
 	if b.distributedSource == nil || b.distributedSource.authority == nil {
@@ -14852,10 +14853,10 @@ func (b *runtimeBackend) newFilesystemOriginScope() (func(uint32) ([]ttcsnapshot
 		}
 		b.distributedSource.allocating.RUnlock()
 		if err != nil {
-			return nil, fmt.Errorf("allocating Raft filesystem origins: %w", err)
+			return nil, fmt.Errorf("allocating filesystem origins: %w", err)
 		}
 		if !valid {
-			return nil, fmt.Errorf("raft returned invalid filesystem snapshot allocation %+v", allocation)
+			return nil, fmt.Errorf("the authority returned invalid filesystem snapshot allocation %+v", allocation)
 		}
 		origins := make([]ttcsnapshot.SnapshotID, count)
 		for index := range origins {
@@ -14888,7 +14889,7 @@ func (b *runtimeBackend) newFilesystemOriginScope() (func(uint32) ([]ttcsnapshot
 }
 
 // ensureClusterFilesystemWorkingOrigins upgrades immutable cold repository
-// branches to fresh Raft-owned working origins immediately before a runtime is
+// branches to fresh authority-owned working origins immediately before a runtime is
 // admitted to mutate them. Repository open and offline inspection deliberately
 // do not perform this transition.
 func (b *runtimeBackend) ensureClusterFilesystemWorkingOrigins(info ttcbundle.ContainerInfo, filesystemBranch string) error {
@@ -16702,7 +16703,7 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 		}
 	}
 	if recorded == nil {
-		// A failed node may lose its only physical catalog before Raft can mark
+		// A failed node may lose its only physical catalog before the authority can mark
 		// the branch corrupted. The control-plane tombstone is then the only
 		// remaining object, and removing it is both necessary and sufficient.
 		if corrupted {
@@ -17590,7 +17591,7 @@ func (b *runtimeBackend) finalizeObservedInitExit(target selector) (bool, error)
 // a failure between the console follower's durable wait-status write and the
 // asynchronous publication intent. It intentionally scans physical records:
 // remote forks and migrations may be materialized under hidden IDs even though
-// their user-facing identity is a logical Raft branch.
+// their user-facing identity is a logical branch in the authority.
 func (b *runtimeBackend) reconcileObservedInitExits() error {
 	if b == nil || b.dataRoot == "" {
 		return nil

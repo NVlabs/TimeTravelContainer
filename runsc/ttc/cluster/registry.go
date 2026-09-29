@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -51,7 +50,6 @@ type NodeRecord struct {
 	State                 NodeState                      `json:"state"`
 	ControlURL            string                         `json:"control_url"`
 	ControlServerName     string                         `json:"control_server_name"`
-	RaftAddress           string                         `json:"raft_address,omitempty"`
 	Capabilities          Capabilities                   `json:"capabilities"`
 	MemoryTargetBytes     uint64                         `json:"memory_target_bytes,omitempty"`
 	MemoryCurrentBytes    uint64                         `json:"memory_current_bytes,omitempty"`
@@ -63,9 +61,9 @@ type NodeRecord struct {
 	UpdatedAt             time.Time                      `json:"updated_at"`
 	LeaseExpiresAt        time.Time                      `json:"lease_expires_at"`
 	LeaseDuration         time.Duration                  `json:"lease_duration,omitempty"`
-	// LeaseTerm proves that this incarnation renewed with the current Raft
-	// leader. A prior-term wall-clock deadline alone never authorizes work.
-	LeaseTerm uint64 `json:"lease_term,omitempty"`
+	// LeaseEpoch is the epoch of the authority this incarnation last renewed
+	// with. A deadline of an earlier epoch alone never authorizes work.
+	LeaseEpoch uint64 `json:"lease_epoch,omitempty"`
 }
 
 // IncomingReservation fences capacity promised to one placement operation.
@@ -134,15 +132,6 @@ func (r NodeRecord) Validate() error {
 	if parsed.Scheme == "https" && (strings.TrimSpace(r.ControlServerName) == "" || strings.TrimSpace(r.ControlServerName) != r.ControlServerName) {
 		return fmt.Errorf("invalid control TLS server name %q", r.ControlServerName)
 	}
-	if r.RaftAddress != "" {
-		if strings.Contains(r.RaftAddress, "@") {
-			if _, _, err := parseRaftAddress(r.RaftAddress); err != nil {
-				return fmt.Errorf("invalid node Raft address: %w", err)
-			}
-		} else if _, _, err := net.SplitHostPort(r.RaftAddress); err != nil {
-			return fmt.Errorf("invalid node Raft address: %w", err)
-		}
-	}
 	if r.Revision == 0 || r.LeaseDuration <= 0 || r.StartedAt.IsZero() || r.UpdatedAt.Before(r.StartedAt) || r.LeaseExpiresAt.Before(r.UpdatedAt) {
 		return errors.New("invalid node revision or lease timestamps")
 	}
@@ -180,7 +169,7 @@ type NodeDirectory struct {
 }
 
 // NodeCatalog is the linearizable membership and capacity authority consumed
-// by elastic placement. Clustered TTC uses the Raft implementation;
+// by elastic placement. Clustered TTC uses the authority implementation;
 // NodeDirectory is a filesystem-backed test implementation.
 type NodeCatalog interface {
 	Register(NodeRecord, time.Time, time.Duration) (*NodeRecord, error)
@@ -333,7 +322,7 @@ func (d *NodeDirectory) Heartbeat(nodeID, incarnation string, current uint64, no
 
 // updateNodePressureState derives the ordinary ready/pressured load state from
 // the committed memory sample. Keep this in the catalog mutation rather than
-// in a caller-side follow-up transition: Raft renewals must publish the load
+// in a caller-side follow-up transition: a renewal must publish the load
 // and the state it implies atomically, and must not bypass pressure detection.
 func updateNodePressureState(record *NodeRecord) {
 	switch record.State {

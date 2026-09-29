@@ -2165,21 +2165,6 @@ func TestDefaultClusterTransactionCapacitySupportsHighFanout(t *testing.T) {
 	}
 }
 
-func TestClusterRaftStabilityTimeout(t *testing.T) {
-	for _, test := range []struct {
-		lease time.Duration
-		want  time.Duration
-	}{
-		{lease: 3 * time.Second, want: time.Second},
-		{lease: 30 * time.Second, want: 3 * time.Second},
-		{lease: 2 * time.Minute, want: 5 * time.Second},
-	} {
-		if got := clusterRaftStabilityTimeout(test.lease); got != test.want {
-			t.Errorf("clusterRaftStabilityTimeout(%v)=%v, want %v", test.lease, got, test.want)
-		}
-	}
-}
-
 // Every node of a cluster starts alike: its shared root anchors the cluster.
 func TestSimpleClusterOptions(t *testing.T) {
 	opts := defaultDaemonClusterOptions()
@@ -2340,7 +2325,8 @@ func TestPrepareControlOnlyClusterProbesComputeSeed(t *testing.T) {
 	}
 }
 
-func TestJoinAuthorityWaitsForLeaderElection(t *testing.T) {
+// Between holders, a join asks again.
+func TestJoinAuthorityWaitsForAHolder(t *testing.T) {
 	calls := 0
 	seed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/authority/join" {
@@ -2352,8 +2338,8 @@ func TestJoinAuthorityWaitsForLeaderElection(t *testing.T) {
 		if calls < 3 {
 			w.WriteHeader(http.StatusConflict)
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"error":      "TTC authority has no elected Raft leader",
-				"not_leader": true,
+				"error":      "the TTC cluster authority has no holder",
+				"not_holder": true,
 			})
 			return
 		}
@@ -2451,7 +2437,7 @@ func TestControlOnlyClusterDiscoversComputePeers(t *testing.T) {
 	}
 }
 
-func TestControlOnlyClusterFollowsRaftLeaderAfterElection(t *testing.T) {
+func TestControlOnlyClusterFollowsTheHolderRedirect(t *testing.T) {
 	var leader *httptest.Server
 	leader = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/authority/query" {
@@ -2479,8 +2465,8 @@ func TestControlOnlyClusterFollowsRaftLeaderAfterElection(t *testing.T) {
 		case "/v1/authority/query":
 			w.WriteHeader(http.StatusConflict)
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"error": "not leader", "not_leader": true, "leader_id": "leader",
-				"leader_address": "leader:raft", "leader_control_url": leader.URL,
+				"error": "not the holder", "not_holder": true, "holder_id": "leader",
+				"holder_control_url": leader.URL,
 			})
 		default:
 			http.NotFound(w, r)
@@ -2655,39 +2641,32 @@ func TestClusterPageAddressesRequireEphemeralPorts(t *testing.T) {
 }
 
 // A cluster's first daemon records its identity, which every later one
-// shares; an older cluster's identity is kept.
-func TestRaftClusterIdentity(t *testing.T) {
+// shares, and binds its local root to it.
+func TestClusterIdentity(t *testing.T) {
 	shared := t.TempDir()
-	localA := filepath.Join(t.TempDir(), "raft")
-	clusterID, err := prepareClusterRaftIdentity(shared, localA, "repository", "node-a")
+	localA := t.TempDir()
+	clusterID, err := prepareClusterIdentity(shared, localA, "repository", "node-a")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if clusterID == "" {
 		t.Fatal("the first daemon produced an empty cluster ID")
 	}
-	if retry, err := prepareClusterRaftIdentity(shared, localA, "repository", "node-a"); err != nil || retry != clusterID {
+	if retry, err := prepareClusterIdentity(shared, localA, "repository", "node-a"); err != nil || retry != clusterID {
 		t.Fatalf("same-root retry=(%q, %v), want %q", retry, err, clusterID)
 	}
-	if joined, err := prepareClusterRaftIdentity(shared, filepath.Join(t.TempDir(), "raft"), "repository", "node-b"); err != nil || joined != clusterID {
+	if joined, err := prepareClusterIdentity(shared, t.TempDir(), "repository", "node-b"); err != nil || joined != clusterID {
 		t.Fatalf("second node's identity=(%q, %v), want %q", joined, err, clusterID)
 	}
-	if _, err := prepareClusterRaftIdentity(shared, filepath.Join(t.TempDir(), "raft"), "another-repository", "node-c"); err == nil {
-		t.Fatal("mismatched repository joined Raft cluster")
+	if _, err := prepareClusterIdentity(shared, t.TempDir(), "another-repository", "node-c"); err == nil {
+		t.Fatal("mismatched repository joined the cluster")
 	}
-	if _, err := prepareClusterRaftIdentity(t.TempDir(), localA, "repository", "node-a"); err == nil || !strings.Contains(err.Error(), "another Raft cluster") {
+	if _, err := prepareClusterIdentity(t.TempDir(), localA, "repository", "node-a"); err == nil || !strings.Contains(err.Error(), "another cluster") {
 		t.Fatalf("a local root of another cluster: %v", err)
-	}
-	older := t.TempDir()
-	if err := os.WriteFile(filepath.Join(older, ".ttc-raft-cluster.json"), []byte(`{"version":1,"cluster_id":"older-cluster","repository_id":"repository"}`), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if kept, err := prepareClusterRaftIdentity(older, filepath.Join(t.TempDir(), "raft"), "repository", "node-a"); err != nil || kept != "older-cluster" {
-		t.Fatalf("older cluster's identity=(%q, %v), want older-cluster", kept, err)
 	}
 }
 
-func TestLocalIncarnationRecovery(t *testing.T) {
+func TestLocalIncarnationReset(t *testing.T) {
 	const (
 		node        = "node-a"
 		incarnation = "incarnation-a"
@@ -2695,24 +2674,24 @@ func TestLocalIncarnationRecovery(t *testing.T) {
 	for _, test := range []struct {
 		name    string
 		state   *cluster.AuthorityState
-		want    localAuthorityRecovery
+		want    bool
 		wantErr bool
 	}{
-		{name: "forgotten member", state: cluster.NewAuthorityState(), want: resetLocalAuthority},
+		{name: "forgotten member", state: cluster.NewAuthorityState(), want: true},
 		{name: "expired offline member", state: &cluster.AuthorityState{Nodes: map[string]cluster.NodeRecord{
 			node: {NodeID: node, Incarnation: incarnation, State: cluster.NodeOffline},
-		}}, want: rejoinLocalAuthority},
+		}}},
 		{name: "live matching member", state: &cluster.AuthorityState{Nodes: map[string]cluster.NodeRecord{
 			node: {NodeID: node, Incarnation: incarnation, State: cluster.NodeReady},
-		}}, want: keepLocalAuthority},
+		}}},
 		{name: "same name has new identity", state: &cluster.AuthorityState{Nodes: map[string]cluster.NodeRecord{
 			node: {NodeID: node, Incarnation: "incarnation-new", State: cluster.NodeReady},
 		}}, wantErr: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			got, err := localIncarnationRecovery(test.state, node, incarnation)
+			got, err := localIncarnationReset(test.state, node, incarnation)
 			if (err != nil) != test.wantErr || got != test.want {
-				t.Fatalf("localIncarnationRecovery()=(%d, %v), want (%d, err=%t)", got, err, test.want, test.wantErr)
+				t.Fatalf("localIncarnationReset()=(%t, %v), want (%t, err=%t)", got, err, test.want, test.wantErr)
 			}
 		})
 	}

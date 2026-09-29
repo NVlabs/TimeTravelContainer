@@ -134,14 +134,14 @@ type Transaction struct {
 	CreatedAt  time.Time              `json:"created_at"`
 	UpdatedAt  time.Time              `json:"updated_at"`
 	Failure    string                 `json:"failure,omitempty"`
-	// SourceIncarnation is assigned by the replicated state machine when the
+	// SourceIncarnation is assigned by the authority's state machine when the
 	// transaction is created. Reusing a human node ID cannot satisfy an old
 	// target's volatile dependency.
 	SourceIncarnation string `json:"source_incarnation,omitempty"`
 	TargetIncarnation string `json:"target_incarnation,omitempty"`
 	// SourcePhysical* binds the transaction's provider to the exact node-local
 	// container selected when the transaction began. For migration this comes
-	// from the Raft placement. For an ordinary fork the authenticated source
+	// from the authority placement. For an ordinary fork the authenticated source
 	// reports it, which is essential when an unplaced cold branch is served
 	// from a temporary materialization. SourceBranch remains the stable logical
 	// identity and may be reused while the physical provider is still fenced.
@@ -177,7 +177,7 @@ type Transaction struct {
 	// the older completion from mistaking that newer dependency for an ancestor
 	// and releasing its source prematurely.
 	InheritedDependencies []string `json:"inherited_dependencies,omitempty"`
-	// OwnershipCommitted is set in the same Raft entry that moves a migrated
+	// OwnershipCommitted is set in the same authority command that moves a migrated
 	// branch's placement. It separates a physically prepared target from the
 	// sole authoritative target before activation.
 	OwnershipCommitted bool `json:"ownership_committed,omitempty"`

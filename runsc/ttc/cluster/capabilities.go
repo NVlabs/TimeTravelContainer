@@ -14,10 +14,12 @@ import (
 )
 
 const (
-	// ControlProtocolVersion 11 moves ephemeral dehydrated-fork metadata from
-	// shared-filesystem paths to the transaction-fenced peer relay. Version 10
-	// records the target-reported physical runtime identity before cutover.
-	ControlProtocolVersion = 11
+	// ControlProtocolVersion 12 replaces Raft with the authority log: a node
+	// registers with the authority's holder and is not a Raft member, and a
+	// redirect names the holder. Version 11 moves ephemeral dehydrated-fork
+	// metadata from shared-filesystem paths to the transaction-fenced peer
+	// relay.
+	ControlProtocolVersion = 12
 
 	FeatureRemotePull           = "remote-memory-pull"
 	FeatureReversePush          = "reverse-page-push"

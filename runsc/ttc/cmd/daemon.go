@@ -41,7 +41,6 @@ import (
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/runsc/boot"
-	"gvisor.dev/gvisor/runsc/processutil"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 	"gvisor.dev/gvisor/runsc/ttc/protocol"
@@ -473,33 +472,30 @@ func defaultDaemonClusterOptions() daemonClusterOptions {
 }
 
 type daemonClusterRuntime struct {
-	listen            string
-	authToken         string
-	mux               *cluster.ProtocolMux
-	controlListener   net.Listener
-	controlPlane      *cluster.ControlPlane
-	source            *distributedSourceRuntime
-	directory         cluster.NodeCatalog
-	placements        cluster.PlacementCatalog
-	transactions      cluster.TransactionCatalog
-	raft              *cluster.AuthorityRaftNode
-	raftLocalDir      string
-	raftCatalog       *cluster.RaftCatalog
-	nodeRecord        cluster.NodeRecord
-	lease             time.Duration
-	clusterID         string
-	recoverMembership func(context.Context) error
+	listen          string
+	authToken       string
+	controlListener net.Listener
+	controlPlane    *cluster.ControlPlane
+	source          *distributedSourceRuntime
+	directory       cluster.NodeCatalog
+	placements      cluster.PlacementCatalog
+	transactions    cluster.TransactionCatalog
+	// authority is this daemon's part in the cluster authority: the
+	// authority itself while it holds it.
+	authority  *cluster.AuthorityNode
+	catalog    *cluster.AuthorityCatalog
+	nodeRecord cluster.NodeRecord
+	lease      time.Duration
+	clusterID  string
 	// shared is the part of the cluster in the shared root; heartbeat keeps
-	// this daemon alive in it, liveness judges others', and authority names
-	// the authority this daemon holds, if it is self, or joined.
+	// this daemon alive in it, liveness judges others', and authorityRecord
+	// names the node that holds the authority, self if this daemon does.
 	shared          cluster.SharedCluster
 	heartbeat       *cluster.Heartbeat
 	liveness        *cluster.Liveness
 	authorityMu     sync.Mutex
-	authority       cluster.AuthorityRecord
+	authorityRecord cluster.AuthorityRecord
 	self            cluster.AuthorityRecord
-	raftEpoch       *atomic.Uint64
-	cancelFreshJoin func(context.Context) error
 	autoRebalance   bool
 	capacitySink    elasticCapacitySink
 	cpuProfile      daemonCPUProfile
@@ -508,17 +504,17 @@ type daemonClusterRuntime struct {
 func (r *daemonClusterRuntime) currentAuthority() cluster.AuthorityRecord {
 	r.authorityMu.Lock()
 	defer r.authorityMu.Unlock()
-	return r.authority
+	return r.authorityRecord
 }
 
 func (r *daemonClusterRuntime) setAuthority(record cluster.AuthorityRecord) {
 	r.authorityMu.Lock()
 	defer r.authorityMu.Unlock()
-	r.authority = record
+	r.authorityRecord = record
 }
 
 // controlOnlyCluster is an outbound-only cluster gateway. It deliberately has
-// no Raft node, NodeRecord, placement capacity, TCP listener, or data-plane
+// no authority state, NodeRecord, placement capacity, TCP listener, or data-plane
 // provider. Commands arriving on its per-user Unix socket are tunneled to a
 // compute daemon, which performs the ordinary authoritative routing.
 type controlOnlyCluster struct {
@@ -609,11 +605,12 @@ func (c *controlOnlyCluster) seedURLs() []string {
 	return urls
 }
 
-// authorityState follows the Raft leader hint returned by any compute seed.
-// A control-only daemon has no local Raft replica, so its seed is expected to
-// become a follower during ordinary elections. Treating that as an endpoint
-// failure leaves the gateway permanently pinned to a usable but non-authoritative
-// node and breaks every command that needs a linearizable snapshot.
+// authorityState reads the cluster authority through any compute seed,
+// following the holder it names. A control-only daemon keeps no authority
+// state, and its seed need not hold the authority. Treating a refusal that
+// names the holder as an endpoint failure would pin the gateway to a usable
+// node that cannot answer, and break every command that needs a linearizable
+// snapshot.
 func (c *controlOnlyCluster) authorityState(ctx context.Context, query cluster.AuthorityQuery) (*cluster.AuthorityState, error) {
 	if c == nil {
 		return nil, errors.New("control-only cluster is unavailable")
@@ -630,30 +627,30 @@ func (c *controlOnlyCluster) authorityState(ctx context.Context, query cluster.A
 			return state, nil
 		}
 		readErrors = errors.Join(readErrors, fmt.Errorf("%s: %w", peer.url, err))
-		var redirect *cluster.AuthorityNotLeaderError
-		if !errors.As(err, &redirect) || redirect.LeaderControlURL == "" || redirect.LeaderControlURL == peer.url {
+		var redirect *cluster.AuthorityNotHolderError
+		if !errors.As(err, &redirect) || redirect.ControlURL == "" || redirect.ControlURL == peer.url {
 			continue
 		}
-		leader := clients[redirect.LeaderControlURL]
-		if leader == nil {
-			leader, err = cluster.NewPlainClient(redirect.LeaderControlURL, c.nodeID, c.authToken, 2*time.Minute)
+		holder := clients[redirect.ControlURL]
+		if holder == nil {
+			holder, err = cluster.NewPlainClient(redirect.ControlURL, c.nodeID, c.authToken, 2*time.Minute)
 			if err != nil {
-				readErrors = errors.Join(readErrors, fmt.Errorf("creating redirected leader client %s: %w", redirect.LeaderControlURL, err))
+				readErrors = errors.Join(readErrors, fmt.Errorf("creating redirected holder client %s: %w", redirect.ControlURL, err))
 				continue
 			}
-			clients[redirect.LeaderControlURL] = leader
+			clients[redirect.ControlURL] = holder
 		}
-		state, err = leader.AuthorityQuery(ctx, query)
+		state, err = holder.AuthorityQuery(ctx, query)
 		if err == nil {
 			return state, nil
 		}
-		readErrors = errors.Join(readErrors, fmt.Errorf("%s: %w", redirect.LeaderControlURL, err))
+		readErrors = errors.Join(readErrors, fmt.Errorf("%s: %w", redirect.ControlURL, err))
 	}
 	return nil, fmt.Errorf("reading cluster authority through all compute peers: %w", readErrors)
 }
 
 // refreshPeers learns the current compute endpoints through a linearizable
-// authority read. The gateway itself remains absent from Raft membership and
+// authority read. The gateway itself remains absent from the authority membership and
 // never advertises a listener. Existing clients are reused so an in-flight
 // stream is unaffected by a concurrent refresh.
 func (c *controlOnlyCluster) refreshPeers(ctx context.Context) error {
@@ -933,7 +930,7 @@ func removeLocalNodeIncarnation(localRoot, nodeID, incarnation string) error {
 }
 
 // discardRetiredLocalAuthority removes state that was authoritative only for a
-// cluster node incarnation which the replicated catalog has forgotten. A
+// cluster node incarnation which the authority has forgotten. A
 // subsequent join is a new execution epoch: replaying the old publication,
 // graph-reference, runtime, or request journals could retain objects for
 // transactions that no longer exist, or resurrect runtimes that the cluster
@@ -972,7 +969,7 @@ type daemonTargetRuntime struct {
 	incarnation string
 	directory   cluster.NodeCatalog
 	store       cluster.TransactionCatalog
-	authority   *cluster.RaftCatalog
+	authority   *cluster.AuthorityCatalog
 	done        <-chan struct{}
 	watch       sync.Map
 	watchCount  atomic.Int64
@@ -1025,8 +1022,8 @@ func (r *daemonTargetRuntime) monitorTransaction(id string) (*cluster.Transactio
 		if ok {
 			return &transaction, nil
 		}
-		// A forwarded proposal can return just before this follower applies the
-		// entry. Fall back to one linearizable lookup only for that narrow gap.
+		// A node that does not hold the authority has no applied state: read
+		// the transaction through the holder.
 	}
 	return r.store.Load(id)
 }
@@ -1034,13 +1031,13 @@ func (r *daemonTargetRuntime) monitorTransaction(id string) (*cluster.Transactio
 func (r *daemonTargetRuntime) monitorSourceAvailable(id string) bool {
 	if r.authority != nil {
 		node, ok := r.authority.AppliedNode(id)
-		// Lease expiry is interpreted and committed by the authority leader.
-		// Comparing the leader's wall-clock deadline on another host would be
-		// unsafe; a locally applied non-offline record remains observable.
+		// Lease expiry is interpreted and committed by the authority's holder.
+		// Comparing the holder's wall-clock deadline on another host would be
+		// unsafe; an applied non-offline record remains observable.
 		if ok {
 			return node.State != cluster.NodeOffline
 		}
-		// As above, tolerate local apply lag without declaring source loss.
+		// Without applied state, ask the holder.
 	}
 	node, err := r.directory.Lookup(id)
 	return err == nil && node.LeaseActive(time.Now()) && node.State != cluster.NodeOffline
@@ -1087,7 +1084,7 @@ func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transacti
 	if r.authority != nil {
 		// Shared container metadata describes the whole logical family and may
 		// retain a former owner after migration. Reuse only a physical Sentry
-		// that Raft currently places on this node; otherwise create an isolated
+		// that the authority currently places on this node; otherwise create an isolated
 		// transaction-scoped target. This applies equally to forks and migrations:
 		// keeping siblings in one Sentry preserves family-local resource sharing
 		// and avoids splitting the runtime's branch bookkeeping.
@@ -1126,7 +1123,7 @@ func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transacti
 	// Migration restores use the transaction ID as their physical Sentry branch
 	// name. An older incarnation with the same logical name may therefore remain
 	// paused in this Sentry while it serves sparse pages to another node; neither
-	// incarnation blocks the other and Raft placement selects the current one.
+	// incarnation blocks the other and authority placement selects the current one.
 	_, err := r.backend.containerStore().PrepareDistributedFork(ctx, ttcbundle.DistributedForkOptions{
 		SourceContainer: tx.Identity.SourceContainer, TargetName: targetName,
 		SourcePhysicalBranch: tx.SourcePhysicalBranch,
@@ -1559,7 +1556,7 @@ func (r *daemonTargetRuntime) Publish(_ context.Context, tx *cluster.Transaction
 	// In particular, a detached restored init may have no attachable console.
 	// Starting followers here would delay publication by the control timeout;
 	// normal daemon reconciliation starts every attachable init/exec follower
-	// after the Raft placement is visible.
+	// after the authority placement is visible.
 	r.monitorDependency(tx.Identity.TransactionID, info.ID)
 	return nil
 }
@@ -1890,7 +1887,7 @@ func distributedGraphHandoffHasLiveRuntime(branch ttcbundle.BranchInfo) bool {
 		// target has faulted every page and retired its backing roots. At that
 		// point the live Sentry is self-contained: there is no relay reader to
 		// refresh, and the former origin may correctly have been reclaimed from
-		// Raft. Treating the historical handoff as live would make daemon restart
+		// the authority. Treating the historical handoff as live would make daemon restart
 		// depend on an object that the data plane has already proved unnecessary.
 		return branch.DependentMemoryBytes != 0 || branch.SnapshotID != 0 || len(branch.MemoryRootObjects) != 0
 	default:
@@ -1958,7 +1955,7 @@ func (r *daemonTargetRuntime) MarkIndependent(ctx context.Context, tx *cluster.T
 	if tx.GraphHandoff != nil {
 		status, err := r.graphHandoffStatus(tx)
 		if err != nil {
-			// Raft may contain a bound handoff intent whose first runtime attempt
+			// The authority may contain a bound handoff intent whose first runtime attempt
 			// failed before the Sentry recorded it. Reinstall the exact immutable
 			// descriptor and let the ordinary retry observe completion. This also
 			// repairs transactions produced by older daemons with this race.
@@ -2962,7 +2959,7 @@ func drainSourceDependencies(backend *runtimeBackend, source *distributedSourceR
 // references disappear. Consequently, a transaction that was source-backed
 // when List returned can legitimately be absent by the time the source asks
 // the target to drain it. Re-read the linearizable authority before treating a
-// lost target reply as a failure; absence is itself proof that Raft admitted
+// lost target reply as a failure; absence is itself proof that the authority admitted
 // the terminal retirement.
 func distributedSourceNoLongerNeeded(store cluster.TransactionCatalog, transactionID string) (bool, error) {
 	if store == nil || transactionID == "" {
@@ -3177,7 +3174,7 @@ func drainSourceDependency(backend *runtimeBackend, source *distributedSourceRun
 // deliberately executed as branch-local child commands; without this barrier
 // an early target delete can make a later source drain fail, leaving a
 // half-removed family and retained source pages. Transaction IDs are validated
-// against Raft and this node's source authority before any work is performed.
+// against the cluster authority and this node's source authority before any work is performed.
 func (b *runtimeBackend) settleDistributedSourceTransactions(transactionIDs []string) error {
 	if b == nil || b.distributedSource == nil || b.nodeID == "" || len(transactionIDs) == 0 {
 		return nil
@@ -3214,7 +3211,7 @@ func (b *runtimeBackend) settleDistributedSourceTransactions(transactionIDs []st
 // themselves part of a destructive rm operation. No state from such a target
 // can survive the mutation, so forcing it through the ordinary independence
 // barrier would copy its entire resident memory and filesystem only to delete
-// those bytes immediately afterward. The target cleanup and Raft cancellation
+// those bytes immediately afterward. The target cleanup and the authority cancellation
 // are one idempotent control-plane operation; source monitors observe the
 // terminal transaction and release their capture sessions asynchronously.
 func (b *runtimeBackend) cancelDistributedForkTargets(transactionIDs []string) error {
@@ -3311,7 +3308,7 @@ func (b *runtimeBackend) retireTransactionWithoutBranch(store cluster.Transactio
 }
 
 // cancelRemoteForkTarget retries optimistic cancellation across transaction
-// progress that races a family removal. Cancellation is fenced in Raft before
+// progress that races a family removal. Cancellation is fenced in the authority before
 // target cleanup, and a canceled retry repeats that idempotent cleanup. If
 // draining wins the revision race, the target remains intact and the caller
 // rolls it forward to independence instead.
@@ -3349,7 +3346,7 @@ func cancelRemoteForkTarget(ctx context.Context, peer *cluster.Client, transacti
 // cancellation. TargetRuntime.Cancel has already destroyed the physical
 // branch, its filesystems, and its graph references, so routing this through
 // ordinary branch destruction would incorrectly require that runtime to still
-// exist. Raft placement removal also performs the user-visible lineage splice.
+// exist. Removing the authority's placement also performs the user-visible lineage splice.
 func (b *runtimeBackend) removeCanceledForkPlacement(target selector, transactionID string) error {
 	if b == nil || b.nodeID == "" || b.distributedSource == nil {
 		return errors.New("canceled-fork placement removal requires a clustered daemon")
@@ -3495,7 +3492,7 @@ func (b *runtimeBackend) cleanupRemovedMigrationSource(tx cluster.Transaction) e
 		return nil
 	}
 	// A live coordinator may retire the metadata for a source incarnation that
-	// Raft has already fenced. Its node-local runtime and graph-reference intent
+	// the authority has already fenced. Its node-local runtime and graph-reference intent
 	// are disposable residue: the lease guardian stopped execution before the
 	// deadline, and startup cache reconciliation removes them if that physical
 	// node returns. This keeps family deletion available after an abrupt node
@@ -3513,7 +3510,7 @@ func (b *runtimeBackend) cleanupRemovedMigrationSource(tx cluster.Transaction) e
 	return nil
 }
 
-// migrationSourceIncarnationFenced reports whether Raft proves that a
+// migrationSourceIncarnationFenced reports whether the authority proves that a
 // migration's former source cannot still execute. A replacement incarnation
 // is itself a fence for the old one; an offline/expired exact incarnation is
 // fenced by the lease protocol; and graceful retirement records an explicit
@@ -3604,7 +3601,7 @@ func abortedMigration(tx cluster.Transaction) bool {
 }
 
 // cancelRemovedMigration cancels the migration of a removed branch, which
-// its target may be advancing meanwhile. Raft refuses while the branch
+// its target may be advancing meanwhile. The authority refuses while the branch
 // exists.
 func cancelRemovedMigration(store cluster.TransactionCatalog, tx cluster.Transaction) (*cluster.Transaction, error) {
 	for tx.State != cluster.TransactionCanceled && tx.State != cluster.TransactionIndependent {
@@ -4124,7 +4121,7 @@ func resolveSimpleClusterOptions(opts *daemonClusterOptions, roots daemonRoots) 
 		}
 		opts.RepositoryID = marker.RepositoryID
 		// No peer may dial this daemon. In particular it owns neither a page
-		// listener nor a Raft/control address.
+		// listener nor a control address.
 		opts.PageListen = ""
 		return nil
 	}
@@ -4370,7 +4367,7 @@ func daemonRootVersionForRole(role string) (int, error) {
 }
 
 // inspectDaemonStorageRoot validates an existing root without modifying it.
-// Daemon startup performs this before platform probes, worker creation, Raft
+// Daemon startup performs this before platform probes, worker creation, cluster
 // admission, or opening the daemon socket.
 func inspectDaemonStorageRoot(root, role string) error {
 	wantVersion, err := daemonRootVersionForRole(role)
@@ -4579,29 +4576,10 @@ func syncDaemonRootDirectory(root string) error {
 	return directory.Sync()
 }
 
-// localAuthorityRecovery is what a member starting on an existing local root
-// must discard of it before it rejoins its cluster. An ordinary restart keeps
-// everything; an offline incarnation must not reopen a stale Raft WAL; and a
-// removed node must not replay mutable local journals under replacement
-// authority.
-type localAuthorityRecovery int
-
-const (
-	// keepLocalAuthority: the authority still counts this incarnation live,
-	// or no seed could say otherwise; its Raft replica rejoins as it is.
-	keepLocalAuthority localAuthorityRecovery = iota
-	// rejoinLocalAuthority: this incarnation's lease expired while it was
-	// away. What it runs and stores is still its own, but its Raft replica
-	// may describe a configuration it was removed from; only that goes, and
-	// it rejoins as a new member of the current one.
-	rejoinLocalAuthority
-	// resetLocalAuthority: the node was removed, and what it held with it.
-	resetLocalAuthority
-)
-
-// localNodeAuthorityRecovery asks the first seed that answers what this
-// incarnation must discard; see localIncarnationRecovery.
-func localNodeAuthorityRecovery(nodeID, incarnation, authToken string, clients map[string]*cluster.Client) (localAuthorityRecovery, error) {
+// localNodeAuthorityReset asks the first seed that answers whether this
+// incarnation must discard its node-local authority; see
+// localIncarnationReset.
+func localNodeAuthorityReset(nodeID, incarnation, authToken string, clients map[string]*cluster.Client) (bool, error) {
 	ids := make([]string, 0, len(clients))
 	for id := range clients {
 		ids = append(ids, id)
@@ -4614,33 +4592,27 @@ func localNodeAuthorityRecovery(nodeID, incarnation, authToken string, clients m
 		if err != nil {
 			continue
 		}
-		return localIncarnationRecovery(state, nodeID, incarnation)
+		return localIncarnationReset(state, nodeID, incarnation)
 	}
-	return keepLocalAuthority, nil
+	return false, nil
 }
 
-func localIncarnationRecovery(state *cluster.AuthorityState, nodeID, incarnation string) (localAuthorityRecovery, error) {
+// localIncarnationReset reports whether the authority no longer knows the
+// node: `node rm` gives up what the node held, and forgets its record, so
+// its absence from a linearizable read authorizes discarding what the node
+// kept locally. An incarnation whose lease expired while it was away keeps
+// its placements, volatile dependencies and unpublished origins.
+func localIncarnationReset(state *cluster.AuthorityState, nodeID, incarnation string) (bool, error) {
 	if state == nil {
-		return keepLocalAuthority, errors.New("cluster authority state is nil")
+		return false, errors.New("cluster authority state is nil")
 	}
 	if record, ok := state.Nodes[nodeID]; ok {
 		if record.Incarnation != incarnation {
-			return keepLocalAuthority, fmt.Errorf("cluster node %q already belongs to incarnation %q; local scratch belongs to %q", nodeID, record.Incarnation, incarnation)
+			return false, fmt.Errorf("cluster node %q already belongs to incarnation %q; local scratch belongs to %q", nodeID, record.Incarnation, incarnation)
 		}
-		// Expiry leaves an incarnation's placements, volatile dependencies and
-		// unpublished origins its own, for when it returns. Its Raft WAL may
-		// still describe a configuration from which this server was removed
-		// while offline.
-		if record.State == cluster.NodeOffline {
-			return rejoinLocalAuthority, nil
-		}
-		return keepLocalAuthority, nil
+		return false, nil
 	}
-	// `node rm` gives up what the node held, and deliberately forgets its
-	// retirement tombstone after removing the Raft member. Absence from a
-	// linearizable authority snapshot is therefore itself the durable
-	// authorization to discard this excluded local replica.
-	return resetLocalAuthority, nil
+	return true, nil
 }
 
 func authorityStateThroughSeed(ctx context.Context, seed *cluster.Client, nodeID, authToken string) (*cluster.AuthorityState, error) {
@@ -4651,22 +4623,22 @@ func authorityStateThroughSeed(ctx context.Context, seed *cluster.Client, nodeID
 		if err == nil {
 			return state, nil
 		}
-		var redirect *cluster.AuthorityNotLeaderError
-		if !errors.As(err, &redirect) || redirect.LeaderControlURL == "" {
+		var redirect *cluster.AuthorityNotHolderError
+		if !errors.As(err, &redirect) || redirect.ControlURL == "" {
 			return nil, err
 		}
-		key := redirect.LeaderID + "\x00" + redirect.LeaderControlURL
+		key := redirect.HolderID + "\x00" + redirect.ControlURL
 		if seen[key] {
-			return nil, fmt.Errorf("raft leader redirect loop through %q", redirect.LeaderID)
+			return nil, fmt.Errorf("authority redirect loop through %q", redirect.HolderID)
 		}
 		seen[key] = true
 		var clientErr error
-		peer, clientErr = cluster.NewPlainClient(redirect.LeaderControlURL, nodeID, authToken, 2*time.Minute)
+		peer, clientErr = cluster.NewPlainClient(redirect.ControlURL, nodeID, authToken, 2*time.Minute)
 		if clientErr != nil {
-			return nil, fmt.Errorf("configuring redirected Raft leader %q: %w", redirect.LeaderID, clientErr)
+			return nil, fmt.Errorf("configuring the redirected authority %q: %w", redirect.HolderID, clientErr)
 		}
 	}
-	return nil, errors.New("too many Raft leader redirects while reading cluster authority")
+	return nil, errors.New("too many authority redirects while reading cluster authority")
 }
 
 func lockDaemonLocalRoot(root string) (*os.File, error) {
@@ -4900,12 +4872,6 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 		return nil, errors.New("cluster mode requires listen/advertise addresses, node ID, and repository ID")
 	}
 	opts.AuthToken = os.Getenv("TTC_CLUSTER_TOKEN")
-	raftLocalDir := filepath.Join(localRoot, "cluster", "raft")
-	_, localRaftErr := os.Stat(filepath.Join(raftLocalDir, "raft.db"))
-	localRaftState := localRaftErr == nil
-	if localRaftErr != nil && !errors.Is(localRaftErr, os.ErrNotExist) {
-		return nil, localRaftErr
-	}
 	resolvedCPU, err := resolveDaemonCPUProfile(opts.CPUProfileMode, opts.CPUFeatures, runtimePlatform)
 	if err != nil {
 		return nil, fmt.Errorf("resolving cluster CPU profile: %w", err)
@@ -4918,7 +4884,7 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 	if err := validateDaemonCPUProfile(opts.ResolvedCPU, runtimePlatform); err != nil {
 		return nil, fmt.Errorf("validating cluster CPU profile: %w", err)
 	}
-	clusterID, err := prepareClusterRaftIdentity(dataRoot, raftLocalDir, opts.RepositoryID, opts.NodeID)
+	clusterID, err := prepareClusterIdentity(dataRoot, localRoot, opts.RepositoryID, opts.NodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -4981,22 +4947,17 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 	if err != nil {
 		return nil, err
 	}
-	sharedListener, err := net.Listen("tcp", opts.Listen)
+	controlListener, err := net.Listen("tcp", opts.Listen)
 	if err != nil {
-		return nil, fmt.Errorf("listening for cluster control and Raft on %s: %w", opts.Listen, err)
+		return nil, fmt.Errorf("listening for cluster control on %s: %w", opts.Listen, err)
 	}
-	protocolMux, err := cluster.NewProtocolMux(sharedListener)
-	if err != nil {
-		sharedListener.Close()
-		return nil, err
-	}
-	closeMux := true
+	closeListener := true
 	defer func() {
-		if closeMux {
-			_ = protocolMux.Close()
+		if closeListener {
+			_ = controlListener.Close()
 		}
 	}()
-	advertiseURL, err = resolveClusterAdvertise(advertiseURL, protocolMux.Addr().String())
+	advertiseURL, err = resolveClusterAdvertise(advertiseURL, controlListener.Addr().String())
 	if err != nil {
 		return nil, err
 	}
@@ -5005,9 +4966,9 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 		return nil, fmt.Errorf("resolving shared cluster advertise address %q", advertiseURL)
 	}
 	// The cluster is anchored in the shared root, which says which node holds
-	// its authority, the only Raft voter, and keeps its log: see
-	// cluster.SharedCluster. This daemon holds it, or joins its holder as a
-	// non-voter, keeping a replica of its state in the local root.
+	// its authority, and keeps the authority's state: see
+	// cluster.SharedCluster. This daemon holds it, or registers with the node
+	// that does, and sends its reads and proposals there.
 	shared := cluster.NewSharedCluster(dataRoot)
 	role := cluster.RoleCompute
 	if opts.ControlHolder {
@@ -5015,11 +4976,11 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 	}
 	self := cluster.AuthorityRecord{
 		NodeID: opts.NodeID, Incarnation: incarnation, Role: role,
-		ControlURL: advertiseURL, ControlServerName: advertiseServerName, RaftAddress: parsedAdvertise.Host,
+		ControlURL: advertiseURL, ControlServerName: advertiseServerName,
 	}
 	heartbeat, err := cluster.StartHeartbeat(shared, cluster.MemberRecord{
 		NodeID: self.NodeID, Incarnation: self.Incarnation, Role: self.Role,
-		ControlURL: self.ControlURL, ControlServerName: self.ControlServerName, RaftAddress: self.RaftAddress,
+		ControlURL: self.ControlURL, ControlServerName: self.ControlServerName,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("starting this node's cluster heartbeat: %w", err)
@@ -5045,37 +5006,21 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 			liveness.Assume(seen)
 		}
 	}
-	// The epoch of the Raft group this node is in: see
-	// cluster.AuthorityRaftOptions.Epoch.
-	raftEpoch := new(atomic.Uint64)
-	var raftNode *cluster.AuthorityRaftNode
-	var authority cluster.AuthorityRecord
-	var authorityJoinRequest cluster.AuthorityJoinRequest
-	var cancelFreshJoin func(context.Context) error
-	closeRaft := true
+	authorityNode := cluster.NewAuthorityNode(opts.NodeID, 0, shared.ReadAuthority)
+	closeAuthority := true
 	defer func() {
-		if closeRaft && raftNode != nil {
-			if cancelFreshJoin != nil {
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				_ = cancelFreshJoin(ctx)
-				cancel()
-			}
-			_ = raftNode.Close()
+		if closeAuthority {
+			_ = authorityNode.Close()
 		}
 	}()
-	raftListener := protocolMux.RaftListener()
+	var authority cluster.AuthorityRecord
 	// A node whose Sentries a fence stopped keeps trying, however long the
 	// cluster is away; see registerClusterNodeWithRetry.
 	wait := holdsFencedRuntimes(localRoot)
 	giveUp := time.Now().Add(2 * cluster.AuthorityTakeover)
 	recoveryChecked := false
 	for report := time.Now().Add(clusterWaitReport); ; {
-		// A member of a cluster that kept its Raft state in its members'
-		// local roots may start the authority from its own.
-		decision, err := shared.DecideAuthority(context.Background(), self, localRaftState, liveness)
-		if errors.Is(err, cluster.ErrNoAuthorityState) {
-			return nil, errors.New("this cluster kept its Raft state in its members' local roots: first start a former member, whose local root holds it")
-		}
+		decision, err := shared.DecideAuthority(context.Background(), self, liveness)
 		if err != nil {
 			return nil, err
 		}
@@ -5084,50 +5029,8 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 			return nil, fmt.Errorf("node %s holds the cluster's authority, which a control holder holds only while no other daemon does", authority.NodeID)
 		}
 		if decision.Hold {
-			if !shared.Prepared(authority.Epoch) {
-				source := ""
-				if authority.Previous != 0 {
-					previous, err := shared.ReadClaim(authority.Previous)
-					if err != nil {
-						return nil, err
-					}
-					if err := shared.AwaitRelease(context.Background(), previous, authority.Epoch, liveness); err != nil {
-						return nil, err
-					}
-					source = shared.RaftDir(authority.Previous)
-				} else if localRaftState {
-					source = raftLocalDir
-				}
-				if err := shared.PrepareEpochFor(source, authority.Epoch, opts.NodeID, self.RaftAddress); err != nil {
-					return nil, fmt.Errorf("making the Raft state of the authority of epoch %d: %w", authority.Epoch, err)
-				}
-			}
-			holder := cluster.AuthorityHolder{Cluster: shared, Heartbeat: heartbeat, Record: authority}
-			raftEpoch.Store(authority.Epoch)
-			raftNode, err = cluster.OpenAuthorityRaftNode(cluster.AuthorityRaftOptions{
-				NodeID: opts.NodeID, Listener: raftListener, AdvertiseHost: parsedAdvertise.Host,
-				AuthToken: opts.AuthToken, EpochDir: shared.RaftDir(authority.Epoch), Holder: holder.Held,
-				Epoch: raftEpoch.Load,
-			})
-			if err != nil {
+			if err := holdClusterAuthority(shared, authorityNode, heartbeat, liveness, authority); err != nil {
 				return nil, err
-			}
-			deadline := time.Now().Add(15 * time.Second)
-			for !raftNode.IsLeader() && time.Now().Before(deadline) {
-				time.Sleep(20 * time.Millisecond)
-			}
-			if !raftNode.IsLeader() {
-				return nil, fmt.Errorf("the authority of epoch %d, this node, was not elected its Raft leader", authority.Epoch)
-			}
-			if err := heartbeat.Update(func(record *cluster.MemberRecord) { record.Authority = authority.Epoch }, true); err != nil {
-				return nil, err
-			}
-			_ = shared.PruneEpochs(authority.Previous)
-			authorityJoinRequest = cluster.AuthorityJoinRequest{
-				NodeID: opts.NodeID, Incarnation: incarnation,
-				ControlURL: advertiseURL, ControlServerName: advertiseServerName,
-				RaftAddress: raftNode.Address(), ClusterID: clusterID,
-				Capabilities: capabilities, MemoryTargetBytes: opts.MemoryTarget,
 			}
 			break
 		}
@@ -5136,101 +5039,49 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 			return nil, fmt.Errorf("configuring the cluster authority %q: %w", authority.NodeID, err)
 		}
 		clients = map[string]*cluster.Client{authority.NodeID: holderClient}
-		// A removed or expired member's local Raft replica describes a
-		// configuration in which it still takes part. Once the authority
-		// proves this incarnation offline, discard the replica and rejoin;
-		// once it proves the node absent, discard its node-local authority
-		// and rotate the execution epoch. Immutable image cache and shared
-		// snapshot authority remain either way.
-		recovery := keepLocalAuthority
+		// Once the authority proves the node absent, as `node rm` leaves it,
+		// discard its node-local authority and rotate the execution epoch.
+		// Immutable image cache and shared snapshot authority remain.
 		if !recoveryChecked {
-			if recovery, err = localNodeAuthorityRecovery(opts.NodeID, incarnation, opts.AuthToken, clients); err != nil {
+			reset, err := localNodeAuthorityReset(opts.NodeID, incarnation, opts.AuthToken, clients)
+			if err != nil {
 				return nil, err
 			}
 			recoveryChecked = true
-		}
-		if recovery == rejoinLocalAuthority {
-			if err := os.RemoveAll(raftLocalDir); err != nil {
-				return nil, fmt.Errorf("discarding the Raft replica of an expired incarnation: %w", err)
+			if reset {
+				// An absent incarnation has no remaining execution or storage
+				// authority, and its local journals must not be replayed under
+				// the replacement incarnation. Reap the guardian-stopped runtime
+				// before deleting the fence record and runsc sockets needed to
+				// identify and clean those processes.
+				if err := terminateRetiredElasticRuntimeRoot(filepath.Join(localRoot, "runtime", "runsc")); err != nil {
+					return nil, fmt.Errorf("reaping retired local runtimes: %w", err)
+				}
+				if err := discardRetiredLocalAuthority(localRoot); err != nil {
+					return nil, err
+				}
+				if incarnation, err = localNodeIncarnation(localRoot, opts.NodeID); err != nil {
+					return nil, err
+				}
+				self.Incarnation = incarnation
+				if err := heartbeat.Update(func(record *cluster.MemberRecord) { record.Incarnation = incarnation }, true); err != nil {
+					return nil, err
+				}
+				if _, err := prepareClusterIdentity(dataRoot, localRoot, opts.RepositoryID, opts.NodeID); err != nil {
+					return nil, err
+				}
 			}
-			localRaftState = false
-		}
-		if recovery == resetLocalAuthority {
-			// An offline or absent incarnation has no remaining execution or
-			// storage authority. Its other local journals are just as stale as
-			// its Raft replica and must not be replayed under the replacement
-			// incarnation. Reap the guardian-stopped runtime before deleting
-			// the fence record and runsc sockets needed to identify and clean
-			// those processes.
-			if err := terminateRetiredElasticRuntimeRoot(filepath.Join(localRoot, "runtime", "runsc")); err != nil {
-				return nil, fmt.Errorf("reaping retired local runtimes: %w", err)
-			}
-			if err := discardRetiredLocalAuthority(localRoot); err != nil {
-				return nil, err
-			}
-			localRaftState = false
-			if incarnation, err = localNodeIncarnation(localRoot, opts.NodeID); err != nil {
-				return nil, err
-			}
-			self.Incarnation = incarnation
-			if err := heartbeat.Update(func(record *cluster.MemberRecord) { record.Incarnation = incarnation }, true); err != nil {
-				return nil, err
-			}
-			if _, err := prepareClusterRaftIdentity(dataRoot, raftLocalDir, opts.RepositoryID, opts.NodeID); err != nil {
-				return nil, err
-			}
-		}
-		raftEpoch.Store(authority.Epoch)
-		raftNode, err = cluster.OpenAuthorityRaftNode(cluster.AuthorityRaftOptions{
-			NodeID: opts.NodeID, LocalDir: raftLocalDir,
-			Listener: raftListener, AdvertiseHost: parsedAdvertise.Host,
-			AuthToken: opts.AuthToken, StabilityTimeout: clusterRaftStabilityTimeout(opts.LeaseDuration),
-			Epoch: raftEpoch.Load,
-		})
-		if err != nil {
-			return nil, err
-		}
-		authorityJoinRequest = cluster.AuthorityJoinRequest{
-			NodeID: opts.NodeID, Incarnation: incarnation,
-			ControlURL: advertiseURL, ControlServerName: advertiseServerName,
-			RaftAddress: raftNode.Address(), ClusterID: clusterID,
-			Capabilities: capabilities, MemoryTargetBytes: opts.MemoryTarget,
-		}
-		cancelRequest := cluster.AuthorityCancelJoinRequest{NodeID: opts.NodeID, Incarnation: incarnation, RaftAddress: raftNode.Address()}
-		cancelFreshJoin = func(ctx context.Context) error {
-			return cancelAuthorityJoinThroughSeed(ctx, holderClient, cancelRequest, opts.NodeID, opts.AuthToken)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		joinErr := joinAuthorityThroughSeed(ctx, holderClient, authorityJoinRequest, opts.NodeID, opts.AuthToken)
+		joinErr := joinAuthorityThroughSeed(ctx, holderClient, cluster.AuthorityJoinRequest{
+			NodeID: opts.NodeID, Incarnation: incarnation,
+			ControlURL: advertiseURL, ControlServerName: advertiseServerName, ClusterID: clusterID,
+			Capabilities: capabilities, MemoryTargetBytes: opts.MemoryTarget,
+		}, opts.NodeID, opts.AuthToken)
 		cancel()
 		if joinErr == nil {
-			cancelFreshJoin = nil
-			deadline := time.Now().Add(15 * time.Second)
-			for raftNode.Leader() == "" && time.Now().Before(deadline) {
-				time.Sleep(20 * time.Millisecond)
-			}
-			if raftNode.Leader() == "" {
-				return nil, errors.New("this node joined the cluster authority as a non-voter but hears no leader")
-			}
 			break
 		}
-		// A timeout can lose the successful AddNonvoter response, so cancel
-		// even when the holder acknowledged nothing. A freshly opened Bolt
-		// store still counts as existing Raft state; retaining it would make
-		// the next attempt wait forever as a member that was never admitted.
-		ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
-		_ = cancelFreshJoin(ctx)
-		cancel()
-		cancelFreshJoin = nil
-		_ = raftNode.Close()
-		raftNode = nil
-		if !localRaftState {
-			_ = os.RemoveAll(raftLocalDir)
-			if _, err := prepareClusterRaftIdentity(dataRoot, raftLocalDir, opts.RepositoryID, opts.NodeID); err != nil {
-				return nil, err
-			}
-		}
-		raftListener = protocolMux.RenewRaftListener()
 		if !wait && time.Now().After(giveUp) {
 			return nil, fmt.Errorf("joining the cluster authority, node %s: %w", authority.NodeID, joinErr)
 		}
@@ -5243,7 +5094,7 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 	}
 	if authority.Holds(self) {
 		base := immutableClusterConfigFromOptions(opts)
-		policy, err := reconcileClusterRuntimePolicy(raftNode, dataRoot, base, pendingClusterPolicy)
+		policy, err := reconcileClusterRuntimePolicy(authorityNode, dataRoot, base, pendingClusterPolicy)
 		if err != nil {
 			return nil, err
 		}
@@ -5254,20 +5105,19 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 		}
 	} else {
 		// A member that is not the authority adopts the policy the shared
-		// root records, which applyImmutableClusterConfig loaded, until its
-		// replica catches up with the authority's.
+		// root records, which applyImmutableClusterConfig loaded.
 		capabilities.PagingPolicy = opts.PagingPolicy
 		if err := capabilities.Validate(); err != nil {
 			return nil, err
 		}
 	}
-	catalog, err := cluster.NewRaftCatalog(raftNode)
+	catalog, err := cluster.NewAuthorityCatalog(authorityNode)
 	if err != nil {
 		return nil, err
 	}
 	nodeRecord := cluster.NodeRecord{
 		NodeID: opts.NodeID, Incarnation: incarnation,
-		ControlURL: advertiseURL, ControlServerName: advertiseServerName, RaftAddress: raftNode.Address(),
+		ControlURL: advertiseURL, ControlServerName: advertiseServerName,
 		Capabilities: capabilities, MemoryTargetBytes: opts.MemoryTarget,
 	}
 	if opts.ControlHolder {
@@ -5282,11 +5132,9 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 		dynamicPeers: make(map[string]dynamicClusterPeer),
 		pageListen:   opts.PageListen, pageAdvertise: opts.PageAdvertise,
 	}
-	// The authority's holder is its only voter, and so the Raft leader: the
-	// shared root names it, where this member's Raft engine may still
-	// remember a holder that ended or stalled.
+	// The shared root names the authority's holder.
 	var holderClients sync.Map
-	catalog.SetLeaderClientResolver(func(string) (*cluster.Client, error) {
+	catalog.SetHolderClientResolver(func(string) (*cluster.Client, error) {
 		record, ok, err := shared.ReadAuthority()
 		if err != nil {
 			return nil, err
@@ -5304,52 +5152,22 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 		actual, _ := holderClients.LoadOrStore(record.ControlURL, client)
 		return actual.(*cluster.Client), nil
 	})
-	closeRaft = false
-	closeMux = false
+	closeAuthority = false
+	closeListener = false
 	closeHeartbeat = false
 	return &daemonClusterRuntime{
-		listen: protocolMux.Addr().String(), authToken: opts.AuthToken,
-		mux: protocolMux, controlListener: protocolMux.HTTPListener(),
+		listen: controlListener.Addr().String(), authToken: opts.AuthToken,
+		controlListener: controlListener,
 		controlPlane: &cluster.ControlPlane{
 			Capabilities: capabilities, Store: transactions, MaxTransactions: opts.MaxTransactions, Now: time.Now,
-			Authority:     &cluster.AuthorityService{Node: raftNode, Capabilities: capabilities, ClusterID: clusterID, MaxVoters: 1},
+			Authority:     &cluster.AuthorityService{Node: authorityNode, Capabilities: capabilities, ClusterID: clusterID},
 			TopologyState: catalog.LinearizableState, AuthToken: opts.AuthToken,
 		},
 		source: source, directory: catalog, placements: placements, transactions: transactions,
-		raft: raftNode, raftLocalDir: raftLocalDir, raftCatalog: catalog, nodeRecord: nodeRecord, lease: opts.LeaseDuration, clusterID: clusterID,
-		recoverMembership: func(ctx context.Context) error {
-			current, ok, err := shared.ReadAuthority()
-			if err != nil {
-				return err
-			}
-			if !ok || current.Holds(self) {
-				return nil
-			}
-			holder, err := cluster.NewPlainClient(current.ControlURL, opts.NodeID, opts.AuthToken, 2*time.Minute)
-			if err != nil {
-				return err
-			}
-			return joinAuthorityThroughSeed(ctx, holder, authorityJoinRequest, opts.NodeID, opts.AuthToken)
-		},
-		shared: shared, heartbeat: heartbeat, liveness: liveness, authority: authority, self: self, raftEpoch: raftEpoch,
-		cancelFreshJoin: cancelFreshJoin,
-		autoRebalance:   opts.AutoRebalance, capacitySink: capacitySink, cpuProfile: opts.ResolvedCPU,
+		authority: authorityNode, catalog: catalog, nodeRecord: nodeRecord, lease: opts.LeaseDuration, clusterID: clusterID,
+		shared: shared, heartbeat: heartbeat, liveness: liveness, authorityRecord: authority, self: self,
+		autoRebalance: opts.AutoRebalance, capacitySink: capacitySink, cpuProfile: opts.ResolvedCPU,
 	}, nil
-}
-
-// clusterRaftStabilityTimeout keeps transient data-plane congestion from
-// looking like leadership failure. It remains a fraction of the execution
-// lease so a genuine leader loss can be resolved before runtime guardians
-// reach their conservative fencing deadline.
-func clusterRaftStabilityTimeout(lease time.Duration) time.Duration {
-	timeout := lease / 10
-	if timeout < time.Second {
-		return time.Second
-	}
-	if timeout > 5*time.Second {
-		return 5 * time.Second
-	}
-	return timeout
 }
 
 const daemonImmutableClusterConfigVersion = 2
@@ -5401,9 +5219,6 @@ func equalClusterRuntimePolicy(a, b cluster.ClusterRuntimePolicy) bool {
 	return a == b
 }
 
-// applyImmutableClusterConfig reads the shared bootstrap record. It returns a
-// requested operational-policy change instead of applying it: only the Raft
-// state machine can prove that every execution lease is inactive.
 // applyImmutableClusterConfig applies to opts the cluster-wide configuration
 // the shared root records, which the cluster's first daemon records. It
 // returns the configuration opts asks for instead, if it differs: the
@@ -5482,7 +5297,7 @@ func persistClusterRuntimePolicy(sharedRoot string, base daemonImmutableClusterC
 	return writeDurableJSON(filepath.Join(sharedRoot, ".ttc-cluster-config.json"), base)
 }
 
-func reconcileClusterRuntimePolicy(node *cluster.AuthorityRaftNode, sharedRoot string, base daemonImmutableClusterConfig, pending *daemonImmutableClusterConfig) (cluster.ClusterRuntimePolicy, error) {
+func reconcileClusterRuntimePolicy(node *cluster.AuthorityNode, sharedRoot string, base daemonImmutableClusterConfig, pending *daemonImmutableClusterConfig) (cluster.ClusterRuntimePolicy, error) {
 	state, err := node.AppliedState()
 	if err != nil {
 		return cluster.ClusterRuntimePolicy{}, err
@@ -5493,59 +5308,28 @@ func reconcileClusterRuntimePolicy(node *cluster.AuthorityRaftNode, sharedRoot s
 	if pending != nil {
 		desired = clusterRuntimePolicy(*pending)
 	}
-	// An existing member can replay its committed FSM only after the restarted
-	// group elects a leader. Do not require that election before opening the
-	// control server when no policy change was requested: doing so makes a
-	// fully stopped multi-voter cluster impossible to start sequentially. The
-	// shared bootstrap record is the last policy atomically persisted after a
-	// Raft commit, so it is a safe temporary projection while the remaining
-	// voters return. registerClusterNodeWithRetry below keeps this process alive
-	// until quorum is restored and the committed policy is replayed.
-	if effective.Revision == 0 && !changeRequested && node.HadExistingState() && !node.IsLeader() {
-		if err := desired.Validate(); err != nil {
-			return cluster.ClusterRuntimePolicy{}, fmt.Errorf("persisted cluster operational policy: %w", err)
-		}
-		return desired, nil
-	}
 	if effective.Revision == 0 || (changeRequested && !equalClusterRuntimePolicy(effective, desired)) {
-		deadline := time.Now().Add(15 * time.Second)
-		for !node.IsLeader() && time.Now().Before(deadline) {
-			time.Sleep(20 * time.Millisecond)
-		}
-		if !node.IsLeader() {
-			return cluster.ClusterRuntimePolicy{}, errors.New("cluster operational policy can only change after the fully stopped cluster's surviving Raft member becomes leader")
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		latest, err := node.LinearizableState(ctx)
-		cancel()
-		if err != nil {
-			return cluster.ClusterRuntimePolicy{}, fmt.Errorf("reading cluster operational policy after leader election: %w", err)
-		}
-		effective = latest.ClusterPolicy
-		catalog, err := cluster.NewRaftCatalog(node)
+		catalog, err := cluster.NewAuthorityCatalog(node)
 		if err != nil {
 			return cluster.ClusterRuntimePolicy{}, err
 		}
-		if effective.Revision == 0 || (changeRequested && !equalClusterRuntimePolicy(effective, desired)) {
-			configured, err := catalog.ConfigureClusterPolicy(effective.Revision, desired)
-			if err != nil {
-				return cluster.ClusterRuntimePolicy{}, fmt.Errorf("configuring cluster operational policy: %w", err)
-			}
-			effective = *configured
+		configured, err := catalog.ConfigureClusterPolicy(effective.Revision, desired)
+		if err != nil {
+			return cluster.ClusterRuntimePolicy{}, fmt.Errorf("configuring cluster operational policy: %w", err)
 		}
+		effective = *configured
 	}
 	if err := effective.Validate(); err != nil {
-		return cluster.ClusterRuntimePolicy{}, fmt.Errorf("replicated cluster operational policy: %w", err)
+		return cluster.ClusterRuntimePolicy{}, fmt.Errorf("the authority's cluster operational policy: %w", err)
 	}
 	if err := persistClusterRuntimePolicy(sharedRoot, base, effective); err != nil {
-		return cluster.ClusterRuntimePolicy{}, fmt.Errorf("persisting replicated cluster operational policy: %w", err)
+		return cluster.ClusterRuntimePolicy{}, fmt.Errorf("persisting the cluster operational policy: %w", err)
 	}
 	return effective, nil
 }
 
-// joinAuthorityThroughSeed follows Raft-leader redirects at the control-plane
-// layer. A deployment only needs to configure one reachable seed; the seed
-// need not currently be the leader.
+// joinAuthorityThroughSeed registers this node with the authority's holder,
+// seed, following its redirects should another node hold it by then.
 func joinAuthorityThroughSeed(ctx context.Context, seed *cluster.Client, request cluster.AuthorityJoinRequest, nodeID, authToken string) error {
 	peer := seed
 	seen := make(map[string]bool)
@@ -5556,11 +5340,9 @@ func joinAuthorityThroughSeed(ctx context.Context, seed *cluster.Client, request
 			return nil
 		}
 		if isTransientAuthorityJoinTransport(err) {
-			// Whole-cluster restart commonly launches members concurrently. The
-			// first seed process may not have opened its listener when another
-			// member makes its initial connection. Keep this joiner's Raft listener
-			// alive and retry the configured seed within the existing bounded
-			// context, just as we already do during leader election.
+			// Whole-cluster restart commonly launches members concurrently: the
+			// holder may not have opened its listener yet. Retry it within the
+			// bounded context.
 			peer = seed
 			seen = make(map[string]bool)
 			redirects = 0
@@ -5568,20 +5350,17 @@ func joinAuthorityThroughSeed(ctx context.Context, seed *cluster.Client, request
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				return fmt.Errorf("waiting for a reachable Raft seed while joining cluster: %w", ctx.Err())
+				return fmt.Errorf("waiting for the cluster authority's holder to answer: %w", ctx.Err())
 			case <-timer.C:
 			}
 			continue
 		}
-		var redirect *cluster.AuthorityNotLeaderError
+		var redirect *cluster.AuthorityNotHolderError
 		if !errors.As(err, &redirect) {
 			return err
 		}
-		if redirect.LeaderControlURL == "" {
-			// A surviving member can expose its control listener before the
-			// restarted Raft group has elected a leader. Keep the fresh joiner
-			// listening and retry the configured seed instead of tearing down its
-			// local state during this ordinary election window.
+		if redirect.ControlURL == "" {
+			// The authority is between holders: ask again.
 			peer = seed
 			seen = make(map[string]bool)
 			redirects = 0
@@ -5589,24 +5368,24 @@ func joinAuthorityThroughSeed(ctx context.Context, seed *cluster.Client, request
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				return fmt.Errorf("waiting for a Raft leader while joining cluster: %w", ctx.Err())
+				return fmt.Errorf("waiting for the cluster authority's holder: %w", ctx.Err())
 			case <-timer.C:
 			}
 			continue
 		}
 		redirects++
 		if redirects > 5 {
-			return errors.New("too many Raft leader redirects while joining cluster")
+			return errors.New("too many authority redirects while joining cluster")
 		}
-		key := redirect.LeaderID + "\x00" + redirect.LeaderControlURL
+		key := redirect.HolderID + "\x00" + redirect.ControlURL
 		if seen[key] {
-			return fmt.Errorf("raft leader redirect loop through %q", redirect.LeaderID)
+			return fmt.Errorf("authority redirect loop through %q", redirect.HolderID)
 		}
 		seen[key] = true
 		var clientErr error
-		peer, clientErr = cluster.NewPlainClient(redirect.LeaderControlURL, nodeID, authToken, 2*time.Minute)
+		peer, clientErr = cluster.NewPlainClient(redirect.ControlURL, nodeID, authToken, 2*time.Minute)
 		if clientErr != nil {
-			return fmt.Errorf("configuring redirected Raft leader %q: %w", redirect.LeaderID, clientErr)
+			return fmt.Errorf("configuring the redirected authority %q: %w", redirect.HolderID, clientErr)
 		}
 	}
 }
@@ -5619,39 +5398,7 @@ func isTransientAuthorityJoinTransport(err error) bool {
 	return errors.As(err, &transport)
 }
 
-// cancelAuthorityJoinThroughSeed follows the same leader redirect rules as
-// admission. This path is intentionally available before a node has a catalog
-// record, since that is precisely the failure window it closes.
-func cancelAuthorityJoinThroughSeed(ctx context.Context, seed *cluster.Client, request cluster.AuthorityCancelJoinRequest, nodeID, authToken string) error {
-	peer := seed
-	seen := make(map[string]bool)
-	for redirects := 0; redirects < 5; redirects++ {
-		err := peer.CancelAuthorityJoin(ctx, request)
-		if err == nil {
-			return nil
-		}
-		var redirect *cluster.AuthorityNotLeaderError
-		if !errors.As(err, &redirect) {
-			return err
-		}
-		if redirect.LeaderControlURL == "" {
-			return fmt.Errorf("cancelling join through a follower that cannot resolve its Raft leader: %w", err)
-		}
-		key := redirect.LeaderID + "\x00" + redirect.LeaderControlURL
-		if seen[key] {
-			return fmt.Errorf("raft leader redirect loop through %q", redirect.LeaderID)
-		}
-		seen[key] = true
-		var clientErr error
-		peer, clientErr = cluster.NewPlainClient(redirect.LeaderControlURL, nodeID, authToken, 2*time.Minute)
-		if clientErr != nil {
-			return fmt.Errorf("configuring redirected Raft leader %q: %w", redirect.LeaderID, clientErr)
-		}
-	}
-	return errors.New("too many Raft leader redirects while cancelling cluster join")
-}
-
-type daemonRaftClusterIdentity struct {
+type daemonClusterIdentity struct {
 	Version      int       `json:"version"`
 	ClusterID    string    `json:"cluster_id"`
 	RepositoryID string    `json:"repository_id"`
@@ -5659,50 +5406,48 @@ type daemonRaftClusterIdentity struct {
 	CreatedAt    time.Time `json:"created_at"`
 }
 
-func prepareClusterRaftIdentity(sharedRoot, localRaftDir, repositoryID, nodeID string) (string, error) {
-	// A cluster that kept its Raft state in its members' local roots
-	// recorded its identity at the top of the shared root; one that keeps it
-	// in the shared root records it with its authority, which the first of
-	// its daemons creates.
-	var identity daemonRaftClusterIdentity
-	data, err := os.ReadFile(filepath.Join(sharedRoot, ".ttc-raft-cluster.json"))
+// prepareClusterIdentity returns the ID of the cluster anchored in
+// sharedRoot, which its first daemon records with its authority, and binds
+// localRoot to it.
+func prepareClusterIdentity(sharedRoot, localRoot, repositoryID, nodeID string) (string, error) {
+	var identity daemonClusterIdentity
+	path := filepath.Join(sharedRoot, "cluster", "authority", "cluster.json")
+	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		path := filepath.Join(sharedRoot, "cluster", "authority", "cluster.json")
-		if data, err = os.ReadFile(path); errors.Is(err, os.ErrNotExist) {
-			clusterID, idErr := newDaemonRequestID()
-			if idErr != nil {
-				return "", idErr
-			}
-			identity = daemonRaftClusterIdentity{Version: 1, ClusterID: clusterID, RepositoryID: repositoryID, CreatedBy: nodeID, CreatedAt: time.Now().UTC()}
-			encoded, marshalErr := json.Marshal(identity)
-			if marshalErr != nil {
-				return "", marshalErr
-			}
-			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-				return "", err
-			}
-			// Another daemon of a new cluster may create it first.
-			if data, err = publishOnce(path, encoded); err != nil {
-				return "", fmt.Errorf("creating the cluster's Raft identity: %w", err)
-			}
+		clusterID, idErr := newDaemonRequestID()
+		if idErr != nil {
+			return "", idErr
+		}
+		identity = daemonClusterIdentity{Version: 1, ClusterID: clusterID, RepositoryID: repositoryID, CreatedBy: nodeID, CreatedAt: time.Now().UTC()}
+		encoded, marshalErr := json.Marshal(identity)
+		if marshalErr != nil {
+			return "", marshalErr
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			return "", err
+		}
+		// Another daemon of a new cluster may create it first.
+		if data, err = publishOnce(path, encoded); err != nil {
+			return "", fmt.Errorf("creating the cluster's identity: %w", err)
 		}
 	}
 	if err != nil {
 		return "", err
 	}
 	if err := json.Unmarshal(data, &identity); err != nil {
-		return "", fmt.Errorf("decoding Raft cluster identity: %w", err)
+		return "", fmt.Errorf("decoding the cluster's identity: %w", err)
 	}
 	if identity.Version != 1 || !transactionIDPatternForDaemon(identity.ClusterID) || identity.RepositoryID != repositoryID {
-		return "", errors.New("shared TTC_ROOT has an incompatible Raft cluster identity")
+		return "", errors.New("shared TTC_ROOT has an incompatible cluster identity")
 	}
-	if err := os.MkdirAll(localRaftDir, 0700); err != nil {
+	localDir := filepath.Join(localRoot, "cluster")
+	if err := os.MkdirAll(localDir, 0700); err != nil {
 		return "", err
 	}
-	localPath := filepath.Join(localRaftDir, "cluster-id")
+	localPath := filepath.Join(localDir, "cluster-id")
 	if local, err := os.ReadFile(localPath); err == nil {
 		if strings.TrimSpace(string(local)) != identity.ClusterID {
-			return "", errors.New("TTC_LOCAL_ROOT belongs to another Raft cluster")
+			return "", errors.New("TTC_LOCAL_ROOT belongs to another cluster")
 		}
 	} else if errors.Is(err, os.ErrNotExist) {
 		if err := os.WriteFile(localPath, []byte(identity.ClusterID+"\n"), 0600); err != nil {
@@ -6221,45 +5966,9 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 	if err := validatePersistedMemoryGraph(ttcbundle.Store{Root: dataRoot, ActiveRoot: localRoot}); err != nil {
 		return fmt.Errorf("validating snapshot-graph branch records: %w", err)
 	}
-	removeRetiredRaftState := false
-	if clusterRuntime != nil && clusterRuntime.raftLocalDir != "" {
-		// This defer is intentionally registered before raft.Close below, so it
-		// runs afterward. A cleanly retired node must rejoin as a fresh Raft
-		// member; retaining the removed member's Bolt state leaves it waiting
-		// forever for a configuration in which it no longer participates.
-		defer func() {
-			if removeRetiredRaftState {
-				if err := os.RemoveAll(clusterRuntime.raftLocalDir); err != nil && stderr != nil {
-					fmt.Fprintf(stderr, "ttcd: warning: removing retired Raft state: %v\n", err)
-				}
-			}
-		}()
+	if clusterRuntime != nil && clusterRuntime.authority != nil {
+		defer clusterRuntime.authority.Close()
 	}
-	if clusterRuntime != nil && clusterRuntime.mux != nil {
-		defer clusterRuntime.mux.Close()
-	}
-	if clusterRuntime != nil && clusterRuntime.raft != nil {
-		defer clusterRuntime.raft.Close()
-	}
-	// A fresh node first joins Raft as a learner, then commits its execution
-	// identity and proves full-mesh topology before becoming ready. If any
-	// startup step in that window fails, remove the learner after the shutdown
-	// defer has fenced/offlined a possibly committed joining record and before
-	// the local Raft transport closes.
-	cancelFreshJoin := (func(context.Context) error)(nil)
-	if clusterRuntime != nil {
-		cancelFreshJoin = clusterRuntime.cancelFreshJoin
-	}
-	defer func() {
-		if cancelFreshJoin == nil {
-			return
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := cancelFreshJoin(ctx); err != nil && stderr != nil {
-			fmt.Fprintf(stderr, "ttcd: warning: cancelling incomplete Raft admission: %v\n", err)
-		}
-	}()
 	dir := filepath.Dir(socket)
 	if err := secureDaemonDirectory(dir); err != nil {
 		return err
@@ -6325,7 +6034,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 	}
 	var sharedReferences *sharedReferenceService
 	if clusterRuntime != nil {
-		sharedReferences = newSharedReferenceService(dataRoot, localRoot, clusterRuntime.nodeRecord.NodeID, clusterRuntime.nodeRecord.Incarnation, clusterRuntime.raftCatalog, sharedObjects, snapshotGraph, clusterRuntime.source)
+		sharedReferences = newSharedReferenceService(dataRoot, localRoot, clusterRuntime.nodeRecord.NodeID, clusterRuntime.nodeRecord.Incarnation, clusterRuntime.catalog, sharedObjects, snapshotGraph, clusterRuntime.source)
 		server.sharedReferences = sharedReferences
 	}
 	var publicationQueue *ttcstorage.Queue
@@ -6339,7 +6048,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 		publisher.incarnation = clusterRuntime.nodeRecord.Incarnation
 		publisher.placements = clusterRuntime.placements
 		publisher.transactions = clusterRuntime.transactions
-		publisher.authority = clusterRuntime.raftCatalog
+		publisher.authority = clusterRuntime.catalog
 		publisher.peers = clusterRuntime.source
 		publicationQueue, err = ttcstorage.Open(localRoot, publisher)
 		if err != nil {
@@ -6368,9 +6077,9 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 	if clusterRuntime != nil {
 		maintenanceTransactions = clusterRuntime.transactions
 	}
-	var maintenanceAuthority *cluster.RaftCatalog
+	var maintenanceAuthority *cluster.AuthorityCatalog
 	if clusterRuntime != nil {
-		maintenanceAuthority = clusterRuntime.raftCatalog
+		maintenanceAuthority = clusterRuntime.catalog
 	}
 	go maintainRepositories(dataRoot, localRoot, server.root, server.runsc, publicationQueue, maintenanceTransactions, maintenanceAuthority, snapshotGraph, snapshotData, clusterRuntime == nil, stderr, maintenanceDone, func() func() {
 		return server.lockDataRoot(dataRoot)
@@ -6405,11 +6114,9 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 		if intentErr != nil {
 			result = errors.Join(result, fmt.Errorf("loading completed drain intent: %w", intentErr))
 		} else if intent != nil && intent.State == elasticDrainComplete && transitionErr == nil {
-			retired, err := retireDaemonRaftMember(clusterRuntime, offline.NodeID, offline.Incarnation)
-			if err != nil {
-				result = errors.Join(result, fmt.Errorf("retiring drained Raft member: %w", err))
+			if err := retireDaemonNode(clusterRuntime, offline.NodeID, offline.Incarnation); err != nil {
+				result = errors.Join(result, fmt.Errorf("retiring the drained node: %w", err))
 			} else {
-				removeRetiredRaftState = retired
 				if err := removeLocalNodeIncarnation(localRoot, offline.NodeID, offline.Incarnation); err != nil {
 					result = errors.Join(result, fmt.Errorf("rotating retired node incarnation: %w", err))
 				}
@@ -6419,14 +6126,14 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 			result = errors.Join(result, fmt.Errorf("consuming completed drain intent: %w", err))
 		}
 		if result == nil {
-			// The discovery identity and, where applicable, Raft membership are
-			// gone. Suppress duplicate work in the shutdown defer.
+			// The node's identity is gone. Suppress duplicate work in the
+			// shutdown defer.
 			elasticRecord = nil
 		}
 		return result
 	}
 	defer func() {
-		// Relinquishing shared-data mutation authority is a Raft operation. Stop
+		// Relinquishing shared-data mutation authority is an authority operation. Stop
 		// and join that worker while the execution heartbeat is still renewing;
 		// otherwise a slow final collection can outlive the node lease and turn a
 		// clean shutdown into a spurious stale-lease warning.
@@ -6483,7 +6190,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 	}()
 	if clusterRuntime != nil {
 		graphProvider := &graphObjectProvider{
-			graph: snapshotGraph, data: snapshotData, authority: clusterRuntime.raftCatalog,
+			graph: snapshotGraph, data: snapshotData, authority: clusterRuntime.catalog,
 			transactions: clusterRuntime.transactions, nodeID: clusterRuntime.nodeRecord.NodeID,
 			incarnation: clusterRuntime.nodeRecord.Incarnation, shared: sharedReferences,
 		}
@@ -6493,7 +6200,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 		clusterRuntime.controlPlane.SharedReferences = sharedReferences
 		clusterRuntime.controlPlane.ReferenceInventory = sharedReferences
 		resolver, err := ttcsnapshot.NewResolver(snapshotGraph, snapshotData,
-			raftOriginLocator{authority: clusterRuntime.raftCatalog},
+			authorityOriginLocator{authority: clusterRuntime.catalog},
 			clusterPeerSources{runtime: clusterRuntime.source}, sharedObjects)
 		if err != nil {
 			return fmt.Errorf("opening distributed snapshot resolver: %w", err)
@@ -6523,7 +6230,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 			publisher := &branchPublisher{
 				sharedRoot: targetBackend.dataRoot,
 				nodeID:     targetBackend.nodeID, incarnation: clusterRuntime.nodeRecord.Incarnation,
-				authority: clusterRuntime.raftCatalog, graph: targetBackend.snapshotGraph,
+				authority: clusterRuntime.catalog, graph: targetBackend.snapshotGraph,
 				graphData: targetBackend.snapshotData, graphShared: targetBackend.snapshotShared,
 				sharedRefs: targetBackend.sharedReferences, peers: targetBackend.distributedSource,
 			}
@@ -6532,7 +6239,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 		targetRuntime := &daemonTargetRuntime{
 			backend: targetBackend, nodeID: clusterRuntime.controlPlane.Capabilities.NodeID,
 			incarnation: clusterRuntime.nodeRecord.Incarnation, directory: clusterRuntime.directory,
-			store: clusterRuntime.controlPlane.Store, authority: clusterRuntime.raftCatalog, done: clusterDone,
+			store: clusterRuntime.controlPlane.Store, authority: clusterRuntime.catalog, done: clusterDone,
 		}
 		clusterRuntime.controlPlane.TargetRuntime = targetRuntime
 		clusterRuntime.controlPlane.CommandProxy = daemonClusterProxy{socket: socket}
@@ -6575,24 +6282,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 				clusterListener.Close()
 				return fmt.Errorf("loading elastic drain recovery state: %w", err)
 			}
-			waitingForQuorum := clusterRuntime.raft != nil && clusterRuntime.raft.HadExistingState() && clusterRuntime.raft.Leader() == ""
-			if waitingForQuorum {
-				// The Raft/control listener is already serving. Advertise this
-				// intentional intermediate state to the local launcher so an
-				// operator can start the remaining voters sequentially. This is
-				// not readiness: the Unix request loop and every execution grant
-				// remain unavailable until registration below commits.
-				if err := writeDaemonQuorumWait(socket); err != nil {
-					clusterListener.Close()
-					return fmt.Errorf("publishing quorum-wait startup state: %w", err)
-				}
-			}
-			registered, err := registerClusterNodeWithRetry(clusterRuntime.directory, clusterRuntime.nodeRecord, clusterRuntime.lease, clusterRuntime.recoverMembership, holdsFencedRuntimes(localRoot), stderr)
-			if waitingForQuorum {
-				if removeErr := os.Remove(protocol.DaemonQuorumWaitPath(socket)); removeErr != nil && !os.IsNotExist(removeErr) && err == nil {
-					err = fmt.Errorf("clearing quorum-wait startup state: %w", removeErr)
-				}
-			}
+			registered, err := registerClusterNodeWithRetry(clusterRuntime.directory, clusterRuntime.nodeRecord, clusterRuntime.lease, holdsFencedRuntimes(localRoot), stderr)
 			if err != nil {
 				clusterListener.Close()
 				return fmt.Errorf("registering elastic cluster node: %w", err)
@@ -6618,14 +6308,14 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 			}
 			var heartbeatFatal <-chan error
 			elasticHeartbeatStopped, heartbeatFatal, err = startElasticNodeHeartbeat(
-				clusterRuntime.directory, clusterRuntime.raftCatalog, *registered, clusterRuntime.lease,
+				clusterRuntime.directory, clusterRuntime.catalog, *registered, clusterRuntime.lease,
 				stderr, clusterDone, targetBackend, leaseGuardian, fence)
 			if err != nil {
 				clusterListener.Close()
 				return fmt.Errorf("starting elastic cluster heartbeat: %w", err)
 			}
 			localCacheCleanupStopped = maintainOrphanLocalCacheCleanup(
-				clusterRuntime.raftCatalog, targetBackend, clusterRuntime.lease/4, stderr, clusterDone,
+				clusterRuntime.catalog, targetBackend, clusterRuntime.lease/4, stderr, clusterDone,
 				func() func() { return server.lockDataRootIdle(dataRoot) })
 			go func() {
 				select {
@@ -6645,7 +6335,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 			sharedGCStopped = gcStopped
 			go func() {
 				defer close(gcStopped)
-				maintainSharedGCCoordinator(clusterRuntime.raftCatalog, sharedObjects, sharedReferences, registered.NodeID, registered.Incarnation, stderr, sharedGCDone)
+				maintainSharedGCCoordinator(clusterRuntime.catalog, sharedObjects, sharedReferences, registered.NodeID, registered.Incarnation, stderr, sharedGCDone)
 			}()
 			if err := targetBackend.reconcileInterruptedClusterMemoryGraph(); err != nil {
 				clusterListener.Close()
@@ -6659,7 +6349,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 			// daemon exits. Placement reconciliation inventories runsc state and may
 			// need a container lock that an in-flight console follower or control
 			// command held when the Sentry was stopped. Re-authorize the exact
-			// PID/start-time set against the replicated placement catalog before
+			// PID/start-time set against the authority's placement catalog before
 			// taking those locks; otherwise restart can deadlock behind its own
 			// execution fence. This does not admit new work: the node is still
 			// Joining and the Unix command listener has not entered its accept loop.
@@ -6700,8 +6390,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 				}
 			}
 			// The exact incarnation is now admitted. From here ordinary offline,
-			// drain, lease expiry, and Raft reconciliation own its lifecycle.
-			cancelFreshJoin = nil
+			// drain and lease expiry own its lifecycle.
 			elasticRecord = ready
 			server.retireNode = func() error { return retireClusterNode(true) }
 			// Origin abandonment is an execution-authority mutation and is not
@@ -6743,7 +6432,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 			server.stopOnce.Do(func() { _ = server.listener.Close() })
 		}, stderr, clusterDone)
 		if elasticRecord != nil {
-			go maintainAuthorityExpirations(clusterRuntime.raft, clusterRuntime.raftCatalog, clusterRuntime.lease, stderr, clusterDone)
+			go maintainAuthorityExpirations(clusterRuntime.authority, clusterRuntime.catalog, clusterRuntime.lease, stderr, clusterDone)
 		}
 		resumeDistributedForkMonitors(targetRuntime, targetBackend, clusterRuntime)
 		resumeFrozenOriginPublications(targetBackend)
@@ -6912,8 +6601,8 @@ func maintainDistributedGraphReferences(backend *runtimeBackend, stderr io.Write
 	}
 }
 
-// reconcileDistributedGraphReferencesAtStartup waits for the cluster's Raft
-// leader, volatile providers, and shared-reference coordinator to become
+// reconcileDistributedGraphReferencesAtStartup waits for the cluster
+// authority's holder, volatile providers, and shared-reference coordinator to become
 // reachable during a simultaneous restart. The node remains joining and no
 // guest runtime is resumed while this runs.
 func reconcileDistributedGraphReferencesAtStartup(backend *runtimeBackend, lease time.Duration) error {
@@ -6994,12 +6683,12 @@ func shutdownClusterServer(server *http.Server) {
 	}
 }
 
-// waitDaemonWorker keeps an unavailable Raft leader from turning an ordinary
+// waitDaemonWorker keeps an unavailable authority holder from turning an ordinary
 // startup failure or daemon stop into an immortal half-started process. Some
 // catalog interfaces predate context-aware reads, so a worker may be blocked
 // inside a linearizable barrier even after clusterDone closes. The process is
 // already committed to exit at this point; bounding the join lets subsequent
-// deferred cleanup close the Raft transport and local stores.
+// deferred cleanup close the authority and local stores.
 func waitDaemonWorker(done <-chan struct{}, name string, stderr io.Writer) {
 	waitDaemonWorkerFor(done, name, 5*time.Second, stderr)
 }
@@ -7022,10 +6711,6 @@ func waitDaemonWorkerFor(done <-chan struct{}, name string, timeout time.Duratio
 	}
 }
 
-// registerClusterNodeWithRetry keeps an existing Raft member alive while a
-// restarted quorum elects a leader and waits out execution leases granted in
-// the prior term. Exiting during this interval can collapse the quorum before
-// any member is able to re-register and expose its control endpoint.
 // holdsFencedRuntimes reports whether Sentries of this node's local root are
 // stopped by an execution fence, waiting for the cluster to authorize them
 // again.
@@ -7040,7 +6725,7 @@ const clusterWaitReport = 30 * time.Second
 // registerClusterNodeWithRetry registers record, retrying for a bounded time,
 // or for as long as it takes if wait is set: a daemon whose Sentries a fence
 // stopped must not end while they wait, however long the cluster is away.
-func registerClusterNodeWithRetry(directory cluster.NodeCatalog, record cluster.NodeRecord, lease time.Duration, recoverMembership func(context.Context) error, wait bool, stderr io.Writer) (*cluster.NodeRecord, error) {
+func registerClusterNodeWithRetry(directory cluster.NodeCatalog, record cluster.NodeRecord, lease time.Duration, wait bool, stderr io.Writer) (*cluster.NodeRecord, error) {
 	if directory == nil {
 		return nil, errors.New("cluster node directory is unavailable")
 	}
@@ -7064,115 +6749,33 @@ func registerClusterNodeWithRetry(directory cluster.NodeCatalog, record cluster.
 			fmt.Fprintf(stderr, "ttcd: waiting for the cluster, with this node's sandboxes stopped: %v\n", lastErr)
 			report = time.Now().Add(clusterWaitReport)
 		}
-		// An offline server may have been removed from the live Raft
-		// configuration while this daemon was absent. Re-adding the same ID and
-		// address is idempotent for an existing voter and revives a removed
-		// member as a learner. The cluster HTTP listener is already serving, so
-		// simultaneous restarts cannot deadlock on these recovery attempts.
-		if recoverMembership != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			_ = recoverMembership(ctx)
-			cancel()
-		}
 		time.Sleep(100 * time.Millisecond)
 	}
 }
 
-func retireDaemonRaftMember(runtime *daemonClusterRuntime, nodeID, incarnation string) (bool, error) {
-	if runtime == nil || runtime.raft == nil || runtime.source == nil {
-		return false, errors.New("raft retirement is unavailable")
+// retireDaemonNode removes the record of the node nodeID, whose
+// incarnation committed itself offline, from the authority.
+func retireDaemonNode(runtime *daemonClusterRuntime, nodeID, incarnation string) error {
+	if runtime == nil || runtime.catalog == nil {
+		return errors.New("node retirement is unavailable")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
 	record, err := runtime.directory.Lookup(nodeID)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return false, fmt.Errorf("reading retiring node authority: %w", err)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
 	}
-	if err == nil {
-		if record.Incarnation != incarnation || record.State != cluster.NodeOffline {
-			return false, errors.New("node must commit its exact incarnation offline before identity retirement")
-		}
-		if _, err := runtime.raftCatalog.RemoveNode(nodeID, incarnation, record.Revision); err != nil {
-			return false, fmt.Errorf("removing retired node identity: %w", err)
-		}
+	if err != nil {
+		return fmt.Errorf("reading retiring node authority: %w", err)
 	}
-	var lastErr error
-	for {
-		leaderID := runtime.raft.LeaderID()
-		var err error
-		if leaderID == "" || leaderID == nodeID {
-			err = runtime.raft.RetireMember(ctx, nodeID)
-		} else {
-			peer, peerErr := runtime.source.peer(leaderID, false)
-			if peerErr != nil {
-				err = peerErr
-			} else {
-				err = peer.RetireAuthority(ctx, cluster.AuthorityRetireRequest{NodeID: nodeID, Incarnation: incarnation})
-			}
-		}
-		if err == nil {
-			return true, nil
-		}
-		if strings.Contains(err.Error(), "refusing to retire the last Raft voter") {
-			// The final voter is intentionally retained: its local Raft state is
-			// the restart point for a fully stopped cluster.
-			return false, nil
-		}
-		var redirect *cluster.AuthorityNotLeaderError
-		if errors.As(err, &redirect) && redirect.LeaderID != "" {
-			peer, peerErr := runtime.source.peer(redirect.LeaderID, false)
-			if peerErr == nil {
-				err = peer.RetireAuthority(ctx, cluster.AuthorityRetireRequest{NodeID: nodeID, Incarnation: incarnation})
-				if err == nil {
-					return true, nil
-				}
-				if strings.Contains(err.Error(), "refusing to retire the last Raft voter") {
-					return false, nil
-				}
-			} else {
-				err = peerErr
-			}
-		}
-		// A re-admitted member's local LeaderID may transiently name the leader
-		// from its stale pre-removal log. Do not make graceful shutdown wait for
-		// the full two-minute retirement deadline in that case. Ask every
-		// currently discoverable peer; only the leader will perform the removal,
-		// and RetireMember is idempotent once this server has disappeared from the
-		// configuration.
-		records, listErr := runtime.directory.List()
-		if listErr == nil {
-			sort.Slice(records, func(i, j int) bool { return records[i].NodeID < records[j].NodeID })
-			for _, record := range records {
-				if record.NodeID == nodeID || record.State == cluster.NodeOffline {
-					continue
-				}
-				peer, peerErr := runtime.source.peer(record.NodeID, false)
-				if peerErr != nil {
-					err = peerErr
-					continue
-				}
-				peerErr = peer.RetireAuthority(ctx, cluster.AuthorityRetireRequest{NodeID: nodeID, Incarnation: incarnation})
-				if peerErr == nil {
-					return true, nil
-				}
-				if strings.Contains(peerErr.Error(), "refusing to retire the last Raft voter") {
-					return false, nil
-				}
-				err = peerErr
-			}
-		}
-		lastErr = err
-		timer := time.NewTimer(100 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return false, errors.Join(lastErr, ctx.Err())
-		case <-timer.C:
-		}
+	if record.Incarnation != incarnation || record.State != cluster.NodeOffline {
+		return errors.New("node must commit its exact incarnation offline before identity retirement")
 	}
+	if _, err := runtime.catalog.RemoveNode(nodeID, incarnation, record.Revision); err != nil {
+		return fmt.Errorf("removing retired node identity: %w", err)
+	}
+	return nil
 }
 
-func maintainRepositories(dataRoot, localRoot, runtimeRoot, runsc string, publications *ttcstorage.Queue, transactions cluster.TransactionCatalog, authority *cluster.RaftCatalog, snapshotGraph *ttcsnapshot.Store, snapshotData *ttcsnapshot.LocalDataStore, standalone bool, stderr io.Writer, done <-chan struct{}, lock func() func(), busy func() bool) {
+func maintainRepositories(dataRoot, localRoot, runtimeRoot, runsc string, publications *ttcstorage.Queue, transactions cluster.TransactionCatalog, authority *cluster.AuthorityCatalog, snapshotGraph *ttcsnapshot.Store, snapshotData *ttcsnapshot.LocalDataStore, standalone bool, stderr io.Writer, done <-chan struct{}, lock func() func(), busy func() bool) {
 	timer := time.NewTimer(time.Second)
 	defer timer.Stop()
 	consumption := time.NewTicker(30 * time.Second)
@@ -7375,10 +6978,10 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 				// A distributed daemon stop is also a node retirement. Reuse the
 				// node-stop state machine so the node is cordoned, all authoritative
 				// state and peer dependencies are drained, its offline record is
-				// committed, and deferred shutdown can transfer leadership and
-				// remove the retiring Raft member. Merely applying the branch policy
-				// here would leave a cleanly stopped voter in the quorum and strand a
-				// surviving two-node cluster.
+				// committed, and deferred shutdown can give up the authority if it
+				// holds it. Merely applying the branch policy here would leave its
+				// record ready, and the rest of the cluster waiting for its lease
+				// to expire.
 				mode := ""
 				switch {
 				case slices.Contains(request.Args, "--migrate-all"):
@@ -7478,11 +7081,11 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		if owner != "" && daemonCommandMayAwaitColdUnplacement(s.dataRoot, s.clusterPlacements, request.Args) {
 			// Dehydrate/stop return after the process-free local capture is safe,
 			// while publication to shared storage is intentionally asynchronous.
-			// Wait outside every lifecycle lock for its atomic Raft commit, then
+			// Wait outside every lifecycle lock for its atomic authority command, then
 			// redo routing so the destination can claim the unplaced branch. This
 			// is required even when the requested destination is the former owner:
 			// otherwise start can carry a stale running-placement claim across the
-			// publication commit and fail at the destination as soon as Raft
+			// publication commit and fail at the destination as soon as the authority
 			// unplaces the branch.
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 			owner, request.PlacementClaims, err = awaitDaemonColdUnplacement(ctx, s.dataRoot, s.clusterPlacements, request.Args)
@@ -7779,7 +7382,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	}
 	// A retry after a lost response must consult the durable result before
 	// mutable-state validation. The committed command may have removed its own
-	// runtime or Raft placement, in which case revalidating the original claim
+	// runtime or authority placement, in which case revalidating the original claim
 	// would turn a successful idempotent retry into a false stale-route error.
 	if request.RequestID != "" && daemonCommandNeedsMutationJournal(request.Args) {
 		record, replay, err := replayCompletedDaemonMutation(s.mutationRoot(), request)
@@ -8734,37 +8337,6 @@ func exchangeDaemon(conn net.Conn, request daemonRequest, stdin io.Reader, stdou
 			return 1, fmt.Errorf("unexpected daemon frame %q", typ)
 		}
 	}
-}
-
-func writeDaemonQuorumWait(socket string) error {
-	started, err := processutil.StartTime(os.Getpid())
-	if err != nil {
-		return err
-	}
-	state := protocol.DaemonQuorumWait{PID: os.Getpid(), StartTime: started, APIVersion: daemonAPIVersion, BuildID: version.Version()}
-	data, err := json.Marshal(state)
-	if err != nil {
-		return err
-	}
-	path := protocol.DaemonQuorumWaitPath(socket)
-	temporary, err := os.CreateTemp(filepath.Dir(path), ".ttcd-quorum-wait-*")
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	if err := temporary.Chmod(0600); err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	if _, err := temporary.Write(append(data, '\n')); err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	return os.Rename(temporaryPath, path)
 }
 
 func startDaemonProcess(socket, runtimePlatform string, unsafeNoHostIsolation bool, clusterOpts daemonClusterOptions) (string, <-chan error, error) {

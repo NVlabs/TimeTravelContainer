@@ -37,7 +37,7 @@ type preparedRunIngress struct {
 var errIngressPortNotFound = errors.New("ephemeral ingress port not found")
 
 // portIngressManager owns node-local, intentionally ephemeral published
-// ports. Each accepted connection resolves current Raft placement, so the
+// ports. Each accepted connection resolves current authority placement, so the
 // listening endpoint remains valid after migration without being recreated on
 // the destination node.
 type portIngressManager struct {
@@ -48,7 +48,7 @@ type portIngressManager struct {
 
 // portIngressRouter separates the lifetime of a node-local listening socket
 // from the runtime that currently owns its target. Compute daemons resolve the
-// route from their local Raft catalog; outbound-only control daemons resolve it
+// route through their authority catalog; outbound-only control daemons resolve it
 // through a linearizable authority read. Keeping this boundary here prevents
 // the command proxy from accidentally moving an ingress socket to the branch
 // owner.
@@ -161,7 +161,7 @@ func (r daemonPortIngressRouter) ResolveFamily(container string) (string, error)
 
 // PublishPrepared installs a node-local ingress listener for a container that
 // this daemon has prepared locally. A new clustered run reaches this point
-// before its first Raft placement record exists, so Publish cannot resolve it
+// before its first placement record exists, so Publish cannot resolve it
 // through the placement catalog yet. Connections accepted after publication
 // still resolve placement on every dial and therefore follow later migration.
 func (m *portIngressManager) PublishPrepared(info ttcbundle.ContainerInfo, branch string, binding ttcbundle.PortBinding) error {
@@ -200,7 +200,7 @@ func (m *portIngressManager) publishResolved(target selector, binding ttcbundle.
 }
 
 // PublishPending reserves a node-local endpoint before a remotely placed run
-// exists in Raft. The logical container name is resolved on every accepted
+// exists in the authority. The logical container name is resolved on every accepted
 // connection, so the listener is useful as soon as the target commits its
 // placement and continues to follow subsequent migrations.
 func (m *portIngressManager) PublishPending(target selector, binding ttcbundle.PortBinding) error {

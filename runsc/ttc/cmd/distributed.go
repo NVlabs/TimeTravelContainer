@@ -44,9 +44,9 @@ import (
 
 // distributedBatchControlConcurrency bounds target-side control requests from
 // one sibling batch. Target runtime mutation is serialized per family anyway;
-// allowing every sibling to occupy an HTTP handler only queues Raft state
+// allowing every sibling to occupy an HTTP handler only queues authority state
 // transitions behind slow Sentry work and can starve the target node's
-// execution-lease renewal. A small window retains network/Raft overlap without
+// execution-lease renewal. A small window retains network/authority overlap without
 // making fan-out width part of the lease-safety envelope.
 const distributedBatchControlConcurrency = 8
 
@@ -169,7 +169,7 @@ func newConfigMemFD(name string, payload []byte) (*os.File, error) {
 }
 
 // publishRemoteTarget retries the idempotent publication boundary while a
-// restored target remains physically paused. A Raft leadership change renews
+// restored target remains physically paused. A takeover renews
 // node execution leases in the new term asynchronously; without this retry a
 // perfectly healthy target can be exposed to the caller as a dynamic fork
 // denial during that short interval. Status distinguishes a lost successful
@@ -255,7 +255,7 @@ type distributedSourceRuntime struct {
 	directory     cluster.NodeCatalog
 	placements    cluster.PlacementCatalog
 	transactions  cluster.TransactionCatalog
-	authority     *cluster.RaftCatalog
+	authority     *cluster.AuthorityCatalog
 	authToken     string
 	peerMu        sync.Mutex
 	dynamicPeers  map[string]dynamicClusterPeer
@@ -623,7 +623,7 @@ func (r *distributedSourceRuntime) beginBackgroundSnapshotWorkUnless(abandon fun
 	return r.handoffGate.RUnlock, true
 }
 
-// sourceTransactionTerminalAction resolves handoff liveness from local Raft
+// sourceTransactionTerminalAction resolves handoff liveness from the cluster
 // authority when the target peer is unavailable. Family removal may retire a
 // transaction before a background handoff next contacts the target; retrying
 // that dead endpoint forever would pin both source memory and daemon shutdown.
@@ -735,7 +735,7 @@ type dynamicClusterPeer struct {
 }
 
 // renewDistributedExecutionAuthority synchronously acquires an execution
-// lease in the current Raft term. A leader change intentionally invalidates
+// lease in the current epoch. A takeover intentionally invalidates
 // grants from the prior term; user-triggered fork and migration operations
 // must not race the periodic heartbeat and fail dynamically during that
 // otherwise healthy takeover window.
@@ -770,14 +770,14 @@ func (b *runtimeBackend) placementCatalog() (cluster.PlacementCatalog, error) {
 	if b != nil && b.distributedSource != nil && b.distributedSource.placements != nil {
 		return b.distributedSource.placements, nil
 	}
-	return nil, errors.New("raft placement authority is unavailable")
+	return nil, errors.New("placement authority is unavailable")
 }
 
 func (b *runtimeBackend) transactionCatalog() (cluster.TransactionCatalog, error) {
 	if b != nil && b.distributedSource != nil && b.distributedSource.transactions != nil {
 		return b.distributedSource.transactions, nil
 	}
-	return nil, errors.New("raft transaction authority is unavailable")
+	return nil, errors.New("transaction authority is unavailable")
 }
 
 func (r *distributedSourceRuntime) peer(nodeID string, forPlacement bool) (*cluster.Client, error) {
@@ -817,8 +817,8 @@ func (r *distributedSourceRuntime) peer(nodeID string, forPlacement bool) (*clus
 }
 
 // peerForRecord constructs a control-plane client from an already-authorized
-// Raft membership record. In particular, Raft leader redirection must use a
-// locally applied record: resolving it through directory.Lookup would recurse
+// authority node record. In particular, redirection to the authority's holder
+// must use a record the caller already has: resolving it through directory.Lookup would recurse
 // into the same linearizable read that is being redirected.
 func (r *distributedSourceRuntime) peerForRecord(record cluster.NodeRecord) (*cluster.Client, error) {
 	nodeID := record.NodeID
@@ -1919,7 +1919,7 @@ func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.Co
 
 // importRemoteRepositoryBranch imports descriptor as branch of the repository
 // at path, or, if there is none, of a new private one named name, with the
-// Raft-allocated origins if there are any. An import that would share a
+// authority-allocated origins if there are any. An import that would share a
 // snapshot frozen for an authority handoff, as the branch's own is until the
 // provider that published it completes the handoff, is refused and changes
 // nothing: it waits the handoff out.
@@ -2223,7 +2223,7 @@ func (b *runtimeBackend) publishMigratedMemoryOrigins(branch ttcbundle.BranchInf
 
 // publishVolatileGraphOrigin performs the provider-to-shared authority handoff
 // for an existing immutable origin. Bulk pack creation happens before the
-// short ledger freeze; Raft changes routing only after the shared coordinator
+// short ledger freeze; the authority changes routing only after the shared coordinator
 // has imported the exact provider baseline and catch-up suffix.
 func (b *runtimeBackend) publishVolatileGraphOrigin(origin ttcsnapshot.SnapshotID) error {
 	return b.graphOriginPublisher().publishVolatileGraphOrigin(context.Background(), origin)
@@ -2551,7 +2551,7 @@ func snapshotOriginAuthority(authority snapshotProviderLookup, origin ttcsnapsho
 }
 
 // publishRetirementFilesystemOrigin publishes a filesystem origin discovered
-// in node-local repository metadata unless Raft has already permanently
+// in node-local repository metadata unless the authority has already permanently
 // retired or abandoned that origin. A corrupted branch can leave an immutable
 // local graph generation behind after provider-loss reconciliation has
 // tombstoned its authority. Such residue must not prevent the node that still
@@ -2596,7 +2596,7 @@ func (b *runtimeBackend) publishRemainingVolatileOrigins() error {
 		return nil
 	}
 	// drainNode has fenced and evacuated every runtime. Seal the repositories'
-	// final working generations before consulting the coarse Raft provider
+	// final working generations before consulting the coarse authority provider
 	// directory; publishing a raw working origin is invalid, while creating a
 	// replacement working generation would leave new authority on the node that
 	// is trying to retire.
@@ -2686,9 +2686,9 @@ func distributedRootfsDigest(info ttcbundle.ContainerInfo, sourceBranch, reposit
 
 const targetPlacementTemporarilyUnavailable = "transaction target is not accepting placement"
 
-// reserveRemoteTarget hides the short authority gap after a Raft election.
+// reserveRemoteTarget hides the short authority gap after a takeover.
 // A ready target cannot accept a new transaction until it has renewed its
-// execution lease in the new leader term, even though the request reaching
+// execution lease in the new epoch, even though the request reaching
 // that target proves its control plane is alive. Retry the same transaction
 // identity until that renewal commits. Draining and offline are policy states,
 // so they remain immediate systematic rejections.
@@ -3865,7 +3865,7 @@ func (b *runtimeBackend) monitorHandoffCompletion(peer *cluster.Client, sourceCo
 	// This monitor owns the exported root after the synchronous completion path
 	// hands off to it. All of its return paths are terminal, so release the
 	// source's authoritative reference exactly once. The restore manifest is
-	// owned by the bound Raft transaction: an independent target still needs it
+	// owned by the bound authority transaction: an independent target still needs it
 	// to recreate its detached shared-pack reader after a daemon/helper restart.
 	defer func() {
 		_ = b.releaseSharedGraphMemoryRoots(rootNames, rootObjects)

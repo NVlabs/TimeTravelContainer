@@ -25,7 +25,6 @@ import (
 	"time"
 
 	"golang.org/x/term"
-	"gvisor.dev/gvisor/runsc/processutil"
 	"gvisor.dev/gvisor/runsc/ttc/protocol"
 	"gvisor.dev/gvisor/runsc/version"
 )
@@ -374,7 +373,7 @@ Options:
                                   (default: false)
   --node NAME                     Node name: [A-Za-z0-9._-]+ (default: hostname;
                                   control-only default: control-HOSTNAME)
-  --listen IP:PORT                Cluster/Raft listener
+  --listen IP:PORT                Cluster control listener
                                   (default: 0.0.0.0:7443)
   --advertise HOST:PORT           Peer-reachable address (default: hostname and
                                   the --listen port)
@@ -414,7 +413,7 @@ Environment:
   TTC_CLUSTER_TOKEN Optional shared cluster authentication token (default: none)
 
 With --control-only, the daemon finds the cluster's compute nodes in TTC_ROOT.
-It does not advertise a TCP endpoint, join Raft, or accept container
+It does not advertise a TCP endpoint, register a node, or accept container
 placement; it opens only its socket in TTC_LOCAL_ROOT.`,
 	"daemon status": `Usage: ttc daemon status
 
@@ -839,14 +838,6 @@ func runDaemon(opts options, args []string, stdout, stderr io.Writer) int {
 	}
 	switch args[0] {
 	case "start":
-		if waiting, ok := quorumWaitDaemon(opts.socket); ok {
-			if waiting.APIVersion != daemonAPIVersion || waiting.BuildID != version.Version() {
-				fmt.Fprintf(stderr, "ttc: client build %q does not match quorum-waiting daemon build %q (API %d); only 'ttc daemon stop' is allowed across versions\n", version.Version(), waiting.BuildID, waiting.APIVersion)
-				return 1
-			}
-			fmt.Fprintln(stdout, "ttcd already started; waiting for cluster quorum")
-			return 0
-		}
 		if conn, err := net.DialTimeout("unix", opts.socket, 150*time.Millisecond); err == nil {
 			_ = conn.SetDeadline(time.Now().Add(time.Second))
 			status, exchangeErr := exchange(conn, request{Version: daemonAPIVersion, ClientBuildID: version.Version(), Action: "ping"}, strings.NewReader(""), io.Discard, stderr)
@@ -871,15 +862,6 @@ func runDaemon(opts options, args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "ttc: usage: ttc daemon status")
 			return 2
 		}
-		if waiting, ok := quorumWaitDaemon(opts.socket); ok {
-			if waiting.APIVersion != daemonAPIVersion || waiting.BuildID != version.Version() {
-				fmt.Fprintf(stderr, "ttc: client build %q does not match quorum-waiting daemon build %q (API %d)\n", version.Version(), waiting.BuildID, waiting.APIVersion)
-				return 1
-			}
-			encoded, _ := json.Marshal(map[string]any{"pid": waiting.PID, "state": "starting", "waiting_for_cluster_quorum": true})
-			fmt.Fprintln(stdout, string(encoded))
-			return 0
-		}
 		return exchangeControl(opts.socket, request{Version: daemonAPIVersion, ClientBuildID: version.Version(), Action: "ping"}, stdout, stderr)
 	case "stop":
 		if len(args) > 2 || (len(args) == 2 && args[1] != "--dehydrate-all" && args[1] != "--stop-all" && args[1] != "--migrate-all") {
@@ -902,28 +884,6 @@ func runDaemon(opts options, args []string, stdout, stderr io.Writer) int {
 // same stop action with that version is safe because the rejected request made
 // no state change.
 func stopDaemon(socket string, args []string, stdout, stderr io.Writer) int {
-	if waiting, ok := quorumWaitDaemon(socket); ok {
-		pid := waiting.PID
-		if len(args) != 0 {
-			fmt.Fprintln(stderr, "ttc: a daemon waiting for cluster quorum has no admitted containers; stop policies are not applicable")
-			return 2
-		}
-		if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
-			fmt.Fprintf(stderr, "ttc: stopping daemon waiting for cluster quorum: %v\n", err)
-			return 1
-		}
-		deadline := time.Now().Add(2 * time.Second)
-		for time.Now().Before(deadline) && syscall.Kill(pid, 0) == nil {
-			time.Sleep(20 * time.Millisecond)
-		}
-		if syscall.Kill(pid, 0) == nil {
-			_ = syscall.Kill(-pid, syscall.SIGKILL)
-		}
-		_ = os.Remove(protocol.DaemonQuorumWaitPath(socket))
-		_ = os.Remove(socket)
-		fmt.Fprintln(stdout, "ttcd stopped")
-		return 0
-	}
 	req := request{Version: daemonAPIVersion, Action: "stop", ManageStop: true, Args: append([]string(nil), args...)}
 	status, out, diagnostic, err := exchangeControlCapture(socket, req)
 	if err != nil {
@@ -1024,11 +984,6 @@ func startDaemon(socket string, args []string, stdout, stderr io.Writer) error {
 	command := exec.Command(daemon, append([]string{"--socket", socket}, args...)...)
 	command.Stdin, command.Stdout, command.Stderr = devNull, log, log
 	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	// A SIGKILLed daemon may leave this advisory marker behind. The child
-	// recreates it only after its Raft/control listener is initialized.
-	if err := os.Remove(protocol.DaemonQuorumWaitPath(socket)); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("removing stale quorum-wait marker: %w", err)
-	}
 	if err := command.Start(); err != nil {
 		return err
 	}
@@ -1046,10 +1001,6 @@ func startDaemon(socket string, args []string, stdout, stderr io.Writer) error {
 	}
 	deadline := time.Now().Add(daemonStartTimeout)
 	for time.Now().Before(deadline) {
-		if waiting, ok := quorumWaitDaemon(socket); ok && waiting.APIVersion == daemonAPIVersion && waiting.BuildID == version.Version() {
-			fmt.Fprintln(stdout, "ttcd started; waiting for cluster quorum")
-			return nil
-		}
 		if ready() {
 			fmt.Fprintln(stdout, "ttcd started")
 			return nil
@@ -1075,29 +1026,6 @@ func startDaemon(socket string, args []string, stdout, stderr io.Writer) error {
 	return fmt.Errorf("ttcd did not become ready; startup log: %s\n%s", logPath, strings.TrimSpace(string(data)))
 }
 
-// quorumWaitDaemon validates the advisory marker strongly enough that
-// daemon stop/status cannot act on an unrelated process after PID reuse.
-func quorumWaitDaemon(socket string) (protocol.DaemonQuorumWait, bool) {
-	data, err := os.ReadFile(protocol.DaemonQuorumWaitPath(socket))
-	if err != nil {
-		return protocol.DaemonQuorumWait{}, false
-	}
-	var waiting protocol.DaemonQuorumWait
-	if err := json.Unmarshal(data, &waiting); err != nil || waiting.PID <= 0 || waiting.StartTime == "" || waiting.APIVersion <= 0 || waiting.BuildID == "" || syscall.Kill(waiting.PID, 0) != nil {
-		return protocol.DaemonQuorumWait{}, false
-	}
-	// The marker is in the root of the daemon that wrote it; a process that
-	// started at another time has the PID of one that is gone.
-	if started, err := processutil.StartTime(waiting.PID); err != nil || started != waiting.StartTime {
-		return protocol.DaemonQuorumWait{}, false
-	}
-	executable, err := processutil.Executable(waiting.PID)
-	if err != nil || filepath.Base(executable) != "ttcd" {
-		return protocol.DaemonQuorumWait{}, false
-	}
-	return waiting, true
-}
-
 func terminateStartedDaemon(command *exec.Cmd, done <-chan error) {
 	if command == nil || command.Process == nil {
 		return
@@ -1120,16 +1048,6 @@ func terminateStartedDaemon(command *exec.Cmd, done <-chan error) {
 }
 
 func connect(socket string) (net.Conn, error) {
-	// A daemon waiting for its cluster's quorum has bound its socket, but
-	// serves nothing until the cluster answers, however long that takes.
-	for patience := time.Now().Add(protocol.DaemonQuorumWaitPatience); ; time.Sleep(100 * time.Millisecond) {
-		if _, ok := quorumWaitDaemon(socket); !ok {
-			break
-		}
-		if !time.Now().Before(patience) {
-			return nil, errors.New("ttcd is waiting for its cluster to regain quorum, and serves no commands until it does; 'ttc daemon status' shows it waiting")
-		}
-	}
 	conn, err := net.DialTimeout("unix", socket, 250*time.Millisecond)
 	if err != nil {
 		return nil, fmt.Errorf("ttcd is not running; start it explicitly with 'ttc daemon start': %w", err)

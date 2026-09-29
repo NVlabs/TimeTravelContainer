@@ -147,7 +147,7 @@ func (r *Repository) ImportRemoteBranchDescriptor(descriptor RemoteSnapshotDescr
 }
 
 // ImportRemoteBranchDescriptorWithOrigins installs a deferred root using
-// exact Raft-allocated working and catalog origins.
+// exact authority-allocated working and catalog origins.
 func (r *Repository) ImportRemoteBranchDescriptorWithOrigins(descriptor RemoteSnapshotDescriptor, targetBranch string, working, catalogWorking ttcsnapshot.SnapshotID) error {
 	if working == 0 || catalogWorking == 0 || working == catalogWorking {
 		return errors.New("clustered remote filesystem import requires two distinct working origins")
@@ -411,7 +411,7 @@ func (m *Manager) ImportPrivateRemoteDescriptor(path, name string, descriptor Re
 
 // ImportPrivateRemoteDescriptorWithOrigins creates a clustered private
 // repository and deferred branch using exact branch and catalog origins
-// allocated by Raft. No dummy main branch or local snapshot origin is created.
+// allocated by the authority. No dummy main branch or local snapshot origin is created.
 func (m *Manager) ImportPrivateRemoteDescriptorWithOrigins(path, name string, descriptor RemoteSnapshotDescriptor, targetBranch string, working, catalogWorking ttcsnapshot.SnapshotID) (*Repository, error) {
 	if working == 0 || catalogWorking == 0 || working == catalogWorking {
 		return nil, errors.New("clustered private remote import requires two distinct working origins")

@@ -749,7 +749,7 @@ type DistributedForkImport struct {
 	// PhysicalBranchID is the transaction-scoped Sentry branch that implements
 	// BranchID. It differs for migrations so an older, paused source incarnation
 	// can continue serving sparse pages while a newer incarnation returns to the
-	// same Sentry. BranchID remains the stable user-visible Raft identity.
+	// same Sentry. BranchID remains the stable user-visible authority identity.
 	PhysicalBranchID         string    `json:"physical_branch_id,omitempty"`
 	Quarantined              bool      `json:"quarantined,omitempty"`
 	ParentID                 string    `json:"parent_id,omitempty"`
@@ -848,7 +848,7 @@ type ContainerInfo struct {
 	NodeID                       string                           `json:"node_id,omitempty"`
 	// DistributedCatalogOnly marks the canonical identity record after its
 	// final physical branch has been removed while logical sibling placements
-	// still exist in Raft. Such a record intentionally has no local branches;
+	// still exist in the authority. Such a record intentionally has no local branches;
 	// user-visible branch inventory is synthesized from placement authority.
 	DistributedCatalogOnly bool `json:"distributed_catalog_only,omitempty"`
 }
@@ -2205,7 +2205,7 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	// A remote runtime is a physical implementation detail of the logical
 	// distributed family. Give its persistent record an internal unique name;
 	// exposing the source family name here makes ordinary name lookup ambiguous
-	// after migration. Raft placement maps it back to the logical family.
+	// after migration. The authority's placement maps it back to the logical family.
 	target.Name = id
 	target.LeaseID = leaseID
 	target.BundleDir = filepath.Join(s.Root, "containers", id, "bundle")
@@ -3155,7 +3155,7 @@ func (s Store) loadRuntimeContainer(identifier string) (ContainerInfo, error) {
 // container IDs. Callers using an internal distributed identity must already
 // possess that ID from placement authority; this method deliberately does not
 // expose hidden targets through names or ID prefixes. The exact-ID fallback is
-// also important on NFS, where a newly committed Raft placement can become
+// also important on NFS, where a newly committed authority placement can become
 // visible before another client's directory cache sees the corresponding
 // shared family record.
 func (s Store) LoadRuntimeContainer(identifier string) (ContainerInfo, error) {
@@ -3779,7 +3779,7 @@ func (s Store) listContainersWithPolicy(includeHidden, includePhysical, tolerate
 		}
 		warnedUnreadableContainers.Delete(filepath.Join(containersDir, entry.Name()))
 		// A published physical runtime must remain exactly addressable by daemon
-		// lifecycle helpers, but Raft placement is its only user-visible identity.
+		// lifecycle helpers, but authority placement is its only user-visible identity.
 		// Never duplicate it in ordinary family inventory.
 		physicalDistributedRuntime := info.IsDistributedPhysicalRuntime()
 		if includeHidden || (!info.DistributedForkHidden && (includePhysical || !physicalDistributedRuntime)) {
@@ -4752,8 +4752,8 @@ func (s Store) CompleteBranchPublication(name, branchID, publicationID, manifest
 }
 
 // CompleteConsumedBranchPublication rolls derived physical metadata forward
-// after Raft has consumed a publication transaction but retained its immutable
-// filesystem root. The exact manifest is the fence in this state: Raft no
+// after the authority has consumed a publication transaction but retained its immutable
+// filesystem root. The exact manifest is the fence in this state: the authority no
 // longer names a publication ID, and StopBranch has cleared the physical ID so
 // a worker that passed an earlier queue check cannot replay its old lifecycle.
 func (s Store) CompleteConsumedBranchPublication(name, branchID, manifest, lifecycle string, unplace bool) error {
@@ -4822,7 +4822,7 @@ func (s Store) CompareAndSwapBranchNodeID(name, branchID, expected, replacement 
 				owner = ""
 			}
 			// Another writer made the same change: an activation, say,
-			// records the owner Raft gave the branch.
+			// records the owner the authority gave the branch.
 			if owner == replacement {
 				return false, nil
 			}
@@ -4984,7 +4984,7 @@ func (s Store) RecordBranchActivation(name, branchID, state, nodeID string) erro
 			updateBranchLifecycle(branch, state, nil, now)
 			// Activation is the physical lifecycle commit, so it must also repair
 			// the derived owner atomically. A cold publication completion may clear
-			// NodeID after Raft has already claimed the branch for this node; merely
+			// NodeID after the authority has already claimed the branch for this node; merely
 			// clearing Unplaced here would otherwise leave a running physical branch
 			// with no owner and prevent placement from leaving materializing.
 			if nodeID != "" {
@@ -5394,8 +5394,8 @@ func (s Store) GarbageCollectRepositories() (int, error) {
 
 // FilesystemSnapshotOrigins returns the origin IDs that still have local
 // authoritative graph metadata in any named or container repository. Snapshot
-// IDs are globally unique, so the union is sufficient to reconcile Raft's
-// coarse provider directory without putting per-file state in Raft.
+// IDs are globally unique, so the union is sufficient to reconcile the authority's
+// coarse provider directory without putting per-file state in the authority.
 func (s Store) FilesystemSnapshotOrigins() (map[ttcsnapshot.SnapshotID]struct{}, error) {
 	manager, err := ttcvolume.OpenManager(s.activeRoot())
 	if err != nil {

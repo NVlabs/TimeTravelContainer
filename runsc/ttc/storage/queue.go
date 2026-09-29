@@ -81,7 +81,7 @@ type completionGater interface {
 
 // cancellationFencer is implemented by distributed publishers whose control
 // plane can reject an in-flight Complete before physical cleanup is safe. The
-// durable local tombstone is installed first; Raft then gives commit versus
+// durable local tombstone is installed first; the authority then gives commit versus
 // cancel one total order.
 type cancellationFencer interface {
 	FenceCancellation(Intent) error
@@ -136,7 +136,7 @@ func (q *Queue) Activate(container, branch, publicationID string) error {
 		return err
 	}
 	// Persist the request before consulting external authority. A transient
-	// Raft or filesystem error must be retried by this daemon, not postponed
+	// authority or filesystem error must be retried by this daemon, not postponed
 	// until its next restart.
 	intent.ActivationRequested = true
 	if err := writeJSONAtomic(q.path("pending", id), intent); err != nil {

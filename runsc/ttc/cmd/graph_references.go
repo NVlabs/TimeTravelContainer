@@ -521,13 +521,13 @@ func graphReferenceIntentShouldRelease(intent graphReferenceIntent, tx *cluster.
 	}
 	if intent.Purpose == graphReferencePurposeTransfer {
 		// A transfer intent is transaction-owned, not branch-owned. Keep it
-		// while the target can still depend on the source even though Raft
+		// while the target can still depend on the source even though the
 		// cutover has already replaced the visible branch metadata. A failed
 		// post-cutover migration deliberately retains its source for recovery.
 		return txErr == nil && tx != nil && (tx.State == cluster.TransactionIndependent || tx.State == cluster.TransactionCanceled)
 	}
 	if txErr != nil {
-		// A catalog or quorum failure does not prove that the authorizing
+		// A catalog or authority failure does not prove that the authorizing
 		// transaction disappeared. Only an authoritative not-found result and a
 		// missing branch make this intent unreachable.
 		return errors.Is(txErr, os.ErrNotExist) && !branchPresent
@@ -711,7 +711,7 @@ func (b *runtimeBackend) releaseSharedGraphMemoryRoots(roots, objects []string) 
 		if err != nil {
 			return err
 		}
-		// Raft branch/publication roots are the canonical reachability source.
+		// The authority branch/publication roots are the canonical reachability source.
 		// Never let a local cleanup race release one before the control-plane
 		// transition that replaces or removes it. A skipped release is reclaimed
 		// by the next coordinator rebuild; premature release could let pack
@@ -721,7 +721,7 @@ func (b *runtimeBackend) releaseSharedGraphMemoryRoots(roots, objects []string) 
 		}
 		_, volatile, terminal, err := snapshotOriginAuthority(b.distributedSource.authority, id.Snapshot)
 		if terminal {
-			// Raft tombstones are permanent. Shared GC has either already
+			// Authority tombstones are permanent. Shared GC has either already
 			// consumed this reference, or the unpublished origin never had a
 			// shared-ledger reference. This is the idempotent completion case
 			// when removing a branch marked corrupted after provider loss.
@@ -837,7 +837,7 @@ func providerReferencePrefix(origin ttcsnapshot.SnapshotID, repository string) s
 // graph's references of the origin, which the handoff has frozen.
 //
 // The handoff moves the counting of the origin's references to the shared
-// ledger, which counts the origin's published branches by their roots in Raft
+// ledger, which counts the origin's published branches by their roots in the authority
 // and other nodes' branches by their claims. This node's other live branches
 // it would count by nothing: the ledger would collect a fork base they still
 // share, and their next publication, whose objects have edges into it, would

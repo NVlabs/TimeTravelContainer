@@ -40,7 +40,7 @@ const (
 type PlacementRecord struct {
 	FamilyID string `json:"family_id"`
 	BranchID string `json:"branch_id"`
-	// Display metadata is replicated with placement so name resolution and
+	// Display metadata is committed with placement so name resolution and
 	// cluster-wide inventory never depend on shared-filesystem directory-cache
 	// convergence. It is not part of execution authority.
 	FamilyName       string    `json:"family_name,omitempty"`
@@ -115,8 +115,8 @@ type PlacementStore struct {
 }
 
 // PlacementCatalog is the linearizable ownership interface consumed by
-// routing and migration. PlacementStore is its shared-filesystem backend; a
-// replicated service can implement the same CAS contract without changing
+// routing and migration. PlacementStore is its shared-filesystem backend; the
+// cluster authority implements the same CAS contract without changing
 // callers.
 type PlacementCatalog interface {
 	Create(PlacementRecord, time.Time) (*PlacementRecord, error)

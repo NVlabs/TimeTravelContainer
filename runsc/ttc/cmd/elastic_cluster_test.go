@@ -421,11 +421,11 @@ func TestDaemonCommandPlacementRejectsMissingCurrentPlacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, _, err := daemonCommandPlacementWithCatalog(root, placements, []string{"exec", "web@main", "true"}); err == nil {
-		t.Fatal("branch without a Raft placement used persistent metadata as a routing fallback")
+		t.Fatal("branch without a authority placement used persistent metadata as a routing fallback")
 	}
 }
 
-func TestDaemonCommandPlacementUsesInjectedRaftCatalog(t *testing.T) {
+func TestDaemonCommandPlacementUsesInjectedAuthorityCatalog(t *testing.T) {
 	root := t.TempDir()
 	containerDir := filepath.Join(root, "containers", "web")
 	bundleDir := filepath.Join(containerDir, "bundle")
@@ -443,18 +443,18 @@ func TestDaemonCommandPlacementUsesInjectedRaftCatalog(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Current-format clustered roots resolve placements only through the
-	// injected Raft catalog.
-	raftPlacements, err := cluster.OpenPlacementStore(t.TempDir())
+	// injected authority catalog.
+	authorityPlacements, err := cluster.OpenPlacementStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := raftPlacements.Create(cluster.PlacementRecord{
+	if _, err := authorityPlacements.Create(cluster.PlacementRecord{
 		FamilyID: "web", BranchID: "main", PhysicalContainer: "web", PhysicalBranch: "main",
 		OwnerNode: "node-b", OwnerIncarnation: "boot-b", State: cluster.PlacementRunning,
 	}, time.Unix(2, 0).UTC()); err != nil {
 		t.Fatal(err)
 	}
-	owner, claims, err := daemonCommandPlacementWithCatalog(root, raftPlacements, []string{"rm", "-f", "web@main"})
+	owner, claims, err := daemonCommandPlacementWithCatalog(root, authorityPlacements, []string{"rm", "-f", "web@main"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -463,7 +463,7 @@ func TestDaemonCommandPlacementUsesInjectedRaftCatalog(t *testing.T) {
 	}
 }
 
-func TestLoadDistributedFamilyIdentityUsesRaftDuringNFSVisibilityLag(t *testing.T) {
+func TestLoadDistributedFamilyIdentityUsesAuthorityDuringNFSVisibilityLag(t *testing.T) {
 	placements, err := cluster.OpenPlacementStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -719,7 +719,7 @@ func TestProcessFreeStartRelocationEligibility(t *testing.T) {
 	}
 }
 
-func TestDaemonCommandMayAwaitColdUnplacementUsesRaftAuthority(t *testing.T) {
+func TestDaemonCommandMayAwaitColdUnplacementUsesAuthority(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "containers", "family-id", "container.json")
 	if err := os.MkdirAll(filepath.Join(filepath.Dir(path), "bundle"), 0700); err != nil {
@@ -748,13 +748,13 @@ func TestDaemonCommandMayAwaitColdUnplacementUsesRaftAuthority(t *testing.T) {
 		}},
 	}
 	if !daemonCommandMayAwaitColdUnplacement(root, catalog, []string{"rehydrate", "web@cold"}) {
-		t.Fatal("Raft-authorized process-free publication was hidden by stale derived metadata")
+		t.Fatal("authority-authorized process-free publication was hidden by stale derived metadata")
 	}
 	branch := catalog.branches["family-id\x00cold"]
 	branch.Lifecycle = "running"
 	catalog.branches["family-id\x00cold"] = branch
 	if daemonCommandMayAwaitColdUnplacement(root, catalog, []string{"rehydrate", "web@cold"}) {
-		t.Fatal("running Raft branch may wait for conflicting placement")
+		t.Fatal("running authority branch may wait for conflicting placement")
 	}
 }
 
@@ -769,7 +769,7 @@ func TestAwaitDaemonColdUnplacementWaitsForSameDestinationOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Derived metadata may still name the old owner after stop has captured the
-	// process-free state. Raft lifecycle state is authoritative for deciding
+	// process-free state. The authority lifecycle state is authoritative for deciding
 	// whether start may wait for the asynchronous placement release.
 	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
 		ID: "family-id", Name: "web", State: "exited", BundleDir: bundleDir,
@@ -848,7 +848,7 @@ func TestWaitForCommittedColdBranchMetadataRepairsPublisherCrash(t *testing.T) {
 	initial := ttcbundle.ContainerInfo{
 		ID: "family-id", Name: "web", State: "dehydrated", BundleDir: bundleDir,
 		Branches: []ttcbundle.BranchInfo{{
-			// Model a publisher crash after Raft committed the new roots but before
+			// Model a publisher crash after the authority committed the new roots but before
 			// it replaced the physical branch's preceding shared manifest.
 			ID: "cold", State: "running", StorageState: "local",
 			PublicationID:   publicationID,
@@ -1131,7 +1131,7 @@ func TestClaimUnplacedLifecycleTargetRecordsSelectedNode(t *testing.T) {
 	}
 	info := ttcbundle.ContainerInfo{
 		ID: "web", Name: "web", NodeID: "node-b", BundleDir: bundleDir,
-		// Model the short interval after Raft publication unplaced the branch but
+		// Model the short interval after the authority publication unplaced the branch but
 		// before the derived shared container record cleared its old owner.
 		Branches: []ttcbundle.BranchInfo{{ID: "main", NodeID: "node-old", State: "dehydrated", CreatedAt: time.Unix(1, 0).UTC()}},
 	}
@@ -1264,7 +1264,7 @@ func TestPlacementReconciliationLeavesABusyFamily(t *testing.T) {
 		t.Fatalf("the placement of a family a long operation works on was removed: %v", err)
 	}
 	operations.end(op)
-	// Retiring the removed placement's transactions needs the Raft authority,
+	// Retiring the removed placement's transactions needs the authority,
 	// which this catalog has not; the removal itself comes first.
 	if err := backend.reconcilePlacementCatalog(); err != nil && !strings.Contains(err.Error(), "retiring transactions for removed placement web@main") {
 		t.Fatalf("reconcilePlacementCatalog: %v", err)
@@ -1439,9 +1439,9 @@ func TestRegisterCreatedContainerPlacementRetainsLocalOwner(t *testing.T) {
 	backend := &runtimeBackend{nodeID: "node-a", distributedSource: &distributedSourceRuntime{
 		directory:  directory,
 		placements: placements,
-		// Presence identifies the production Raft-backed cluster path. The
+		// Presence identifies the production authority-backed cluster path. The
 		// placement store remains a deterministic catalog test double.
-		authority: &cluster.RaftCatalog{},
+		authority: &cluster.AuthorityCatalog{},
 	}}
 	created := time.Unix(123, 0).UTC()
 	info := ttcbundle.ContainerInfo{
@@ -1958,7 +1958,7 @@ func TestRuntimeFamiliesContainToleratesConcurrentEviction(t *testing.T) {
 	}
 }
 
-func TestProvisionalRaftTargetAuthorization(t *testing.T) {
+func TestProvisionalTargetAuthorization(t *testing.T) {
 	info := ttcbundle.ContainerInfo{
 		ID: "family-id", Name: "family",
 		DistributedForkImports: map[string]ttcbundle.DistributedForkImport{
@@ -1979,19 +1979,19 @@ func TestProvisionalRaftTargetAuthorization(t *testing.T) {
 		copy := *tx
 		return &copy, nil
 	}
-	if !provisionalRaftTargetAuthorized(info, "child", "node-b", "inc-b", load) {
-		t.Fatal("current Raft target transaction did not authorize its provisional runtime")
+	if !provisionalTargetAuthorized(info, "child", "node-b", "inc-b", load) {
+		t.Fatal("current target transaction did not authorize its provisional runtime")
 	}
 	visible := info
 	visible.DistributedForkImports = nil
 	visible.Branches = []ttcbundle.BranchInfo{{
 		ID: "child", NodeID: "node-b", State: "running", DistributedForkTransactionID: "tx-fork",
 	}}
-	if !provisionalRaftTargetAuthorized(visible, "child", "node-b", "inc-b", load) {
+	if !provisionalTargetAuthorized(visible, "child", "node-b", "inc-b", load) {
 		t.Fatal("visible target transaction did not authorize pre-placement runtime")
 	}
 	tx.State = cluster.TransactionPublished
-	if !provisionalRaftTargetAuthorized(info, "child", "node-b", "inc-b", load) {
+	if !provisionalTargetAuthorized(info, "child", "node-b", "inc-b", load) {
 		t.Fatal("published but unactivated migration target lost its provisional grant")
 	}
 	tx.State = cluster.TransactionTargetRestoring
@@ -2013,7 +2013,7 @@ func TestProvisionalRaftTargetAuthorization(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			copy := *tx
 			test.mutate(&copy)
-			if provisionalRaftTargetAuthorized(info, "child", "node-b", "inc-b", func(string) (*cluster.Transaction, error) { return &copy, nil }) {
+			if provisionalTargetAuthorized(info, "child", "node-b", "inc-b", func(string) (*cluster.Transaction, error) { return &copy, nil }) {
 				t.Fatal("invalid transaction authorized provisional runtime")
 			}
 		})

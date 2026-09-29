@@ -104,7 +104,7 @@ type ReserveRequest struct {
 	// SourcePhysical* identifies the exact node-local provider selected by the
 	// source daemon. This is distinct from Identity's stable logical branch:
 	// an unplaced cold branch may be materialized into a transaction-scoped
-	// cache before it serves a remote fork. Raft retains this identity until
+	// cache before it serves a remote fork. The authority retains this identity until
 	// SourceNeeded becomes false, fencing local cache reclamation meanwhile.
 	// Migrations omit these fields because their source is derived atomically
 	// from the placement transition by the authority state machine.
@@ -487,11 +487,10 @@ type PublishedTargetIdentity interface {
 
 type controlError struct {
 	Error            string `json:"error"`
-	NotLeader        bool   `json:"not_leader,omitempty"`
-	LeaderID         string `json:"leader_id,omitempty"`
-	LeaderAddress    string `json:"leader_address,omitempty"`
-	LeaderControlURL string `json:"leader_control_url,omitempty"`
-	LeaderServerName string `json:"leader_server_name,omitempty"`
+	NotHolder        bool   `json:"not_holder,omitempty"`
+	HolderID         string `json:"holder_id,omitempty"`
+	HolderControlURL string `json:"holder_control_url,omitempty"`
+	HolderServerName string `json:"holder_server_name,omitempty"`
 }
 
 const (
@@ -499,41 +498,31 @@ const (
 	controlAuthorityStatePath   = "/v1/authority/state"
 	controlAuthorityQueryPath   = "/v1/authority/query"
 	controlAuthorityJoinPath    = "/v1/authority/join"
-	controlAuthorityCancelPath  = "/v1/authority/cancel-join"
 	controlAuthorityRetirePath  = "/v1/authority/retire"
 )
 
-// AuthorityProposal deliberately omits a timestamp. The elected leader adds
-// its time immediately before appending the command.
+// AuthorityProposal deliberately omits a timestamp. The authority's holder
+// adds its time immediately before appending the command.
 type AuthorityProposal struct {
 	RequestID string               `json:"request_id"`
 	Kind      AuthorityCommandKind `json:"kind"`
 	Payload   json.RawMessage      `json:"payload"`
 }
 
-// AuthorityJoinRequest registers a replacement execution incarnation and adds
-// its already-listening process to the one cluster Raft group as a learner.
+// AuthorityJoinRequest registers a daemon's execution incarnation with the
+// authority.
 type AuthorityJoinRequest struct {
 	NodeID            string       `json:"node_id"`
 	Incarnation       string       `json:"incarnation"`
 	ControlURL        string       `json:"control_url"`
 	ControlServerName string       `json:"control_server_name,omitempty"`
-	RaftAddress       string       `json:"raft_address"`
 	ClusterID         string       `json:"cluster_id"`
 	Capabilities      Capabilities `json:"capabilities"`
 	MemoryTargetBytes uint64       `json:"memory_target_bytes,omitempty"`
 }
 
-// AuthorityCancelJoinRequest removes a learner whose daemon failed before it
-// completed topology validation and became ready. It is deliberately scoped
-// to the joining node's exact incarnation and Raft address, so a delayed
-// cancellation cannot remove a successfully admitted or replacement member.
-type AuthorityCancelJoinRequest struct {
-	NodeID      string `json:"node_id"`
-	Incarnation string `json:"incarnation"`
-	RaftAddress string `json:"raft_address"`
-}
-
+// AuthorityRetireRequest removes the record of a node whose daemon stopped
+// cleanly, once it committed its incarnation offline.
 type AuthorityRetireRequest struct {
 	NodeID      string `json:"node_id"`
 	Incarnation string `json:"incarnation"`
@@ -554,24 +543,20 @@ type topologyEchoRequest struct {
 	Nonce        string `json:"nonce"`
 }
 
-// AuthorityService exposes leader proposals and membership changes over the
-// existing token-authenticated cluster HTTP endpoint on the trusted private
-// cluster network.
+// AuthorityService exposes the authority's proposals, reads and node
+// registration over the token-authenticated cluster HTTP endpoint on the
+// trusted private cluster network.
 type AuthorityService struct {
-	Node         *AuthorityRaftNode
+	Node         *AuthorityNode
 	Capabilities Capabilities
-	// MaxVoters bounds quorum size. Additional elastic compute nodes remain
-	// non-voting replicas, so adding hundreds of workers does not make every
-	// control-plane commit wait for or depend on all of them.
-	MaxVoters int
-	ClusterID string
+	ClusterID    string
 }
 
 // serveQuery answers a linearizable read of the records query names.
-func (a *AuthorityService) serveQuery(w http.ResponseWriter, r *http.Request, query AuthorityQuery, notLeader func(error) bool) {
+func (a *AuthorityService) serveQuery(w http.ResponseWriter, r *http.Request, query AuthorityQuery, notHolder func(error) bool) {
 	data, err := a.Node.EncodeLinearizable(r.Context(), query)
 	if err != nil {
-		if notLeader(err) {
+		if notHolder(err) {
 			return
 		}
 		writeControlError(w, http.StatusServiceUnavailable, err.Error())
@@ -582,25 +567,20 @@ func (a *AuthorityService) serveQuery(w http.ResponseWriter, r *http.Request, qu
 
 func (a *AuthorityService) serveHTTP(w http.ResponseWriter, r *http.Request, peer string) {
 	if a == nil || a.Node == nil {
-		writeControlError(w, http.StatusServiceUnavailable, "Raft authority is unavailable")
+		writeControlError(w, http.StatusServiceUnavailable, "the cluster authority is unavailable")
 		return
 	}
-	notLeader := func(err error) bool {
-		var redirect *AuthorityNotLeaderError
+	notHolder := func(err error) bool {
+		var redirect *AuthorityNotHolderError
 		if !errors.As(err, &redirect) {
 			return false
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
-		response := controlError{Error: err.Error(), NotLeader: true, LeaderID: a.Node.LeaderID(), LeaderAddress: a.Node.Leader()}
-		// A Raft transport address is not an HTTP endpoint. Include the
-		// leader's committed control endpoint so joining through any seed also
-		// works when that seed is a follower.
-		if leader, ok := a.Node.AppliedNode(response.LeaderID); ok {
-			response.LeaderControlURL = leader.ControlURL
-			response.LeaderServerName = leader.ControlServerName
-		}
-		_ = json.NewEncoder(w).Encode(response)
+		_ = json.NewEncoder(w).Encode(controlError{
+			Error: err.Error(), NotHolder: true, HolderID: redirect.HolderID,
+			HolderControlURL: redirect.ControlURL, HolderServerName: redirect.ControlServerName,
+		})
 		return true
 	}
 	switch r.URL.Path {
@@ -621,27 +601,11 @@ func (a *AuthorityService) serveHTTP(w http.ResponseWriter, r *http.Request, pee
 		var payload any = json.RawMessage(proposal.Payload)
 		result, err := a.Node.Propose(r.Context(), proposal.RequestID, proposal.Kind, payload)
 		if err != nil {
-			if notLeader(err) {
+			if notHolder(err) {
 				return
 			}
 			writeControlError(w, http.StatusServiceUnavailable, err.Error())
 			return
-		}
-		// A joining daemon commits its execution record through this endpoint.
-		// Do not acknowledge the admission transition while the member can still
-		// be only a learner: callers may immediately place work on it or lose the
-		// bootstrap node after the request returns. ReconcileVoters independently
-		// revalidates that the learner is admitted, healthy, and at the advertised
-		// Raft address before promotion. The periodic reconciler remains the crash
-		// recovery path if this response is interrupted after the state commit.
-		if proposal.Kind == AuthorityNodeTransition {
-			if err := a.Node.ReconcileVoters(r.Context(), a.MaxVoters); err != nil {
-				if notLeader(err) {
-					return
-				}
-				writeControlError(w, http.StatusServiceUnavailable, fmt.Sprintf("reconciling admitted Raft voters: %v", err))
-				return
-			}
 		}
 		writeControlJSON(w, http.StatusOK, result)
 	case controlAuthorityStatePath:
@@ -649,7 +613,7 @@ func (a *AuthorityService) serveHTTP(w http.ResponseWriter, r *http.Request, pee
 			writeControlError(w, http.StatusMethodNotAllowed, "authority state requires GET")
 			return
 		}
-		a.serveQuery(w, r, WholeAuthority, notLeader)
+		a.serveQuery(w, r, WholeAuthority, notHolder)
 	case controlAuthorityQueryPath:
 		if r.Method != http.MethodPost {
 			writeControlError(w, http.StatusMethodNotAllowed, "authority query requires POST")
@@ -660,7 +624,7 @@ func (a *AuthorityService) serveHTTP(w http.ResponseWriter, r *http.Request, pee
 			writeControlError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		a.serveQuery(w, r, query, notLeader)
+		a.serveQuery(w, r, query, notHolder)
 	case controlAuthorityJoinPath:
 		if r.Method != http.MethodPost {
 			writeControlError(w, http.StatusMethodNotAllowed, "authority join requires POST")
@@ -676,21 +640,16 @@ func (a *AuthorityService) serveHTTP(w http.ResponseWriter, r *http.Request, pee
 			return
 		}
 		if request.ClusterID == "" || request.ClusterID != a.ClusterID {
-			writeControlError(w, http.StatusConflict, "joining node belongs to another Raft cluster")
+			writeControlError(w, http.StatusConflict, "joining node belongs to another cluster")
 			return
 		}
 		if _, err := Negotiate(a.Capabilities, request.Capabilities); err != nil {
 			writeControlError(w, http.StatusConflict, err.Error())
 			return
 		}
-		// Publish the replacement incarnation before admitting its Raft
-		// learner. An expired member still has an offline NodeRecord while its
-		// stale WAL catches up. Without this ordering, voter reconciliation can
-		// remove the newly added learner as an offline member before it receives
-		// enough state to propose NodeRegister itself.
 		state, err := a.Node.LinearizableState(r.Context())
 		if err != nil {
-			if notLeader(err) {
+			if notHolder(err) {
 				return
 			}
 			writeControlError(w, http.StatusServiceUnavailable, err.Error())
@@ -701,11 +660,11 @@ func (a *AuthorityService) serveHTTP(w http.ResponseWriter, r *http.Request, pee
 			return
 		}
 		// A join registers the incarnation unless it is registered and live
-		// already, as for a retry of the same join, or a member restarting on
-		// its own Raft state that asks to be admitted again: a registration
-		// makes the node Joining, and a late one could demote it once Ready. An
-		// incarnation that expired and returns registers again, told apart
-		// from its earlier joins by the revision it expired at.
+		// already, as for a retry of the same join, or a member restarting that
+		// asks to be admitted again: a registration makes the node Joining, and
+		// a late one could demote it once Ready. An incarnation that expired
+		// and returns registers again, told apart from its earlier joins by the
+		// revision it expired at.
 		current, known := state.Nodes[request.NodeID]
 		if !known || current.Incarnation != request.Incarnation || current.State == NodeOffline {
 			requestID := "join-register-" + request.Incarnation
@@ -715,14 +674,14 @@ func (a *AuthorityService) serveHTTP(w http.ResponseWriter, r *http.Request, pee
 			record := NodeRecord{
 				NodeID: request.NodeID, Incarnation: request.Incarnation,
 				ControlURL: request.ControlURL, ControlServerName: request.ControlServerName,
-				RaftAddress: request.RaftAddress, Capabilities: request.Capabilities,
+				Capabilities:      request.Capabilities,
 				MemoryTargetBytes: request.MemoryTargetBytes,
 			}
 			result, err := a.Node.Propose(r.Context(), requestID, AuthorityNodeRegister, AuthorityNodeRegisterPayload{
 				Record: record, LeaseDuration: state.ClusterPolicy.LeaseDuration,
 			})
 			if err != nil {
-				if notLeader(err) {
+				if notHolder(err) {
 					return
 				}
 				writeControlError(w, http.StatusServiceUnavailable, err.Error())
@@ -732,57 +691,6 @@ func (a *AuthorityService) serveHTTP(w http.ResponseWriter, r *http.Request, pee
 				writeControlError(w, http.StatusConflict, err.Error())
 				return
 			}
-		}
-		if err := a.Node.AddNonvoter(r.Context(), request.NodeID, request.RaftAddress); err != nil {
-			if notLeader(err) {
-				return
-			}
-			writeControlError(w, http.StatusConflict, err.Error())
-			return
-		}
-		// Joining is deliberately learner-only. Promoting a member before its
-		// execution-lease record is committed can let a failed startup enlarge
-		// the quorum and make the healthy cluster unavailable. The leader's
-		// membership reconciler promotes only admitted ready learners.
-		writeControlJSON(w, http.StatusOK, map[string]any{"node_id": request.NodeID, "raft_address": request.RaftAddress})
-	case controlAuthorityCancelPath:
-		if r.Method != http.MethodPost {
-			writeControlError(w, http.StatusMethodNotAllowed, "authority join cancellation requires POST")
-			return
-		}
-		var request AuthorityCancelJoinRequest
-		if err := decodeControlJSON(r.Body, &request); err != nil {
-			writeControlError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		if request.NodeID != peer || !transactionIDPattern.MatchString(request.Incarnation) {
-			writeControlError(w, http.StatusForbidden, "only the exact joining node may cancel its Raft admission")
-			return
-		}
-		state, err := a.Node.LinearizableState(r.Context())
-		if err != nil {
-			if notLeader(err) {
-				return
-			}
-			writeControlError(w, http.StatusServiceUnavailable, err.Error())
-			return
-		}
-		if record, ok := state.Nodes[request.NodeID]; ok {
-			if record.Incarnation != request.Incarnation {
-				writeControlError(w, http.StatusConflict, "join cancellation refers to a stale node incarnation")
-				return
-			}
-			if record.State != NodeJoining && record.State != NodeOffline {
-				writeControlError(w, http.StatusConflict, "an admitted node may not cancel its Raft membership")
-				return
-			}
-		}
-		if err := a.Node.CancelNonvoter(r.Context(), request.NodeID, request.RaftAddress); err != nil {
-			if notLeader(err) {
-				return
-			}
-			writeControlError(w, http.StatusConflict, err.Error())
-			return
 		}
 		writeControlJSON(w, http.StatusOK, map[string]any{"node_id": request.NodeID})
 	case controlAuthorityRetirePath:
@@ -796,12 +704,12 @@ func (a *AuthorityService) serveHTTP(w http.ResponseWriter, r *http.Request, pee
 			return
 		}
 		if request.NodeID != peer {
-			writeControlError(w, http.StatusForbidden, "only a node may retire its own Raft member")
+			writeControlError(w, http.StatusForbidden, "only a node may retire itself")
 			return
 		}
 		state, err := a.Node.LinearizableState(r.Context())
 		if err != nil {
-			if notLeader(err) {
+			if notHolder(err) {
 				return
 			}
 			writeControlError(w, http.StatusServiceUnavailable, err.Error())
@@ -809,10 +717,10 @@ func (a *AuthorityService) serveHTTP(w http.ResponseWriter, r *http.Request, pee
 		}
 		if node, ok := state.Nodes[request.NodeID]; ok {
 			if node.Incarnation != request.Incarnation || node.State != NodeOffline {
-				writeControlError(w, http.StatusConflict, "node must commit its exact incarnation offline before Raft retirement")
+				writeControlError(w, http.StatusConflict, "node must commit its exact incarnation offline before retirement")
 				return
 			}
-			catalog, err := NewRaftCatalog(a.Node)
+			catalog, err := NewAuthorityCatalog(a.Node)
 			if err != nil {
 				writeControlError(w, http.StatusServiceUnavailable, err.Error())
 				return
@@ -822,16 +730,9 @@ func (a *AuthorityService) serveHTTP(w http.ResponseWriter, r *http.Request, pee
 				return
 			}
 		}
-		if err := a.Node.RetireMember(r.Context(), request.NodeID); err != nil {
-			if notLeader(err) {
-				return
-			}
-			writeControlError(w, http.StatusConflict, err.Error())
-			return
-		}
 		writeControlJSON(w, http.StatusOK, map[string]any{"node_id": request.NodeID})
 	default:
-		writeControlError(w, http.StatusNotFound, "unknown Raft authority endpoint")
+		writeControlError(w, http.StatusNotFound, "unknown authority endpoint")
 	}
 }
 
@@ -845,8 +746,8 @@ type ControlPlane struct {
 	TargetRuntime   TargetRuntime
 	Authority       *AuthorityService
 	// TopologyState returns linearizable cluster membership. Topology probes
-	// must not validate a newly committed joining identity against an
-	// arbitrarily stale follower FSM.
+	// must not validate a newly committed joining identity against a stale
+	// read.
 	TopologyState func(context.Context) (*AuthorityState, error)
 	// AuthToken optionally authenticates peers on a trusted plaintext network.
 	// It provides admission control only; it does not provide confidentiality.
@@ -858,23 +759,23 @@ type ControlPlane struct {
 	// the authenticated full-duplex request stream.
 	PortProxy http.Handler
 	// RenewExecution synchronously renews this daemon's node lease in the
-	// current Raft term. Placement coordinators call it immediately before
-	// reserving capacity, closing the healthy leader-change window in which a
+	// current epoch. Placement coordinators call it immediately before
+	// reserving capacity, closing the window after a takeover in which a
 	// target's periodic heartbeat has not run yet.
 	RenewExecution func(context.Context) error
 	// ObjectProvider serves immutable graph objects owned by this node. Reads
-	// are fenced by the provider's current Raft authority and transaction.
+	// are fenced by the provider's current authority and transaction.
 	ObjectProvider ImmutableObjectProvider
 	// SnapshotProvider serves immutable graph metadata without transferring
 	// reference-count authority to the requesting cache.
 	SnapshotProvider ImmutableSnapshotProvider
 	// SnapshotReferences applies bounded root-reference operations at the
 	// unique volatile origin owner. Object and descendant counts never enter
-	// the control plane or Raft.
+	// the control plane or the authority.
 	SnapshotReferences SnapshotReferenceProvider
-	// SharedReferences is active only on the daemon holding the current Raft
+	// SharedReferences is active only on the daemon holding the current
 	// shared-GC lease. It imports a manifest-backed origin and applies the
-	// provider's ordered handoff suffix before Raft changes object routing.
+	// provider's ordered handoff suffix before the authority changes object routing.
 	SharedReferences SharedSnapshotReferenceProvider
 	// ReferenceInventory exposes this node's durable active root claims so a
 	// newly elected shared-GC coordinator can rebuild its disposable local
@@ -925,7 +826,7 @@ type SharedReferenceMutation struct {
 }
 
 // SharedSnapshotReferenceProvider owns exact reference state while its daemon
-// holds the Raft shared-GC lease.
+// holds the shared-GC lease.
 type SharedSnapshotReferenceProvider interface {
 	ImportSharedSnapshot(context.Context, string, uint64) error
 	ApplySharedSnapshotReference(context.Context, string, uint64, string, string, string, bool) error
@@ -1076,7 +977,7 @@ func (c *ControlPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasPrefix(r.URL.Path, "/v1/authority/") {
 		if c.Authority == nil {
-			writeControlError(w, http.StatusNotImplemented, "Raft authority is unavailable")
+			writeControlError(w, http.StatusNotImplemented, "the cluster authority is unavailable")
 			return
 		}
 		c.Authority.serveHTTP(w, r, peer)
@@ -1429,7 +1330,7 @@ func (c *ControlPlane) reserve(w http.ResponseWriter, r *http.Request, peer stri
 		return
 	}
 	if request.Identity.Migration && (request.SourcePhysicalContainer != "" || request.SourcePhysicalBranch != "") {
-		writeControlError(w, http.StatusBadRequest, "migration physical source is selected by Raft placement")
+		writeControlError(w, http.StatusBadRequest, "migration physical source is selected by authority placement")
 		return
 	}
 	if (request.SourcePhysicalContainer == "") != (request.SourcePhysicalBranch == "") ||
@@ -1446,7 +1347,7 @@ func (c *ControlPlane) reserve(w http.ResponseWriter, r *http.Request, peer stri
 			return advanced, nil
 		}
 		// The local reservation is idempotent and may overlap recovery or a
-		// replayed request at this final Raft CAS. Resolve the authoritative
+		// replayed request at this final authority CAS. Resolve the authoritative
 		// state rather than leaking a stale-revision implementation detail.
 		current, loadErr := c.Store.Load(tx.Identity.TransactionID)
 		if loadErr != nil {
@@ -1654,10 +1555,10 @@ func (c *ControlPlane) publish(w http.ResponseWriter, r *http.Request, id, peer 
 		writeControlError(w, http.StatusConflict, fmt.Sprintf("transaction is %s revision %d, want %s revision %d", tx.State, tx.Revision, TransactionTargetPaused, request.Revision))
 		return
 	}
-	_, raftAuthority := c.Store.(AtomicTargetPublisher)
+	_, atomicPublication := c.Store.(AtomicTargetPublisher)
 	runtimePaused := request.Paused
-	if tx.Identity.Migration || raftAuthority {
-		// Raft-backed targets never execute before the placement grant that
+	if tx.Identity.Migration || atomicPublication {
+		// authority-backed targets never execute before the placement grant that
 		// authorizes them. Publish the physical target paused, commit authority,
 		// then activate it below.
 		runtimePaused = true
@@ -1701,7 +1602,7 @@ func (c *ControlPlane) publish(w http.ResponseWriter, r *http.Request, id, peer 
 		writeControlError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if raftAuthority && !tx.Identity.Migration && !request.Paused && !tx.Activated {
+	if atomicPublication && !tx.Identity.Migration && !request.Paused && !tx.Activated {
 		if err := c.TargetRuntime.Activate(r.Context(), tx); err != nil {
 			// Placement is already committed. Leave the target physically paused
 			// and let recovery retry activation; rolling authority back after the
@@ -1743,7 +1644,7 @@ func (c *ControlPlane) activate(w http.ResponseWriter, r *http.Request, id, peer
 		writeControlJSON(w, http.StatusOK, tx)
 		return
 	}
-	if _, raftAuthority := c.Store.(AtomicTargetPublisher); raftAuthority && tx.Identity.Migration && !tx.OwnershipCommitted {
+	if _, atomicPublication := c.Store.(AtomicTargetPublisher); atomicPublication && tx.Identity.Migration && !tx.OwnershipCommitted {
 		writeControlError(w, http.StatusConflict, "migration placement ownership has not committed")
 		return
 	}
@@ -1948,7 +1849,7 @@ func (c *ControlPlane) cancel(w http.ResponseWriter, r *http.Request, id, peer s
 		return
 	}
 	// Cancellation is destructive: TargetRuntime.Cancel removes the physical
-	// target. Fence a cancelable transaction in Raft before touching that
+	// target. Fence a cancelable transaction in the authority before touching that
 	// runtime; otherwise a concurrent Published -> Draining transition can win
 	// after physical deletion and leave an authoritative independent placement
 	// without a Sentry. Once draining has begun, return the observed state so
@@ -2139,7 +2040,7 @@ func (c *Client) FetchSnapshot(ctx context.Context, snapshot uint64, transaction
 	}
 	lengthText := response.Header.Get(controlObjectLengthHeader)
 	length, err := strconv.ParseUint(lengthText, 10, 64)
-	if err != nil || length == 0 || length > maxAuthoritySnapshotBytes || response.ContentLength < 0 || uint64(response.ContentLength) != length {
+	if err != nil || length == 0 || length > maxAuthorityStateBytes || response.ContentLength < 0 || uint64(response.ContentLength) != length {
 		response.Body.Close()
 		return nil, 0, errors.New("immutable snapshot provider returned an invalid exact length")
 	}
@@ -2180,7 +2081,7 @@ func (c *Client) FetchSnapshotObject(ctx context.Context, snapshot uint64, objec
 	}
 	lengthText := response.Header.Get(controlObjectLengthHeader)
 	length, err := strconv.ParseUint(lengthText, 10, 64)
-	if err != nil || length == 0 || length > maxAuthoritySnapshotBytes || response.ContentLength < 0 || uint64(response.ContentLength) != length {
+	if err != nil || length == 0 || length > maxAuthorityStateBytes || response.ContentLength < 0 || uint64(response.ContentLength) != length {
 		response.Body.Close()
 		return nil, 0, errors.New("immutable snapshot object provider returned an invalid exact length")
 	}
@@ -2364,8 +2265,8 @@ func (c *Client) ProxyPort(ctx context.Context, family, branch string, port uint
 	return err
 }
 
-// ProposeAuthority forwards a deterministic mutation envelope to the current
-// cluster leader. The leader supplies the command timestamp.
+// ProposeAuthority forwards a deterministic mutation envelope to the
+// authority's holder, which supplies the command timestamp.
 func (c *Client) ProposeAuthority(ctx context.Context, proposal AuthorityProposal) (AuthorityResult, error) {
 	var result AuthorityResult
 	if err := c.call(ctx, http.MethodPost, controlAuthorityProposePath, proposal, &result); err != nil {
@@ -2377,7 +2278,7 @@ func (c *Client) ProposeAuthority(ctx context.Context, proposal AuthorityProposa
 // AuthorityState returns a linearizable cluster control snapshot.
 func (c *Client) AuthorityState(ctx context.Context) (*AuthorityState, error) {
 	var state AuthorityState
-	if err := c.callWithLimit(ctx, http.MethodGet, controlAuthorityStatePath, nil, &state, maxAuthoritySnapshotBytes); err != nil {
+	if err := c.callWithLimit(ctx, http.MethodGet, controlAuthorityStatePath, nil, &state, maxAuthorityStateBytes); err != nil {
 		return nil, err
 	}
 	return &state, nil
@@ -2387,7 +2288,7 @@ func (c *Client) AuthorityState(ctx context.Context) (*AuthorityState, error) {
 // linearizably, from the node that holds the authority.
 func (c *Client) AuthorityQuery(ctx context.Context, query AuthorityQuery) (*AuthorityState, error) {
 	var state AuthorityState
-	if err := c.callWithLimit(ctx, http.MethodPost, controlAuthorityQueryPath, query, &state, maxAuthoritySnapshotBytes); err != nil {
+	if err := c.callWithLimit(ctx, http.MethodPost, controlAuthorityQueryPath, query, &state, maxAuthorityStateBytes); err != nil {
 		return nil, err
 	}
 	state.initMaps()
@@ -2398,25 +2299,17 @@ func (c *Client) AuthorityQuery(ctx context.Context, query AuthorityQuery) (*Aut
 // for shared reference-ledger reconstruction.
 func (c *Client) SnapshotReferenceInventory(ctx context.Context) (*SnapshotReferenceInventory, error) {
 	var inventory SnapshotReferenceInventory
-	if err := c.callWithLimit(ctx, http.MethodGet, controlReferenceClaimsPath, nil, &inventory, maxAuthoritySnapshotBytes); err != nil {
+	if err := c.callWithLimit(ctx, http.MethodGet, controlReferenceClaimsPath, nil, &inventory, maxAuthorityStateBytes); err != nil {
 		return nil, err
 	}
 	return &inventory, nil
 }
 
-// JoinAuthority admits this client's authenticated node as a learner. The
-// leader promotes it only after a ready execution record is committed.
+// JoinAuthority registers this client's authenticated node with the
+// authority's holder, as a joining node until it renews as ready.
 func (c *Client) JoinAuthority(ctx context.Context, request AuthorityJoinRequest) error {
 	var response map[string]any
 	return c.call(ctx, http.MethodPost, controlAuthorityJoinPath, request, &response)
-}
-
-// CancelAuthorityJoin removes this client's own learner after startup failed
-// before admission. Successfully admitted members must use the ordinary
-// offline/drain retirement protocol instead.
-func (c *Client) CancelAuthorityJoin(ctx context.Context, request AuthorityCancelJoinRequest) error {
-	var response map[string]any
-	return c.call(ctx, http.MethodPost, controlAuthorityCancelPath, request, &response)
 }
 
 // ProbeTopology proves bidirectional control reachability between this
@@ -2432,14 +2325,16 @@ func (c *Client) ProbeTopology(ctx context.Context, request TopologyProbeRequest
 	return nil
 }
 
-// RenewExecutionAuthority asks the target daemon itself to acquire execution
-// authority in the current Raft term. A different node must never fabricate a
-// target heartbeat merely because its previous-term lease has not expired.
+// RenewExecutionAuthority asks the target daemon itself to renew its
+// execution lease with the current authority. A different node must never
+// fabricate a target heartbeat merely because its lease has not expired.
 func (c *Client) RenewExecutionAuthority(ctx context.Context) error {
 	var response map[string]string
 	return c.call(ctx, http.MethodPost, controlExecutionRenewPath, nil, &response)
 }
 
+// RetireAuthority asks the authority to remove the record of this client's
+// node, which committed its incarnation offline.
 func (c *Client) RetireAuthority(ctx context.Context, request AuthorityRetireRequest) error {
 	var response map[string]any
 	return c.call(ctx, http.MethodPost, controlAuthorityRetirePath, request, &response)
@@ -2600,10 +2495,9 @@ func (c *Client) callWithLimit(ctx context.Context, method, path string, request
 		if err := json.NewDecoder(limited).Decode(&remote); err != nil || remote.Error == "" {
 			return fmt.Errorf("cluster peer returned HTTP %s", resp.Status)
 		}
-		if remote.NotLeader || remote.LeaderID != "" || remote.LeaderAddress != "" {
-			return &AuthorityNotLeaderError{
-				LeaderID: remote.LeaderID, Leader: remote.LeaderAddress,
-				LeaderControlURL: remote.LeaderControlURL, LeaderServerName: remote.LeaderServerName,
+		if remote.NotHolder {
+			return &AuthorityNotHolderError{
+				HolderID: remote.HolderID, ControlURL: remote.HolderControlURL, ControlServerName: remote.HolderServerName,
 			}
 		}
 		return fmt.Errorf("cluster peer: %s", remote.Error)

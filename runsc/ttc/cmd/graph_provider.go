@@ -85,7 +85,7 @@ func (b *runtimeBackend) openDistributedGraphRestore(manifest *os.File, _ string
 type graphObjectProvider struct {
 	graph        *ttcsnapshot.Store
 	data         *ttcsnapshot.LocalDataStore
-	authority    *cluster.RaftCatalog
+	authority    *cluster.AuthorityCatalog
 	transactions cluster.TransactionCatalog
 	nodeID       string
 	incarnation  string
@@ -101,9 +101,9 @@ type graphSnapshotCatalog struct {
 	Objects  []ttcsnapshot.Object   `json:"objects"`
 }
 
-type raftOriginLocator struct{ authority *cluster.RaftCatalog }
+type authorityOriginLocator struct{ authority *cluster.AuthorityCatalog }
 
-func (locator raftOriginLocator) Provider(_ context.Context, snapshot ttcsnapshot.SnapshotID) (string, bool, error) {
+func (locator authorityOriginLocator) Provider(_ context.Context, snapshot ttcsnapshot.SnapshotID) (string, bool, error) {
 	provider, found, err := locator.authority.SnapshotProvider(uint64(snapshot))
 	return provider.NodeID, found, err
 }
@@ -177,7 +177,7 @@ func (p *graphObjectProvider) authorizeSnapshot(peer string, snapshot ttcsnapsho
 		}
 		transaction, err := p.transactions.Load(transactionID)
 		if err != nil {
-			// Branches may outlive the bounded Raft transaction history that
+			// Branches may outlive the bounded authority transaction history that
 			// originally authorized their retain. A release is still fenced by its
 			// unguessable operation name and exact object IDs, and can only remove
 			// that previously-created reference. Requiring the retired transaction
@@ -190,7 +190,7 @@ func (p *graphObjectProvider) authorizeSnapshot(peer string, snapshot ttcsnapsho
 		// An immutable root may have been inherited through any number of local
 		// and remote forks. Its provider is therefore not necessarily the source
 		// node of the transaction that is currently fetching or retaining it.
-		// Raft's snapshot-origin mapping above proves that this node is the unique
+		// the authority's snapshot-origin mapping above proves that this node is the unique
 		// provider; the transaction must prove only that the authenticated caller
 		// is its target. Exact object IDs then bound the requested authority.
 		if !snapshotReferenceRequesterAuthorized(transaction, peer, operation) {
@@ -329,7 +329,7 @@ func groupGraphRootBindings(objects []string) (map[ttcsnapshot.SnapshotID][]clus
 // RetainSnapshotRoots activates one transaction-fenced root batch in the
 // volatile origin's authoritative graph. Store.RetainRoots supplies the
 // durable idempotency boundary; neither descendant edges nor counts enter
-// Raft or this request.
+// the authority or this request.
 func (p *graphObjectProvider) RetainSnapshotRoots(ctx context.Context, peer string, snapshotID uint64, transaction, operation string, bindings []cluster.SnapshotRootBinding) error {
 	snapshot := ttcsnapshot.SnapshotID(snapshotID)
 	_, volatile, err := p.authority.SnapshotProvider(snapshotID)

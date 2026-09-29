@@ -118,7 +118,7 @@ func TestAuthorityCommandIdempotencyAndInputReuse(t *testing.T) {
 	}
 	reenveloped := command
 	reenveloped.IssuedAt = command.IssuedAt.Add(time.Minute)
-	reenveloped.LeaderTerm++
+	reenveloped.Epoch++
 	third := state.Apply(reenveloped)
 	if first.Revision != third.Revision || state.Revision != first.Revision {
 		t.Fatalf("re-enveloped retry advanced revision: first=%d third=%d state=%d", first.Revision, third.Revision, state.Revision)

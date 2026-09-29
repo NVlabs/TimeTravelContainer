@@ -1449,20 +1449,10 @@ func TestPlainControlPlaneOptionalToken(t *testing.T) {
 
 // An incarnation whose lease expired joins again when it returns. Its
 // registration must take effect, not be answered from the join it first made:
-// its record would stay offline, and voter reconciliation would take it out of
-// Raft for good. A retry of a join, once registered, registers nothing.
+// its record would stay offline. A retry of a join, once registered,
+// registers nothing.
 func TestAuthorityJoinRegistersAReturningIncarnation(t *testing.T) {
-	serverTLS, clientTLS := newAuthorityRaftTLS(t)
-	node, err := OpenAuthorityRaftNode(AuthorityRaftOptions{
-		NodeID: "node-a", LocalDir: filepath.Join(t.TempDir(), "raft"),
-		ListenAddress: "127.0.0.1:0", AdvertiseHost: "127.0.0.1:0", ServerName: "localhost",
-		ServerTLS: serverTLS, ClientTLS: clientTLS, Bootstrap: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer node.Close()
-	waitAuthorityLeader(t, node)
+	node := newTestHolder(t).node
 	lease := 50 * time.Millisecond
 	propose := func(id string, kind AuthorityCommandKind, payload any) {
 		t.Helper()
@@ -1474,12 +1464,12 @@ func TestAuthorityJoinRegistersAReturningIncarnation(t *testing.T) {
 	propose("policy", AuthorityClusterPolicySet, AuthorityClusterPolicyPayload{Policy: ClusterRuntimePolicy{
 		Version: 1, PagingPolicy: testCapabilities("node-a").PagingPolicy, LeaseDuration: lease, MaxTransactions: 32,
 	}})
-	service := &AuthorityService{Node: node, Capabilities: testCapabilities("node-a"), MaxVoters: 3, ClusterID: "cluster"}
+	service := &AuthorityService{Node: node, Capabilities: testCapabilities("node-a"), ClusterID: "cluster"}
 	join := func() NodeRecord {
 		t.Helper()
 		body, err := json.Marshal(AuthorityJoinRequest{
 			NodeID: "node-b", Incarnation: "incarnation-b", ControlURL: "http://127.0.0.1:2",
-			RaftAddress: "127.0.0.1:1", ClusterID: "cluster", Capabilities: testCapabilities("node-b"),
+			ClusterID: "cluster", Capabilities: testCapabilities("node-b"),
 		})
 		if err != nil {
 			t.Fatal(err)

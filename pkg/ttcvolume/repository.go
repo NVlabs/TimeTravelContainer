@@ -422,7 +422,7 @@ func (r *Repository) VolatileOrigins() []ttcsnapshot.SnapshotID {
 
 // SnapshotOrigins returns every origin represented by this repository's
 // authoritative graph. This includes working origins: in a cluster their IDs
-// have already been allocated by Raft even though their objects remain mutable.
+// have already been allocated by the authority even though their objects remain mutable.
 // Callers use this inventory to reconcile provider-directory entries after a
 // crash or repository removal; it does not expose object-level references.
 func (r *Repository) SnapshotOrigins() []ttcsnapshot.SnapshotID {
@@ -918,7 +918,7 @@ func readOriginReferences(path string, origin ttcsnapshot.SnapshotID, ifIdle boo
 }
 
 // CompleteOriginHandoff changes the local graph into a non-authoritative
-// shared cache view after Raft has committed the provider-to-shared switch.
+// shared cache view after the authority has committed the provider-to-shared switch.
 func (r *Repository) CompleteOriginHandoff(origin ttcsnapshot.SnapshotID) error {
 	return r.withLock(func() error {
 		if err := r.graph.MarkShared(origin); err != nil {
@@ -929,7 +929,7 @@ func (r *Repository) CompleteOriginHandoff(origin ttcsnapshot.SnapshotID) error 
 }
 
 // CancelOriginHandoff restores ordinary provider-side mutation and collection
-// after a publication was canceled before Raft routed origin to shared
+// after a publication was canceled before the authority routed origin to shared
 // storage. It is idempotent so crash recovery may repeat cleanup.
 func (r *Repository) CancelOriginHandoff(origin ttcsnapshot.SnapshotID) error {
 	return r.withLock(func() error {
@@ -1027,7 +1027,7 @@ func (m *Manager) CreatePrivate(path, name string) (*Repository, error) {
 }
 
 // CreatePrivateWithOrigin creates a family-private clustered repository using
-// an initial working origin committed by Raft.
+// an initial working origin committed by the authority.
 func (m *Manager) CreatePrivateWithOrigin(path, name string, working ttcsnapshot.SnapshotID) (*Repository, error) {
 	if working == 0 {
 		return nil, errors.New("clustered repository requires an allocated working snapshot origin")
@@ -2071,7 +2071,7 @@ func (r *Repository) BeginFork(source, child string) (*ForkTransaction, error) {
 }
 
 // BeginForkWithOrigins performs the same O(1) repository fork using the exact
-// fresh source and child working origins already committed by cluster Raft.
+// fresh source and child working origins already committed by the cluster authority.
 func (r *Repository) BeginForkWithOrigins(source, child string, sourceWorking, childWorking ttcsnapshot.SnapshotID) (*ForkTransaction, error) {
 	if sourceWorking == 0 || childWorking == 0 || sourceWorking == childWorking {
 		return nil, errors.New("clustered repository fork requires two distinct working snapshot origins")
@@ -2235,7 +2235,7 @@ func (r *Repository) Fork(source, child string) error {
 }
 
 // ForkWithOrigins creates and commits a clustered fork using exact
-// Raft-allocated fresh working origins.
+// authority-allocated fresh working origins.
 func (r *Repository) ForkWithOrigins(source, child string, sourceWorking, childWorking uint64) error {
 	tx, err := r.BeginForkWithOrigins(source, child, ttcsnapshot.SnapshotID(sourceWorking), ttcsnapshot.SnapshotID(childWorking))
 	if err != nil {

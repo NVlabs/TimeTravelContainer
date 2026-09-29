@@ -10,18 +10,14 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/hashicorp/raft"
-	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 	"golang.org/x/sys/unix"
 )
 
@@ -31,10 +27,10 @@ import (
 //     the epoch it holds it for.
 //   - authority/epochs/N is the claim of epoch N, which one node creates
 //     exclusively to take the authority.
-//   - authority/N/raft is the Raft log and snapshots of the authority of
-//     epoch N, the only voter. A node that takes the authority makes epoch
-//     N+1's from epoch N's, so that nothing a node leaves behind, however it
-//     leaves, can write the log of its successor.
+//   - authority/N is the state of the authority of epoch N: a snapshot and
+//     the log its holder appends to (see authorityLog). A node that takes
+//     the authority makes epoch N+1's from epoch N's, so that nothing a node
+//     leaves behind, however it leaves, can write the log of its successor.
 //   - members/NODE is what the daemon of NODE says of itself, and a counter
 //     it advances every heartbeat.
 //
@@ -83,9 +79,8 @@ type AuthorityRecord struct {
 	Role              string `json:"role"`
 	ControlURL        string `json:"control_url,omitempty"`
 	ControlServerName string `json:"control_server_name,omitempty"`
-	RaftAddress       string `json:"raft_address,omitempty"`
-	// Previous is the epoch whose Raft state this epoch's was made from, or
-	// 0 for a cluster's first.
+	// Previous is the epoch whose state this epoch's was made from, or 0 for
+	// a cluster's first.
 	Previous  uint64    `json:"previous,omitempty"`
 	ClaimedAt time.Time `json:"claimed_at"`
 }
@@ -102,7 +97,6 @@ type MemberRecord struct {
 	Role              string `json:"role"`
 	ControlURL        string `json:"control_url,omitempty"`
 	ControlServerName string `json:"control_server_name,omitempty"`
-	RaftAddress       string `json:"raft_address,omitempty"`
 	// Counter advances every heartbeat.
 	Counter uint64 `json:"counter"`
 	// Authority is the epoch whose authority the daemon holds, if any.
@@ -141,9 +135,9 @@ func (c SharedCluster) memberPath(nodeID string) string {
 	return filepath.Join(c.membersDir(), nodeID)
 }
 
-// RaftDir returns the directory of the Raft state of epoch's authority.
-func (c SharedCluster) RaftDir(epoch uint64) string {
-	return filepath.Join(c.authorityDir(), epochName(epoch), "raft")
+// EpochDir returns the directory of the state of epoch's authority.
+func (c SharedCluster) EpochDir(epoch uint64) string {
+	return filepath.Join(c.authorityDir(), epochName(epoch))
 }
 
 func epochName(epoch uint64) string {
@@ -242,16 +236,11 @@ func (c SharedCluster) ReadClaim(epoch uint64) (AuthorityRecord, error) {
 // AuthorityDecision is what a daemon of a cluster does about its authority.
 type AuthorityDecision struct {
 	// Hold is set if the daemon holds the authority of Record's epoch. Its
-	// Raft state is to be made from Record.Previous's, unless it is made.
+	// state is to be made from Record.Previous's, unless it is made.
 	Hold bool
 	// Record names the authority, the daemon's own if it holds it.
 	Record AuthorityRecord
 }
-
-// ErrNoAuthorityState is the error of a daemon that would start the
-// authority of a cluster whose Raft state predates the shared root's:
-// see DecideAuthority.
-var ErrNoAuthorityState = errors.New("the cluster's Raft state is in its former members' local roots")
 
 // DecideAuthority decides whether the daemon of self, whose heartbeat runs,
 // holds the authority of the cluster or joins the node that does, observing
@@ -259,8 +248,7 @@ var ErrNoAuthorityState = errors.New("the cluster's Raft state is in its former 
 // to know, or until ctx is done.
 //
 //   - The first daemon of a cluster claims its first epoch, and holds its
-//     authority, unless the cluster's Raft state predates the shared root's
-//     and the daemon has none of it, legacy being empty.
+//     authority.
 //   - A daemon holds the authority its record names it for, as when it
 //     restarts, unless another daemon has claimed a later epoch since.
 //   - A daemon takes the authority, claiming the next epoch, from a holder
@@ -270,7 +258,7 @@ var ErrNoAuthorityState = errors.New("the cluster's Raft state is in its former 
 //     as it does once it sees a compute daemon run, and takes it from one
 //     that has not after AuthorityTakeover.
 //   - Otherwise it joins the holder; a control daemon never does.
-func (c SharedCluster) DecideAuthority(ctx context.Context, self AuthorityRecord, legacy bool, liveness *Liveness) (AuthorityDecision, error) {
+func (c SharedCluster) DecideAuthority(ctx context.Context, self AuthorityRecord, liveness *Liveness) (AuthorityDecision, error) {
 	for {
 		record, recorded, err := c.ReadAuthority()
 		if err != nil {
@@ -281,9 +269,6 @@ func (c SharedCluster) DecideAuthority(ctx context.Context, self AuthorityRecord
 			return AuthorityDecision{}, err
 		}
 		takeFrom := func(previous uint64) (bool, error) {
-			if previous == 0 && !legacy && c.predatesSharedAuthority() {
-				return false, ErrNoAuthorityState
-			}
 			claim := self
 			claim.Epoch, claim.Previous, claim.ClaimedAt = max(latest, previous)+1, previous, time.Now().UTC()
 			won, err := c.ClaimEpoch(claim)
@@ -303,8 +288,7 @@ func (c SharedCluster) DecideAuthority(ctx context.Context, self AuthorityRecord
 		done := false
 		switch {
 		case !recorded && latest == 0:
-			// A new cluster, or one whose Raft state predates the shared
-			// root's.
+			// A new cluster.
 			decision, done, err = decided(takeFrom(0))
 		case latest > record.Epoch:
 			// A claim not yet recorded: by this daemon before it restarted,
@@ -373,19 +357,11 @@ func (c SharedCluster) running(record AuthorityRecord, liveness *Liveness) bool 
 	return err == nil && member.Incarnation == record.Incarnation && liveness.Advancing(member)
 }
 
-// predatesSharedAuthority reports whether the cluster ran before its Raft
-// state was kept in the shared root, when it kept it in its members' local
-// roots and recorded its group here.
-func (c SharedCluster) predatesSharedAuthority() bool {
-	_, err := os.Stat(filepath.Join(filepath.Dir(c.Dir), ".ttc-raft-cluster.json"))
-	return err == nil
-}
-
 // AwaitRelease waits until the daemon that held the authority of previous
 // can no longer write its log: until it gave the authority up, or ended, or
 // its lease lapsed, which it has once its counter stood still for
 // AuthorityTakeover.
-func (c SharedCluster) AwaitRelease(ctx context.Context, previous AuthorityRecord, epoch uint64, liveness *Liveness) error {
+func (c SharedCluster) AwaitRelease(ctx context.Context, previous AuthorityRecord, liveness *Liveness) error {
 	for {
 		member, err := c.ReadMember(previous.NodeID)
 		if err != nil || member.Incarnation != previous.Incarnation || member.Released >= previous.Epoch ||
@@ -400,10 +376,10 @@ func (c SharedCluster) AwaitRelease(ctx context.Context, previous AuthorityRecor
 	}
 }
 
-// PruneEpochs removes the Raft state and the claims of the epochs before
-// keep, which the authority of a later epoch than keep's made its own from.
-// The state of keep itself remains: its holder may still write it, if only
-// what it will never acknowledge.
+// PruneEpochs removes the state and the claims of the epochs before keep,
+// the epoch a holder made its own epoch's state from. The state of keep
+// itself remains: its holder may still write it, if only what it will never
+// acknowledge.
 func (c SharedCluster) PruneEpochs(keep uint64) error {
 	entries, err := os.ReadDir(c.claimsDir())
 	if errors.Is(err, fs.ErrNotExist) {
@@ -683,36 +659,6 @@ func (l *Liveness) waitedFor(record AuthorityRecord) time.Duration {
 	return time.Since(since)
 }
 
-// fencedLogStore is the Raft log store of an epoch's authority. It fails every
-// write, before or after it syncs, once the authority is no longer held, and
-// Raft then steps down without committing it.
-type fencedLogStore struct {
-	raft.LogStore
-	// held returns nil while the authority is held.
-	held func() error
-}
-
-func (s fencedLogStore) StoreLog(log *raft.Log) error {
-	return s.StoreLogs([]*raft.Log{log})
-}
-
-func (s fencedLogStore) StoreLogs(logs []*raft.Log) error {
-	if err := s.held(); err != nil {
-		return err
-	}
-	if err := s.LogStore.StoreLogs(logs); err != nil {
-		return err
-	}
-	return s.held()
-}
-
-func (s fencedLogStore) DeleteRange(min, max uint64) error {
-	if err := s.held(); err != nil {
-		return err
-	}
-	return s.LogStore.DeleteRange(min, max)
-}
-
 // ErrAuthorityLost is the error of a write of the log of an authority that is
 // no longer held.
 var ErrAuthorityLost = errors.New("this node no longer holds the cluster authority")
@@ -751,36 +697,49 @@ func (h AuthorityHolder) Held() error {
 	return nil
 }
 
-// Prepared reports whether the Raft state of epoch's authority was made.
+// StateSource returns the epoch whose state makes that of an epoch taken
+// from previous: previous, or, if its claimant ended before it made
+// previous's state, the epoch previous's would have been made from. No
+// holder acknowledged anything in an epoch whose state was never made.
+func (c SharedCluster) StateSource(previous uint64) (uint64, error) {
+	for previous != 0 && !c.Prepared(previous) {
+		claim, err := c.ReadClaim(previous)
+		if err != nil {
+			return 0, fmt.Errorf("finding the state of epoch %d: %w", previous, err)
+		}
+		if claim.Previous >= previous {
+			return 0, fmt.Errorf("the claim of epoch %d takes it from epoch %d", previous, claim.Previous)
+		}
+		previous = claim.Previous
+	}
+	return previous, nil
+}
+
+// Prepared reports whether the state of epoch's authority was made.
 func (c SharedCluster) Prepared(epoch uint64) bool {
 	_, err := os.Stat(c.preparedPath(epoch))
 	return err == nil
 }
 
 func (c SharedCluster) preparedPath(epoch uint64) string {
-	return filepath.Join(c.authorityDir(), epochName(epoch), "prepared")
+	return filepath.Join(c.EpochDir(epoch), "prepared")
 }
 
-// PrepareEpoch makes the Raft state of the authority of epoch from the state
-// in sourceDir, a previous epoch's or, for a cluster that kept its Raft log in
-// its members' local roots, a former voter's, with the server of self as the
-// only voter. The state of sourceDir is copied, not changed: its authority
-// may still be writing it, if only a write it will not acknowledge. With no
-// sourceDir, it bootstraps the authority's first state.
-func (c SharedCluster) PrepareEpoch(sourceDir string, epoch uint64, self raft.Server) (err error) {
+// PrepareEpoch makes the state of the authority of epoch from the state of
+// the authority of source, a previous epoch, or, with source 0, a new
+// cluster's. It reads source's state and changes nothing of it: its holder
+// may still be writing it, if only what it will never acknowledge.
+func (c SharedCluster) PrepareEpoch(source, epoch uint64) (err error) {
 	if c.Prepared(epoch) {
-		return fmt.Errorf("the Raft state of epoch %d was already made", epoch)
+		return fmt.Errorf("the state of epoch %d was already made", epoch)
 	}
-	dir := c.RaftDir(epoch)
-	if err := os.MkdirAll(filepath.Dir(dir), 0700); err != nil {
-		return err
-	}
+	dir := c.EpochDir(epoch)
 	// A claimant that stalled and lost its claim may have left part of this
 	// directory; the claim is this node's now.
 	if err := os.RemoveAll(dir); err != nil {
 		return err
 	}
-	if err := os.Mkdir(dir, 0700); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
 	defer func() {
@@ -788,54 +747,20 @@ func (c SharedCluster) PrepareEpoch(sourceDir string, epoch uint64, self raft.Se
 			_ = os.RemoveAll(dir)
 		}
 	}()
-	configuration := raft.Configuration{Servers: []raft.Server{self}}
-	config := authorityRaftConfig(string(self.ID), 0)
-	_, transport := raft.NewInmemTransport(self.Address)
-	defer transport.Close()
-	if sourceDir == "" {
-		store, err := raftboltdb.NewBoltStore(filepath.Join(dir, "raft.db"))
-		if err != nil {
-			return err
-		}
-		defer store.Close()
-		snapshots, err := raft.NewFileSnapshotStore(dir, authoritySnapshotRetain, io.Discard)
-		if err != nil {
-			return err
-		}
-		if err := raft.BootstrapCluster(config, store, store, snapshots, transport, configuration); err != nil {
-			return err
-		}
-		return c.markPrepared(epoch)
+	sourceDir := ""
+	if source != 0 {
+		sourceDir = c.EpochDir(source)
 	}
-	if err := copyRaftState(sourceDir, dir); err != nil {
-		return err
-	}
-	// A copy taken while the source's authority wrote may be torn: bbolt
-	// panics on some of what that reads as.
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("recovering the Raft state of epoch %d: %v", epoch, recovered)
-		}
-	}()
-	store, err := raftboltdb.NewBoltStore(filepath.Join(dir, "raft.db"))
-	if err != nil {
-		return err
-	}
-	defer store.Close()
-	snapshots, err := raft.NewFileSnapshotStore(dir, authoritySnapshotRetain, io.Discard)
-	if err != nil {
-		return err
-	}
-	if err := raft.RecoverCluster(config, NewAuthorityFSM(), store, store, snapshots, transport, configuration); err != nil {
-		return fmt.Errorf("recovering the Raft state of epoch %d: %w", epoch, err)
+	if err := prepareAuthorityEpoch(dir, epoch, sourceDir, source); err != nil {
+		return fmt.Errorf("making the state of epoch %d: %w", epoch, err)
 	}
 	return c.markPrepared(epoch)
 }
 
-// markPrepared records that the Raft state of epoch was made: from then on
-// its authority may write it, and it is never made again.
+// markPrepared records that the state of epoch was made: from then on its
+// authority may write it, and it is never made again.
 func (c SharedCluster) markPrepared(epoch uint64) error {
-	if err := syncDir(c.RaftDir(epoch)); err != nil {
+	if err := syncDir(c.EpochDir(epoch)); err != nil {
 		return err
 	}
 	file, err := os.OpenFile(c.preparedPath(epoch), os.O_CREATE|os.O_WRONLY, 0600)
@@ -849,77 +774,7 @@ func (c SharedCluster) markPrepared(epoch uint64) error {
 	if err != nil {
 		return err
 	}
-	return syncDir(filepath.Dir(c.preparedPath(epoch)))
-}
-
-// PrepareEpochFor is PrepareEpoch with the member nodeID, at raftAddress, the
-// only voter.
-func (c SharedCluster) PrepareEpochFor(sourceDir string, epoch uint64, nodeID, raftAddress string) error {
-	return c.PrepareEpoch(sourceDir, epoch, raft.Server{ID: raft.ServerID(nodeID), Address: raft.ServerAddress(raftAddress), Suffrage: raft.Voter})
-}
-
-// copyRaftState copies the Raft log and the complete snapshots of source to
-// destination.
-func copyRaftState(source, destination string) error {
-	if err := copyFileSynced(filepath.Join(source, "raft.db"), filepath.Join(destination, "raft.db")); err != nil {
-		return fmt.Errorf("copying the Raft log: %w", err)
-	}
-	entries, err := os.ReadDir(filepath.Join(source, "snapshots"))
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	var names []string
-	for _, entry := range entries {
-		// A snapshot being written has a temporary name until it is
-		// complete.
-		if entry.IsDir() && !strings.HasSuffix(entry.Name(), ".tmp") {
-			names = append(names, entry.Name())
-		}
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		from, to := filepath.Join(source, "snapshots", name), filepath.Join(destination, "snapshots", name)
-		if err := os.MkdirAll(to, 0700); err != nil {
-			return err
-		}
-		for _, file := range []string{"meta.json", "state.bin"} {
-			if err := copyFileSynced(filepath.Join(from, file), filepath.Join(to, file)); err != nil {
-				// Retired by its authority as it was copied.
-				if errors.Is(err, fs.ErrNotExist) {
-					_ = os.RemoveAll(to)
-					break
-				}
-				return fmt.Errorf("copying Raft snapshot %s: %w", name, err)
-			}
-		}
-	}
-	return nil
-}
-
-// copyFileSynced copies source to destination, from its start to its end, and
-// syncs it. bbolt keeps its two meta pages first, so a copy that reads them
-// first holds a consistent state even if the source commits once meanwhile.
-func copyFileSynced(source, destination string) error {
-	in, err := os.Open(source)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-	if err != nil {
-		return err
-	}
-	_, err = io.Copy(out, in)
-	if err == nil {
-		err = out.Sync()
-	}
-	if closeErr := out.Close(); err == nil {
-		err = closeErr
-	}
-	return err
+	return syncDir(c.EpochDir(epoch))
 }
 
 func syncDir(dir string) error {

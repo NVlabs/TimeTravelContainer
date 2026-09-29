@@ -807,7 +807,7 @@ func (store *SharedPackStore) Manifests() ([]*SnapshotManifest, error) {
 		manifest, err := store.Manifest(snapshot)
 		if errors.Is(err, fs.ErrNotExist) {
 			// Enumeration is only a physical discovery pass. A preceding GC
-			// coordinator may have permanently fenced this origin in Raft and be
+			// coordinator may have permanently fenced this origin in the authority and be
 			// finishing its directory rename/removal while a successor rebuilds
 			// disposable reference state. The absent directory is therefore no
 			// longer a candidate manifest, not evidence of a partial pack.
@@ -1226,7 +1226,7 @@ func (store *SharedPackStore) Reconcile(snapshot SnapshotID) (int, bool, error) 
 }
 
 // Retire removes one unreachable committed snapshot pack without racing a
-// cooperating reader. The caller must hold the current Raft shared-GC lease
+// cooperating reader. The caller must hold the current shared-GC lease
 // and must have proved that no authoritative shared root or immutable edge
 // references this origin. busy=true means a reader still has an extent open.
 func (store *SharedPackStore) Retire(snapshot SnapshotID) (busy bool, err error) {
@@ -1318,7 +1318,7 @@ func (store *SharedPackStore) DiscardHandoff(snapshot SnapshotID) (busy bool, er
 
 // RetirementReady reports whether retirement can acquire the snapshot's
 // exclusive physical lease. It does not alter the snapshot. Distributed GC
-// calls this immediately before permanently fencing the origin in Raft: a
+// calls this immediately before permanently fencing the origin in the authority: a
 // busy result proves that some data-plane reader still observes the origin,
 // which is inconsistent with retiring it even if the reference ledger has
 // already reached zero.
@@ -1336,7 +1336,7 @@ func (store *SharedPackStore) RetirementReady(snapshot SnapshotID) (bool, error)
 	return true, errors.Join(syscall.Flock(int(lease.Fd()), syscall.LOCK_UN), lease.Close())
 }
 
-// CompleteRetirement idempotently finishes physical deletion after Raft has
+// CompleteRetirement idempotently finishes physical deletion after the authority has
 // permanently retired snapshot. It also removes directories left after a
 // crash between the namespace rename and RemoveAll.
 func (store *SharedPackStore) CompleteRetirement(snapshot SnapshotID) (busy bool, err error) {
@@ -1367,8 +1367,8 @@ func (store *SharedPackStore) CompleteRetirement(snapshot SnapshotID) (busy bool
 	}
 	// Publication creates the snapshot directory before its temporary pack and
 	// commits the manifest last. A canceled or crashed publisher may therefore
-	// leave an empty (or temporary-only) namespace. Once Raft has permanently
-	// retired this origin, that namespace is no more authoritative than an
+	// leave an empty (or temporary-only) namespace. Once the cluster authority has
+	// permanently retired this origin, that namespace is no more authoritative than an
 	// interrupted handoff and must not survive as shared-root residue.
 	if _, err := os.Stat(filepath.Join(store.snapshotDirectory(snapshot), sharedManifestName)); errors.Is(err, fs.ErrNotExist) {
 		return store.DiscardHandoff(snapshot)

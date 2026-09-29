@@ -125,7 +125,7 @@ func TestSnapshotOriginAuthorityDistinguishesTombstones(t *testing.T) {
 		{name: "volatile", lookup: testSnapshotProviderLookup{found: true}},
 		{name: "shared", lookup: testSnapshotProviderLookup{}},
 		{name: "terminal", lookup: testSnapshotProviderLookup{err: os.ErrNotExist}, terminal: true},
-		{name: "authority failure", lookup: testSnapshotProviderLookup{err: errors.New("raft unavailable")}, wantErr: true},
+		{name: "authority failure", lookup: testSnapshotProviderLookup{err: errors.New("authority unavailable")}, wantErr: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			_, volatile, terminal, err := snapshotOriginAuthority(test.lookup, 17)
@@ -214,7 +214,7 @@ func TestTerminalSourceAction(t *testing.T) {
 		{name: "failed", tx: &cluster.Transaction{State: cluster.TransactionFailed}, action: "distributed-cancel", done: true},
 		{name: "retired", err: os.ErrNotExist, action: "distributed-cancel", done: true},
 		{name: "published", tx: &cluster.Transaction{State: cluster.TransactionPublished}},
-		{name: "read error", err: errors.New("raft unavailable")},
+		{name: "read error", err: errors.New("authority unavailable")},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -238,8 +238,8 @@ func TestColdReferenceIdentityIsScopedToPublication(t *testing.T) {
 		t.Fatal("two durable memory activations reused one named reference")
 	}
 	// Ready and Committed both carry the same publication ID, so the candidate
-	// pin and final branch pin are deliberately identical across the atomic Raft
-	// transition.
+	// pin and final branch pin are deliberately identical across the atomic
+	// authority transition.
 	if got := coldBranchReferenceIdentity("family", "main", "publication-first"); got != first {
 		t.Fatalf("stable publication identity=%q, want %q", got, first)
 	}
@@ -891,7 +891,7 @@ func TestCancelRemoteForkTargetRetriesAdvancedRevision(t *testing.T) {
 	}
 }
 
-func TestReserveRemoteTargetWaitsForNewLeaderLease(t *testing.T) {
+func TestReserveRemoteTargetWaitsForNewEpochLease(t *testing.T) {
 	var attempts atomic.Int32
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()

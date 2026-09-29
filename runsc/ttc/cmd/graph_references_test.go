@@ -264,7 +264,7 @@ func TestGraphReferenceTransferLifetimeFollowsTransaction(t *testing.T) {
 			t.Fatalf("orphaned branch intent was retained in %s", state)
 		}
 	}
-	if graphReferenceIntentShouldRelease(branch, nil, errors.New("temporary quorum failure"), false) {
+	if graphReferenceIntentShouldRelease(branch, nil, errors.New("temporary authority failure"), false) {
 		t.Fatal("transient transaction lookup failure released a branch intent")
 	}
 	if !graphReferenceIntentShouldRelease(branch, nil, os.ErrNotExist, false) {
@@ -569,7 +569,7 @@ func TestDiscardAbandonedSnapshotForgetsImportedEmptyOrigin(t *testing.T) {
 	ledger := ttcsnapshot.NewReferenceLedger()
 	origin := ttcsnapshot.SnapshotID(41)
 	// This is the publication crash prefix where the coordinator imported the
-	// origin, but cancellation won Raft authority before shared publication.
+	// origin, but cancellation won authority before shared publication.
 	if err := ledger.ImportOrigin(origin, nil, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -679,8 +679,8 @@ func TestGraphReferenceIntentCrashPrefixes(t *testing.T) {
 }
 
 // testGraphOriginPublisher returns a publisher of a new graph, and the
-// graph's one origin, sealed and rooted. The publisher's authority has no Raft
-// node, which the tests using it never reach.
+// graph's one origin, sealed and rooted. The publisher's authority has no
+// cluster authority, which the tests using it never reach.
 func testGraphOriginPublisher(t *testing.T) (*branchPublisher, ttcsnapshot.SnapshotID) {
 	t.Helper()
 	graph, err := ttcsnapshot.Open(filepath.Join(t.TempDir(), "graph"))
@@ -707,7 +707,7 @@ func testGraphOriginPublisher(t *testing.T) (*branchPublisher, ttcsnapshot.Snaps
 	}
 	return &branchPublisher{
 		sharedRoot: t.TempDir(), nodeID: "node-a", incarnation: "boot-a",
-		authority: &cluster.RaftCatalog{}, graph: graph, graphShared: &ttcsnapshot.SharedPackStore{},
+		authority: &cluster.AuthorityCatalog{}, graph: graph, graphShared: &ttcsnapshot.SharedPackStore{},
 		sharedRefs: &sharedReferenceService{}, peers: &distributedSourceRuntime{},
 	}, origin
 }

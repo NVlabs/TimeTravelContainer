@@ -22,9 +22,11 @@ import (
 )
 
 const (
-	// AuthorityFormatVersion is the durable replicated-state format. It is
+	// AuthorityFormatVersion is the durable authority-state format. It is
 	// deliberately independent from the peer data-plane protocol version.
-	AuthorityFormatVersion = 10
+	// Version 11 is the first kept in the authority log, which names terms
+	// epochs.
+	AuthorityFormatVersion = 11
 	maxRememberedRequests  = 65536
 	maxSharedGCLease       = 30 * time.Second
 )
@@ -81,16 +83,16 @@ const (
 	AuthoritySharedGCRetire        AuthorityCommandKind = "shared-gc-retire-origin"
 )
 
-// AuthorityCommand is the sole replicated mutation envelope. IssuedAt is
-// assigned by the Raft leader before proposal; followers never consult their
-// clocks while applying it.
+// AuthorityCommand is the sole mutation envelope the authority logs. IssuedAt is
+// assigned by the authority's holder before proposal; applying it never
+// consults a clock, so replaying the log gives the same state.
 type AuthorityCommand struct {
-	Version    int                  `json:"version"`
-	RequestID  string               `json:"request_id"`
-	IssuedAt   time.Time            `json:"issued_at"`
-	LeaderTerm uint64               `json:"leader_term"`
-	Kind       AuthorityCommandKind `json:"kind"`
-	Payload    json.RawMessage      `json:"payload"`
+	Version   int                  `json:"version"`
+	RequestID string               `json:"request_id"`
+	IssuedAt  time.Time            `json:"issued_at"`
+	Epoch     uint64               `json:"epoch"`
+	Kind      AuthorityCommandKind `json:"kind"`
+	Payload   json.RawMessage      `json:"payload"`
 }
 
 // NewAuthorityCommand builds a bounded deterministic command.
@@ -108,11 +110,11 @@ func NewAuthorityCommand(requestID string, at time.Time, kind AuthorityCommandKi
 	if len(data) > maxTransactionRecordBytes {
 		return AuthorityCommand{}, fmt.Errorf("authority command payload is %d bytes, limit is %d", len(data), maxTransactionRecordBytes)
 	}
-	return AuthorityCommand{Version: AuthorityFormatVersion, RequestID: requestID, IssuedAt: at.UTC(), LeaderTerm: 1, Kind: kind, Payload: data}, nil
+	return AuthorityCommand{Version: AuthorityFormatVersion, RequestID: requestID, IssuedAt: at.UTC(), Epoch: 1, Kind: kind, Payload: data}, nil
 }
 
 // AuthorityResult is the stable result of an applied request. State-dependent
-// rejections are replicated too, so replaying the same request cannot change a
+// rejections are logged too, so replaying the same request cannot change a
 // failure into success after unrelated state changes.
 type AuthorityResult struct {
 	Revision uint64          `json:"revision"`
@@ -132,7 +134,7 @@ type appliedAuthorityRequest struct {
 	Result AuthorityResult `json:"result"`
 }
 
-// DurableRoots are immutable bulk-data roots. Raft stores these small names,
+// DurableRoots are immutable bulk-data roots. The authority stores these small names,
 // never the pages, file extents, or packs reached through them.
 type DurableRoots struct {
 	MemoryRoot      string `json:"memory_root,omitempty"`
@@ -149,7 +151,7 @@ type SnapshotOriginProvider struct {
 	NodeID     string `json:"node_id"`
 }
 
-// SnapshotAllocation is the stable result of one Raft allocation request.
+// SnapshotAllocation is the stable result of one allocation request.
 type SnapshotAllocation struct {
 	First uint64 `json:"first"`
 	Count uint32 `json:"count"`
@@ -228,17 +230,17 @@ type PublicationRecord struct {
 	UpdatedAt         time.Time        `json:"updated_at"`
 }
 
-// AuthorityState is snapshotted by Raft. Maps are keyed by stable logical
+// AuthorityState is snapshotted by the authority. Maps are keyed by stable logical
 // identities, never local paths.
 type AuthorityState struct {
 	Version                int    `json:"version"`
 	Revision               uint64 `json:"revision"`
 	NextSnapshotID         uint64 `json:"next_snapshot_id"`
 	NextSharedGCGeneration uint64 `json:"next_shared_gc_generation"`
-	// LeaderObservedAt is populated only on a linearizable read response. It is
-	// zero in the replicated FSM and snapshots, and lets remote readers convert
+	// HolderObservedAt is populated only on a linearizable read response. It is
+	// zero in the applied state and snapshots, and lets remote readers convert
 	// lease deadlines without assuming wall-clock synchronization.
-	LeaderObservedAt time.Time                          `json:"leader_observed_at,omitempty"`
+	HolderObservedAt time.Time                          `json:"holder_observed_at,omitempty"`
 	ClusterPolicy    ClusterRuntimePolicy               `json:"cluster_policy,omitempty"`
 	Nodes            map[string]NodeRecord              `json:"nodes,omitempty"`
 	RetiredNodes     map[string]string                  `json:"retired_nodes,omitempty"`
@@ -374,13 +376,13 @@ func volatileDependencyForwarded(state *AuthorityState, family, branch, transact
 
 func authorityCommandDigest(command AuthorityCommand) (string, error) {
 	copy := command
-	// Request identity binds semantic input, not the leader-generated envelope.
+	// Request identity binds semantic input, not the holder-generated envelope.
 	// A proposal whose committed response was lost may be retried after time has
-	// advanced or leadership changed; both retries must resolve to the original
+	// advanced or the authority changed hands; both retries must resolve to the original
 	// result without being mistaken for request-ID reuse with a new operation.
 	copy.RequestID = ""
 	copy.IssuedAt = time.Time{}
-	copy.LeaderTerm = 0
+	copy.Epoch = 0
 	data, err := json.Marshal(copy)
 	if err != nil {
 		return "", err
@@ -389,7 +391,7 @@ func authorityCommandDigest(command AuthorityCommand) (string, error) {
 	return hex.EncodeToString(digest[:]), nil
 }
 
-// Apply applies exactly one committed Raft command. It is deterministic: it
+// Apply applies exactly one committed authority command. It is deterministic: it
 // performs no I/O, randomness, or wall-clock reads.
 func (s *AuthorityState) Apply(command AuthorityCommand) AuthorityResult {
 	if s == nil {
@@ -406,11 +408,11 @@ func (s *AuthorityState) Apply(command AuthorityCommand) AuthorityResult {
 		}
 		return previous.Result
 	}
-	if command.Version != AuthorityFormatVersion || !transactionIDPattern.MatchString(command.RequestID) || command.IssuedAt.IsZero() || command.LeaderTerm == 0 {
+	if command.Version != AuthorityFormatVersion || !transactionIDPattern.MatchString(command.RequestID) || command.IssuedAt.IsZero() || command.Epoch == 0 {
 		return AuthorityResult{Revision: s.Revision, Error: "invalid authority command envelope"}
 	}
 
-	// Clone only the maps this command may change. Raft serializes Apply calls,
+	// Clone only the maps this command may change. The authority serializes Apply calls,
 	// map values are immutable structs, and command handlers copy nested mutable
 	// fields before editing them. This preserves rollback-on-rejection without
 	// serializing the entire cluster state for every heartbeat.
@@ -564,7 +566,7 @@ type AuthorityNodeRemovePayload struct {
 	Revision            uint64
 }
 
-// ClusterRuntimePolicy is the small operational policy replicated by Raft.
+// ClusterRuntimePolicy is the small operational policy the authority keeps.
 // It may change only while no daemon has a live execution lease. CPU state is
 // intentionally absent: the CPU profile is an immutable snapshot ABI.
 type ClusterRuntimePolicy struct {
@@ -662,7 +664,7 @@ type AuthoritySharedGCPayload struct {
 // AuthorityMigrationCutoverPayload joins the transaction and placement CASes
 // that used to be committed separately. The target runtime is already paused
 // and locally published when this command is proposed; applying it makes that
-// target the sole authoritative owner in one Raft revision.
+// target the sole authoritative owner in one revision.
 type AuthorityMigrationCutoverPayload struct {
 	TransactionID, Family, Branch        string
 	TransactionRevision                  uint64
@@ -751,7 +753,7 @@ func (s *AuthorityState) applySharedGC(command AuthorityCommand) (json.RawMessag
 	if err != nil {
 		return nil, err
 	}
-	if err := s.requireNodeIncarnation(p.NodeID, p.Incarnation, command.IssuedAt, command.LeaderTerm, false); err != nil {
+	if err := s.requireNodeIncarnation(p.NodeID, p.Incarnation, command.IssuedAt, command.Epoch, false); err != nil {
 		return nil, err
 	}
 	switch command.Kind {
@@ -831,7 +833,7 @@ func (s *AuthorityState) applySnapshot(command AuthorityCommand) (json.RawMessag
 	if err != nil {
 		return nil, err
 	}
-	if err := s.requireNodeIncarnation(p.NodeID, p.Incarnation, command.IssuedAt, command.LeaderTerm, false); err != nil {
+	if err := s.requireNodeIncarnation(p.NodeID, p.Incarnation, command.IssuedAt, command.Epoch, false); err != nil {
 		return nil, err
 	}
 	switch command.Kind {
@@ -905,7 +907,7 @@ func (s *AuthorityState) applyForkPublish(command AuthorityCommand) (json.RawMes
 		return nil, errors.New("remote fork transaction is not ready to publish")
 	}
 	node, ok := s.Nodes[tx.Identity.TargetNodeID]
-	if !ok || node.Incarnation != p.TargetIncarnation || node.LeaseTerm != command.LeaderTerm || !node.LeaseActive(command.IssuedAt) || (node.State != NodeReady && node.State != NodePressured) {
+	if !ok || node.Incarnation != p.TargetIncarnation || node.LeaseEpoch != command.Epoch || !node.LeaseActive(command.IssuedAt) || (node.State != NodeReady && node.State != NodePressured) {
 		return nil, errors.New("remote fork target node has no valid execution authority")
 	}
 	if err := tx.Advance(TransactionPublished, "", command.IssuedAt); err != nil {
@@ -982,7 +984,7 @@ func (s *AuthorityState) applyMigrationCutover(command AuthorityCommand) (json.R
 		tx.TargetPhysicalBranch != p.PhysicalBranch || tx.TargetPhysicalIncarnation != p.TargetIncarnation {
 		return nil, errors.New("migration transaction does not match placement cutover")
 	}
-	if err := s.requireNodeIncarnation(p.Target, p.TargetIncarnation, command.IssuedAt, command.LeaderTerm, false); err != nil {
+	if err := s.requireNodeIncarnation(p.Target, p.TargetIncarnation, command.IssuedAt, command.Epoch, false); err != nil {
 		return nil, fmt.Errorf("migration target: %w", err)
 	}
 	key := logicalBranchKey(p.Family, p.Branch)
@@ -1058,7 +1060,7 @@ func (s *AuthorityState) applyNode(command AuthorityCommand) (json.RawMessage, e
 					"source or target daemon incarnation ended before volatile state became durable", command.IssuedAt)
 				// A shared-GC lease is fenced by the daemon incarnation as well as
 				// its generation. Re-registration must revoke the old holder in the
-				// same Raft transition; otherwise the replicated state contains a
+				// same authority transition; otherwise the authority's state contains a
 				// lease that no registered incarnation can legally exercise.
 				if s.SharedGC.NodeID == current.NodeID && s.SharedGC.Incarnation == current.Incarnation {
 					s.SharedGC = SharedGCLease{}
@@ -1072,7 +1074,7 @@ func (s *AuthorityState) applyNode(command AuthorityCommand) (json.RawMessage, e
 		} else {
 			record.Revision = 1
 		}
-		record.State, record.UpdatedAt, record.LeaseExpiresAt, record.LeaseTerm = NodeJoining, command.IssuedAt, leaseUntil, command.LeaderTerm
+		record.State, record.UpdatedAt, record.LeaseExpiresAt, record.LeaseEpoch = NodeJoining, command.IssuedAt, leaseUntil, command.Epoch
 		record.LeaseDuration = leaseUntil.Sub(command.IssuedAt)
 		if record.StartedAt.IsZero() {
 			record.StartedAt = command.IssuedAt
@@ -1107,7 +1109,7 @@ func (s *AuthorityState) applyNode(command AuthorityCommand) (json.RawMessage, e
 		pruneIncomingReservations(&record, command.IssuedAt)
 		updateNodePressureState(&record)
 		record.Revision++
-		record.UpdatedAt, record.LeaseExpiresAt, record.LeaseTerm = command.IssuedAt, leaseUntil, command.LeaderTerm
+		record.UpdatedAt, record.LeaseExpiresAt, record.LeaseEpoch = command.IssuedAt, leaseUntil, command.Epoch
 		record.LeaseDuration = leaseUntil.Sub(command.IssuedAt)
 		if err := record.Validate(); err != nil {
 			return nil, err
@@ -1126,8 +1128,8 @@ func (s *AuthorityState) applyNode(command AuthorityCommand) (json.RawMessage, e
 		if record.Incarnation != p.Incarnation {
 			return nil, errors.New("stale node incarnation")
 		}
-		if record.LeaseTerm != command.LeaderTerm {
-			return nil, errors.New("node has not renewed with the current Raft leader")
+		if record.LeaseEpoch != command.Epoch {
+			return nil, errors.New("node has not renewed with the current authority holder")
 		}
 		if p.State != record.State && !nodeTransitions[record.State][p.State] {
 			return nil, fmt.Errorf("illegal node transition %s -> %s", record.State, p.State)
@@ -1153,7 +1155,7 @@ func (s *AuthorityState) applyNode(command AuthorityCommand) (json.RawMessage, e
 		if p.State == NodeOffline && s.SharedGC.NodeID == p.NodeID && s.SharedGC.Incarnation == p.Incarnation {
 			// Clean retirement is an incarnation fence just like expiry or
 			// replacement. Revoke shared-data mutation authority in the same
-			// Raft entry so a successor does not have to wait for a lease owned
+			// authority command so a successor does not have to wait for a lease owned
 			// by a process that has deliberately gone away. The retiring daemon
 			// completes its own collection before proposing NodeOffline.
 			s.SharedGC = SharedGCLease{}
@@ -1264,7 +1266,7 @@ func (s *AuthorityState) applyNode(command AuthorityCommand) (json.RawMessage, e
 		if record.Incarnation != p.Incarnation {
 			return nil, errors.New("stale node incarnation")
 		}
-		if record.LeaseTerm != command.LeaderTerm || !record.LeaseActive(command.IssuedAt) {
+		if record.LeaseEpoch != command.Epoch || !record.LeaseActive(command.IssuedAt) {
 			return nil, errors.New("node capacity authority has not been renewed in the current term")
 		}
 		record.IncomingReservations = cloneAuthorityMap(record.IncomingReservations)
@@ -1402,7 +1404,7 @@ func (s *AuthorityState) invalidateNodeIncarnation(nodeID, incarnation string, i
 	// Snapshot providers are fenced by daemon incarnation even though the
 	// compact provider index only stores the stable node ID. Once an
 	// incarnation is lost, its unpublished objects can never become shared
-	// authority. Permanently abandon those IDs in the same Raft transition so
+	// authority. Permanently abandon those IDs in the same authority transition so
 	// node removal is possible and a replacement incarnation cannot publish
 	// objects allocated by its predecessor.
 	for id, provider := range s.VolatileOrigins {
@@ -1422,7 +1424,7 @@ func (s *AuthorityState) applyPlacement(command AuthorityCommand) (json.RawMessa
 	if command.Kind == AuthorityPlacementCreate {
 		record := p.Record
 		if record.State != PlacementUnplaced {
-			if err := s.requireNodeIncarnation(record.OwnerNode, record.OwnerIncarnation, command.IssuedAt, command.LeaderTerm, true); err != nil {
+			if err := s.requireNodeIncarnation(record.OwnerNode, record.OwnerIncarnation, command.IssuedAt, command.Epoch, true); err != nil {
 				return nil, fmt.Errorf("placement owner: %w", err)
 			}
 		}
@@ -1471,7 +1473,7 @@ func (s *AuthorityState) applyPlacement(command AuthorityCommand) (json.RawMessa
 			return nil, errors.New("stale or unstable placement cannot be renamed")
 		}
 		if record.State == PlacementRunning || record.State == PlacementPaused {
-			if err := s.requireNodeIncarnation(p.Owner, p.Incarnation, command.IssuedAt, command.LeaderTerm, false); err != nil {
+			if err := s.requireNodeIncarnation(p.Owner, p.Incarnation, command.IssuedAt, command.Epoch, false); err != nil {
 				return nil, fmt.Errorf("placement owner: %w", err)
 			}
 			if record.OwnerNode != p.Owner || record.OwnerIncarnation != p.Incarnation || !transactionIDPattern.MatchString(p.PhysicalBranch) {
@@ -1530,10 +1532,10 @@ func (s *AuthorityState) applyPlacement(command AuthorityCommand) (json.RawMessa
 		}
 		return authorityValue(record)
 	case AuthorityPlacementBegin:
-		if err := s.requireNodeIncarnation(p.Owner, p.Incarnation, command.IssuedAt, command.LeaderTerm, false); err != nil {
+		if err := s.requireNodeIncarnation(p.Owner, p.Incarnation, command.IssuedAt, command.Epoch, false); err != nil {
 			return nil, fmt.Errorf("migration source: %w", err)
 		}
-		if target, ok := s.Nodes[p.Target]; !ok || target.LeaseTerm != command.LeaderTerm || !target.AcceptsPlacement(command.IssuedAt) {
+		if target, ok := s.Nodes[p.Target]; !ok || target.LeaseEpoch != command.Epoch || !target.AcceptsPlacement(command.IssuedAt) {
 			return nil, errors.New("migration target has no active placement lease")
 		}
 		if record.Generation != p.Generation || record.OwnerNode != p.Owner || record.OwnerIncarnation != p.Incarnation {
@@ -1547,7 +1549,7 @@ func (s *AuthorityState) applyPlacement(command AuthorityCommand) (json.RawMessa
 		}
 		record.ResumeState, record.State, record.OperationID, record.TargetNode = record.State, PlacementMigrating, p.Operation, p.Target
 	case AuthorityPlacementAdopt:
-		if err := s.requireRecoveringNodeIncarnation(p.Owner, p.NewIncarnation, command.IssuedAt, command.LeaderTerm); err != nil {
+		if err := s.requireRecoveringNodeIncarnation(p.Owner, p.NewIncarnation, command.IssuedAt, command.Epoch); err != nil {
 			return nil, fmt.Errorf("adopted owner: %w", err)
 		}
 		if record.Generation != p.Generation || record.OwnerNode != p.Owner || record.OwnerIncarnation != p.OldIncarnation || (record.State != PlacementRunning && record.State != PlacementPaused) {
@@ -1556,7 +1558,7 @@ func (s *AuthorityState) applyPlacement(command AuthorityCommand) (json.RawMessa
 		record.OwnerIncarnation = p.NewIncarnation
 		record.Generation++
 	case AuthorityPlacementRecover:
-		if err := s.requireRecoveringNodeIncarnation(p.Owner, p.NewIncarnation, command.IssuedAt, command.LeaderTerm); err != nil {
+		if err := s.requireRecoveringNodeIncarnation(p.Owner, p.NewIncarnation, command.IssuedAt, command.Epoch); err != nil {
 			return nil, fmt.Errorf("recovered owner: %w", err)
 		}
 		if record.OwnerNode == p.Owner && record.OwnerIncarnation == p.NewIncarnation && record.LastOperationID == p.Operation && record.OperationID == "" {
@@ -1572,7 +1574,7 @@ func (s *AuthorityState) applyPlacement(command AuthorityCommand) (json.RawMessa
 		record.LastOperationID = p.Operation
 		record.OperationID, record.TargetNode = "", ""
 	case AuthorityPlacementCommit:
-		if err := s.requireNodeIncarnation(p.Target, p.TargetIncarnation, command.IssuedAt, command.LeaderTerm, false); err != nil {
+		if err := s.requireNodeIncarnation(p.Target, p.TargetIncarnation, command.IssuedAt, command.Epoch, false); err != nil {
 			return nil, fmt.Errorf("migration target: %w", err)
 		}
 		if record.OwnerNode == p.Target && record.LastOperationID == p.Operation && record.OperationID == "" {
@@ -1603,7 +1605,7 @@ func (s *AuthorityState) applyPlacement(command AuthorityCommand) (json.RawMessa
 		record.Generation++
 		record.LastOperationID = ""
 	case AuthorityPlacementClaim:
-		if err := s.requireNodeIncarnation(p.Owner, p.Incarnation, command.IssuedAt, command.LeaderTerm, true); err != nil {
+		if err := s.requireNodeIncarnation(p.Owner, p.Incarnation, command.IssuedAt, command.Epoch, true); err != nil {
 			return nil, fmt.Errorf("claimed owner: %w", err)
 		}
 		if record.State != PlacementUnplaced || record.Generation != p.Generation {
@@ -1616,7 +1618,7 @@ func (s *AuthorityState) applyPlacement(command AuthorityCommand) (json.RawMessa
 		record.State = p.State
 		record.Generation++
 	case AuthorityPlacementStableState:
-		if err := s.requireNodeIncarnation(p.Owner, p.Incarnation, command.IssuedAt, command.LeaderTerm, false); err != nil {
+		if err := s.requireNodeIncarnation(p.Owner, p.Incarnation, command.IssuedAt, command.Epoch, false); err != nil {
 			return nil, fmt.Errorf("placement owner: %w", err)
 		}
 		if record.Generation != p.Generation || record.OwnerNode != p.Owner || record.OwnerIncarnation != p.Incarnation || (record.State != PlacementRunning && record.State != PlacementPaused && record.State != PlacementMaterializing) {
@@ -1627,7 +1629,7 @@ func (s *AuthorityState) applyPlacement(command AuthorityCommand) (json.RawMessa
 		}
 		record.State = p.State
 	case AuthorityPlacementQuarantine:
-		if err := s.requireNodeIncarnation(p.Owner, p.Incarnation, command.IssuedAt, command.LeaderTerm, false); err != nil {
+		if err := s.requireNodeIncarnation(p.Owner, p.Incarnation, command.IssuedAt, command.Epoch, false); err != nil {
 			return nil, fmt.Errorf("placement owner: %w", err)
 		}
 		if record.Generation != p.Generation || record.OwnerNode != p.Owner || record.OwnerIncarnation != p.Incarnation ||
@@ -1652,7 +1654,7 @@ func (s *AuthorityState) applyPlacement(command AuthorityCommand) (json.RawMessa
 		delete(s.Branches, key)
 		// Publication records are identity fences only while their logical
 		// branch exists. Keeping terminal history after removal would make the
-		// bounded Raft state grow with every stop/dehydrate/name-reuse cycle.
+		// bounded authority state grow with every stop/dehydrate/name-reuse cycle.
 		for publicationKey, publication := range s.Publications {
 			if publication.FamilyID == p.Family && publication.BranchID == p.Branch {
 				delete(s.Publications, publicationKey)
@@ -1703,7 +1705,7 @@ func (s *AuthorityState) applyPlacement(command AuthorityCommand) (json.RawMessa
 
 func (s *AuthorityState) requireNodeIncarnation(nodeID, incarnation string, at time.Time, term uint64, accepting bool) error {
 	node, ok := s.Nodes[nodeID]
-	if !ok || node.Incarnation != incarnation || node.LeaseTerm != term || !node.LeaseActive(at) {
+	if !ok || node.Incarnation != incarnation || node.LeaseEpoch != term || !node.LeaseActive(at) {
 		return errors.New("node incarnation has no active execution lease")
 	}
 	if accepting && !node.AcceptsPlacement(at) {
@@ -1717,7 +1719,7 @@ func (s *AuthorityState) requireNodeIncarnation(nodeID, incarnation string, at t
 
 func (s *AuthorityState) requireRecoveringNodeIncarnation(nodeID, incarnation string, at time.Time, term uint64) error {
 	node, ok := s.Nodes[nodeID]
-	if !ok || node.Incarnation != incarnation || node.LeaseTerm != term || !node.LeaseActive(at) {
+	if !ok || node.Incarnation != incarnation || node.LeaseEpoch != term || !node.LeaseActive(at) {
 		return errors.New("node incarnation has no active recovery lease")
 	}
 	if node.State != NodeJoining && node.State != NodeReady && node.State != NodePressured && node.State != NodeDraining {
@@ -1750,11 +1752,11 @@ func (s *AuthorityState) applyTransaction(command AuthorityCommand) (json.RawMes
 			return nil, errors.New("new transaction supplied invalid physical source")
 		}
 		source, ok := s.Nodes[tx.Identity.SourceNodeID]
-		if !ok || source.LeaseTerm != command.LeaderTerm || !source.LeaseActive(command.IssuedAt) || (source.State != NodeReady && source.State != NodePressured && source.State != NodeDraining) {
+		if !ok || source.LeaseEpoch != command.Epoch || !source.LeaseActive(command.IssuedAt) || (source.State != NodeReady && source.State != NodePressured && source.State != NodeDraining) {
 			return nil, errors.New("transaction source has no execution authority")
 		}
 		target, ok := s.Nodes[tx.Identity.TargetNodeID]
-		if !ok || target.LeaseTerm != command.LeaderTerm || !target.AcceptsPlacement(command.IssuedAt) {
+		if !ok || target.LeaseEpoch != command.Epoch || !target.AcceptsPlacement(command.IssuedAt) {
 			return nil, errors.New("transaction target is not accepting placement")
 		}
 		tx.SourceIncarnation, tx.TargetIncarnation = source.Incarnation, target.Incarnation
@@ -1858,7 +1860,7 @@ func (s *AuthorityState) applyTransaction(command AuthorityCommand) (json.RawMes
 			// its edge. Advancing it here is safe: the old target is no longer an
 			// execution owner, and the newly independent migration target is a
 			// complete replacement for every transitive read it could perform.
-			// Source and target cleanup workers observe this replicated terminal
+			// Source and target cleanup workers observe this committed terminal
 			// state and release their process-local sessions idempotently.
 			for _, inheritedID := range tx.InheritedDependencies {
 				if inheritedID == tx.Identity.TransactionID || volatileDependencyReferenced(s.Branches, inheritedID) {
@@ -2101,7 +2103,7 @@ func (s *AuthorityState) applyPublication(command AuthorityCommand) (json.RawMes
 			return nil, errors.New("publication memory root differs from capture fence")
 		}
 		if len(p.SnapshotOrigins) != 0 {
-			if err := s.requireNodeIncarnation(p.ProviderNode, p.ProviderIncarnation, command.IssuedAt, command.LeaderTerm, false); err != nil {
+			if err := s.requireNodeIncarnation(p.ProviderNode, p.ProviderIncarnation, command.IssuedAt, command.Epoch, false); err != nil {
 				return nil, fmt.Errorf("publication provider: %w", err)
 			}
 			seen := make(map[uint64]struct{}, len(p.SnapshotOrigins))
@@ -2287,7 +2289,7 @@ func (s *AuthorityState) applyBranch(command AuthorityCommand) (json.RawMessage,
 // automatically retire a transaction while a healthy descendant still uses
 // the same source session. Losing the source branch is different: every
 // branch backed by that transaction has lost its only volatile authority and
-// is corrupted in the same Raft entry.
+// is corrupted in the same authority command.
 func (s *AuthorityState) corruptBranchClosure(initialKey, reason string, at time.Time) (BranchAuthority, error) {
 	queue := []string{initialKey}
 	seen := make(map[string]struct{})
@@ -2380,7 +2382,7 @@ func (s *AuthorityState) markBranchCorrupted(key, reason string, at time.Time) B
 	branch.PublicationID = ""
 	// Corrupted is terminal except for removal. Its former roots must no longer
 	// pin shared objects or participate in provider recovery; those objects may
-	// be retired immediately. Keeping the stale roots makes a later Raft
+	// be retired immediately. Keeping the stale roots makes a later
 	// snapshot invalid as soon as shared GC performs that permitted retirement,
 	// which can take every daemon offline while trying to restore the state.
 	branch.Roots = DurableRoots{}
@@ -2408,8 +2410,8 @@ func (s *AuthorityState) markBranchCorrupted(key, reason string, at time.Time) B
 	return branch
 }
 
-// SnapshotBytes returns a deterministic-enough JSON representation for Raft
-// snapshots. Map ordering is defined by encoding/json.
+// SnapshotBytes returns a deterministic-enough JSON representation for the
+// authority's snapshots. Map ordering is defined by encoding/json.
 func (s *AuthorityState) SnapshotBytes() ([]byte, error) {
 	if s == nil || s.Version != AuthorityFormatVersion {
 		return nil, errors.New("invalid authority state")
@@ -2417,8 +2419,8 @@ func (s *AuthorityState) SnapshotBytes() ([]byte, error) {
 	return json.Marshal(s)
 }
 
-// RestoreAuthorityState validates a decoded Raft snapshot before it replaces
-// live state.
+// RestoreAuthorityState validates a decoded authority snapshot before it
+// replaces live state.
 func RestoreAuthorityState(data []byte) (*AuthorityState, error) {
 	var state AuthorityState
 	decoder := json.NewDecoder(bytes.NewReader(data))

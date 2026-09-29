@@ -384,7 +384,7 @@ func TestAuthoritativeMigrationReplacesStalePhysicalOwner(t *testing.T) {
 		Branches: []BranchInfo{
 			{ID: "sibling", NodeID: "node-a", State: "running", CreatedAt: created},
 			// Model a branch that migrated away earlier. The physical family kept
-			// derived metadata for its former local branch, while Raft now
+			// derived metadata for its former local branch, while the authority now
 			// authorizes importing that branch back from node-b.
 			{ID: "moving", ParentID: "ancestor", NodeID: "node-a", State: "running", CreatedAt: created},
 		}}

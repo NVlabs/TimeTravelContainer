@@ -2419,7 +2419,7 @@ func (s *Store) AllocateWorking() (SnapshotID, error) {
 }
 
 // AdoptWorking installs an exact externally allocated snapshot origin. It is
-// used by clustered TTC after Raft commits the globally monotonic ID. Replays
+// used by clustered TTC after the authority commits the globally monotonic ID. Replays
 // are idempotent only while the local origin remains working; immutable state
 // can never be regressed to working.
 func (s *Store) AdoptWorking(id SnapshotID) error {
@@ -2507,7 +2507,7 @@ func (s *Store) SealAndFork(source SnapshotID, state SnapshotState, copies map[s
 }
 
 // SealAndForkWithOrigins is the clustered counterpart to SealAndFork. The
-// caller must first commit every supplied working origin in the cluster Raft
+// caller must first commit every supplied working origin in the cluster authority's
 // state machine. Installing the exact IDs and sealing the source occur in one
 // local graph transaction, so no branch can resume with an untracked origin.
 func (s *Store) SealAndForkWithOrigins(source SnapshotID, state SnapshotState, copies map[string]string, workingOrigins []SnapshotID) error {
@@ -3091,12 +3091,6 @@ func (s *Store) SnapshotLedgerHandoffChanges(snapshot SnapshotID, cursor uint64)
 	return changes, latest, handoff.Frozen, nil
 }
 
-// FreezeSnapshotLedger durably installs the final provider-to-owner handoff
-// barrier and returns its original exact reference baseline. While the barrier
-// exists, no root, pin, foreign parent edge, or object owned by snapshot may
-// change; unrelated origins remain writable. The receiver applies the ordered
-// suffix from SnapshotLedgerHandoffChanges after importing this baseline.
-// Repeating the call after a crash returns the same baseline.
 // FreezeSnapshotLedgerHandoff freezes snapshot's reference handoff as
 // FreezeSnapshotLedger does, for a caller that wants the freeze alone: it
 // checks the snapshot's references, but lists none of its objects, whose
@@ -3124,6 +3118,12 @@ func (s *Store) FreezeSnapshotLedgerHandoff(snapshot SnapshotID) error {
 	return nil
 }
 
+// FreezeSnapshotLedger durably installs the final provider-to-owner handoff
+// barrier and returns its original exact reference baseline. While the barrier
+// exists, no root, pin, foreign parent edge, or object owned by snapshot may
+// change; unrelated origins remain writable. The receiver applies the ordered
+// suffix from SnapshotLedgerHandoffChanges after importing this baseline.
+// Repeating the call after a crash returns the same baseline.
 func (s *Store) FreezeSnapshotLedger(snapshot SnapshotID) ([]Object, map[string]ObjectID, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

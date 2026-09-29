@@ -26,7 +26,7 @@ type Store struct {
 
 // TransactionCatalog is the linearizable distributed-operation authority.
 // Store is the previous local/shared-file implementation; cluster mode uses
-// the Raft implementation through this interface.
+// the authority implementation through this interface.
 type TransactionCatalog interface {
 	Create(*Transaction) error
 	Load(id string) (*Transaction, error)
@@ -40,14 +40,14 @@ type TransactionCatalog interface {
 	List() ([]Transaction, error)
 }
 
-// AtomicTargetPublisher is implemented by the cluster Raft catalog. It binds
+// AtomicTargetPublisher is implemented by the cluster authority catalog. It binds
 // a published remote-fork transaction to its first placement in one revision.
 type AtomicTargetPublisher interface {
 	PublishTarget(id string, revision uint64, desiredPaused bool, family, branch, physicalContainer, physicalBranch, targetIncarnation string) (*Transaction, error)
 }
 
 // AtomicMigrationTargetPublisher records the physical identity of a paused
-// migration target before the separate Raft cutover transfers ownership.
+// migration target before the separate cutover transfers ownership.
 type AtomicMigrationTargetPublisher interface {
 	PublishMigrationTarget(id string, revision uint64, desiredPaused bool, physicalContainer, physicalBranch, targetIncarnation string) (*Transaction, error)
 }
@@ -177,7 +177,7 @@ func (s *Store) Publish(id string, revision uint64, desiredPaused, activated boo
 }
 
 // PublishMigrationTarget is the local-store equivalent used by control-plane
-// tests. Production clustered TTC uses the Raft implementation.
+// tests. Production clustered TTC uses the authority implementation.
 func (s *Store) PublishMigrationTarget(id string, revision uint64, desiredPaused bool, physicalContainer, physicalBranch, targetIncarnation string) (*Transaction, error) {
 	path, err := s.path(id)
 	if err != nil {

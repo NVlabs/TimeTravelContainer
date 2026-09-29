@@ -446,7 +446,7 @@ func (state *referenceLedgerState) deleteCursor(origin SnapshotID) {
 
 // ReferenceLedger is the common exact-counting engine used by volatile
 // providers and the elected shared-GC coordinator. Durable wrappers journal
-// its bounded mutations; this type contains no filesystem or Raft policy.
+// its bounded mutations; this type contains no filesystem or authority policy.
 type ReferenceLedger struct {
 	mu       sync.RWMutex
 	state    referenceLedgerState
@@ -1713,7 +1713,7 @@ func (ledger *ReferenceLedger) Collect(limit int) (int, error) {
 
 // EmptyOrigins returns origins whose immutable object graph has been fully
 // collected and whose cross-owner edge queue is drained. The shared-GC
-// coordinator must commit permanent retirement in Raft before calling
+// coordinator must commit permanent retirement in the authority before calling
 // RetireOrigin; this method merely reports candidates.
 func (ledger *ReferenceLedger) EmptyOrigins() []SnapshotID {
 	if ledger == nil {
@@ -1744,9 +1744,9 @@ func (ledger *ReferenceLedger) EmptyOrigins() []SnapshotID {
 	return result
 }
 
-// RetireOrigin forgets an empty origin after Raft has permanently fenced its
+// RetireOrigin forgets an empty origin after the authority has permanently fenced its
 // snapshot ID. It is idempotent so a successor coordinator can finish a crash
-// that occurred after the Raft commit. Physical packs are removed only after
+// that occurred after the authority command. Physical packs are removed only after
 // this durable ledger mutation succeeds.
 func (ledger *ReferenceLedger) RetireOrigin(origin SnapshotID) error {
 	if ledger == nil || origin == 0 {
@@ -1773,7 +1773,7 @@ func (ledger *ReferenceLedger) RetireOrigin(origin SnapshotID) error {
 	return ledger.mutateLocked(func(state *referenceLedgerState) (*referenceLedgerRecord, error) {
 		state.setOrigin(origin, false)
 		state.deleteCursor(origin)
-		// Once Raft fences the immutable ID, retries are rejected before
+		// Once the authority fences the immutable ID, retries are rejected before
 		// reaching this ledger. Its old operation receipts no longer serve
 		// deduplication and would otherwise grow without bound over
 		// long-lived clusters.

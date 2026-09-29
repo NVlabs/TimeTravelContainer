@@ -190,7 +190,7 @@ func NewImmutableCatalog(objects []Object) (*ImmutableCatalog, error) {
 // ResolveImmutableCatalog loads immutable origin sections while walking only
 // objects reachable from roots. Snapshot packs intentionally contain objects
 // allocated by one origin; when a reachable edge crosses origins, load
-// supplies that origin directly from its Raft-selected provider or shared
+// supplies that origin directly from its authority-selected provider or shared
 // pack. Each origin and object is visited at most once.
 func ResolveImmutableCatalog(roots []ObjectID, load func(SnapshotID) ([]Object, error)) (*ImmutableCatalog, error) {
 	if len(roots) == 0 || load == nil {

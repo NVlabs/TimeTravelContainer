@@ -8,37 +8,11 @@ package protocol
 import (
 	"strconv"
 	"strings"
-	"time"
 )
 
 // DaemonAPIVersion is the exact native CLI protocol version. Official TTC
 // clients also require an exact build match; SDKs negotiate their own API.
 const DaemonAPIVersion = 10
-
-// DaemonQuorumWait is the bounded pre-admission status published by a daemon
-// that has opened its persistent Raft transport but cannot yet regain quorum.
-type DaemonQuorumWait struct {
-	PID int `json:"pid"`
-	// StartTime is when the process PID names started, which tells the
-	// daemon apart from a process that reused its PID.
-	StartTime  string `json:"start_time"`
-	APIVersion int    `json:"api_version"`
-	BuildID    string `json:"build_id"`
-}
-
-// DaemonQuorumWaitPath returns the advisory local-startup marker used while a
-// persistent Raft member is alive but cannot yet regain quorum. The marker is
-// deliberately outside the RPC stream: the full daemon request loop remains
-// unavailable until the node has recovered execution authority.
-func DaemonQuorumWaitPath(socket string) string {
-	return socket + ".quorum-wait"
-}
-
-// DaemonQuorumWaitPatience is how long a request waits for a daemon waiting
-// for quorum to begin serving: long enough for a starting cluster to elect
-// its leader, where a cluster that is away may keep the daemon waiting for as
-// long as it lasts.
-const DaemonQuorumWaitPatience = 30 * time.Second
 
 // CommandUsesTerminalControl reports whether a CLI command can ask the client
 // for terminal mode or size updates. This is part of the wire contract rather

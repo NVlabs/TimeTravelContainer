@@ -255,7 +255,7 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest, output io.Writer)
 	if err != nil {
 		return errors.Join(fmt.Errorf("creating checkpoint snapshot branch: %w", err), finishFilesystemOrigins(false))
 	}
-	// The source and hidden child now use the exact Raft-allocated working
+	// The source and hidden child now use the exact authority-allocated working
 	// origins. They cannot be abandoned even if archive construction fails:
 	// the source may resume and mutate its new working origin.
 	if err := finishFilesystemOrigins(true); err != nil {

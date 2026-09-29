@@ -467,7 +467,7 @@ type branchPublisher struct {
 	incarnation  string
 	placements   cluster.PlacementCatalog
 	transactions cluster.TransactionCatalog
-	authority    *cluster.RaftCatalog
+	authority    *cluster.AuthorityCatalog
 	graph        *ttcsnapshot.Store
 	graphData    *ttcsnapshot.LocalDataStore
 	graphShared  *ttcsnapshot.SharedPackStore
@@ -484,7 +484,7 @@ func publicationAuthorityIdentity(info ttcbundle.ContainerInfo, intent ttcstorag
 }
 
 // FenceCancellation orders cancellation against the publication's one
-// irreversible Raft commit before waiting for data-plane cleanup.
+// irreversible authority command before waiting for data-plane cleanup.
 func (p *branchPublisher) FenceCancellation(intent ttcstorage.Intent) error {
 	if p.authority == nil {
 		return nil
@@ -951,7 +951,7 @@ func (p *branchPublisher) CaptureAvailable(intent ttcstorage.Intent) (bool, erro
 		family, authorityBranch := publicationAuthorityIdentity(info, intent)
 		if intent.SupersedesPublicationID != "" && intent.SupersedesPublicationID != intent.PublicationID {
 			if err := p.authority.CancelPublication(family, authorityBranch, intent.SupersedesPublicationID); err != nil {
-				return false, fmt.Errorf("fencing superseded publication in Raft: %w", err)
+				return false, fmt.Errorf("fencing superseded publication in the authority: %w", err)
 			}
 		}
 		lifecycle := "exited"
@@ -973,7 +973,7 @@ func (p *branchPublisher) CaptureAvailable(intent ttcstorage.Intent) (bool, erro
 			captureRoots.MemorySnapshot = branch.SnapshotID
 		}
 		if _, err := p.authority.EnsurePublicationReady(family, authorityBranch, intent.PublicationID, lifecycle, captureRoots); err != nil {
-			return false, fmt.Errorf("authorizing publication capture in Raft: %w", err)
+			return false, fmt.Errorf("authorizing publication capture in the authority: %w", err)
 		}
 	}
 	return true, nil
@@ -1152,7 +1152,7 @@ func (p *branchPublisher) Cleanup(intent ttcstorage.Intent) error {
 }
 
 // releasePublishedProviderGraphRoots drops the temporary roots installed for
-// remote consumers once Raft routes the origin to its committed shared pack.
+// remote consumers once the authority routes the origin to its committed shared pack.
 // Branch-local roots remain untouched, and targets now resolve the immutable
 // data from shared storage, so the provider copy is cache rather than
 // authority after this boundary.
@@ -1202,7 +1202,7 @@ func releasePublishedProviderGraphRoots(graph *ttcsnapshot.Store, data *ttcsnaps
 // immutable origin durable before the parent can become a durable root. The
 // graph is a DAG, so recursively publishing children first makes lookup
 // independent of ancestry depth without putting page/file identities in
-// Raft. Remote owners perform their own recursive publication through the
+// the authority. Remote owners perform their own recursive publication through the
 // authenticated provider endpoint.
 func (p *branchPublisher) publishGraphDependencies(ctx context.Context, snapshot ttcsnapshot.SnapshotID) error {
 	if p == nil || p.graph == nil || p.authority == nil || p.graphShared == nil || snapshot == 0 {
@@ -1640,12 +1640,12 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 			// Snapshot identity, not a runtime checksum, is the protocol root.
 			roots.MemorySnapshot = branch.SnapshotID
 		}
-		// This single Raft entry is the irreversible publication boundary. It
+		// This single authority command is the irreversible publication boundary. It
 		// installs branch roots, releases placement, and changes every prepared
 		// origin from provider-owned to shared together. Cancellation before it
 		// reverses every handoff; cancellation after it is a no-op.
 		if _, err := p.authority.CommitPublication(family, authorityBranch, intent.PublicationID, roots, p.nodeID, p.incarnation, handoffOrigins); err != nil {
-			return fmt.Errorf("committing publication roots in Raft: %w", err)
+			return fmt.Errorf("committing publication roots in the authority: %w", err)
 		}
 		for _, encodedOrigin := range handoffOrigins {
 			if err := p.releaseSharedPublicationBridge(ttcsnapshot.SnapshotID(encodedOrigin)); err != nil {
@@ -1815,7 +1815,7 @@ func (p *branchPublisher) publishSharedReferenceLedger(snapshot ttcsnapshot.Snap
 	// being written (for example when a stopped branch releases its runtime
 	// roots). Pin those roots under publication-owned names before replaying the
 	// handoff delta. Otherwise the last provider-root release can put an object
-	// into the irreversible reclaiming state immediately before Raft publishes
+	// into the irreversible reclaiming state immediately before the authority publishes
 	// the equivalent cold branch root. Authority reconciliation retains the
 	// final cold roots before releasing these bridge roots after the atomic
 	// provider-to-shared transition.
@@ -2322,7 +2322,7 @@ func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, bra
 // stopped branch without requiring dehydration memory records. A stopped
 // branch has deliberately discarded execution state, but its next fresh start
 // must still reconstruct the committed writable repositories on whichever
-// node claims its unplaced Raft record.
+// node claims its unplaced authority record.
 func (b *runtimeBackend) ensureLocalColdFilesystem(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) error {
 	if branch.StorageManifest == "" {
 		return nil
@@ -2726,7 +2726,7 @@ func collectColdStorageOlderThan(sharedRoot, localRoot string, publications *ttc
 	store := ttcbundle.Store{Root: sharedRoot, ActiveRoot: localRoot}
 	// Destructive tracing must include internal distributed physical records.
 	// User-facing ListContainers intentionally hides them, but their cold
-	// manifests remain authoritative after Raft unplaces a remote branch.
+	// manifests remain authoritative after the authority unplaces a remote branch.
 	containers, err := store.ListContainersForGC()
 	if err != nil {
 		return err
@@ -2741,7 +2741,7 @@ func collectColdStorageOlderThan(sharedRoot, localRoot string, publications *ttc
 	}
 	// A live clustered branch may continue faulting immutable files from the
 	// publication that materialized it after its old physical source record has
-	// been reclaimed. Raft deliberately retains that filesystem root until a
+	// been reclaimed. The authority deliberately retains that filesystem root until a
 	// later publication replaces it or branch removal drops it. Include those
 	// logical roots directly: deriving reachability only from physical
 	// container.json records creates a window in which ordinary cold GC can

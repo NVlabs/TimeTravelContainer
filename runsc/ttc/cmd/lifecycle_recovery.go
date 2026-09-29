@@ -27,7 +27,7 @@ import (
 //
 // It returns false without changing an actively transitioning Sentry so the
 // daemon retries reconciliation on a later request. Clustered dehydration has
-// additional Raft/publication fences and is reconciled by its data plane.
+// additional authority/publication fences and is reconciled by its data plane.
 func (b *runtimeBackend) reconcileInterruptedStandaloneLifecycles() (bool, error) {
 	if b == nil || b.dataRoot == "" || b.distributedSource != nil {
 		return true, nil

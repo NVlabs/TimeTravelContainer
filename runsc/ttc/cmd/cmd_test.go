@@ -3490,7 +3490,7 @@ func TestWaitDurableAcceptsAuthoritativeStandaloneLocalState(t *testing.T) {
 			}}}},
 		},
 		// runtimeBackend has this method even in standalone mode. Its false
-		// result means that Raft is inapplicable, not that local durability can
+		// result means that the authority is inapplicable, not that local durability can
 		// never converge.
 		durable: false,
 	}
@@ -5570,7 +5570,7 @@ func TestLogicalPersistentBranchInfosHidesMigrationNames(t *testing.T) {
 	}
 }
 
-func TestLogicalPersistentBranchInfosUsesRaftNames(t *testing.T) {
+func TestLogicalPersistentBranchInfosUsesAuthorityNames(t *testing.T) {
 	infos := []ttcbundle.BranchInfo{
 		{ID: "main", State: "running"},
 		{ID: "old-name", ParentID: "main", State: "running"},
@@ -7012,7 +7012,7 @@ func TestColdStorageRetainsDistributedPhysicalBranchManifest(t *testing.T) {
 	}
 }
 
-func TestColdStorageRetainsRaftBranchBackingAfterPhysicalCleanup(t *testing.T) {
+func TestColdStorageRetainsAuthorityBranchBackingAfterPhysicalCleanup(t *testing.T) {
 	shared, local := t.TempDir(), t.TempDir()
 	manifestPath := coldManifestPath(shared, "fork-old-physical", "fork-old-physical", "publication-old")
 	if err := os.MkdirAll(filepath.Dir(manifestPath), 0700); err != nil {
@@ -7049,13 +7049,13 @@ func TestColdStorageRetainsRaftBranchBackingAfterPhysicalCleanup(t *testing.T) {
 		},
 	}}
 	// The old physical container record has already been removed. The logical
-	// Raft branch is nevertheless still allowed to fault from this immutable
+	// branch the authority records is nevertheless still allowed to fault from this immutable
 	// manifest, so terminal collection must retain it.
 	if err := collectColdStorageOlderThan(shared, local, nil, nil, authority, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(manifestPath); err != nil {
-		t.Fatalf("Raft-selected branch backing was reclaimed: %v", err)
+		t.Fatalf("authority-selected branch backing was reclaimed: %v", err)
 	}
 }
 
@@ -7228,7 +7228,7 @@ func TestPendingDistributedTargetProtectsHiddenRuntime(t *testing.T) {
 		ID: "child", NodeID: "node-b", State: "running", DistributedForkTransactionID: "tx-fork",
 	})
 	if !pendingDistributedTarget(container, "child", "node-b") {
-		t.Fatal("visible target was not protected before Raft placement publication")
+		t.Fatal("visible target was not protected before authority placement publication")
 	}
 }
 
@@ -7813,7 +7813,7 @@ func TestOriginCleanupPassesOverALockedOrigin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	source := &distributedSourceRuntime{authority: &cluster.RaftCatalog{}, incarnation: "incarnation-1"}
+	source := &distributedSourceRuntime{authority: &cluster.AuthorityCatalog{}, incarnation: "incarnation-1"}
 	b := &runtimeBackend{nodeID: "n1", distributedSource: source, snapshotGraph: graph}
 	unlock := source.lockSnapshotOrigin(empty)
 	defer unlock()

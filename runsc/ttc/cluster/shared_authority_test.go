@@ -5,18 +5,12 @@ package cluster
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/hashicorp/raft"
-	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 )
 
 func TestSharedBlockRoundTripAndTornBlock(t *testing.T) {
@@ -131,159 +125,6 @@ func TestHeartbeatAdvancesAndLivenessSeesItStop(t *testing.T) {
 	}
 }
 
-func TestFencedLogStoreStopsWhenTheAuthorityIsLost(t *testing.T) {
-	shared := NewSharedCluster(t.TempDir())
-	heartbeat, err := StartHeartbeat(shared, MemberRecord{NodeID: "node-a", Incarnation: "i-1", Role: RoleCompute})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer heartbeat.Stop()
-	record := AuthorityRecord{Epoch: 3, NodeID: "node-a", Incarnation: "i-1", Role: RoleCompute}
-	holder := AuthorityHolder{Cluster: shared, Heartbeat: heartbeat, Record: record}
-	store := fencedLogStore{LogStore: raft.NewInmemStore(), held: holder.Held}
-	entry := func(index uint64) *raft.Log { return &raft.Log{Index: index, Term: 1, Type: raft.LogCommand} }
-
-	// With no record yet, and then over a stale claimant's, it records its
-	// own epoch.
-	if err := store.StoreLog(entry(1)); err != nil {
-		t.Fatal(err)
-	}
-	if err := shared.WriteAuthority(AuthorityRecord{Epoch: 2, NodeID: "node-b"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.StoreLog(entry(2)); err != nil {
-		t.Fatal(err)
-	}
-	if current, _, err := shared.ReadAuthority(); err != nil || current.Epoch != 3 || current.NodeID != "node-a" {
-		t.Fatalf("authority record %+v, %v, want epoch 3's restored", current, err)
-	}
-
-	// A later epoch takes the authority.
-	if err := shared.WriteAuthority(AuthorityRecord{Epoch: 4, NodeID: "node-b"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.StoreLog(entry(3)); !errors.Is(err, ErrAuthorityLost) {
-		t.Fatalf("a write after a later epoch took the authority = %v, want ErrAuthorityLost", err)
-	}
-	if last, err := store.LastIndex(); err != nil || last != 2 {
-		t.Fatalf("last index %d, %v, want 2: the write was not refused before it was made", last, err)
-	}
-
-	// Or the lease lapses.
-	if err := shared.WriteAuthority(record); err != nil {
-		t.Fatal(err)
-	}
-	heartbeat.Stop()
-	heartbeat.mu.Lock()
-	heartbeat.landed = time.Now().Add(-LeaseHold)
-	heartbeat.mu.Unlock()
-	if err := store.StoreLog(entry(3)); !errors.Is(err, ErrAuthorityLost) {
-		t.Fatalf("a write after the lease lapsed = %v, want ErrAuthorityLost", err)
-	}
-}
-
-// openTestEpoch runs the authority of epoch as its one voter.
-func openTestEpoch(t *testing.T, shared SharedCluster, epoch uint64, self raft.Server) (*raft.Raft, *AuthorityFSM, func()) {
-	t.Helper()
-	dir := shared.RaftDir(epoch)
-	store, err := raftboltdb.NewBoltStore(filepath.Join(dir, "raft.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	snapshots, err := raft.NewFileSnapshotStore(dir, authoritySnapshotRetain, io.Discard)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, transport := raft.NewInmemTransport(self.Address)
-	config := authorityRaftConfig(string(self.ID), 50*time.Millisecond)
-	fsm := NewAuthorityFSM()
-	engine, err := raft.NewRaft(config, fsm, store, store, snapshots, transport)
-	if err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(10 * time.Second)
-	for engine.State() != raft.Leader {
-		if time.Now().After(deadline) {
-			t.Fatalf("the voter of epoch %d was not elected", epoch)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	return engine, fsm, func() {
-		if err := engine.Shutdown().Error(); err != nil {
-			t.Error(err)
-		}
-		_ = transport.Close()
-		_ = store.Close()
-	}
-}
-
-func TestPrepareEpochCarriesTheAuthorityToOneVoter(t *testing.T) {
-	shared := NewSharedCluster(t.TempDir())
-	first := raft.Server{ID: "node-a", Address: "node-a:7443", Suffrage: raft.Voter}
-	if err := shared.PrepareEpoch("", 1, first); err != nil {
-		t.Fatal(err)
-	}
-	engine, _, closeFirst := openTestEpoch(t, shared, 1, first)
-	at := time.Now().UTC()
-	node := testAuthorityNode(at)
-	command, err := NewAuthorityCommand("register-node-a", at, AuthorityNodeRegister, AuthorityNodeRegisterPayload{Record: node, LeaseDuration: time.Hour})
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := json.Marshal(command)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := engine.Apply(data, 5*time.Second).Error(); err != nil {
-		t.Fatal(err)
-	}
-	// Some of the state is in a snapshot, and some only in the log.
-	if err := engine.Snapshot().Error(); err != nil {
-		t.Fatal(err)
-	}
-	command, err = NewAuthorityCommand("ready-node-a", at.Add(time.Second), AuthorityNodeTransition, AuthorityNodeTransitionPayload{NodeID: node.NodeID, Incarnation: node.Incarnation, State: NodeReady, LeaseDuration: time.Hour})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if data, err = json.Marshal(command); err != nil {
-		t.Fatal(err)
-	}
-	if err := engine.Apply(data, 5*time.Second).Error(); err != nil {
-		t.Fatal(err)
-	}
-	closeFirst()
-
-	second := raft.Server{ID: "node-b", Address: "node-b:7443", Suffrage: raft.Voter}
-	if err := shared.PrepareEpoch(shared.RaftDir(1), 2, second); err != nil {
-		t.Fatal(err)
-	}
-	engine, fsm, closeSecond := openTestEpoch(t, shared, 2, second)
-	defer closeSecond()
-	state, err := fsm.copyState()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if record, ok := state.Nodes["node-a"]; !ok || record.State != NodeReady {
-		t.Fatalf("epoch 2's authority has node-a as %+v (%t), want it ready", record, ok)
-	}
-	future := engine.GetConfiguration()
-	if err := future.Error(); err != nil {
-		t.Fatal(err)
-	}
-	if servers := future.Configuration().Servers; len(servers) != 1 || servers[0].ID != "node-b" || servers[0].Suffrage != raft.Voter {
-		t.Fatalf("epoch 2's configuration is %+v, want node-b alone", servers)
-	}
-	// Epoch 1's state is as its authority left it.
-	source, err := raftboltdb.NewBoltStore(filepath.Join(shared.RaftDir(1), "raft.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer source.Close()
-	if last, err := source.LastIndex(); err != nil || last == 0 {
-		t.Fatalf("epoch 1's log ends at %d, %v", last, err)
-	}
-}
-
 // ageLiveness makes liveness have seen every member's counter stand still
 // for AuthorityTakeover.
 func ageLiveness(liveness *Liveness) {
@@ -318,7 +159,7 @@ func TestDecideAuthorityStartsAClusterOnce(t *testing.T) {
 			var liveness Liveness
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			decision, err := shared.DecideAuthority(ctx, self, false, &liveness)
+			decision, err := shared.DecideAuthority(ctx, self, &liveness)
 			results <- result{decision, err}
 		}()
 	}
@@ -355,31 +196,31 @@ func TestDecideAuthorityKeepsAHolderAndTakesOverFromAStoppedOne(t *testing.T) {
 	aHeartbeat, a := startTestMember(t, shared, "node-a", "i-1", RoleCompute)
 	var aLiveness Liveness
 	ctx := context.Background()
-	decision, err := shared.DecideAuthority(ctx, a, false, &aLiveness)
+	decision, err := shared.DecideAuthority(ctx, a, &aLiveness)
 	if err != nil || !decision.Hold {
 		t.Fatalf("the first daemon decided %+v, %v", decision, err)
 	}
 	// Restarted, it holds it still.
-	if again, err := shared.DecideAuthority(ctx, a, false, &aLiveness); err != nil || !again.Hold || again.Record.Epoch != 1 {
+	if again, err := shared.DecideAuthority(ctx, a, &aLiveness); err != nil || !again.Hold || again.Record.Epoch != 1 {
 		t.Fatalf("the restarted holder decided %+v, %v", again, err)
 	}
 	_, b := startTestMember(t, shared, "node-b", "i-1", RoleCompute)
 	var bLiveness Liveness
-	if joined, err := shared.DecideAuthority(ctx, b, false, &bLiveness); err != nil || joined.Hold || joined.Record.NodeID != "node-a" {
+	if joined, err := shared.DecideAuthority(ctx, b, &bLiveness); err != nil || joined.Hold || joined.Record.NodeID != "node-a" {
 		t.Fatalf("a daemon beside a live holder decided %+v, %v", joined, err)
 	}
 	// Its counter stands still.
 	aHeartbeat.Stop()
-	shared.DecideAuthority(ctx, b, false, &bLiveness)
+	shared.DecideAuthority(ctx, b, &bLiveness)
 	ageLiveness(&bLiveness)
-	taken, err := shared.DecideAuthority(ctx, b, false, &bLiveness)
+	taken, err := shared.DecideAuthority(ctx, b, &bLiveness)
 	if err != nil || !taken.Hold || taken.Record.Epoch != 2 || taken.Record.Previous != 1 || taken.Record.NodeID != "node-b" {
 		t.Fatalf("a daemon beside a stopped holder decided %+v, %v", taken, err)
 	}
 	// The old holder, back, joins the new one.
 	back, _ := startTestMember(t, shared, "node-a", "i-1", RoleCompute)
 	defer back.Stop()
-	if rejoined, err := shared.DecideAuthority(ctx, a, false, &aLiveness); err != nil || rejoined.Hold || rejoined.Record.NodeID != "node-b" {
+	if rejoined, err := shared.DecideAuthority(ctx, a, &aLiveness); err != nil || rejoined.Hold || rejoined.Record.NodeID != "node-b" {
 		t.Fatalf("the old holder, back, decided %+v, %v", rejoined, err)
 	}
 }
@@ -392,12 +233,12 @@ func TestDecideAuthorityTakesOverAtOnceFromAHolderThatLeft(t *testing.T) {
 	aHeartbeat, a := startTestMember(t, shared, "node-a", "i-1", RoleCompute)
 	var aLiveness Liveness
 	ctx := context.Background()
-	if decision, err := shared.DecideAuthority(ctx, a, false, &aLiveness); err != nil || !decision.Hold {
+	if decision, err := shared.DecideAuthority(ctx, a, &aLiveness); err != nil || !decision.Hold {
 		t.Fatalf("the first daemon decided %+v, %v", decision, err)
 	}
 	_, b := startTestMember(t, shared, "node-b", "i-1", RoleCompute)
 	var bLiveness Liveness
-	if joined, err := shared.DecideAuthority(ctx, b, false, &bLiveness); err != nil || joined.Hold {
+	if joined, err := shared.DecideAuthority(ctx, b, &bLiveness); err != nil || joined.Hold {
 		t.Fatalf("a daemon beside a live holder decided %+v, %v", joined, err)
 	}
 	if err := aHeartbeat.Leave(); err != nil {
@@ -410,7 +251,7 @@ func TestDecideAuthorityTakesOverAtOnceFromAHolderThatLeft(t *testing.T) {
 	if bLiveness.Advancing(left) {
 		t.Fatal("a daemon that left is advancing")
 	}
-	taken, err := shared.DecideAuthority(ctx, b, false, &bLiveness)
+	taken, err := shared.DecideAuthority(ctx, b, &bLiveness)
 	if err != nil || !taken.Hold || taken.Record.NodeID != "node-b" || taken.Record.Previous != 1 {
 		t.Fatalf("a daemon beside a holder that left decided %+v, %v", taken, err)
 	}
@@ -421,13 +262,13 @@ func TestDecideAuthorityTakesOverFromAReplacedIncarnation(t *testing.T) {
 	aHeartbeat, a := startTestMember(t, shared, "node-a", "i-1", RoleCompute)
 	var liveness Liveness
 	ctx := context.Background()
-	if decision, err := shared.DecideAuthority(ctx, a, false, &liveness); err != nil || !decision.Hold {
+	if decision, err := shared.DecideAuthority(ctx, a, &liveness); err != nil || !decision.Hold {
 		t.Fatalf("decided %+v, %v", decision, err)
 	}
 	// Its node comes back without its local root, a new incarnation.
 	aHeartbeat.Stop()
 	_, replaced := startTestMember(t, shared, "node-a", "i-2", RoleCompute)
-	taken, err := shared.DecideAuthority(ctx, replaced, false, &liveness)
+	taken, err := shared.DecideAuthority(ctx, replaced, &liveness)
 	if err != nil || !taken.Hold || taken.Record.Epoch != 2 || taken.Record.Incarnation != "i-2" {
 		t.Fatalf("the new incarnation decided %+v, %v", taken, err)
 	}
@@ -438,7 +279,7 @@ func TestDecideAuthorityTakesItFromAControlDaemonWhichGivesItUp(t *testing.T) {
 	loginHeartbeat, login := startTestMember(t, shared, "login", "i-1", RoleControl)
 	var liveness Liveness
 	ctx := context.Background()
-	held, err := shared.DecideAuthority(ctx, login, false, &liveness)
+	held, err := shared.DecideAuthority(ctx, login, &liveness)
 	if err != nil || !held.Hold {
 		t.Fatalf("the login daemon alone decided %+v, %v", held, err)
 	}
@@ -448,7 +289,7 @@ func TestDecideAuthorityTakesItFromAControlDaemonWhichGivesItUp(t *testing.T) {
 	var computeLiveness Liveness
 	decisions := make(chan AuthorityDecision, 1)
 	go func() {
-		taken, err := shared.DecideAuthority(ctx, compute, false, &computeLiveness)
+		taken, err := shared.DecideAuthority(ctx, compute, &computeLiveness)
 		if err != nil {
 			t.Error(err)
 		}
@@ -466,11 +307,11 @@ func TestDecideAuthorityTakesItFromAControlDaemonWhichGivesItUp(t *testing.T) {
 	if !taken.Hold || taken.Record.Epoch != 2 || taken.Record.Previous != 1 {
 		t.Fatalf("a compute daemon decided %+v once the control daemon gave the authority up", taken)
 	}
-	if err := shared.AwaitRelease(ctx, held.Record, taken.Record.Epoch, &computeLiveness); err != nil {
+	if err := shared.AwaitRelease(ctx, held.Record, &computeLiveness); err != nil {
 		t.Fatal(err)
 	}
 	// A control daemon does not take it from a compute one.
-	if joined, err := shared.DecideAuthority(ctx, login, false, &liveness); err != nil || joined.Hold {
+	if joined, err := shared.DecideAuthority(ctx, login, &liveness); err != nil || joined.Hold {
 		t.Fatalf("the control daemon decided %+v, %v", joined, err)
 	}
 }
@@ -534,125 +375,63 @@ func TestDecideAuthorityWaitsForAClaimInProgress(t *testing.T) {
 	var liveness Liveness
 	ctx, cancel := context.WithTimeout(context.Background(), 3*HeartbeatInterval/2)
 	defer cancel()
-	if decision, err := shared.DecideAuthority(ctx, b, false, &liveness); !errors.Is(err, context.DeadlineExceeded) {
+	if decision, err := shared.DecideAuthority(ctx, b, &liveness); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("a daemon beside a claim in progress decided %+v, %v, want it to wait", decision, err)
 	}
 	// The claimant restarted before it recorded the claim: it holds it.
-	held, err := shared.DecideAuthority(context.Background(), a, false, &liveness)
+	held, err := shared.DecideAuthority(context.Background(), a, &liveness)
 	if err != nil || !held.Hold || held.Record.Epoch != 1 {
 		t.Fatalf("the claimant decided %+v, %v", held, err)
 	}
-	if joined, err := shared.DecideAuthority(context.Background(), b, false, &liveness); err != nil || joined.Hold || joined.Record.NodeID != "node-a" {
+	if joined, err := shared.DecideAuthority(context.Background(), b, &liveness); err != nil || joined.Hold || joined.Record.NodeID != "node-a" {
 		t.Fatalf("a daemon beside the recorded claim decided %+v, %v", joined, err)
 	}
 }
 
-func TestDecideAuthorityKeepsAnOlderClustersRaftState(t *testing.T) {
-	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, ".ttc-raft-cluster.json"), []byte("{}\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	shared := NewSharedCluster(root)
-	_, a := startTestMember(t, shared, "node-a", "i-1", RoleCompute)
-	var liveness Liveness
-	if _, err := shared.DecideAuthority(context.Background(), a, false, &liveness); !errors.Is(err, ErrNoAuthorityState) {
-		t.Fatalf("a daemon with none of the older cluster's Raft state decided %v, want ErrNoAuthorityState", err)
-	}
-	held, err := shared.DecideAuthority(context.Background(), a, true, &liveness)
-	if err != nil || !held.Hold || held.Record.Epoch != 1 || held.Record.Previous != 0 {
-		t.Fatalf("a daemon with some decided %+v, %v", held, err)
-	}
-	if err := shared.PrepareEpoch("", 1, raft.Server{ID: "node-a", Address: "node-a:1", Suffrage: raft.Voter}); err != nil {
-		t.Fatal(err)
-	}
-	if err := shared.PrepareEpoch("", 1, raft.Server{ID: "node-a", Address: "node-a:1", Suffrage: raft.Voter}); err == nil {
-		t.Fatal("made the Raft state of a made epoch again")
-	}
-}
-
-// The daemon's path: an epoch's holder runs on the network, and the next
-// epoch's holder takes its state over.
-func TestEpochHoldersTakeOverOnTheNetwork(t *testing.T) {
+// The daemon's path: an epoch's holder stops, and the next epoch's holder
+// takes its state over.
+func TestEpochHoldersTakeOver(t *testing.T) {
 	shared := NewSharedCluster(t.TempDir())
-	hold := func(node string, epoch, previous uint64) (*AuthorityRaftNode, *Heartbeat) {
-		t.Helper()
-		heartbeat, self := startTestMember(t, shared, node, "i-1", RoleCompute)
-		listener, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		self.RaftAddress = listener.Addr().String()
-		self.Epoch, self.Previous = epoch, previous
-		if won, err := shared.ClaimEpoch(self); err != nil || !won {
-			t.Fatalf("claiming epoch %d: %t, %v", epoch, won, err)
-		}
-		if err := shared.WriteAuthority(self); err != nil {
-			t.Fatal(err)
-		}
-		source := ""
-		if previous != 0 {
-			source = shared.RaftDir(previous)
-		}
-		if err := shared.PrepareEpochFor(source, epoch, node, self.RaftAddress); err != nil {
-			t.Fatal(err)
-		}
-		holder := AuthorityHolder{Cluster: shared, Heartbeat: heartbeat, Record: self}
-		raftNode, err := OpenAuthorityRaftNode(AuthorityRaftOptions{
-			NodeID: node, Listener: listener, AdvertiseHost: self.RaftAddress,
-			EpochDir: shared.RaftDir(epoch), Holder: holder.Held,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		deadline := time.Now().Add(15 * time.Second)
-		for !raftNode.IsLeader() {
-			if time.Now().After(deadline) {
-				t.Fatalf("the holder of epoch %d was not elected", epoch)
-			}
-			time.Sleep(20 * time.Millisecond)
-		}
-		return raftNode, heartbeat
-	}
-	first, firstHeartbeat := hold("node-a", 1, 0)
-	registerReadyRaftNode(t, first, "node-a", "i-1")
-	if err := first.Close(); err != nil {
+	first := holdTestEpoch(t, shared, "node-a", 1, 0)
+	registerReadyNode(t, first.node, "node-a", "i-1")
+	if err := first.node.Close(); err != nil {
 		t.Fatal(err)
 	}
-	firstHeartbeat.Stop()
-	second, _ := hold("node-b", 2, 1)
-	defer second.Close()
-	state, err := second.AppliedState()
+	first.heartbeat.Stop()
+	second := holdTestEpoch(t, shared, "node-b", 2, 1)
+	state, err := second.node.AppliedState()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if record, ok := state.Nodes["node-a"]; !ok || record.State != NodeReady {
 		t.Fatalf("epoch 2 has node-a as %+v (%t)", record, ok)
 	}
-	// A read takes one barrier a term, and then only asks whether the node
-	// still holds the authority.
-	if _, err := second.LinearizableState(context.Background()); err != nil {
+	// A read only asks whether the node still holds the authority, and
+	// writes nothing.
+	segment := lastSegment(t, shared.EpochDir(2))
+	before, err := os.Stat(segment)
+	if err != nil {
 		t.Fatal(err)
 	}
-	before := second.engine().raft.LastIndex()
 	for range 3 {
-		if _, err := second.LinearizableState(context.Background()); err != nil {
+		if _, err := second.node.LinearizableState(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if after := second.engine().raft.LastIndex(); after != before {
-		t.Fatalf("reads wrote the log from %d to %d", before, after)
+	if after, err := os.Stat(segment); err != nil || after.Size() != before.Size() {
+		t.Fatalf("reads wrote the log from %d to %v bytes, %v", before.Size(), after.Size(), err)
 	}
 	// Epoch 3's holder would prune what came before epoch 2.
 	if err := shared.PruneEpochs(2); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(shared.RaftDir(1)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("epoch 1's Raft state remains: %v", err)
+	if _, err := os.Stat(shared.EpochDir(1)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("epoch 1's state remains: %v", err)
 	}
 	if latest, err := shared.LatestClaim(); err != nil || latest != 2 {
 		t.Fatalf("latest claim %d, %v, want 2", latest, err)
 	}
 	if !shared.Prepared(2) {
-		t.Fatal("epoch 2's Raft state was pruned")
+		t.Fatal("epoch 2's state was pruned")
 	}
 }

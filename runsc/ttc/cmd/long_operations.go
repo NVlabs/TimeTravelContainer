@@ -100,7 +100,7 @@ type familyOperations struct {
 	ended *sync.Cond
 	byID  map[string]*familyOperation
 	// making counts, by runtime and branch, the runtime branches a command
-	// is making that Raft has no placement for yet: a fork's new branches
+	// is making that the authority has no placement for yet: a fork's new branches
 	// until their placements are registered, and a checkpoint's hidden
 	// branch, which never has one. Placement enforcement and the cleanup of
 	// branches this node does not own must leave them alone.

@@ -84,7 +84,7 @@ func persistSharedPublicationBridgeIntent(sharedRoot string, intent sharedPublic
 // persistSharedPublicationBridgeIntentWithAuthority durably transfers bridge
 // ownership from a completed operation to its next operation on the same
 // immutable snapshot. The bridge's ledger roots are snapshot/object-derived,
-// so they remain valid across this ownership handoff. Raft terminality is the
+// so they remain valid across this ownership handoff. Authority terminality is the
 // fence that prevents a previous publisher from resuming after adoption.
 func persistSharedPublicationBridgeIntentWithAuthority(sharedRoot string, intent sharedPublicationBridgeIntent, state *cluster.AuthorityState) error {
 	if sharedRoot == "" {
@@ -119,10 +119,10 @@ func persistSharedPublicationBridgeIntentWithAuthority(sharedRoot string, intent
 		}
 		if current.Snapshot != intent.Snapshot || current.Kind != intent.Kind || current.Transaction != intent.Transaction ||
 			current.Family != intent.Family || current.Branch != intent.Branch || current.PublicationID != intent.PublicationID {
-			// An origin handoff has no separate Raft transaction whose
+			// An origin handoff has no separate authority transaction whose
 			// terminality can fence a concurrent attempt, so only its exact retry
 			// may reuse the intent. Transaction and branch-publication owners are
-			// safely replaceable only after Raft says they are terminal.
+			// safely replaceable only after the authority says they are terminal.
 			if publicationBridgeOwnerLive(state, current) {
 				return fmt.Errorf("snapshot %d publication bridge is owned by a different operation", intent.Snapshot)
 			}
@@ -234,7 +234,7 @@ func publicationBridgeIntentNeeded(state *cluster.AuthorityState, intent sharedP
 }
 
 // publicationBridgeOwnerLive reports whether the operation that recorded a
-// bridge may still resume it, which only Raft's record of that operation
+// bridge may still resume it, which only the authority's record of that operation
 // decides: whether the origin is still volatile does not, as the owner records
 // its bridge before it publishes the origin. An origin handoff has no such
 // record, so its owner is always taken as live.
@@ -273,7 +273,7 @@ func withSnapshotOrigins(query cluster.AuthorityQuery) cluster.AuthorityQuery {
 }
 
 // sharedReferenceService serializes exact shared-origin reference mutations
-// through the daemon holding Raft's shared-GC lease. The hot ledger lives only
+// through the daemon holding the authority's shared-GC lease. The hot ledger lives only
 // on TTC_LOCAL_ROOT and is rebuilt for every new lease generation from shared
 // immutable manifests plus each live node's durable bounded root claims.
 type sharedReferenceService struct {
@@ -281,7 +281,7 @@ type sharedReferenceService struct {
 	activationMu sync.Mutex
 	collectionMu sync.Mutex
 	claimMu      sync.Mutex
-	authority    *cluster.RaftCatalog
+	authority    *cluster.AuthorityCatalog
 	packs        *ttcsnapshot.SharedPackStore
 	directory    string
 	localRoot    string
@@ -309,7 +309,7 @@ type sharedReferenceService struct {
 // coordinator has yet to examine.
 const unexaminedOrigin = math.MaxUint64
 
-func newSharedReferenceService(sharedRoot, localRoot, nodeID, incarnation string, authority *cluster.RaftCatalog, packs *ttcsnapshot.SharedPackStore, graph *ttcsnapshot.Store, peers *distributedSourceRuntime) *sharedReferenceService {
+func newSharedReferenceService(sharedRoot, localRoot, nodeID, incarnation string, authority *cluster.AuthorityCatalog, packs *ttcsnapshot.SharedPackStore, graph *ttcsnapshot.Store, peers *distributedSourceRuntime) *sharedReferenceService {
 	return &sharedReferenceService{
 		authority: authority, packs: packs, nodeID: nodeID, incarnation: incarnation,
 		directory: filepath.Join(localRoot, "snapshot-graph", "shared-reference-ledger"), localRoot: localRoot, sharedRoot: sharedRoot,
@@ -398,7 +398,7 @@ func snapshotReferenceClaims(intent graphReferenceIntent, retired map[uint64]str
 // durably acknowledged, so the union is a conservative, crash-safe inventory.
 //
 // This inventory is deliberately queried from live nodes instead of inferred
-// from Raft branch records. A branch can own roots during target preparation or
+// from the authority branch records. A branch can own roots during target preparation or
 // an asynchronous handoff before its final visible record is committed.
 func (s *sharedReferenceService) activeSharedClaimReferences(state *cluster.AuthorityState, deadline time.Time) (map[ttcsnapshot.SnapshotID]map[string]ttcsnapshot.ObjectID, error) {
 	if s == nil || s.peers == nil || state == nil {
@@ -412,7 +412,7 @@ func (s *sharedReferenceService) activeSharedClaimReferences(state *cluster.Auth
 		}
 	}
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].NodeID < nodes[j].NodeID })
-	observed := state.LeaderObservedAt
+	observed := state.HolderObservedAt
 	if observed.IsZero() {
 		observed = time.Now()
 	}
@@ -681,7 +681,7 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 		return nil, err
 	}
 
-	// A cold branch's original canonical roots remain live exactly while Raft
+	// A cold branch's original canonical roots remain live exactly while the authority
 	// names its immutable memory snapshot. Cross-origin tree edges are rebuilt
 	// from immutable objects, never copied reference counters.
 	coldMemoryReferences := make(map[ttcsnapshot.SnapshotID]map[string]ttcsnapshot.ObjectID)
@@ -842,7 +842,7 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 			continue
 		}
 		// Publication writes immutable pack bytes before authority handoff.
-		// While Raft still names a volatile provider, that provider's ledger is
+		// While the authority still names a volatile provider, that provider's ledger is
 		// authoritative and a coordinator must not pre-import a speculative pack:
 		// doing so with no local roots would make its objects reclaiming and cause
 		// the later exact handoff to look like an idempotent import.
@@ -900,7 +900,7 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 		imported[manifest.Snapshot] = struct{}{}
 	}
 	// All structural cross-origin edges and authoritative roots are now
-	// present. Remove the temporary provider baselines; only Raft-selected cold
+	// present. Remove the temporary provider baselines; only authority-selected cold
 	// roots and incarnation-bound active claims remain.
 	inspection := ledger.Inspect()
 	for name, object := range inspection.References {
@@ -1131,7 +1131,7 @@ func (s *sharedReferenceService) ApplySharedSnapshotReference(_ context.Context,
 				return err
 			}
 		} else if err := s.reconcileAuthoritativeColdReferences(); err != nil {
-			// Cold branch roots selected by Raft must reach the ledger before
+			// Cold branch roots selected by the authority must reach the ledger before
 			// their temporary publication bridge is released.
 			return fmt.Errorf("reconciling replacement roots: %w", err)
 		}
@@ -1190,7 +1190,7 @@ func (s *sharedReferenceService) FlushSharedSnapshot(ctx context.Context, peer s
 	}
 }
 
-// mutateRoots applies ordinary branch lifetime references after Raft routes an
+// mutateRoots applies ordinary branch lifetime references after the authority routes an
 // origin to shared storage. A partial response is safe: each stable slot has
 // an independent idempotency identity and the caller retries the group.
 func (s *sharedReferenceService) mutateRoots(snapshot ttcsnapshot.SnapshotID, operation string, bindings []cluster.SnapshotRootBinding, retain bool) error {
@@ -1301,7 +1301,7 @@ func providerBaselineCanBeReleased(state *cluster.AuthorityState, name string, o
 // A branch may stop, restart, and stop again without changing an immutable
 // filesystem root or memory snapshot. PublicationID distinguishes those
 // lifetimes while remaining identical on both sides of the Ready->Committed
-// Raft transition, so replacement is count-neutral and an old retain receipt
+// authority transition, so replacement is count-neutral and an old retain receipt
 // can never suppress a later activation.
 func coldBranchReferenceIdentity(family, branch, publicationID string) string {
 	return "branch\x00" + family + "\x00" + branch + "\x00" + publicationID
@@ -1313,7 +1313,7 @@ func coldMemoryReferenceName(origin ttcsnapshot.SnapshotID, identity, source str
 }
 
 // authoritativeColdReferences derives the small mutable root set selected by
-// Raft. The immutable object graph and its per-edge counts remain outside
+// the authority. The immutable object graph and its per-edge counts remain outside
 // consensus; only these branch-level roots change when a durable branch is
 // published, replaced, or removed.
 func (s *sharedReferenceService) authoritativeColdReferences(state *cluster.AuthorityState) (map[string]ttcsnapshot.ObjectID, error) {
@@ -1410,7 +1410,7 @@ func (s *sharedReferenceService) authoritativeColdReferences(state *cluster.Auth
 }
 
 // reconcileAuthoritativeColdReferences keeps coordinator-local reference
-// counts synchronized with the current Raft root set without rebuilding or
+// counts synchronized with the authority's current root set without rebuilding or
 // walking immutable objects. Retains precede releases so replacing one branch
 // root can never expose a transient zero-count graph.
 func (s *sharedReferenceService) reconcileAuthoritativeColdReferences() error {
@@ -1466,7 +1466,7 @@ func (s *sharedReferenceService) reconcileAuthoritativeColdReferences() error {
 			continue
 		}
 		// PublishHandoff imports the provider's exact root/pin baseline so its
-		// counts remain correct until Raft moves the origin to shared storage.
+		// counts remain correct until the authority moves the origin to shared storage.
 		// Once that move commits, branch durability is represented by desired
 		// cold roots above and live remote consumers by their durable remote/
 		// claims. Keeping the provider baseline would pin an otherwise-dead
@@ -1559,7 +1559,7 @@ func inactiveGraphReferenceMutations(state *cluster.AuthorityState, current, des
 			continue
 		}
 		// Provider authority only moves node -> shared. Restricting cleanup to
-		// origins already shared in the inventory's linearizable Raft view keeps
+		// origins already shared in the inventory's linearizable authority view keeps
 		// it disjoint from an in-progress provider handoff.
 		if _, volatile := state.VolatileOrigins[uint64(object.Snapshot)]; volatile {
 			continue
@@ -1606,7 +1606,7 @@ func applySharedReferenceBatches(ledger *ttcsnapshot.ReferenceLedger, mutations 
 // reconcilePublicationBridgeIntents rolls forward bridge cleanup after a
 // publisher crash or lost response. Nonterminal operations keep their bridge;
 // committed publications, terminal handoffs, and generic origin transfers
-// already have replacement roots in Raft or node inventories.
+// already have replacement roots in the authority or node inventories.
 func (s *sharedReferenceService) reconcilePublicationBridgeIntents() error {
 	state, err := s.authority.AuthorityStateOf(withSnapshotOrigins(cluster.AuthorityQuery{Publications: cluster.All[string](), Transactions: cluster.All[string]()}))
 	if err != nil {
@@ -1616,7 +1616,7 @@ func (s *sharedReferenceService) reconcilePublicationBridgeIntents() error {
 	if err != nil {
 		return err
 	}
-	// Install Raft-selected cold roots before removing any publication bridge.
+	// Install authority-selected cold roots before removing any publication bridge.
 	if err := s.reconcileAuthoritativeColdReferences(); err != nil {
 		return err
 	}
@@ -1664,7 +1664,7 @@ func (s *sharedReferenceService) reconcilePublicationBridgeIntents() error {
 // collectAndRetire performs the shared origin retirement protocol in its only
 // safe order: collect exact zero-count objects, deliver every resulting
 // cross-origin release, prove that no physical reader remains, fence the empty
-// origin permanently in Raft, remove its physical packs, and finally forget
+// origin permanently in the authority, remove its physical packs, and finally forget
 // its ledger state. Each boundary is durable and idempotent, so a successor
 // lease holder rolls an interrupted attempt forward rather than guessing from
 // directory contents.
@@ -1869,7 +1869,7 @@ func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease clu
 			continue
 		}
 		if _, retired := state.RetiredOrigins[uint64(snapshot)]; retired {
-			// Resume a crash after the irreversible Raft fence. In particular,
+			// Resume a crash after the irreversible authority fence. In particular,
 			// the ledger and physical pack may independently have completed
 			// their idempotent cleanup steps.
 			if err := s.completeRetirement(snapshot); err != nil {
@@ -1908,7 +1908,7 @@ func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease clu
 				continue
 			}
 			if _, stillVolatile := latest.VolatileOrigins[uint64(snapshot)]; stillVolatile {
-				// A stale follower read must never authorize shared-pack mutation.
+				// A stale read must never authorize shared-pack mutation.
 				continue
 			}
 		}
@@ -1918,7 +1918,7 @@ func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease clu
 		}
 		if !ready {
 			// A range reader is still using this origin. Do not make the
-			// irreversible Raft transition until the physical data plane agrees
+			// irreversible authority transition until the physical data plane agrees
 			// with the ledger's zero-reference result.
 			continue
 		}
@@ -2027,7 +2027,7 @@ func sharedPackNeedsCompaction(manifest *ttcsnapshot.SnapshotManifest, live map[
 }
 
 func (s *sharedReferenceService) completeRetirement(snapshot ttcsnapshot.SnapshotID) error {
-	// Raft has already made the origin unreachable to new readers. Forget the
+	// The authority has already made the origin unreachable to new readers. Forget the
 	// logical origin durably before deleting its bytes. If the daemon crashes
 	// between these steps, RetiredOrigins is the permanent recovery work list;
 	// deleting bytes first instead leaves a live ledger origin with no pack.
@@ -2048,7 +2048,7 @@ func (s *sharedReferenceService) completeRetirement(snapshot ttcsnapshot.Snapsho
 
 // completeAbandonment removes the speculative data-plane state left when a
 // provider-to-shared handoff is canceled after coordinator import but before
-// the Raft authority switch. Raft's abandonment is already permanent, so no
+// the authority switch. the authority's abandonment is already permanent, so no
 // shared reader may newly acquire this origin and a missing handoff pack is an
 // expected idempotent prefix rather than evidence of lost shared data.
 func (s *sharedReferenceService) completeAbandonment(snapshot ttcsnapshot.SnapshotID) error {

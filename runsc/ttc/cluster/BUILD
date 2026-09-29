@@ -11,8 +11,10 @@ package(
 go_library(
     name = "cluster",
     srcs = [
+		"authority_catalog.go",
+		"authority_log.go",
+		"authority_node.go",
 		"authority_query.go",
-		"authority_raft.go",
 		"authority_state.go",
         "capabilities.go",
         "control.go",
@@ -20,8 +22,6 @@ go_library(
         "placement.go",
 		"planner.go",
 		"policy.go",
-		"protocol_mux.go",
-		"raft_catalog.go",
         "registry.go",
 		"resource_window.go",
 		"shared_authority.go",
@@ -31,8 +31,6 @@ go_library(
         "transaction.go",
     ],
     deps = [
-		"@com_github_hashicorp_raft//:raft",
-		"@com_github_hashicorp_raft_boltdb_v2//:raft-boltdb",
 		"@org_golang_x_sys//unix:go_default_library",
 		"//pkg/hostarch",
 		"//pkg/ttcremote",
@@ -45,8 +43,9 @@ go_test(
     name = "cluster_test",
     size = "small",
     srcs = [
+		"authority_log_test.go",
+		"authority_node_test.go",
 		"authority_query_test.go",
-		"authority_raft_test.go",
 		"authority_state_test.go",
         "cluster_test.go",
         "control_test.go",
@@ -54,7 +53,6 @@ go_test(
         "placement_test.go",
 		"planner_test.go",
 		"policy_test.go",
-		"protocol_mux_test.go",
         "registry_test.go",
 		"resource_window_test.go",
 		"shared_authority_test.go",
