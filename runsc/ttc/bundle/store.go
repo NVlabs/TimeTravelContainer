@@ -3751,13 +3751,14 @@ func (s Store) listContainersWithPolicy(includeHidden, includePhysical, tolerate
 		}
 		return nil, fmt.Errorf("listing containers: %w", err)
 	}
+	loaded := s.loadContainerKeys(entries)
 	containers := make([]ContainerInfo, 0, len(entries))
-	for _, entry := range entries {
+	for i, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
 		containerDir := filepath.Join(containersDir, entry.Name())
-		info, err := s.loadContainerKey(entry.Name())
+		info, err := loaded[i].info, loaded[i].err
 		if err != nil {
 			if _, markerErr := os.Stat(filepath.Join(containerDir, containerCreationMarker)); markerErr == nil {
 				// Another cluster node may still be preparing this directory in
@@ -3799,6 +3800,41 @@ func (s Store) listContainersWithPolicy(includeHidden, includePhysical, tolerate
 		return containers[i].ID < containers[j].ID
 	})
 	return containers, nil
+}
+
+// listReadWorkers is how many records a listing reads at once.
+const listReadWorkers = 8
+
+// loadedContainer is a record loadContainerKeys read, or why it could not.
+type loadedContainer struct {
+	info ContainerInfo
+	err  error
+}
+
+// loadContainerKeys reads the records of the directories among entries, in
+// entries' order. Each read waits on the shared root's round trips, which on
+// a network mount make a listing's time: it reads several at once.
+func (s Store) loadContainerKeys(entries []fs.DirEntry) []loadedContainer {
+	loaded := make([]loadedContainer, len(entries))
+	work := make(chan int)
+	var workers sync.WaitGroup
+	for range min(listReadWorkers, len(entries)) {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for i := range work {
+				loaded[i].info, loaded[i].err = s.loadContainerKey(entries[i].Name())
+			}
+		}()
+	}
+	for i, entry := range entries {
+		if entry.IsDir() {
+			work <- i
+		}
+	}
+	close(work)
+	workers.Wait()
+	return loaded
 }
 
 // PublishDistributedForkTarget atomically makes a prepared target visible to
@@ -5605,12 +5641,13 @@ func (s Store) ContainersWithActiveState() ([]ContainerInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listing active container state: %w", err)
 	}
+	loaded := s.loadContainerKeys(entries)
 	var containers []ContainerInfo
-	for _, entry := range entries {
+	for i, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
-		info, err := s.loadContainerKey(entry.Name())
+		info, err := loaded[i].info, loaded[i].err
 		if err != nil {
 			containerDir := filepath.Join(s.Root, "containers", entry.Name())
 			if _, markerErr := os.Stat(filepath.Join(containerDir, containerCreationMarker)); markerErr == nil {
