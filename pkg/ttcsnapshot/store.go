@@ -539,7 +539,13 @@ func (s *Store) Reload() error {
 	if s.poisoned != nil {
 		return fmt.Errorf("TTC snapshot graph requires reopen after an uncertain journal commit: %w", s.poisoned)
 	}
-	if s.externallyCoordinated && !s.externalTransaction {
+	if s.externalTransaction {
+		// The transaction holds graph.lock, and began with a reload: until it
+		// ends, only this store changes the graph. A repository reloaded for
+		// each operation within one, two stats a file a guest creates.
+		return nil
+	}
+	if s.externallyCoordinated {
 		if err := hostthread.Flock(int(s.lock.Fd()), syscall.LOCK_SH); err != nil {
 			return err
 		}
