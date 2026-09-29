@@ -1414,6 +1414,21 @@ func (b *runtimeBackend) runtimeSandboxIDs() (map[string]struct{}, error) {
 	return ids, nil
 }
 
+// sandboxSentryRuns reports whether the Sentry of sandbox id runs, or might:
+// not for a sandbox a runtime command holds, as one deleting it does, nor for
+// one stopped, or whose state is gone.
+func (b *runtimeBackend) sandboxSentryRuns(id string) bool {
+	if !embeddedRuntime(b.runsc) {
+		return true
+	}
+	c, err := container.Load(b.root, container.FullID{SandboxID: id, ContainerID: id}, container.LoadOpts{Exact: true, SkipCheck: true, TryLock: container.TryAcquire})
+	if err != nil {
+		return false
+	}
+	pid := c.SandboxPid()
+	return c.Status != container.Stopped && pid > 0 && sentryRuns(pid, id, b.root)
+}
+
 // liveRuntimeSandboxes returns physical runsc container IDs whose Sentry host
 // process still exists. It intentionally does not contact the Sentry: a
 // correctly lease-fenced Sentry may be SIGSTOPped until placement recovery is
@@ -1487,8 +1502,9 @@ type sentryIdentity struct {
 	start                  string
 }
 
-// verifiedSentries has the Sentries sentryRuns found, by PID.
-var verifiedSentries sync.Map
+// verifiedSentries has the Sentries sentryRuns found, by PID, and
+// verifyingSentries those whose command lines it waits for.
+var verifiedSentries, verifyingSentries sync.Map
 
 // sentryArgumentsWait is how long sentryRuns waits for a process's command
 // line.
@@ -1511,8 +1527,14 @@ func sentryRuns(pid int, container, runtimeRoot string) bool {
 	if known, ok := verifiedSentries.Load(pid); ok && known == identity {
 		return true
 	}
+	// One read of a process's command line at a time: a Sentry that maps
+	// its memory for long keeps each of them waiting.
+	if _, waiting := verifyingSentries.LoadOrStore(identity, struct{}{}); waiting {
+		return true
+	}
 	verified := make(chan bool, 1)
 	go func() {
+		defer verifyingSentries.Delete(identity)
 		arguments, err := processutil.Arguments(pid)
 		ok := err == nil && len(arguments) != 0 && strings.HasPrefix(filepath.Base(arguments[0]), "ttc-sentry[") &&
 			arguments[len(arguments)-1] == container && processUsesRuntimeRoot(arguments, runtimeRoot)
@@ -4457,7 +4479,11 @@ func (b *runtimeBackend) reclaimOrphanLocalContainerDirs(state *cluster.Authorit
 			continue
 		}
 		if _, ok := liveIDs[id]; ok {
-			result = errors.Join(result, fmt.Errorf("local container %q has no authority metadata but its runtime is still live", id))
+			// A runtime being deleted, or stopped, leaves its local files to a
+			// later pass without a warning.
+			if b.sandboxSentryRuns(id) {
+				result = errors.Join(result, fmt.Errorf("local container %q has no authority metadata but its runtime is still live", id))
+			}
 			continue
 		}
 		if err := b.stopContainerConsoleDrains(id); err != nil {
