@@ -232,6 +232,17 @@ func (r *Repository) completeMetadata(state *branchMetadata) error {
 	if err != nil {
 		return err
 	}
+	// Expand the files' objects many to a journal record, not one each as
+	// preparing them below would.
+	files := make([]ttcsnapshot.ObjectID, 0, len(inodes))
+	for _, record := range inodes {
+		if record.Type == "regular" && !record.File.IsZero() {
+			files = append(files, record.File)
+		}
+	}
+	if err := r.graph.ResolveObjects(files); err != nil {
+		return err
+	}
 	resolvedInodes := make([]Inode, 0, len(inodes))
 	for _, record := range inodes {
 		inode := inodeFromGraph(record)

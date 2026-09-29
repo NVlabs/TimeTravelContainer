@@ -16,6 +16,7 @@ package ttcsnapshot
 
 import (
 	"fmt"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -377,5 +378,216 @@ func TestDeferredResolutionSingleFlightsProviderRead(t *testing.T) {
 	}
 	if got := loads.Load(); got != 1 {
 		t.Fatalf("provider loads=%d, want one", got)
+	}
+}
+
+// A walk of a whole deferred filesystem expands it many objects to a journal
+// record, to the graph the source has.
+func TestDeferredFilesystemRecordsExpandManyToARecord(t *testing.T) {
+	source, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	sourceOrigin, err := source.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	operations := []FilesystemOperation{
+		{PutInode: &InodeRecord{Number: 1, Type: "directory", Mode: 0755, Nlink: 4}},
+		{PutInode: &InodeRecord{Number: 2, Type: "directory", Mode: 0755, Nlink: 2}},
+		{PutInode: &InodeRecord{Number: 3, Type: "directory", Mode: 0700, Nlink: 2}},
+		{PutEntry: &DirectoryEntryRecord{Parent: 1, Name: "big", Inode: 2}},
+		{PutEntry: &DirectoryEntryRecord{Parent: 1, Name: "small", Inode: 3}},
+	}
+	for i := uint64(10); i < 1010; i++ {
+		parent := uint64(2)
+		if i >= 710 {
+			parent = 3
+		}
+		operations = append(operations,
+			FilesystemOperation{PutInode: &InodeRecord{Number: i, Type: "regular", Mode: 0644, Nlink: 1, Size: int64(i)}},
+			FilesystemOperation{PutEntry: &DirectoryEntryRecord{Parent: parent, Name: fmt.Sprintf("file-%04d", i), Inode: i}},
+		)
+	}
+	// A second name for one file.
+	operations = append(operations, FilesystemOperation{PutEntry: &DirectoryEntryRecord{Parent: 3, Name: "link", Inode: 10}})
+	sourceRoot, err := source.ApplyFilesystem(sourceOrigin, "source", operations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Seal(sourceOrigin, SnapshotSealedLocal); err != nil {
+		t.Fatal(err)
+	}
+	wantInodes, wantEntries, err := source.FilesystemRecords(sourceRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	targetDir := t.TempDir()
+	target, err := Open(targetDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetOrigin, err := target.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetRoot, err := target.ImportDeferredFilesystemRoot(targetOrigin, "target", "peer-A/tx-1", sourceRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.AttachDeferredResolver("peer-A/tx-1", targetOrigin, func(id ObjectID) (Object, error) {
+		object, ok := source.Object(id)
+		if !ok {
+			return Object{}, fmt.Errorf("source object %s is absent", id)
+		}
+		return object, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before := target.state.Sequence
+	inodes, entries, err := target.FilesystemRecords(targetRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := target.state.Sequence - before
+	expanded := uint64(target.Stats().Objects)
+	if records == 0 || records*10 > expanded {
+		t.Fatalf("expanding %d objects took %d journal records", expanded, records)
+	}
+	sameRecords := func(inodes []InodeRecord, entries []DirectoryEntryRecord) {
+		t.Helper()
+		if len(inodes) != len(wantInodes) || !reflect.DeepEqual(entries, wantEntries) {
+			t.Fatalf("walked %d inodes and %d entries, want %d and %d", len(inodes), len(entries), len(wantInodes), len(wantEntries))
+		}
+		for index, inode := range inodes {
+			// The target names the directories' trees by its own IDs.
+			want := wantInodes[index]
+			if want.Directory.IsZero() != inode.Directory.IsZero() {
+				t.Fatalf("inode %d has directory %s, want %s", inode.Number, inode.Directory, want.Directory)
+			}
+			inode.Directory, want.Directory = ObjectID{}, ObjectID{}
+			if !reflect.DeepEqual(inode, want) {
+				t.Fatalf("inode %+v, want %+v", inode, want)
+			}
+		}
+	}
+	sameRecords(inodes, entries)
+	if err := validateGraphState(&target.state); err != nil {
+		t.Fatalf("the expanded graph is invalid: %v", err)
+	}
+	if err := target.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Replayed, the graph needs its source no more.
+	target, err = Open(targetDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	inodes, entries, err = target.FilesystemRecords(targetRoot)
+	if err != nil {
+		t.Fatalf("walking the replayed graph without its source: %v", err)
+	}
+	sameRecords(inodes, entries)
+}
+
+// A provider may expand a stub of the graph it answers for, even one of the
+// batch it answers.
+func TestDeferredBatchAllowsReentrantExpansion(t *testing.T) {
+	source, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	sourceOrigin, err := source.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	operations := []FilesystemOperation{{PutInode: &InodeRecord{Number: 1, Type: "directory", Mode: 0755}}}
+	for i := uint64(2); i < 300; i++ {
+		operations = append(operations,
+			FilesystemOperation{PutInode: &InodeRecord{Number: i, Type: "regular", Mode: 0644}},
+			FilesystemOperation{PutEntry: &DirectoryEntryRecord{Parent: 1, Name: fmt.Sprintf("file-%03d", i), Inode: i}},
+		)
+	}
+	sourceRoot, err := source.ApplyFilesystem(sourceOrigin, "source", operations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Seal(sourceOrigin, SnapshotSealedLocal); err != nil {
+		t.Fatal(err)
+	}
+	wantInodes, wantEntries, err := source.FilesystemRecords(sourceRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	targetOrigin, err := target.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetRoot, err := target.ImportDeferredFilesystemRoot(targetOrigin, "target", "peer-A", sourceRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reentered, depth atomic.Int64
+	if err := target.AttachDeferredResolver("peer-A", targetOrigin, func(id ObjectID) (Object, error) {
+		// Expand another stub of this catalog first, as a multi-hop
+		// provider may; not from within that expansion, whose own object is
+		// being loaded up the stack.
+		if depth.Add(1) == 1 {
+			target.mu.RLock()
+			var other ObjectID
+			for _, object := range target.state.Objects {
+				if object.Deferred && object.SourceObject != id {
+					other = object.ID
+					break
+				}
+			}
+			target.mu.RUnlock()
+			if !other.IsZero() {
+				reentered.Add(1)
+				if _, err := target.ResolveObject(other); err != nil {
+					depth.Add(-1)
+					return Object{}, err
+				}
+			}
+		}
+		depth.Add(-1)
+		object, ok := source.Object(id)
+		if !ok {
+			return Object{}, fmt.Errorf("source object %s is absent", id)
+		}
+		return object, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		inodes, entries, err := target.FilesystemRecords(targetRoot)
+		if err == nil && (len(inodes) != len(wantInodes) || !reflect.DeepEqual(entries, wantEntries)) {
+			err = fmt.Errorf("walked %d inodes and %d entries, want %d and %d", len(inodes), len(entries), len(wantInodes), len(wantEntries))
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a reentrant expansion deadlocked the batch")
+	}
+	if reentered.Load() == 0 {
+		t.Fatal("the provider never expanded another stub")
+	}
+	if err := validateGraphState(&target.state); err != nil {
+		t.Fatalf("the expanded graph is invalid: %v", err)
 	}
 }

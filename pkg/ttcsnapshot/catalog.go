@@ -158,7 +158,7 @@ func (catalog *LazyImmutableCatalog) FilesystemDirectory(root ObjectID, parent u
 
 // FilesystemRecords explicitly materializes the complete reachable namespace.
 func (catalog *LazyImmutableCatalog) FilesystemRecords(root ObjectID) ([]InodeRecord, []DirectoryEntryRecord, error) {
-	inodes, entries, err := filesystemRecordsObjects(root, catalog.Object)
+	inodes, entries, err := filesystemRecordsObjects(root, catalog.Object, nil)
 	return inodes, entries, catalog.operationError(err)
 }
 
@@ -288,7 +288,7 @@ func (catalog *ImmutableCatalog) FilesystemDirectory(root ObjectID, parent uint6
 // for explicit portable export and transitional adapters; live lookups should
 // use the point and single-directory methods above.
 func (catalog *ImmutableCatalog) FilesystemRecords(root ObjectID) ([]InodeRecord, []DirectoryEntryRecord, error) {
-	return filesystemRecordsObjects(root, catalog.Object)
+	return filesystemRecordsObjects(root, catalog.Object, nil)
 }
 
 // MemoryPageEntries enumerates the pages a memory tree maps.

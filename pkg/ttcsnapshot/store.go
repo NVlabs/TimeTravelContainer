@@ -2722,6 +2722,14 @@ func (s *Store) ResolveObject(id ObjectID) (Object, error) {
 	return cloneObject(object), nil
 }
 
+// ResolveObjects makes the deferred objects among ids local, as ResolveObject
+// makes each, many to a journal record.
+func (s *Store) ResolveObjects(ids []ObjectID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.resolveDeferredBatchLocked(ids)
+}
+
 // Object returns a copy of locally available object metadata. It does not
 // contact a deferred provider; callers that require complete metadata use
 // ResolveObject.

@@ -1274,11 +1274,14 @@ func (s *Store) FilesystemRecords(rootID ObjectID) ([]InodeRecord, []DirectoryEn
 			loadErr = errors.Join(loadErr, resolveErr)
 		}
 		return object, found && resolveErr == nil
-	})
+	}, s.resolveDeferredBatchLocked)
 	return inodes, entries, errors.Join(err, loadErr)
 }
 
-func filesystemRecordsObjects(rootID ObjectID, objectFor func(ObjectID) (Object, bool)) ([]InodeRecord, []DirectoryEntryRecord, error) {
+// filesystemRecordsObjects walks the filesystem at rootID. prefetch, if it is
+// not nil, is given the objects the walk will look at next, a level of a tree
+// at a time, before it looks at each.
+func filesystemRecordsObjects(rootID ObjectID, objectFor func(ObjectID) (Object, bool), prefetch func([]ObjectID) error) ([]InodeRecord, []DirectoryEntryRecord, error) {
 	rootObject, ok := objectFor(rootID)
 	if !ok {
 		return nil, nil, fmt.Errorf("filesystem root %s is missing", rootID.key())
@@ -1289,13 +1292,16 @@ func filesystemRecordsObjects(rootID ObjectID, objectFor func(ObjectID) (Object,
 	}
 	var inodeIDs []ObjectID
 	if !root.inodes.IsZero() {
-		inodeIDs, err = bTreeValuesObjects(root.inodes, ObjectKindInodeNode, objectFor)
+		inodeIDs, err = bTreeValuesObjects(root.inodes, ObjectKindInodeNode, objectFor, prefetch)
 		if err != nil {
 			return nil, nil, err
 		}
 	}
+	if err := prefetchObjects(prefetch, inodeIDs); err != nil {
+		return nil, nil, err
+	}
 	inodes := make([]InodeRecord, 0, len(inodeIDs))
-	var entries []DirectoryEntryRecord
+	var directories []ObjectID
 	for _, id := range inodeIDs {
 		object, ok := objectFor(id)
 		if !ok || object.ID.Kind != ObjectKindInode {
@@ -1306,11 +1312,20 @@ func filesystemRecordsObjects(rootID ObjectID, objectFor func(ObjectID) (Object,
 			return nil, nil, err
 		}
 		inodes = append(inodes, inode)
-		if inode.Directory.IsZero() {
-			continue
+		if !inode.Directory.IsZero() {
+			directories = append(directories, inode.Directory)
 		}
-		entryIDs, err := bTreeValuesObjects(inode.Directory, ObjectKindDirectoryNode, objectFor)
+	}
+	if err := prefetchObjects(prefetch, directories); err != nil {
+		return nil, nil, err
+	}
+	var entries []DirectoryEntryRecord
+	for _, directory := range directories {
+		entryIDs, err := bTreeValuesObjects(directory, ObjectKindDirectoryNode, objectFor, prefetch)
 		if err != nil {
+			return nil, nil, err
+		}
+		if err := prefetchObjects(prefetch, entryIDs); err != nil {
 			return nil, nil, err
 		}
 		for _, entryID := range entryIDs {
@@ -1335,14 +1350,23 @@ func filesystemRecordsObjects(rootID ObjectID, objectFor func(ObjectID) (Object,
 	return inodes, entries, nil
 }
 
+func prefetchObjects(prefetch func([]ObjectID) error, ids []ObjectID) error {
+	if prefetch == nil || len(ids) == 0 {
+		return nil
+	}
+	return prefetch(ids)
+}
+
 func bTreeValuesState(state graphState, root ObjectID, kind ObjectKind) ([]ObjectID, error) {
 	return bTreeValuesObjects(root, kind, func(id ObjectID) (Object, bool) {
 		object, ok := state.Objects[id.key()]
 		return object, ok
-	})
+	}, nil)
 }
 
-func bTreeValuesObjects(root ObjectID, kind ObjectKind, objectFor func(ObjectID) (Object, bool)) ([]ObjectID, error) {
+// bTreeValuesObjects returns the values of the tree at root. prefetch, if it
+// is not nil, is given each inner node's children before they are visited.
+func bTreeValuesObjects(root ObjectID, kind ObjectKind, objectFor func(ObjectID) (Object, bool), prefetch func([]ObjectID) error) ([]ObjectID, error) {
 	var values []ObjectID
 	var visit func(ObjectID, int) error
 	visit = func(id ObjectID, depth int) error {
@@ -1360,6 +1384,9 @@ func bTreeValuesObjects(root ObjectID, kind ObjectKind, objectFor func(ObjectID)
 		if node.leaf {
 			values = append(values, node.children...)
 			return nil
+		}
+		if err := prefetchObjects(prefetch, node.children); err != nil {
+			return err
 		}
 		for _, child := range node.children {
 			if err := visit(child, depth+1); err != nil {
