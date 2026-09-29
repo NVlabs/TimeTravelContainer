@@ -3237,3 +3237,70 @@ func TestGraphHeld(t *testing.T) {
 	closeGraph(again)
 	held(false)
 }
+
+// A store that takes a graph's cached state takes the indexes of it too, and
+// they are what a rebuild gives, after it replays what another appended.
+func TestGraphReopenKeepsIndexes(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "graph")
+	open := func() *Store {
+		t.Helper()
+		graph, err := OpenExternallyCoordinated(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return graph
+	}
+	write := func(graph *Store, change func()) {
+		t.Helper()
+		if err := graph.BeginExternalTransaction(); err != nil {
+			t.Fatal(err)
+		}
+		change()
+		if err := graph.EndExternalTransaction(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	graph := open()
+	var origin SnapshotID
+	write(graph, func() {
+		var err error
+		if origin, err = graph.AllocateWorking(); err != nil {
+			t.Fatal(err)
+		}
+		commitTestMemory(t, graph, origin, "memory/a", 0x100)
+		if _, err := graph.ImportDeferredFilesystemRoot(origin, "filesystem/a", "catalog-a", ObjectID{Snapshot: 99, Kind: ObjectKindMetadata, Ordinal: 1}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if err := graph.Close(); err != nil {
+		t.Fatal(err)
+	}
+	first := open()
+	second := open()
+	write(second, func() {
+		commitTestMemory(t, second, origin, "memory/b", 0x205)
+		if _, err := second.ImportDeferredFilesystemRoot(origin, "filesystem/b", "catalog-b", ObjectID{Snapshot: 98, Kind: ObjectKindMetadata, Ordinal: 1}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	for _, closed := range []*Store{first, second} {
+		if err := closed.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Keep only first's state cached, which is behind second's changes.
+	third := open()
+	defer third.Close()
+	third.mu.Lock()
+	defer third.mu.Unlock()
+	taken := graphIndexes{third.deferredObjects, third.memoryPages, third.memoryPagesElsewhere, third.memoryTables, third.memoryTableSeed}
+	third.rebuildDeferredObjectsLocked()
+	third.rebuildMemoryIndexesLocked()
+	rebuilt := graphIndexes{third.deferredObjects, third.memoryPages, third.memoryPagesElsewhere, third.memoryTables, third.memoryTableSeed}
+	if !reflect.DeepEqual(taken, rebuilt) {
+		t.Fatalf("taken indexes\n%+v\nrebuilt\n%+v", taken, rebuilt)
+	}
+	if len(rebuilt.deferredObjects) != 2 || len(rebuilt.memoryPages) != 2 {
+		t.Fatalf("indexes of %d deferred objects and %d pages, want 2 and 2", len(rebuilt.deferredObjects), len(rebuilt.memoryPages))
+	}
+}

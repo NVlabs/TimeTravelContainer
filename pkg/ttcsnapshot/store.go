@@ -1010,7 +1010,20 @@ type cachedGraphState struct {
 	journalEnd        int64
 	// state is a closed store's, which the store that takes it changes.
 	state graphState
-	used  uint64
+	// indexes are the store's indexes of state, which its taker takes too:
+	// rebuilt instead, they took 0.4 s for a graph of 300,000 objects.
+	indexes graphIndexes
+	used    uint64
+}
+
+// graphIndexes are a store's indexes derived from its graph state, and the
+// seed of the hashes memoryTables is keyed by.
+type graphIndexes struct {
+	deferredObjects      map[string]ObjectID
+	memoryPages          map[MemoryPageIdentity]memoryPageHolding
+	memoryPagesElsewhere map[MemoryPageIdentity][]memoryPageHolding
+	memoryTables         map[uint64][]ObjectID
+	memoryTableSeed      maphash.Seed
 }
 
 type graphStateCache struct {
@@ -1115,6 +1128,11 @@ func (s *Store) cacheStateLocked() {
 	graphStates.put(directory, &cachedGraphState{
 		generation: s.generation, checkpoint: checkpoint, journal: journal, checkpointBytes: s.checkpointBytes,
 		checkpointObjects: s.checkpointObjects, journalEnd: s.journalEnd, state: s.state,
+		indexes: graphIndexes{
+			deferredObjects: s.deferredObjects, memoryPages: s.memoryPages,
+			memoryPagesElsewhere: s.memoryPagesElsewhere, memoryTables: s.memoryTables,
+			memoryTableSeed: s.memoryTableSeed,
+		},
 	})
 }
 
@@ -1161,8 +1179,16 @@ func (s *Store) loadCachedGeneration(head graphHead, repairTail bool) (bool, err
 	s.journal = journal
 	s.generation = head.Generation
 	s.journalEnd = cached.journalEnd
-	s.rebuildDeferredObjectsLocked()
-	s.rebuildMemoryIndexesLocked()
+	if cached.indexes.deferredObjects != nil && cached.indexes.memoryPages != nil {
+		s.deferredObjects = cached.indexes.deferredObjects
+		s.memoryPages = cached.indexes.memoryPages
+		s.memoryPagesElsewhere = cached.indexes.memoryPagesElsewhere
+		s.memoryTables = cached.indexes.memoryTables
+		s.memoryTableSeed = cached.indexes.memoryTableSeed
+	} else {
+		s.rebuildDeferredObjectsLocked()
+		s.rebuildMemoryIndexesLocked()
+	}
 	restore := func() {
 		s.journal = previous
 		s.state = previousState
