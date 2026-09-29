@@ -431,10 +431,10 @@ ttc daemon start --node node-a \
   --memory-target 64GiB
 ```
 
-The cluster's authority is one node at a time, the only voter of a Raft group
-whose log is kept in the shared root; the other nodes hold replicas of its
-state. The first node to start takes the authority, and every later one joins
-the node that holds it, which the shared root names. Each daemon advances a
+The cluster's authority is one node at a time, which keeps the authority's
+state as a log in the shared root; the other nodes keep no copy, and send it
+their requests. The first node to start takes the authority, and every later
+one registers with the node that holds it, which the shared root names. Each daemon advances a
 counter in the shared root every second; when the authority's has stood still
 for 10 seconds, as when its node fails or its daemon stalls, another node takes
 the authority over, from the log in the shared root, and the others follow
@@ -442,7 +442,8 @@ it. Branches keep running meanwhile. A node that starts with no local root,
 as a new batch job does, takes over a cluster whose nodes are all gone. A
 daemon that stops gives the authority up at once. The authority depends on the
 shared filesystem: while it cannot write there, it holds the authority for 7
-seconds at most, and then gives it up.
+seconds at most, and then gives it up. A cluster whose authority an earlier
+TTC kept in a Raft log is refused; start a new cluster.
 
 A login node that should control the cluster but never execute containers can
 run an outbound-only gateway:
@@ -475,24 +476,23 @@ back within a few seconds, and the holder stops. `ttc daemon stop` stops the
 gateway, and its holder with it; use `ttc node stop` to retire a compute node.
 Run one gateway per cluster.
 
-HTTP control requests and Raft streams share the single TCP port named by
-`--listen` and `--advertise`; page-transfer listeners are ephemeral per
-operation. Cluster-wide paging, lease, transaction, and automatic-rebalance
+HTTP control requests use the single TCP port named by `--listen` and
+`--advertise`; page-transfer listeners are ephemeral per operation. Cluster-wide paging, lease, transaction, and automatic-rebalance
 policy is created once, by the cluster's first node, and adopted by later ones;
 a node started with a different policy has the authority adopt it when it holds
 the authority. Node names, addresses, local memory targets, and
 capacity-provider hooks remain node-local settings.
 
 Node names default to their hostnames. Admission checks connectivity in both
-directions between the candidate and every current member before joining
-Raft. Use `--advertise` when the hostname does not resolve to an address that
+directions between the candidate and every current member before it
+registers. Use `--advertise` when the hostname does not resolve to an address that
 the other nodes can reach. Firewalls must also allow the ephemeral page-data
 connections used during remote fork and migration.
 
-Only the authority votes, so a fleet of any size commits as fast as one node
-writes the shared filesystem, and the loss of any other node stops nothing.
-Membership, leases, placements, distributed transactions, publication
-generations, and durable root IDs are Raft state. Memory pages, filesystem
+Only the authority's holder writes its log, so a fleet of any size commits as
+fast as one node writes the shared filesystem, and the loss of any other node
+stops nothing. Membership, leases, placements, distributed transactions,
+publication generations, and durable root IDs are the authority's state. Memory pages, filesystem
 extents, and immutable packs remain on the data plane and ordinary guest reads
 and writes perform no consensus operation.
 

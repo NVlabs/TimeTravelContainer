@@ -1,5 +1,12 @@
 # TTC cluster-wide Raft control plane
 
+> **Superseded (2026-09-29):** the cluster's authority is no longer a Raft
+> group. Its state machine, described here, is kept by the node that holds the
+> authority, as a log in the shared root, one directory per epoch; other nodes
+> keep no copy and send it their requests. See the cluster section of the
+> [user guide](../user_guide/timetravelcontainer.md). What follows describes
+> the design as it was built on Raft.
+
 > **Current data plane:** The
 > [snapshot-graph storage refactor](ttc_snapshot_graph_refactor.md) preserves
 > this single cluster-wide Raft group and is authoritative for snapshot IDs,
