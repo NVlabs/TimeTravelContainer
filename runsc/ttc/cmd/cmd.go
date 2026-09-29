@@ -9990,7 +9990,14 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 		containerInfo = refreshed
 	}
 	if b.nodeID != "" {
-		if placements, openErr := b.placementCatalog(); openErr == nil {
+		if b.distributedSource != nil && b.distributedSource.authority != nil {
+			// The family's placements, not the cluster's.
+			query := cluster.PlacementsWithOwners
+			query.Family = containerInfo.ID
+			if snapshot, readErr := b.distributedSource.authority.AuthorityStateOf(query); readErr == nil {
+				containerInfo.Branches = logicalPersistentBranchInfos(containerInfo.Branches, snapshot.PlacementList(), snapshot.OfflineNodes(), containerInfo.ID)
+			}
+		} else if placements, openErr := b.placementCatalog(); openErr == nil {
 			if records, offlineOwners, listErr := placementsWithOfflineOwners(placements); listErr == nil {
 				containerInfo.Branches = logicalPersistentBranchInfos(containerInfo.Branches, records, offlineOwners, containerInfo.ID)
 			}
