@@ -2807,13 +2807,52 @@ func (s *Store) SnapshotLedger(snapshot SnapshotID) ([]Object, map[string]Object
 	return snapshotLedger(s.state, snapshot)
 }
 
-func snapshotLedger(state graphState, snapshot SnapshotID) ([]Object, map[string]ObjectID, error) {
+// snapshotLedgerOrigin returns the record of snapshot, whose ledger is to be
+// read: it must be sealed.
+func snapshotLedgerOrigin(state graphState, snapshot SnapshotID) (Snapshot, error) {
 	record, ok := state.Snapshots[snapshotKey(snapshot)]
 	if !ok {
-		return nil, nil, os.ErrNotExist
+		return Snapshot{}, os.ErrNotExist
 	}
 	if record.State == SnapshotWorking {
-		return nil, nil, fmt.Errorf("snapshot %d is still working", snapshot)
+		return Snapshot{}, fmt.Errorf("snapshot %d is still working", snapshot)
+	}
+	return record, nil
+}
+
+// checkSnapshotLedger checks snapshot's objects' references as snapshotLedger
+// does, and returns its references, without listing its objects.
+func checkSnapshotLedger(state graphState, snapshot SnapshotID) (map[string]ObjectID, error) {
+	if _, err := snapshotLedgerOrigin(state, snapshot); err != nil {
+		return nil, err
+	}
+	references := snapshotReferences(state, snapshot)
+	counts := make(map[ObjectID]uint64)
+	for _, parent := range state.Objects {
+		if parent.ID.Snapshot != snapshot {
+			continue
+		}
+		for _, edge := range parent.Children {
+			if edge.Child.Snapshot == snapshot {
+				counts[edge.Child]++
+			}
+		}
+	}
+	for _, object := range references {
+		counts[object]++
+	}
+	for _, object := range state.Objects {
+		if object.ID.Snapshot == snapshot && counts[object.ID] != object.Refs {
+			return nil, fmt.Errorf("snapshot %d object %s baseline has %d references, graph records %d", snapshot, object.ID, counts[object.ID], object.Refs)
+		}
+	}
+	return references, nil
+}
+
+func snapshotLedger(state graphState, snapshot SnapshotID) ([]Object, map[string]ObjectID, error) {
+	record, err := snapshotLedgerOrigin(state, snapshot)
+	if err != nil {
+		return nil, nil, err
 	}
 	// The snapshot has at most as many objects as it has given ordinals.
 	objects := make([]Object, 0, min(uint64(len(state.Objects)), record.NextOrdinal))
@@ -2951,6 +2990,33 @@ func (s *Store) SnapshotLedgerHandoffChanges(snapshot SnapshotID, cursor uint64)
 // change; unrelated origins remain writable. The receiver applies the ordered
 // suffix from SnapshotLedgerHandoffChanges after importing this baseline.
 // Repeating the call after a crash returns the same baseline.
+// FreezeSnapshotLedgerHandoff freezes snapshot's reference handoff as
+// FreezeSnapshotLedger does, for a caller that wants the freeze alone: it
+// checks the snapshot's references, but lists none of its objects, whose
+// copies, sorted, took 0.4 s for a snapshot of 300,000.
+func (s *Store) FreezeSnapshotLedgerHandoff(snapshot SnapshotID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	references, err := checkSnapshotLedger(s.state, snapshot)
+	if err != nil {
+		return err
+	}
+	handoff, exists := s.state.Handoffs[snapshotKey(snapshot)]
+	if !exists {
+		handoff = SnapshotLedgerHandoff{
+			Snapshot:     snapshot,
+			NextSequence: 1,
+			Baseline:     cloneObjectReferences(references),
+			Frozen:       true,
+		}
+		return s.commitLocked([]journalOp{{BeginHandoff: &handoff}})
+	}
+	if !handoff.Frozen {
+		return s.commitLocked([]journalOp{{FreezeSnapshot: snapshot}})
+	}
+	return nil
+}
+
 func (s *Store) FreezeSnapshotLedger(snapshot SnapshotID) ([]Object, map[string]ObjectID, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2989,19 +3055,19 @@ func (s *Store) FreezeSnapshotLedger(snapshot SnapshotID) ([]Object, map[string]
 // object's count at the baseline is its same-origin edges and its references
 // in baseline.
 func baselineObjects(objects []Object, snapshot SnapshotID, baseline map[string]ObjectID) []Object {
-	counts := make(map[string]uint64, len(objects))
+	counts := make(map[ObjectID]uint64, len(objects))
 	for _, parent := range objects {
 		for _, edge := range parent.Children {
 			if edge.Child.Snapshot == snapshot {
-				counts[edge.Child.key()]++
+				counts[edge.Child]++
 			}
 		}
 	}
 	for _, object := range baseline {
-		counts[object.key()]++
+		counts[object]++
 	}
 	for index := range objects {
-		objects[index].Refs = counts[objects[index].ID.key()]
+		objects[index].Refs = counts[objects[index].ID]
 		objects[index].State = ObjectLive
 		if objects[index].Refs == 0 {
 			objects[index].State = ObjectReclaiming

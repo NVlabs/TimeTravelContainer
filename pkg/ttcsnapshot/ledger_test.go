@@ -1702,3 +1702,65 @@ func TestEdgeReferenceNames(t *testing.T) {
 		}
 	}
 }
+
+// FreezeSnapshotLedgerHandoff freezes a snapshot's handoff as
+// FreezeSnapshotLedger does, begun or not, and refuses what it refuses.
+func TestFreezeSnapshotLedgerHandoff(t *testing.T) {
+	build := func(begin bool) (*Store, SnapshotID) {
+		graph, err := Open(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { graph.Close() })
+		origin, err := graph.AllocateWorking()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := graph.ApplyFilesystem(origin, "filesystem", []FilesystemOperation{
+			{PutInode: &InodeRecord{Number: 1, Type: "directory", Mode: 0755}},
+			{PutInode: &InodeRecord{Number: 2, Type: "regular", Mode: 0644}},
+			{PutEntry: &DirectoryEntryRecord{Parent: 1, Name: "file", Inode: 2}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := graph.Seal(origin, SnapshotSealedLocal); err != nil {
+			t.Fatal(err)
+		}
+		if begin {
+			if _, _, _, err := graph.BeginSnapshotLedgerHandoff(origin); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return graph, origin
+	}
+	for _, begin := range []bool{false, true} {
+		listed, origin := build(begin)
+		if _, _, err := listed.FreezeSnapshotLedger(origin); err != nil {
+			t.Fatal(err)
+		}
+		frozen, origin := build(begin)
+		for range 2 {
+			if err := frozen.FreezeSnapshotLedgerHandoff(origin); err != nil {
+				t.Fatalf("begun %t: %v", begin, err)
+			}
+		}
+		if !reflect.DeepEqual(frozen.state.Handoffs, listed.state.Handoffs) || !reflect.DeepEqual(frozen.state.Frozen, listed.state.Frozen) {
+			t.Fatalf("begun %t: frozen alone to\n%+v %v\nwant\n%+v %v", begin, frozen.state.Handoffs, frozen.state.Frozen, listed.state.Handoffs, listed.state.Frozen)
+		}
+	}
+	graph, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	working, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.FreezeSnapshotLedgerHandoff(working); err == nil {
+		t.Fatal("froze a working snapshot")
+	}
+	if err := graph.FreezeSnapshotLedgerHandoff(working + 100); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("froze an absent snapshot: %v", err)
+	}
+}

@@ -2096,7 +2096,7 @@ func (b *runtimeBackend) exportDistributedGraph(containerID, transactionID strin
 	// this origin; the later freeze will include them in its baseline.
 	finishFinalHandoff := b.distributedSource.beginBackgroundSnapshotWork()
 	defer finishFinalHandoff()
-	if _, _, err := b.snapshotGraph.FreezeSnapshotLedger(origin); err != nil {
+	if err := b.snapshotGraph.FreezeSnapshotLedgerHandoff(origin); err != nil {
 		return cluster.GraphHandoffDescriptor{}, nil, nil, err
 	}
 	ledgerFrozen = true

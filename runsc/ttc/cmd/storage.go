@@ -1347,7 +1347,7 @@ func (p *branchPublisher) publishVolatileGraphOrigin(ctx context.Context, snapsh
 			p.rollForwardFrozenOrigin(snapshot)
 		}
 	}()
-	if _, _, err := p.graph.FreezeSnapshotLedger(snapshot); err != nil {
+	if err := p.graph.FreezeSnapshotLedgerHandoff(snapshot); err != nil {
 		return err
 	}
 	ledgerFrozen = true
@@ -1554,7 +1554,7 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 				if p.graph == nil {
 					return errors.New("snapshot graph is unavailable for shared reference handoff")
 				}
-				if _, _, err := p.graph.FreezeSnapshotLedger(snapshot); err != nil {
+				if err := p.graph.FreezeSnapshotLedgerHandoff(snapshot); err != nil {
 					return fmt.Errorf("freezing snapshot origin %d reference handoff: %w", branch.SnapshotID, err)
 				}
 				changes, _, frozen, err := p.graph.SnapshotLedgerHandoffChanges(snapshot, 0)

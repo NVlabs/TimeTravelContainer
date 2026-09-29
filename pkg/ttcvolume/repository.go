@@ -842,7 +842,7 @@ func (r *Repository) PublishOriginHandoff(ctx context.Context, shared *ttcsnapsh
 func (r *Repository) FreezeOriginHandoff(origin ttcsnapshot.SnapshotID) ([]ttcsnapshot.SnapshotReferenceMutation, error) {
 	var changes []ttcsnapshot.SnapshotReferenceMutation
 	err := r.withLock(func() error {
-		if _, _, err := r.graph.FreezeSnapshotLedger(origin); err != nil {
+		if err := r.graph.FreezeSnapshotLedgerHandoff(origin); err != nil {
 			return err
 		}
 		var frozen bool
