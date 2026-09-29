@@ -178,6 +178,10 @@ func TestAuthorityLogCompacts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Closing waits for the snapshot being written.
+	if err := holder.node.Close(); err != nil {
+		t.Fatal(err)
+	}
 	dir := holder.shared.EpochDir(1)
 	index, _, err := readAuthoritySnapshot(dir)
 	if err != nil || index == 0 {
@@ -186,9 +190,6 @@ func TestAuthorityLogCompacts(t *testing.T) {
 	segments, err := authoritySegments(dir)
 	if err != nil || len(segments) != 1 || segments[0].first != index+1 {
 		t.Fatalf("segments %+v, %v, want one, after the snapshot's %d", segments, err, index)
-	}
-	if err := holder.node.Close(); err != nil {
-		t.Fatal(err)
 	}
 	state, last, _, err := loadAuthorityState(dir, 1)
 	if err != nil {

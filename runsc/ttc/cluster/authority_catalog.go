@@ -18,8 +18,10 @@ import (
 // and snapshot APIs over the cluster authority. Every mutation is a command
 // of its log and every read a linearizable read of its holder.
 type AuthorityCatalog struct {
-	node         *AuthorityNode
-	holderClient func(string) (*Client, error)
+	node *AuthorityNode
+	// holderClient returns the client of the authority's holder; retry is
+	// set once a request sent to it failed.
+	holderClient func(retry bool) (*Client, error)
 }
 
 func NewAuthorityCatalog(node *AuthorityNode) (*AuthorityCatalog, error) {
@@ -30,14 +32,17 @@ func NewAuthorityCatalog(node *AuthorityNode) (*AuthorityCatalog, error) {
 }
 
 // SetHolderClientResolver lets a daemon that does not hold the authority send
-// its reads and proposals to the one that does, the caller unaware.
-func (c *AuthorityCatalog) SetHolderClientResolver(resolve func(string) (*Client, error)) {
+// its reads and proposals to the one that does, the caller unaware. resolve
+// is told when a request it sent failed, as it does to a holder that no
+// longer holds the authority.
+func (c *AuthorityCatalog) SetHolderClientResolver(resolve func(retry bool) (*Client, error)) {
 	c.holderClient = resolve
 }
 
 func (c *AuthorityCatalog) propose(ctx context.Context, requestID string, kind AuthorityCommandKind, payload any) (AuthorityResult, error) {
 	deadline := time.Now().Add(15 * time.Second)
 	result, err := c.node.Propose(ctx, requestID, kind, payload)
+	forwarded := false
 	for err != nil && time.Now().Before(deadline) {
 		var redirect *AuthorityNotHolderError
 		if !errors.As(err, &redirect) {
@@ -61,7 +66,7 @@ func (c *AuthorityCatalog) propose(ctx context.Context, requestID string, kind A
 			result, err = c.node.Propose(ctx, requestID, kind, payload)
 			continue
 		}
-		peer, resolveErr := c.holderClient(redirect.HolderID)
+		peer, resolveErr := c.holderClient(forwarded)
 		if resolveErr != nil {
 			select {
 			case <-ctx.Done():
@@ -78,6 +83,7 @@ func (c *AuthorityCatalog) propose(ctx context.Context, requestID string, kind A
 		attempt, cancel := forwardAttempt(ctx, deadline)
 		result, err = peer.ProposeAuthority(attempt, AuthorityProposal{RequestID: requestID, Kind: kind, Payload: encoded})
 		cancel()
+		forwarded = true
 	}
 	return result, err
 }
@@ -103,6 +109,7 @@ func forwardAttempt(ctx context.Context, deadline time.Time) (context.Context, c
 func (c *AuthorityCatalog) linearizableQuery(ctx context.Context, query AuthorityQuery) (*AuthorityState, error) {
 	deadline := time.Now().Add(15 * time.Second)
 	state, err := c.node.LinearizableQuery(ctx, query)
+	forwarded := false
 	for err != nil && time.Now().Before(deadline) {
 		var redirect *AuthorityNotHolderError
 		if !errors.As(err, &redirect) {
@@ -123,7 +130,7 @@ func (c *AuthorityCatalog) linearizableQuery(ctx context.Context, query Authorit
 			state, err = c.node.LinearizableQuery(ctx, query)
 			continue
 		}
-		peer, resolveErr := c.holderClient(redirect.HolderID)
+		peer, resolveErr := c.holderClient(forwarded)
 		if resolveErr != nil {
 			select {
 			case <-ctx.Done():
@@ -136,6 +143,7 @@ func (c *AuthorityCatalog) linearizableQuery(ctx context.Context, query Authorit
 		attempt, cancel := forwardAttempt(ctx, deadline)
 		state, err = peer.AuthorityQuery(attempt, query)
 		cancel()
+		forwarded = true
 	}
 	if err == nil {
 		normalizeAuthorityLeaseClock(state, time.Now().UTC())

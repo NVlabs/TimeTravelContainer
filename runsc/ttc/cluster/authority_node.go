@@ -371,7 +371,7 @@ func (n *AuthorityNode) EncodeLinearizable(ctx context.Context, query AuthorityQ
 	if err != nil {
 		return nil, err
 	}
-	if err := engine.held(); err != nil {
+	if err := engine.fence.wait(engine.held); err != nil {
 		engine.lose(err)
 		return nil, n.notHolder()
 	}
@@ -397,11 +397,18 @@ type authorityEngine struct {
 	log   *authorityLog
 	held  func() error
 	since time.Time
+	// fence has the checks that the node still holds the authority.
+	fence heldFence
 
 	requests chan *authorityRequest
 	done     chan struct{}
 	stopped  chan struct{}
 	stopOnce sync.Once
+
+	// compacting is set while a snapshot is written in the background, which
+	// background waits for.
+	compacting atomic.Bool
+	background sync.WaitGroup
 
 	mu   sync.Mutex
 	lost error
@@ -542,7 +549,7 @@ func (e *authorityEngine) commit(batch []*authorityRequest) {
 	}
 	// Acknowledge only what was written while this node held the authority;
 	// see SharedCluster.
-	if err := e.held(); err != nil {
+	if err := e.fence.wait(e.held); err != nil {
 		e.lose(err)
 		e.fail(batch, err)
 		return
@@ -550,15 +557,32 @@ func (e *authorityEngine) commit(batch []*authorityRequest) {
 	for _, request := range batch {
 		request.reply <- authorityReply{result: e.fsm.apply(request.command)}
 	}
-	if e.log.full() {
-		snapshot, err := e.fsm.snapshot()
-		if err == nil {
-			err = e.log.compact(snapshot)
-		}
-		// A failed compaction leaves the log whole, to be compacted after a
-		// later batch.
-		_ = err
+	if e.log.full() && !e.compacting.Load() {
+		e.compact()
 	}
+}
+
+// compact begins a segment, and has the state as of the last command before
+// it written as the snapshot in the background, which then removes the
+// segments before it. Encoding the state holds up commands, as it did Raft's;
+// writing it does not. A compaction that fails leaves the log whole, to be
+// compacted once the next segment fills.
+func (e *authorityEngine) compact() {
+	snapshot, err := e.fsm.snapshot()
+	if err != nil {
+		return
+	}
+	index := e.log.next - 1
+	if err := e.log.startSegment(); err != nil {
+		return
+	}
+	e.compacting.Store(true)
+	e.background.Add(1)
+	go func() {
+		defer e.background.Done()
+		defer e.compacting.Store(false)
+		_ = compactAuthorityLog(e.log.dir, e.epoch, index, snapshot)
+	}()
 }
 
 func (e *authorityEngine) close() error {
@@ -566,5 +590,50 @@ func (e *authorityEngine) close() error {
 	e.lose(ErrAuthorityClosed)
 	e.stopOnce.Do(func() { close(e.done) })
 	<-e.stopped
+	e.background.Wait()
 	return e.log.close()
+}
+
+// heldFence batches the checks that the node still holds the authority. A
+// caller waits for a check that began after it called, and one check serves
+// every caller that came while the one before it ran: reads and batches wait
+// for one read of the authority record between them, not one each.
+type heldFence struct {
+	mu      sync.Mutex
+	running bool
+	// next is the check that begins once the running one ends.
+	next *heldCheck
+}
+
+type heldCheck struct {
+	done chan struct{}
+	err  error
+}
+
+func (f *heldFence) wait(held func() error) error {
+	f.mu.Lock()
+	check := f.next
+	if check == nil {
+		check = &heldCheck{done: make(chan struct{})}
+		f.next = check
+	}
+	if !f.running {
+		f.running, f.next = true, nil
+		go f.run(check, held)
+	}
+	f.mu.Unlock()
+	<-check.done
+	return check.err
+}
+
+// run makes check, and then each next one, until none waits.
+func (f *heldFence) run(check *heldCheck, held func() error) {
+	for check != nil {
+		check.err = held()
+		close(check.done)
+		f.mu.Lock()
+		check, f.next = f.next, nil
+		f.running = check != nil
+		f.mu.Unlock()
+	}
 }

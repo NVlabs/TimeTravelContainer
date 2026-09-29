@@ -513,9 +513,11 @@ func (s *AuthorityState) remember(id, digest string, result AuthorityResult) {
 	s.Requests[id] = appliedAuthorityRequest{Digest: digest, Result: result}
 	s.RequestOrder = append(s.RequestOrder, id)
 	if len(s.RequestOrder) > maxRememberedRequests {
-		oldest := s.RequestOrder[0]
-		s.RequestOrder = append([]string(nil), s.RequestOrder[1:]...)
-		delete(s.Requests, oldest)
+		delete(s.Requests, s.RequestOrder[0])
+		// Reslicing keeps a command's cost constant: append moves the window
+		// to a new array once it reaches the end of its old one. A state a
+		// command replaced keeps its own window of the shared array.
+		s.RequestOrder = s.RequestOrder[1:]
 	}
 }
 

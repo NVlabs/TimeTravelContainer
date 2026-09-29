@@ -142,6 +142,86 @@ func TestAuthorityFSMReadCopyOmitsReplayHistory(t *testing.T) {
 	}
 }
 
+// The state remembers the last maxRememberedRequests requests, and a state
+// a command replaced keeps the window it had.
+func TestAuthorityStateRemembersAWindowOfRequests(t *testing.T) {
+	state := NewAuthorityState()
+	for i := 0; i < maxRememberedRequests; i++ {
+		state.remember(fmt.Sprintf("r-%d", i), "digest", AuthorityResult{})
+	}
+	before := *state
+	for i := maxRememberedRequests; i < maxRememberedRequests+100; i++ {
+		state.remember(fmt.Sprintf("r-%d", i), "digest", AuthorityResult{})
+	}
+	if len(state.Requests) != maxRememberedRequests || len(state.RequestOrder) != maxRememberedRequests {
+		t.Fatalf("remembered %d requests in an order of %d, want %d", len(state.Requests), len(state.RequestOrder), maxRememberedRequests)
+	}
+	if state.RequestOrder[0] != "r-100" || state.RequestOrder[maxRememberedRequests-1] != fmt.Sprintf("r-%d", maxRememberedRequests+99) {
+		t.Fatalf("window is %s to %s, want r-100 to r-%d", state.RequestOrder[0], state.RequestOrder[maxRememberedRequests-1], maxRememberedRequests+99)
+	}
+	if _, ok := state.Requests["r-99"]; ok {
+		t.Fatal("remembered a request older than the window")
+	}
+	if before.RequestOrder[0] != "r-0" || before.RequestOrder[len(before.RequestOrder)-1] != fmt.Sprintf("r-%d", maxRememberedRequests-1) {
+		t.Fatalf("the earlier state's window changed to %s to %s", before.RequestOrder[0], before.RequestOrder[len(before.RequestOrder)-1])
+	}
+}
+
+// One check serves the callers that came while the one before it ran, and
+// none is served by a check that began before it called.
+func TestHeldFenceBatchesChecks(t *testing.T) {
+	var fence heldFence
+	var mu sync.Mutex
+	checks := 0
+	release := make(chan struct{})
+	started := make(chan struct{}, 2)
+	held := func() error {
+		mu.Lock()
+		checks++
+		mu.Unlock()
+		started <- struct{}{}
+		<-release
+		return nil
+	}
+	first := make(chan error, 1)
+	go func() { first <- fence.wait(held) }()
+	<-started
+	var arrived, waiters sync.WaitGroup
+	later := make(chan error, 5)
+	for i := 0; i < 5; i++ {
+		arrived.Add(1)
+		waiters.Add(1)
+		go func() {
+			defer waiters.Done()
+			arrived.Done()
+			later <- fence.wait(held)
+		}()
+	}
+	// Let the five callers queue behind the running check.
+	arrived.Wait()
+	time.Sleep(50 * time.Millisecond)
+	release <- struct{}{}
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-later:
+		t.Fatal("a caller was served by the check that ran when it called")
+	case <-started:
+	}
+	release <- struct{}{}
+	waiters.Wait()
+	close(later)
+	for err := range later {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if checks != 2 {
+		t.Fatalf("%d checks for six callers in two rounds, want 2", checks)
+	}
+}
+
 // A holder another node took the authority from sends requests to that node,
 // as a node that never held it does: the batch that finds the authority gone,
 // every request after it, and reads of what it applied.

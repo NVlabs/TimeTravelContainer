@@ -435,3 +435,23 @@ func TestEpochHoldersTakeOver(t *testing.T) {
 		t.Fatal("epoch 2's state was pruned")
 	}
 }
+
+// A holder view reads the record again only once what it read is older than
+// its caller allows.
+func TestHolderViewKeepsTheRecordItRead(t *testing.T) {
+	shared := NewSharedCluster(t.TempDir())
+	view := &HolderView{Cluster: shared}
+	if _, recorded, err := view.Record(time.Second); err != nil || recorded {
+		t.Fatalf("the record of a new cluster: %t, %v", recorded, err)
+	}
+	if err := shared.WriteAuthority(AuthorityRecord{Epoch: 1, NodeID: "node-a", Incarnation: "i-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, recorded, err := view.Record(time.Hour); err != nil || recorded {
+		t.Fatalf("the view read the record again within its age: %t, %v", recorded, err)
+	}
+	record, recorded, err := view.Record(0)
+	if err != nil || !recorded || record.NodeID != "node-a" {
+		t.Fatalf("the record read again is %+v, %t, %v, want node-a's", record, recorded, err)
+	}
+}

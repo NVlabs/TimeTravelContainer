@@ -5006,7 +5006,12 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 			liveness.Assume(seen)
 		}
 	}
-	authorityNode := cluster.NewAuthorityNode(opts.NodeID, 0, shared.ReadAuthority)
+	// Requests go to the holder the shared root names, as last read at most
+	// a second before, or again once one sent there failed.
+	holderView := &cluster.HolderView{Cluster: shared}
+	authorityNode := cluster.NewAuthorityNode(opts.NodeID, 0, func() (cluster.AuthorityRecord, bool, error) {
+		return holderView.Record(time.Second)
+	})
 	closeAuthority := true
 	defer func() {
 		if closeAuthority {
@@ -5132,10 +5137,13 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 		dynamicPeers: make(map[string]dynamicClusterPeer),
 		pageListen:   opts.PageListen, pageAdvertise: opts.PageAdvertise,
 	}
-	// The shared root names the authority's holder.
 	var holderClients sync.Map
-	catalog.SetHolderClientResolver(func(string) (*cluster.Client, error) {
-		record, ok, err := shared.ReadAuthority()
+	catalog.SetHolderClientResolver(func(retry bool) (*cluster.Client, error) {
+		maxAge := time.Second
+		if retry {
+			maxAge = 0
+		}
+		record, ok, err := holderView.Record(maxAge)
 		if err != nil {
 			return nil, err
 		}

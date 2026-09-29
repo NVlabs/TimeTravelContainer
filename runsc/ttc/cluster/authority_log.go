@@ -395,22 +395,20 @@ func (l *authorityLog) full() bool {
 	return l.records >= authoritySegmentRecords || l.bytes >= authoritySegmentBytes
 }
 
-// compact writes state, as of the last command appended, as the snapshot,
-// begins a new segment, and removes the segments the snapshot holds.
-func (l *authorityLog) compact(state []byte) error {
-	if err := writeAuthoritySnapshot(l.dir, l.epoch, l.next-1, state); err != nil {
+// compactAuthorityLog writes state, as of the command at index, as the
+// snapshot in dir, and removes the segments the snapshot holds: those that
+// begin at or before index, which the holder began a segment after.
+func compactAuthorityLog(dir string, epoch, index uint64, state []byte) error {
+	if err := writeAuthoritySnapshot(dir, epoch, index, state); err != nil {
 		return fmt.Errorf("writing the authority's snapshot: %w", err)
 	}
-	if err := l.startSegment(); err != nil {
-		return err
-	}
-	segments, err := authoritySegments(l.dir)
+	segments, err := authoritySegments(dir)
 	if err != nil {
 		return err
 	}
 	var result error
 	for _, segment := range segments {
-		if segment.first < l.next {
+		if segment.first <= index {
 			if err := os.Remove(segment.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				result = errors.Join(result, err)
 			}

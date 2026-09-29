@@ -168,6 +168,43 @@ func (c SharedCluster) WriteAuthority(record AuthorityRecord) error {
 	return nil
 }
 
+// HolderView keeps the authority record for a daemon that sends requests
+// to the holder it names: reading the record for each request would cost
+// the shared filesystem a request or more each time.
+type HolderView struct {
+	Cluster SharedCluster
+
+	mu       sync.Mutex
+	record   AuthorityRecord
+	recorded bool
+	// read is when the record was read, zero before it was.
+	read time.Time
+}
+
+// Record returns the authority record, reading it again if the one the view
+// has was read more than maxAge ago.
+func (v *HolderView) Record(maxAge time.Duration) (AuthorityRecord, bool, error) {
+	v.mu.Lock()
+	if !v.read.IsZero() && time.Since(v.read) <= maxAge {
+		defer v.mu.Unlock()
+		return v.record, v.recorded, nil
+	}
+	v.mu.Unlock()
+	record, recorded, err := v.Cluster.ReadAuthority()
+	if err != nil {
+		return AuthorityRecord{}, false, err
+	}
+	v.Set(record)
+	return record, recorded, nil
+}
+
+// Set gives the view a record just read.
+func (v *HolderView) Set(record AuthorityRecord) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.record, v.recorded, v.read = record, record.Epoch != 0, time.Now()
+}
+
 // LatestClaim returns the latest epoch claimed, or 0 if none was.
 func (c SharedCluster) LatestClaim() (uint64, error) {
 	entries, err := os.ReadDir(c.claimsDir())
