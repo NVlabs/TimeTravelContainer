@@ -17,6 +17,7 @@ package ttcsnapshot
 import (
 	"bytes"
 	"encoding/json"
+	"math/rand"
 	"reflect"
 	"strings"
 	"testing"
@@ -146,4 +147,124 @@ func TestFilesystemReplaysNonUTF8Names(t *testing.T) {
 	if err := store.Verify(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// checkRecordDecodesAlike fails unless decodeInodeRecord and
+// decodeDirectoryEntryRecord decode data as the records' UnmarshalJSON do,
+// and reports whether the canonical decoders took it.
+func checkRecordDecodesAlike(t *testing.T, data []byte) bool {
+	t.Helper()
+	var wantInode InodeRecord
+	wantInodeErr := wantInode.UnmarshalJSON(data)
+	inode, canonicalInode := decodeCanonicalInodeRecord(data)
+	if canonicalInode && (wantInodeErr != nil || !reflect.DeepEqual(inode, wantInode)) {
+		t.Fatalf("the canonical inode decoder took what UnmarshalJSON decodes otherwise (%v):\n%.300s", wantInodeErr, data)
+	}
+	if got, err := decodeInodeRecord(data); (err == nil) != (wantInodeErr == nil) || err == nil && !reflect.DeepEqual(got, wantInode) {
+		t.Fatalf("decoded an inode (%v) differently from UnmarshalJSON (%v):\n%.300s", err, wantInodeErr, data)
+	}
+	var wantEntry DirectoryEntryRecord
+	wantEntryErr := wantEntry.UnmarshalJSON(data)
+	entry, canonicalEntry := decodeCanonicalDirectoryEntryRecord(data)
+	if canonicalEntry && (wantEntryErr != nil || !reflect.DeepEqual(entry, wantEntry)) {
+		t.Fatalf("the canonical entry decoder took what UnmarshalJSON decodes otherwise (%v):\n%.300s", wantEntryErr, data)
+	}
+	if got, err := decodeDirectoryEntryRecord(data); (err == nil) != (wantEntryErr == nil) || err == nil && !reflect.DeepEqual(got, wantEntry) {
+		t.Fatalf("decoded an entry (%v) differently from UnmarshalJSON (%v):\n%.300s", err, wantEntryErr, data)
+	}
+	return canonicalInode || canonicalEntry
+}
+
+func randomInodeRecord(random *rand.Rand) InodeRecord {
+	inode := InodeRecord{
+		Number: random.Uint64(), Type: []string{"regular", "directory", "symlink", "fifo"}[random.Intn(4)],
+		Mode: random.Uint32(), UID: random.Uint32(), GID: random.Uint32(), Nlink: random.Uint32(),
+		Size: random.Int63(), DeviceMajor: random.Uint32(), DeviceMinor: random.Uint32(),
+		AtimeNsec: random.Int63(), BtimeNsec: random.Int63(), CtimeNsec: random.Int63(), MtimeNsec: random.Int63(),
+	}
+	if random.Intn(2) == 0 {
+		inode.File = ObjectID{Snapshot: SnapshotID(random.Uint64()), Kind: ObjectKindFile, Ordinal: random.Uint64()}
+	}
+	if random.Intn(2) == 0 {
+		inode.Directory = ObjectID{Snapshot: SnapshotID(random.Uint64()), Kind: ObjectKindDirectoryNode, Ordinal: random.Uint64()}
+	}
+	if random.Intn(3) == 0 {
+		inode.Target = "../target/" + strings.Repeat("x", random.Intn(20))
+	}
+	switch random.Intn(3) {
+	case 0:
+		inode.Xattrs = map[string][]byte{}
+	case 1:
+		inode.Xattrs = map[string][]byte{"user.a": nil, "security.capability": {1, 2, 3}, "user.empty": {}}
+	}
+	return inode
+}
+
+// A record as MarshalJSON writes it decodes, without encoding/json, to what
+// UnmarshalJSON decodes; any other form goes to UnmarshalJSON.
+func TestDecodeFilesystemRecords(t *testing.T) {
+	random := rand.New(rand.NewSource(1))
+	for round := 0; round < 200; round++ {
+		inode := randomInodeRecord(random)
+		data, err := json.Marshal(inode)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !checkRecordDecodesAlike(t, data) {
+			t.Fatalf("round %d: the canonical decoder refused MarshalJSON's inode record %s", round, data)
+		}
+		if got, err := decodeInodeRecord(data); err != nil || !reflect.DeepEqual(got, inode) {
+			t.Fatalf("round %d: inode record decodes (%v) to %+v, want %+v", round, err, got, inode)
+		}
+		entry := DirectoryEntryRecord{Parent: random.Uint64(), Name: "name-" + strings.Repeat("y", random.Intn(30)), Inode: random.Uint64()}
+		if data, err = json.Marshal(entry); err != nil {
+			t.Fatal(err)
+		}
+		if !checkRecordDecodesAlike(t, data) {
+			t.Fatalf("round %d: the canonical decoder refused MarshalJSON's entry record %s", round, data)
+		}
+	}
+	inode, err := json.Marshal(randomInodeRecord(random))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(inode)
+	for _, variant := range []string{
+		strings.Replace(text, `"Size":`, `"size":`, 1),
+		strings.Replace(text, `"Size":`, `"Unknown":1,"Size":`, 1),
+		strings.Replace(text, `"Size":`, `"Size":1,"Size":`, 1),
+		strings.Replace(text, `"Size":`, `"Size":-`, 1),
+		strings.Replace(text, `"Mode":`, `"Mode":4294967296,"x":`, 1),
+		strings.Replace(text, `"Type":"`, `"Type":"\u0072`, 1),
+		strings.Replace(text, `"Type":`, `"Type":null,"t":`, 1),
+		strings.Replace(text, `"Xattrs":`, `"Xattrs":{"a":"AA==","a":"AA=="},"x":`, 1),
+		strings.Replace(text, `"Xattrs":`, `"XattrList":[{"Name":"/w==","Value":null}],"Xattrs":`, 1),
+		strings.Replace(text, `"Target":`, `"TargetBytes":"/w==","Target":`, 1),
+		strings.Replace(text, `{`, "{\n ", 1),
+		text + " x",
+		`{"Parent":1,"Name":"a","Inode":2}`,
+		`{"Parent":1,"Name":"a","NameBytes":"/w==","Inode":2}`,
+		`{"Parent":1,"Name":"\u00e9","Inode":2}`,
+		`{"Parent":1.5,"Name":"a","Inode":2}`,
+		"null",
+		"{}",
+		"[]",
+		"",
+	} {
+		checkRecordDecodesAlike(t, []byte(variant))
+	}
+}
+
+// FuzzDecodeFilesystemRecords checks that whatever the canonical decoders
+// take, UnmarshalJSON decodes alike.
+func FuzzDecodeFilesystemRecords(f *testing.F) {
+	data, err := json.Marshal(randomInodeRecord(rand.New(rand.NewSource(2))))
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(data)
+	f.Add([]byte(`{"Parent":1,"Name":"a","Inode":2}`))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		checkRecordDecodesAlike(t, data)
+	})
 }
