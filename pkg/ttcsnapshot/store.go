@@ -2080,7 +2080,7 @@ func (s *Store) commitLockedPrepared(ops []journalOp, references map[string]Obje
 			}
 		}
 	}
-	data, err := json.Marshal(record)
+	data, err := encodeJournalRecord(&record)
 	if err != nil {
 		return err
 	}
