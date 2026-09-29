@@ -546,6 +546,24 @@ func (s *Store) Reload() error {
 		return nil
 	}
 	if s.externallyCoordinated {
+		// Whether anything changed is seen without the lock: a writer that
+		// appends as the journal is looked at comes after the look, which a
+		// look just before it would not have seen either. Only a change is
+		// read under the lock. A guest's every path lookup reloads, and the
+		// lock took two of its four system calls.
+		if s.journal != nil {
+			unchanged, err := s.headUnchanged()
+			if err != nil {
+				return err
+			}
+			info, err := s.journal.Stat()
+			if err != nil {
+				return err
+			}
+			if unchanged && info.Size() == s.journalEnd {
+				return nil
+			}
+		}
 		if err := hostthread.Flock(int(s.lock.Fd()), syscall.LOCK_SH); err != nil {
 			return err
 		}
