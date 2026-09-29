@@ -69,6 +69,12 @@ func (id ObjectID) String() string {
 	return id.key()
 }
 
+// Compare orders id and other as their String forms order: by snapshot, then
+// kind, then ordinal.
+func (id ObjectID) Compare(other ObjectID) int {
+	return compareObjectIDs(id, other)
+}
+
 // ParseObjectID parses a canonical stable object ID.
 func ParseObjectID(value string) (ObjectID, error) {
 	return parseObjectKey(value)

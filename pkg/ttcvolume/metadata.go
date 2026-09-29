@@ -20,6 +20,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -441,7 +442,7 @@ func (r *Repository) flushMetadataBatchLocked(branchID string) error {
 		}
 	}
 	r.dirtyMu.Unlock()
-	sort.Slice(pending, func(i, j int) bool { return pending[i].ID.String() < pending[j].ID.String() })
+	slices.SortFunc(pending, func(a, b ttcsnapshot.ReservedObject) int { return a.ID.Compare(b.ID) })
 	var unpublished []ttcsnapshot.ReservedObject
 	for _, object := range pending {
 		if _, exists := r.graph.Object(object.ID); exists && r.graph.HasPin(object.Pin) {

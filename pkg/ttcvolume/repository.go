@@ -30,6 +30,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -3219,7 +3220,7 @@ func (r *Repository) syncMetadataLocked() error {
 		}
 		dataIDs = append(dataIDs, id)
 	}
-	sort.Slice(dataIDs, func(i, j int) bool { return dataIDs[i].String() < dataIDs[j].String() })
+	slices.SortFunc(dataIDs, ttcsnapshot.ObjectID.Compare)
 	// A guest durability boundary first persists every new or modified payload
 	// and the complete directory path that publishes it. Only then may the
 	// graph WAL making those immutable IDs reachable become durable.
@@ -3258,7 +3259,7 @@ func (r *Repository) syncMetadataLocked() error {
 		reclaims = append(reclaims, id)
 	}
 	r.dirtyMu.Unlock()
-	sort.Slice(reclaims, func(i, j int) bool { return reclaims[i].String() < reclaims[j].String() })
+	slices.SortFunc(reclaims, ttcsnapshot.ObjectID.Compare)
 	for _, id := range reclaims {
 		if err := r.data.Remove(id); err != nil {
 			return fmt.Errorf("removing reclaimed repository object %s: %w", id, err)
