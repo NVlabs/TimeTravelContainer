@@ -776,7 +776,33 @@ func (s *Store) readFile(name string) ([]byte, error) {
 		return nil, err
 	}
 	defer file.Close()
-	return io.ReadAll(file)
+	return readWholeFile(file)
+}
+
+// readWholeFile reads file to its end into a buffer of the file's size, as
+// os.ReadFile does: io.ReadAll grows one from 512 bytes, copying a graph
+// checkpoint of 100 MB over and over, which took 0.3 s of a daemon's first
+// open of a repository of 100,000 files.
+func readWholeFile(file *os.File) ([]byte, error) {
+	size := 512
+	if info, err := file.Stat(); err == nil && info.Size() < math.MaxInt32 {
+		// One byte more, to read the end of the file.
+		size = max(size, int(info.Size())+1)
+	}
+	data := make([]byte, 0, size)
+	for {
+		n, err := file.Read(data[len(data):cap(data)])
+		data = data[:len(data)+n]
+		if err == io.EOF {
+			return data, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if len(data) == cap(data) {
+			data = append(data, 0)[:len(data)]
+		}
+	}
 }
 
 func (s *Store) regularFile(name string) error {

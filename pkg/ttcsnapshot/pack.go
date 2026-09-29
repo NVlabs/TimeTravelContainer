@@ -571,7 +571,7 @@ func (store *SharedPackStore) manifest(snapshot SnapshotID) (*SnapshotManifest, 
 		return result, nil
 	}
 	store.mu.Unlock()
-	data, err := io.ReadAll(file)
+	data, err := readWholeFile(file)
 	closeErr := file.Close()
 	if err != nil {
 		return nil, err
