@@ -15463,8 +15463,9 @@ func (b *runtimeBackend) persistDehydration(target selector, info ttcbundle.Cont
 	var output []byte
 	var exportErr error
 	var outcome graphImportOutcome
-	// Streaming the branch's memory into the graph takes time in
-	// proportion to it; other commands go on meanwhile.
+	// Streaming the branch's memory into the graph, and writing and importing
+	// its control state, take time in proportion to the branch; they are the
+	// family's own, and other commands go on meanwhile.
 	if err := b.withoutLifecycleLock(info, longOperation{branch: target.branch, state: "dehydrating", shown: true}, func() error {
 		go func() {
 			result, importErr := b.importGraphCapture(reader, origin, prefix)
@@ -15474,52 +15475,52 @@ func (b *runtimeBackend) persistDehydration(target selector, info ttcbundle.Cont
 		output, exportErr = b.commandWithFiles([]*os.File{writer, metadataFile}, "timetravel", "--dehydration-graph-stream-fd=3", "--dehydration-graph-stream-filtered", "--dehydration-fd=4", target.container, "dehydrate-export", target.branch)
 		_ = writer.Close()
 		outcome = <-imported
+		if exportErr != nil {
+			return fmt.Errorf("streaming graph-native dehydration memory: %w", exportErr)
+		}
+		if outcome.err != nil {
+			return fmt.Errorf("importing graph-native dehydration memory: %w", outcome.err)
+		}
+		var exported boot.BranchDehydrationExportInfo
+		if err := json.Unmarshal(output, &exported); err != nil {
+			return fmt.Errorf("decoding dehydration capture description: %w", err)
+		}
+		capture := exported.Capture
+		for _, root := range outcome.result.Roots {
+			capture.MemoryRoots = append(capture.MemoryRoots, boot.BranchMemoryRoot{
+				ResourceID: root.ResourceID,
+				Name:       root.Name,
+				Root:       root.Root.String(),
+			})
+			graphMemoryRoots = append(graphMemoryRoots, root.Name)
+			graphMemoryRootObjects = append(graphMemoryRootObjects, root.Root.String())
+		}
+		capture.SnapshotID = uint64(origin)
+		if err := writeDurableJSON(filepath.Join(stagingDir, "control.json"), &capture); err != nil {
+			return fmt.Errorf("persisting dehydration control state: %w", err)
+		}
+		if err := metadataFile.Sync(); err != nil {
+			return fmt.Errorf("syncing dehydration metadata: %w", err)
+		}
+		if err := metadataFile.Close(); err != nil {
+			metadataFile = nil
+			return fmt.Errorf("closing dehydration metadata: %w", err)
+		}
+		metadataFile = nil
+		graphControlRoot = graphCaptureControlRootName(uint64(origin))
+		controlObject, err := ttcsnapshot.ImportDirectory(context.Background(), b.snapshotGraph, b.snapshotData, origin, graphControlRoot, stagingDir)
+		if err != nil {
+			return fmt.Errorf("importing graph-native dehydration control state: %w", err)
+		}
+		graphControlRootObject = controlObject.String()
+		if err := b.snapshotGraph.Seal(origin, sealState); err != nil {
+			return fmt.Errorf("sealing dehydration snapshot origin %d: %w", origin, err)
+		}
 		return nil
 	}); err != nil {
 		_ = writer.Close()
 		_ = reader.Close()
 		return err
-	}
-	if exportErr != nil {
-		return fmt.Errorf("streaming graph-native dehydration memory: %w", exportErr)
-	}
-	if outcome.err != nil {
-		return fmt.Errorf("importing graph-native dehydration memory: %w", outcome.err)
-	}
-	var exported boot.BranchDehydrationExportInfo
-	if err := json.Unmarshal(output, &exported); err != nil {
-		return fmt.Errorf("decoding dehydration capture description: %w", err)
-	}
-	capture := exported.Capture
-	for _, root := range outcome.result.Roots {
-		capture.MemoryRoots = append(capture.MemoryRoots, boot.BranchMemoryRoot{
-			ResourceID: root.ResourceID,
-			Name:       root.Name,
-			Root:       root.Root.String(),
-		})
-		graphMemoryRoots = append(graphMemoryRoots, root.Name)
-		graphMemoryRootObjects = append(graphMemoryRootObjects, root.Root.String())
-	}
-	capture.SnapshotID = uint64(origin)
-	if err := writeDurableJSON(filepath.Join(stagingDir, "control.json"), &capture); err != nil {
-		return fmt.Errorf("persisting dehydration control state: %w", err)
-	}
-	if err := metadataFile.Sync(); err != nil {
-		return fmt.Errorf("syncing dehydration metadata: %w", err)
-	}
-	if err := metadataFile.Close(); err != nil {
-		metadataFile = nil
-		return fmt.Errorf("closing dehydration metadata: %w", err)
-	}
-	metadataFile = nil
-	graphControlRoot = graphCaptureControlRootName(uint64(origin))
-	controlObject, err := ttcsnapshot.ImportDirectory(context.Background(), b.snapshotGraph, b.snapshotData, origin, graphControlRoot, stagingDir)
-	if err != nil {
-		return fmt.Errorf("importing graph-native dehydration control state: %w", err)
-	}
-	graphControlRootObject = controlObject.String()
-	if err := b.snapshotGraph.Seal(origin, sealState); err != nil {
-		return fmt.Errorf("sealing dehydration snapshot origin %d: %w", origin, err)
 	}
 	if graphCaptureActive {
 		finishGraphCapture()
