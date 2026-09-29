@@ -829,6 +829,12 @@ func (r *Repository) materializeRemoteObjectsPassLocked() ([]remoteMaterializati
 			if !ok {
 				return nil, nil, fmt.Errorf("branch %q has no filesystem diff-base root", branch)
 			}
+			// A base that is the tree itself, as a branch rehydrated and made
+			// durable again unchanged has, has no file the walk of the tree
+			// did not prepare: walking it again took 1 s for 100,000 files.
+			if baseRoot == root {
+				continue
+			}
 			inodes, _, err := r.graph.FilesystemRecords(baseRoot)
 			if err != nil {
 				return nil, nil, fmt.Errorf("resolving branch %q filesystem diff base: %w", branch, err)
