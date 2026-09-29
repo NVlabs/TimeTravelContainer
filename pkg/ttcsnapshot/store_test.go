@@ -3066,3 +3066,49 @@ func TestGraphReopenFromCachedState(t *testing.T) {
 		t.Fatal("a journal cut below the cached position was not loaded in full")
 	}
 }
+
+// validateGraphState takes a consistent graph and refuses each
+// inconsistency of its references.
+func TestValidateGraphStateReferences(t *testing.T) {
+	root := ObjectID{Snapshot: 1, Kind: ObjectKindMetadata, Ordinal: 1}
+	child := ObjectID{Snapshot: 1, Kind: ObjectKindInode, Ordinal: 2}
+	consistent := func() graphState {
+		return graphState{
+			Version: formatVersion, NextSnapshot: 2,
+			Snapshots: map[string]Snapshot{snapshotKey(1): {ID: 1, State: SnapshotWorking, NextOrdinal: 3}},
+			Objects: map[string]Object{
+				root.key():  {ID: root, State: ObjectLive, Refs: 1, Children: []Edge{{Slot: 0, Child: child}}},
+				child.key(): {ID: child, State: ObjectLive, Refs: 2},
+			},
+			Roots:  map[string]ObjectID{"filesystem/main": root},
+			Pins:   map[string]ObjectID{"construct/x": child},
+			Frozen: map[string]bool{}, Handoffs: map[string]SnapshotLedgerHandoff{},
+		}
+	}
+	state := consistent()
+	if err := validateGraphState(&state); err != nil {
+		t.Fatal(err)
+	}
+	missing := ObjectID{Snapshot: 1, Kind: ObjectKindInode, Ordinal: 3}
+	for name, corrupt := range map[string]func(*graphState){
+		"missing child": func(state *graphState) {
+			object := state.Objects[root.key()]
+			object.Children = append(object.Children, Edge{Slot: 1, Child: missing})
+			state.Objects[root.key()] = object
+		},
+		"missing root":        func(state *graphState) { state.Roots["filesystem/other"] = missing },
+		"missing pin":         func(state *graphState) { state.Pins["construct/y"] = missing },
+		"too few references":  func(state *graphState) { delete(state.Pins, "construct/x") },
+		"too many references": func(state *graphState) { state.Pins["construct/y"] = root },
+		"key of another object": func(state *graphState) {
+			state.Objects[missing.key()] = state.Objects[child.key()]
+			delete(state.Objects, child.key())
+		},
+	} {
+		state := consistent()
+		corrupt(&state)
+		if err := validateGraphState(&state); err == nil {
+			t.Errorf("%s: the graph was taken", name)
+		}
+	}
+}

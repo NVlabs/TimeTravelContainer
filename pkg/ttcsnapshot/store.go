@@ -1319,14 +1319,22 @@ func validateGraphState(state *graphState) error {
 		}
 		expected[id] = count + 1
 	}
+	// An edge is counted in one look into the table: a missing child adds to
+	// it, which is found after.
 	for _, object := range state.Objects {
 		for _, edge := range object.Children {
-			count, ok := expected[edge.Child]
-			if !ok {
-				return fmt.Errorf("object %s references missing child %s", object.ID.key(), edge.Child.key())
-			}
-			expected[edge.Child] = count + 1
+			expected[edge.Child]++
 		}
+	}
+	if len(expected) != len(state.Objects) {
+		for _, object := range state.Objects {
+			for _, edge := range object.Children {
+				if _, ok := state.Objects[edge.Child.key()]; !ok {
+					return fmt.Errorf("object %s references missing child %s", object.ID.key(), edge.Child.key())
+				}
+			}
+		}
+		return errors.New("graph state references missing objects")
 	}
 	for key, object := range state.Objects {
 		if object.Refs != expected[object.ID] {
