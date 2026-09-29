@@ -220,6 +220,13 @@ func graphHandoffReferenceOperation(transaction string, snapshot uint64) string 
 	return fmt.Sprintf("handoff-%s-%016x", transaction, snapshot)
 }
 
+// graphHandoffReferenceIntent reports whether intent is the one a graph
+// handoff of its transaction retains, as graphHandoffReferenceOperation names
+// it.
+func graphHandoffReferenceIntent(intent graphReferenceIntent) bool {
+	return intent.Purpose == graphReferencePurposeBranch && strings.HasPrefix(intent.Operation, "handoff-"+intent.Transaction+"-")
+}
+
 func (b *runtimeBackend) resumeGraphReferenceRetain(path string, intent *graphReferenceIntent) error {
 	if intent == nil || intent.State == "releasing" {
 		return errors.New("graph reference operation is already releasing")
@@ -552,12 +559,20 @@ func graphReferenceIntentShouldRelease(intent graphReferenceIntent, tx *cluster.
 	// can publish them. Once Prepare returns, TargetPaused (and every later
 	// state) proves that the branch record should already own the intent, so a
 	// missing record is a genuine interrupted removal.
+	//
+	// A graph handoff's intent is owned the same way, later: the handoff
+	// retains the roots it hands the target while the transaction is
+	// published, and records them in the branch before the transaction drains.
+	// Released in between, the branch went on paging from an origin GC then
+	// retired.
 	switch tx.State {
 	case cluster.TransactionPreparing,
 		cluster.TransactionTargetReserved,
 		cluster.TransactionSourceCaptured,
 		cluster.TransactionTargetRestoring:
 		return false
+	case cluster.TransactionPublished:
+		return !graphHandoffReferenceIntent(intent)
 	default:
 		return true
 	}
@@ -667,11 +682,8 @@ func graphReferenceAuthorizationTransaction(intent graphReferenceIntent) string 
 	if intent.Purpose == graphReferencePurposeProvider {
 		return ""
 	}
-	if intent.Purpose == graphReferencePurposeBranch && intent.Operation != intent.Transaction {
-		prefix := "handoff-" + intent.Transaction + "-"
-		if !strings.HasPrefix(intent.Operation, prefix) {
-			return ""
-		}
+	if intent.Purpose == graphReferencePurposeBranch && intent.Operation != intent.Transaction && !graphHandoffReferenceIntent(intent) {
+		return ""
 	}
 	return intent.Transaction
 }

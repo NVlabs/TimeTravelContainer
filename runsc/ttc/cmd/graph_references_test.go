@@ -286,6 +286,32 @@ func TestGraphReferenceTransferLifetimeFollowsTransaction(t *testing.T) {
 	}
 }
 
+func TestGraphHandoffIntentIsKeptUntilRecorded(t *testing.T) {
+	handoff := graphReferenceIntent{
+		Purpose: graphReferencePurposeBranch, State: "active",
+		Transaction: "tx", Operation: graphHandoffReferenceOperation("tx", 233),
+	}
+	if graphReferenceIntentShouldRelease(handoff, &cluster.Transaction{State: cluster.TransactionPublished}, nil, false) {
+		t.Fatal("a graph handoff's intent was released before the branch recorded it")
+	}
+	for _, state := range []cluster.TransactionState{
+		cluster.TransactionTargetPaused,
+		cluster.TransactionDraining,
+		cluster.TransactionIndependent,
+		cluster.TransactionCanceled,
+		cluster.TransactionFailed,
+	} {
+		if !graphReferenceIntentShouldRelease(handoff, &cluster.Transaction{State: state}, nil, false) {
+			t.Fatalf("orphaned graph handoff intent was retained in %s", state)
+		}
+	}
+	other := handoff
+	other.Operation = graphHandoffReferenceOperation("other", 233)
+	if !graphReferenceIntentShouldRelease(other, &cluster.Transaction{State: cluster.TransactionPublished}, nil, false) {
+		t.Fatal("another transaction's orphaned handoff intent was retained")
+	}
+}
+
 func TestGraphReferenceIntentRejectsOldVersion(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "intent.json")
 	legacy := `{"version":1,"transaction":"tx","operation":"op","container":"family","branch":"child","state":"active","groups":[{"origin":1,"roots":[{"slot":0,"object":"0000000000000001-03-0000000000000001"}]}]}`
