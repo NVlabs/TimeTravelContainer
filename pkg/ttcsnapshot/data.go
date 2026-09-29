@@ -500,11 +500,7 @@ func (store *LocalDataStore) InstallEmptyDeferred(id ObjectID) (bool, error) {
 		store.noteUnsyncedName(id)
 		return true, nil
 	}
-	existing, err := store.Open(id, 0)
-	if err != nil {
-		return false, fmt.Errorf("existing immutable object: %w", err)
-	}
-	return false, existing.Close()
+	return false, store.checkExistingEmpty(id)
 }
 
 // ReplaceDeferred writes a complete cache object and atomically replaces any
@@ -692,6 +688,38 @@ func (store *LocalDataStore) createEmpty(id ObjectID) (bool, error) {
 	return true, file.Close()
 }
 
+// checkExistingEmpty checks that the object id, which createEmpty found
+// there already, is empty, as it must be. One stat does it.
+func (store *LocalDataStore) checkExistingEmpty(id ObjectID) error {
+	var size int64
+	var regular bool
+	if store.rootFD != nil {
+		relative, err := objectRelativePath(id)
+		if err != nil {
+			return err
+		}
+		var stat unix.Stat_t
+		if err := unix.Fstatat(int(store.rootFD.Fd()), relative, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+			return fmt.Errorf("existing immutable object: %w", err)
+		}
+		size, regular = stat.Size, stat.Mode&unix.S_IFMT == unix.S_IFREG
+	} else {
+		path, err := store.objectPath(id)
+		if err != nil {
+			return err
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			return fmt.Errorf("existing immutable object: %w", err)
+		}
+		size, regular = info.Size(), info.Mode().IsRegular()
+	}
+	if size != 0 || !regular {
+		return fmt.Errorf("existing immutable object: TTC bulk object %s has length %d, want 0", id.key(), size)
+	}
+	return nil
+}
+
 // installEmpty publishes the empty object id, which may be there already.
 func (store *LocalDataStore) installEmpty(id ObjectID, durable bool) error {
 	created, err := store.createEmpty(id)
@@ -699,11 +727,7 @@ func (store *LocalDataStore) installEmpty(id ObjectID, durable bool) error {
 		return err
 	}
 	if !created {
-		existing, err := store.Open(id, 0)
-		if err != nil {
-			return fmt.Errorf("existing immutable object: %w", err)
-		}
-		return existing.Close()
+		return store.checkExistingEmpty(id)
 	}
 	if !durable {
 		return nil
