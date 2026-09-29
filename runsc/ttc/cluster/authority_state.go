@@ -449,6 +449,10 @@ func (s *AuthorityState) cloneMutationMaps(kind AuthorityCommandKind) {
 		s.Nodes = cloneAuthorityMap(s.Nodes)
 		if kind == AuthorityNodeRegister {
 			s.RetiredNodes = cloneAuthorityMap(s.RetiredNodes)
+			// Registering another incarnation abandons the origins the
+			// previous one provided.
+			s.VolatileOrigins = cloneAuthorityMap(s.VolatileOrigins)
+			s.AbandonedOrigins = cloneAuthorityMap(s.AbandonedOrigins)
 		}
 		s.Transactions = cloneAuthorityMap(s.Transactions)
 		s.Branches = cloneAuthorityMap(s.Branches)
@@ -460,9 +464,19 @@ func (s *AuthorityState) cloneMutationMaps(kind AuthorityCommandKind) {
 		s.Branches = cloneAuthorityMap(s.Branches)
 		s.Placements = cloneAuthorityMap(s.Placements)
 		s.Publications = cloneAuthorityMap(s.Publications)
+		s.VolatileOrigins = cloneAuthorityMap(s.VolatileOrigins)
+		s.AbandonedOrigins = cloneAuthorityMap(s.AbandonedOrigins)
 	case AuthorityNodeRemove:
 		s.Nodes = cloneAuthorityMap(s.Nodes)
 		s.RetiredNodes = cloneAuthorityMap(s.RetiredNodes)
+		// Removal gives up what the incarnation held before it checks that
+		// nothing remains, and may then be refused.
+		s.Transactions = cloneAuthorityMap(s.Transactions)
+		s.Branches = cloneAuthorityMap(s.Branches)
+		s.Placements = cloneAuthorityMap(s.Placements)
+		s.Publications = cloneAuthorityMap(s.Publications)
+		s.VolatileOrigins = cloneAuthorityMap(s.VolatileOrigins)
+		s.AbandonedOrigins = cloneAuthorityMap(s.AbandonedOrigins)
 	case AuthorityClusterPolicySet:
 		// ClusterPolicy is copied by value with AuthorityState.
 	case AuthorityPlacementCreate, AuthorityPlacementBegin, AuthorityPlacementAdopt, AuthorityPlacementRecover,
@@ -494,6 +508,8 @@ func (s *AuthorityState) cloneMutationMaps(kind AuthorityCommandKind) {
 		s.Branches = cloneAuthorityMap(s.Branches)
 		if kind == AuthorityPublicationCommit {
 			s.Placements = cloneAuthorityMap(s.Placements)
+			// A commit publishes the origins its snapshot names.
+			s.VolatileOrigins = cloneAuthorityMap(s.VolatileOrigins)
 		}
 	case AuthorityBranchCorrupt, AuthorityBranchInherit, AuthorityBranchDiscardMemory, AuthorityBranchRemoveCorrupted:
 		s.Branches = cloneAuthorityMap(s.Branches)

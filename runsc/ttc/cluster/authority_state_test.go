@@ -1089,6 +1089,50 @@ func TestAuthorityRemovalCorruptsExactDependencyClosure(t *testing.T) {
 	}
 }
 
+// A refused removal gives up nothing. Removal gives up what the incarnation
+// held before it checks that nothing remains: here the shared-GC lease of a
+// coordinator whose node ended, which an operator then removes.
+func TestAuthorityRefusedRemovalChangesNothing(t *testing.T) {
+	at := time.Unix(3800, 0).UTC()
+	state := NewAuthorityState()
+	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at)
+	allocation := decodeAuthorityResultForTest[SnapshotAllocation](t, applyAuthorityForTest(t, state, "allocate", at.Add(time.Second), AuthoritySnapshotAllocate, AuthoritySnapshotPayload{
+		NodeID: "node-a", Incarnation: "incarnation-a", Count: 1,
+	}))
+	applyAuthorityForTest(t, state, "place", at.Add(2*time.Second), AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
+		FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main",
+		OwnerNode: "node-a", OwnerIncarnation: "incarnation-a", State: PlacementRunning,
+	}})
+	applyAuthorityForTest(t, state, "gc", at.Add(3*time.Second), AuthoritySharedGCAcquire, AuthoritySharedGCPayload{
+		NodeID: "node-a", Incarnation: "incarnation-a", Lease: 10 * time.Second,
+	})
+	node := state.Nodes["node-a"]
+	applyAuthorityForTest(t, state, "expire", node.LeaseExpiresAt, AuthorityNodeExpire, AuthorityNodeExpirePayload{
+		NodeID: node.NodeID, Incarnation: node.Incarnation, Revision: node.Revision,
+	})
+	key := logicalBranchKey("family", "main")
+	branch, placement := state.Branches[key], state.Placements[key]
+	offline := state.Nodes["node-a"]
+	command, err := NewAuthorityCommand("remove", offline.UpdatedAt.Add(time.Second), AuthorityNodeRemove, AuthorityNodeRemovePayload{
+		NodeID: offline.NodeID, Incarnation: offline.Incarnation, Revision: offline.Revision,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := state.Apply(command); result.Err() == nil {
+		t.Fatal("removed the node of the shared-GC coordinator")
+	}
+	if got := state.Branches[key]; got.Corrupted || got.Generation != branch.Generation {
+		t.Fatalf("the refused removal changed the branch: %+v", got)
+	}
+	if got := state.Placements[key]; got.OwnerNode != placement.OwnerNode || got.Generation != placement.Generation {
+		t.Fatalf("the refused removal changed the placement: %+v", got)
+	}
+	if _, ok := state.VolatileOrigins[allocation.First]; !ok {
+		t.Fatal("the refused removal abandoned the node's origin")
+	}
+}
+
 // An expired provider keeps its unpublished origins for when it returns;
 // removing it abandons them.
 func TestAuthorityRemovalAbandonsProviderOrigins(t *testing.T) {
