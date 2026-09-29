@@ -2779,7 +2779,8 @@ func snapshotLedger(state graphState, snapshot SnapshotID) ([]Object, map[string
 	if record.State == SnapshotWorking {
 		return nil, nil, fmt.Errorf("snapshot %d is still working", snapshot)
 	}
-	objects := make([]Object, 0)
+	// The snapshot has at most as many objects as it has given ordinals.
+	objects := make([]Object, 0, min(uint64(len(state.Objects)), record.NextOrdinal))
 	for _, object := range state.Objects {
 		if object.ID.Snapshot == snapshot {
 			objects = append(objects, cloneObject(object))
@@ -2787,20 +2788,22 @@ func snapshotLedger(state graphState, snapshot SnapshotID) ([]Object, map[string
 	}
 	slices.SortFunc(objects, func(a, b Object) int { return compareObjectIDs(a.ID, b.ID) })
 	references := snapshotReferences(state, snapshot)
-	counts := make(map[string]uint64, len(objects))
+	// By ID, not by key: keys were a million strings for a snapshot of
+	// 300,000 objects.
+	counts := make(map[ObjectID]uint64, len(objects))
 	for _, parent := range objects {
 		for _, edge := range parent.Children {
 			if edge.Child.Snapshot == snapshot {
-				counts[edge.Child.key()]++
+				counts[edge.Child]++
 			}
 		}
 	}
 	for _, object := range references {
-		counts[object.key()]++
+		counts[object]++
 	}
 	for _, object := range objects {
-		if counts[object.ID.key()] != object.Refs {
-			return nil, nil, fmt.Errorf("snapshot %d object %s baseline has %d references, graph records %d", snapshot, object.ID, counts[object.ID.key()], object.Refs)
+		if counts[object.ID] != object.Refs {
+			return nil, nil, fmt.Errorf("snapshot %d object %s baseline has %d references, graph records %d", snapshot, object.ID, counts[object.ID], object.Refs)
 		}
 	}
 	return objects, references, nil
