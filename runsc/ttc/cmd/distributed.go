@@ -361,9 +361,14 @@ func (r *distributedSourceRuntime) markOwnerSynced(key string, record cluster.Pl
 	r.syncedOwners.Store(key, syncedPlacementOwner{generation: record.Generation, owner: record.OwnerNode})
 }
 
-// forgetRemovedOwners forgets the branches that have no placement.
-func (r *distributedSourceRuntime) forgetRemovedOwners(placements map[string]cluster.PlacementRecord) {
+// forgetRemovedOwners forgets the branches that have no placement: of the
+// family with ID family alone, if it is not empty, whose placements alone
+// placements then holds.
+func (r *distributedSourceRuntime) forgetRemovedOwners(placements map[string]cluster.PlacementRecord, family string) {
 	r.syncedOwners.Range(func(key, _ any) bool {
+		if family != "" && !strings.HasPrefix(key.(string), family+"\x00") {
+			return true
+		}
 		if _, ok := placements[key.(string)]; !ok {
 			r.syncedOwners.Delete(key)
 		}

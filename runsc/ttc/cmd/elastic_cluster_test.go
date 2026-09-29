@@ -1274,6 +1274,67 @@ func TestPlacementReconciliationLeavesABusyFamily(t *testing.T) {
 	}
 }
 
+// A reconciliation of the families a command names repairs only theirs: the
+// stale placement of another family stays until a reconciliation of every
+// family.
+func TestPlacementReconciliationOfOneFamily(t *testing.T) {
+	root := t.TempDir()
+	runsc := filepath.Join(t.TempDir(), "runsc")
+	if err := os.WriteFile(runsc, []byte("#!/bin/sh\n[ \"$3\" = list ] && { echo '[]'; exit 0; }\nexit 2\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	placements, err := cluster.OpenPlacementStore(filepath.Join(root, "cluster", "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := cluster.OpenNodeDirectory(filepath.Join(root, "cluster", "nodes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	node, err := directory.Register(testElasticCapacityRecord("node-a", 0, 1<<60), now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node, err = directory.Transition(node.NodeID, node.Incarnation, cluster.NodeReady, now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	// Running placements with neither a runtime nor a record on their node
+	// are stale.
+	for _, family := range []string{"web", "db"} {
+		if _, err := placements.Create(cluster.PlacementRecord{
+			FamilyID: family, BranchID: "main", PhysicalContainer: family, PhysicalBranch: "main",
+			OwnerNode: "node-a", OwnerIncarnation: node.Incarnation, State: cluster.PlacementRunning,
+		}, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	backend := &runtimeBackend{
+		root: filepath.Join(root, "runsc-root"), runsc: runsc, dataRoot: root, localRoot: t.TempDir(), nodeID: "node-a",
+		operations: &familyOperations{}, stdin: strings.NewReader(""), stdout: io.Discard, stderr: io.Discard,
+		distributedSource: &distributedSourceRuntime{directory: directory, placements: placements},
+	}
+	reconcile := func(families ...string) {
+		t.Helper()
+		// Retiring a removed placement's transactions needs the authority,
+		// which this catalog has not; the removal itself comes first.
+		if err := backend.reconcilePlacementCatalogOf(families...); err != nil && !strings.Contains(err.Error(), "retiring transactions for removed placement") {
+			t.Fatalf("reconcilePlacementCatalogOf(%q): %v", families, err)
+		}
+	}
+	reconcile("web")
+	if _, err := placements.Lookup("web", "main"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the stale placement of the family reconciled remains: %v", err)
+	}
+	if _, err := placements.Lookup("db", "main"); err != nil {
+		t.Fatalf("the placement of a family not reconciled was removed: %v", err)
+	}
+	reconcile()
+	if _, err := placements.Lookup("db", "main"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the stale placement of another family remains after reconciling every family: %v", err)
+	}
+}
+
 // The cleanup of runtime branches a node does not own leaves alone one that a
 // command there is making: a fork's new branch runs before its record names
 // it, as a checkpoint's hidden branch does all its life.

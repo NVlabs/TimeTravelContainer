@@ -624,8 +624,28 @@ func validateDaemonPlacementClaimsWithCatalog(dataRoot, localNode string, args [
 // pause/resume. Every placed branch has an explicit owner; unplaced branches
 // have none. Records for deleted locally owned branches are reclaimed.
 func (b *runtimeBackend) reconcilePlacementCatalog() error {
+	return b.reconcilePlacementCatalogOf()
+}
+
+// reconcilePlacementCatalogOf is reconcilePlacementCatalog of the families
+// with these IDs, or of every family if none is given. What a command that
+// changes only the families it names left to reconcile is theirs: it reads
+// their placements and records alone, where reconciling every family read
+// every placement of the cluster and every family record of the node.
+func (b *runtimeBackend) reconcilePlacementCatalogOf(families ...string) error {
 	if b == nil || b.dataRoot == "" || b.nodeID == "" || b.distributedSource == nil || b.distributedSource.directory == nil {
 		return nil
+	}
+	if len(families) > 1 {
+		var result error
+		for _, family := range families {
+			result = errors.Join(result, b.reconcilePlacementCatalogOf(family))
+		}
+		return result
+	}
+	scope := ""
+	if len(families) == 1 {
+		scope = families[0]
 	}
 	placements, err := b.placementCatalog()
 	if err != nil {
@@ -644,6 +664,7 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 		// a publication, and one mapped through a transaction, are read in
 		// the same state.
 		query := cluster.PlacementsWithOwners
+		query.Family = scope
 		query.Publications, query.Transactions = cluster.All[string](), cluster.All[string]()
 		authorityState, err = b.distributedSource.authority.AuthorityStateOf(query)
 		if err != nil {
@@ -675,7 +696,9 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 			return err
 		}
 		for _, record := range records {
-			placementByBranch[record.FamilyID+"\x00"+record.BranchID] = record
+			if scope == "" || record.FamilyID == scope {
+				placementByBranch[record.FamilyID+"\x00"+record.BranchID] = record
+			}
 		}
 	}
 	var result error
@@ -725,9 +748,13 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 			needed[record.FamilyID] = struct{}{}
 		}
 	}
-	b.distributedSource.forgetRemovedOwners(placementByBranch)
-	for id := range liveSandboxes {
-		needed[id] = struct{}{}
+	b.distributedSource.forgetRemovedOwners(placementByBranch, scope)
+	if scope != "" {
+		needed[scope] = struct{}{}
+	} else {
+		for id := range liveSandboxes {
+			needed[id] = struct{}{}
+		}
 	}
 	containers := make([]ttcbundle.ContainerInfo, 0, len(needed))
 	for id := range needed {
@@ -896,6 +923,10 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 						}
 					}
 				}
+			}
+			if scope != "" && placementFamily != scope {
+				// Another family's, whose placements were not read.
+				continue
 			}
 			key := placementFamily + "\x00" + placementBranch
 			known[key] = struct{}{}

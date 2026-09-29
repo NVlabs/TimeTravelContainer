@@ -2696,13 +2696,15 @@ func (s *daemonServer) observeInitConsoleExit(target selector) {
 	}
 	backend := directBackend(s.optionsFromRequest(), strings.NewReader(""), io.Discard, s.stderr)
 	s.configureCommandBackend(backend)
+	backend.resolvedFamilies = &familySet{}
 	// Releasing the family's last live branch makes its resident
 	// dehydrations durable, which gives the lifecycle lock up meanwhile.
 	unlock := backend.holdFamilyLifecycle(backend.familyID(target.container))
 	defer unlock()
 	changed, err := backend.finalizeObservedInitExit(target)
 	if err == nil && changed {
-		err = backend.reconcilePlacementCatalog()
+		// The exit changed only the family of the branch.
+		err = backend.reconcilePlacementCatalogOf(backend.resolvedFamilies.list()...)
 	}
 	var remoteOwner *remoteBranchOwnershipError
 	if err != nil && !errors.Is(err, os.ErrNotExist) && !errors.As(err, &remoteOwner) && s.stderr != nil {
@@ -7367,6 +7369,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		return
 	}
 	backend.heldFamilies = families
+	backend.resolvedFamilies = &familySet{}
 	if listing {
 		// A listing neither waits for the lifecycle lock, which a mutation
 		// such as a durable dehydration may hold for minutes, nor holds it
@@ -7490,6 +7493,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		mutationBackend.lifecycleLockHeld = holdsLifecycleLock
 		mutationBackend.clientGone = backend.clientGone
 		mutationBackend.heldFamilies = families
+		mutationBackend.resolvedFamilies = backend.resolvedFamilies
 		mutationBackend.mutating = backend.mutating
 		mutationBackend.commandName = backend.commandName
 		if !daemonCommandKeepsLifecycleLock(request.Args) {
@@ -7515,7 +7519,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 				if err := s.activateMaterializedLifecycleTargets(mutationBackend, request.Args); err != nil {
 					fmt.Fprintf(&mutationStderr, "ttcd: warning: activating materialized placement: %v\n", err)
 				}
-				if err := mutationBackend.reconcilePlacementCatalog(); err != nil {
+				if err := mutationBackend.reconcilePlacementCatalogOf(commandReconciledFamilies(request.Args, mutationBackend)...); err != nil {
 					fmt.Fprintf(&mutationStderr, "ttcd: warning: reconciling placement catalog: %v\n", err)
 				}
 			}
@@ -7562,7 +7566,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			if err := s.activateMaterializedLifecycleTargets(backend, request.Args); err != nil {
 				fmt.Fprintf(backend.stderr, "ttcd: warning: activating materialized placement: %v\n", err)
 			}
-			if err := backend.reconcilePlacementCatalog(); err != nil {
+			if err := backend.reconcilePlacementCatalogOf(commandReconciledFamilies(request.Args, backend)...); err != nil {
 				fmt.Fprintf(backend.stderr, "ttcd: warning: reconciling placement catalog: %v\n", err)
 			}
 		}
@@ -7629,6 +7633,17 @@ func writeDaemonBufferedResult(conn net.Conn, writeMu *sync.Mutex, stdout, stder
 	_, _ = stdoutWriter.Write(stdout)
 	_, _ = stderrWriter.Write(stderr)
 	_ = writeDaemonStatus(conn, writeMu, status)
+}
+
+// commandReconciledFamilies returns the families whose placements the
+// reconciliation after a successful command must bring in line with this
+// node's runtimes: those the command resolved, if it changes only the
+// families it names, or none, which stands for every family.
+func commandReconciledFamilies(args []string, b *runtimeBackend) []string {
+	if name := daemonCommandName(args); !familyScopedCommands[name] && name != "migrate" {
+		return nil
+	}
+	return b.resolvedFamilies.list()
 }
 
 func daemonCommandNeedsMutationLock(args []string) bool {

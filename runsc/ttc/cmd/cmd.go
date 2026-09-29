@@ -6394,6 +6394,10 @@ type runtimeBackend struct {
 	heldFamilies        []string
 	lockFamily          func(id string) func()
 	lockSharedLifecycle func() func()
+	// resolvedFamilies, if not nil, collects the logical families the
+	// request resolves: those a command that changes only the families it
+	// names acts on, and the placement reconciliation after it covers.
+	resolvedFamilies *familySet
 	publicationQueue    *ttcstorage.Queue
 	snapshotGraph       *ttcsnapshot.Store
 	snapshotData        *ttcsnapshot.LocalDataStore
@@ -6720,11 +6724,44 @@ func (b *runtimeBackend) resolveContainer(identifier string) (ttcbundle.Containe
 			// branch while transaction-scoped siblings are still being removed.
 			// Keep those siblings operable from placement authority instead of
 			// waiting for metadata that is intentionally gone.
-			return loadDistributedFamilyIdentity(store, placements, identifier)
+			info, err = loadDistributedFamilyIdentity(store, placements, identifier)
+			if err == nil {
+				b.resolvedFamilies.add(logicalFamilyID(info))
+			}
+			return info, err
 		}
 		return ttcbundle.ContainerInfo{}, err
 	}
+	b.resolvedFamilies.add(logicalFamilyID(info))
 	return info, nil
+}
+
+// familySet is a set of family IDs, to which a request's goroutines may add.
+type familySet struct {
+	mu  sync.Mutex
+	ids []string
+}
+
+// add adds id to s, if s is not nil.
+func (s *familySet) add(id string) {
+	if s == nil || id == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !slices.Contains(s.ids, id) {
+		s.ids = append(s.ids, id)
+	}
+}
+
+// list returns the IDs in s.
+func (s *familySet) list() []string {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.ids)
 }
 
 // resolveDistributedPersistentBranch maps one logical family branch to the
