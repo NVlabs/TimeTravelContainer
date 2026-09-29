@@ -6593,6 +6593,11 @@ func validateClusterTopology(runtime *daemonClusterRuntime, self cluster.NodeRec
 	return lastErr
 }
 
+// sharedManifestIdle is how long a daemon keeps a shared manifest cached that
+// it does not read: a restore or a publication reads one for a moment, and
+// shared GC reads those it counts on each pass.
+const sharedManifestIdle = 2 * time.Minute
+
 func maintainDistributedGraphReferences(backend *runtimeBackend, stderr io.Writer, done <-chan struct{}, lock func() func()) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -6609,6 +6614,9 @@ func maintainDistributedGraphReferences(backend *runtimeBackend, stderr io.Write
 		err := backend.reconcileDistributedGraphReferences(false)
 		backingErr := backend.reconcileConsumedMemoryBacking()
 		unlock()
+		if backend.snapshotShared != nil {
+			backend.snapshotShared.ExpireManifests(sharedManifestIdle)
+		}
 		err = errors.Join(err, backend.reconcileProviderClaims())
 		if err != nil && stderr != nil {
 			fmt.Fprintf(stderr, "ttcd: warning: reconciling distributed graph references: %v\n", err)

@@ -951,6 +951,69 @@ func TestSharedPackManifestCacheIsBounded(t *testing.T) {
 	cached(a, b)
 }
 
+// The cache forgets a manifest none has read for a while, and one whose
+// origin was retired, whose manifest is gone.
+func TestSharedPackManifestCacheExpires(t *testing.T) {
+	shared, err := OpenSharedPackStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	graph := openTestStore(t)
+	data, err := OpenLocalDataStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var origins []SnapshotID
+	for index := 0; index < 3; index++ {
+		origin, err := graph.AllocateWorking()
+		if err != nil {
+			t.Fatal(err)
+		}
+		object, err := graph.CreateObject(origin, fmt.Sprintf("root/%d", origin), ObjectKindMetadata, []byte{byte(origin)}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := graph.SetRoot(fmt.Sprintf("snapshot/%d", origin), object); err != nil {
+			t.Fatal(err)
+		}
+		if err := graph.Seal(origin, SnapshotSealedLocal); err != nil {
+			t.Fatal(err)
+		}
+		if err := shared.Publish(context.Background(), graph, origin, data); err != nil {
+			t.Fatal(err)
+		}
+		origins = append(origins, origin)
+	}
+	idle, used, retired := origins[0], origins[1], origins[2]
+	cached := func(origin SnapshotID) bool {
+		shared.mu.Lock()
+		defer shared.mu.Unlock()
+		_, ok := shared.manifests[origin]
+		return ok
+	}
+	shared.mu.Lock()
+	entry := shared.manifests[idle]
+	entry.usedAt = time.Now().Add(-10 * time.Minute)
+	shared.manifests[idle] = entry
+	shared.mu.Unlock()
+	if _, err := shared.manifest(used); err != nil {
+		t.Fatal(err)
+	}
+	shared.ExpireManifests(2 * time.Minute)
+	if cached(idle) || !cached(used) {
+		t.Fatalf("after expiry, the idle manifest is cached %t and the one read %t, want false and true", cached(idle), cached(used))
+	}
+	if err := os.Remove(filepath.Join(shared.snapshotDirectory(retired), sharedManifestName)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := shared.manifest(retired); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("reading a removed manifest: %v", err)
+	}
+	if cached(retired) {
+		t.Fatal("the manifest of a retired origin is still cached")
+	}
+}
+
 // validateManifest takes a consistent manifest in any order, and sorts it;
 // it refuses each inconsistency.
 func TestValidateManifest(t *testing.T) {

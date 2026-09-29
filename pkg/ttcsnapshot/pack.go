@@ -83,6 +83,8 @@ type cachedSharedManifest struct {
 	manifest *SnapshotManifest
 	info     os.FileInfo
 	used     uint64
+	// usedAt is when the manifest was last read from the cache, or cached.
+	usedAt time.Time
 }
 
 // sharedManifestCacheBytes bounds the manifests a store keeps decoded, by the
@@ -541,6 +543,12 @@ func (store *SharedPackStore) manifest(snapshot SnapshotID) (*SnapshotManifest, 
 	path := filepath.Join(store.snapshotDirectory(snapshot), sharedManifestName)
 	file, err := os.Open(path)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			// Retired: no one reads it again.
+			store.mu.Lock()
+			store.forgetManifestLocked(snapshot)
+			store.mu.Unlock()
+		}
 		return nil, err
 	}
 	info, err := file.Stat()
@@ -551,7 +559,7 @@ func (store *SharedPackStore) manifest(snapshot SnapshotID) (*SnapshotManifest, 
 	store.mu.Lock()
 	if cached, ok := store.manifests[snapshot]; ok && cached.manifest != nil && cached.info != nil && os.SameFile(cached.info, info) && cached.info.Size() == info.Size() && cached.info.ModTime().Equal(info.ModTime()) {
 		store.manifestUses++
-		cached.used = store.manifestUses
+		cached.used, cached.usedAt = store.manifestUses, time.Now()
 		store.manifests[snapshot] = cached
 		result := cached.manifest
 		store.mu.Unlock()
@@ -585,7 +593,7 @@ func (store *SharedPackStore) manifest(snapshot SnapshotID) (*SnapshotManifest, 
 func (store *SharedPackStore) cacheManifestLocked(snapshot SnapshotID, entry cachedSharedManifest) {
 	store.forgetManifestLocked(snapshot)
 	store.manifestUses++
-	entry.used = store.manifestUses
+	entry.used, entry.usedAt = store.manifestUses, time.Now()
 	store.manifests[snapshot] = entry
 	store.manifestBytes += entry.info.Size()
 	for store.manifestBytes > store.manifestLimit && len(store.manifests) > 1 {
@@ -597,6 +605,21 @@ func (store *SharedPackStore) cacheManifestLocked(snapshot SnapshotID, entry cac
 			}
 		}
 		store.forgetManifestLocked(oldest)
+	}
+}
+
+// ExpireManifests forgets the cached manifests that none has read for idle.
+// The cache keeps the manifests of the images a daemon restored or published
+// a moment ago, up to its bound, and would keep them for as long as the daemon
+// then ran without them.
+func (store *SharedPackStore) ExpireManifests(idle time.Duration) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	now := time.Now()
+	for snapshot, cached := range store.manifests {
+		if now.Sub(cached.usedAt) > idle {
+			store.forgetManifestLocked(snapshot)
+		}
 	}
 }
 
