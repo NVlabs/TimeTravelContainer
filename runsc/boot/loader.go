@@ -264,10 +264,11 @@ type Loader struct {
 	// to the restored Kernel in restoreDistributedFork or dehydration restore.
 	distributedMemoryFile *os.File
 
-	// restoringDehydration is set while a durable dehydration restore
-	// installs a branch image into an unstarted sandbox, which holds mu for
-	// as long as that takes: in proportion to the branch's memory.
-	restoringDehydration atomicbitops.Bool
+	// restoring is set while a durable dehydration's restore, or a
+	// distributed fork's or migration's, installs a branch image into an
+	// unstarted sandbox, which holds mu for as long as that takes: in
+	// proportion to the branch's memory.
+	restoring atomicbitops.Bool
 
 	// sandboxID is the ID for the whole sandbox.
 	sandboxID string
@@ -2962,7 +2963,7 @@ func (l *Loader) SpecEnviron(containerName string) []string {
 }
 
 func (l *Loader) containerRuntimeState(cid string) ContainerRuntimeState {
-	if l.restoringDehydration.Load() {
+	if l.restoring.Load() {
 		// The container is being created until the restore finishes, as it
 		// was before the restore began; waiting for mu would hold up every
 		// runtime that lists this sandbox.

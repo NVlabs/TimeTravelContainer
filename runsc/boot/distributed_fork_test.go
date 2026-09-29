@@ -67,15 +67,15 @@ func TestAliasRestoreFilesystemResourcesRejectsMissingCurrent(t *testing.T) {
 	}
 }
 
-// While a durable dehydration restore holds the loader's lock, a runtime that
-// asks whether the container still runs is told at once that it is being
-// created, instead of waiting for the restore to finish.
-func TestContainerRuntimeStateDuringDehydrationRestore(t *testing.T) {
+// While a restore holds the loader's lock, a runtime that asks whether the
+// container still runs is told at once that it is being created, instead of
+// waiting for the restore to finish.
+func TestContainerRuntimeStateDuringRestore(t *testing.T) {
 	l := &Loader{}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.restoringDehydration.Store(true)
-	defer l.restoringDehydration.Store(false)
+	l.restoring.Store(true)
+	defer l.restoring.Store(false)
 	answered := make(chan ContainerRuntimeState, 1)
 	go func() { answered <- l.containerRuntimeState("restoring") }()
 	select {

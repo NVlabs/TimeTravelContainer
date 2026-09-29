@@ -147,6 +147,8 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		}
 		return l.restoreDistributedForkPeer(args)
 	}
+	l.restoring.Store(true)
+	defer l.restoring.Store(false)
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.distributedRestore && l.distributedRestoreSessionID == args.SessionID {
