@@ -3373,3 +3373,47 @@ func TestSnapshotKeysAndObjectPaths(t *testing.T) {
 		t.Fatal("a metadata object has a data path")
 	}
 }
+
+// Once most of the pages the page index held have left it, it is made anew at
+// the size of those left, which it still holds, where in place it kept the
+// room of all it ever held.
+func TestMemoryPageIndexCompacts(t *testing.T) {
+	s := &Store{
+		memoryPages:          make(map[MemoryPageIdentity]memoryPageHolding),
+		memoryPagesElsewhere: make(map[MemoryPageIdentity][]memoryPageHolding),
+	}
+	identity := func(i int) MemoryPageIdentity { return MemoryPageIdentity{LogicalSequence: uint64(i), VersionSequence: 1} }
+	here := MemoryPageLocation{Chunk: ObjectID{Snapshot: 1, Kind: ObjectKindMemoryChunk, Ordinal: 1}}
+	there := MemoryPageLocation{Chunk: ObjectID{Snapshot: 1, Kind: ObjectKindMemoryChunk, Ordinal: 2}}
+	const held, kept = 3 * memoryIndexCompaction, memoryIndexCompaction / 2
+	for i := range held {
+		s.holdMemoryPageLocked(identity(i), here)
+	}
+	s.holdMemoryPageLocked(identity(0), there)
+	before := reflect.ValueOf(s.memoryPages).Pointer()
+	for i := kept; i < held; i++ {
+		s.releaseMemoryPageLocked(identity(i), here)
+	}
+	s.compactMemoryIndexesLocked()
+	if reflect.ValueOf(s.memoryPages).Pointer() == before {
+		t.Fatalf("the page index was not made anew after %d of %d pages left it", held-kept, held)
+	}
+	if s.memoryPagesReleased != 0 || len(s.memoryPages) != kept || len(s.memoryPagesElsewhere) != 1 {
+		t.Fatalf("after compaction: %d released, %d pages, %d held elsewhere; want 0, %d, 1", s.memoryPagesReleased, len(s.memoryPages), len(s.memoryPagesElsewhere), kept)
+	}
+	for i := range kept {
+		if holding := s.memoryPages[identity(i)]; holding.location != here || holding.holders != 1 {
+			t.Fatalf("page %d is held %+v after compaction", i, holding)
+		}
+	}
+	if holdings := s.memoryPagesElsewhere[identity(0)]; len(holdings) != 1 || holdings[0].location != there {
+		t.Fatalf("page 0 is held elsewhere %+v after compaction", holdings)
+	}
+	// Fewer released pages than those left make no copy.
+	after := reflect.ValueOf(s.memoryPages).Pointer()
+	s.releaseMemoryPageLocked(identity(1), here)
+	s.compactMemoryIndexesLocked()
+	if reflect.ValueOf(s.memoryPages).Pointer() != after {
+		t.Fatal("the page index was made anew after one page left it")
+	}
+}

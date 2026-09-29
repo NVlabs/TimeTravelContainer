@@ -392,12 +392,38 @@ func (s *Store) unindexMemoryObjectLocked(object Object) {
 			s.memoryTables[key] = tables
 		}
 	}
+	s.compactMemoryIndexesLocked()
+}
+
+// memoryIndexCompaction is how many pages must leave the page index, as many
+// as it still holds at least, before compactMemoryIndexesLocked makes it anew.
+const memoryIndexCompaction = 1 << 12
+
+// compactMemoryIndexesLocked copies the page indexes into maps of their
+// present size once the pages that left them outnumber those left: a map
+// keeps the room of its largest size, 50 MB after a capture of 1.5 GiB was
+// indexed, however few pages it holds since. Each page that left pays for
+// the copy of one that stays.
+func (s *Store) compactMemoryIndexesLocked() {
+	if s.memoryPagesReleased < memoryIndexCompaction || s.memoryPagesReleased < len(s.memoryPages) {
+		return
+	}
+	pages := make(map[MemoryPageIdentity]memoryPageHolding, len(s.memoryPages))
+	for identity, holding := range s.memoryPages {
+		pages[identity] = holding
+	}
+	elsewhere := make(map[MemoryPageIdentity][]memoryPageHolding, len(s.memoryPagesElsewhere))
+	for identity, holdings := range s.memoryPagesElsewhere {
+		elsewhere[identity] = holdings
+	}
+	s.memoryPages, s.memoryPagesElsewhere, s.memoryPagesReleased = pages, elsewhere, 0
 }
 
 func (s *Store) rebuildMemoryIndexesLocked() {
 	s.memoryPages = make(map[MemoryPageIdentity]memoryPageHolding)
 	s.memoryPagesElsewhere = make(map[MemoryPageIdentity][]memoryPageHolding)
 	s.memoryTables = make(map[uint64][]ObjectID)
+	s.memoryPagesReleased = 0
 	for _, object := range s.state.Objects {
 		s.indexMemoryObjectLocked(object)
 	}
@@ -438,6 +464,7 @@ func (s *Store) releaseMemoryPageLocked(identity MemoryPageIdentity, location Me
 		}
 		if len(elsewhere) == 0 {
 			delete(s.memoryPages, identity)
+			s.memoryPagesReleased++
 			return
 		}
 		s.memoryPages[identity] = elsewhere[0]

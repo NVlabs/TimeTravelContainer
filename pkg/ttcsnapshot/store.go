@@ -344,6 +344,9 @@ type Store struct {
 	memoryPagesElsewhere map[MemoryPageIdentity][]memoryPageHolding
 	memoryTables         map[uint64][]ObjectID
 	memoryTableSeed      maphash.Seed
+	// memoryPagesReleased is how many pages have left memoryPages since it
+	// was last made: see compactMemoryIndexesLocked.
+	memoryPagesReleased int
 	// deferredLoads serializes provider I/O for one foreign immutable object.
 	// Provider reads must never run while mu is held: a multi-hop filesystem
 	// graph may legitimately re-enter this Store while resolving an ancestor.
