@@ -104,6 +104,16 @@ func appendJSONString(out []byte, s string) []byte {
 	return append(out, '"')
 }
 
+// appendJSONBytes appends value as json.Marshal writes a byte slice.
+func appendJSONBytes(out []byte, value []byte) []byte {
+	if value == nil {
+		return append(out, "null"...)
+	}
+	out = append(out, '"')
+	out = base64.StdEncoding.AppendEncode(out, value)
+	return append(out, '"')
+}
+
 func appendObjectIDJSON(out []byte, id ObjectID) []byte {
 	out = append(out, `{"Snapshot":`...)
 	out = strconv.AppendUint(out, uint64(id.Snapshot), 10)
@@ -125,13 +135,7 @@ func appendObjectJSON(out []byte, object Object) []byte {
 	out = append(out, `,"BulkLength":`...)
 	out = strconv.AppendUint(out, object.BulkLength, 10)
 	out = append(out, `,"Data":`...)
-	if object.Data == nil {
-		out = append(out, "null"...)
-	} else {
-		out = append(out, '"')
-		out = base64.StdEncoding.AppendEncode(out, object.Data)
-		out = append(out, '"')
-	}
+	out = appendJSONBytes(out, object.Data)
 	out = append(out, `,"Children":`...)
 	if object.Children == nil {
 		out = append(out, "null"...)

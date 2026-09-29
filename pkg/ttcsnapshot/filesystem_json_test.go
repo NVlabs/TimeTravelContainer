@@ -268,3 +268,53 @@ func FuzzDecodeFilesystemRecords(f *testing.F) {
 		checkRecordDecodesAlike(t, data)
 	})
 }
+
+// oddStrings are strings encoding/json escapes, replaces or keeps as they
+// are.
+var oddStrings = []string{"", "plain", "<&>", "tab\there", "quote\"back\\slash", "café", "line sep", "\xff\xfe", "nul\x00"}
+
+// A record encodes as encoding/json encodes it, byte for byte.
+func TestEncodeFilesystemRecords(t *testing.T) {
+	random := rand.New(rand.NewSource(5))
+	for round := 0; round < 500; round++ {
+		inode := randomInodeRecord(random)
+		inode.Type = oddStrings[random.Intn(len(oddStrings))]
+		if random.Intn(2) == 0 {
+			inode.Target = oddStrings[random.Intn(len(oddStrings))]
+		}
+		if random.Intn(3) == 0 {
+			inode.Xattrs = map[string][]byte{oddStrings[random.Intn(len(oddStrings))]: nil, "user.x": {}, "user.y": {1, 2, 3}}
+		}
+		if random.Intn(2) == 0 {
+			inode.Size, inode.MtimeNsec = -inode.Size, -inode.MtimeNsec
+		}
+		want, err := marshalInodeRecord(&inode)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, encode := range []func() ([]byte, error){
+			func() ([]byte, error) { return appendInodeRecordJSON(nil, &inode) },
+			inode.MarshalJSON,
+			func() ([]byte, error) { return json.Marshal(inode) },
+			func() ([]byte, error) { return encodeRecord(inode) },
+		} {
+			if got, err := encode(); err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("round %d: inode encodes (%v) as\n%s\nwant\n%s", round, err, got, want)
+			}
+		}
+		entry := DirectoryEntryRecord{Parent: random.Uint64(), Name: oddStrings[random.Intn(len(oddStrings))], Inode: random.Uint64()}
+		if want, err = marshalDirectoryEntryRecord(&entry); err != nil {
+			t.Fatal(err)
+		}
+		for _, encode := range []func() ([]byte, error){
+			func() ([]byte, error) { return appendDirectoryEntryRecordJSON(nil, &entry) },
+			entry.MarshalJSON,
+			func() ([]byte, error) { return json.Marshal(entry) },
+			func() ([]byte, error) { return encodeRecord(entry) },
+		} {
+			if got, err := encode(); err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("round %d: entry encodes (%v) as\n%s\nwant\n%s", round, err, got, want)
+			}
+		}
+	}
+}

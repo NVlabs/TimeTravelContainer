@@ -174,7 +174,16 @@ func directoryKey(parent uint64, name string) ([]byte, error) {
 }
 
 func encodeRecord(value any) ([]byte, error) {
-	data, err := json.Marshal(value)
+	var data []byte
+	var err error
+	switch record := value.(type) {
+	case InodeRecord:
+		data, err = appendInodeRecordJSON(nil, &record)
+	case DirectoryEntryRecord:
+		data, err = appendDirectoryEntryRecordJSON(nil, &record)
+	default:
+		data, err = json.Marshal(value)
+	}
 	if err != nil {
 		return nil, err
 	}
