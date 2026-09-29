@@ -323,6 +323,15 @@ recovery, and nested execution.
 - [Security, performance, and compatibility audit](g3doc/proposals/timetravel_ttc_audit.md)
 - [Upstream gVisor documentation](https://gvisor.dev/docs/)
 
+## Contributing
+
+Commits must be signed off under the Developer Certificate of Origin; see
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## License
 
-TimeTravelContainer is licensed under the [Apache License 2.0](LICENSE).
+TimeTravelContainer is licensed under the [Apache License 2.0](LICENSE). It is
+a modified version of [gVisor](https://github.com/google/gvisor).
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) names gVisor and the
+third-party components TimeTravelContainer uses, with their licenses and the
+texts of those licenses.
