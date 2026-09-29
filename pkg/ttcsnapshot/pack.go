@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -375,7 +374,11 @@ func (store *SharedPackStore) publish(ctx context.Context, graph *Store, snapsho
 		return fmt.Errorf("validating snapshot %d manifest before commit: %w", snapshot, err)
 	}
 	path := filepath.Join(directory, sharedManifestName)
-	created, err := writeAtomicJSON(path, manifest)
+	encoded, err := encodeSharedManifest(&manifest)
+	if err != nil {
+		return err
+	}
+	created, err := writeAtomicJSON(path, encoded)
 	if err != nil {
 		return err
 	}
@@ -441,9 +444,9 @@ func (store *SharedPackStore) resolveDeferredForPublication(graph *Store, local 
 	return Object{}, publicationBulkSource{}, errors.New("deferred object has no source identity")
 }
 
-// writeAtomicJSON writes value at path unless something is there already. It
+// writeAtomicJSON writes data at path unless something is there already. It
 // reports whether it wrote it.
-func writeAtomicJSON(path string, value any) (bool, error) {
+func writeAtomicJSON(path string, data []byte) (bool, error) {
 	directory := filepath.Dir(path)
 	temporary, err := os.CreateTemp(directory, ".manifest-")
 	if err != nil {
@@ -451,9 +454,7 @@ func writeAtomicJSON(path string, value any) (bool, error) {
 	}
 	temporaryPath := temporary.Name()
 	defer os.Remove(temporaryPath)
-	encoder := json.NewEncoder(temporary)
-	encoder.SetEscapeHTML(false)
-	if err := encoder.Encode(value); err != nil {
+	if _, err := temporary.Write(data); err != nil {
 		temporary.Close()
 		return false, err
 	}
@@ -474,7 +475,7 @@ func writeAtomicJSON(path string, value any) (bool, error) {
 	return created, syncDirectory(directory)
 }
 
-func replaceAtomicJSON(path string, value any) error {
+func replaceAtomicJSON(path string, data []byte) error {
 	directory := filepath.Dir(path)
 	temporary, err := os.CreateTemp(directory, ".manifest-replacement-")
 	if err != nil {
@@ -482,9 +483,7 @@ func replaceAtomicJSON(path string, value any) error {
 	}
 	temporaryPath := temporary.Name()
 	defer os.Remove(temporaryPath)
-	encoder := json.NewEncoder(temporary)
-	encoder.SetEscapeHTML(false)
-	if err := encoder.Encode(value); err != nil {
+	if _, err := temporary.Write(data); err != nil {
 		temporary.Close()
 		return err
 	}
@@ -1162,7 +1161,11 @@ func (store *SharedPackStore) Compact(snapshot SnapshotID, objects []Object, ref
 	if err := store.validateManifest(&replacement); err != nil {
 		return stats, false, fmt.Errorf("validating compacted shared pack: %w", err)
 	}
-	if err := replaceAtomicJSON(filepath.Join(directory, sharedManifestName), replacement); err != nil {
+	encoded, err := encodeSharedManifest(&replacement)
+	if err != nil {
+		return stats, false, err
+	}
+	if err := replaceAtomicJSON(filepath.Join(directory, sharedManifestName), encoded); err != nil {
 		return stats, false, err
 	}
 	store.mu.Lock()

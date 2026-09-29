@@ -55,7 +55,8 @@ func manifestFixture(random *rand.Rand, objects int) SnapshotManifest {
 	return manifest
 }
 
-// encodeManifest encodes manifest as writeAtomicJSON does.
+// encodeManifest encodes manifest as encoding/json encoded it for
+// writeAtomicJSON.
 func encodeManifest(t testing.TB, manifest SnapshotManifest) []byte {
 	var encoded bytes.Buffer
 	encoder := json.NewEncoder(&encoded)
@@ -151,4 +152,37 @@ func FuzzDecodeSharedManifest(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		checkManifestDecodesAlike(t, data)
 	})
+}
+
+// A manifest encodes as encoding/json encoded it for writeAtomicJSON, byte
+// for byte.
+func TestEncodeSharedManifest(t *testing.T) {
+	random := rand.New(rand.NewSource(9))
+	manifests := []SnapshotManifest{{}, {Objects: []PackedObject{}, References: map[string]ObjectID{}, Packs: []PackInfo{}}}
+	for round := 0; round < 40; round++ {
+		manifest := manifestFixture(random, random.Intn(100))
+		for index := range manifest.Objects {
+			object := &manifest.Objects[index].Object
+			if random.Intn(4) == 0 {
+				object.State = ObjectState(oddStrings[random.Intn(len(oddStrings))])
+			}
+			if random.Intn(4) == 0 {
+				object.SourceCatalog = oddStrings[1+random.Intn(len(oddStrings)-1)]
+			}
+			if random.Intn(8) == 0 {
+				manifest.Objects[index].Extents = []PackExtent{}
+			}
+		}
+		if random.Intn(2) == 0 {
+			manifest.References = map[string]ObjectID{oddStrings[random.Intn(len(oddStrings))]: {Snapshot: 1, Kind: 1, Ordinal: 2}, "root/<&>": {Snapshot: 1, Kind: 1, Ordinal: 3}}
+		}
+		manifests = append(manifests, manifest)
+	}
+	for index := range manifests {
+		want := encodeManifest(t, manifests[index])
+		got, err := encodeSharedManifest(&manifests[index])
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("manifest %d encodes (%v) as\n%.600s\nwant\n%.600s", index, err, got, want)
+		}
+	}
 }

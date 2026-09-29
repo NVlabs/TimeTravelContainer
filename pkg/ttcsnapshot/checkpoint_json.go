@@ -15,6 +15,7 @@
 package ttcsnapshot
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"slices"
@@ -103,11 +104,20 @@ func appendObjectTableJSON(out []byte, objects map[string]Object) []byte {
 
 // appendJSONString appends s as json.Marshal writes it.
 func appendJSONString(out []byte, s string) []byte {
+	return appendJSONStringEscaping(out, s, true)
+}
+
+// appendJSONStringEscaping appends s as a json.Encoder writes it that
+// escapes HTML, or does not.
+func appendJSONStringEscaping(out []byte, s string, escapeHTML bool) []byte {
 	for i := 0; i < len(s); i++ {
-		// Beyond these, json.Marshal escapes a character or replaces it.
-		if c := s[i]; c < 0x20 || c >= 0x7f || c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' {
-			encoded, _ := json.Marshal(s)
-			return append(out, encoded...)
+		// Beyond these, encoding/json escapes a character or replaces it.
+		if c := s[i]; c < 0x20 || c >= 0x7f || c == '"' || c == '\\' || escapeHTML && (c == '<' || c == '>' || c == '&') {
+			var encoded bytes.Buffer
+			encoder := json.NewEncoder(&encoded)
+			encoder.SetEscapeHTML(escapeHTML)
+			_ = encoder.Encode(s)
+			return append(out, bytes.TrimSuffix(encoded.Bytes(), []byte{'\n'})...)
 		}
 	}
 	out = append(out, '"')
@@ -137,10 +147,16 @@ func appendObjectIDJSON(out []byte, id ObjectID) []byte {
 
 // appendObjectJSON appends object as json.Marshal writes it.
 func appendObjectJSON(out []byte, object Object) []byte {
+	return appendObjectJSONEscaping(out, object, true)
+}
+
+// appendObjectJSONEscaping appends object as a json.Encoder writes it that
+// escapes HTML, or does not.
+func appendObjectJSONEscaping(out []byte, object Object, escapeHTML bool) []byte {
 	out = append(out, `{"ID":`...)
 	out = appendObjectIDJSON(out, object.ID)
 	out = append(out, `,"State":`...)
-	out = appendJSONString(out, string(object.State))
+	out = appendJSONStringEscaping(out, string(object.State), escapeHTML)
 	out = append(out, `,"Refs":`...)
 	out = strconv.AppendUint(out, object.Refs, 10)
 	out = append(out, `,"BulkLength":`...)
@@ -166,7 +182,7 @@ func appendObjectJSON(out []byte, object Object) []byte {
 	}
 	if object.SourceCatalog != "" {
 		out = append(out, `,"SourceCatalog":`...)
-		out = appendJSONString(out, object.SourceCatalog)
+		out = appendJSONStringEscaping(out, object.SourceCatalog, escapeHTML)
 	}
 	out = append(out, `,"SourceObject":`...)
 	out = appendObjectIDJSON(out, object.SourceObject)
