@@ -1,5 +1,7 @@
-// Copyright 2026 The gVisor Authors.
-// SPDX-License-Identifier: Apache-2.0
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
 
 // elastic_memory_worker is a small live-fork qualification workload. It keeps
 // anonymous memory mapped and resident, then accepts branch-local write

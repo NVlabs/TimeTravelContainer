@@ -1,5 +1,5 @@
-// Copyright 2026 The gVisor Authors.
-// Licensed under the Apache License, Version 2.0 (the "License");
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package storage coordinates crash-recoverable publication from node-local
 // active state to the shared cold repository.

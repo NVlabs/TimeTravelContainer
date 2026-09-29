@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 // Reconstructed for benchmarking from deeplethe/firecracker commit
 // 7d80afade831f01e3178c5b76daf8b4cbc02d176, whose commit message and routing
 // changes reference this file but whose Git tree omits it.

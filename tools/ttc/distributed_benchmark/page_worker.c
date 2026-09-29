@@ -1,5 +1,7 @@
-// Copyright 2026 The gVisor Authors.
-// SPDX-License-Identifier: Apache-2.0
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
 
 #include <errno.h>
 #include <fcntl.h>

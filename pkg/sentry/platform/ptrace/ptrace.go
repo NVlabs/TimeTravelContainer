@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package ptrace provides a ptrace-based implementation of the platform
 // interface. This is useful for development and testing purposes primarily,
 // and runs on stock kernels without special permissions.

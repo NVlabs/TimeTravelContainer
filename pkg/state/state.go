@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package state provides functionality related to saving and loading object
 // graphs.  For most types, it provides a set of default saving / loading logic
 // that will be invoked automatically if custom logic is not defined.

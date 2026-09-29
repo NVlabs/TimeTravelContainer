@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package futex provides an implementation of the futex interface as found in
 // the Linux kernel. It allows one to easily transform Wait() calls into waits
 // on a channel, which is useful in a Go-based kernel, for example.

@@ -1,5 +1,8 @@
 #!/bin/sh
-#
+
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Install the latest TimeTravelContainer release for the current user.
 
 set -eu

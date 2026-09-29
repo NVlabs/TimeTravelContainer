@@ -1,6 +1,7 @@
 #!/bin/sh
-# Copyright 2026 The gVisor Authors.
-# Licensed under the Apache License, Version 2.0 (the "License");
+
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 # Covers the CLI paths that are intentionally not repeated in the larger image,
 # storage, terminal, and distributed workload matrices. Keep this focused on

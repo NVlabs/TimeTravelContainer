@@ -195,10 +195,9 @@ diff --git a/src/runtime/ttc_vm_darwin.go b/src/runtime/ttc_vm_darwin.go
 new file mode 100644
 --- /dev/null
 +++ b/src/runtime/ttc_vm_darwin.go
-@@ -0,0 +1,335 @@
-+// Copyright 2026 The Go Authors. All rights reserved.
-+// Use of this source code is governed by a BSD-style
-+// license that can be found in the LICENSE file.
+@@ -0,0 +1,334 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
 +
 +//go:build darwin
 +
@@ -535,10 +534,9 @@ diff --git a/src/runtime/ttc_vm_openbsd.go b/src/runtime/ttc_vm_openbsd.go
 new file mode 100644
 --- /dev/null
 +++ b/src/runtime/ttc_vm_openbsd.go
-@@ -0,0 +1,16 @@
-+// Copyright 2026 The Go Authors. All rights reserved.
-+// Use of this source code is governed by a BSD-style
-+// license that can be found in the LICENSE file.
+@@ -0,0 +1,15 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
 +
 +//go:build openbsd
 +

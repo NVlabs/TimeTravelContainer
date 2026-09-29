@@ -1,4 +1,4 @@
-// Copyright 2026 The gVisor Authors.
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 // page_worker is the pure-Go equivalent of page_worker.c. It exists so hosts

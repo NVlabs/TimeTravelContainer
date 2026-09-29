@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package iouringfs provides a filesystem implementation for IO_URING basing
 // it on anonfs. Currently, we don't support neither IOPOLL nor SQPOLL modes.
 // Thus, user needs to set up IO_URING first with io_uring_setup(2) syscall and

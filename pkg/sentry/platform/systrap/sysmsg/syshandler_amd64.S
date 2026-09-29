@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 // This file contains the switch functionality of the systrap "syshandler" optimization.
 // It lets us avoid the signal frame setup overhead of the regular SIGSYS handler. These
 // switch routines save user state, and rely on having %gs point to this thread's sysmsg

@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package safecopy provides an efficient implementation of functions to access
 // memory that may result in SIGSEGV or SIGBUS being sent to the accessor.
 package safecopy

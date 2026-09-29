@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // This file isolates the unsafe.Pointer and raw-syscall surface of the rdma
 // proxy: forwarding the RDMA_VERBS_IOCTL to the host, reading from host FDs,
 // and mirroring app pages into the sentry's address space via mmap/mremap.
