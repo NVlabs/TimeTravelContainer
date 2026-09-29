@@ -2638,6 +2638,7 @@ func (b *runtimeBackend) publishRemainingVolatileOrigins() error {
 		}
 	}
 	sort.Slice(origins, func(i, j int) bool { return origins[i] < origins[j] })
+	settled := false
 	for _, origin := range origins {
 		if b.snapshotGraph != nil {
 			if _, ok := b.snapshotGraph.Snapshot(origin); ok {
@@ -2654,9 +2655,16 @@ func (b *runtimeBackend) publishRemainingVolatileOrigins() error {
 			continue
 		}
 		// Reconciliation inventories the same local stores while the daemon
-		// mutation lock is held. Reaching this point means the origin vanished
-		// after that pass without a corresponding authority transition.
-		return fmt.Errorf("volatile snapshot origin %d has no node-local memory or filesystem graph", origin)
+		// mutation lock is held, but leaves an origin whose lock, or lock
+		// stripe, another holds to a later pass: settle it now, waiting for
+		// the lock. The last check below is what decides.
+		if !settled {
+			b.distributedSource.awaitOriginAllocations()
+			settled = true
+		}
+		if err := b.settleStaleOrigin(b.nodeID, uint64(origin), true); err != nil {
+			return fmt.Errorf("settling remaining origin %d: %w", origin, err)
+		}
 	}
 	state, err = b.distributedSource.authority.AuthorityState()
 	if err != nil {

@@ -14288,12 +14288,24 @@ const staleOriginWorkers = 8
 // this node the provider of, and neither its memory graph nor a repository
 // holds, unless that is no longer so.
 func (b *runtimeBackend) abandonStaleOrigin(node string, encoded uint64) error {
+	return b.settleStaleOrigin(node, encoded, false)
+}
+
+// settleStaleOrigin abandons encoded, a volatile origin of node that its
+// stores do not hold, unless it turns out live or another's. Without wait,
+// one whose lock is held, being published or handed off, or sharing its lock
+// stripe with one that is, is left to a later reconciliation; with wait, it
+// waits for the lock.
+func (b *runtimeBackend) settleStaleOrigin(node string, encoded uint64, wait bool) error {
 	origin := ttcsnapshot.SnapshotID(encoded)
-	// One whose lock is held is being published or handed off; a later
-	// reconciliation takes it up if it is still stale.
-	unlockOrigin, locked := b.distributedSource.tryLockSnapshotOrigin(origin)
-	if !locked {
-		return nil
+	var unlockOrigin func()
+	if wait {
+		unlockOrigin = b.distributedSource.lockSnapshotOrigin(origin)
+	} else {
+		var locked bool
+		if unlockOrigin, locked = b.distributedSource.tryLockSnapshotOrigin(origin); !locked {
+			return nil
+		}
 	}
 	defer unlockOrigin()
 	// The inventory is only a candidate list. A concurrent publisher or
