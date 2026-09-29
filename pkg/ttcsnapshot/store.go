@@ -1062,7 +1062,10 @@ func shareGraphState(state *graphState) graphState {
 	return next
 }
 
-// cacheStateLocked records the store's state in graphStates.
+// cacheStateLocked records the store's state in graphStates. Close calls it,
+// and a closed store changes its state no more: its maps are cached as they
+// are, and whoever takes them copies them. Copying them here as well took
+// 0.3 s for a graph of 300,000 objects.
 func (s *Store) cacheStateLocked() {
 	if s.poisoned != nil || s.journal == nil || s.dirFD == nil {
 		return
@@ -1082,7 +1085,7 @@ func (s *Store) cacheStateLocked() {
 	journal.size, journal.mtime = 0, 0
 	graphStates.put(directory, &cachedGraphState{
 		generation: s.generation, checkpoint: checkpoint, journal: journal, checkpointBytes: s.checkpointBytes,
-		checkpointObjects: s.checkpointObjects, journalEnd: s.journalEnd, state: shareGraphState(&s.state),
+		checkpointObjects: s.checkpointObjects, journalEnd: s.journalEnd, state: s.state,
 	})
 }
 
