@@ -3089,11 +3089,17 @@ func samePortBinding(a, b PortBinding) bool {
 
 // LoadContainer resolves an exact name, full ID, or unambiguous ID prefix.
 func (s Store) LoadContainer(identifier string) (ContainerInfo, error) {
+	return s.loadContainer(identifier, false)
+}
+
+// loadContainer is LoadContainer, which, if hidden is set, also returns the
+// hidden target whose ID is identifier.
+func (s Store) loadContainer(identifier string, hidden bool) (ContainerInfo, error) {
 	if err := validateName(identifier); err != nil {
 		return ContainerInfo{}, err
 	}
 	if info, err := s.loadContainerKey(identifier); err == nil {
-		if !info.DistributedForkHidden {
+		if hidden || !info.DistributedForkHidden {
 			return info, nil
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -3159,7 +3165,7 @@ func (s Store) loadRuntimeContainer(identifier string) (ContainerInfo, error) {
 // visible before another client's directory cache sees the corresponding
 // shared family record.
 func (s Store) LoadRuntimeContainer(identifier string) (ContainerInfo, error) {
-	info, err := s.LoadContainer(identifier)
+	info, err := s.loadContainer(identifier, true)
 	if err == nil {
 		return info, nil
 	}
