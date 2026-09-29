@@ -3775,6 +3775,10 @@ func (s Store) listContainersWithPolicy(includeHidden, includePhysical, tolerate
 				// run, and a strict listing must not fail for it.
 				continue
 			}
+			// Published since it was read, with its marker gone.
+			info, err = s.loadContainerKey(entry.Name())
+		}
+		if err != nil {
 			if tolerateUnreadable {
 				key := filepath.Join(containersDir, entry.Name())
 				if _, loaded := warnedUnreadableContainers.LoadOrStore(key, struct{}{}); !loaded {
@@ -5656,7 +5660,12 @@ func (s Store) ContainersWithActiveState() ([]ContainerInfo, error) {
 			if sharedPathGone(containerDir) {
 				continue
 			}
-			return nil, err
+			// Published since it was read: a record is published whole,
+			// by renaming its directory into place, or by removing its
+			// marker once it is complete.
+			if info, err = s.loadContainerKey(entry.Name()); err != nil {
+				return nil, err
+			}
 		}
 		containers = append(containers, info)
 	}
