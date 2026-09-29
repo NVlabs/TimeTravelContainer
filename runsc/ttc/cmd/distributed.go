@@ -465,6 +465,39 @@ func (r *distributedSourceRuntime) tryLockSnapshotOrigin(origin ttcsnapshot.Snap
 	return lock.Unlock, true
 }
 
+// tryLockSnapshotOrigins is tryLockSnapshotOrigin of each of origins: it
+// returns, in order, the origins whose locks it took, and what releases them.
+// Origins share locks, and it takes each once.
+func (r *distributedSourceRuntime) tryLockSnapshotOrigins(origins []uint64) ([]uint64, func()) {
+	if r == nil {
+		return origins, func() {}
+	}
+	taken := make(map[*sync.Mutex]bool)
+	var locked []uint64
+	for _, encoded := range origins {
+		if encoded == 0 {
+			locked = append(locked, encoded)
+			continue
+		}
+		lock := &r.originLocks[encoded%uint64(len(r.originLocks))]
+		held, tried := taken[lock]
+		if !tried {
+			held = lock.TryLock()
+			taken[lock] = held
+		}
+		if held {
+			locked = append(locked, encoded)
+		}
+	}
+	return locked, func() {
+		for lock, held := range taken {
+			if held {
+				lock.Unlock()
+			}
+		}
+	}
+}
+
 func (r *distributedSourceRuntime) lockSourceFamily(family string) func() {
 	if r == nil {
 		return func() {}

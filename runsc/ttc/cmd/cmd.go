@@ -14276,28 +14276,51 @@ func (b *runtimeBackend) reconcileVolatileSnapshotOrigins() (int, error) {
 		}
 	}
 	sort.Slice(stale, func(i, j int) bool { return stale[i] < stale[j] })
-	if len(stale) != 0 {
-		// An origin a capture allocated before the inventory, and has yet
-		// to adopt, is building by the time this returns.
-		b.distributedSource.awaitOriginAllocations()
+	if len(stale) == 0 {
+		return abandoned, nil
 	}
-	// The stale origins are independent, and each costs rechecks and an authority
-	// proposal: several go at once, and the authority commits theirs together.
+	// An origin a capture allocated before the inventory, and has yet to
+	// adopt, is building by the time this returns.
+	b.distributedSource.awaitOriginAllocations()
+	// The inventory is only a candidate list: a concurrent publisher or
+	// branch mutation may have made an origin live before its lock was
+	// taken. Take the stale origins' locks, passing over those held, and
+	// look at the repositories again once, with every lock held, rather than
+	// once for each origin.
+	locked, unlockOrigins := b.distributedSource.tryLockSnapshotOrigins(stale)
+	defer unlockOrigins()
+	if len(locked) != 0 {
+		if filesystem, err = b.containerStore().FilesystemSnapshotOrigins(); err != nil {
+			return 0, fmt.Errorf("rechecking orphan snapshot origins: %w", err)
+		}
+	}
+	var orphans []uint64
+	for _, encoded := range locked {
+		live, err := b.lockedOriginLive(ttcsnapshot.SnapshotID(encoded), filesystem)
+		if err != nil {
+			return 0, fmt.Errorf("rechecking orphan snapshot origin %d: %w", encoded, err)
+		}
+		if !live {
+			orphans = append(orphans, encoded)
+		}
+	}
+	// The orphans are independent, and each costs an authority proposal:
+	// several go at once, and the authority commits theirs together.
 	work := make(chan uint64)
-	errs := make([]error, min(len(stale), staleOriginWorkers))
+	errs := make([]error, min(len(orphans), staleOriginWorkers))
 	var workers sync.WaitGroup
 	for worker := range errs {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
 			for encoded := range work {
-				if err := b.abandonStaleOrigin(node, encoded); err != nil && errs[worker] == nil {
+				if err := b.abandonLockedOrigin(node, encoded); err != nil && errs[worker] == nil {
 					errs[worker] = err
 				}
 			}
 		}()
 	}
-	for _, encoded := range stale {
+	for _, encoded := range orphans {
 		work <- encoded
 	}
 	close(work)
@@ -14339,21 +14362,41 @@ func (b *runtimeBackend) settleStaleOrigin(node string, encoded uint64, wait boo
 	// The inventory is only a candidate list. A concurrent publisher or
 	// branch mutation may have made the origin live before this origin fence
 	// was acquired, so repeat both data-plane and authority observations.
-	if b.distributedSource.buildingOrigin(origin) {
+	live, err := b.lockedOriginLive(origin, nil)
+	if err != nil {
+		return fmt.Errorf("rechecking orphan snapshot origin %d: %w", origin, err)
+	}
+	if live {
 		return nil
+	}
+	return b.abandonLockedOrigin(node, encoded)
+}
+
+// lockedOriginLive reports whether this node's stores hold origin, whose
+// lock the caller holds: a capture building it, the memory graph, or a
+// repository, which filesystem lists if it is not nil, as it was inventoried
+// with the lock held.
+func (b *runtimeBackend) lockedOriginLive(origin ttcsnapshot.SnapshotID, filesystem map[ttcsnapshot.SnapshotID]struct{}) (bool, error) {
+	if b.distributedSource.buildingOrigin(origin) {
+		return true, nil
 	}
 	if b.snapshotGraph != nil {
 		if _, ok := b.snapshotGraph.Snapshot(origin); ok {
-			return nil
+			return true, nil
 		}
 	}
-	filesystemLive, liveErr := b.containerStore().WithFilesystemSnapshotOrigin(origin, func(*ttcvolume.Repository) error { return nil })
-	if liveErr != nil {
-		return fmt.Errorf("rechecking orphan snapshot origin %d: %w", origin, liveErr)
+	if filesystem != nil {
+		_, ok := filesystem[origin]
+		return ok, nil
 	}
-	if filesystemLive {
-		return nil
-	}
+	return b.containerStore().WithFilesystemSnapshotOrigin(origin, func(*ttcvolume.Repository) error { return nil })
+}
+
+// abandonLockedOrigin abandons encoded, a volatile origin of node whose lock
+// the caller holds and that its stores do not hold, unless the authority no
+// longer names node its provider.
+func (b *runtimeBackend) abandonLockedOrigin(node string, encoded uint64) error {
+	origin := ttcsnapshot.SnapshotID(encoded)
 	provider, volatile, providerErr := b.distributedSource.authority.SnapshotProvider(encoded)
 	if errors.Is(providerErr, os.ErrNotExist) || (!volatile && providerErr == nil) {
 		return nil

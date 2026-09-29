@@ -7839,6 +7839,32 @@ func TestOriginCleanupPassesOverALockedOrigin(t *testing.T) {
 	}
 }
 
+// The origin reconciliation takes the locks of all the stale origins it
+// found before it looks at the repositories again: origins that share a lock
+// are all taken with it, once, and those whose lock is held are passed over.
+func TestTryLockSnapshotOrigins(t *testing.T) {
+	source := &distributedSourceRuntime{}
+	stripes := uint64(len(source.originLocks))
+	releaseBusy := source.lockSnapshotOrigin(ttcsnapshot.SnapshotID(3))
+	locked, unlock := source.tryLockSnapshotOrigins([]uint64{1, 1 + stripes, 3, 2})
+	if want := []uint64{1, 1 + stripes, 2}; !slices.Equal(locked, want) {
+		t.Fatalf("tryLockSnapshotOrigins locked %v, want %v", locked, want)
+	}
+	if release, ok := source.tryLockSnapshotOrigin(ttcsnapshot.SnapshotID(1)); ok {
+		release()
+		t.Fatal("an origin's lock was free while the reconciliation held it")
+	}
+	unlock()
+	releaseBusy()
+	for _, origin := range []uint64{1, 2, 3} {
+		release, ok := source.tryLockSnapshotOrigin(ttcsnapshot.SnapshotID(origin))
+		if !ok {
+			t.Fatalf("origin %d's lock is still held", origin)
+		}
+		release()
+	}
+}
+
 func TestDistributedGraphHandoffRequiresLiveRuntime(t *testing.T) {
 	for _, test := range []struct {
 		name   string
