@@ -2991,13 +2991,21 @@ func TestGraphReopenFromCachedState(t *testing.T) {
 	}
 	closeGraph(graph)
 
-	// A second handle appends while it is open; a third opens from the cached
-	// state and replays what the second appended.
+	// A first handle takes the cached state; a second, opened meanwhile,
+	// loads the graph afresh and appends. The first caches its state as it
+	// closes, and a third takes that and replays what the second appended.
+	first, err := OpenExternallyCoordinated(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	second := open()
 	if _, err := second.CreateObject(origin, "build/second", ObjectKindFile, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := second.EndExternalTransaction(); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
 		t.Fatal(err)
 	}
 	// Read without a transaction, whose start would replay the journal too.
@@ -3110,5 +3118,80 @@ func TestValidateGraphStateReferences(t *testing.T) {
 		if err := validateGraphState(&state); err == nil {
 			t.Errorf("%s: the graph was taken", name)
 		}
+	}
+}
+
+// A graph opened while another handle holds its cached state loads afresh;
+// the state is cached again when that handle closes.
+func TestGraphStateCacheIsTakenWhileOpen(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "graph")
+	graph, err := OpenExternallyCoordinated(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.BeginExternalTransaction(); err != nil {
+		t.Fatal(err)
+	}
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := graph.CreateObject(origin, "build/one", ObjectKindFile, []byte{1}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.CheckpointExternallyCoordinated(); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.EndExternalTransaction(); err != nil {
+		t.Fatal(err)
+	}
+	want := graph.Inspect()
+	if err := graph.Close(); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := OpenExternallyCoordinated(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Damage the checkpoint's bytes, keeping its identity: only an open
+	// from the cached state succeeds now.
+	head, err := os.ReadFile(filepath.Join(dir, headFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var current graphHead
+	if err := json.Unmarshal(head, &current); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := filepath.Join(dir, graphCheckpointName(current.Generation))
+	info, err := os.Stat(checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(checkpoint, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt([]byte("#"), 0); err != nil {
+		t.Fatal(err)
+	}
+	file.Close()
+	if err := os.Chtimes(checkpoint, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if meanwhile, err := OpenExternallyCoordinated(dir); err == nil {
+		meanwhile.Close()
+		t.Fatal("an open while the cached state was held did not load the damaged checkpoint")
+	}
+	if err := holder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := OpenExternallyCoordinated(dir)
+	if err != nil {
+		t.Fatalf("an open after the holder closed did not take its state: %v", err)
+	}
+	defer after.Close()
+	if got := after.Inspect(); !reflect.DeepEqual(got, want) {
+		t.Fatal("the state taken again differs from the graph")
 	}
 }

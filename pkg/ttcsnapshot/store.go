@@ -1013,15 +1013,20 @@ type graphStateCache struct {
 	uses    uint64
 }
 
-func (c *graphStateCache) get(directory graphFileIdentity, generation uint64, checkpoint graphFileIdentity) (*cachedGraphState, bool) {
+// take returns the state cached of directory, if it is of generation and
+// checkpoint, and forgets it: its taker changes it in place, and caches it
+// again when it closes. Takers copied it, which took 0.5-0.8 s for a graph of
+// 300,000 objects at each opening of a repository; one that opens it while
+// another holds its state loads it afresh instead.
+func (c *graphStateCache) take(directory graphFileIdentity, generation uint64, checkpoint graphFileIdentity) (*cachedGraphState, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry, ok := c.entries[directory]
 	if !ok || entry.generation != generation || entry.checkpoint != checkpoint {
 		return nil, false
 	}
-	c.uses++
-	entry.used = c.uses
+	delete(c.entries, directory)
+	c.objects -= len(entry.state.Objects)
 	return entry, true
 }
 
@@ -1050,40 +1055,6 @@ func (c *graphStateCache) put(directory graphFileIdentity, entry *cachedGraphSta
 		c.objects -= len(oldestEntry.state.Objects)
 		delete(c.entries, oldest)
 	}
-}
-
-// shareGraphState returns a copy of state with maps of its own. Its objects
-// share their data and edges with state's, which no transaction writes in
-// place; its handoffs, whose mutations are appended to, are copied whole.
-func shareGraphState(state *graphState) graphState {
-	next := graphState{
-		Version: state.Version, Sequence: state.Sequence, NextSnapshot: state.NextSnapshot,
-		Snapshots: make(map[string]Snapshot, len(state.Snapshots)),
-		Objects:   make(map[string]Object, len(state.Objects)),
-		Roots:     make(map[string]ObjectID, len(state.Roots)),
-		Pins:      make(map[string]ObjectID, len(state.Pins)),
-		Frozen:    make(map[string]bool, len(state.Frozen)),
-		Handoffs:  make(map[string]SnapshotLedgerHandoff, len(state.Handoffs)),
-	}
-	for key, value := range state.Snapshots {
-		next.Snapshots[key] = value
-	}
-	for key, value := range state.Objects {
-		next.Objects[key] = value
-	}
-	for key, value := range state.Roots {
-		next.Roots[key] = value
-	}
-	for key, value := range state.Pins {
-		next.Pins[key] = value
-	}
-	for key, value := range state.Frozen {
-		next.Frozen[key] = value
-	}
-	for key, value := range state.Handoffs {
-		next.Handoffs[key] = cloneSnapshotLedgerHandoff(value)
-	}
-	return next
 }
 
 // cacheStateLocked records the store's state in graphStates. Close calls it,
@@ -1125,12 +1096,13 @@ func (s *Store) loadCachedGeneration(head graphHead, repairTail bool) (bool, err
 	if err != nil {
 		return false, nil
 	}
-	cached, ok := graphStates.get(directory, head.Generation, checkpoint)
+	cached, ok := graphStates.take(directory, head.Generation, checkpoint)
 	if !ok {
 		return false, nil
 	}
 	journal, err := s.openFile(graphJournalName(head.Generation), unix.O_RDWR, 0600)
 	if err != nil {
+		graphStates.put(directory, cached)
 		return false, nil
 	}
 	header := make([]byte, len(journalHeader))
@@ -1139,6 +1111,7 @@ func (s *Store) loadCachedGeneration(head graphHead, repairTail bool) (bool, err
 	if _, readErr := journal.ReadAt(header, 0); readErr != nil || statErr != nil || string(header) != journalHeader ||
 		uint64(stat.Dev) != cached.journal.dev || stat.Ino != cached.journal.ino || stat.Size < cached.journalEnd {
 		journal.Close()
+		graphStates.put(directory, cached)
 		return false, nil
 	}
 	previous := s.journal
@@ -1146,7 +1119,9 @@ func (s *Store) loadCachedGeneration(head graphHead, repairTail bool) (bool, err
 	previousGeneration := s.generation
 	previousEnd := s.journalEnd
 	previousPoisoned := s.poisoned
-	s.state = shareGraphState(&cached.state)
+	// The state taken is this store's to change; if loading fails, what it
+	// may have changed of it is dropped with it.
+	s.state = cached.state
 	s.journal = journal
 	s.generation = head.Generation
 	s.journalEnd = cached.journalEnd
