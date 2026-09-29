@@ -2422,3 +2422,35 @@ func TestPlacementAwaitsActivation(t *testing.T) {
 		t.Error("a node without the authority's state left the placement alone")
 	}
 }
+
+// sentryRuns takes a process whose command line names the container's Sentry
+// of the runtime root for one, and no other.
+func TestSentryRunsChecksTheCommandLine(t *testing.T) {
+	sentry := exec.Command("/bin/sh", "-c", "sleep 30", "--root=/runtime", "container-a")
+	sentry.Args[0] = "ttc-sentry[a]"
+	if err := sentry.Start(); err != nil {
+		t.Skipf("starting a stand-in Sentry: %v", err)
+	}
+	defer func() {
+		_ = sentry.Process.Kill()
+		_ = sentry.Wait()
+	}()
+	pid := sentry.Process.Pid
+	// The shell's command line is in place once it runs its script.
+	deadline := time.Now().Add(5 * time.Second)
+	for !sentryRuns(pid, "container-a", "/runtime") {
+		if time.Now().After(deadline) {
+			t.Fatal("the stand-in Sentry was not found")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if sentryRuns(pid, "container-b", "/runtime") {
+		t.Fatal("the Sentry of container-a was taken for container-b's")
+	}
+	if sentryRuns(pid, "container-a", "/other-runtime") {
+		t.Fatal("the Sentry of one runtime root was taken for another's")
+	}
+	if sentryRuns(os.Getpid(), "container-a", "/runtime") {
+		t.Fatal("a process that is no Sentry was taken for one")
+	}
+}

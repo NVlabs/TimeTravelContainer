@@ -10489,13 +10489,9 @@ func (b *runtimeBackend) reclaimRemovedFamilyLocal(familyID string, physicalIDs 
 	if len(records) != 0 {
 		return fmt.Errorf("family %q still has placement for branch %q", familyID, records[0].BranchID)
 	}
-	runtimes, err := b.listRuntimeSandboxes()
+	live, err := b.runtimeSandboxIDs()
 	if err != nil {
 		return fmt.Errorf("listing runtimes before local family cleanup: %w", err)
-	}
-	live := make(map[string]struct{}, len(runtimes))
-	for _, runtime := range runtimes {
-		live[runtime.ID] = struct{}{}
 	}
 	seen := make(map[string]struct{}, len(physicalIDs))
 	for _, physicalID := range physicalIDs {
@@ -10526,18 +10522,14 @@ func (b *runtimeBackend) reclaimRemovedFamilyLocal(familyID string, physicalIDs 
 // family metadata and branch filesystems are intentionally untouched; elastic
 // migration and family-removal coordinators use this after ownership moved.
 func (b *runtimeBackend) purgeRuntime(containerID string) error {
-	sandboxes, err := b.listRuntimeSandboxes()
+	sandboxes, err := b.runtimeSandboxIDs()
 	if err != nil {
 		return fmt.Errorf("listing runtimes before purging %q: %w", containerID, err)
 	}
-	for _, sandbox := range sandboxes {
-		if sandbox.ID != containerID {
-			continue
-		}
+	if _, ok := sandboxes[containerID]; ok {
 		if _, err := b.command("delete", "--force", containerID); err != nil {
 			return fmt.Errorf("purging physical runtime %q: %w", containerID, err)
 		}
-		break
 	}
 	return nil
 }

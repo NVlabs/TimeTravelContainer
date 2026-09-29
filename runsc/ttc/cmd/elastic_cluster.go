@@ -33,6 +33,7 @@ import (
 	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/processutil"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
@@ -1387,42 +1388,145 @@ func placementHasProcessFreePublication(state *cluster.AuthorityState, placement
 	return false
 }
 
+// runtimeSandboxIDs returns the IDs of the sandboxes runsc keeps state for.
+// It reads them from runsc's directory, and asks no Sentry: loading each
+// sandbox, as runsc list does, asks its Sentry whether it runs, which one
+// restoring a branch answers once it is done.
+func (b *runtimeBackend) runtimeSandboxIDs() (map[string]struct{}, error) {
+	ids := make(map[string]struct{})
+	if !embeddedRuntime(b.runsc) {
+		sandboxes, err := b.listRuntimeSandboxes()
+		if err != nil {
+			return nil, err
+		}
+		for _, sandbox := range sandboxes {
+			ids[sandbox.ID] = struct{}{}
+		}
+		return ids, nil
+	}
+	sandboxes, err := container.ListSandboxes(b.root)
+	if err != nil {
+		return nil, fmt.Errorf("listing sandboxes: %w", err)
+	}
+	for _, id := range sandboxes {
+		ids[id.SandboxID] = struct{}{}
+	}
+	return ids, nil
+}
+
 // liveRuntimeSandboxes returns physical runsc container IDs whose Sentry host
 // process still exists. It intentionally does not contact the Sentry: a
 // correctly lease-fenced Sentry may be SIGSTOPped until placement recovery is
 // complete, but its PID remains valid execution state.
 func (b *runtimeBackend) liveRuntimeSandboxes() (map[string]struct{}, error) {
-	output, err := b.command("list", "--format=json", "--sandbox")
-	if err != nil {
-		return nil, err
-	}
-	var states []struct {
-		ID  string `json:"id"`
-		PID int    `json:"pid"`
-	}
-	if err := json.Unmarshal(output, &states); err != nil {
-		return nil, fmt.Errorf("decoding runsc sandbox list: %w", err)
-	}
-	processes, err := sentryProcessesForRuntimeRoot(b.root)
-	if err != nil {
-		return nil, fmt.Errorf("discovering Sentry processes: %w", err)
-	}
-	physicalPIDs := make(map[string]int, len(processes))
-	for _, process := range processes {
-		if process.ContainerID != "" {
-			physicalPIDs[process.ContainerID] = process.PID
+	result := make(map[string]struct{})
+	if !embeddedRuntime(b.runsc) {
+		output, err := b.command("list", "--format=json", "--sandbox")
+		if err != nil {
+			return nil, err
 		}
+		var states []struct {
+			ID  string `json:"id"`
+			PID int    `json:"pid"`
+		}
+		if err := json.Unmarshal(output, &states); err != nil {
+			return nil, fmt.Errorf("decoding runsc sandbox list: %w", err)
+		}
+		processes, err := sentryProcessesForRuntimeRoot(b.root)
+		if err != nil {
+			return nil, fmt.Errorf("discovering Sentry processes: %w", err)
+		}
+		physicalPIDs := make(map[string]int, len(processes))
+		for _, process := range processes {
+			if process.ContainerID != "" {
+				physicalPIDs[process.ContainerID] = process.PID
+			}
+		}
+		for _, state := range states {
+			// Match both the state-directory PID and the live ttc-sentry
+			// command line. kill(pid, 0) alone is insufficient because Linux
+			// may have reused a dead Sentry's PID for an unrelated process.
+			if state.ID != "" && state.PID > 0 && physicalPIDs[state.ID] == state.PID {
+				result[state.ID] = struct{}{}
+			}
+		}
+		return result, nil
 	}
-	result := make(map[string]struct{}, len(states))
-	for _, state := range states {
-		// Match both the state-directory PID and the live ttc-sentry command
-		// line. kill(pid, 0) alone is insufficient because Linux may have
-		// reused a dead Sentry's PID for an unrelated process.
-		if state.ID != "" && state.PID > 0 && physicalPIDs[state.ID] == state.PID {
+	ids, err := container.ListSandboxes(b.root)
+	if err != nil {
+		return nil, fmt.Errorf("listing sandboxes: %w", err)
+	}
+	for _, id := range ids {
+		// Only the state file is read: loading a sandbox otherwise asks its
+		// Sentry whether it runs, which a Sentry restoring a branch answers
+		// once it is done, and a fenced one not at all.
+		c, err := container.Load(b.root, id, container.LoadOpts{Exact: true, SkipCheck: true, TryLock: container.TryAcquire})
+		if errors.Is(err, container.ErrStateFileLocked) {
+			// A runtime command holds the sandbox, as one creating it does:
+			// the sandbox is there, and its family busy.
+			result[id.SandboxID] = struct{}{}
+			continue
+		}
+		if err != nil {
+			// Like runsc list, pass over one that cannot be loaded, as one
+			// being deleted.
+			continue
+		}
+		state := c.State()
+		if state.ID != "" && state.Pid > 0 && sentryRuns(state.Pid, state.ID, b.root) {
 			result[state.ID] = struct{}{}
 		}
 	}
 	return result, nil
+}
+
+// sentryIdentity is a process that its command line named the Sentry of a
+// container of a runtime root, and when it started.
+type sentryIdentity struct {
+	container, runtimeRoot string
+	start                  string
+}
+
+// verifiedSentries has the Sentries sentryRuns found, by PID.
+var verifiedSentries sync.Map
+
+// sentryArgumentsWait is how long sentryRuns waits for a process's command
+// line.
+const sentryArgumentsWait = 100 * time.Millisecond
+
+// sentryRuns reports whether pid is the Sentry of container, of the runtime
+// root: kill(pid, 0) alone is insufficient because Linux may have reused a
+// dead Sentry's PID for an unrelated process. Its command line says whose
+// Sentry it is, and the process's start time, which a reused PID changes,
+// that it is still the one that said so. Reading a command line waits while
+// the process maps memory, as a Sentry restoring a branch does for as long as
+// that takes: one that does not answer in sentryArgumentsWait is taken for a
+// Sentry that runs, and the read goes on to verify it.
+func sentryRuns(pid int, container, runtimeRoot string) bool {
+	start, err := processStartTime(pid)
+	if err != nil {
+		return false
+	}
+	identity := sentryIdentity{container: container, runtimeRoot: runtimeRoot, start: start}
+	if known, ok := verifiedSentries.Load(pid); ok && known == identity {
+		return true
+	}
+	verified := make(chan bool, 1)
+	go func() {
+		arguments, err := processutil.Arguments(pid)
+		ok := err == nil && len(arguments) != 0 && strings.HasPrefix(filepath.Base(arguments[0]), "ttc-sentry[") &&
+			arguments[len(arguments)-1] == container && processUsesRuntimeRoot(arguments, runtimeRoot)
+		if ok {
+			verifiedSentries.Store(pid, identity)
+		}
+		verified <- ok
+	}()
+	select {
+	case ok := <-verified:
+		return ok
+	case <-time.After(sentryArgumentsWait):
+		return true
+	}
 }
 
 // retireTransactionsForRemovedPlacement bounds the authority's history after the target
@@ -3775,14 +3879,11 @@ func (b *runtimeBackend) removeUnrecordedMigratedSourceRuntime(containerID, bran
 	// reached independence, so metadata absence (or metadata containing only
 	// process-free/remote branches) makes this exact physical runtime disposable.
 	if info == nil || !persistentFamilyRequiredRuntime(*info, b.nodeID) {
-		sandboxes, err := b.listRuntimeSandboxes()
+		sandboxes, err := b.runtimeSandboxIDs()
 		if err != nil {
 			return fmt.Errorf("listing unrecorded migrated source %s@%s: %w", containerID, branchID, err)
 		}
-		for _, sandbox := range sandboxes {
-			if sandbox.ID != containerID {
-				continue
-			}
+		if _, ok := sandboxes[containerID]; ok {
 			if err := b.removeOrphanRuntime(containerID); err != nil {
 				return fmt.Errorf("removing unrecorded migrated source %s@%s: %w", containerID, branchID, err)
 			}
@@ -4309,13 +4410,9 @@ func (b *runtimeBackend) reclaimOrphanLocalContainerDirs(state *cluster.Authorit
 	if err != nil {
 		return err
 	}
-	live, err := b.listRuntimeSandboxes()
+	liveIDs, err := b.runtimeSandboxIDs()
 	if err != nil {
 		return err
-	}
-	liveIDs := make(map[string]struct{}, len(live))
-	for _, runtime := range live {
-		liveIDs[runtime.ID] = struct{}{}
 	}
 	var publicationIntents []ttcstorage.Intent
 	if b.publicationQueue != nil {
@@ -4402,18 +4499,18 @@ func (b *runtimeBackend) dropSupersededCaptures(state *cluster.AuthorityState) e
 	if len(elsewhere) == 0 {
 		return nil
 	}
-	// Ask only the runtimes that may keep such a capture: runsc's own list
-	// costs no Sentry a request.
-	sandboxes, err := b.listRuntimeSandboxes()
+	// Ask only the runtimes that may keep such a capture.
+	sandboxes, err := b.runtimeSandboxIDs()
 	if err != nil {
 		return err
 	}
 	var ids []string
-	for _, sandbox := range sandboxes {
-		if elsewhere[sandbox.ID] != nil {
-			ids = append(ids, sandbox.ID)
+	for id := range sandboxes {
+		if elsewhere[id] != nil {
+			ids = append(ids, id)
 		}
 	}
+	sort.Strings(ids)
 	if len(ids) == 0 {
 		return nil
 	}
