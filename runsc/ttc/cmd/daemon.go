@@ -7506,7 +7506,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		}
 		s.configureFamilyLocks(mutationBackend)
 		status := runCommand(request.Args, mutationBackend.stdout, mutationBackend.stderr, mutationBackend)
-		s.recordCommandEvents(opts.dataRoot, request.Args, status)
+		s.recordCommandEvents(opts.dataRoot, request.Args, status, mutationBackend.resolvedFamilies)
 		if status == 0 {
 			// Publication runs outside the lifecycle lock. It may unplace a
 			// dehydration after the pre-command claim but before rehydrate
@@ -7557,7 +7557,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	} else {
 		status = runCommand(request.Args, backend.stdout, backend.stderr, backend)
 	}
-	s.recordCommandEvents(opts.dataRoot, request.Args, status)
+	s.recordCommandEvents(opts.dataRoot, request.Args, status, backend.resolvedFamilies)
 	if status == 0 {
 		if err := s.claimUnplacedLifecycleTargets(backend, request.Args); err != nil {
 			fmt.Fprintf(backend.stderr, "ttcd: claiming completed rehydration placement: %v\n", err)

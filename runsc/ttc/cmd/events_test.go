@@ -73,7 +73,7 @@ func TestDaemonEventIncludesOutputRetentionSnapshot(t *testing.T) {
 	}
 	server := &daemonServer{}
 	event := DaemonEvent{Type: "container", Action: "logs", Subject: "demo@main"}
-	server.enrichConsoleRetentionEvent(root, &event)
+	server.enrichConsoleRetentionEvent(root, &event, nil)
 	if event.Attributes["output_evicted_bytes"] != "99" || event.Attributes["output_evicted_generations"] != "3" {
 		t.Fatalf("retention event attributes=%v", event.Attributes)
 	}
@@ -85,9 +85,35 @@ func TestDaemonEventIncludesOutputRetentionSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	execEvent := DaemonEvent{Type: "exec", Action: "exit", Subject: "demo@main:job"}
-	server.enrichConsoleRetentionEvent(root, &execEvent)
+	server.enrichConsoleRetentionEvent(root, &execEvent, nil)
 	if execEvent.Attributes["output_evicted_bytes"] != "17" || execEvent.Attributes["output_evicted_generations"] != "1" {
 		t.Fatalf("exec retention event attributes=%v", execEvent.Attributes)
+	}
+}
+
+// A cluster node keeps its branches' consoles in its own root, and a command
+// resolved its container before its event is recorded: the event reads the
+// console's retention there, and neither reads the record again nor makes
+// anything in the shared root.
+func TestDaemonEventRetentionSnapshotOnClusterNode(t *testing.T) {
+	shared, local := t.TempDir(), t.TempDir()
+	paths := (ttcbundle.Store{Root: shared, ActiveRoot: local}).BranchConsolePathsOf("demo-id", "main")
+	if err := os.MkdirAll(paths.FamilyDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.RetentionStats, []byte(`{"evicted_bytes":5,"evicted_generations":2}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	resolved := &familySet{}
+	resolved.resolved("demo", ttcbundle.ContainerInfo{ID: "demo-id", Name: "demo"})
+	server := &daemonServer{localRoot: local}
+	event := DaemonEvent{Type: "container", Action: "pause", Subject: "demo@main"}
+	server.enrichConsoleRetentionEvent(shared, &event, resolved)
+	if event.Attributes["output_evicted_bytes"] != "5" || event.Attributes["output_evicted_generations"] != "2" {
+		t.Fatalf("retention event attributes=%v", event.Attributes)
+	}
+	if entries, err := os.ReadDir(shared); err != nil || len(entries) != 0 {
+		t.Fatalf("the shared root holds %v (%v), want nothing", entries, err)
 	}
 }
 

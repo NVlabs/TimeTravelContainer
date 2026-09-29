@@ -6727,20 +6727,22 @@ func (b *runtimeBackend) resolveContainer(identifier string) (ttcbundle.Containe
 			// waiting for metadata that is intentionally gone.
 			info, err = loadDistributedFamilyIdentity(store, placements, identifier)
 			if err == nil {
-				b.resolvedFamilies.add(logicalFamilyID(info))
+				b.resolvedFamilies.resolved(identifier, info)
 			}
 			return info, err
 		}
 		return ttcbundle.ContainerInfo{}, err
 	}
-	b.resolvedFamilies.add(logicalFamilyID(info))
+	b.resolvedFamilies.resolved(identifier, info)
 	return info, nil
 }
 
-// familySet is a set of family IDs, to which a request's goroutines may add.
+// familySet is a set of family IDs, to which a request's goroutines may add,
+// with the ID of the container each name the request resolved named.
 type familySet struct {
-	mu  sync.Mutex
-	ids []string
+	mu    sync.Mutex
+	ids   []string
+	names map[string]string
 }
 
 // add adds id to s, if s is not nil.
@@ -6753,6 +6755,32 @@ func (s *familySet) add(id string) {
 	if !slices.Contains(s.ids, id) {
 		s.ids = append(s.ids, id)
 	}
+}
+
+// resolved adds to s the family of info, which identifier named.
+func (s *familySet) resolved(identifier string, info ttcbundle.ContainerInfo) {
+	if s == nil {
+		return
+	}
+	s.add(logicalFamilyID(info))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.names == nil {
+		s.names = make(map[string]string)
+	}
+	s.names[identifier] = info.ID
+}
+
+// containerOf returns the ID of the container identifier named when the
+// request resolved it.
+func (s *familySet) containerOf(identifier string) (string, bool) {
+	if s == nil {
+		return "", false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, ok := s.names[identifier]
+	return id, ok
 }
 
 // list returns the IDs in s.
@@ -7627,7 +7655,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 		return containerRunResult{}, errors.Join(err, finishFilesystemOrigins(false))
 	}
 	id := prepared.Container.ID
-	b.resolvedFamilies.add(id)
+	b.resolvedFamilies.resolved(prepared.Container.Name, prepared.Container)
 	target := selector{container: id, branch: defaultBranchID}
 	reservation, err := b.reserveNewContainerPlacement(prepared.Container)
 	if err != nil {

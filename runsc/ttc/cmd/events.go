@@ -106,17 +106,19 @@ func rotateDaemonEventLog(path string, incoming, maxBytes int64, files int) erro
 	return closeErr
 }
 
-func (s *daemonServer) recordCommandEvents(dataRoot string, args []string, status int) {
+// recordCommandEvents records the events of a command, whose request
+// resolved the containers resolved names.
+func (s *daemonServer) recordCommandEvents(dataRoot string, args []string, status int, resolved *familySet) {
 	if dataRoot == "" {
 		return
 	}
 	for _, event := range commandEvents(args, status) {
-		s.enrichConsoleRetentionEvent(dataRoot, &event)
+		s.enrichConsoleRetentionEvent(dataRoot, &event, resolved)
 		s.recordEvent(dataRoot, event)
 	}
 }
 
-func (s *daemonServer) enrichConsoleRetentionEvent(dataRoot string, event *DaemonEvent) {
+func (s *daemonServer) enrichConsoleRetentionEvent(dataRoot string, event *DaemonEvent, resolved *familySet) {
 	if event.Subject == "" {
 		return
 	}
@@ -134,9 +136,17 @@ func (s *daemonServer) enrichConsoleRetentionEvent(dataRoot string, event *Daemo
 	if err != nil {
 		return
 	}
-	store := ttcbundle.Store{Root: dataRoot}
+	// A cluster node keeps its branches' consoles in its own root.
+	store := ttcbundle.Store{Root: dataRoot, ActiveRoot: s.localRoot}
 	var paths ttcbundle.ConsolePaths
-	if execID == "" {
+	if id, ok := resolved.containerOf(target.container); ok {
+		// The request read the record already.
+		if execID == "" {
+			paths = store.BranchConsolePathsOf(id, target.branch)
+		} else {
+			paths = store.ExecConsolePathsOf(id, target.branch, execID)
+		}
+	} else if execID == "" {
 		paths, err = store.BranchConsolePaths(target.container, target.branch)
 	} else {
 		paths, err = store.ExecConsolePaths(target.container, target.branch, execID)

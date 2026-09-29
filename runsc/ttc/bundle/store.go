@@ -6424,10 +6424,18 @@ func (s Store) BranchConsolePaths(container, branch string) (ConsolePaths, error
 	if err != nil {
 		return ConsolePaths{}, err
 	}
-	dir := filepath.Join(s.activeRoot(), "containers", info.ID, "console")
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	paths := s.BranchConsolePathsOf(info.ID, branch)
+	if err := os.MkdirAll(paths.FamilyDir, 0700); err != nil {
 		return ConsolePaths{}, fmt.Errorf("creating console state for %q: %w", container, err)
 	}
+	return paths, nil
+}
+
+// BranchConsolePathsOf is BranchConsolePaths of the container with the exact
+// ID id, for a caller that only reads what is there: it reads no record and
+// makes no directory.
+func (s Store) BranchConsolePathsOf(id, branch string) ConsolePaths {
+	dir := filepath.Join(s.activeRoot(), "containers", id, "console")
 	base := filepath.Join(dir, branch)
 	return ConsolePaths{
 		FamilyDir:      dir,
@@ -6438,7 +6446,7 @@ func (s Store) BranchConsolePaths(container, branch string) (ConsolePaths, error
 		WaitStatus:     base + ".wait-status",
 		RetentionStats: ttcconsole.RetentionStatsPath(base + ".log"),
 		PID:            base + ".pid",
-	}, nil
+	}
 }
 
 // ExecConsolePaths returns persistent console paths for one managed exec
@@ -6457,10 +6465,18 @@ func (s Store) ExecConsolePaths(container, branch, execID string) (ConsolePaths,
 	if err != nil {
 		return ConsolePaths{}, err
 	}
-	dir := filepath.Join(s.activeRoot(), "containers", info.ID, "console", "exec", branch)
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	paths := s.ExecConsolePathsOf(info.ID, branch, execID)
+	if err := os.MkdirAll(filepath.Dir(paths.Log), 0700); err != nil {
 		return ConsolePaths{}, fmt.Errorf("creating exec console state for %q: %w", container, err)
 	}
+	return paths, nil
+}
+
+// ExecConsolePathsOf is ExecConsolePaths of the container with the exact ID
+// id, for a caller that only reads what is there: it reads no record and
+// makes no directory.
+func (s Store) ExecConsolePathsOf(id, branch, execID string) ConsolePaths {
+	dir := filepath.Join(s.activeRoot(), "containers", id, "console", "exec", branch)
 	base := filepath.Join(dir, execID)
 	return ConsolePaths{
 		FamilyDir:      filepath.Dir(filepath.Dir(dir)),
@@ -6471,7 +6487,7 @@ func (s Store) ExecConsolePaths(container, branch, execID string) (ConsolePaths,
 		WaitStatus:     base + ".wait-status",
 		RetentionStats: ttcconsole.RetentionStatsPath(base + ".log"),
 		PID:            base + ".pid",
-	}, nil
+	}
 }
 
 // ListExecConsoleRetentionStats returns non-zero cumulative retention counters by exec ID.
