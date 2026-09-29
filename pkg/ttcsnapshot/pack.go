@@ -579,8 +579,8 @@ func (store *SharedPackStore) manifest(snapshot SnapshotID) (*SnapshotManifest, 
 	if closeErr != nil {
 		return nil, closeErr
 	}
-	var manifest SnapshotManifest
-	if err := json.Unmarshal(data, &manifest); err != nil {
+	manifest, err := decodeSharedManifest(data)
+	if err != nil {
 		return nil, fmt.Errorf("decoding shared snapshot manifest: %w", err)
 	}
 	if err := store.validateManifest(&manifest); err != nil {
