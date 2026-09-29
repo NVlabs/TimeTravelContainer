@@ -28,9 +28,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 )
@@ -310,6 +312,8 @@ type sharedReferenceService struct {
 	// collection instead, and each one by scanning all the ledger's objects,
 	// took 1.9 s of a 100,000-file family's removal.
 	compactionExamined map[ttcsnapshot.SnapshotID]uint64
+	// checkpointing is set while the ledger is checkpointed after a request.
+	checkpointing atomic.Bool
 }
 
 // unexaminedOrigin is the compactionExamined count of an origin that a new
@@ -1046,8 +1050,19 @@ func (s *sharedReferenceService) withLedger(fn func(*ttcsnapshot.ReferenceLedger
 	// while converging back to a tiny live graph. Bound restart time and local
 	// scratch growth by checkpointing the resulting state once the WAL reaches
 	// the same scale as other snapshot-graph journals.
-	if s.ledger.CheckpointDue(sharedReferenceLedgerCheckpointBytes) {
-		return s.ledger.Checkpoint()
+	//
+	// The request's changes are in the WAL already: the checkpoint is made
+	// after it returns, one at a time, and the ledger's next change waits for
+	// it. Made before, it took 1.3 s of a large snapshot's import. One that
+	// fails is due again at the next request.
+	if s.ledger.CheckpointDue(sharedReferenceLedgerCheckpointBytes) && s.checkpointing.CompareAndSwap(false, true) {
+		ledger := s.ledger
+		go func() {
+			defer s.checkpointing.Store(false)
+			if err := ledger.Checkpoint(); err != nil {
+				log.Warningf("ttcd: checkpointing the shared reference ledger: %v", err)
+			}
+		}()
 	}
 	return nil
 }
