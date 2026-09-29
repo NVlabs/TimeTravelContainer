@@ -62,28 +62,32 @@ func encodeGraphCheckpoint(state *graphState) ([]byte, error) {
 	out := make([]byte, 0, len(head)+len(tail)+len(state.Objects)*256)
 	out = append(out, head[:len(head)-1]...)
 	out = append(out, `,"Objects":`...)
-	if state.Objects == nil {
-		out = append(out, "null"...)
-	} else {
-		keys := make([]string, 0, len(state.Objects))
-		for key := range state.Objects {
-			keys = append(keys, key)
-		}
-		slices.Sort(keys)
-		out = append(out, '{')
-		for index, key := range keys {
-			if index != 0 {
-				out = append(out, ',')
-			}
-			out = appendJSONString(out, key)
-			out = append(out, ':')
-			out = appendObjectJSON(out, state.Objects[key])
-		}
-		out = append(out, '}')
-	}
+	out = appendObjectTableJSON(out, state.Objects)
 	out = append(out, ',')
 	out = append(out, tail[1:]...)
 	return out, nil
+}
+
+// appendObjectTableJSON appends objects as json.Marshal writes it.
+func appendObjectTableJSON(out []byte, objects map[string]Object) []byte {
+	if objects == nil {
+		return append(out, "null"...)
+	}
+	keys := make([]string, 0, len(objects))
+	for key := range objects {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	out = append(out, '{')
+	for index, key := range keys {
+		if index != 0 {
+			out = append(out, ',')
+		}
+		out = appendJSONString(out, key)
+		out = append(out, ':')
+		out = appendObjectJSON(out, objects[key])
+	}
+	return append(out, '}')
 }
 
 // appendJSONString appends s as json.Marshal writes it.

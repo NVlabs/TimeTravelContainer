@@ -1005,7 +1005,7 @@ func (ledger *ReferenceLedger) Checkpoint() error {
 		return fmt.Errorf("reference ledger requires reopen: %w", ledger.poisoned)
 	}
 	checkpoint := referenceLedgerCheckpoint{Version: referenceLedgerVersion, Sequence: ledger.sequence, State: ledger.state}
-	data, err := json.Marshal(checkpoint)
+	data, err := encodeReferenceLedgerCheckpoint(&checkpoint)
 	if err != nil {
 		return err
 	}
@@ -1025,6 +1025,47 @@ func (ledger *ReferenceLedger) Checkpoint() error {
 	old := ledger.journal
 	ledger.journal = journal
 	return old.Close()
+}
+
+// encodeReferenceLedgerCheckpoint encodes checkpoint as json.Marshal does,
+// byte for byte, its objects, nearly all of it, without reflection, as
+// encodeGraphCheckpoint does: encoding/json took 1.6 s for the ledger of a
+// cluster holding a branch of 100,000 files, which the import of its
+// snapshot checkpoints.
+func encodeReferenceLedgerCheckpoint(checkpoint *referenceLedgerCheckpoint) ([]byte, error) {
+	// The fields around the objects are small: encoding/json encodes them.
+	state := &checkpoint.State
+	head, err := json.Marshal(struct {
+		Version  int    `json:"version"`
+		Sequence uint64 `json:"sequence"`
+		State    struct {
+			Origins map[SnapshotID]struct{}
+		} `json:"state"`
+	}{Version: checkpoint.Version, Sequence: checkpoint.Sequence, State: struct {
+		Origins map[SnapshotID]struct{}
+	}{state.Origins}})
+	if err != nil {
+		return nil, err
+	}
+	tail, err := json.Marshal(struct {
+		References    map[string]ObjectID
+		Applied       map[string]appliedReference
+		Outbox        []OutboundReference
+		NextSequence  uint64
+		Acknowledged  uint64
+		HandoffCursor map[SnapshotID]uint64
+	}{state.References, state.Applied, state.Outbox, state.NextSequence, state.Acknowledged, state.HandoffCursor})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 0, len(head)+len(tail)+len(state.Objects)*256)
+	// head ends in the two braces that close the state and the checkpoint.
+	out = append(out, head[:len(head)-2]...)
+	out = append(out, `,"Objects":`...)
+	out = appendObjectTableJSON(out, state.Objects)
+	out = append(out, ',')
+	out = append(out, tail[1:]...)
+	return append(out, '}'), nil
 }
 
 func writeReferenceLedgerAtomic(dir, destination, prefix string, data []byte) error {

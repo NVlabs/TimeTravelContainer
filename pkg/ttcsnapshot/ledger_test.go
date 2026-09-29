@@ -15,6 +15,7 @@
 package ttcsnapshot
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -1635,5 +1636,42 @@ func TestSnapshotLedgerHandoffCatchupFollowsRandomMutations(t *testing.T) {
 	}
 	if !reflect.DeepEqual(replayed, changes) || !reflect.DeepEqual(reopened.Inspect(), final) {
 		t.Fatal("the replayed graph differs from the one written")
+	}
+}
+
+// A ledger checkpoint encodes as json.Marshal writes it, byte for byte.
+func TestEncodeReferenceLedgerCheckpoint(t *testing.T) {
+	random := rand.New(rand.NewSource(4))
+	states := []referenceLedgerState{{}, newReferenceLedgerState()}
+	for round := 0; round < 20; round++ {
+		state := newReferenceLedgerState()
+		state.Objects = checkpointFixture(random, random.Intn(200)).Objects
+		for origin := SnapshotID(1); origin <= SnapshotID(random.Intn(4)); origin++ {
+			state.Origins[origin] = struct{}{}
+			state.HandoffCursor[origin] = random.Uint64()
+		}
+		id := ObjectID{Snapshot: 1, Kind: ObjectKindMetadata, Ordinal: random.Uint64()}
+		state.References[fmt.Sprintf("root/%d", random.Intn(100))] = id
+		state.Applied[fmt.Sprintf("op-%d", random.Intn(100))] = appliedReference{Name: "root/applied", Object: id, Retain: random.Intn(2) == 0}
+		for index := 0; index < random.Intn(3); index++ {
+			state.Outbox = append(state.Outbox, OutboundReference{Sequence: random.Uint64(), Operation: "op", Name: "edge/<&>", Parent: id, Child: id, Retain: true})
+		}
+		state.NextSequence, state.Acknowledged = random.Uint64(), random.Uint64()
+		states = append(states, state)
+	}
+	odd := newReferenceLedgerState()
+	odd.Objects = map[string]Object{"key <&> \"quoted\"   \xff": {ID: ObjectID{Snapshot: 1, Kind: 1, Ordinal: 1}, State: "odd\tstate", SourceCatalog: "<catalog>"}}
+	odd.References["ré <&>"] = ObjectID{Snapshot: 1, Kind: 1, Ordinal: 1}
+	states = append(states, odd)
+	for index := range states {
+		checkpoint := referenceLedgerCheckpoint{Version: referenceLedgerVersion, Sequence: random.Uint64(), State: states[index]}
+		want, err := json.Marshal(checkpoint)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := encodeReferenceLedgerCheckpoint(&checkpoint)
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("state %d encodes (%v) as\n%.400s\nwant\n%.400s", index, err, got, want)
+		}
 	}
 }
