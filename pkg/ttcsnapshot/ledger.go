@@ -818,6 +818,55 @@ func encodeReferenceLedgerRecord(record referenceLedgerRecord) ([]byte, error) {
 	return encoded, nil
 }
 
+// ledgerImportObjectsBatch is the most objects a record of an import holds.
+const ledgerImportObjectsBatch = 256
+
+// encodeLedgerImportObjects encodes, as encodeReferenceLedgerRecord does, byte
+// for byte, the record of sequence that holds the objects of origin's import
+// from offset on: as many of objects as a record fits, one at least, and at
+// most ledgerImportObjectsBatch. It returns the record and how many objects
+// it holds.
+//
+// Through json.Marshal, a batch of memory tables too large for a record was
+// encoded whole before it was halved, and json kept its encoder, grown to
+// 32 MB, in a pool, where the daemon's every later json.Marshal kept it alive.
+// Here each object is encoded once, into a buffer of the record's own.
+func encodeLedgerImportObjects(sequence uint64, origin SnapshotID, offset uint64, objects []Object) ([]byte, int, error) {
+	const tail = `]},"ImportReferences":null,"ImportCommit":null,"Reference":null,"References":null,"Handoff":null,"Ack":null,"Collect":null,"Collected":0,"Retire":null}`
+	out := make([]byte, 8, 64<<10)
+	out = append(out, `{"Version":`...)
+	out = strconv.AppendInt(out, referenceLedgerVersion, 10)
+	out = append(out, `,"Sequence":`...)
+	out = strconv.AppendUint(out, sequence, 10)
+	out = append(out, `,"Import":null,"ImportBegin":null,"ImportObjects":{"Origin":`...)
+	out = strconv.AppendUint(out, uint64(origin), 10)
+	out = append(out, `,"Offset":`...)
+	out = strconv.AppendUint(out, offset, 10)
+	out = append(out, `,"Objects":[`...)
+	count := 0
+	for _, object := range objects[:min(len(objects), ledgerImportObjectsBatch)] {
+		mark := len(out)
+		if count != 0 {
+			out = append(out, ',')
+		}
+		out = appendObjectJSON(out, object)
+		if length := len(out) - 8 + len(tail); length > maxReferenceLedgerRecord {
+			if count == 0 {
+				return nil, 0, fmt.Errorf("reference ledger record has invalid length %d", length)
+			}
+			out = out[:mark]
+			break
+		}
+		count++
+	}
+	if count == 0 {
+		return nil, 0, errors.New("reference ledger import record has no objects")
+	}
+	out = append(out, tail...)
+	binary.BigEndian.PutUint64(out[:8], uint64(len(out)-8))
+	return out, count, nil
+}
+
 // journalChunkedImportLocked makes an arbitrarily large origin import atomic
 // without weakening the bounded-WAL invariant. The commit marker is synced
 // separately from its payload. Replay rolls an incomplete prefix back to the
@@ -872,12 +921,16 @@ func (ledger *ReferenceLedger) journalChunkedImportLocked(origin SnapshotID, obj
 		}
 		return nil
 	}
-	if err := appendBatches(len(objects), func(offset, end int) referenceLedgerRecord {
-		return referenceLedgerRecord{ImportObjects: &ledgerImportObjectsRecord{
-			Origin: origin, Offset: uint64(offset), Objects: objects[offset:end],
-		}}
-	}); err != nil {
-		return err
+	for offset := 0; offset < len(objects); {
+		if uint64(len(encoded)) >= math.MaxUint64-ledger.sequence {
+			return errors.New("reference ledger sequence exhausted")
+		}
+		data, count, err := encodeLedgerImportObjects(ledger.sequence+uint64(len(encoded))+1, origin, uint64(offset), objects[offset:])
+		if err != nil {
+			return err
+		}
+		encoded = append(encoded, data)
+		offset += count
 	}
 	if err := appendBatches(len(named), func(offset, end int) referenceLedgerRecord {
 		return referenceLedgerRecord{ImportReferences: &ledgerImportReferencesRecord{

@@ -1753,3 +1753,54 @@ func TestFreezeSnapshotLedgerHandoff(t *testing.T) {
 		t.Fatalf("froze an absent snapshot: %v", err)
 	}
 }
+
+// An import's records of objects are those encodeReferenceLedgerRecord
+// writes, byte for byte, of as many objects as a record fits.
+func TestEncodeLedgerImportObjects(t *testing.T) {
+	random := rand.New(rand.NewSource(7))
+	object := func(ordinal uint64, data int) Object {
+		payload := make([]byte, data)
+		random.Read(payload)
+		o := Object{
+			ID: ObjectID{Snapshot: 9, Ordinal: ordinal, Kind: ObjectKindMemoryTable}, State: ObjectLive,
+			Refs: uint64(random.Intn(3)), BulkLength: uint64(random.Intn(1 << 20)), Data: payload,
+			SourceObject: ObjectID{Snapshot: 4, Ordinal: ordinal, Kind: ObjectKindMemoryChunk},
+		}
+		if ordinal%3 == 0 {
+			o.Children = []Edge{{Slot: 1, Child: ObjectID{Snapshot: 9, Ordinal: ordinal + 1, Kind: ObjectKindMemoryChunk}}}
+		}
+		if ordinal%5 == 0 {
+			o.SourceCatalog, o.Deferred = "catalog<&>", true
+		}
+		return o
+	}
+	check := func(name string, objects []Object, wantCount int) {
+		t.Helper()
+		data, count, err := encodeLedgerImportObjects(41, 9, 17, objects)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if count != wantCount {
+			t.Fatalf("%s: a record of %d objects, want %d", name, count, wantCount)
+		}
+		want, err := encodeReferenceLedgerRecord(referenceLedgerRecord{Sequence: 41, ImportObjects: &ledgerImportObjectsRecord{Origin: 9, Offset: 17, Objects: objects[:count]}})
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if !bytes.Equal(data, want) {
+			t.Fatalf("%s: the record is\n%.300q\nwant\n%.300q", name, data, want)
+		}
+	}
+	var small, large []Object
+	for ordinal := uint64(1); ordinal <= 300; ordinal++ {
+		small = append(small, object(ordinal, 64))
+		large = append(large, object(ordinal, 128<<10))
+	}
+	check("small objects", small, ledgerImportObjectsBatch)
+	check("one object", small[:1], 1)
+	// Each large object takes about 171 KiB of the 8 MiB a record holds.
+	check("large objects", large, 47)
+	if _, _, err := encodeLedgerImportObjects(1, 9, 0, []Object{object(1, maxReferenceLedgerRecord)}); err == nil {
+		t.Fatal("encoded a record larger than the ledger holds")
+	}
+}
