@@ -6825,8 +6825,18 @@ func maintainOrphanLocalCacheCleanup(authority *cluster.AuthorityCatalog, backen
 			case <-timer.C:
 			}
 
+			query := cluster.AuthorityQuery{Placements: cluster.All[string](), Transactions: cluster.All[string]()}
+			if initialized {
+				// A pass finds nothing to do unless the state changed since the
+				// last; that takes no lock. Only a changed state is read again
+				// with the lock held, as a reclamation needs.
+				if state, err := authority.AuthorityStateOf(query); err == nil && localCleanupAuthorityFingerprint(state) == lastFingerprint {
+					timer.Reset(interval)
+					continue
+				}
+			}
 			currentState, unlock, err := serializedAuthorityState(lockLocalState, func() (*cluster.AuthorityState, error) {
-				return authority.AuthorityStateOf(cluster.AuthorityQuery{Placements: cluster.All[string](), Transactions: cluster.All[string]()})
+				return authority.AuthorityStateOf(query)
 			})
 			if err == nil {
 				fingerprint := localCleanupAuthorityFingerprint(currentState)
