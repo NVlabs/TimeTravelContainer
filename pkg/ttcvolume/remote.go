@@ -814,7 +814,8 @@ func (r *Repository) materializeRemoteObjectsPassLocked() ([]remoteMaterializati
 			return nil, nil, fmt.Errorf("branch %q has no snapshot graph root", branch)
 		}
 		branchRecord.Root = root.String()
-		if _, err := r.branchObjects(branchRecord); err != nil {
+		objects, err := r.branchObjects(branchRecord)
+		if err != nil {
 			return nil, nil, err
 		}
 		// The current namespace does not necessarily retain metadata that exists
@@ -834,6 +835,11 @@ func (r *Repository) materializeRemoteObjectsPassLocked() ([]remoteMaterializati
 			}
 			for _, inode := range inodes {
 				if inode.Type != "regular" || inode.File.IsZero() {
+					continue
+				}
+				// The walk of the current namespace prepared the files the base
+				// shares with it: every one, in a tree of unchanged files.
+				if _, prepared := objects[inode.File.String()]; prepared {
 					continue
 				}
 				if err := r.prepareDeferredFileObject(inode.File, int64(inode.Size)); err != nil {
