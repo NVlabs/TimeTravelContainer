@@ -257,6 +257,21 @@ func TestAuthorityLostRedirectsToTheHolder(t *testing.T) {
 	}
 }
 
+// A holder that gives the authority up answers as a node that never held it,
+// before it records that it did.
+func TestAuthorityRelinquished(t *testing.T) {
+	holder := newTestHolder(t)
+	registerReadyNode(t, holder.node, "node-a", "incarnation-a")
+	holder.node.Relinquish()
+	if holder.node.Holds() {
+		t.Fatal("the node still holds the authority it gave up")
+	}
+	var redirect *AuthorityNotHolderError
+	if _, err := holder.node.LinearizableState(context.Background()); !errors.As(err, &redirect) {
+		t.Fatalf("a read after the authority was given up = %v, want a redirect", err)
+	}
+}
+
 func TestAuthorityLinearizableApply(t *testing.T) {
 	node := newTestHolder(t).node
 	registerReadyNode(t, node, "node-a", "incarnation-a")

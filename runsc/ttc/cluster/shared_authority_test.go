@@ -455,3 +455,35 @@ func TestHolderViewKeepsTheRecordItRead(t *testing.T) {
 		t.Fatalf("the record read again is %+v, %t, %v, want node-a's", record, recorded, err)
 	}
 }
+
+// A read of the authority record that fails proves nothing: the holder reads
+// it again while its lease holds, rather than give the authority up.
+func TestAuthorityHolderRereadsARecordItCannotRead(t *testing.T) {
+	shared := NewSharedCluster(t.TempDir())
+	heartbeat, self := startTestMember(t, shared, "node-a", "i-1", RoleCompute)
+	self.Epoch = 1
+	if err := shared.WriteAuthority(self); err != nil {
+		t.Fatal(err)
+	}
+	holder := AuthorityHolder{Cluster: shared, Heartbeat: heartbeat, Record: self}
+	if err := os.Chmod(shared.recordPath(), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := shared.ReadAuthority(); err == nil {
+		t.Skip("the record is readable without permission, as it is to root")
+	}
+	held := make(chan error, 1)
+	go func() { held <- holder.Held() }()
+	time.Sleep(4 * heldReadRetry)
+	select {
+	case err := <-held:
+		t.Fatalf("the check ended while the record was unreadable: %v", err)
+	default:
+	}
+	if err := os.Chmod(shared.recordPath(), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-held; err != nil {
+		t.Fatalf("the check failed once the record was readable: %v", err)
+	}
+}

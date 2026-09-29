@@ -696,6 +696,10 @@ func (l *Liveness) waitedFor(record AuthorityRecord) time.Duration {
 	return time.Since(since)
 }
 
+// heldReadRetry is how long AuthorityHolder.Held waits to read the authority
+// record again after a read failed.
+const heldReadRetry = 50 * time.Millisecond
+
 // ErrAuthorityLost is the error of a write of the log of an authority that is
 // no longer held.
 var ErrAuthorityLost = errors.New("this node no longer holds the cluster authority")
@@ -711,14 +715,27 @@ type AuthorityHolder struct {
 // Held returns nil if the node still holds its epoch's authority: it holds
 // its lease, and no later epoch's record replaced its own. A record of an
 // earlier epoch, which a node that claimed that epoch and then stalled wrote
-// over it, it restores.
+// over it, it restores. A read of the record that fails proves nothing: it
+// reads again, for as long as the lease holds. And the lease must still hold
+// once a read returns: a read the server answered before a successor
+// recorded its epoch may return long after, once the successor holds the
+// authority.
 func (h AuthorityHolder) Held() error {
-	if !h.Heartbeat.Held() {
-		return fmt.Errorf("%w: its lease lapsed", ErrAuthorityLost)
-	}
-	current, ok, err := h.Cluster.ReadAuthority()
-	if err != nil {
-		return fmt.Errorf("%w: %v", ErrAuthorityLost, err)
+	var current AuthorityRecord
+	var ok bool
+	for {
+		if !h.Heartbeat.Held() {
+			return fmt.Errorf("%w: its lease lapsed", ErrAuthorityLost)
+		}
+		var err error
+		current, ok, err = h.Cluster.ReadAuthority()
+		if !h.Heartbeat.Held() {
+			return fmt.Errorf("%w: its lease lapsed", ErrAuthorityLost)
+		}
+		if err == nil {
+			break
+		}
+		time.Sleep(heldReadRetry)
 	}
 	if ok && current.Epoch > h.Record.Epoch {
 		return fmt.Errorf("%w: node %s took it for epoch %d", ErrAuthorityLost, current.NodeID, current.Epoch)

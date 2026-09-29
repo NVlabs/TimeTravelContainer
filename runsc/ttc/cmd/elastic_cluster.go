@@ -6591,6 +6591,7 @@ func releaseClusterAuthority(runtime *daemonClusterRuntime) {
 	if !authority.Holds(runtime.self) {
 		return
 	}
+	runtime.authority.Relinquish()
 	epoch := authority.Epoch
 	_ = runtime.heartbeat.Update(func(record *cluster.MemberRecord) {
 		record.Authority = 0

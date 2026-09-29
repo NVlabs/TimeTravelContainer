@@ -375,7 +375,24 @@ func (n *AuthorityNode) EncodeLinearizable(ctx context.Context, query AuthorityQ
 		engine.lose(err)
 		return nil, n.notHolder()
 	}
+	if engine.lostErr() != nil {
+		// The node gave the authority up while the check ran.
+		return nil, n.notHolder()
+	}
 	return engine.fsm.encode(query)
+}
+
+// Relinquish ends the node's hold of the authority, if it holds it, without
+// waiting for requests in flight: from then on it answers as a node that never
+// held it does. A holder relinquishes the authority before it records that it
+// gave it up, so that no read it serves follows that record.
+func (n *AuthorityNode) Relinquish() {
+	if n == nil {
+		return
+	}
+	if engine := n.current.Load(); engine != nil {
+		engine.lose(ErrAuthorityClosed)
+	}
 }
 
 // Close stops the authority the node holds, if any.
