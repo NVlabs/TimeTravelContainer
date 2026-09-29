@@ -525,9 +525,12 @@ type controlOnlyCluster struct {
 	// none alive, and liveness judges from it which ones stalled, as
 	// observePeers records in stalled every heartbeat.
 	sharedRoot string
-	liveness   cluster.Liveness
-	stalledMu  sync.Mutex
-	stalled    map[string]bool
+	// shared is the cluster in sharedRoot, whose records the gateway reads
+	// every heartbeat through files it keeps open.
+	shared    cluster.SharedCluster
+	liveness  cluster.Liveness
+	stalledMu sync.Mutex
+	stalled   map[string]bool
 	// holder runs this login node's control holder while the cluster needs
 	// one; see controlHolder.
 	holder *controlHolder
@@ -557,7 +560,7 @@ func (c *controlOnlyCluster) observePeers() {
 	if c.sharedRoot == "" {
 		return
 	}
-	members, err := cluster.NewSharedCluster(c.sharedRoot).ReadMembers()
+	members, err := c.shared.ReadMembers()
 	if err != nil {
 		return
 	}
@@ -571,7 +574,7 @@ func (c *controlOnlyCluster) observePeers() {
 	c.stalled = stalled
 	c.stalledMu.Unlock()
 	if c.holder != nil {
-		c.holder.consider(members, &c.liveness)
+		c.holder.consider(c.shared, members, &c.liveness)
 	}
 }
 
@@ -752,6 +755,9 @@ func sharedRootComputePeers(sharedRoot string) []string {
 
 func prepareControlOnlyCluster(opts daemonClusterOptions, sharedRoot string) (*controlOnlyCluster, error) {
 	control := &controlOnlyCluster{nodeID: opts.NodeID, repositoryID: opts.RepositoryID, authToken: os.Getenv("TTC_CLUSTER_TOKEN"), sharedRoot: sharedRoot}
+	if sharedRoot != "" {
+		control.shared = cluster.NewSharedCluster(sharedRoot).KeepFilesOpen()
+	}
 	peers := opts.Peers
 	if len(peers) == 0 {
 		peers = sharedRootComputePeers(sharedRoot)
@@ -4969,7 +4975,7 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 	// its authority, and keeps the authority's state: see
 	// cluster.SharedCluster. This daemon holds it, or registers with the node
 	// that does, and sends its reads and proposals there.
-	shared := cluster.NewSharedCluster(dataRoot)
+	shared := cluster.NewSharedCluster(dataRoot).KeepFilesOpen()
 	role := cluster.RoleCompute
 	if opts.ControlHolder {
 		role = cluster.RoleControl
@@ -4989,6 +4995,7 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 	defer func() {
 		if closeHeartbeat {
 			heartbeat.Stop()
+			shared.CloseFiles()
 		}
 	}()
 	liveness := &cluster.Liveness{}
@@ -6170,6 +6177,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 			} else {
 				clusterRuntime.heartbeat.Stop()
 			}
+			clusterRuntime.shared.CloseFiles()
 		}
 		if leaseGuardian != nil {
 			_ = leaseGuardian.Close()

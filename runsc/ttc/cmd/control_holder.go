@@ -84,7 +84,7 @@ func (h *controlHolder) running() bool {
 // consider starts the holder if the cluster needs one: the gateway has
 // watched the shared root for AuthorityTakeover, and has seen no compute
 // daemon's counter advance, nor that of a daemon that holds the authority.
-func (h *controlHolder) consider(members map[string]cluster.MemberRecord, liveness *cluster.Liveness) {
+func (h *controlHolder) consider(shared cluster.SharedCluster, members map[string]cluster.MemberRecord, liveness *cluster.Liveness) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.watchedSince.IsZero() {
@@ -96,7 +96,7 @@ func (h *controlHolder) consider(members map[string]cluster.MemberRecord, livene
 			running = true
 		}
 	}
-	record, recorded, err := cluster.NewSharedCluster(h.sharedRoot).ReadAuthority()
+	record, recorded, err := shared.ReadAuthority()
 	if err != nil {
 		return
 	}

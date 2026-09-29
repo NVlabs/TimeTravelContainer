@@ -487,3 +487,35 @@ func TestAuthorityHolderRereadsARecordItCannotRead(t *testing.T) {
 		t.Fatalf("the check failed once the record was readable: %v", err)
 	}
 }
+
+// A cluster that keeps its records' files open reads what another writes to
+// them, and reads on once it closes them.
+func TestSharedClusterKeepsFilesOpen(t *testing.T) {
+	root := t.TempDir()
+	shared := NewSharedCluster(root).KeepFilesOpen()
+	other := NewSharedCluster(root)
+	if err := shared.WriteAuthority(AuthorityRecord{Epoch: 1, NodeID: "node-a", Incarnation: "i-1"}); err != nil {
+		t.Fatal(err)
+	}
+	for epoch := uint64(1); epoch < 4; epoch++ {
+		if epoch > 1 {
+			if err := other.WriteAuthority(AuthorityRecord{Epoch: epoch, NodeID: "node-b", Incarnation: "i-1"}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		record, ok, err := shared.ReadAuthority()
+		if err != nil || !ok || record.Epoch != epoch {
+			t.Fatalf("read epoch %d, %t, %v; want %d", record.Epoch, ok, err, epoch)
+		}
+	}
+	if len(shared.files.files) != 2 {
+		t.Fatalf("%d files kept open, want the record's, for reading and for writing", len(shared.files.files))
+	}
+	shared.CloseFiles()
+	if record, ok, err := shared.ReadAuthority(); err != nil || !ok || record.Epoch != 3 {
+		t.Fatalf("read epoch %d, %t, %v after closing the files; want 3", record.Epoch, ok, err)
+	}
+	if len(shared.files.files) != 0 {
+		t.Fatal("a file was kept open after the files were closed")
+	}
+}

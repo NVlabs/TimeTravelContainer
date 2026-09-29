@@ -115,6 +115,37 @@ type MemberRecord struct {
 type SharedCluster struct {
 	// Dir is the cluster directory of the shared root.
 	Dir string
+	// files, if set, keeps the files of the records open: see
+	// KeepFilesOpen.
+	files *sharedFiles
+}
+
+// KeepFilesOpen returns c, reading and writing the records of its members and
+// of its authority through files it keeps open until CloseFiles. On a network
+// filesystem, an open and a close cost a request each, where a read or a write
+// of an open file costs one; a daemon reads and writes records every second,
+// and its authority's holder reads the authority record for each batch.
+func (c SharedCluster) KeepFilesOpen() SharedCluster {
+	c.files = &sharedFiles{files: make(map[sharedFileKey]*sharedFile)}
+	return c
+}
+
+// CloseFiles closes the files c keeps open; from then on, each read or write
+// of a record opens its file for itself.
+func (c SharedCluster) CloseFiles() {
+	if c.files != nil {
+		c.files.close()
+	}
+}
+
+// readBlock reads the shared block of path into value.
+func (c SharedCluster) readBlock(path string, value any) error {
+	return c.files.use(path, unix.O_RDONLY, func(fd int) error { return readSharedBlockFrom(fd, path, value) })
+}
+
+// writeBlock writes value as the shared block of path.
+func (c SharedCluster) writeBlock(path string, value any) error {
+	return c.files.use(path, unix.O_WRONLY|unix.O_CREAT, func(fd int) error { return writeSharedBlockTo(fd, path, value) })
 }
 
 // NewSharedCluster returns the cluster anchored in sharedRoot.
@@ -148,7 +179,7 @@ func epochName(epoch uint64) string {
 // the authority.
 func (c SharedCluster) ReadAuthority() (AuthorityRecord, bool, error) {
 	var record AuthorityRecord
-	if err := readSharedBlock(c.recordPath(), &record); err != nil {
+	if err := c.readBlock(c.recordPath(), &record); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return AuthorityRecord{}, false, nil
 		}
@@ -162,7 +193,7 @@ func (c SharedCluster) WriteAuthority(record AuthorityRecord) error {
 	if err := os.MkdirAll(c.authorityDir(), 0700); err != nil {
 		return err
 	}
-	if err := writeSharedBlock(c.recordPath(), record); err != nil {
+	if err := c.writeBlock(c.recordPath(), record); err != nil {
 		return fmt.Errorf("writing the cluster authority record: %w", err)
 	}
 	return nil
@@ -468,7 +499,7 @@ func (c SharedCluster) ReadMembers() (map[string]MemberRecord, error) {
 // ReadMember returns the member record of nodeID.
 func (c SharedCluster) ReadMember(nodeID string) (MemberRecord, error) {
 	var record MemberRecord
-	if err := readSharedBlock(c.memberPath(nodeID), &record); err != nil {
+	if err := c.readBlock(c.memberPath(nodeID), &record); err != nil {
 		return MemberRecord{}, fmt.Errorf("reading the member record of %s: %w", nodeID, err)
 	}
 	return record, nil
@@ -530,7 +561,7 @@ func (h *Heartbeat) beat() error {
 	record := h.record
 	h.mu.Unlock()
 	started := time.Now()
-	if err := writeSharedBlock(h.cluster.memberPath(record.NodeID), record); err != nil {
+	if err := h.cluster.writeBlock(h.cluster.memberPath(record.NodeID), record); err != nil {
 		return err
 	}
 	h.mu.Lock()
@@ -854,6 +885,11 @@ var sharedBlockTable = crc32.MakeTable(crc32.Castagnoli)
 // writeSharedBlock writes value as the block of path, with direct I/O where
 // the filesystem allows it, and syncs it.
 func writeSharedBlock(path string, value any) error {
+	return (*sharedFiles)(nil).use(path, unix.O_WRONLY|unix.O_CREAT, func(fd int) error { return writeSharedBlockTo(fd, path, value) })
+}
+
+// writeSharedBlockTo is writeSharedBlock to the file of path open as fd.
+func writeSharedBlockTo(fd int, path string, value any) error {
 	data, err := json.Marshal(value)
 	if err != nil {
 		return err
@@ -869,11 +905,6 @@ func writeSharedBlock(path string, value any) error {
 	binary.LittleEndian.PutUint32(block[0:], uint32(len(data)))
 	binary.LittleEndian.PutUint32(block[4:], crc32.Checksum(data, sharedBlockTable))
 	copy(block[8:], data)
-	fd, err := openShared(path, unix.O_WRONLY|unix.O_CREAT)
-	if err != nil {
-		return err
-	}
-	defer unix.Close(fd)
 	if _, err := unix.Pwrite(fd, block, 0); err != nil {
 		return &os.PathError{Op: "write", Path: path, Err: err}
 	}
@@ -886,16 +917,16 @@ func writeSharedBlock(path string, value any) error {
 // readSharedBlock reads the block of path into value. A torn block, which a
 // write in progress leaves, it reads again.
 func readSharedBlock(path string, value any) error {
+	return (*sharedFiles)(nil).use(path, unix.O_RDONLY, func(fd int) error { return readSharedBlockFrom(fd, path, value) })
+}
+
+// readSharedBlockFrom is readSharedBlock from the file of path open as fd.
+func readSharedBlockFrom(fd int, path string, value any) error {
 	block, release, err := alignedBlock()
 	if err != nil {
 		return err
 	}
 	defer release()
-	fd, err := openShared(path, unix.O_RDONLY)
-	if err != nil {
-		return err
-	}
-	defer unix.Close(fd)
 	for attempt := 0; ; attempt++ {
 		n, err := unix.Pread(fd, block, 0)
 		if err != nil {
@@ -914,6 +945,83 @@ func readSharedBlock(path string, value any) error {
 			return fmt.Errorf("%s holds no whole record", path)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// sharedFiles keeps the files of records open, each by its path and the
+// flags it was opened with.
+type sharedFiles struct {
+	mu     sync.Mutex
+	files  map[sharedFileKey]*sharedFile
+	closed bool
+}
+
+type sharedFileKey struct {
+	path  string
+	flags int
+}
+
+type sharedFile struct {
+	mu     sync.Mutex
+	fd     int
+	open   bool
+	closed bool
+}
+
+// use calls do with the file of path open with flags: a file f keeps open, or,
+// if f is nil or closed, one it opens for do and closes after it. A file that
+// do failed with is closed, and opened again for the next.
+func (f *sharedFiles) use(path string, flags int, do func(fd int) error) error {
+	var file *sharedFile
+	if f != nil {
+		f.mu.Lock()
+		if !f.closed {
+			key := sharedFileKey{path: path, flags: flags}
+			if file = f.files[key]; file == nil {
+				file = &sharedFile{}
+				f.files[key] = file
+			}
+		}
+		f.mu.Unlock()
+	}
+	if file == nil {
+		fd, err := openShared(path, flags)
+		if err != nil {
+			return err
+		}
+		defer unix.Close(fd)
+		return do(fd)
+	}
+	file.mu.Lock()
+	defer file.mu.Unlock()
+	if !file.open {
+		fd, err := openShared(path, flags)
+		if err != nil {
+			return err
+		}
+		file.fd, file.open = fd, true
+	}
+	err := do(file.fd)
+	if err != nil || file.closed {
+		_ = unix.Close(file.fd)
+		file.open = false
+	}
+	return err
+}
+
+func (f *sharedFiles) close() {
+	f.mu.Lock()
+	files := f.files
+	f.files, f.closed = nil, true
+	f.mu.Unlock()
+	for _, file := range files {
+		file.mu.Lock()
+		if file.open {
+			_ = unix.Close(file.fd)
+			file.open = false
+		}
+		file.closed = true
+		file.mu.Unlock()
 	}
 }
 
