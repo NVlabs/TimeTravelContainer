@@ -142,6 +142,41 @@ func TestAuthorityFSMReadCopyOmitsReplayHistory(t *testing.T) {
 	}
 }
 
+// A holder another node took the authority from sends requests to that node,
+// as a node that never held it does: the batch that finds the authority gone,
+// every request after it, and reads of what it applied.
+func TestAuthorityLostRedirectsToTheHolder(t *testing.T) {
+	holder := newTestHolder(t)
+	registerReadyNode(t, holder.node, "node-a", "incarnation-a")
+	successor := AuthorityRecord{Epoch: 2, Previous: 1, NodeID: "node-b", Incarnation: "i-1", ControlURL: "http://node-b"}
+	if err := holder.shared.WriteAuthority(successor); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		_, err := holder.node.Propose(context.Background(), fmt.Sprintf("after-%d", i), AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
+			FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main",
+			OwnerNode: "node-a", OwnerIncarnation: "incarnation-a", State: PlacementRunning,
+		}})
+		var redirect *AuthorityNotHolderError
+		if !errors.As(err, &redirect) || redirect.HolderID != "node-b" || redirect.ControlURL != "http://node-b" {
+			t.Fatalf("proposal %d after the takeover: %v, want a redirect to node-b", i, err)
+		}
+	}
+	if holder.node.Holds() {
+		t.Fatal("the node still holds the authority")
+	}
+	var redirect *AuthorityNotHolderError
+	if _, err := holder.node.LinearizableState(context.Background()); !errors.As(err, &redirect) || redirect.HolderID != "node-b" {
+		t.Fatalf("read after the takeover: %v, want a redirect to node-b", err)
+	}
+	if _, err := holder.node.AppliedState(); !errors.As(err, &redirect) {
+		t.Fatalf("applied state after the takeover: %v, want a redirect", err)
+	}
+	if _, ok := holder.node.AppliedNode("node-a"); ok {
+		t.Fatal("the node answered from the state it applied before the takeover")
+	}
+}
+
 func TestAuthorityLinearizableApply(t *testing.T) {
 	node := newTestHolder(t).node
 	registerReadyNode(t, node, "node-a", "incarnation-a")
@@ -302,14 +337,15 @@ func TestAuthorityHolderStopsWhenTheAuthorityIsLost(t *testing.T) {
 	if err := holder.shared.WriteAuthority(AuthorityRecord{Epoch: 2, NodeID: "node-b"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := propose("b2"); !errors.Is(err, ErrAuthorityLost) {
-		t.Fatalf("a write after a later epoch took the authority = %v, want ErrAuthorityLost", err)
+	var redirect *AuthorityNotHolderError
+	if err := propose("b2"); !errors.As(err, &redirect) || redirect.HolderID != "node-b" {
+		t.Fatalf("a write after a later epoch took the authority = %v, want a redirect to node-b", err)
 	}
 	if node.Holds() {
 		t.Fatal("the holder still holds the authority it lost")
 	}
-	if _, err := node.LinearizableState(context.Background()); !errors.Is(err, ErrAuthorityLost) {
-		t.Fatalf("a read after the authority was lost = %v, want ErrAuthorityLost", err)
+	if _, err := node.LinearizableState(context.Background()); !errors.As(err, &redirect) || redirect.HolderID != "node-b" {
+		t.Fatalf("a read after the authority was lost = %v, want a redirect to node-b", err)
 	}
 }
 
@@ -320,8 +356,11 @@ func TestAuthorityHolderStopsWhenItsLeaseLapses(t *testing.T) {
 	holder.heartbeat.mu.Lock()
 	holder.heartbeat.landed = time.Now().Add(-LeaseHold)
 	holder.heartbeat.mu.Unlock()
-	if _, err := holder.node.LinearizableState(context.Background()); !errors.Is(err, ErrAuthorityLost) {
-		t.Fatalf("a read after the lease lapsed = %v, want ErrAuthorityLost", err)
+	// The record still names the node: the authority has no other holder to
+	// send the read to.
+	var redirect *AuthorityNotHolderError
+	if _, err := holder.node.LinearizableState(context.Background()); !errors.As(err, &redirect) || redirect.HolderID != "" {
+		t.Fatalf("a read after the lease lapsed = %v, want a redirect to no holder", err)
 	}
 	if holder.node.Holds() {
 		t.Fatal("the holder still holds the authority after its lease lapsed")

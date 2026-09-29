@@ -192,19 +192,26 @@ func (n *AuthorityNode) notHolder() error {
 }
 
 // engine returns the engine of the authority the node holds, or the error
-// that says where the authority is.
+// that says where the authority is. A node whose hold ended, however it
+// ended, sends requests on as a node that never held it does: a deposed
+// holder's daemon stops through requests to its successor.
 func (n *AuthorityNode) engine() (*authorityEngine, error) {
 	if n == nil {
 		return nil, errors.New("nil cluster authority")
 	}
+	if engine := n.holding(); engine != nil {
+		return engine, nil
+	}
+	return nil, n.notHolder()
+}
+
+// holding returns the engine of the authority the node holds, or nil.
+func (n *AuthorityNode) holding() *authorityEngine {
 	engine := n.current.Load()
-	if engine == nil {
-		return nil, n.notHolder()
+	if engine == nil || engine.lostErr() != nil {
+		return nil
 	}
-	if err := engine.lostErr(); err != nil {
-		return nil, err
-	}
-	return engine, nil
+	return engine
 }
 
 // HeldFor reports whether this node has held the authority for
@@ -225,7 +232,7 @@ func (n *AuthorityNode) AppliedState() (*AuthorityState, error) {
 // AppliedRevision returns the revision of the state the holder applied, or
 // 0 on a node that holds no authority.
 func (n *AuthorityNode) AppliedRevision() uint64 {
-	if engine := n.current.Load(); engine != nil {
+	if engine := n.holding(); engine != nil {
 		return engine.fsm.revision()
 	}
 	return 0
@@ -233,7 +240,7 @@ func (n *AuthorityNode) AppliedRevision() uint64 {
 
 // AppliedQuery is AppliedState for the records query names.
 func (n *AuthorityNode) AppliedQuery(query AuthorityQuery) (*AuthorityState, error) {
-	engine := n.current.Load()
+	engine := n.holding()
 	if engine == nil {
 		return nil, n.notHolder()
 	}
@@ -247,7 +254,7 @@ func (n *AuthorityNode) AppliedQuery(query AuthorityQuery) (*AuthorityState, err
 // AppliedTransaction returns one transaction of the holder's state, for
 // observation, not for ownership or publication decisions.
 func (n *AuthorityNode) AppliedTransaction(id string) (Transaction, bool) {
-	if engine := n.current.Load(); engine != nil {
+	if engine := n.holding(); engine != nil {
 		return engine.fsm.appliedTransaction(id)
 	}
 	return Transaction{}, false
@@ -255,7 +262,7 @@ func (n *AuthorityNode) AppliedTransaction(id string) (Transaction, bool) {
 
 // AppliedNode returns one node of the holder's state; see AppliedTransaction.
 func (n *AuthorityNode) AppliedNode(id string) (NodeRecord, bool) {
-	if engine := n.current.Load(); engine != nil {
+	if engine := n.holding(); engine != nil {
 		return engine.fsm.appliedNode(id)
 	}
 	return NodeRecord{}, false
@@ -279,7 +286,13 @@ func (n *AuthorityNode) Apply(ctx context.Context, command AuthorityCommand) (Au
 	if timeout <= 0 {
 		return AuthorityResult{}, context.DeadlineExceeded
 	}
-	return engine.submit(ctx, timeout, command, data)
+	result, err := engine.submit(ctx, timeout, command, data)
+	if errors.Is(err, ErrAuthorityLost) || errors.Is(err, ErrAuthorityClosed) {
+		// The log may hold the command, and its successor's state then: the
+		// caller retries it there by its request ID.
+		return AuthorityResult{}, n.notHolder()
+	}
+	return result, err
 }
 
 // Propose timestamps a mutation on the holder, so that durations in command
@@ -360,7 +373,7 @@ func (n *AuthorityNode) EncodeLinearizable(ctx context.Context, query AuthorityQ
 	}
 	if err := engine.held(); err != nil {
 		engine.lose(err)
-		return nil, err
+		return nil, n.notHolder()
 	}
 	return engine.fsm.encode(query)
 }
