@@ -1323,7 +1323,9 @@ func (state *referenceLedgerState) importOrigin(origin SnapshotID, objects []Obj
 	}
 	state.setOrigin(origin, true)
 	state.putCursor(origin, 0)
-	for _, input := range objects {
+	// Each object's key, formed once.
+	keys := make([]string, len(objects))
+	for index, input := range objects {
 		object := cloneObject(input)
 		if object.ID.Snapshot != origin {
 			return fmt.Errorf("origin %d import contains foreign object %s", origin, object.ID)
@@ -1332,10 +1334,11 @@ func (state *referenceLedgerState) importOrigin(origin SnapshotID, objects []Obj
 		if err := validateObject(object); err != nil {
 			return err
 		}
-		if _, exists := state.Objects[object.ID.key()]; exists {
+		keys[index] = object.ID.key()
+		if _, exists := state.Objects[keys[index]]; exists {
 			return fmt.Errorf("origin import repeats object %s", object.ID)
 		}
-		state.putObject(object.ID.key(), object)
+		state.putObject(keys[index], object)
 	}
 	// An edge of the import may replace a named reference bridging it, which
 	// only the parents named by one can have: naming each edge to look for
@@ -1346,8 +1349,8 @@ func (state *referenceLedgerState) importOrigin(origin SnapshotID, objects []Obj
 			bridgedParents[parent] = struct{}{}
 		}
 	}
-	for _, input := range objects {
-		parent := state.Objects[input.ID.key()]
+	for index := range objects {
+		parent := state.Objects[keys[index]]
 		_, parentBridged := bridgedParents[parent.ID]
 		for _, edge := range parent.Children {
 			if !state.owns(edge.Child) {
@@ -1431,8 +1434,7 @@ func (state *referenceLedgerState) importOrigin(origin SnapshotID, objects []Obj
 			return fmt.Errorf("importing reference %q: %w", effectiveName, err)
 		}
 	}
-	for _, input := range objects {
-		key := input.ID.key()
+	for _, key := range keys {
 		if object := state.Objects[key]; object.Refs == 0 {
 			object.State = ObjectReclaiming
 			state.putObject(key, object)
