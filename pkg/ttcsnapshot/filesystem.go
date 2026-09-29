@@ -692,9 +692,11 @@ func buildFilesystemMutationSequential(state *graphState, origin SnapshotID, roo
 				if !ok || oldObject.ID.Kind != ObjectKindInode {
 					return nil, ObjectID{}, errors.New("inode tree references missing or invalid inode object")
 				}
-				if err := json.Unmarshal(oldObject.Data, &old); err != nil {
+				decoded, err := decodeInodeRecord(oldObject.Data)
+				if err != nil {
 					return nil, ObjectID{}, err
 				}
+				old = decoded
 			}
 			root.bulkBytes, err = replaceFilesystemBulkLength(root.bulkBytes, old, oldExists, inode, true)
 			if err != nil {
@@ -752,9 +754,11 @@ func buildFilesystemMutationSequential(state *graphState, origin SnapshotID, roo
 				if !ok || oldObject.ID.Kind != ObjectKindInode {
 					return nil, ObjectID{}, errors.New("inode tree references missing or invalid inode object")
 				}
-				if err := json.Unmarshal(oldObject.Data, &old); err != nil {
+				decoded, err := decodeInodeRecord(oldObject.Data)
+				if err != nil {
 					return nil, ObjectID{}, err
 				}
+				old = decoded
 			}
 			root.bulkBytes, err = replaceFilesystemBulkLength(root.bulkBytes, old, found, InodeRecord{}, false)
 			if err != nil {
@@ -778,8 +782,8 @@ func buildFilesystemMutationSequential(state *graphState, origin SnapshotID, roo
 				return nil, ObjectID{}, fmt.Errorf("looking up parent inode %d: %w", entry.Parent, err)
 			}
 			parentObject, _ := mutation.object(parentID)
-			var parent InodeRecord
-			if err := json.Unmarshal(parentObject.Data, &parent); err != nil {
+			parent, err := decodeInodeRecord(parentObject.Data)
+			if err != nil {
 				return nil, ObjectID{}, err
 			}
 			if parent.Type != "directory" {
@@ -824,8 +828,8 @@ func buildFilesystemMutationSequential(state *graphState, origin SnapshotID, roo
 				return nil, ObjectID{}, fmt.Errorf("looking up parent inode %d: %w", operation.DeleteEntry.Parent, lookupErr)
 			}
 			parentObject, _ := mutation.object(parentID)
-			var parent InodeRecord
-			if err := json.Unmarshal(parentObject.Data, &parent); err != nil {
+			parent, err := decodeInodeRecord(parentObject.Data)
+			if err != nil {
 				return nil, ObjectID{}, err
 			}
 			directoryBuilder := bTreeBuilder{mutation: mutation, kind: ObjectKindDirectoryNode}
@@ -1157,8 +1161,8 @@ func filesystemLookupObjects(rootID ObjectID, parent uint64, name string, object
 	if !exists || parentObject.ID.Kind != ObjectKindInode {
 		return DirectoryEntryRecord{}, false, errors.New("inode tree references missing or invalid parent inode")
 	}
-	var parentInode InodeRecord
-	if err := json.Unmarshal(parentObject.Data, &parentInode); err != nil {
+	parentInode, err := decodeInodeRecord(parentObject.Data)
+	if err != nil {
 		return DirectoryEntryRecord{}, false, err
 	}
 	id, ok, err := bTreeLookupObjects(parentInode.Directory, ObjectKindDirectoryNode, key[8:], objectFor)
@@ -1209,8 +1213,8 @@ func filesystemDirectoryObjects(rootID ObjectID, parent uint64, objectFor func(O
 	if !exists || parentObject.ID.Kind != ObjectKindInode {
 		return nil, errors.New("inode tree references missing or invalid parent inode")
 	}
-	var parentInode InodeRecord
-	if err := json.Unmarshal(parentObject.Data, &parentInode); err != nil {
+	parentInode, err := decodeInodeRecord(parentObject.Data)
+	if err != nil {
 		return nil, err
 	}
 	if parentInode.Directory.IsZero() {
