@@ -1059,7 +1059,7 @@ func encodeReferenceLedgerCheckpoint(checkpoint *referenceLedgerCheckpoint) ([]b
 	if err != nil {
 		return nil, err
 	}
-	out := make([]byte, 0, len(head)+len(tail)+len(state.Objects)*256)
+	out := make([]byte, 0, len(head)+len(tail)+objectTableJSONSize(state.Objects))
 	// head ends in the two braces that close the state and the checkpoint.
 	out = append(out, head[:len(head)-2]...)
 	out = append(out, `,"Objects":`...)

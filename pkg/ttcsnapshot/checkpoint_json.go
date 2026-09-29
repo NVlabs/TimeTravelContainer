@@ -59,13 +59,24 @@ func encodeGraphCheckpoint(state *graphState) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := make([]byte, 0, len(head)+len(tail)+len(state.Objects)*256)
+	out := make([]byte, 0, len(head)+len(tail)+objectTableJSONSize(state.Objects))
 	out = append(out, head[:len(head)-1]...)
 	out = append(out, `,"Objects":`...)
 	out = appendObjectTableJSON(out, state.Objects)
 	out = append(out, ',')
 	out = append(out, tail[1:]...)
 	return out, nil
+}
+
+// objectTableJSONSize estimates, generously, the length of objects as
+// appendObjectTableJSON writes it. A buffer sized at 256 bytes an object grew
+// as a checkpoint filled it, and copied a checkpoint of 100 MB over and over.
+func objectTableJSONSize(objects map[string]Object) int {
+	size := 2
+	for key, object := range objects {
+		size += len(key) + 4 + 190 + len(object.State) + base64.StdEncoding.EncodedLen(len(object.Data)) + 64*len(object.Children) + len(object.SourceCatalog)
+	}
+	return size
 }
 
 // appendObjectTableJSON appends objects as json.Marshal writes it.
