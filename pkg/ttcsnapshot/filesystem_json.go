@@ -222,8 +222,15 @@ func decodeDirectoryEntryRecord(data []byte) (DirectoryEntryRecord, error) {
 func decodeCanonicalInodeRecord(data []byte) (InodeRecord, bool) {
 	d := checkpointDecoder{data: data}
 	var inode InodeRecord
+	ok := d.inodeRecord(&inode)
+	d.space()
+	return inode, ok && d.pos == len(d.data)
+}
+
+// inodeRecord consumes an inode record of the canonical form.
+func (d *checkpointDecoder) inodeRecord(inode *InodeRecord) bool {
 	var seen [17]bool
-	ok := d.members(func(name []byte) bool {
+	return d.members(func(name []byte) bool {
 		var index int
 		var ok bool
 		var value uint64
@@ -302,8 +309,6 @@ func decodeCanonicalInodeRecord(data []byte) (InodeRecord, bool) {
 		seen[index] = true
 		return ok
 	})
-	d.space()
-	return inode, ok && d.pos == len(d.data)
 }
 
 // decodeCanonicalDirectoryEntryRecord is decodeCanonicalInodeRecord for a
@@ -311,8 +316,16 @@ func decodeCanonicalInodeRecord(data []byte) (InodeRecord, bool) {
 func decodeCanonicalDirectoryEntryRecord(data []byte) (DirectoryEntryRecord, bool) {
 	d := checkpointDecoder{data: data}
 	var entry DirectoryEntryRecord
+	ok := d.directoryEntryRecord(&entry)
+	d.space()
+	return entry, ok && d.pos == len(d.data)
+}
+
+// directoryEntryRecord consumes a directory entry record of the canonical
+// form.
+func (d *checkpointDecoder) directoryEntryRecord(entry *DirectoryEntryRecord) bool {
 	var seen [3]bool
-	ok := d.members(func(name []byte) bool {
+	return d.members(func(name []byte) bool {
 		var index int
 		var ok bool
 		switch string(name) {
@@ -335,8 +348,6 @@ func decodeCanonicalDirectoryEntryRecord(data []byte) (DirectoryEntryRecord, boo
 		seen[index] = true
 		return ok
 	})
-	d.space()
-	return entry, ok && d.pos == len(d.data)
 }
 
 // xattrs consumes a map of base64 values, or null, as json.Unmarshal does

@@ -216,3 +216,378 @@ func appendFilesystemMutationJSON(out []byte, mutation *filesystemJournalMutatio
 	out = appendObjectIDJSON(out, mutation.Result)
 	return append(out, '}'), nil
 }
+
+// decodeJournalRecord decodes a journal record as json.Unmarshal does. A
+// record as encodeJournalRecord writes one is decoded without reflection, but
+// for its handoffs; anything else, however valid, is left to encoding/json
+// whole, so that the two can never differ. A store opening a graph replays
+// every record since its checkpoint: a guest's 100,000 new files are 100,000
+// records.
+func decodeJournalRecord(data []byte) (journalRecord, error) {
+	if record, ok := decodeCanonicalJournalRecord(data); ok {
+		return record, nil
+	}
+	var record journalRecord
+	err := json.Unmarshal(data, &record)
+	return record, err
+}
+
+// decodeCanonicalJournalRecord decodes a record of the canonical form. It
+// reports false for anything else.
+func decodeCanonicalJournalRecord(data []byte) (journalRecord, bool) {
+	d := checkpointDecoder{data: data}
+	var record journalRecord
+	var seen [4]bool
+	ok := d.members(func(name []byte) bool {
+		var index int
+		var ok bool
+		switch string(name) {
+		case "Version":
+			var version uint64
+			version, ok = d.integer(31)
+			record.Version = int(version)
+		case "Sequence":
+			index = 1
+			record.Sequence, ok = d.integer(64)
+		case "Ops":
+			index = 2
+			ok = d.journalOps(&record.Ops)
+		case "References":
+			index = 3
+			ok = d.journalReferences(&record.References)
+		default:
+			return false
+		}
+		if seen[index] {
+			return false
+		}
+		seen[index] = true
+		return ok
+	})
+	d.space()
+	return record, ok && d.pos == len(d.data)
+}
+
+// array consumes an array, or null, calling element with the decoder at each
+// element, which element consumes. It reports whether the array was null.
+func (d *checkpointDecoder) array(element func() bool) (null, ok bool) {
+	if d.literal("null") {
+		return true, true
+	}
+	if !d.consume('[') {
+		return false, false
+	}
+	if d.consume(']') {
+		return false, true
+	}
+	for {
+		if !element() {
+			return false, false
+		}
+		if d.consume(',') {
+			continue
+		}
+		return false, d.consume(']')
+	}
+}
+
+func (d *checkpointDecoder) journalOps(value *[]journalOp) bool {
+	ops := []journalOp{}
+	null, ok := d.array(func() bool {
+		ops = append(ops, journalOp{})
+		return d.journalOp(&ops[len(ops)-1])
+	})
+	if null {
+		ops = nil
+	}
+	*value = ops
+	return ok
+}
+
+func (d *checkpointDecoder) journalReferences(value *[]journalReference) bool {
+	references := []journalReference{}
+	null, ok := d.array(func() bool {
+		var reference journalReference
+		var seen [3]bool
+		if !d.members(func(name []byte) bool {
+			var index int
+			var ok bool
+			switch string(name) {
+			case "Object":
+				ok = d.objectID(&reference.Object)
+			case "Refs":
+				index = 1
+				reference.Refs, ok = d.integer(64)
+			case "State":
+				index = 2
+				var state []byte
+				state, ok = d.plainString()
+				reference.State = ObjectState(state)
+			default:
+				return false
+			}
+			if seen[index] {
+				return false
+			}
+			seen[index] = true
+			return ok
+		}) {
+			return false
+		}
+		references = append(references, reference)
+		return true
+	})
+	if null {
+		references = nil
+	}
+	*value = references
+	return ok
+}
+
+// boolean consumes true or false.
+func (d *checkpointDecoder) boolean(value *bool) bool {
+	if d.literal("true") {
+		*value = true
+		return true
+	}
+	*value = false
+	return d.literal("false")
+}
+
+// objectIDPointer consumes an object ID, or null, into a new ID.
+func (d *checkpointDecoder) objectIDPointer(value **ObjectID) bool {
+	if d.literal("null") {
+		*value = nil
+		return true
+	}
+	*value = new(ObjectID)
+	return d.objectID(*value)
+}
+
+// unmarshaled consumes a value, or null, that encoding/json decodes into
+// target, a pointer to a pointer it sets.
+func (d *checkpointDecoder) unmarshaled(target any) bool {
+	start := d.pos
+	if !d.skip(0) {
+		return false
+	}
+	return json.Unmarshal(d.data[start:d.pos], target) == nil
+}
+
+func (d *checkpointDecoder) journalOp(op *journalOp) bool {
+	var seen [16]bool
+	return d.members(func(name []byte) bool {
+		var index int
+		var ok bool
+		var value uint64
+		switch string(name) {
+		case "PutSnapshot":
+			if d.literal("null") {
+				op.PutSnapshot, ok = nil, true
+				break
+			}
+			snapshot := new(Snapshot)
+			var fields [3]bool
+			ok = d.members(func(name []byte) bool {
+				var field int
+				var ok bool
+				switch string(name) {
+				case "ID":
+					value, ok = d.integer(64)
+					snapshot.ID = SnapshotID(value)
+				case "State":
+					field = 1
+					var state []byte
+					state, ok = d.plainString()
+					snapshot.State = SnapshotState(state)
+				case "NextOrdinal":
+					field = 2
+					snapshot.NextOrdinal, ok = d.integer(64)
+				default:
+					return false
+				}
+				if fields[field] {
+					return false
+				}
+				fields[field] = true
+				return ok
+			})
+			op.PutSnapshot = snapshot
+		case "DeleteSnapshot":
+			index = 1
+			value, ok = d.integer(64)
+			op.DeleteSnapshot = SnapshotID(value)
+		case "PutObject":
+			index = 2
+			if d.literal("null") {
+				op.PutObject, ok = nil, true
+				break
+			}
+			op.PutObject = new(Object)
+			ok = d.object(op.PutObject)
+		case "DeleteObject":
+			index = 3
+			var key []byte
+			key, ok = d.plainString()
+			op.DeleteObject = string(key)
+		case "RootName":
+			index = 4
+			var root []byte
+			root, ok = d.plainString()
+			op.RootName = string(root)
+		case "PutRoot":
+			index = 5
+			ok = d.objectIDPointer(&op.PutRoot)
+		case "DeleteRoot":
+			index = 6
+			ok = d.boolean(&op.DeleteRoot)
+		case "PinName":
+			index = 7
+			var pin []byte
+			pin, ok = d.plainString()
+			op.PinName = string(pin)
+		case "PutPin":
+			index = 8
+			ok = d.objectIDPointer(&op.PutPin)
+		case "DeletePin":
+			index = 9
+			ok = d.boolean(&op.DeletePin)
+		case "SetNextSnapshot":
+			index = 10
+			if d.literal("null") {
+				op.SetNextSnapshot, ok = nil, true
+				break
+			}
+			value, ok = d.integer(64)
+			next := SnapshotID(value)
+			op.SetNextSnapshot = &next
+		case "FreezeSnapshot":
+			index = 11
+			value, ok = d.integer(64)
+			op.FreezeSnapshot = SnapshotID(value)
+		case "UnfreezeSnapshot":
+			index = 12
+			value, ok = d.integer(64)
+			op.UnfreezeSnapshot = SnapshotID(value)
+		case "BeginHandoff":
+			// Handoffs are rare: encoding/json decodes them.
+			index = 13
+			ok = d.unmarshaled(&op.BeginHandoff)
+		case "AppendHandoff":
+			index = 14
+			ok = d.unmarshaled(&op.AppendHandoff)
+		case "ApplyFilesystem":
+			index = 15
+			if d.literal("null") {
+				op.ApplyFilesystem, ok = nil, true
+				break
+			}
+			op.ApplyFilesystem = new(filesystemJournalMutation)
+			ok = d.filesystemMutation(op.ApplyFilesystem)
+		default:
+			return false
+		}
+		if seen[index] {
+			return false
+		}
+		seen[index] = true
+		return ok
+	})
+}
+
+func (d *checkpointDecoder) filesystemMutation(mutation *filesystemJournalMutation) bool {
+	var seen [5]bool
+	return d.members(func(name []byte) bool {
+		var index int
+		var ok bool
+		switch string(name) {
+		case "Origin":
+			var origin uint64
+			origin, ok = d.integer(64)
+			mutation.Origin = SnapshotID(origin)
+		case "RootName":
+			index = 1
+			var root []byte
+			root, ok = d.plainString()
+			mutation.RootName = string(root)
+		case "Operations":
+			index = 2
+			operations := []FilesystemOperation{}
+			var null bool
+			null, ok = d.array(func() bool {
+				operations = append(operations, FilesystemOperation{})
+				return d.filesystemOperation(&operations[len(operations)-1])
+			})
+			if null {
+				operations = nil
+			}
+			mutation.Operations = operations
+		case "ReleasePins":
+			index = 3
+			pins := []string{}
+			var null bool
+			null, ok = d.array(func() bool {
+				pin, ok := d.plainString()
+				pins = append(pins, string(pin))
+				return ok
+			})
+			if null {
+				pins = nil
+			}
+			mutation.ReleasePins = pins
+		case "Result":
+			index = 4
+			ok = d.objectID(&mutation.Result)
+		default:
+			return false
+		}
+		if seen[index] {
+			return false
+		}
+		seen[index] = true
+		return ok
+	})
+}
+
+func (d *checkpointDecoder) filesystemOperation(operation *FilesystemOperation) bool {
+	var seen [4]bool
+	return d.members(func(name []byte) bool {
+		var index int
+		var ok bool
+		switch string(name) {
+		case "PutInode":
+			if d.literal("null") {
+				operation.PutInode, ok = nil, true
+				break
+			}
+			operation.PutInode = new(InodeRecord)
+			ok = d.inodeRecord(operation.PutInode)
+		case "DeleteInode":
+			index = 1
+			operation.DeleteInode, ok = d.integer(64)
+		case "PutEntry":
+			index = 2
+			if d.literal("null") {
+				operation.PutEntry, ok = nil, true
+				break
+			}
+			operation.PutEntry = new(DirectoryEntryRecord)
+			ok = d.directoryEntryRecord(operation.PutEntry)
+		case "DeleteEntry":
+			index = 3
+			if d.literal("null") {
+				operation.DeleteEntry, ok = nil, true
+				break
+			}
+			operation.DeleteEntry = new(DirectoryEntryRecord)
+			ok = d.directoryEntryRecord(operation.DeleteEntry)
+		default:
+			return false
+		}
+		if seen[index] {
+			return false
+		}
+		seen[index] = true
+		return ok
+	})
+}

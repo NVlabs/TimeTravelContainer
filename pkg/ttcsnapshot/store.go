@@ -1414,8 +1414,8 @@ func (s *Store) replayJournal(repairTail bool) error {
 			break
 		}
 		offset += int64(length)
-		var record journalRecord
-		if err := json.Unmarshal(data, &record); err != nil {
+		record, err := decodeJournalRecord(data)
+		if err != nil {
 			return fmt.Errorf("decoding TTC snapshot graph journal record at %d: %w", recordStart, err)
 		}
 		if record.Version != formatVersion {
@@ -1491,8 +1491,8 @@ func (s *Store) replayJournalSuffix(repairTail bool) error {
 			break
 		}
 		offset += int64(length)
-		var record journalRecord
-		if err := json.Unmarshal(data, &record); err != nil {
+		record, err := decodeJournalRecord(data)
+		if err != nil {
 			return fmt.Errorf("decoding TTC snapshot graph journal record at %d: %w", recordStart, err)
 		}
 		if err := validateJournalRecord(record); err != nil {
