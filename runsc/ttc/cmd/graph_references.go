@@ -1098,7 +1098,14 @@ func (b *runtimeBackend) reconcileProviderClaims() error {
 type providerCheck struct {
 	next     time.Time
 	interval time.Duration
+	// busy counts the checks in a row that found the claim's repository in
+	// use by another handle, and so did not read it.
+	busy int
 }
+
+// providerCheckBusyLimit is the checks in a row that may find a claim's
+// repository in use before one reads it anyway.
+const providerCheckBusyLimit = 5
 
 // reconcileProviderReferences releases the provider claim at path once its
 // graph references nothing of the claim's origin, checking a claim that is
@@ -1119,7 +1126,11 @@ func (b *runtimeBackend) reconcileProviderReferences(path string, intent graphRe
 		return b.releaseDistributedGraphReferences(intent.Operation)
 	}
 	if volatile {
-		if _, _, frozen, err := b.providerGraphReferences(intent.Repository, origin); err != nil || frozen {
+		if _, _, frozen, err := b.providerGraphReferences(intent.Repository, origin, true); err != nil || frozen {
+			if errors.Is(err, ttcvolume.ErrRepositoryBusy) {
+				// Checked again, at the next reconciliation.
+				return nil
+			}
 			return err
 		}
 		// The handoff was canceled before it committed, and the origin's
@@ -1142,10 +1153,20 @@ func (b *runtimeBackend) reconcileProviderReferences(path string, intent graphRe
 			return nil
 		}
 	}
-	references, edges, _, err := b.providerGraphReferences(intent.Repository, origin)
+	// A repository another handle has open is read once it is idle, or once
+	// it has been found in use too often.
+	references, edges, _, err := b.providerGraphReferences(intent.Repository, origin, check.busy < providerCheckBusyLimit)
+	if errors.Is(err, ttcvolume.ErrRepositoryBusy) {
+		check.busy++
+		check.interval = min(max(2*check.interval, 5*time.Second), 2*time.Minute)
+		check.next = now.Add(check.interval)
+		b.distributedSource.providerChecks.Store(intent.Operation, check)
+		return nil
+	}
 	if err != nil {
 		return err
 	}
+	check.busy = 0
 	if providerReferencesNeeded(references, edges) {
 		check.interval = min(max(2*check.interval, 5*time.Second), 2*time.Minute)
 		check.next = now.Add(check.interval)
@@ -1159,8 +1180,10 @@ func (b *runtimeBackend) reconcileProviderReferences(path string, intent graphRe
 // providerGraphReferences returns what the graph of the repository at
 // repository, or the memory graph when it is empty, still references of
 // origin, as OriginReferences returns it, and whether origin's handoff is
-// frozen there. A repository that is gone references nothing.
-func (b *runtimeBackend) providerGraphReferences(repository string, origin ttcsnapshot.SnapshotID) (map[string]ttcsnapshot.ObjectID, bool, bool, error) {
+// frozen there. A repository that is gone references nothing. With ifIdle,
+// a repository another handle has open is not read: it reports
+// ttcvolume.ErrRepositoryBusy.
+func (b *runtimeBackend) providerGraphReferences(repository string, origin ttcsnapshot.SnapshotID, ifIdle bool) (map[string]ttcsnapshot.ObjectID, bool, bool, error) {
 	if repository == "" {
 		if b.snapshotGraph == nil {
 			return nil, false, false, nil
@@ -1168,7 +1191,11 @@ func (b *runtimeBackend) providerGraphReferences(repository string, origin ttcsn
 		references, edges := b.snapshotGraph.OriginReferences(origin)
 		return references, edges, b.snapshotGraph.SnapshotLedgerFrozen(origin), nil
 	}
-	references, edges, frozen, err := ttcvolume.ReadOriginReferences(repository, origin)
+	read := ttcvolume.ReadOriginReferences
+	if ifIdle {
+		read = ttcvolume.ReadOriginReferencesIfIdle
+	}
+	references, edges, frozen, err := read(repository, origin)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, false, false, nil
 	}

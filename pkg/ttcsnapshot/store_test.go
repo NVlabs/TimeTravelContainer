@@ -3195,3 +3195,45 @@ func TestGraphStateCacheIsTakenWhileOpen(t *testing.T) {
 		t.Fatal("the state taken again differs from the graph")
 	}
 }
+
+// GraphHeld reports a graph whose cached state an open store took, until
+// the store closes.
+func TestGraphHeld(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "graph")
+	held := func(want bool) {
+		t.Helper()
+		if got, err := GraphHeld(dir); err != nil || got != want {
+			t.Fatalf("GraphHeld = %t, %v; want %t", got, err, want)
+		}
+	}
+	open := func() *Store {
+		t.Helper()
+		graph, err := OpenExternallyCoordinated(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return graph
+	}
+	closeGraph := func(graph *Store) {
+		t.Helper()
+		if err := graph.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	loaded := open()
+	held(false)
+	closeGraph(loaded)
+	held(false)
+	taker := open()
+	held(true)
+	// Opened meanwhile, the graph is loaded afresh, and holds nothing.
+	meanwhile := open()
+	closeGraph(meanwhile)
+	held(true)
+	closeGraph(taker)
+	held(false)
+	again := open()
+	held(true)
+	closeGraph(again)
+	held(false)
+}

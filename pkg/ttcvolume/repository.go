@@ -891,9 +891,32 @@ func (r *Repository) OriginReferences(origin ttcsnapshot.SnapshotID) (map[string
 // not. It returns an error satisfying os.ErrNotExist when path has no
 // repository.
 func ReadOriginReferences(path string, origin ttcsnapshot.SnapshotID) (map[string]ttcsnapshot.ObjectID, bool, bool, error) {
+	return readOriginReferences(path, origin, false)
+}
+
+// ErrRepositoryBusy is ReadOriginReferencesIfIdle's report of a repository
+// whose graph another handle of this process has open.
+var ErrRepositoryBusy = errors.New("repository graph is open in this process")
+
+// ReadOriginReferencesIfIdle is ReadOriginReferences, but for a repository
+// whose graph another handle of this process has open, which it reports
+// with ErrRepositoryBusy: the handle holds the graph's cached state, and
+// reading the graph meanwhile loads it afresh, 1.7 s for 300,000 objects.
+func ReadOriginReferencesIfIdle(path string, origin ttcsnapshot.SnapshotID) (map[string]ttcsnapshot.ObjectID, bool, bool, error) {
+	return readOriginReferences(path, origin, true)
+}
+
+func readOriginReferences(path string, origin ttcsnapshot.SnapshotID, ifIdle bool) (map[string]ttcsnapshot.ObjectID, bool, bool, error) {
 	dir := filepath.Join(path, "graph")
 	if _, err := os.Stat(dir); err != nil {
 		return nil, false, false, err
+	}
+	if ifIdle {
+		if held, err := ttcsnapshot.GraphHeld(dir); err != nil {
+			return nil, false, false, err
+		} else if held {
+			return nil, false, false, ErrRepositoryBusy
+		}
 	}
 	graph, err := ttcsnapshot.OpenExternallyCoordinated(dir)
 	if err != nil {

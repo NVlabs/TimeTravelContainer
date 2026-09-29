@@ -326,6 +326,10 @@ type Store struct {
 	// its whole lifetime. Callers must invoke Reload while holding that flock
 	// before every mutation that may race another process.
 	externallyCoordinated bool
+	// holding is set while the store holds the graph state it took from
+	// graphStates for heldDirectory, which GraphHeld reports.
+	holding       bool
+	heldDirectory graphFileIdentity
 	// externalTransaction is true while the enclosing repository holds this
 	// graph's cross-process writer fence. Repository transactions retain the
 	// fence from reload through their final graph mutation; otherwise a lazy
@@ -747,6 +751,10 @@ func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cacheStateLocked()
+	if s.holding {
+		graphStates.release(s.heldDirectory)
+		s.holding = false
+	}
 	var err error
 	if s.journal != nil {
 		err = s.journal.Close()
@@ -965,7 +973,7 @@ func (s *Store) loadCurrentGeneration(repairTail bool) error {
 // five times in one rehydration. An open that finds the generation's
 // checkpoint unchanged starts from the cached state, and replays only the
 // journal after it.
-var graphStates = graphStateCache{entries: make(map[graphFileIdentity]*cachedGraphState)}
+var graphStates = graphStateCache{entries: make(map[graphFileIdentity]*cachedGraphState), held: make(map[graphFileIdentity]int)}
 
 // graphStateCacheObjects bounds the objects of the cached states.
 const graphStateCacheObjects = 1 << 19
@@ -1000,7 +1008,7 @@ type cachedGraphState struct {
 	checkpointBytes   int64
 	checkpointObjects int
 	journalEnd        int64
-	// state is never written: a Store takes a copy of it.
+	// state is a closed store's, which the store that takes it changes.
 	state graphState
 	used  uint64
 }
@@ -1009,6 +1017,9 @@ type graphStateCache struct {
 	mu sync.Mutex
 	// entries holds a state per graph directory.
 	entries map[graphFileIdentity]*cachedGraphState
+	// held counts, for each graph directory, the open stores that took its
+	// state from the cache.
+	held    map[graphFileIdentity]int
 	objects int
 	uses    uint64
 }
@@ -1027,7 +1038,30 @@ func (c *graphStateCache) take(directory graphFileIdentity, generation uint64, c
 	}
 	delete(c.entries, directory)
 	c.objects -= len(entry.state.Objects)
+	c.held[directory]++
 	return entry, true
+}
+
+// release records that a store that took directory's state holds it no more.
+func (c *graphStateCache) release(directory graphFileIdentity) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.held[directory]--; c.held[directory] <= 0 {
+		delete(c.held, directory)
+	}
+}
+
+// GraphHeld reports whether a store of this process that took the graph at
+// dir from the cache has it open: another opening would load it afresh,
+// 1.7 s for a graph of 300,000 objects.
+func GraphHeld(dir string) (bool, error) {
+	var stat unix.Stat_t
+	if err := unix.Stat(dir, &stat); err != nil {
+		return false, err
+	}
+	graphStates.mu.Lock()
+	defer graphStates.mu.Unlock()
+	return graphStates.held[graphFileIdentity{dev: uint64(stat.Dev), ino: stat.Ino}] > 0, nil
 }
 
 func (c *graphStateCache) put(directory graphFileIdentity, entry *cachedGraphState) {
@@ -1102,6 +1136,7 @@ func (s *Store) loadCachedGeneration(head graphHead, repairTail bool) (bool, err
 	}
 	journal, err := s.openFile(graphJournalName(head.Generation), unix.O_RDWR, 0600)
 	if err != nil {
+		graphStates.release(directory)
 		graphStates.put(directory, cached)
 		return false, nil
 	}
@@ -1111,6 +1146,7 @@ func (s *Store) loadCachedGeneration(head graphHead, repairTail bool) (bool, err
 	if _, readErr := journal.ReadAt(header, 0); readErr != nil || statErr != nil || string(header) != journalHeader ||
 		uint64(stat.Dev) != cached.journal.dev || stat.Ino != cached.journal.ino || stat.Size < cached.journalEnd {
 		journal.Close()
+		graphStates.release(directory)
 		graphStates.put(directory, cached)
 		return false, nil
 	}
@@ -1136,6 +1172,7 @@ func (s *Store) loadCachedGeneration(head graphHead, repairTail bool) (bool, err
 		s.rebuildDeferredObjectsLocked()
 		s.rebuildMemoryIndexesLocked()
 		journal.Close()
+		graphStates.release(directory)
 	}
 	if err := s.replayJournalSuffix(repairTail); err != nil {
 		// The cached state and the journal disagree, or the journal is
@@ -1152,6 +1189,11 @@ func (s *Store) loadCachedGeneration(head graphHead, repairTail bool) (bool, err
 	}
 	s.checkpointBytes = cached.checkpointBytes
 	s.checkpointObjects = cached.checkpointObjects
+	// A store holds its graph once, however often it takes its state.
+	if s.holding {
+		graphStates.release(directory)
+	}
+	s.holding, s.heldDirectory = true, directory
 	return true, nil
 }
 
