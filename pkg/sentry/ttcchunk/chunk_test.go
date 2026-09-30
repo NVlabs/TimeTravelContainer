@@ -17,8 +17,10 @@ import (
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
 
@@ -969,5 +971,49 @@ func TestCaptureImportPlanOrdersPagesAndMappings(t *testing.T) {
 	manifest.Runs = append(manifest.Runs, run(8, 7, 1))
 	if _, _, _, err := planCaptureImport(manifest, "plan"); err == nil {
 		t.Fatal("a page index mapped to two pages was planned")
+	}
+}
+
+// BenchmarkInstallManifestSet installs the manifest of 1.5 GiB of memory,
+// 1,536 chunks of 256 pages, as a rehydration does.
+func BenchmarkInstallManifestSet(b *testing.B) {
+	const chunks = 1536
+	allocator := testAllocator(31)
+	manifest := Manifest{Runs: make([]ManifestRun, 0, chunks)}
+	for chunk := uint64(0); chunk < chunks; chunk++ {
+		logical := pgalloc.LogicalChunkID{Allocator: allocator, Sequence: chunk + 1}
+		manifest.Runs = append(manifest.Runs, ManifestRun{
+			OldOffset: chunk * PagesPerChunk * hostarch.PageSize, References: 1,
+			FirstPage:    pgalloc.LogicalPageID{Allocator: allocator, Sequence: logical.Sequence * PagesPerChunk},
+			FirstVersion: pgalloc.PageVersionID{Allocator: testAllocator(32), Sequence: 1 + chunk*PagesPerChunk},
+			Logical:      logical, Pages: PagesPerChunk, Object: graphCaptureObjectID(chunk + 1),
+		})
+	}
+	file, err := os.CreateTemp("", "ttc-install-")
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := os.Remove(file.Name()); err != nil {
+		b.Fatal(err)
+	}
+	mf, err := pgalloc.NewMemoryFile(file, pgalloc.MemoryFileOpts{
+		DelayedEviction: pgalloc.DelayedEvictionDisabled, DisableIMAWorkAround: true, DisableMemoryAccounting: true,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer mf.Destroy()
+	files := map[checkpoint.ResourceID]*pgalloc.MemoryFile{{}: mf}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		result, err := InstallManifestSet(files, manifest, usage.Anonymous, 0)
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.StopTimer()
+		if err := result.Abort(); err != nil {
+			b.Fatal(err)
+		}
+		b.StartTimer()
 	}
 }

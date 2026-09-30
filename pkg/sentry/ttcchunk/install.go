@@ -4,8 +4,11 @@
 package ttcchunk
 
 import (
+	"bytes"
+	"cmp"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -131,6 +134,15 @@ func (r *InstallResult) Abort() error { return r.transaction.Abort() }
 
 // InstallManifest installs an already-loaded immutable graph manifest.
 func InstallManifest(mf *pgalloc.MemoryFile, manifest Manifest, kind usage.MemoryKind, memCgID uint32) (InstallResult, error) {
+	return installManifest(mf, manifest, kind, memCgID, pgalloc.NewSparseRelocation())
+}
+
+// compareIDs orders IDs as their String forms are ordered.
+func compareIDs(a, b ID) int { return bytes.Compare(a[:], b[:]) }
+
+// installManifest is InstallManifest, recording the relocation of the
+// manifest's pages in relocation.
+func installManifest(mf *pgalloc.MemoryFile, manifest Manifest, kind usage.MemoryKind, memCgID uint32, relocation *pgalloc.SparseRelocation) (InstallResult, error) {
 	if mf == nil {
 		return InstallResult{}, fmt.Errorf("installing manifest into nil MemoryFile")
 	}
@@ -144,55 +156,38 @@ func InstallManifest(mf *pgalloc.MemoryFile, manifest Manifest, kind usage.Memor
 	// cold remote restore that would eagerly fetch every 1 MiB chunk before the
 	// first guest instruction. Page contents are loaded by ChunkReader when the
 	// corresponding resident range first faults in.
-	// An object may hold pages of several logical chunks, packed.
-	objects := make(map[ID][]int)
-	for index, run := range manifest.Runs {
-		objects[run.Object] = append(objects[run.Object], index)
+	// An object may hold pages of several logical chunks, packed. Objects
+	// are installed in the order of their first pages.
+	type objectInstall struct {
+		firstOldOffset uint64
+		install        pgalloc.SparseChunkInstall
 	}
-	objectIDs := make([]ID, 0, len(objects))
-	firstOldOffset := make(map[ID]uint64, len(objects))
-	for object, runs := range objects {
-		objectIDs = append(objectIDs, object)
-		firstOldOffset[object] = ^uint64(0)
-		for _, index := range runs {
-			firstOldOffset[object] = min(firstOldOffset[object], manifest.Runs[index].OldOffset)
+	objects := make(map[ID]int)
+	var ordered []objectInstall
+	for _, run := range manifest.Runs {
+		at, ok := objects[run.Object]
+		if !ok {
+			at = len(ordered)
+			objects[run.Object] = at
+			ordered = append(ordered, objectInstall{firstOldOffset: run.OldOffset, install: pgalloc.SparseChunkInstall{
+				Object: pgalloc.SparseChunkObjectID(run.Object), Kind: kind, MemCgID: memCgID,
+			}})
 		}
+		object := &ordered[at]
+		object.firstOldOffset = min(object.firstOldOffset, run.OldOffset)
+		object.install.Runs = append(object.install.Runs, pgalloc.SparseChunkRun{
+			Position: run.ObjectPage, Pages: run.Pages, Page: run.FirstPage, Version: run.FirstVersion,
+		})
 	}
-	sort.Slice(objectIDs, func(i, j int) bool {
-		if firstOldOffset[objectIDs[i]] != firstOldOffset[objectIDs[j]] {
-			return firstOldOffset[objectIDs[i]] < firstOldOffset[objectIDs[j]]
+	slices.SortFunc(ordered, func(a, b objectInstall) int {
+		if c := cmp.Compare(a.firstOldOffset, b.firstOldOffset); c != 0 {
+			return c
 		}
-		return objectIDs[i].String() < objectIDs[j].String()
+		return compareIDs(ID(a.install.Object), ID(b.install.Object))
 	})
-	installs := make([]pgalloc.SparseChunkInstall, 0, len(objects))
-	for _, object := range objectIDs {
-		install := pgalloc.SparseChunkInstall{
-			Object: pgalloc.SparseChunkObjectID(object),
-			Kind:   kind, MemCgID: memCgID,
-		}
-		installedPages := make(map[uint8]pgalloc.SparseChunkPage)
-		for _, index := range objects[object] {
-			run := &manifest.Runs[index]
-			for i := uint16(0); i < run.Pages; i++ {
-				position := run.ObjectPage + uint8(i)
-				version := pgalloc.PageVersionID{Allocator: run.FirstVersion.Allocator, Sequence: run.FirstVersion.Sequence + uint64(i)}
-				page := pgalloc.SparseChunkPage{
-					Position: position,
-					Slot:     run.FirstSlot + uint8(i),
-					Page:     pgalloc.LogicalPageID{Allocator: run.FirstPage.Allocator, Sequence: run.FirstPage.Sequence + uint64(i)},
-					Version:  version, References: run.References,
-				}
-				if previous, ok := installedPages[position]; ok {
-					if previous != page {
-						return InstallResult{}, fmt.Errorf("manifest object %s page %d has conflicting page identities", object, position)
-					}
-					continue
-				}
-				installedPages[position] = page
-				install.Pages = append(install.Pages, page)
-			}
-		}
-		installs = append(installs, install)
+	installs := make([]pgalloc.SparseChunkInstall, len(ordered))
+	for i := range ordered {
+		installs[i] = ordered[i].install
 	}
 	transaction, err := mf.InstallSparseChunks(installs)
 	if err != nil {
@@ -205,28 +200,26 @@ func InstallManifest(mf *pgalloc.MemoryFile, manifest Manifest, kind usage.Memor
 		}
 	}()
 	newRanges := transaction.NewRanges()
-	relocation := pgalloc.NewSparseRelocation()
 	for _, run := range manifest.Runs {
 		resident, ok := mf.SparseChunkRange(pgalloc.SparseChunkObjectID(run.Object))
 		if !ok {
 			return InstallResult{}, fmt.Errorf("installed memory object %s has no resident range", run.Object)
 		}
-		for i := uint16(0); i < run.Pages; i++ {
-			if err := relocation.Add(run.ResourceID, run.OldOffset+uint64(i)*hostarch.PageSize, resident.Start+uint64(run.ObjectPage+uint8(i))*hostarch.PageSize); err != nil {
-				return InstallResult{}, err
-			}
+		old := memmap.FileRange{Start: run.OldOffset, End: run.OldOffset + uint64(run.Pages)*hostarch.PageSize}
+		if err := relocation.AddRange(run.ResourceID, old, resident.Start+uint64(run.ObjectPage)*hostarch.PageSize); err != nil {
+			return InstallResult{}, err
 		}
 	}
-	objectIDs = make([]ID, 0, len(newRanges))
+	objectIDs := make([]ID, 0, len(newRanges))
 	for object := range newRanges {
 		objectIDs = append(objectIDs, ID(object))
 	}
-	sort.Slice(objectIDs, func(i, j int) bool { return objectIDs[i].String() < objectIDs[j].String() })
+	slices.SortFunc(objectIDs, compareIDs)
 	allObjects := make([]ID, 0, len(objects))
 	for object := range objects {
 		allObjects = append(allObjects, object)
 	}
-	sort.Slice(allObjects, func(i, j int) bool { return allObjects[i].String() < allObjects[j].String() })
+	slices.SortFunc(allObjects, compareIDs)
 	result := InstallResult{Relocation: relocation, Chunks: make([]InstalledChunk, len(objectIDs)), Objects: allObjects, transaction: transaction}
 	for i, object := range objectIDs {
 		result.Chunks[i] = InstalledChunk{
@@ -274,30 +267,18 @@ func InstallManifestSet(memoryFiles map[checkpoint.ResourceID]*pgalloc.MemoryFil
 	}()
 	for _, resource := range resources {
 		submanifest := Manifest{Runs: runsByResource[resource]}
-		installed, err := InstallManifest(memoryFiles[resource], submanifest, kind, memCgID)
+		installed, err := installManifest(memoryFiles[resource], submanifest, kind, memCgID, result.Relocation)
 		if err != nil {
 			return InstallSetResult{}, err
 		}
 		result.transactions = append(result.transactions, installed.transaction)
 		result.Chunks = append(result.Chunks, installed.Chunks...)
 		result.Objects = append(result.Objects, installed.Objects...)
-		for _, run := range submanifest.Runs {
-			for i := uint16(0); i < run.Pages; i++ {
-				old := run.OldOffset + uint64(i)*hostarch.PageSize
-				target, ok := installed.Relocation.Page(resource, old)
-				if !ok {
-					return InstallSetResult{}, fmt.Errorf("submanifest relocation omitted %s:%#x", resource, old)
-				}
-				if err := result.Relocation.Add(resource, old, target); err != nil {
-					return InstallSetResult{}, err
-				}
-			}
-		}
 	}
 	for i := range result.Chunks {
 		result.Chunks[i].StreamOffset = uint64(i) * pgalloc.SparseChunkBytes
 	}
-	sort.Slice(result.Objects, func(i, j int) bool { return result.Objects[i].String() < result.Objects[j].String() })
+	slices.SortFunc(result.Objects, compareIDs)
 	committed = true
 	return result, nil
 }

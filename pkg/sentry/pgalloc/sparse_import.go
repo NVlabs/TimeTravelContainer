@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"sort"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -78,7 +79,7 @@ func (f *MemoryFile) InstallRemoteBindings(bindings []CapturedPageBinding, kind 
 			hash.Write(binding.Version.Allocator[:])
 			binary.BigEndian.PutUint64(encoded[:], binding.Version.Sequence)
 			hash.Write(encoded[:])
-			install.Pages = append(install.Pages, SparseChunkPage{Position: binding.Slot, Slot: binding.Slot, Page: binding.Page, Version: binding.Version, References: binding.References})
+			install.Runs = append(install.Runs, SparseChunkRun{Position: binding.Slot, Pages: 1, Page: binding.Page, Version: binding.Version})
 		}
 		copy(install.Object[:], hash.Sum(nil))
 		installs = append(installs, install)
@@ -152,31 +153,72 @@ func PagesPerSparseChunk() int { return logicalPagesPerChunk }
 // chunk. pgalloc treats it as opaque to avoid depending on the chunk codec.
 type SparseChunkObjectID [32]byte
 
-// SparseChunkPage describes one valid page in a sparse chunk and the number
-// of references the restored branch object graph will own. Position is the
-// page's index in the chunk object, where its bytes are, and Slot its index
-// in its logical chunk. A chunk may hold pages of several logical chunks,
-// packed together.
-type SparseChunkPage struct {
-	Position   uint8
-	Slot       uint8
-	Page       LogicalPageID
-	Version    PageVersionID
-	References uint64
+// SparseChunkRun describes Pages valid pages of a sparse chunk at
+// consecutive positions, whose page and version identities are consecutive
+// too. Position is the first page's index in the chunk object, where its
+// bytes are. A chunk may hold pages of several logical chunks, packed
+// together.
+type SparseChunkRun struct {
+	Position uint8
+	Pages    uint16
+	Page     LogicalPageID
+	Version  PageVersionID
+}
+
+// valid reports whether run's pages are in a chunk and have identities.
+func (run SparseChunkRun) valid() bool {
+	last := uint64(run.Pages) - 1
+	return run.Pages != 0 && uint16(run.Position)+run.Pages <= logicalPagesPerChunk &&
+		run.Page.Allocator != (LogicalAllocatorID{}) && run.Version.Allocator != (LogicalAllocatorID{}) &&
+		run.Page.Sequence <= math.MaxUint64-last && run.Version.Sequence <= math.MaxUint64-last
+}
+
+// aligns reports whether a page at a position of both run and next, which
+// starts no earlier, would have the same identities in each.
+func (run SparseChunkRun) aligns(next SparseChunkRun) bool {
+	delta := uint64(next.Position - run.Position)
+	return run.Page.Allocator == next.Page.Allocator && run.Version.Allocator == next.Version.Allocator &&
+		run.Page.Sequence <= math.MaxUint64-delta && run.Page.Sequence+delta == next.Page.Sequence &&
+		run.Version.Sequence <= math.MaxUint64-delta && run.Version.Sequence+delta == next.Version.Sequence
+}
+
+// normalizeSparseChunkRuns orders runs by position, lists a page given more
+// than once with one identity once, and merges runs whose identities continue
+// each other's. It fails if a page is given two identities. It reuses runs.
+func normalizeSparseChunkRuns(runs []SparseChunkRun) ([]SparseChunkRun, error) {
+	sort.Slice(runs, func(i, j int) bool { return runs[i].Position < runs[j].Position })
+	normalized := runs[:0]
+	for _, run := range runs {
+		if len(normalized) != 0 {
+			last := &normalized[len(normalized)-1]
+			end := uint16(last.Position) + last.Pages
+			aligned := uint16(run.Position) <= end && last.aligns(run)
+			if uint16(run.Position) < end && !aligned {
+				return nil, fmt.Errorf("page %d has two identities", run.Position)
+			}
+			if aligned {
+				last.Pages = max(end, uint16(run.Position)+run.Pages) - uint16(last.Position)
+				continue
+			}
+		}
+		normalized = append(normalized, run)
+	}
+	return normalized, nil
 }
 
 // SparseChunkInstall describes one immutable 1 MiB residency unit.
 type SparseChunkInstall struct {
 	Object  SparseChunkObjectID
-	Pages   []SparseChunkPage
+	Runs    []SparseChunkRun
 	Kind    usage.MemoryKind
 	MemCgID uint32
 }
 
 type sparseResidentChunk struct {
 	Range memmap.FileRange
-	// Pages are keyed by position.
-	Pages map[uint8]SparseChunkPage
+	// Runs are the unit's pages its installations used, as
+	// normalizeSparseChunkRuns leaves them.
+	Runs []SparseChunkRun
 }
 
 // SparseChunkInstallation is a transactional set of new residency units.
@@ -336,42 +378,63 @@ func (i *SparseChunkInstallation) Abort() error {
 	return nil
 }
 
-// SparseOffset identifies a page offset in a serialized MemoryFile.
-type SparseOffset struct {
-	ResourceID checkpoint.ResourceID
-	OldOffset  uint64
-}
-
 // SparseRelocation maps serialized page offsets to family-MemoryFile offsets.
 type SparseRelocation struct {
-	pages map[SparseOffset]uint64
+	// resources map each serialized MemoryFile's relocated ranges to the
+	// offsets they relocate to.
+	resources map[checkpoint.ResourceID]*sparseRelocationSet
 }
 
 // NewSparseRelocation creates an empty relocation table.
 func NewSparseRelocation() *SparseRelocation {
-	return &SparseRelocation{pages: make(map[SparseOffset]uint64)}
+	return &SparseRelocation{resources: make(map[checkpoint.ResourceID]*sparseRelocationSet)}
 }
 
 // Add records one page relocation. Repeated identical mappings are accepted.
 func (r *SparseRelocation) Add(resourceID checkpoint.ResourceID, oldOffset, newOffset uint64) error {
-	if r == nil || !hostarch.IsPageAligned(oldOffset) || !hostarch.IsPageAligned(newOffset) {
-		return fmt.Errorf("invalid sparse page relocation %s:%#x -> %#x", resourceID, oldOffset, newOffset)
+	return r.AddRange(resourceID, memmap.FileRange{Start: oldOffset, End: oldOffset + hostarch.PageSize}, newOffset)
+}
+
+// AddRange records that old's pages relocate to consecutive pages from
+// newStart. Pages it already records must relocate as they do here.
+func (r *SparseRelocation) AddRange(resourceID checkpoint.ResourceID, old memmap.FileRange, newStart uint64) error {
+	if r == nil || !old.WellFormed() || old.Length() == 0 || !hostarch.IsPageAligned(old.Start) || !hostarch.IsPageAligned(old.End) ||
+		!hostarch.IsPageAligned(newStart) || newStart > math.MaxUint64-old.Length() {
+		return fmt.Errorf("invalid sparse page relocation %s:%v -> %#x", resourceID, old, newStart)
 	}
-	key := SparseOffset{ResourceID: resourceID, OldOffset: oldOffset}
-	if previous, ok := r.pages[key]; ok && previous != newOffset {
-		return fmt.Errorf("conflicting sparse page relocation %s:%#x -> %#x and %#x", resourceID, oldOffset, previous, newOffset)
+	set := r.resources[resourceID]
+	if set == nil {
+		set = &sparseRelocationSet{}
+		r.resources[resourceID] = set
 	}
-	r.pages[key] = newOffset
+	cursor := old.Start
+	seg, gap := set.Find(cursor)
+	for cursor < old.End {
+		want := newStart + (cursor - old.Start)
+		if !seg.Ok() {
+			// Insert merges the new segment only with neighbors that
+			// relocate consistently with it: the pages they add need no
+			// check.
+			seg = set.Insert(gap, memmap.FileRange{Start: cursor, End: min(gap.End(), old.End)}, want)
+		} else if previous := seg.Value() + (cursor - seg.Start()); previous != want {
+			return fmt.Errorf("conflicting sparse page relocation %s:%#x -> %#x and %#x", resourceID, cursor, previous, want)
+		}
+		cursor = seg.End()
+		seg, gap = seg.NextNonEmpty()
+	}
 	return nil
 }
 
 // Page returns the relocated page offset.
 func (r *SparseRelocation) Page(resourceID checkpoint.ResourceID, oldOffset uint64) (uint64, bool) {
-	if r == nil {
+	if r == nil || r.resources[resourceID] == nil {
 		return 0, false
 	}
-	value, ok := r.pages[SparseOffset{ResourceID: resourceID, OldOffset: oldOffset}]
-	return value, ok
+	seg := r.resources[resourceID].FindSegment(oldOffset)
+	if !seg.Ok() {
+		return 0, false
+	}
+	return seg.Value() + (oldOffset - seg.Start()), true
 }
 
 // Range relocates a contiguous FileRange. It fails closed if any page is
@@ -393,19 +456,50 @@ func (r *SparseRelocation) Runs(resourceID checkpoint.ResourceID, old memmap.Fil
 	if !old.WellFormed() || old.Length() == 0 || !hostarch.IsPageAligned(old.Start) || !hostarch.IsPageAligned(old.End) {
 		return nil, fmt.Errorf("invalid sparse source range %s:%v", resourceID, old)
 	}
+	var set *sparseRelocationSet
+	if r != nil {
+		set = r.resources[resourceID]
+	}
+	if set == nil {
+		return nil, fmt.Errorf("sparse relocation is missing %s:%#x", resourceID, old.Start)
+	}
 	var runs []memmap.FileRange
-	for offset := old.Start; offset < old.End; offset += hostarch.PageSize {
-		target, ok := r.Page(resourceID, offset)
-		if !ok {
-			return nil, fmt.Errorf("sparse relocation is missing %s:%#x", resourceID, offset)
+	cursor := old.Start
+	for seg := set.FindSegment(cursor); cursor < old.End; seg = seg.NextSegment() {
+		if !seg.Ok() || seg.Start() > cursor {
+			return nil, fmt.Errorf("sparse relocation is missing %s:%#x", resourceID, cursor)
 		}
+		end := min(seg.End(), old.End)
+		target := seg.Value() + (cursor - seg.Start())
 		if len(runs) == 0 || runs[len(runs)-1].End != target {
-			runs = append(runs, memmap.FileRange{Start: target, End: target + hostarch.PageSize})
+			runs = append(runs, memmap.FileRange{Start: target, End: target + (end - cursor)})
 		} else {
-			runs[len(runs)-1].End += hostarch.PageSize
+			runs[len(runs)-1].End += end - cursor
 		}
+		cursor = end
 	}
 	return runs, nil
+}
+
+type sparseRelocationSetFunctions struct{}
+
+func (sparseRelocationSetFunctions) MinKey() uint64 {
+	return 0
+}
+
+func (sparseRelocationSetFunctions) MaxKey() uint64 {
+	return math.MaxUint64
+}
+
+func (sparseRelocationSetFunctions) ClearValue(*uint64) {
+}
+
+func (sparseRelocationSetFunctions) Merge(r1 memmap.FileRange, target1 uint64, _ memmap.FileRange, target2 uint64) (uint64, bool) {
+	return target1, target1+r1.Length() == target2
+}
+
+func (sparseRelocationSetFunctions) Split(r memmap.FileRange, target uint64, split uint64) (uint64, uint64) {
+	return target, target + (split - r.Start)
 }
 
 // InstallSparseChunks installs or reuses immutable resident chunks. It adds a
@@ -415,14 +509,13 @@ func (r *SparseRelocation) Runs(resourceID checkpoint.ResourceID, old memmap.Fil
 // bytes. The returned ranges identify only new chunks and should be registered
 // with a loader before restored state can access them.
 func (f *MemoryFile) InstallSparseChunks(installs []SparseChunkInstall) (*SparseChunkInstallation, error) {
-	ordered := append([]SparseChunkInstall(nil), installs...)
 	newRanges := make(map[SparseChunkObjectID]memmap.FileRange)
 	installation := &SparseChunkInstallation{mf: f, newRanges: newRanges}
 	rollback := func() {
 		_ = installation.Abort()
 	}
-	seen := make(map[SparseChunkObjectID]struct{}, len(ordered))
-	for _, install := range ordered {
+	seen := make(map[SparseChunkObjectID]struct{}, len(installs))
+	for _, install := range installs {
 		if install.Object == (SparseChunkObjectID{}) {
 			rollback()
 			return nil, fmt.Errorf("invalid sparse chunk object")
@@ -432,19 +525,18 @@ func (f *MemoryFile) InstallSparseChunks(installs []SparseChunkInstall) (*Sparse
 			return nil, fmt.Errorf("sparse chunk object %x is repeated", install.Object)
 		}
 		seen[install.Object] = struct{}{}
-		pages := make(map[uint8]SparseChunkPage, len(install.Pages))
-		for _, page := range install.Pages {
-			if _, slot := page.Page.Chunk(); slot != page.Slot || page.Page.Allocator == (LogicalAllocatorID{}) || page.References == 0 || page.Version.Allocator == (LogicalAllocatorID{}) {
+		for _, run := range install.Runs {
+			if !run.valid() {
 				rollback()
-				return nil, fmt.Errorf("invalid sparse chunk page %+v", page)
+				return nil, fmt.Errorf("invalid sparse chunk run %+v", run)
 			}
-			if _, ok := pages[page.Position]; ok {
-				rollback()
-				return nil, fmt.Errorf("sparse chunk repeats page %d", page.Position)
-			}
-			pages[page.Position] = page
 		}
-		if len(pages) == 0 {
+		runs, err := normalizeSparseChunkRuns(append([]SparseChunkRun(nil), install.Runs...))
+		if err != nil {
+			rollback()
+			return nil, fmt.Errorf("sparse chunk object %x: %w", install.Object, err)
+		}
+		if len(runs) == 0 {
 			rollback()
 			return nil, fmt.Errorf("sparse chunk object %x has no pages", install.Object)
 		}
@@ -459,25 +551,35 @@ func (f *MemoryFile) InstallSparseChunks(installs []SparseChunkInstall) (*Sparse
 			// range whichever branch installed it first, so a page only a
 			// later branch uses needs just its identity recorded. Pages both
 			// use must name the same page version.
-			for position, page := range pages {
-				if old, ok := resident.Pages[position]; ok && (old.Page != page.Page || old.Version != page.Version) {
-					f.mu.Unlock()
-					rollback()
-					return nil, fmt.Errorf("resident sparse chunk %x page %d identity mismatch", install.Object, position)
+			merged, err := normalizeSparseChunkRuns(append(append([]SparseChunkRun(nil), resident.Runs...), runs...))
+			if err != nil {
+				f.mu.Unlock()
+				rollback()
+				return nil, fmt.Errorf("resident sparse chunk %x: %w", install.Object, err)
+			}
+			var held [logicalPagesPerChunk / 64]uint64
+			for _, run := range resident.Runs {
+				for position := uint16(run.Position); position < uint16(run.Position)+run.Pages; position++ {
+					held[position/64] |= 1 << (position % 64)
 				}
 			}
-			for position, page := range pages {
-				if _, ok := resident.Pages[position]; ok {
-					continue
+			for _, run := range runs {
+				end := uint16(run.Position) + run.Pages
+				for position := uint16(run.Position); position < end; {
+					if held[position/64]&(1<<(position%64)) != 0 {
+						position++
+						continue
+					}
+					next := position + 1
+					for next < end && held[next/64]&(1<<(next%64)) == 0 {
+						next++
+					}
+					f.setSparseIdentitiesLocked(resident.Range.Start, run, position, next)
+					position = next
 				}
-				pageFR := memmap.FileRange{Start: resident.Range.Start + uint64(position)*hostarch.PageSize, End: resident.Range.Start + (uint64(position)+1)*hostarch.PageSize}
-				f.logicalPages.RemoveFullRange(pageFR)
-				f.logicalPages.InsertRange(pageFR, logicalPageInfo{
-					Allocator: page.Page.Allocator, FirstSequence: page.Page.Sequence,
-					VersionAllocator: page.Version.Allocator, FirstVersionSequence: page.Version.Sequence,
-				})
-				resident.Pages[position] = page
 			}
+			resident.Runs = merged
+			f.sparseChunks[install.Object] = resident
 			f.mu.Unlock()
 		} else {
 			f.mu.Unlock()
@@ -486,7 +588,7 @@ func (f *MemoryFile) InstallSparseChunks(installs []SparseChunkInstall) (*Sparse
 				rollback()
 				return nil, fmt.Errorf("allocating sparse resident chunk: %w", err)
 			}
-			resident = sparseResidentChunk{Range: fr, Pages: pages}
+			resident = sparseResidentChunk{Range: fr, Runs: runs}
 			f.mu.Lock()
 			if f.sparseChunks == nil {
 				f.sparseChunks = make(map[SparseChunkObjectID]sparseResidentChunk)
@@ -497,13 +599,8 @@ func (f *MemoryFile) InstallSparseChunks(installs []SparseChunkInstall) (*Sparse
 				rollback()
 				return nil, fmt.Errorf("concurrent sparse chunk installation is unsupported")
 			}
-			for position, page := range pages {
-				pageFR := memmap.FileRange{Start: fr.Start + uint64(position)*hostarch.PageSize, End: fr.Start + (uint64(position)+1)*hostarch.PageSize}
-				f.logicalPages.RemoveFullRange(pageFR)
-				f.logicalPages.InsertRange(pageFR, logicalPageInfo{
-					Allocator: page.Page.Allocator, FirstSequence: page.Page.Sequence,
-					VersionAllocator: page.Version.Allocator, FirstVersionSequence: page.Version.Sequence,
-				})
+			for _, run := range runs {
+				f.setSparseIdentitiesLocked(fr.Start, run, uint16(run.Position), uint16(run.Position)+run.Pages)
 			}
 			f.sparseChunks[install.Object] = resident
 			delete(f.reclaimedSparseChunks, install.Object)
@@ -513,6 +610,20 @@ func (f *MemoryFile) InstallSparseChunks(installs []SparseChunkInstall) (*Sparse
 		}
 	}
 	return installation, nil
+}
+
+// setSparseIdentitiesLocked gives the pages of the unit at base from position
+// start to end the identities run, which holds them, gives them.
+//
+// Preconditions: f.mu is locked.
+func (f *MemoryFile) setSparseIdentitiesLocked(base uint64, run SparseChunkRun, start, end uint16) {
+	delta := uint64(start - uint16(run.Position))
+	fr := memmap.FileRange{Start: base + uint64(start)*hostarch.PageSize, End: base + uint64(end)*hostarch.PageSize}
+	f.logicalPages.RemoveFullRange(fr)
+	f.logicalPages.InsertRange(fr, logicalPageInfo{
+		Allocator: run.Page.Allocator, FirstSequence: run.Page.Sequence + delta,
+		VersionAllocator: run.Version.Allocator, FirstVersionSequence: run.Version.Sequence + delta,
+	})
 }
 
 // adoptResidentSparseChunk returns, each with an owner reference of the

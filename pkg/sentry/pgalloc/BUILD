@@ -107,6 +107,23 @@ go_template_instance(
 )
 
 go_template_instance(
+    name = "sparse_relocation_set",
+    out = "sparse_relocation_set.go",
+    imports = {
+        "memmap": "gvisor.dev/gvisor/pkg/sentry/memmap",
+    },
+    package = "pgalloc",
+    prefix = "sparseRelocation",
+    template = "//pkg/segment:generic_set",
+    types = {
+        "Key": "uint64",
+        "Range": "memmap.FileRange",
+        "Value": "uint64",
+        "Functions": "sparseRelocationSetFunctions",
+    },
+)
+
+go_template_instance(
     name = "memacct_set",
     out = "memacct_set.go",
     consts = {
@@ -192,6 +209,7 @@ go_library(
         "remote_snapshot.go",
         "save_restore.go",
         "sparse_import.go",
+        "sparse_relocation_set.go",
         "unfree_set.go",
         "unwaste_set.go",
     ],

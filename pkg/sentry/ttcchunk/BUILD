@@ -40,8 +40,10 @@ go_test(
     library = ":ttcchunk",
     deps = [
         "//pkg/hostarch",
+        "//pkg/sentry/checkpoint",
         "//pkg/sentry/memmap",
         "//pkg/sentry/pgalloc",
+        "//pkg/sentry/usage",
         "//pkg/ttcsnapshot",
     ],
 )
