@@ -78,6 +78,9 @@ type TaskConfig struct {
 	// Niceness is the niceness of the new task.
 	Niceness int
 
+	// SchedPolicy is the scheduling policy of the new task.
+	SchedPolicy SchedPolicy
+
 	// NetworkNamespace is the network namespace to be used for the new task.
 	NetworkNamespace *inet.Namespace
 
@@ -231,6 +234,7 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 		allowedCPUMask:  cfg.AllowedCPUMask.Copy(),
 		ioUsage:         &usage.IO{},
 		niceness:        cfg.Niceness,
+		sched:           cfg.SchedPolicy,
 		utsns:           cfg.UTSNamespace,
 		ipcns:           cfg.IPCNamespace,
 		cgroupns:        cfg.CgroupNamespace,

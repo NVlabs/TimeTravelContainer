@@ -534,12 +534,12 @@ type Task struct {
 	// entirely if Kernel.useHostCores is true.
 	cpu atomicbitops.Int32
 
-	// This is used to keep track of the scheduling policy for this task.
-	// It has no effect and is only used to provide a reasonable return value for
-	// sched_getattr() and similar.
+	// sched is this task's scheduling policy. It has no effect, since the Go
+	// runtime schedules tasks, and only provides reasonable results for
+	// sched_getscheduler(2), sched_getattr(2), and similar.
 	//
-	// scheduler is protected by mu.
-	scheduler uint
+	// sched is protected by mu.
+	sched SchedPolicy
 
 	// This is used to keep track of changes made to a process' priority/niceness.
 	// It is mostly used to provide some reasonable return value from

@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package kernel
 
 import (
@@ -316,6 +319,7 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 		childCreds = creds.ForkIntoUserNamespace(userns)
 	}
 
+	schedPolicy, niceness := t.childSchedPolicy()
 	cfg := &TaskConfig{
 		Kernel:           t.k,
 		ThreadGroup:      tg,
@@ -325,7 +329,8 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 		FDTable:          fdTable,
 		Credentials:      childCreds,
 		NoNewPrivs:       t.GetNoNewPrivs(),
-		Niceness:         t.Niceness(),
+		Niceness:         niceness,
+		SchedPolicy:      schedPolicy,
 		NetworkNamespace: netns,
 		AllowedCPUMask:   t.CPUMask(),
 		UTSNamespace:     utsns,

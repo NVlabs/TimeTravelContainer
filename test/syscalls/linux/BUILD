@@ -2623,6 +2623,7 @@ cc_binary(
     deps = select_gtest() + [
         "//test/util:capability_util",
         "//test/util:cleanup",
+        "//test/util:multiprocess_util",
         "//test/util:posix_error",
         "//test/util:test_main",
         "//test/util:test_util",

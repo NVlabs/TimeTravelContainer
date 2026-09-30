@@ -876,7 +876,8 @@ func (s *taskStatData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 		terminationSignal = s.task.ThreadGroup().TerminationSignal()
 	}
 	fmt.Fprintf(buf, "%d ", terminationSignal)
-	fmt.Fprintf(buf, "0 0 0 " /* processor rt_priority policy */)
+	sched := s.task.SchedPolicy()
+	fmt.Fprintf(buf, "0 %d %d " /* processor rt_priority policy */, sched.Priority, sched.Policy)
 	fmt.Fprintf(buf, "0 0 0 " /* delayacct_blkio_ticks guest_time cguest_time */)
 	fmt.Fprintf(buf, "0 0 0 %d %d %d %d " /* start_data end_data start_brk arg_start arg_end env_start env_end */, argStart, argEnd, envStart, envEnd)
 	fmt.Fprintf(buf, "0\n" /* exit_code */)
