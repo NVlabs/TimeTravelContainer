@@ -468,6 +468,10 @@ func (b *runtimeBackend) reconcileDistributedGraphReferences(strictRetain bool) 
 		}
 		path := filepath.Join(dir, entry.Name())
 		intent, err := readGraphReferenceIntent(path)
+		if errors.Is(err, os.ErrNotExist) {
+			// Released since the directory was read.
+			continue
+		}
 		if err != nil {
 			if strictRetain {
 				return fmt.Errorf("reading graph reference intent %q: %w", entry.Name(), err)

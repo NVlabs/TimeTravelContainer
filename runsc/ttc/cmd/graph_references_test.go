@@ -979,3 +979,25 @@ func TestSharedRelayOriginScope(t *testing.T) {
 		}
 	}
 }
+
+// A claim released while a coordinator reads the node's claims is gone from
+// the inventory, not an error: its file goes once the ledger let go of it.
+func TestSnapshotReferenceInventoryPassesOverReleasedClaims(t *testing.T) {
+	localRoot := t.TempDir()
+	dir := filepath.Join(localRoot, "graph-references")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	// A name listed whose file is gone by the time it is read.
+	if err := os.Symlink(filepath.Join(dir, "released"), filepath.Join(dir, "provider-0000000000000007-memory-x.json")); err != nil {
+		t.Fatal(err)
+	}
+	service := &sharedReferenceService{localRoot: localRoot, nodeID: "node-a", incarnation: "boot-a"}
+	inventory, err := service.SnapshotReferenceInventory(context.Background(), "coordinator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inventory.Claims) != 0 {
+		t.Fatalf("inventory claims = %+v", inventory.Claims)
+	}
+}

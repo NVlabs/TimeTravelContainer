@@ -340,6 +340,11 @@ func (s *sharedReferenceService) SnapshotReferenceInventory(_ context.Context, _
 			continue
 		}
 		intent, err := readGraphReferenceIntent(filepath.Join(dir, entry.Name()))
+		if errors.Is(err, os.ErrNotExist) {
+			// Released since the directory was read: a claim's file goes only
+			// once the ledger has let go of what it retained.
+			continue
+		}
 		if err != nil {
 			return nil, fmt.Errorf("reading reference claim %q: %w", entry.Name(), err)
 		}
