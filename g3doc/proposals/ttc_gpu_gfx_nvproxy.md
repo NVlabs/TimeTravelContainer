@@ -768,8 +768,9 @@ redroid's arm64 images could then run on macOS too.
 on the virtual GPU.* redroid 14's arm64 image
 (`redroid/redroid:14.0.0_64only-latest`) boots with its own init as the
 container's in about 40 s; SurfaceFlinger and apps render with ANGLE on
-gfxstream's Vulkan driver, and apps from F-Droid install and run.
-`runsc/ttc/test/e2e_redroid.sh` checks that.
+gfxstream's Vulkan driver; Android's network comes up and validates; and
+apps from F-Droid install and run, F-Droid itself downloading its
+repository. `runsc/ttc/test/e2e_redroid.sh` checks that.
 
 *   **Sentry:** what Android's init and daemons required:
     *   binder, and binderfs for `binder`, `hwbinder`, and `vndbinder`;
@@ -784,6 +785,15 @@ gfxstream's Vulkan driver, and apps from F-Droid install and run.
         add `CAP_NET_RAW`, alarm clocks for AlarmManager, `/proc/pressure`
         for lmkd, and real-time scheduling policies, recorded without effect,
         for Bluetooth;
+    *   for Android's network: TTC's interface named `eth0`, as Docker's is,
+        which Android's Ethernet service manages; `/sys/class/net`, where
+        netd lists interfaces; the per-interface settings of
+        `/proc/sys/net/ipv{4,6}/{conf,neigh}`, which netd and IpClient
+        write; `SIOCSIFADDR` and `SIOCSIFNETMASK`, with which IpClient sets
+        the address; and rtnetlink's address events, from which it learns
+        the address. Policy routing remains unsupported: netd fails to add
+        rules and per-network routes, but the Sentry routes every socket by
+        its main table, which is right for one interface;
     *   fixes: arm64 signal frames laid out as Linux lays them out, which ART's
         unwinder reads; `setsid(2)` deadlocked with children in an orphaned
         process group; `SOCK_SEQPACKET` peer credentials; and container roots
@@ -794,13 +804,8 @@ gfxstream's Vulkan driver, and apps from F-Droid install and run.
     selects it, redroid's minigbm, and ANGLE. SurfaceFlinger crashed while
     MoltenVK's four identical queue families showed; gfxstream patch `0009`
     hides the duplicates.
-*   **Not done:**
-    *   networking. Android adopts only interfaces named `eth\d`, not
-        `ttc0`, and brings a network up only with rtnetlink notifications,
-        policy routing, `/sys/class/net`, and per-interface IPv6 sysctls,
-        which the Sentry lacks. Apps have no network;
-    *   display (scrcpy or VNC), forks of Android (it runs with
-        `--waive-live-fork`), and the device-lost experiment.
+*   **Not done:** display (scrcpy or VNC), forks of Android (it runs with
+    `--waive-live-fork`), and the device-lost experiment.
 *   **Found in the image:** its simulated Bluetooth HAL aborts on any
     kernel ("Invalid address"): it links two different
     `bluetooth::hci::Address` classes, and tests the parsed address's

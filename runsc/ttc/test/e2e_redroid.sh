@@ -6,7 +6,8 @@
 # Manual end-to-end coverage for Android in TTC: redroid (an Android image
 # for containers) boots, as its container's init, with the virtual GPU
 # (--gfx); SurfaceFlinger composes with ANGLE on gfxstream's Vulkan driver;
-# apps render on the GPU; and, given one, an APK installs and runs.
+# Android's network comes up and validates; apps render on the GPU; and,
+# given one, an APK installs and runs.
 #
 # It needs what runsc/ttc/test/e2e_gfx.sh needs (TTC, TTCD,
 # TTC_GFX_RENDERER, TTC_GFXSTREAM_LIBRARY, TTC_GFX_GUEST_DRIVER), and:
@@ -125,6 +126,15 @@ case "$gles" in
   *) fail "SurfaceFlinger composes without the virtual GPU: $gles" ;;
 esac
 echo "ttc redroid e2e: $gles"
+
+# Android brings its Ethernet network up on eth0, and validates it on the
+# internet.
+deadline=$(($(date +%s) + 120))
+until adb /system/bin/dumpsys connectivity 2>/dev/null | grep -q '&VALIDATED&'; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "Android's network is not validated"
+  sleep 5
+done
+echo "ttc redroid e2e: the network is validated"
 
 # launch PACKAGE starts the package's launcher activity, and checks that it
 # renders with ANGLE on gfxstream's driver.
