@@ -88,6 +88,20 @@ go_test(
     deps = [":netstack"],
 )
 
+go_test(
+    name = "addr_test",
+    srcs = ["addr_test.go"],
+    library = ":netstack",
+    deps = [
+        "//pkg/abi/linux",
+        "//pkg/context",
+        "//pkg/sentry/inet",
+        "//pkg/tcpip/link/loopback",
+        "//pkg/tcpip/network/ipv4",
+        "//pkg/tcpip/stack",
+    ],
+)
+
 proto_library(
     name = "events",
     srcs = ["events.proto"],

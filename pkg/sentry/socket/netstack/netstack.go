@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/bits"
 	"reflect"
 	"strconv"
 	"time"
@@ -3588,6 +3589,16 @@ func Ioctl(ctx context.Context, ep commonEndpoint, io usermem.IO, sysno uintptr,
 		}
 		return 0, nil
 
+	case linux.SIOCSIFADDR, linux.SIOCSIFNETMASK:
+		var ifr linux.IFReq
+		if _, err := ifr.CopyIn(t, args[2].Pointer()); err != nil {
+			return 0, err
+		}
+		if err := setInterfaceAddrIoctl(ctx, t, arg, &ifr); err != nil {
+			return 0, err.ToError()
+		}
+		return 0, nil
+
 	case linux.SIOCGIFCONF:
 		// Return a list of interface addresses or the buffer size
 		// necessary to hold the list.
@@ -3662,6 +3673,118 @@ func setInterfaceFlagsIoctl(ctx context.Context, t *kernel.Task, ifr *linux.IFRe
 		return stk.setLinkUpLocked(ctx, tcpip.NICID(index), flags&linux.IFF_UP != 0)
 	}
 	return syserr.ErrNoDevice
+}
+
+// setInterfaceAddrIoctl implements SIOCSIFADDR and SIOCSIFNETMASK, which set
+// an interface's IPv4 address and its netmask, as Linux's
+// net/ipv4/devinet.c:devinet_ioctl() does. An address replaces the
+// interface's, with the prefix of the address's class, and 0.0.0.0 removes
+// it; a netmask changes the prefix of the interface's address. Listeners
+// learn of the changes by netlink, as they do on Linux.
+func setInterfaceAddrIoctl(ctx context.Context, t *kernel.Task, arg int, ifr *linux.IFReq) *syserr.Error {
+	ns := t.NetworkNamespace()
+	if ns == nil || !ns.HasCapability(ctx, linux.CAP_NET_ADMIN) {
+		return syserr.ErrNotPermitted
+	}
+	// ifr_addr is a struct sockaddr_in.
+	if hostarch.ByteOrder.Uint16(ifr.Data[:2]) != linux.AF_INET {
+		return syserr.ErrInvalidArgument
+	}
+	value := append([]byte(nil), ifr.Data[4:8]...)
+	stk := ns.Stack()
+	if stk == nil {
+		return syserr.ErrNoDevice
+	}
+	index := int32(-1)
+	for idx, iface := range stk.Interfaces() {
+		if iface.Name == ifr.Name() {
+			index = idx
+			break
+		}
+	}
+	if index < 0 {
+		return syserr.ErrNoDevice
+	}
+	var current *inet.InterfaceAddr
+	for _, addr := range stk.InterfaceAddrs()[index] {
+		if addr.Family == linux.AF_INET {
+			current = &addr
+			break
+		}
+	}
+
+	switch arg {
+	case linux.SIOCSIFADDR:
+		prefix, ok := ipv4ClassPrefixLen(value)
+		if !ok {
+			return syserr.ErrInvalidArgument
+		}
+		if current != nil {
+			if bytes.Equal(current.Addr, value) {
+				return nil
+			}
+			if err := stk.RemoveInterfaceAddr(index, *current); err != nil {
+				return syserr.FromError(err)
+			}
+		}
+		if binary.BigEndian.Uint32(value) == 0 {
+			return nil
+		}
+		return syserr.FromError(stk.AddInterfaceAddr(index, inet.InterfaceAddr{
+			Family:    linux.AF_INET,
+			PrefixLen: prefix,
+			Addr:      value,
+		}))
+
+	default: // linux.SIOCSIFNETMASK
+		if current == nil {
+			return syserr.ErrAddressNotAvailable
+		}
+		prefix, ok := ipv4MaskPrefixLen(value)
+		if !ok {
+			return syserr.ErrInvalidArgument
+		}
+		if current.PrefixLen == prefix {
+			return nil
+		}
+		if err := stk.RemoveInterfaceAddr(index, *current); err != nil {
+			return syserr.FromError(err)
+		}
+		addr := *current
+		addr.PrefixLen = prefix
+		return syserr.FromError(stk.AddInterfaceAddr(index, addr))
+	}
+}
+
+// ipv4ClassPrefixLen returns the prefix of an IPv4 address's class, as
+// Linux's net/ipv4/devinet.c:inet_abc_len() does: 0 for 0.0.0.0/8 and the
+// broadcast address, 8, 16, 24, or 32 for classes A, B, C, and E, and false
+// for multicast addresses.
+func ipv4ClassPrefixLen(addr []byte) (uint8, bool) {
+	switch v := binary.BigEndian.Uint32(addr); {
+	case v>>24 == 0, v == 0xffffffff:
+		return 0, true
+	case v>>31 == 0:
+		return 8, true
+	case v>>30 == 0b10:
+		return 16, true
+	case v>>29 == 0b110:
+		return 24, true
+	case v>>28 == 0b1111:
+		return 32, true
+	}
+	return 0, false
+}
+
+// ipv4MaskPrefixLen returns the prefix length of an IPv4 netmask, and false
+// if its ones are not contiguous.
+func ipv4MaskPrefixLen(mask []byte) (uint8, bool) {
+	v := binary.BigEndian.Uint32(mask)
+	ones := bits.LeadingZeros32(^v)
+	if ones < 32 && v<<ones != 0 {
+		return 0, false
+	}
+	return uint8(ones), true
 }
 
 // interfaceIoctl implements interface requests.
