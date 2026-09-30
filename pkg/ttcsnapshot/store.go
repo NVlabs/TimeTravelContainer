@@ -575,11 +575,11 @@ func (s *Store) Reload() error {
 			if err != nil {
 				return err
 			}
-			info, err := s.journal.Stat()
+			size, err := s.journalSize()
 			if err != nil {
 				return err
 			}
-			if unchanged && info.Size() == s.journalEnd {
+			if unchanged && size == s.journalEnd {
 				return nil
 			}
 		}
@@ -593,12 +593,12 @@ func (s *Store) Reload() error {
 		if err != nil {
 			return err
 		}
-		info, err := s.journal.Stat()
+		size, err := s.journalSize()
 		if err != nil {
 			return err
 		}
-		if unchanged && info.Size() >= s.journalEnd {
-			if info.Size() == s.journalEnd {
+		if unchanged && size >= s.journalEnd {
+			if size == s.journalEnd {
 				return nil
 			}
 			return s.replayJournalSuffix(false)
@@ -631,12 +631,12 @@ func (s *Store) ReloadForWrite() error {
 		if err != nil {
 			return err
 		}
-		info, err := s.journal.Stat()
+		size, err := s.journalSize()
 		if err != nil {
 			return err
 		}
-		if unchanged && info.Size() >= s.journalEnd {
-			if info.Size() == s.journalEnd {
+		if unchanged && size >= s.journalEnd {
+			if size == s.journalEnd {
 				return nil
 			}
 			return s.replayJournalSuffix(true)
@@ -697,12 +697,12 @@ func (s *Store) reloadForExternalWriteLocked() error {
 		if err != nil {
 			return err
 		}
-		info, err := s.journal.Stat()
+		size, err := s.journalSize()
 		if err != nil {
 			return err
 		}
-		if unchanged && info.Size() >= s.journalEnd {
-			if info.Size() == s.journalEnd {
+		if unchanged && size >= s.journalEnd {
+			if size == s.journalEnd {
 				return nil
 			}
 			return s.replayJournalSuffix(true)
@@ -738,6 +738,16 @@ func (s *Store) endImplicitExternalMutationLocked(acquired bool) {
 		s.implicitExternalTransaction = false
 		_ = syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN)
 	}
+}
+
+// journalSize returns the size of the journal file. Every reload checks it,
+// and os.File.Stat allocates what it returns.
+func (s *Store) journalSize() (int64, error) {
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(s.journal.Fd()), &stat); err != nil {
+		return 0, err
+	}
+	return stat.Size, nil
 }
 
 func (s *Store) headUnchanged() (bool, error) {
@@ -1562,11 +1572,11 @@ func appendHex(out []byte, value uint64, digits int) []byte {
 }
 
 func (s *Store) replayJournal(repairTail bool) error {
-	info, err := s.journal.Stat()
+	size, err := s.journalSize()
 	if err != nil {
 		return err
 	}
-	if info.Size() == 0 {
+	if size == 0 {
 		if _, err := s.journal.WriteAt([]byte(journalHeader), 0); err != nil {
 			return err
 		}
@@ -1624,14 +1634,14 @@ func (s *Store) replayJournal(repairTail bool) error {
 
 // readJournalAt reads the journal from offset to its end.
 func (s *Store) readJournalAt(offset int64) ([]byte, error) {
-	info, err := s.journal.Stat()
+	size, err := s.journalSize()
 	if err != nil {
 		return nil, err
 	}
-	if info.Size() < offset {
-		return nil, fmt.Errorf("TTC snapshot graph journal is %d bytes, fewer than the %d replayed", info.Size(), offset)
+	if size < offset {
+		return nil, fmt.Errorf("TTC snapshot graph journal is %d bytes, fewer than the %d replayed", size, offset)
 	}
-	data := make([]byte, info.Size()-offset)
+	data := make([]byte, size-offset)
 	n, err := s.journal.ReadAt(data, offset)
 	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
@@ -2354,12 +2364,12 @@ func (s *Store) commitLockedPrepared(ops []journalOp, references map[ObjectID]Ob
 		return fmt.Errorf("TTC snapshot graph transaction is %d bytes, limit is %d", len(data), maxJournalRecordSize)
 	}
 	start := s.journalEnd
-	info, err := s.journal.Stat()
+	size, err := s.journalSize()
 	if err != nil {
 		return err
 	}
-	if info.Size() != start {
-		return fmt.Errorf("TTC snapshot graph journal size %d disagrees with committed end %d", info.Size(), start)
+	if size != start {
+		return fmt.Errorf("TTC snapshot graph journal size %d disagrees with committed end %d", size, start)
 	}
 	rollback := func(cause error) error {
 		if err := s.journal.Truncate(start); err != nil {
@@ -4114,11 +4124,11 @@ func (s *Store) CheckpointExternallyCoordinated() error {
 	if err != nil {
 		return err
 	}
-	info, err := s.journal.Stat()
+	size, err := s.journalSize()
 	if err != nil {
 		return err
 	}
-	if head.Generation != s.generation || info.Size() != s.journalEnd {
+	if head.Generation != s.generation || size != s.journalEnd {
 		if err := s.loadGeneration(head, true); err != nil {
 			return err
 		}

@@ -48,7 +48,7 @@ type LocalDataStore struct {
 	// began before it. Removal forgets them: a removed object has no name to
 	// make durable.
 	namesMu       sync.Mutex
-	unsyncedNames map[string]unsyncedName
+	unsyncedNames map[ObjectID]unsyncedName
 	// chunkCache makes sweeps keep, within memoryChunkCacheTarget, memory
 	// chunks their graph no longer holds: those of origins the graph does not
 	// hold as its own, whose images the shared store has, and which a restore
@@ -165,15 +165,15 @@ func (store *LocalDataStore) noteUnsyncedName(id ObjectID) {
 	store.namesMu.Lock()
 	defer store.namesMu.Unlock()
 	if store.unsyncedNames == nil {
-		store.unsyncedNames = make(map[string]unsyncedName)
+		store.unsyncedNames = make(map[ObjectID]unsyncedName)
 	}
-	current := store.unsyncedNames[id.key()]
-	store.unsyncedNames[id.key()] = unsyncedName{id: id, generation: current.generation + 1}
+	current := store.unsyncedNames[id]
+	store.unsyncedNames[id] = unsyncedName{id: id, generation: current.generation + 1}
 }
 
 func (store *LocalDataStore) forgetUnsyncedName(id ObjectID) {
 	store.namesMu.Lock()
-	delete(store.unsyncedNames, id.key())
+	delete(store.unsyncedNames, id)
 	store.namesMu.Unlock()
 }
 
@@ -183,7 +183,7 @@ func (store *LocalDataStore) forgetUnsyncedName(id ObjectID) {
 // their payloads are the fence's separate concern.
 func (store *LocalDataStore) SyncNewNames() error {
 	store.namesMu.Lock()
-	snapshot := make(map[string]unsyncedName, len(store.unsyncedNames))
+	snapshot := make(map[ObjectID]unsyncedName, len(store.unsyncedNames))
 	ids := make([]ObjectID, 0, len(store.unsyncedNames))
 	for key, name := range store.unsyncedNames {
 		snapshot[key] = name
@@ -1108,13 +1108,13 @@ func (store *LocalDataStore) SyncObjects(ids []ObjectID) error {
 
 // unsyncedNamesOf returns the entries of unsyncedNames for ids, as they are
 // before a sync that covers them begins.
-func (store *LocalDataStore) unsyncedNamesOf(ids []ObjectID) map[string]unsyncedName {
+func (store *LocalDataStore) unsyncedNamesOf(ids []ObjectID) map[ObjectID]unsyncedName {
 	store.namesMu.Lock()
 	defer store.namesMu.Unlock()
-	names := make(map[string]unsyncedName)
+	names := make(map[ObjectID]unsyncedName)
 	for _, id := range ids {
-		if name, ok := store.unsyncedNames[id.key()]; ok {
-			names[id.key()] = name
+		if name, ok := store.unsyncedNames[id]; ok {
+			names[id] = name
 		}
 	}
 	return names
@@ -1122,7 +1122,7 @@ func (store *LocalDataStore) unsyncedNamesOf(ids []ObjectID) map[string]unsynced
 
 // forgetSyncedNames drops the entries of synced from unsyncedNames, unless the
 // object was installed again after the sync began.
-func (store *LocalDataStore) forgetSyncedNames(synced map[string]unsyncedName) {
+func (store *LocalDataStore) forgetSyncedNames(synced map[ObjectID]unsyncedName) {
 	store.namesMu.Lock()
 	defer store.namesMu.Unlock()
 	for key, name := range synced {
@@ -1220,13 +1220,15 @@ func (store *LocalDataStore) OpenFile(id ObjectID, flags int, length int64) (*os
 	if err != nil {
 		return nil, err
 	}
-	info, err := file.Stat()
-	if err != nil || length >= 0 && info.Size() != length || !info.Mode().IsRegular() {
+	// Not os.File.Stat, which allocates what it returns.
+	var stat unix.Stat_t
+	err = unix.Fstat(int(file.Fd()), &stat)
+	if err != nil || length >= 0 && stat.Size != length || stat.Mode&unix.S_IFMT != unix.S_IFREG {
 		file.Close()
 		if err != nil {
 			return nil, err
 		}
-		return nil, fmt.Errorf("TTC bulk object %s has length %d, want %d", id.key(), info.Size(), length)
+		return nil, fmt.Errorf("TTC bulk object %s has length %d, want %d", id.key(), stat.Size, length)
 	}
 	return file, nil
 }

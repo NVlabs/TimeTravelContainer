@@ -155,10 +155,17 @@ func (s *Store) resolveDeferredLocked(id ObjectID) (Object, bool, error) {
 // prevents a demand-loaded child from colliding with that private batch.
 // +checklocksignore
 func (s *Store) resolveDeferredLockedAfter(id ObjectID, ordinalFloor uint64) (Object, bool, uint64, error) {
-	object, ok := s.state.Objects[id]
-	if !ok || !object.Deferred {
+	if object, ok := s.state.Objects[id]; !ok || !object.Deferred {
 		return object, ok, ordinalFloor, nil
 	}
+	return s.expandDeferredLockedAfter(id, ordinalFloor)
+}
+
+// expandDeferredLockedAfter is resolveDeferredLockedAfter for an object
+// that is deferred. It is apart because its object escapes, which every
+// lookup of a mutation then allocated, deferred or not.
+func (s *Store) expandDeferredLockedAfter(id ObjectID, ordinalFloor uint64) (Object, bool, uint64, error) {
+	object := s.state.Objects[id]
 	resolver, ok := s.deferredResolvers[object.SourceCatalog]
 	if !ok || resolver.load == nil {
 		return Object{}, false, ordinalFloor, fmt.Errorf("deferred TTC catalog %q has no attached authoritative source", object.SourceCatalog)
