@@ -189,8 +189,10 @@ type FilePrivileges struct {
 // handlePrivilegedRoot updates creds for a privileged root user as per
 // "Capabilities and execution of programs by root" in capabilities(7).
 func handlePrivilegedRoot(c *Credentials, f *FilePrivileges, filename string) {
-	// gVisor currently does not support SECURE_NOROOT secure bit since
-	// PR_SET_SECUREBITS is not supported. So no need to check here.
+	// With SECBIT_NOROOT, root is not privileged for executed programs.
+	if c.SecureBits&linux.SECBIT_NOROOT != 0 {
+		return
+	}
 	root := c.UserNamespace.MapToKUID(RootUID)
 
 	// "If (a) the binary that is being executed has capabilities attached and (b) the real user ID of

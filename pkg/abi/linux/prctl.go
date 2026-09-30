@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package linux
 
 // PR_* flags, from <linux/pcrtl.h> for prctl(2).
@@ -178,8 +181,21 @@ const (
 	PR_CAP_AMBIENT_LOWER     = 3
 	PR_CAP_AMBIENT_CLEAR_ALL = 4
 
-	// SECBIT_* flags are used to control securebits.
-	SECBIT_KEEP_CAPS = 1 << 4
+	// SECBIT_* flags are used to control securebits. Each flag's lock, the
+	// bit above it, keeps it from changing.
+	SECBIT_NOROOT                      = 1 << 0
+	SECBIT_NOROOT_LOCKED               = 1 << 1
+	SECBIT_NO_SETUID_FIXUP             = 1 << 2
+	SECBIT_NO_SETUID_FIXUP_LOCKED      = 1 << 3
+	SECBIT_KEEP_CAPS                   = 1 << 4
+	SECBIT_KEEP_CAPS_LOCKED            = 1 << 5
+	SECBIT_NO_CAP_AMBIENT_RAISE        = 1 << 6
+	SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED = 1 << 7
+
+	// SECURE_ALL_BITS and SECURE_ALL_LOCKS are the securebits flags and their
+	// locks.
+	SECURE_ALL_BITS  = SECBIT_NOROOT | SECBIT_NO_SETUID_FIXUP | SECBIT_KEEP_CAPS | SECBIT_NO_CAP_AMBIENT_RAISE
+	SECURE_ALL_LOCKS = SECURE_ALL_BITS << 1
 )
 
 // From <asm/prctl.h>
