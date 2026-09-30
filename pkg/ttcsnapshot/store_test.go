@@ -2709,7 +2709,7 @@ func TestRandomGraphReferenceAndReplayModel(t *testing.T) {
 // A cluster node's store keeps, within its bound, the memory chunks its graph
 // released of origins it does not hold as its own, whose images the shared
 // store has; the oldest go first. It removes the chunks of its graph's own
-// origins, and every other kind of object, as before.
+// origins and of retired origins, and every other kind of object, as before.
 func TestReclaimUnreferencedKeepsCachedChunks(t *testing.T) {
 	for _, byDescriptor := range []bool{false, true} {
 		graph := openTestStore(t)
@@ -2729,12 +2729,12 @@ func TestReclaimUnreferencedKeepsCachedChunks(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		data.EnableMemoryChunkCache()
 		own, err := graph.AllocateWorking()
 		if err != nil {
 			t.Fatal(err)
 		}
-		shared := own + 100
+		shared, retired := own+100, own+200
+		data.EnableMemoryChunkCache(func(origin SnapshotID) bool { return origin == retired })
 		now := time.Now()
 		path := func(id ObjectID) string {
 			relative, err := objectRelativePath(id)
@@ -2759,15 +2759,17 @@ func TestReclaimUnreferencedKeepsCachedChunks(t *testing.T) {
 		newer := ObjectID{Snapshot: shared, Kind: ObjectKindMemoryChunk, Ordinal: 2}
 		ownChunk := ObjectID{Snapshot: own, Kind: ObjectKindMemoryChunk, Ordinal: 1}
 		sharedFile := ObjectID{Snapshot: shared, Kind: ObjectKindFile, Ordinal: 3}
+		retiredChunk := ObjectID{Snapshot: retired, Kind: ObjectKindMemoryChunk, Ordinal: 1}
 		install(older, 2*time.Hour)
 		install(newer, time.Hour)
 		install(ownChunk, 0)
 		install(sharedFile, 0)
-		if removed, _, err := data.ReclaimUnreferenced(graph); err != nil || removed != 2 {
-			t.Fatalf("reclaim removed %d, %v; want the own origin's chunk and the file", removed, err)
+		install(retiredChunk, 0)
+		if removed, _, err := data.ReclaimUnreferenced(graph); err != nil || removed != 3 {
+			t.Fatalf("reclaim removed %d, %v; want the own origin's chunk, the file and the retired origin's chunk", removed, err)
 		}
-		if !exists(older) || !exists(newer) || exists(ownChunk) || exists(sharedFile) {
-			t.Fatalf("kept older %t newer %t own %t file %t; want only the shared chunks", exists(older), exists(newer), exists(ownChunk), exists(sharedFile))
+		if !exists(older) || !exists(newer) || exists(ownChunk) || exists(sharedFile) || exists(retiredChunk) {
+			t.Fatalf("kept older %t newer %t own %t file %t retired %t; want only the live shared chunks", exists(older), exists(newer), exists(ownChunk), exists(sharedFile), exists(retiredChunk))
 		}
 		info, err := os.Stat(path(newer))
 		if err != nil {
@@ -3415,5 +3417,77 @@ func TestMemoryPageIndexCompacts(t *testing.T) {
 	s.compactMemoryIndexesLocked()
 	if reflect.ValueOf(s.memoryPages).Pointer() != after {
 		t.Fatal("the page index was made anew after one page left it")
+	}
+}
+
+// The cached chunks of a retired origin go when the cache next looks, with
+// their directories; a live origin's stay, and so do the graph's own.
+func TestEvictDeadCachedChunks(t *testing.T) {
+	for _, byDescriptor := range []bool{false, true} {
+		graph := openTestStore(t)
+		root := filepath.Join(t.TempDir(), "objects")
+		data, err := OpenLocalDataStore(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if byDescriptor {
+			directory, err := os.Open(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err = OpenLocalDataStoreFD(directory)
+			directory.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		own, err := graph.AllocateWorking()
+		if err != nil {
+			t.Fatal(err)
+		}
+		live, retired := own+100, own+200
+		data.EnableMemoryChunkCache(func(origin SnapshotID) bool { return origin == retired || origin == own })
+		path := func(id ObjectID) string {
+			relative, err := objectRelativePath(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return filepath.Join(root, relative)
+		}
+		exists := func(name string) bool {
+			_, err := os.Stat(name)
+			return err == nil
+		}
+		var liveChunks, retiredChunks []ObjectID
+		for ordinal := uint64(1); ordinal <= 3; ordinal++ {
+			liveChunks = append(liveChunks, ObjectID{Snapshot: live, Kind: ObjectKindMemoryChunk, Ordinal: ordinal})
+			retiredChunks = append(retiredChunks, ObjectID{Snapshot: retired, Kind: ObjectKindMemoryChunk, Ordinal: ordinal * 300})
+		}
+		ownChunk := ObjectID{Snapshot: own, Kind: ObjectKindMemoryChunk, Ordinal: 1}
+		for _, id := range append(append(append([]ObjectID(nil), liveChunks...), retiredChunks...), ownChunk) {
+			if err := data.Install(id, strings.NewReader("chunk"), 5); err != nil {
+				t.Fatal(err)
+			}
+		}
+		removed, err := data.EvictDeadCachedChunks(graph)
+		if err != nil || removed != len(retiredChunks) {
+			t.Fatalf("evicted %d, %v; want the %d chunks of the retired origin", removed, err, len(retiredChunks))
+		}
+		for _, id := range retiredChunks {
+			if exists(path(id)) {
+				t.Fatalf("the retired origin's chunk %v remains", id)
+			}
+		}
+		if exists(filepath.Dir(filepath.Dir(path(retiredChunks[0])))) {
+			t.Fatal("the retired origin's directory remains")
+		}
+		for _, id := range append(liveChunks, ownChunk) {
+			if !exists(path(id)) {
+				t.Fatalf("chunk %v of a live or the graph's own origin was evicted", id)
+			}
+		}
+		if err := data.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

@@ -5952,6 +5952,58 @@ func controlOnlyProxyInput(header string, stdin io.Reader, streaming bool) io.Re
 	return io.MultiReader(strings.NewReader(header), stdin)
 }
 
+// deadOrigins tells which snapshot origins the cluster's authority calls
+// dead, retired or abandoned, asking it again after deadOriginRecheck for an
+// origin it last called alive: a dead origin stays dead.
+type deadOrigins struct {
+	authority *cluster.AuthorityCatalog
+
+	mu    sync.Mutex
+	alive map[ttcsnapshot.SnapshotID]time.Time
+	gone  map[ttcsnapshot.SnapshotID]struct{}
+}
+
+// deadOriginRecheck is how long deadOrigins takes an origin it found alive
+// for alive.
+const deadOriginRecheck = time.Minute
+
+// dead reports whether origin is dead. An origin it cannot ask about is not.
+func (d *deadOrigins) dead(origin ttcsnapshot.SnapshotID) bool {
+	if d == nil || d.authority == nil {
+		return false
+	}
+	d.mu.Lock()
+	if _, ok := d.gone[origin]; ok {
+		d.mu.Unlock()
+		return true
+	}
+	if at, ok := d.alive[origin]; ok && time.Since(at) < deadOriginRecheck {
+		d.mu.Unlock()
+		return false
+	}
+	d.mu.Unlock()
+	state, err := d.authority.AuthorityStateOf(cluster.OriginsQuery(uint64(origin)))
+	if err != nil {
+		return false
+	}
+	dead := state.OriginDead(uint64(origin))
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if dead {
+		if d.gone == nil {
+			d.gone = make(map[ttcsnapshot.SnapshotID]struct{})
+		}
+		d.gone[origin] = struct{}{}
+		delete(d.alive, origin)
+	} else {
+		if d.alive == nil {
+			d.alive = make(map[ttcsnapshot.SnapshotID]time.Time)
+		}
+		d.alive[origin] = time.Now()
+	}
+	return dead
+}
+
 func serveDaemon(socket, runtimePlatform string, unsafeNoHostIsolation bool, kernelCompatibility hostKernelCompatibility, dataRoot, root, runsc string, volumeCapability ttcvolume.Capability, stdout, stderr io.Writer) error {
 	profile, err := applyStandaloneCPUProfile(dataRoot, "portable", "", runtimePlatform, false)
 	if err != nil {
@@ -5977,8 +6029,8 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 			return fmt.Errorf("opening shared snapshot packs: %w", err)
 		}
 		// The node keeps the memory chunks of images the shared store has, as
-		// it keeps their image layers.
-		snapshotData.EnableMemoryChunkCache()
+		// it keeps their image layers, until shared GC retires them.
+		snapshotData.EnableMemoryChunkCache((&deadOrigins{authority: clusterRuntime.catalog}).dead)
 	}
 	if err := validatePersistedMemoryGraph(ttcbundle.Store{Root: dataRoot, ActiveRoot: localRoot}); err != nil {
 		return fmt.Errorf("validating snapshot-graph branch records: %w", err)
@@ -6616,6 +6668,11 @@ func maintainDistributedGraphReferences(backend *runtimeBackend, stderr io.Write
 		unlock()
 		if backend.snapshotShared != nil {
 			backend.snapshotShared.ExpireManifests(sharedManifestIdle)
+		}
+		if backend.snapshotData != nil && backend.snapshotGraph != nil {
+			if _, err := backend.snapshotData.EvictDeadCachedChunks(backend.snapshotGraph); err != nil && stderr != nil {
+				fmt.Fprintf(stderr, "ttcd: warning: evicting cached chunks of retired origins: %v\n", err)
+			}
 		}
 		err = errors.Join(err, backend.reconcileProviderClaims())
 		if err != nil && stderr != nil {

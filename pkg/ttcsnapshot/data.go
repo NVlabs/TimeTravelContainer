@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -56,16 +57,21 @@ type LocalDataStore struct {
 	// the branch on the node then fetched every chunk back. The oldest are
 	// removed first.
 	chunkCache bool
+	// chunkCacheDead, if not nil, reports the origins no one will read again,
+	// as those shared GC retired: sweeps keep none of their chunks.
+	chunkCacheDead func(SnapshotID) bool
 	// chunkCacheLimit, if nonzero, replaces memoryChunkCacheTarget, for tests.
 	chunkCacheLimit int64
 }
 
 // EnableMemoryChunkCache makes sweeps keep memory chunks of origins their
-// graph does not hold as its own, as a node's cache of shared images.
-func (store *LocalDataStore) EnableMemoryChunkCache() {
+// graph does not hold as its own, as a node's cache of shared images, but for
+// those of origins dead reports gone, if it is not nil.
+func (store *LocalDataStore) EnableMemoryChunkCache(dead func(SnapshotID) bool) {
 	store.gcMu.Lock()
 	defer store.gcMu.Unlock()
 	store.chunkCache = true
+	store.chunkCacheDead = dead
 }
 
 // memoryChunkCacheTarget bounds the cached chunks a sweep keeps: an eighth of
@@ -108,13 +114,16 @@ type cachedChunk struct {
 
 // keepsAsCache reports whether a sweep keeps id, which graph does not hold,
 // as a cached chunk: a memory chunk of an origin graph does not hold as its
-// own.
+// own, and that is not dead. A retired origin's chunks stayed until newer ones
+// outgrew the cache's bound, of up to 32 GiB, though no image names them.
 func (store *LocalDataStore) keepsAsCache(graph *Store, id ObjectID) bool {
 	if !store.chunkCache || id.Kind != ObjectKindMemoryChunk {
 		return false
 	}
-	snapshot, ok := graph.Snapshot(id.Snapshot)
-	return !ok || snapshot.State == SnapshotShared
+	if snapshot, ok := graph.Snapshot(id.Snapshot); ok && snapshot.State != SnapshotShared {
+		return false
+	}
+	return store.chunkCacheDead == nil || !store.chunkCacheDead(id.Snapshot)
 }
 
 // evictCachedChunks removes the oldest of chunks until those left fit the
@@ -1443,6 +1452,132 @@ func (store *LocalDataStore) ReclaimCollected(graph *Store, ids []ObjectID) (rem
 		removed++
 	}
 	return removed, nil
+}
+
+// EvictDeadCachedChunks removes the cached chunks of the origins the cache's
+// dead reports gone, which graph does not hold, reading no other origin's.
+// Shared GC retires an origin only after the removal that left its chunks
+// cached, and its sweeps, so no sweep found them dead: they stayed until newer
+// chunks outgrew the cache's bound. It returns how many it removed.
+func (store *LocalDataStore) EvictDeadCachedChunks(graph *Store) (int, error) {
+	store.gcMu.Lock()
+	dead := store.chunkCacheDead
+	caching := store.chunkCache && store.gcLock != nil
+	store.gcMu.Unlock()
+	if !caching || dead == nil {
+		return 0, nil
+	}
+	origins, err := store.readDirNames("memory-chunks")
+	if err != nil {
+		return 0, err
+	}
+	var gone []string
+	for _, name := range origins {
+		value, err := strconv.ParseUint(name, 16, 64)
+		if err != nil || len(name) != 16 {
+			continue
+		}
+		origin := SnapshotID(value)
+		if snapshot, ok := graph.Snapshot(origin); ok && snapshot.State != SnapshotShared {
+			continue
+		}
+		// Asked without the store's lock: the answer may take a round trip.
+		if dead(origin) {
+			gone = append(gone, name)
+		}
+	}
+	if len(gone) == 0 {
+		return 0, nil
+	}
+	store.gcMu.Lock()
+	defer store.gcMu.Unlock()
+	if store.gcLock == nil {
+		return 0, errors.New("TTC bulk-object store is closed")
+	}
+	if err := hostthread.Flock(int(store.gcLock.Fd()), syscall.LOCK_EX); err != nil {
+		return 0, err
+	}
+	defer syscall.Flock(int(store.gcLock.Fd()), syscall.LOCK_UN)
+	removed := 0
+	for _, origin := range gone {
+		originDir := filepath.Join("memory-chunks", origin)
+		shards, err := store.readDirNames(originDir)
+		if err != nil {
+			return removed, err
+		}
+		for _, shard := range shards {
+			shardDir := filepath.Join(originDir, shard)
+			names, err := store.readDirNames(shardDir)
+			if err != nil {
+				return removed, err
+			}
+			for _, name := range names {
+				id, err := ParseObjectID(strings.TrimSuffix(name, ".data"))
+				if err != nil || !strings.HasSuffix(name, ".data") || id.Kind != ObjectKindMemoryChunk {
+					// Left to a sweep, which quarantines what it cannot name.
+					continue
+				}
+				if _, ok := graph.Object(id); ok {
+					continue
+				}
+				store.forgetUnsyncedName(id)
+				if err := store.removeRelative(filepath.Join(shardDir, name), false); err != nil {
+					return removed, err
+				}
+				removed++
+			}
+			if err := store.removeRelative(shardDir, true); err != nil {
+				return removed, err
+			}
+		}
+		if err := store.removeRelative(originDir, true); err != nil {
+			return removed, err
+		}
+	}
+	return removed, nil
+}
+
+// readDirNames returns the names in the store's directory relative, none if
+// it is gone.
+func (store *LocalDataStore) readDirNames(relative string) ([]string, error) {
+	var file *os.File
+	var err error
+	if store.rootFD != nil {
+		var fd int
+		fd, err = unix.Openat(int(store.rootFD.Fd()), relative, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+		if err == nil {
+			file = os.NewFile(uintptr(fd), relative)
+		}
+	} else {
+		file, err = os.Open(filepath.Join(store.root, relative))
+	}
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, unix.ENOENT) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return file.Readdirnames(-1)
+}
+
+// removeRelative removes the store's file relative, or, if directory is set,
+// the directory, unless something is in it. That it is gone is no error.
+func (store *LocalDataStore) removeRelative(relative string, directory bool) error {
+	var err error
+	if store.rootFD != nil {
+		flags := 0
+		if directory {
+			flags = unix.AT_REMOVEDIR
+		}
+		err = unix.Unlinkat(int(store.rootFD.Fd()), relative, flags)
+	} else {
+		err = os.Remove(filepath.Join(store.root, relative))
+	}
+	if err == nil || errors.Is(err, fs.ErrNotExist) || errors.Is(err, unix.ENOENT) || (directory && (errors.Is(err, unix.ENOTEMPTY) || errors.Is(err, unix.EEXIST))) {
+		return nil
+	}
+	return err
 }
 
 // ReclaimUnreferenced removes complete bulk objects absent from graph and
