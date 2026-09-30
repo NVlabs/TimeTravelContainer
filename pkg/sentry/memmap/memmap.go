@@ -629,6 +629,19 @@ func MapInternalForPMA(file File, fr FileRange, at hostarch.AccessType) (safemem
 	return file.MapInternal(fr, at)
 }
 
+// HostMemoryFile is implemented by Files whose contents are memory that the
+// Sentry shares with another host process, such as a GPU renderer, which must
+// see the application's writes at once, as the application must see its. A
+// platform that copies Files that it cannot map into applications must map
+// such a File's memory instead.
+type HostMemoryFile interface {
+	File
+
+	// HostAddress returns the address of fr in the Sentry's mapping of the
+	// memory. The mapping is stable while any page of the File is referenced.
+	HostAddress(fr FileRange) (uintptr, error)
+}
+
 // MemoryFileRange identifies one range whose ownership is serialized as part
 // of a Mappable. It is used by TTC branch-scoped sparse memory capture; it is
 // distinct from transient translations cached in PMAs.
