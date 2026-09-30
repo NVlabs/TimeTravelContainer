@@ -298,14 +298,13 @@ carried in the capture and load context as nvproxy's device remapping is:
 
 *   The child's device loads with every inherited context lost. Its submissions
     fail, its waits return, and its fences signal with an error.
-*   The guest driver busy-waits on its command rings, and gives up only when a
-    ring's `in_error` field is set (see the A0 findings). So the child gets
-    private copies of its rings with `in_error` set.
-*   Its other mappings of the source's blob memory become inaccessible, since
-    they belong to the source's renderer.
-*   The child's next context gets a new renderer. The guest driver reports
-    `VK_ERROR_DEVICE_LOST` from fence waits; what it does elsewhere, and what
-    applications do, is for A4 to find out.
+*   Its mappings of the source's blob memory, which belongs to the source's
+    renderer, raise `SIGBUS`. The guest driver waits for the renderer's
+    replies by spinning on its command ring, and treats a reply that cannot
+    come as fatal, so a process that was using the GPU cannot recover in the
+    child. `SIGBUS` ends it at its next use of the GPU, where it would
+    otherwise spin forever.
+*   The child's next context gets a new renderer.
 
 **gfx, `snapshot`:**
 
@@ -448,8 +447,9 @@ MoltenVK 1.4.2 on an Apple M5 Pro:
 *   **The command transport is a ring in shared memory.** The guest writes
     commands into a host blob with blob ID 0, which it maps, and pings with
     `EXECBUFFER` only when the host is not consuming. It busy-waits for the
-    host, falling back to `usleep` after 50 million spins, and gives up only
-    when the ring's `in_error` field is set. Its Vulkan driver reports
+    host, falling back to `usleep` after 50 million spins. Its writes give up
+    when the ring's `in_error` field is set, but its reads never do (A4 found
+    that), and a failed read aborts the process. Its Vulkan driver reports
     `VK_ERROR_DEVICE_LOST` from fence waits.
 
 **A1, the Sentry's device**, independent of the platform, with a fake renderer
@@ -492,29 +492,46 @@ for unit tests:
 End to end, `vulkaninfo` and an offscreen render's checksum in
 `ttc run --gfx --waive-live-fork`.
 
-*Status (2026-09-30): in progress.*
+*Status (2026-09-30): done on macOS, with one limit.* `ttc run --gfx
+--waive-live-fork` gives a Debian container a GPU whose `vulkaninfo` reports
+"Virtio-GPU GFXStream (Apple M5 Pro)", and `runsc/ttc/test/e2e_gfx.sh` checks
+that, and an offscreen compute and render whose every pixel it checks
+(`test/gfx/vkoffscreen.c`).
 
-*   Done, and tested on the host's GPU (MoltenVK):
-    *   `ttc-gfx-renderer` (`runsc/ttcgfx`, `runsc/ttc/gfxrenderer`), its own
-        binary because ttcd is pure Go on Linux. It loads gfxstream with
-        `dlopen`; `probe` prints the capability sets. Its README records the
-        gfxstream build and TTC's patches to it, and how to build the guest's
-        driver.
-    *   `pkg/gfxproto`, the protocol: framed messages on a Unix stream
-        socket, descriptors with `SCM_RIGHTS`; the renderer answers only
-        context creation and resource mapping, and forwards gfxstream's
-        fences, signaled on its own threads, through a pipe.
-    *   `rendererclient`, the Sentry's `virtgpu.Renderer`, and its `Broker`,
-        which asks the daemon for renderers over a socket that the daemon
-        gives the Sentry at boot (`gfxrenderer.ServeBroker` is the daemon's
-        side).
-*   Done, with unit tests on fake VMs; not yet run on Hypervisor.framework:
-    vmplatform maps a `memmap.HostMemoryFile` in place, in GuestRAM's
-    external slabs: at IPA of their own, readable and writable, never
-    executable, whole host slabs within the file's own mapping, unmapped from
-    stage 2 before the Sentry unmaps the memory.
-*   To do: the daemon's broker and `--gfx` plumbing, the runsc boot wiring,
-    the guest driver's injection, and the end-to-end test.
+*   `ttc-gfx-renderer` (`runsc/ttcgfx`, `runsc/ttc/gfxrenderer`) is its own
+    binary because ttcd is pure Go on Linux. It loads gfxstream with `dlopen`;
+    `probe` prints the capability sets. Its README records the gfxstream build
+    and TTC's patches to it, and how to build the guest's driver.
+*   `pkg/gfxproto` is the protocol: framed messages on a Unix stream socket,
+    descriptors with `SCM_RIGHTS`. The renderer answers only context creation
+    and resource mapping, and forwards gfxstream's fences, which it signals on
+    its own threads, through a pipe.
+*   `rendererclient` is the Sentry's `virtgpu.Renderer`. Its `Broker` asks the
+    daemon's GPU service for a renderer for each branch whose GPU is in use:
+    runsc connects the sandbox to the service's socket, in the daemon's
+    `run/`, and passes the connection to the Sentry at boot. The service
+    probes the renderer for its capability sets once, and passes them to
+    runsc (`--gfx-capsets`).
+*   vmplatform maps a `memmap.HostMemoryFile` in place, in GuestRAM's external
+    slabs: at IPA of their own, readable and writable, never executable, whole
+    host slabs within the file's own mapping, unmapped from stage 2 before the
+    Sentry unmaps the memory. It maps them through `vmm.SharedStage2Mapper`:
+    mapping touches the pages, which the Sentry's continuation cannot do at
+    guest EL1 (the ring0 engine mirrors only memory that the Sentry owns, or
+    that stage 2 already maps), so HVF returns it to host EL0 first. The first
+    end-to-end runs found that crash.
+*   **Limit:** on macOS, ttcd confines itself, and so its children, with a
+    Seatbelt profile that denies the GPU, so `--gfx` needs a daemon started
+    with `--unsafe-no-host-isolation`. The fix is a launcher that ttcd starts
+    before it confines itself, which starts renderers that confine themselves
+    with a profile of their own (Metal's IOKit clients and compiler service,
+    POSIX shared memory, no network); a renderer must not run unconfined, since
+    it parses untrusted command streams.
+*   The Linux side of A2 (Phase B) needs: the renderer built with cgo, and
+    gfxstream on the host's Vulkan driver; blobs that gfxstream exports as
+    shared memory or dma-bufs, which the Sentry maps through their
+    descriptors, as `hostMemory.DataFD` offers; and seccomp rules for the
+    Sentry's broker and renderer connections.
 
 **A3, the CLI and family:**
 
@@ -524,7 +541,29 @@ End to end, `vulkaninfo` and an offscreen render's checksum in
 *   the family record and the waiver rule;
 *   validation tests.
 
+*Status (2026-09-30): done for `--gfx`.* `ttcbundle.GPUOptions` is the
+family's record, which `ValidateGPUOptions` checks on creation, and
+`checkGPURecord` on load. `--gfx-fork=snapshot` is refused until A5, and
+`--nvproxy` until Phase B (on macOS, as needing NVIDIA GPUs).
+
 **A4**, `--gfx-fork=device-lost`.
+
+*Status (2026-09-30): done.* A fork's child loads the device with every
+inherited context lost. Their submissions fail with `ENODEV`, their pending
+fences signal with it, and the child's mappings of the source's blob memory
+raise `SIGBUS`. The source keeps its renderer. A fork invalidates the source's
+translations of blob memory, which it cannot save, and the source faults them
+back in. `e2e_gfx.sh` forks a container while it renders:
+
+*   in the child, the process that was rendering dies of `SIGBUS` at its next
+    use of the GPU;
+*   a new process in the child renders with a renderer of the child's own;
+*   the source renders on, unaffected.
+
+A first version gave the child copies of its command rings with `in_error`
+set. That left the process spinning forever: gfxstream's guest driver cannot
+survive the loss of its renderer. Its reads spin until data arrives, whatever
+`in_error` says, and a failed read aborts the process.
 
 **A5**, `--gfx-fork=snapshot`: local forks first, then dehydration and remote
 forks with renderer-profile checks.
