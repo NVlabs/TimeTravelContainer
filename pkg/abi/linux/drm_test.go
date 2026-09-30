@@ -36,9 +36,34 @@ func TestDRMStructSizes(t *testing.T) {
 		{"sync_merge_data", &SyncMergeData{}, 48},
 		{"sync_file_info", &SyncFileInfo{}, 56},
 		{"sync_fence_info", &SyncFenceInfo{}, 80},
+		{"sync_set_deadline", &SyncSetDeadline{}, 16},
+		{"dma_buf_sync", &DMABufSync{}, 8},
+		{"dma_buf_export_sync_file", &DMABufSyncFile{}, 8},
 	} {
 		if got := test.v.SizeBytes(); got != test.want {
 			t.Errorf("struct %s is %d bytes, want %d", test.name, got, test.want)
+		}
+	}
+}
+
+// The ioctl commands are those of Linux's uapi headers.
+func TestSyncFileAndDMABufIoctls(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		got  uint32
+		want uint32
+	}{
+		{"SYNC_IOC_MERGE", SYNC_IOC_MERGE, 0xc0303e03},
+		{"SYNC_IOC_FILE_INFO", SYNC_IOC_FILE_INFO, 0xc0383e04},
+		{"SYNC_IOC_SET_DEADLINE", SYNC_IOC_SET_DEADLINE, 0x40103e05},
+		{"DMA_BUF_IOCTL_SYNC", DMA_BUF_IOCTL_SYNC, 0x40086200},
+		{"DMA_BUF_SET_NAME_A", DMA_BUF_SET_NAME_A, 0x40046201},
+		{"DMA_BUF_SET_NAME_B", DMA_BUF_SET_NAME_B, 0x40086201},
+		{"DMA_BUF_IOCTL_EXPORT_SYNC_FILE", DMA_BUF_IOCTL_EXPORT_SYNC_FILE, 0xc0086202},
+		{"DMA_BUF_IOCTL_IMPORT_SYNC_FILE", DMA_BUF_IOCTL_IMPORT_SYNC_FILE, 0x40086203},
+	} {
+		if test.got != test.want {
+			t.Errorf("%s is %#x, want %#x", test.name, test.got, test.want)
 		}
 	}
 }

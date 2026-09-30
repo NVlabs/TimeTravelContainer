@@ -25,6 +25,7 @@ go_library(
         "rdma.go",
         "save_restore.go",
         "sys.go",
+        "virtgpu.go",
     ],
     visibility = ["//pkg/sentry:internal"],
     deps = [

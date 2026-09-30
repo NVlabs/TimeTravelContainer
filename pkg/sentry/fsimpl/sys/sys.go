@@ -71,6 +71,9 @@ type InternalData struct {
 	// TestSysfsPathPrefix is a prefix for the sysfs paths. It is useful for
 	// unit testing.
 	TestSysfsPathPrefix string
+	// VirtualGPU is whether to present the virtual GPU of
+	// pkg/sentry/devices/virtgpu.
+	VirtualGPU bool
 }
 
 // filesystem implements vfs.FilesystemImpl.
@@ -140,6 +143,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	productName := ""
 	busSub := make(map[string]kernfs.Inode)     // /sys/bus
 	pciDevices := make(map[string]kernfs.Inode) // /sys/bus/pci/devices
+	devChar := make(map[string]kernfs.Inode)    // /sys/dev/char
 	kernelSub := kernelDir(ctx, fs, creds)      // /sys/kernel
 	if opts.InternalData != nil {
 		idata := opts.InternalData.(*InternalData)
@@ -211,6 +215,21 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 				systemSub["node"] = rdmaDirs.node
 			}
 		}
+		if idata.VirtualGPU {
+			gpu := fs.newVirtGPUSysfs(ctx, creds)
+			if _, ok := devicesSub[virtGPURootComplex]; ok {
+				return nil, nil, fmt.Errorf("the host's PCI devices and the virtual GPU both populate /sys/devices/%s", virtGPURootComplex)
+			}
+			devicesSub[virtGPURootComplex] = gpu.devices
+			pciDevices[virtGPUPCISlot] = gpu.busPCIDevice
+			busSub["virtio"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+				"devices": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+					virtGPUVirtio: gpu.busVirtioDevice,
+				}),
+			})
+			classSub["drm"] = gpu.classDRM
+			devChar[virtGPURenderDev] = gpu.devChar
+		}
 	}
 	if len(pciDevices) > 0 {
 		busSub["pci"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
@@ -238,7 +257,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		"class": fs.newDir(ctx, creds, defaultSysDirMode, classSub),
 		"dev": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
 			"block": fs.newDir(ctx, creds, defaultSysDirMode, nil),
-			"char":  fs.newDir(ctx, creds, defaultSysDirMode, nil),
+			"char":  fs.newDir(ctx, creds, defaultSysDirMode, devChar),
 		}),
 		"devices":  fs.newDir(ctx, creds, defaultSysDirMode, devicesSub),
 		"firmware": fs.newDir(ctx, creds, defaultSysDirMode, nil),

@@ -29,9 +29,10 @@ const (
 	DRM_NR_PRIME_FD_TO_HANDLE = 0x2e
 
 	// DRM_CAP_* for DRM_IOCTL_GET_CAP.
-	DRM_CAP_PRIME            = 0x5
-	DRM_CAP_SYNCOBJ          = 0x13
-	DRM_CAP_SYNCOBJ_TIMELINE = 0x14
+	DRM_CAP_PRIME               = 0x5
+	DRM_CAP_TIMESTAMP_MONOTONIC = 0x6
+	DRM_CAP_SYNCOBJ             = 0x13
+	DRM_CAP_SYNCOBJ_TIMELINE    = 0x14
 	// DRM_PRIME_CAP_* are the bits of DRM_CAP_PRIME.
 	DRM_PRIME_CAP_IMPORT = 0x1
 	DRM_PRIME_CAP_EXPORT = 0x2
@@ -317,14 +318,42 @@ type DRMVirtgpuContextInit struct {
 const (
 	// SYNC_IOC_MAGIC is the ioctl type of sync_file ioctls.
 	SYNC_IOC_MAGIC = '>'
-	// SYNC_IOC_MERGE_NR and SYNC_IOC_FILE_INFO_NR are their numbers.
-	SYNC_IOC_MERGE_NR     = 3
-	SYNC_IOC_FILE_INFO_NR = 4
+	// SYNC_IOC_*_NR are their numbers.
+	SYNC_IOC_MERGE_NR        = 3
+	SYNC_IOC_FILE_INFO_NR    = 4
+	SYNC_IOC_SET_DEADLINE_NR = 5
 
 	// DMA_BUF_BASE is the ioctl type of dma-buf ioctls.
 	DMA_BUF_BASE = 'b'
-	// DMA_BUF_IOCTL_SYNC_NR is the number of DMA_BUF_IOCTL_SYNC.
-	DMA_BUF_IOCTL_SYNC_NR = 0
+	// DMA_BUF_*_NR are their numbers.
+	DMA_BUF_IOCTL_SYNC_NR             = 0
+	DMA_BUF_SET_NAME_NR               = 1
+	DMA_BUF_IOCTL_EXPORT_SYNC_FILE_NR = 2
+	DMA_BUF_IOCTL_IMPORT_SYNC_FILE_NR = 3
+
+	// DMA_BUF_SYNC_* are the flags of DMA_BUF_IOCTL_SYNC, and, READ and
+	// WRITE, of DMA_BUF_IOCTL_EXPORT_SYNC_FILE and
+	// DMA_BUF_IOCTL_IMPORT_SYNC_FILE.
+	DMA_BUF_SYNC_READ  = 1 << 0
+	DMA_BUF_SYNC_WRITE = 2 << 0
+	DMA_BUF_SYNC_RW    = DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE
+	DMA_BUF_SYNC_START = 0 << 2
+	DMA_BUF_SYNC_END   = 1 << 2
+
+	// DMA_BUF_NAME_LEN is the size of a dma-buf's name, with its NUL.
+	DMA_BUF_NAME_LEN = 32
+)
+
+// sync_file and dma-buf ioctls.
+var (
+	SYNC_IOC_MERGE                 = IOWR(SYNC_IOC_MAGIC, SYNC_IOC_MERGE_NR, 48)
+	SYNC_IOC_FILE_INFO             = IOWR(SYNC_IOC_MAGIC, SYNC_IOC_FILE_INFO_NR, 56)
+	SYNC_IOC_SET_DEADLINE          = IOW(SYNC_IOC_MAGIC, SYNC_IOC_SET_DEADLINE_NR, 16)
+	DMA_BUF_IOCTL_SYNC             = IOW(DMA_BUF_BASE, DMA_BUF_IOCTL_SYNC_NR, 8)
+	DMA_BUF_SET_NAME_A             = IOW(DMA_BUF_BASE, DMA_BUF_SET_NAME_NR, 4)
+	DMA_BUF_SET_NAME_B             = IOW(DMA_BUF_BASE, DMA_BUF_SET_NAME_NR, 8)
+	DMA_BUF_IOCTL_EXPORT_SYNC_FILE = IOWR(DMA_BUF_BASE, DMA_BUF_IOCTL_EXPORT_SYNC_FILE_NR, 8)
+	DMA_BUF_IOCTL_IMPORT_SYNC_FILE = IOW(DMA_BUF_BASE, DMA_BUF_IOCTL_IMPORT_SYNC_FILE_NR, 8)
 )
 
 // SyncMergeData is struct sync_merge_data.
@@ -352,9 +381,36 @@ type SyncFileInfo struct {
 	SyncFenceInfo uint64
 }
 
-// SyncFenceInfo is struct sync_fence_info.
+// SyncSetDeadline is struct sync_set_deadline.
 //
 // +marshal
+type SyncSetDeadline struct {
+	_          structs.HostLayout
+	DeadlineNS uint64
+	Pad        uint64
+}
+
+// DMABufSync is struct dma_buf_sync.
+//
+// +marshal
+type DMABufSync struct {
+	_     structs.HostLayout
+	Flags uint64
+}
+
+// DMABufSyncFile is struct dma_buf_export_sync_file, and struct
+// dma_buf_import_sync_file.
+//
+// +marshal
+type DMABufSyncFile struct {
+	_     structs.HostLayout
+	Flags uint32
+	FD    int32
+}
+
+// SyncFenceInfo is struct sync_fence_info.
+//
+// +marshal slice:SyncFenceInfoSlice
 type SyncFenceInfo struct {
 	_           structs.HostLayout
 	ObjName     [32]byte
