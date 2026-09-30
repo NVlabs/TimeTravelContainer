@@ -559,7 +559,7 @@ func TestCheckpointHeadPublicationBoundary(t *testing.T) {
 	}
 	baseline := readGraphTestFiles(t, dir)
 
-	nextCheckpoint := append(checkpoint, '\n')
+	nextCheckpoint := checkpoint
 	nextJournal := []byte(journalHeader)
 	nextHead, err := json.Marshal(graphHead{Version: formatVersion, Generation: 3})
 	if err != nil {
@@ -3504,9 +3504,20 @@ func TestInconsistentCheckpointIsRefused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	damaged := bytes.Replace(data, []byte(`"Refs":1`), []byte(`"Refs":2`), 1)
-	if bytes.Equal(damaged, data) {
-		t.Fatal("the checkpoint has no reference count to change")
+	// Sealed with a checksum of its own, which it passes.
+	state, err := decodeGraphCheckpoint(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for id, object := range state.Objects {
+		if id.Kind == ObjectKindFile {
+			object.Refs++
+			state.Objects[id] = object
+		}
+	}
+	damaged, err := encodeGraphCheckpoint(&state)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if err := os.WriteFile(path, damaged, 0600); err != nil {
 		t.Fatal(err)

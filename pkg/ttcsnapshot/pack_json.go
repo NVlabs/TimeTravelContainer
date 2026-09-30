@@ -103,7 +103,7 @@ func decodeSharedManifest(data []byte) (SnapshotManifest, error) {
 // decodeCanonicalManifest decodes a manifest of the canonical form. It
 // reports false for anything else.
 func decodeCanonicalManifest(data []byte) (SnapshotManifest, bool) {
-	d := checkpointDecoder{data: data}
+	d := jsonDecoder{data: data}
 	var manifest SnapshotManifest
 	var seen [5]bool
 	ok := d.members(func(name []byte) bool {
@@ -149,7 +149,7 @@ func decodeCanonicalManifest(data []byte) (SnapshotManifest, bool) {
 
 // packedObjects consumes an array of packed objects, or null, into a new
 // slice.
-func (d *checkpointDecoder) packedObjects(value *[]PackedObject) bool {
+func (d *jsonDecoder) packedObjects(value *[]PackedObject) bool {
 	if d.literal("null") {
 		*value = nil
 		return true
@@ -197,7 +197,7 @@ func (d *checkpointDecoder) packedObjects(value *[]PackedObject) bool {
 }
 
 // extents consumes an array of pack extents, or null, into a new slice.
-func (d *checkpointDecoder) extents(value *[]PackExtent) bool {
+func (d *jsonDecoder) extents(value *[]PackExtent) bool {
 	if d.literal("null") {
 		*value = nil
 		return true
@@ -256,7 +256,7 @@ func (d *checkpointDecoder) extents(value *[]PackExtent) bool {
 
 // references consumes an object of named object IDs, or null, into a new
 // map.
-func (d *checkpointDecoder) references(value *map[string]ObjectID) bool {
+func (d *jsonDecoder) references(value *map[string]ObjectID) bool {
 	if d.literal("null") {
 		*value = nil
 		return true

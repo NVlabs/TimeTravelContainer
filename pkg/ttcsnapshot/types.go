@@ -15,7 +15,9 @@ import (
 )
 
 const (
-	formatVersion      = 5
+	// formatVersion is that of a graph whose checkpoint and journal are
+	// binary. Opened, a graph of legacyFormatVersion is converted.
+	formatVersion      = 6
 	maxObjectDataBytes = 4 << 20
 	maxObjectEdges     = 256
 )

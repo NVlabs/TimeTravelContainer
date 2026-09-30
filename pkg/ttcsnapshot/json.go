@@ -7,126 +7,8 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"strconv"
 )
-
-// decodeGraphCheckpoint decodes a graph checkpoint as json.Unmarshal does
-// into a graphState. A checkpoint as json.Marshal writes one has its objects,
-// nearly all of it, decoded here without reflection, four times as fast:
-// encoding/json took 1.6 s for 300,000 objects, and a daemon's first load of
-// a repository of 100,000 files spent 4 s in it. Anything else, however
-// valid, is left to encoding/json whole, so that the two can never differ.
-func decodeGraphCheckpoint(data []byte) (graphState, error) {
-	if state, ok := decodeCanonicalCheckpoint(data); ok {
-		return state, nil
-	}
-	var checkpoint checkpointJSON
-	if err := json.Unmarshal(data, &checkpoint); err != nil {
-		return graphState{}, err
-	}
-	return checkpoint.state()
-}
-
-// checkpointJSON is a graph state as a checkpoint holds it: its objects named
-// by their keys.
-type checkpointJSON struct {
-	Version      int
-	Sequence     uint64
-	NextSnapshot SnapshotID
-	Snapshots    map[string]Snapshot
-	Objects      map[string]Object
-	Roots        map[string]ObjectID
-	Pins         map[string]ObjectID
-	Frozen       map[string]bool
-	Handoffs     map[string]SnapshotLedgerHandoff
-}
-
-// state returns the graph state checkpoint holds, each object under the ID
-// its key names, which must be its own.
-func (checkpoint *checkpointJSON) state() (graphState, error) {
-	state := graphState{
-		Version: checkpoint.Version, Sequence: checkpoint.Sequence, NextSnapshot: checkpoint.NextSnapshot,
-		Snapshots: checkpoint.Snapshots, Roots: checkpoint.Roots, Pins: checkpoint.Pins,
-		Frozen: checkpoint.Frozen, Handoffs: checkpoint.Handoffs,
-	}
-	if checkpoint.Objects != nil {
-		state.Objects = make(map[ObjectID]Object, len(checkpoint.Objects))
-		for key, object := range checkpoint.Objects {
-			id, err := parseObjectKey(key)
-			if err != nil {
-				return graphState{}, err
-			}
-			if id != object.ID {
-				return graphState{}, fmt.Errorf("object key %q does not match %s", key, object.ID)
-			}
-			state.Objects[id] = object
-		}
-	}
-	return state, nil
-}
-
-// encodeGraphCheckpoint encodes state as json.Marshal does, byte for byte,
-// the objects without reflection, twice as fast: encoding/json took 1 s for
-// 300,000 objects.
-func encodeGraphCheckpoint(state *graphState) ([]byte, error) {
-	// The fields around the objects are small: encoding/json encodes them.
-	head, err := json.Marshal(struct {
-		Version      int
-		Sequence     uint64
-		NextSnapshot SnapshotID
-		Snapshots    map[string]Snapshot
-	}{state.Version, state.Sequence, state.NextSnapshot, state.Snapshots})
-	if err != nil {
-		return nil, err
-	}
-	tail, err := json.Marshal(struct {
-		Roots    map[string]ObjectID
-		Pins     map[string]ObjectID
-		Frozen   map[string]bool
-		Handoffs map[string]SnapshotLedgerHandoff
-	}{state.Roots, state.Pins, state.Frozen, state.Handoffs})
-	if err != nil {
-		return nil, err
-	}
-	out := make([]byte, 0, len(head)+len(tail)+objectTableJSONSize(state.Objects))
-	out = append(out, head[:len(head)-1]...)
-	out = append(out, `,"Objects":`...)
-	out = appendObjectTableJSON(out, state.Objects)
-	out = append(out, ',')
-	out = append(out, tail[1:]...)
-	return out, nil
-}
-
-// objectTableJSONSize estimates, generously, the length of objects as
-// appendObjectTableJSON writes it. A buffer sized at 256 bytes an object grew
-// as a checkpoint filled it, and copied a checkpoint of 100 MB over and over.
-func objectTableJSONSize(objects map[ObjectID]Object) int {
-	size := 2
-	for _, object := range objects {
-		size += 36 + 4 + 190 + len(object.State) + base64.StdEncoding.EncodedLen(len(object.Data)) + 64*len(object.Children) + len(object.SourceCatalog)
-	}
-	return size
-}
-
-// appendObjectTableJSON appends objects as json.Marshal writes a table of
-// them by key: in the order of their keys, which is their IDs'.
-func appendObjectTableJSON(out []byte, objects map[ObjectID]Object) []byte {
-	if objects == nil {
-		return append(out, "null"...)
-	}
-	out = append(out, '{')
-	for index, id := range sortedIDs(objects) {
-		if index != 0 {
-			out = append(out, ',')
-		}
-		out = append(out, '"')
-		out = appendObjectKey(out, id)
-		out = append(out, '"', ':')
-		out = appendObjectJSON(out, objects[id])
-	}
-	return append(out, '}')
-}
 
 // appendJSONString appends s as json.Marshal writes it.
 func appendJSONString(out []byte, s string) []byte {
@@ -218,65 +100,15 @@ func appendObjectJSONEscaping(out []byte, object Object, escapeHTML bool) []byte
 	return append(out, '}')
 }
 
-// checkpointDecoder reads the canonical form of a checkpoint: each field once
-// and known, each string ASCII without escapes, each number an integer.
-type checkpointDecoder struct {
+// jsonDecoder reads the canonical form of the JSON of a shared manifest or a
+// filesystem record: each field once and known, each string ASCII without
+// escapes, each number an integer.
+type jsonDecoder struct {
 	data []byte
 	pos  int
 }
 
-// decodeCanonicalCheckpoint decodes a checkpoint of the canonical form. It
-// reports false for anything else.
-func decodeCanonicalCheckpoint(data []byte) (graphState, bool) {
-	d := checkpointDecoder{data: data}
-	var state graphState
-	var seen [9]bool
-	ok := d.members(func(name []byte) bool {
-		// The fields other than the objects are small: encoding/json decodes
-		// them.
-		var target any
-		index := 0
-		switch string(name) {
-		case "Version":
-			target = &state.Version
-		case "Sequence":
-			index, target = 1, &state.Sequence
-		case "NextSnapshot":
-			index, target = 2, &state.NextSnapshot
-		case "Snapshots":
-			index, target = 3, &state.Snapshots
-		case "Objects":
-			if seen[4] {
-				return false
-			}
-			seen[4] = true
-			return d.objects(&state.Objects)
-		case "Roots":
-			index, target = 5, &state.Roots
-		case "Pins":
-			index, target = 6, &state.Pins
-		case "Frozen":
-			index, target = 7, &state.Frozen
-		case "Handoffs":
-			index, target = 8, &state.Handoffs
-		default:
-			return false
-		}
-		if seen[index] {
-			return false
-		}
-		seen[index] = true
-		start := d.pos
-		if !d.skip(0) {
-			return false
-		}
-		return json.Unmarshal(d.data[start:d.pos], target) == nil
-	})
-	d.space()
-	return state, ok && d.pos == len(d.data)
-}
-
-func (d *checkpointDecoder) space() {
+func (d *jsonDecoder) space() {
 	for d.pos < len(d.data) {
 		switch d.data[d.pos] {
 		case ' ', '\t', '\n', '\r':
@@ -288,7 +120,7 @@ func (d *checkpointDecoder) space() {
 }
 
 // consume consumes c after any space.
-func (d *checkpointDecoder) consume(c byte) bool {
+func (d *jsonDecoder) consume(c byte) bool {
 	d.space()
 	if d.pos < len(d.data) && d.data[d.pos] == c {
 		d.pos++
@@ -298,7 +130,7 @@ func (d *checkpointDecoder) consume(c byte) bool {
 }
 
 // literal consumes word after any space.
-func (d *checkpointDecoder) literal(word string) bool {
+func (d *jsonDecoder) literal(word string) bool {
 	d.space()
 	if len(d.data)-d.pos >= len(word) && string(d.data[d.pos:d.pos+len(word)]) == word {
 		d.pos += len(word)
@@ -309,7 +141,7 @@ func (d *checkpointDecoder) literal(word string) bool {
 
 // plainString consumes a string of printable ASCII without escapes, and
 // returns its contents.
-func (d *checkpointDecoder) plainString() ([]byte, bool) {
+func (d *jsonDecoder) plainString() ([]byte, bool) {
 	d.space()
 	if d.pos >= len(d.data) || d.data[d.pos] != '"' {
 		return nil, false
@@ -329,7 +161,7 @@ func (d *checkpointDecoder) plainString() ([]byte, bool) {
 
 // integer consumes an unsigned integer of at most bits bits, written without
 // a sign, fraction, exponent or leading zero.
-func (d *checkpointDecoder) integer(bits uint) (uint64, bool) {
+func (d *jsonDecoder) integer(bits uint) (uint64, bool) {
 	d.space()
 	start := d.pos
 	limit := uint64(1)<<bits - 1
@@ -360,7 +192,7 @@ func (d *checkpointDecoder) integer(bits uint) (uint64, bool) {
 
 // members consumes an object, calling member with each member's name with
 // the decoder at its value, which member consumes.
-func (d *checkpointDecoder) members(member func(name []byte) bool) bool {
+func (d *jsonDecoder) members(member func(name []byte) bool) bool {
 	if !d.consume('{') {
 		return false
 	}
@@ -379,8 +211,31 @@ func (d *checkpointDecoder) members(member func(name []byte) bool) bool {
 	}
 }
 
+// array consumes an array, or null, calling element with the decoder at each
+// element, which element consumes. It reports whether the array was null.
+func (d *jsonDecoder) array(element func() bool) (null, ok bool) {
+	if d.literal("null") {
+		return true, true
+	}
+	if !d.consume('[') {
+		return false, false
+	}
+	if d.consume(']') {
+		return false, true
+	}
+	for {
+		if !element() {
+			return false, false
+		}
+		if d.consume(',') {
+			continue
+		}
+		return false, d.consume(']')
+	}
+}
+
 // skip consumes any value, checking its syntax.
-func (d *checkpointDecoder) skip(depth int) bool {
+func (d *jsonDecoder) skip(depth int) bool {
 	if depth > 10000 {
 		return false
 	}
@@ -420,31 +275,8 @@ func (d *checkpointDecoder) skip(depth int) bool {
 	}
 }
 
-// objects consumes the checkpoint's object table into *table. Each key must
-// name its object's ID.
-func (d *checkpointDecoder) objects(table *map[ObjectID]Object) bool {
-	if d.literal("null") {
-		*table = nil
-		return true
-	}
-	if *table == nil {
-		*table = make(map[ObjectID]Object)
-	}
-	return d.members(func(key []byte) bool {
-		var object Object
-		if !d.object(&object) {
-			return false
-		}
-		if id, err := parseObjectKey(string(key)); err != nil || id != object.ID {
-			return false
-		}
-		(*table)[object.ID] = object
-		return true
-	})
-}
-
 // object consumes one object's record.
-func (d *checkpointDecoder) object(object *Object) bool {
+func (d *jsonDecoder) object(object *Object) bool {
 	var seen [9]bool
 	once := func(index int) bool {
 		if seen[index] {
@@ -494,7 +326,7 @@ func (d *checkpointDecoder) object(object *Object) bool {
 	})
 }
 
-func (d *checkpointDecoder) objectID(id *ObjectID) bool {
+func (d *jsonDecoder) objectID(id *ObjectID) bool {
 	var seen [3]bool
 	return d.members(func(name []byte) bool {
 		var index int
@@ -525,7 +357,7 @@ func (d *checkpointDecoder) objectID(id *ObjectID) bool {
 
 // bytes consumes a base64 string, or null, as json.Unmarshal does into a
 // byte slice: "" is an empty slice, null a nil one.
-func (d *checkpointDecoder) bytes(value *[]byte) bool {
+func (d *jsonDecoder) bytes(value *[]byte) bool {
 	if d.literal("null") {
 		*value = nil
 		return true
@@ -541,7 +373,7 @@ func (d *checkpointDecoder) bytes(value *[]byte) bool {
 }
 
 // edges consumes an array of edges, or null, into a new slice.
-func (d *checkpointDecoder) edges(value *[]Edge) bool {
+func (d *jsonDecoder) edges(value *[]Edge) bool {
 	if d.literal("null") {
 		*value = nil
 		return true

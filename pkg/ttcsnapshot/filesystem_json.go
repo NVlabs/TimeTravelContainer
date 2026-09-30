@@ -209,7 +209,7 @@ func decodeDirectoryEntryRecord(data []byte) (DirectoryEntryRecord, error) {
 // decodeCanonicalInodeRecord decodes a record of the canonical form, each
 // field once and known. It reports false for anything else.
 func decodeCanonicalInodeRecord(data []byte) (InodeRecord, bool) {
-	d := checkpointDecoder{data: data}
+	d := jsonDecoder{data: data}
 	var inode InodeRecord
 	ok := d.inodeRecord(&inode)
 	d.space()
@@ -217,7 +217,7 @@ func decodeCanonicalInodeRecord(data []byte) (InodeRecord, bool) {
 }
 
 // inodeRecord consumes an inode record of the canonical form.
-func (d *checkpointDecoder) inodeRecord(inode *InodeRecord) bool {
+func (d *jsonDecoder) inodeRecord(inode *InodeRecord) bool {
 	var seen [17]bool
 	return d.members(func(name []byte) bool {
 		var index int
@@ -303,7 +303,7 @@ func (d *checkpointDecoder) inodeRecord(inode *InodeRecord) bool {
 // decodeCanonicalDirectoryEntryRecord is decodeCanonicalInodeRecord for a
 // directory entry.
 func decodeCanonicalDirectoryEntryRecord(data []byte) (DirectoryEntryRecord, bool) {
-	d := checkpointDecoder{data: data}
+	d := jsonDecoder{data: data}
 	var entry DirectoryEntryRecord
 	ok := d.directoryEntryRecord(&entry)
 	d.space()
@@ -312,7 +312,7 @@ func decodeCanonicalDirectoryEntryRecord(data []byte) (DirectoryEntryRecord, boo
 
 // directoryEntryRecord consumes a directory entry record of the canonical
 // form.
-func (d *checkpointDecoder) directoryEntryRecord(entry *DirectoryEntryRecord) bool {
+func (d *jsonDecoder) directoryEntryRecord(entry *DirectoryEntryRecord) bool {
 	var seen [3]bool
 	return d.members(func(name []byte) bool {
 		var index int
@@ -341,7 +341,7 @@ func (d *checkpointDecoder) directoryEntryRecord(entry *DirectoryEntryRecord) bo
 
 // xattrs consumes a map of base64 values, or null, as json.Unmarshal does
 // into a new map; a name it repeats is left to encoding/json.
-func (d *checkpointDecoder) xattrs(value *map[string][]byte) bool {
+func (d *jsonDecoder) xattrs(value *map[string][]byte) bool {
 	if d.literal("null") {
 		*value = nil
 		return true

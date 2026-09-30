@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"hash/maphash"
 	"io"
 	"math"
@@ -28,7 +29,7 @@ import (
 )
 
 const (
-	journalHeader        = "TTCSGJ5\n"
+	journalHeader        = "TTCSGJ6\n"
 	maxJournalRecordSize = 8 << 20
 	// maxCollectObjectsPerTransaction bounds the fan-out of reference updates
 	// emitted by one GC transaction. An object may have maxObjectEdges
@@ -258,7 +259,7 @@ type journalOp struct {
 	PutSnapshot      *Snapshot
 	DeleteSnapshot   SnapshotID
 	PutObject        *Object
-	DeleteObject     string
+	DeleteObject     ObjectID
 	RootName         string
 	PutRoot          *ObjectID
 	DeleteRoot       bool
@@ -278,16 +279,13 @@ func (op *journalOp) object() (ObjectID, bool) {
 	if op.PutObject != nil {
 		return op.PutObject.ID, true
 	}
-	if op.DeleteObject != "" {
-		// A record is validated before it is applied: the key is canonical.
-		id, err := parseObjectKey(op.DeleteObject)
-		return id, err == nil
+	if !op.DeleteObject.IsZero() {
+		return op.DeleteObject, true
 	}
 	return ObjectID{}, false
 }
 
 type journalRecord struct {
-	Version    int
 	Sequence   uint64
 	Ops        []journalOp
 	References []journalReference
@@ -315,6 +313,10 @@ type Store struct {
 	state      graphState
 	poisoned   error
 	journalEnd int64
+	// journalWeight is what replaying the journal costs, as loading so many
+	// bytes of checkpoint costs: its bytes, and more for what its records
+	// cost to replay beyond them (see journalRecordWeight).
+	journalWeight int64
 	// checkpointBytes is the size of the generation's checkpoint, and
 	// checkpointObjects the number of objects it holds.
 	checkpointBytes   int64
@@ -421,7 +423,7 @@ func decodeHead(data []byte) (graphHead, error) {
 	if err := json.Unmarshal(data, &head); err != nil {
 		return graphHead{}, fmt.Errorf("decoding TTC snapshot graph head: %w", err)
 	}
-	if head.Version != formatVersion || head.Generation == 0 {
+	if head.Version != formatVersion && head.Version != legacyFormatVersion || head.Generation == 0 {
 		return graphHead{}, fmt.Errorf("unsupported TTC snapshot graph head version %d generation %d", head.Version, head.Generation)
 	}
 	return head, nil
@@ -935,7 +937,6 @@ func (s *Store) initializeGeneration() error {
 	if err != nil {
 		return err
 	}
-	checkpoint = append(checkpoint, '\n')
 	if err := s.writeFileAtomically(graphCheckpointName(1), ".graph-checkpoint-", checkpoint); err != nil {
 		return err
 	}
@@ -974,6 +975,14 @@ func (s *Store) loadCurrentGeneration(repairTail bool) error {
 		head = graphHead{Version: formatVersion, Generation: 1}
 	} else if err != nil {
 		return err
+	}
+	if head.Version == legacyFormatVersion {
+		if err := s.convertLegacyGeneration(head); err != nil {
+			return err
+		}
+		if head, err = s.readHead(); err != nil {
+			return err
+		}
 	}
 	return s.loadGeneration(head, repairTail)
 }
@@ -1020,6 +1029,7 @@ type cachedGraphState struct {
 	checkpointBytes   int64
 	checkpointObjects int
 	journalEnd        int64
+	journalWeight     int64
 	// state is a closed store's, which the store that takes it changes.
 	state graphState
 	// indexes are the store's indexes of state, which its taker takes too:
@@ -1200,7 +1210,7 @@ func (s *Store) cacheStateLocked() {
 	journal.size, journal.mtime = 0, 0
 	graphStates.put(directory, &cachedGraphState{
 		generation: s.generation, checkpoint: checkpoint, journal: journal, checkpointBytes: s.checkpointBytes,
-		checkpointObjects: s.checkpointObjects, journalEnd: s.journalEnd, state: s.state,
+		checkpointObjects: s.checkpointObjects, journalEnd: s.journalEnd, journalWeight: s.journalWeight, state: s.state,
 		indexes: graphIndexes{
 			deferredObjects: s.deferredObjects, memoryPages: s.memoryPages,
 			memoryPagesElsewhere: s.memoryPagesElsewhere, memoryTables: s.memoryTables,
@@ -1244,14 +1254,14 @@ func (s *Store) loadCachedGeneration(head graphHead, repairTail bool) (bool, err
 	previous := s.journal
 	previousState := s.state
 	previousGeneration := s.generation
-	previousEnd := s.journalEnd
+	previousEnd, previousWeight := s.journalEnd, s.journalWeight
 	previousPoisoned := s.poisoned
 	// The state taken is this store's to change; if loading fails, what it
 	// may have changed of it is dropped with it.
 	s.state = cached.state
 	s.journal = journal
 	s.generation = head.Generation
-	s.journalEnd = cached.journalEnd
+	s.journalEnd, s.journalWeight = cached.journalEnd, cached.journalWeight
 	if cached.indexes.deferredObjects != nil && cached.indexes.memoryPages != nil {
 		s.deferredObjects = cached.indexes.deferredObjects
 		s.memoryPages = cached.indexes.memoryPages
@@ -1266,7 +1276,7 @@ func (s *Store) loadCachedGeneration(head graphHead, repairTail bool) (bool, err
 		s.journal = previous
 		s.state = previousState
 		s.generation = previousGeneration
-		s.journalEnd = previousEnd
+		s.journalEnd, s.journalWeight = previousEnd, previousWeight
 		s.poisoned = previousPoisoned
 		s.rebuildDeferredObjectsLocked()
 		s.rebuildMemoryIndexesLocked()
@@ -1297,6 +1307,10 @@ func (s *Store) loadCachedGeneration(head graphHead, repairTail bool) (bool, err
 }
 
 func (s *Store) loadGeneration(head graphHead, repairTail bool) error {
+	if head.Version != formatVersion {
+		// An open converts the graph.
+		return fmt.Errorf("TTC snapshot graph generation %d is of format %d", head.Generation, head.Version)
+	}
 	checkpointName := graphCheckpointName(head.Generation)
 	journalName := graphJournalName(head.Generation)
 	for _, name := range []string{checkpointName, journalName} {
@@ -1327,7 +1341,7 @@ func (s *Store) loadGeneration(head graphHead, repairTail bool) error {
 	previous := s.journal
 	previousState := s.state
 	previousGeneration := s.generation
-	previousEnd := s.journalEnd
+	previousEnd, previousWeight := s.journalEnd, s.journalWeight
 	previousHeadDev, previousHeadIno := s.headDev, s.headIno
 	previousHeadSize, previousHeadMtime := s.headSize, s.headMtime
 	checkpointObjects := len(state.Objects)
@@ -1339,7 +1353,7 @@ func (s *Store) loadGeneration(head graphHead, repairTail bool) error {
 		s.journal = previous
 		s.state = previousState
 		s.generation = previousGeneration
-		s.journalEnd = previousEnd
+		s.journalEnd, s.journalWeight = previousEnd, previousWeight
 		s.headDev, s.headIno = previousHeadDev, previousHeadIno
 		s.headSize, s.headMtime = previousHeadSize, previousHeadMtime
 		journal.Close()
@@ -1349,7 +1363,7 @@ func (s *Store) loadGeneration(head graphHead, repairTail bool) error {
 		s.journal = previous
 		s.state = previousState
 		s.generation = previousGeneration
-		s.journalEnd = previousEnd
+		s.journalEnd, s.journalWeight = previousEnd, previousWeight
 		s.headDev, s.headIno = previousHeadDev, previousHeadIno
 		s.headSize, s.headMtime = previousHeadSize, previousHeadMtime
 		journal.Close()
@@ -1563,86 +1577,46 @@ func (s *Store) replayJournal(repairTail bool) error {
 			return err
 		}
 	}
-	header := make([]byte, len(journalHeader))
-	if _, err := s.journal.ReadAt(header, 0); err != nil {
+	journal, err := s.readJournalAt(0)
+	if err != nil {
 		return err
 	}
-	if string(header) != journalHeader {
+	if len(journal) < len(journalHeader) || string(journal[:len(journalHeader)]) != journalHeader {
 		return errors.New("invalid TTC snapshot graph journal header")
 	}
-	offset := int64(len(journalHeader))
-	s.journalEnd = offset
-	lengthBuffer := make([]byte, 4)
-	for {
-		recordStart := offset
-		n, err := s.journal.ReadAt(lengthBuffer, offset)
-		if errors.Is(err, io.EOF) && n == 0 {
-			break
+	offset := len(journalHeader)
+	s.journalEnd, s.journalWeight = int64(offset), int64(offset)
+	for offset < len(journal) {
+		data, length, complete, err := nextJournalRecord(journal[offset:])
+		if err != nil {
+			return fmt.Errorf("reading TTC snapshot graph journal record at %d: %w", offset, err)
 		}
-		if err != nil && !errors.Is(err, io.EOF) {
-			return err
-		}
-		if n != len(lengthBuffer) {
-			if !repairTail {
-				// What the complete records made of the checkpoint is
-				// validated, as below.
-				if err := validateGraphState(&s.state); err != nil {
-					return fmt.Errorf("validating TTC snapshot graph after journal replay: %w", err)
+		if !complete {
+			if repairTail {
+				if err := s.truncateJournal(int64(offset)); err != nil {
+					return err
 				}
-				_, seekErr := s.journal.Seek(0, io.SeekEnd)
-				return seekErr
-			}
-			if err := s.truncateJournal(recordStart); err != nil {
-				return err
 			}
 			break
 		}
-		offset += int64(len(lengthBuffer))
-		length := binary.BigEndian.Uint32(lengthBuffer)
-		if length == 0 || length > maxJournalRecordSize {
-			return fmt.Errorf("invalid TTC snapshot graph journal record length %d at %d", length, recordStart)
-		}
-		data := make([]byte, length)
-		n, err = s.journal.ReadAt(data, offset)
-		if err != nil && !errors.Is(err, io.EOF) {
-			return err
-		}
-		if n != len(data) {
-			if !repairTail {
-				// What the complete records made of the checkpoint is
-				// validated, as below.
-				if err := validateGraphState(&s.state); err != nil {
-					return fmt.Errorf("validating TTC snapshot graph after journal replay: %w", err)
-				}
-				_, seekErr := s.journal.Seek(0, io.SeekEnd)
-				return seekErr
-			}
-			if err := s.truncateJournal(recordStart); err != nil {
-				return err
-			}
-			break
-		}
-		offset += int64(length)
 		record, err := decodeJournalRecord(data)
 		if err != nil {
-			return fmt.Errorf("decoding TTC snapshot graph journal record at %d: %w", recordStart, err)
-		}
-		if record.Version != formatVersion {
-			return fmt.Errorf("journal record version %d, want %d", record.Version, formatVersion)
+			return fmt.Errorf("decoding TTC snapshot graph journal record at %d: %w", offset, err)
 		}
 		if err := validateJournalRecord(record); err != nil {
-			return fmt.Errorf("validating TTC snapshot graph journal record at %d: %w", recordStart, err)
+			return fmt.Errorf("validating TTC snapshot graph journal record at %d: %w", offset, err)
 		}
-		if record.Sequence <= s.state.Sequence {
-			continue
+		if record.Sequence > s.state.Sequence {
+			if record.Sequence != s.state.Sequence+1 {
+				return fmt.Errorf("journal sequence %d follows %d", record.Sequence, s.state.Sequence)
+			}
+			if err := applyJournalRecord(&s.state, record); err != nil {
+				return fmt.Errorf("applying journal sequence %d: %w", record.Sequence, err)
+			}
+			s.journalWeight += journalRecordWeight(&record, length)
 		}
-		if record.Sequence != s.state.Sequence+1 {
-			return fmt.Errorf("journal sequence %d follows %d", record.Sequence, s.state.Sequence)
-		}
-		if err := applyJournalRecord(&s.state, record); err != nil {
-			return fmt.Errorf("applying journal sequence %d: %w", record.Sequence, err)
-		}
-		s.journalEnd = offset
+		offset += length
+		s.journalEnd = int64(offset)
 	}
 	if err := validateGraphState(&s.state); err != nil {
 		return fmt.Errorf("validating TTC snapshot graph after journal replay: %w", err)
@@ -1651,55 +1625,78 @@ func (s *Store) replayJournal(repairTail bool) error {
 	return err
 }
 
+// readJournalAt reads the journal from offset to its end.
+func (s *Store) readJournalAt(offset int64) ([]byte, error) {
+	info, err := s.journal.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() < offset {
+		return nil, fmt.Errorf("TTC snapshot graph journal is %d bytes, fewer than the %d replayed", info.Size(), offset)
+	}
+	data := make([]byte, info.Size()-offset)
+	n, err := s.journal.ReadAt(data, offset)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	return data[:n], nil
+}
+
+// nextJournalRecord returns the data of the record framed at the start of
+// frames, and the length of the frame and data. It reports the record
+// incomplete if frames end within it, or it is the last and fails its
+// checksum: a writer that crashed appending a record can leave either.
+func nextJournalRecord(frames []byte) ([]byte, int, bool, error) {
+	if len(frames) < journalFrameBytes {
+		return nil, 0, false, nil
+	}
+	size := binary.BigEndian.Uint32(frames[0:4])
+	if size == 0 || size > maxJournalRecordSize {
+		return nil, 0, false, fmt.Errorf("invalid TTC snapshot graph journal record length %d", size)
+	}
+	end := journalFrameBytes + int(size)
+	if end > len(frames) {
+		return nil, 0, false, nil
+	}
+	data := frames[journalFrameBytes:end]
+	if crc32.Checksum(data, castagnoli) != binary.BigEndian.Uint32(frames[4:8]) {
+		if end == len(frames) {
+			return nil, 0, false, nil
+		}
+		return nil, 0, false, errors.New("TTC snapshot graph journal record fails its checksum")
+	}
+	return data, end, true, nil
+}
+
 // replayJournalSuffix consumes transactions appended by another
 // externally-coordinated Store. The enclosing graph lock prevents a writer
-// from appending while the suffix is selected and decoded. Every v5 record
+// from appending while the suffix is selected and decoded. Every record
 // carries the bounded set of materialized reference-count changes that is not
 // otherwise represented by immutable PutObject operations, so replay work is
 // proportional to the appended transactions rather than total graph size.
 func (s *Store) replayJournalSuffix(repairTail bool) error {
-	start := s.journalEnd
-	offset := start
-	lengthBuffer := make([]byte, 4)
+	base := s.journalEnd
+	journal, err := s.readJournalAt(base)
+	if err != nil {
+		return err
+	}
+	offset := 0
 	var records []journalRecord
-	for {
-		recordStart := offset
-		n, err := s.journal.ReadAt(lengthBuffer, offset)
-		if errors.Is(err, io.EOF) && n == 0 {
-			break
+	var weight int64
+	for offset < len(journal) {
+		recordStart := base + int64(offset)
+		data, length, complete, err := nextJournalRecord(journal[offset:])
+		if err != nil {
+			return fmt.Errorf("reading TTC snapshot graph journal record at %d: %w", recordStart, err)
 		}
-		if err != nil && !errors.Is(err, io.EOF) {
-			return err
-		}
-		if n != len(lengthBuffer) {
+		if !complete {
 			if repairTail {
 				if err := s.truncateJournal(recordStart); err != nil {
 					return err
 				}
 			}
-			offset = recordStart
 			break
 		}
-		offset += int64(len(lengthBuffer))
-		length := binary.BigEndian.Uint32(lengthBuffer)
-		if length == 0 || length > maxJournalRecordSize {
-			return fmt.Errorf("invalid TTC snapshot graph journal record length %d at %d", length, recordStart)
-		}
-		data := make([]byte, length)
-		n, err = s.journal.ReadAt(data, offset)
-		if err != nil && !errors.Is(err, io.EOF) {
-			return err
-		}
-		if n != len(data) {
-			if repairTail {
-				if err := s.truncateJournal(recordStart); err != nil {
-					return err
-				}
-			}
-			offset = recordStart
-			break
-		}
-		offset += int64(length)
 		record, err := decodeJournalRecord(data)
 		if err != nil {
 			return fmt.Errorf("decoding TTC snapshot graph journal record at %d: %w", recordStart, err)
@@ -1712,6 +1709,8 @@ func (s *Store) replayJournalSuffix(repairTail bool) error {
 			return fmt.Errorf("journal sequence %d follows %d", record.Sequence, want-1)
 		}
 		records = append(records, record)
+		weight += journalRecordWeight(&record, length)
+		offset += length
 	}
 	for _, record := range records {
 		if err := s.applyIncrementalJournalRecord(record); err != nil {
@@ -1719,8 +1718,9 @@ func (s *Store) replayJournalSuffix(repairTail bool) error {
 			return s.poisoned
 		}
 	}
-	s.journalEnd = offset
-	_, err := s.journal.Seek(0, io.SeekEnd)
+	s.journalEnd = base + int64(offset)
+	s.journalWeight += weight
+	_, err = s.journal.Seek(0, io.SeekEnd)
 	return err
 }
 
@@ -1800,12 +1800,11 @@ func applyJournalRecord(state *graphState, record journalRecord) error {
 				return err
 			}
 			state.putObject(cloneObject(*op.PutObject))
-		case op.DeleteObject != "":
-			id, err := parseObjectKey(op.DeleteObject)
-			if err != nil {
+		case !op.DeleteObject.IsZero():
+			if err := op.DeleteObject.validate(); err != nil {
 				return err
 			}
-			state.deleteObject(id)
+			state.deleteObject(op.DeleteObject)
 		case op.PutRoot != nil:
 			if err := validateRootName(op.RootName); err != nil {
 				return err
@@ -1892,7 +1891,7 @@ func applyJournalRecord(state *graphState, record journalRecord) error {
 }
 
 func validateJournalRecord(record journalRecord) error {
-	if record.Version != formatVersion || record.Sequence == 0 {
+	if record.Sequence == 0 {
 		return errors.New("invalid TTC snapshot graph journal record header")
 	}
 	for _, op := range record.Ops {
@@ -1912,9 +1911,9 @@ func validateJournalRecord(record journalRecord) error {
 				return err
 			}
 		}
-		if op.DeleteObject != "" {
+		if !op.DeleteObject.IsZero() {
 			selectors++
-			if _, err := parseObjectKey(op.DeleteObject); err != nil {
+			if err := op.DeleteObject.validate(); err != nil {
 				return err
 			}
 		}
@@ -2204,14 +2203,8 @@ func validateFrozenSnapshotMutation(state *graphState, frozen []SnapshotID, ops 
 			if op.PutObject != nil && op.PutObject.ID.Snapshot == snapshot {
 				return fmt.Errorf("snapshot %d objects are frozen for authority handoff: %w", snapshot, ErrSnapshotLedgerFrozen)
 			}
-			if op.DeleteObject != "" {
-				id, err := parseObjectKey(op.DeleteObject)
-				if err != nil {
-					return err
-				}
-				if id.Snapshot == snapshot {
-					return fmt.Errorf("snapshot %d objects are frozen for authority handoff: %w", snapshot, ErrSnapshotLedgerFrozen)
-				}
+			if !op.DeleteObject.IsZero() && op.DeleteObject.Snapshot == snapshot {
+				return fmt.Errorf("snapshot %d objects are frozen for authority handoff: %w", snapshot, ErrSnapshotLedgerFrozen)
 			}
 		}
 	}
@@ -2293,7 +2286,7 @@ func (s *Store) commitLockedPrepared(ops []journalOp, references map[ObjectID]Ob
 			affectedObjects[id] = object
 		}
 	}
-	record := journalRecord{Version: formatVersion, Sequence: s.state.Sequence + 1, Ops: ops, References: referenceUpdates}
+	record := journalRecord{Sequence: s.state.Sequence + 1, Ops: ops, References: referenceUpdates}
 	if err := validateJournalRecord(record); err != nil {
 		return err
 	}
@@ -2374,8 +2367,6 @@ func (s *Store) commitLockedPrepared(ops []journalOp, references map[ObjectID]Ob
 	if len(data) == 0 || len(data) > maxJournalRecordSize {
 		return fmt.Errorf("TTC snapshot graph transaction is %d bytes, limit is %d", len(data), maxJournalRecordSize)
 	}
-	var length [4]byte
-	binary.BigEndian.PutUint32(length[:], uint32(len(data)))
 	start := s.journalEnd
 	info, err := s.journal.Stat()
 	if err != nil {
@@ -2391,9 +2382,7 @@ func (s *Store) commitLockedPrepared(ops []journalOp, references map[ObjectID]Ob
 		}
 		return cause
 	}
-	frame := make([]byte, len(length)+len(data))
-	copy(frame, length[:])
-	copy(frame[len(length):], data)
+	frame := frameJournalRecord(data)
 	if err := writeFullAt(s.journal, frame, start); err != nil {
 		return rollback(err)
 	}
@@ -2413,7 +2402,8 @@ func (s *Store) commitLockedPrepared(ops []journalOp, references map[ObjectID]Ob
 			return err
 		}
 	}
-	s.journalEnd = start + int64(len(length)) + int64(len(data))
+	s.journalEnd = start + int64(len(frame))
+	s.journalWeight += journalRecordWeight(&record, len(frame))
 	var applyErr error
 	if prepared != nil {
 		applyErr = prepared(&s.state)
@@ -3576,7 +3566,7 @@ func (s *Store) commitReleaseLocked(ops []journalOp, touched map[ObjectID]Object
 		return err
 	}
 	for _, id := range collected {
-		ops = append(ops, journalOp{DeleteObject: id.key()})
+		ops = append(ops, journalOp{DeleteObject: id})
 	}
 	if err := s.commitLockedWithMaterializedReferences(ops, touched); err != nil {
 		return err
@@ -4038,7 +4028,7 @@ func (s *Store) collectBatchLocked(limit, referenceLimit int) (int, error) {
 	deletedIDs := sortedIDs(deleted)
 	ops := make([]journalOp, 0, len(deletedIDs))
 	for _, id := range deletedIDs {
-		ops = append(ops, journalOp{DeleteObject: id.key()})
+		ops = append(ops, journalOp{DeleteObject: id})
 	}
 	if err := s.commitLockedWithMaterializedReferences(ops, references); err != nil {
 		return 0, err
@@ -4172,7 +4162,7 @@ func (s *Store) compactGenerationLocked() error {
 	if err != nil {
 		return err
 	}
-	if err := s.writeFileAtomically(graphCheckpointName(nextGeneration), ".graph-checkpoint-", append(data, '\n')); err != nil {
+	if err := s.writeFileAtomically(graphCheckpointName(nextGeneration), ".graph-checkpoint-", data); err != nil {
 		return err
 	}
 	if err := s.writeFileAtomically(graphJournalName(nextGeneration), ".graph-journal-", []byte(journalHeader)); err != nil {
@@ -4201,8 +4191,8 @@ func (s *Store) compactGenerationLocked() error {
 	previous := s.journal
 	s.journal = journal
 	s.generation = nextGeneration
-	s.journalEnd = int64(len(journalHeader))
-	s.checkpointBytes = int64(len(data) + 1)
+	s.journalEnd, s.journalWeight = int64(len(journalHeader)), int64(len(journalHeader))
+	s.checkpointBytes = int64(len(data))
 	s.checkpointObjects = len(s.state.Objects)
 	if previous != nil {
 		_ = previous.Close()
@@ -4395,17 +4385,42 @@ func (s *Store) JournalBytes() int64 {
 	return s.journalEnd
 }
 
+// filesystemOperationWeight is what replaying a filesystem operation costs,
+// as loading so many bytes of checkpoint costs. A journal names such an
+// operation in some 50 bytes, but replaying it rebuilds the paths it changes
+// of the filesystem's trees, and counts anew the references of what those
+// paths reference. For a filesystem of 100,000 files, created 128 files a
+// transaction, as a repository commits them, an operation took 20 us; 1,024
+// files a transaction, 7 us; and a checkpoint loads in 8.6 ns a byte. A
+// kilobyte keeps what replaying a journal costs within about twice what
+// loading its checkpoint does: counted by what it costs, the journal was
+// folded so often that creating files took half as long again.
+const filesystemOperationWeight = 1 << 10
+
+// journalRecordWeight returns the weight of record, which a journal holds in
+// frameBytes: what replaying it costs, as loading so many bytes of checkpoint
+// costs.
+func journalRecordWeight(record *journalRecord, frameBytes int) int64 {
+	weight := int64(frameBytes)
+	for index := range record.Ops {
+		if mutation := record.Ops[index].ApplyFilesystem; mutation != nil {
+			weight += filesystemOperationWeight * int64(len(mutation.Operations))
+		}
+	}
+	return weight
+}
+
 // CheckpointDue reports whether the journal has grown enough to fold into a
-// new checkpoint: past minimum, and past the size of the checkpoint it would
-// replace. A checkpoint rewrites the whole graph, so the second bound spreads
-// that cost over as many journal bytes as it writes; without it, importing a
-// large memory image rewrote a checkpoint of hundreds of megabytes for every
-// minimum's worth of journal. Replaying such a journal costs about what
-// loading its checkpoint does.
+// new checkpoint: its weight past minimum, and past the size of the
+// checkpoint it would replace. A checkpoint rewrites the whole graph, so the
+// second bound spreads that cost over as much journal as it writes; without
+// it, importing a large memory image rewrote a checkpoint of hundreds of
+// megabytes for every minimum's worth of journal. Replaying such a journal
+// costs about what loading its checkpoint does.
 func (s *Store) CheckpointDue(minimum int64) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.journalEnd >= max(minimum, s.checkpointBytes) {
+	if s.journalWeight >= max(minimum, s.checkpointBytes) {
 		return true
 	}
 	// A checkpoint costs in proportion to what it holds. Once the graph has
