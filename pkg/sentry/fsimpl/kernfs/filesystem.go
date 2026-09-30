@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package kernfs
 
 // This file implements vfs.FilesystemImpl for kernfs.
@@ -254,6 +257,14 @@ func checkCreateLocked(ctx context.Context, creds *auth.Credentials, name string
 	}
 	if parent.VFSDentry().IsDead() {
 		return linuxerr.ENOENT
+	}
+	// A child that the dentry cache has yet to see exists as well: Linux
+	// looks a name up before it checks that the name may be created, and
+	// userspace relies on EEXIST for directories that exist, as Android's
+	// libprocessgroup does for /sys/fs/cgroup.
+	if child, err := parent.inode.Lookup(ctx, name); err == nil {
+		child.DecRef(ctx)
+		return linuxerr.EEXIST
 	}
 	if err := parent.inode.CheckPermissions(ctx, creds, vfs.MayWrite); err != nil {
 		return err
