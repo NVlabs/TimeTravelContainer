@@ -203,13 +203,58 @@ type Snapshot struct {
 	NextOrdinal uint64
 }
 
-// ObjectState prevents a zero-count object from being resurrected.
-type ObjectState string
+// ObjectState prevents a zero-count object from being resurrected. The zero
+// value is no state.
+//
+// It is a byte, which text marshals by name, as when it was the name: a
+// string took 16 bytes of every object and ledger entry, and a pointer the
+// garbage collector followed.
+type ObjectState uint8
 
 const (
-	ObjectLive       ObjectState = "live"
-	ObjectReclaiming ObjectState = "reclaiming"
+	ObjectLive ObjectState = iota + 1
+	ObjectReclaiming
 )
+
+// objectStateNames are the states' names, by state.
+var objectStateNames = [...]string{ObjectLive: "live", ObjectReclaiming: "reclaiming"}
+
+// parseObjectState returns the state name names, if any; the empty name
+// names no state.
+func parseObjectState(name string) (ObjectState, bool) {
+	for state, known := range objectStateNames {
+		if name == known {
+			return ObjectState(state), true
+		}
+	}
+	return 0, false
+}
+
+// String returns the state's name.
+func (state ObjectState) String() string {
+	if int(state) < len(objectStateNames) {
+		return objectStateNames[state]
+	}
+	return fmt.Sprintf("ObjectState(%d)", uint8(state))
+}
+
+// MarshalText implements encoding.TextMarshaler.
+func (state ObjectState) MarshalText() ([]byte, error) {
+	if int(state) < len(objectStateNames) {
+		return []byte(objectStateNames[state]), nil
+	}
+	return nil, fmt.Errorf("invalid object state %d", uint8(state))
+}
+
+// UnmarshalText implements encoding.TextUnmarshaler.
+func (state *ObjectState) UnmarshalText(text []byte) error {
+	parsed, ok := parseObjectState(string(text))
+	if !ok {
+		return fmt.Errorf("invalid object state %q", text)
+	}
+	*state = parsed
+	return nil
+}
 
 // Edge is one counted parent-to-child graph edge. Slots are unique within a
 // parent and make activation/deactivation idempotency keys stable.
@@ -222,7 +267,6 @@ type Edge struct {
 // by the object's typed ID and are not stored here.
 type Object struct {
 	ID         ObjectID
-	State      ObjectState
 	Refs       uint64
 	BulkLength uint64
 	Data       []byte
@@ -233,7 +277,9 @@ type Object struct {
 	// bounded set of direct child stubs in one graph transaction.
 	SourceCatalog string   `json:",omitempty"`
 	SourceObject  ObjectID `json:",omitempty"`
-	Deferred      bool     `json:",omitempty"`
+	// State is beside Deferred, with which it fills one word.
+	State    ObjectState
+	Deferred bool `json:",omitempty"`
 }
 
 func validateObject(object Object) error {

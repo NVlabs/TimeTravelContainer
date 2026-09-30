@@ -243,8 +243,10 @@ func (d *jsonDecoder) object(object *Object) bool {
 		case "ID":
 			return once(0) && d.objectID(&object.ID)
 		case "State":
-			state, ok := d.plainString()
-			object.State = ObjectState(state)
+			name, ok := d.plainString()
+			if ok {
+				object.State, ok = parseObjectState(string(name))
+			}
 			return once(1) && ok
 		case "Refs":
 			refs, ok := d.integer(64)
