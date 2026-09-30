@@ -269,11 +269,22 @@ func validateObject(object Object) error {
 	if len(object.Children) > maxObjectEdges {
 		return fmt.Errorf("object %s has %d edges, limit is %d", object.ID.key(), len(object.Children), maxObjectEdges)
 	}
-	seen := make(map[uint16]struct{}, len(object.Children))
-	for _, edge := range object.Children {
+	// Edges are nearly always in the order of their slots, which are then
+	// distinct: a table of them is made only to check edges that are not.
+	ordered := true
+	for index, edge := range object.Children {
 		if err := edge.Child.validate(); err != nil {
 			return fmt.Errorf("object %s child: %w", object.ID.key(), err)
 		}
+		if index != 0 && edge.Slot <= object.Children[index-1].Slot {
+			ordered = false
+		}
+	}
+	if ordered {
+		return nil
+	}
+	seen := make(map[uint16]struct{}, len(object.Children))
+	for _, edge := range object.Children {
 		if _, ok := seen[edge.Slot]; ok {
 			return fmt.Errorf("object %s repeats child slot %d", object.ID.key(), edge.Slot)
 		}
@@ -281,10 +292,7 @@ func validateObject(object Object) error {
 	}
 	// Sort edges only when they are not sorted: objects a graph's cached state
 	// shares are never written.
-	bySlot := func(i, j int) bool { return object.Children[i].Slot < object.Children[j].Slot }
-	if !sort.SliceIsSorted(object.Children, bySlot) {
-		sort.Slice(object.Children, bySlot)
-	}
+	sort.Slice(object.Children, func(i, j int) bool { return object.Children[i].Slot < object.Children[j].Slot })
 	return nil
 }
 

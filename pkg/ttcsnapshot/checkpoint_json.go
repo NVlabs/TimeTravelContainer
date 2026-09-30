@@ -7,7 +7,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
-	"slices"
+	"fmt"
 	"strconv"
 )
 
@@ -21,9 +21,49 @@ func decodeGraphCheckpoint(data []byte) (graphState, error) {
 	if state, ok := decodeCanonicalCheckpoint(data); ok {
 		return state, nil
 	}
-	var state graphState
-	err := json.Unmarshal(data, &state)
-	return state, err
+	var checkpoint checkpointJSON
+	if err := json.Unmarshal(data, &checkpoint); err != nil {
+		return graphState{}, err
+	}
+	return checkpoint.state()
+}
+
+// checkpointJSON is a graph state as a checkpoint holds it: its objects named
+// by their keys.
+type checkpointJSON struct {
+	Version      int
+	Sequence     uint64
+	NextSnapshot SnapshotID
+	Snapshots    map[string]Snapshot
+	Objects      map[string]Object
+	Roots        map[string]ObjectID
+	Pins         map[string]ObjectID
+	Frozen       map[string]bool
+	Handoffs     map[string]SnapshotLedgerHandoff
+}
+
+// state returns the graph state checkpoint holds, each object under the ID
+// its key names, which must be its own.
+func (checkpoint *checkpointJSON) state() (graphState, error) {
+	state := graphState{
+		Version: checkpoint.Version, Sequence: checkpoint.Sequence, NextSnapshot: checkpoint.NextSnapshot,
+		Snapshots: checkpoint.Snapshots, Roots: checkpoint.Roots, Pins: checkpoint.Pins,
+		Frozen: checkpoint.Frozen, Handoffs: checkpoint.Handoffs,
+	}
+	if checkpoint.Objects != nil {
+		state.Objects = make(map[ObjectID]Object, len(checkpoint.Objects))
+		for key, object := range checkpoint.Objects {
+			id, err := parseObjectKey(key)
+			if err != nil {
+				return graphState{}, err
+			}
+			if id != object.ID {
+				return graphState{}, fmt.Errorf("object key %q does not match %s", key, object.ID)
+			}
+			state.Objects[id] = object
+		}
+	}
+	return state, nil
 }
 
 // encodeGraphCheckpoint encodes state as json.Marshal does, byte for byte,
@@ -61,32 +101,29 @@ func encodeGraphCheckpoint(state *graphState) ([]byte, error) {
 // objectTableJSONSize estimates, generously, the length of objects as
 // appendObjectTableJSON writes it. A buffer sized at 256 bytes an object grew
 // as a checkpoint filled it, and copied a checkpoint of 100 MB over and over.
-func objectTableJSONSize(objects map[string]Object) int {
+func objectTableJSONSize(objects map[ObjectID]Object) int {
 	size := 2
-	for key, object := range objects {
-		size += len(key) + 4 + 190 + len(object.State) + base64.StdEncoding.EncodedLen(len(object.Data)) + 64*len(object.Children) + len(object.SourceCatalog)
+	for _, object := range objects {
+		size += 36 + 4 + 190 + len(object.State) + base64.StdEncoding.EncodedLen(len(object.Data)) + 64*len(object.Children) + len(object.SourceCatalog)
 	}
 	return size
 }
 
-// appendObjectTableJSON appends objects as json.Marshal writes it.
-func appendObjectTableJSON(out []byte, objects map[string]Object) []byte {
+// appendObjectTableJSON appends objects as json.Marshal writes a table of
+// them by key: in the order of their keys, which is their IDs'.
+func appendObjectTableJSON(out []byte, objects map[ObjectID]Object) []byte {
 	if objects == nil {
 		return append(out, "null"...)
 	}
-	keys := make([]string, 0, len(objects))
-	for key := range objects {
-		keys = append(keys, key)
-	}
-	slices.Sort(keys)
 	out = append(out, '{')
-	for index, key := range keys {
+	for index, id := range sortedIDs(objects) {
 		if index != 0 {
 			out = append(out, ',')
 		}
-		out = appendJSONString(out, key)
-		out = append(out, ':')
-		out = appendObjectJSON(out, objects[key])
+		out = append(out, '"')
+		out = appendObjectKey(out, id)
+		out = append(out, '"', ':')
+		out = appendObjectJSON(out, objects[id])
 	}
 	return append(out, '}')
 }
@@ -383,21 +420,25 @@ func (d *checkpointDecoder) skip(depth int) bool {
 	}
 }
 
-// objects consumes the checkpoint's object table into *table.
-func (d *checkpointDecoder) objects(table *map[string]Object) bool {
+// objects consumes the checkpoint's object table into *table. Each key must
+// name its object's ID.
+func (d *checkpointDecoder) objects(table *map[ObjectID]Object) bool {
 	if d.literal("null") {
 		*table = nil
 		return true
 	}
 	if *table == nil {
-		*table = make(map[string]Object)
+		*table = make(map[ObjectID]Object)
 	}
 	return d.members(func(key []byte) bool {
 		var object Object
 		if !d.object(&object) {
 			return false
 		}
-		(*table)[string(key)] = object
+		if id, err := parseObjectKey(string(key)); err != nil || id != object.ID {
+			return false
+		}
+		(*table)[object.ID] = object
 		return true
 	})
 }

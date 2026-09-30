@@ -35,7 +35,7 @@ type FilesystemCatalog interface {
 // arrive in the fenced control record, and reference ownership remains at the
 // origin provider (or shared ledger).
 type ImmutableCatalog struct {
-	objects map[string]Object
+	objects map[ObjectID]Object
 }
 
 // ImmutableObjectLoader resolves one immutable metadata record by its stable
@@ -52,7 +52,7 @@ type ImmutableObjectLoader func(ObjectID) (Object, error)
 // or structural failure could combine metadata from different views.
 type LazyImmutableCatalog struct {
 	mu      sync.Mutex
-	objects map[string]Object
+	objects map[ObjectID]Object
 	loader  ImmutableObjectLoader
 	err     error
 }
@@ -62,7 +62,7 @@ func NewLazyImmutableCatalog(loader ImmutableObjectLoader) (*LazyImmutableCatalo
 	if loader == nil {
 		return nil, errors.New("immutable TTC object loader is nil")
 	}
-	return &LazyImmutableCatalog{objects: make(map[string]Object), loader: loader}, nil
+	return &LazyImmutableCatalog{objects: make(map[ObjectID]Object), loader: loader}, nil
 }
 
 // Object resolves and caches one immutable metadata record. Concurrent misses
@@ -77,7 +77,7 @@ func (catalog *LazyImmutableCatalog) Object(id ObjectID) (Object, bool) {
 	if catalog.err != nil {
 		return Object{}, false
 	}
-	if object, ok := catalog.objects[id.key()]; ok {
+	if object, ok := catalog.objects[id]; ok {
 		return cloneObject(object), true
 	}
 	object, err := catalog.loader(id)
@@ -94,7 +94,7 @@ func (catalog *LazyImmutableCatalog) Object(id ObjectID) (Object, bool) {
 		catalog.err = err
 		return Object{}, false
 	}
-	catalog.objects[id.key()] = cloneObject(object)
+	catalog.objects[id] = cloneObject(object)
 	return cloneObject(object), true
 }
 
@@ -173,16 +173,15 @@ func osErrNotExist(id ObjectID) error {
 // immutable snapshot manifests. References are treated as authority metadata
 // and ignored by this cache view.
 func NewImmutableCatalog(objects []Object) (*ImmutableCatalog, error) {
-	catalog := &ImmutableCatalog{objects: make(map[string]Object, len(objects))}
+	catalog := &ImmutableCatalog{objects: make(map[ObjectID]Object, len(objects))}
 	for _, object := range objects {
 		if err := validateObject(object); err != nil {
 			return nil, err
 		}
-		key := object.ID.key()
-		if _, ok := catalog.objects[key]; ok {
-			return nil, fmt.Errorf("immutable catalog repeats object %s", key)
+		if _, ok := catalog.objects[object.ID]; ok {
+			return nil, fmt.Errorf("immutable catalog repeats object %s", object.ID)
 		}
-		catalog.objects[key] = cloneObject(object)
+		catalog.objects[object.ID] = cloneObject(object)
 	}
 	return catalog, nil
 }
@@ -197,7 +196,7 @@ func ResolveImmutableCatalog(roots []ObjectID, load func(SnapshotID) ([]Object, 
 		return nil, errors.New("immutable TTC catalog resolution requires a root")
 	}
 	loaded := make(map[SnapshotID]struct{})
-	all := make(map[string]Object)
+	all := make(map[ObjectID]Object)
 	seen := make(map[ObjectID]struct{})
 	pending := append([]ObjectID(nil), roots...)
 	for len(pending) != 0 {
@@ -211,7 +210,7 @@ func ResolveImmutableCatalog(roots []ObjectID, load func(SnapshotID) ([]Object, 
 			continue
 		}
 		seen[id] = struct{}{}
-		object, ok := all[id.key()]
+		object, ok := all[id]
 		if !ok {
 			origin := id.Snapshot
 			if _, ok := loaded[origin]; ok {
@@ -226,13 +225,12 @@ func ResolveImmutableCatalog(roots []ObjectID, load func(SnapshotID) ([]Object, 
 				if candidate.ID.Snapshot != origin {
 					return nil, fmt.Errorf("immutable TTC origin %d returned foreign object %s", origin, candidate.ID)
 				}
-				key := candidate.ID.key()
-				if previous, exists := all[key]; exists && !reflect.DeepEqual(previous, candidate) {
+				if previous, exists := all[candidate.ID]; exists && !reflect.DeepEqual(previous, candidate) {
 					return nil, fmt.Errorf("immutable TTC object %s has conflicting metadata", candidate.ID)
 				}
-				all[key] = cloneObject(candidate)
+				all[candidate.ID] = cloneObject(candidate)
 			}
-			object, ok = all[id.key()]
+			object, ok = all[id]
 			if !ok {
 				return nil, fmt.Errorf("immutable TTC origin %d omits reachable object %s", origin, id)
 			}
@@ -254,7 +252,7 @@ func (catalog *ImmutableCatalog) Object(id ObjectID) (Object, bool) {
 	if catalog == nil {
 		return Object{}, false
 	}
-	object, ok := catalog.objects[id.key()]
+	object, ok := catalog.objects[id]
 	return cloneObject(object), ok
 }
 
@@ -286,7 +284,7 @@ func (catalog *ImmutableCatalog) MemoryPageEntries(root ObjectID) ([]MemoryPageE
 		return nil, fmt.Errorf("nil immutable TTC catalog")
 	}
 	return memoryPageEntries(root, func(id ObjectID) (Object, bool) {
-		object, ok := catalog.objects[id.key()]
+		object, ok := catalog.objects[id]
 		return object, ok
 	})
 }

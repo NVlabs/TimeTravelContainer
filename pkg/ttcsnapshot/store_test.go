@@ -550,7 +550,7 @@ func TestCheckpointHeadPublicationBoundary(t *testing.T) {
 	if store.generation != 2 {
 		t.Fatalf("baseline generation=%d, want 2", store.generation)
 	}
-	checkpoint, err := json.Marshal(store.state)
+	checkpoint, err := encodeGraphCheckpoint(&store.state)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3249,9 +3249,9 @@ func TestValidateGraphStateReferences(t *testing.T) {
 		return graphState{
 			Version: formatVersion, NextSnapshot: 2,
 			Snapshots: map[string]Snapshot{snapshotKey(1): {ID: 1, State: SnapshotWorking, NextOrdinal: 3}},
-			Objects: map[string]Object{
-				root.key():  {ID: root, State: ObjectLive, Refs: 1, Children: []Edge{{Slot: 0, Child: child}}},
-				child.key(): {ID: child, State: ObjectLive, Refs: 2},
+			Objects: map[ObjectID]Object{
+				root:  {ID: root, State: ObjectLive, Refs: 1, Children: []Edge{{Slot: 0, Child: child}}},
+				child: {ID: child, State: ObjectLive, Refs: 2},
 			},
 			Roots:  map[string]ObjectID{"filesystem/main": root},
 			Pins:   map[string]ObjectID{"construct/x": child},
@@ -3265,17 +3265,17 @@ func TestValidateGraphStateReferences(t *testing.T) {
 	missing := ObjectID{Snapshot: 1, Kind: ObjectKindInode, Ordinal: 3}
 	for name, corrupt := range map[string]func(*graphState){
 		"missing child": func(state *graphState) {
-			object := state.Objects[root.key()]
+			object := state.Objects[root]
 			object.Children = append(object.Children, Edge{Slot: 1, Child: missing})
-			state.Objects[root.key()] = object
+			state.Objects[root] = object
 		},
 		"missing root":        func(state *graphState) { state.Roots["filesystem/other"] = missing },
 		"missing pin":         func(state *graphState) { state.Pins["construct/y"] = missing },
 		"too few references":  func(state *graphState) { delete(state.Pins, "construct/x") },
 		"too many references": func(state *graphState) { state.Pins["construct/y"] = root },
 		"key of another object": func(state *graphState) {
-			state.Objects[missing.key()] = state.Objects[child.key()]
-			delete(state.Objects, child.key())
+			state.Objects[missing] = state.Objects[child]
+			delete(state.Objects, child)
 		},
 	} {
 		state := consistent()
@@ -3772,4 +3772,196 @@ func TestGraphVersionAt(t *testing.T) {
 	if _, err := GraphVersionAt(filepath.Join(t.TempDir(), "absent")); err == nil {
 		t.Fatal("an absent graph has a version")
 	}
+}
+
+// BenchmarkOpenFilesystemGraph opens, with nothing cached, the graph of a
+// filesystem of 100,000 files in 100 directories: checkpointed, and as the
+// journal of its creation holds it.
+func BenchmarkOpenFilesystemGraph(b *testing.B) {
+	for _, checkpointed := range []bool{true, false} {
+		name := "journal"
+		if checkpointed {
+			name = "checkpoint"
+		}
+		b.Run(name, func(b *testing.B) {
+			dir := filepath.Join(b.TempDir(), "graph")
+			objects, checkpoint, journal := createFilesystemGraph(b, dir, 100000, checkpointed)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				ExpireGraphStates(-1)
+				b.StartTimer()
+				reopened, err := Open(dir)
+				if err != nil {
+					b.Fatal(err)
+				}
+				b.StopTimer()
+				if err := reopened.Close(); err != nil {
+					b.Fatal(err)
+				}
+				b.StartTimer()
+			}
+			b.ReportMetric(float64(objects), "objects")
+			b.ReportMetric(float64(checkpoint), "checkpoint-bytes")
+			b.ReportMetric(float64(journal), "journal-bytes")
+		})
+	}
+}
+
+// createFilesystemGraph makes at dir the graph of a filesystem of files files
+// in 100 directories, 1,024 files a transaction, and checkpoints it if asked.
+// It returns the graph's objects and the sizes of its checkpoint and journal.
+func createFilesystemGraph(b *testing.B, dir string, files int, checkpointed bool) (int, int64, int64) {
+	const batch, directories = 1024, 100
+	store, err := Open(dir)
+	if err != nil {
+		b.Fatal(err)
+	}
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		b.Fatal(err)
+	}
+	operations := []FilesystemOperation{{PutInode: &InodeRecord{Number: 1, Type: "directory", Mode: 0755, Nlink: 2 + directories}}}
+	for d := uint64(0); d < directories; d++ {
+		operations = append(operations,
+			FilesystemOperation{PutInode: &InodeRecord{Number: 2 + d, Type: "directory", Mode: 0755, Nlink: 2}},
+			FilesystemOperation{PutEntry: &DirectoryEntryRecord{Parent: 1, Name: fmt.Sprintf("dir-%03d", d), Inode: 2 + d}})
+	}
+	if _, err := store.ApplyFilesystem(origin, "branch/main", operations); err != nil {
+		b.Fatal(err)
+	}
+	for created := 0; created < files; created += batch {
+		count := min(batch, files-created)
+		kinds := make([]ObjectKind, count)
+		for i := range kinds {
+			kinds[i] = ObjectKindFile
+		}
+		ids, err := store.ReserveObjects(origin, kinds)
+		if err != nil {
+			b.Fatal(err)
+		}
+		reserved := make([]ReservedObject, count)
+		pins := make([]string, count)
+		operations := make([]FilesystemOperation, 0, 2*count)
+		for i, id := range ids {
+			file := created + i
+			number := uint64(2 + directories + file)
+			pins[i] = fmt.Sprintf("file-%d", file)
+			reserved[i] = ReservedObject{ID: id, Pin: pins[i], BulkLength: 4096}
+			operations = append(operations,
+				FilesystemOperation{PutInode: &InodeRecord{Number: number, Type: "regular", Mode: 0644, Nlink: 1, Size: 4096, File: id, MtimeNsec: int64(file)}},
+				FilesystemOperation{PutEntry: &DirectoryEntryRecord{Parent: 2 + uint64(file%directories), Name: fmt.Sprintf("file-%06d", file), Inode: number}})
+		}
+		if err := store.CommitReservedObjects(reserved); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := store.ApplyFilesystemAndReleasePins(origin, "branch/main", operations, pins); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if checkpointed {
+		if err := store.Checkpoint(); err != nil {
+			b.Fatal(err)
+		}
+	}
+	objects, checkpoint, journal := len(store.state.Objects), store.checkpointBytes, store.journalEnd
+	if err := store.Close(); err != nil {
+		b.Fatal(err)
+	}
+	return objects, checkpoint, journal
+}
+
+// BenchmarkCreateFiles creates b.N files in a graph embedded in a repository,
+// as a repository does: in transactions of 128 files, each file's object
+// published before the transaction that names it, and the graph checkpointed
+// when due. It reports the bytes of journal and checkpoint written per file,
+// and how long opening the graph then takes, with nothing cached.
+func BenchmarkCreateFiles(b *testing.B) {
+	const batch, directories = 128, 100
+	dir := filepath.Join(b.TempDir(), "graph")
+	store, err := OpenExternallyCoordinated(dir)
+	if err != nil {
+		b.Fatal(err)
+	}
+	transaction := func(body func() error) {
+		if err := store.BeginExternalTransaction(); err != nil {
+			b.Fatal(err)
+		}
+		if err := body(); err != nil {
+			b.Fatal(err)
+		}
+		if err := store.EndExternalTransaction(); err != nil {
+			b.Fatal(err)
+		}
+	}
+	var origin SnapshotID
+	transaction(func() error {
+		origin, err = store.AllocateWorking()
+		if err != nil {
+			return err
+		}
+		operations := []FilesystemOperation{{PutInode: &InodeRecord{Number: 1, Type: "directory", Mode: 0755, Nlink: 2 + directories}}}
+		for d := uint64(0); d < directories; d++ {
+			operations = append(operations,
+				FilesystemOperation{PutInode: &InodeRecord{Number: 2 + d, Type: "directory", Mode: 0755, Nlink: 2}},
+				FilesystemOperation{PutEntry: &DirectoryEntryRecord{Parent: 1, Name: fmt.Sprintf("dir-%03d", d), Inode: 2 + d}})
+		}
+		_, err := store.ApplyFilesystem(origin, "branch/main", operations)
+		return err
+	})
+	var written int64
+	b.ResetTimer()
+	for created := 0; created < b.N; created += batch {
+		count := min(batch, b.N-created)
+		transaction(func() error {
+			kinds := make([]ObjectKind, count)
+			for i := range kinds {
+				kinds[i] = ObjectKindFile
+			}
+			ids, err := store.ReserveObjects(origin, kinds)
+			if err != nil {
+				return err
+			}
+			reserved := make([]ReservedObject, count)
+			pins := make([]string, count)
+			operations := make([]FilesystemOperation, 0, 2*count)
+			for i, id := range ids {
+				file := created + i
+				number := uint64(2 + directories + file)
+				pins[i] = fmt.Sprintf("file-%d", file)
+				reserved[i] = ReservedObject{ID: id, Pin: pins[i], BulkLength: 4096}
+				operations = append(operations,
+					FilesystemOperation{PutInode: &InodeRecord{Number: number, Type: "regular", Mode: 0644, Nlink: 1, Size: 4096, File: id, MtimeNsec: int64(file)}},
+					FilesystemOperation{PutEntry: &DirectoryEntryRecord{Parent: 2 + uint64(file%directories), Name: fmt.Sprintf("file-%06d", file), Inode: number}})
+			}
+			if err := store.CommitReservedObjects(reserved); err != nil {
+				return err
+			}
+			if _, err := store.ApplyFilesystemAndReleasePins(origin, "branch/main", operations, pins); err != nil {
+				return err
+			}
+			if store.CheckpointDue(8 << 20) {
+				written += store.journalEnd
+				if err := store.CheckpointExternallyCoordinated(); err != nil {
+					return err
+				}
+				written += store.checkpointBytes
+			}
+			return nil
+		})
+	}
+	b.StopTimer()
+	written += store.journalEnd
+	b.ReportMetric(float64(written)/float64(b.N), "bytes/file")
+	if err := store.Close(); err != nil {
+		b.Fatal(err)
+	}
+	ExpireGraphStates(-1)
+	start := time.Now()
+	reopened, err := OpenExternallyCoordinated(dir)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportMetric(float64(time.Since(start).Milliseconds()), "open-ms")
+	reopened.Close()
 }

@@ -22,7 +22,7 @@ func checkpointFixture(random *rand.Rand, objects int) graphState {
 			snapshotKey(1): {ID: 1, State: SnapshotWorking, NextOrdinal: uint64(objects) + 10},
 			snapshotKey(2): {ID: 2, State: SnapshotSealedVolatile, NextOrdinal: 3},
 		},
-		Objects: make(map[string]Object), Roots: make(map[string]ObjectID), Pins: make(map[string]ObjectID),
+		Objects: make(map[ObjectID]Object), Roots: make(map[string]ObjectID), Pins: make(map[string]ObjectID),
 		Frozen:   map[string]bool{snapshotKey(2): true},
 		Handoffs: map[string]SnapshotLedgerHandoff{snapshotKey(2): {Snapshot: 2, NextSequence: 5, Frozen: true, Baseline: map[string]ObjectID{"root/a": {Snapshot: 2, Kind: ObjectKindMetadata, Ordinal: 1}}, Mutations: []SnapshotReferenceMutation{{Sequence: 4, Operation: "op", Name: "root/b", Object: ObjectID{Snapshot: 2, Kind: ObjectKindMetadata, Ordinal: 2}, Retain: true}}}},
 	}
@@ -52,19 +52,42 @@ func checkpointFixture(random *rand.Rand, objects int) graphState {
 		if object.Refs == 0 {
 			object.State = ObjectReclaiming
 		}
-		state.Objects[id.key()] = object
+		state.Objects[id] = object
 	}
 	state.Roots["branch/main"] = ObjectID{Snapshot: 1, Kind: ObjectKindMetadata, Ordinal: 1}
 	state.Pins["construct/x"] = ObjectID{Snapshot: 1, Kind: ObjectKindMetadata, Ordinal: 2}
 	return state
 }
 
+// checkpointJSONOf returns state as a checkpoint holds it.
+func checkpointJSONOf(state graphState) checkpointJSON {
+	checkpoint := checkpointJSON{
+		Version: state.Version, Sequence: state.Sequence, NextSnapshot: state.NextSnapshot,
+		Snapshots: state.Snapshots, Roots: state.Roots, Pins: state.Pins, Frozen: state.Frozen, Handoffs: state.Handoffs,
+	}
+	if state.Objects != nil {
+		checkpoint.Objects = make(map[string]Object, len(state.Objects))
+		for id, object := range state.Objects {
+			checkpoint.Objects[id.key()] = object
+		}
+	}
+	return checkpoint
+}
+
+// decodeCheckpointJSON decodes data as json.Unmarshal decodes a checkpoint.
+func decodeCheckpointJSON(data []byte) (graphState, error) {
+	var checkpoint checkpointJSON
+	if err := json.Unmarshal(data, &checkpoint); err != nil {
+		return graphState{}, err
+	}
+	return checkpoint.state()
+}
+
 // checkDecodesAlike fails unless decodeGraphCheckpoint decodes data as
 // json.Unmarshal does, and reports whether the canonical decoder took it.
 func checkDecodesAlike(t *testing.T, data []byte) bool {
 	t.Helper()
-	var want graphState
-	wantErr := json.Unmarshal(data, &want)
+	want, wantErr := decodeCheckpointJSON(data)
 	canonical, ok := decodeCanonicalCheckpoint(data)
 	if ok && (wantErr != nil || !reflect.DeepEqual(canonical, want)) {
 		t.Fatalf("the canonical decoder took what json.Unmarshal decodes otherwise (%v):\n%.300s", wantErr, data)
@@ -81,7 +104,7 @@ func checkDecodesAlike(t *testing.T, data []byte) bool {
 func TestDecodeGraphCheckpoint(t *testing.T) {
 	random := rand.New(rand.NewSource(1))
 	for round := 0; round < 20; round++ {
-		data, err := json.Marshal(checkpointFixture(random, 1+random.Intn(200)))
+		data, err := json.Marshal(checkpointJSONOf(checkpointFixture(random, 1+random.Intn(200))))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -96,7 +119,7 @@ func TestDecodeGraphCheckpoint(t *testing.T) {
 			t.Fatalf("round %d: the canonical decoder refused an indented checkpoint", round)
 		}
 	}
-	data, err := json.Marshal(checkpointFixture(random, 20))
+	data, err := json.Marshal(checkpointJSONOf(checkpointFixture(random, 20)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,15 +152,15 @@ func TestDecodeGraphCheckpoint(t *testing.T) {
 // A checkpoint encodes as json.Marshal writes it, byte for byte.
 func TestEncodeGraphCheckpoint(t *testing.T) {
 	random := rand.New(rand.NewSource(3))
-	states := []graphState{{}, {Objects: map[string]Object{}}}
+	states := []graphState{{}, {Objects: map[ObjectID]Object{}}}
 	for round := 0; round < 20; round++ {
 		states = append(states, checkpointFixture(random, random.Intn(200)))
 	}
 	odd := checkpointFixture(random, 5)
-	odd.Objects["key <&> \"quoted\" \u2028 \xff"] = Object{ID: ObjectID{Snapshot: 1, Kind: 1, Ordinal: 1}, State: "odd\tstate", SourceCatalog: "<catalog>"}
+	odd.Objects[ObjectID{Snapshot: 1, Kind: 1, Ordinal: 1}] = Object{ID: ObjectID{Snapshot: 1, Kind: 1, Ordinal: 1}, State: "odd\tstate <&> \"quoted\" \u2028 \xff", SourceCatalog: "<catalog>"}
 	states = append(states, odd)
 	for index := range states {
-		want, err := json.Marshal(states[index])
+		want, err := json.Marshal(checkpointJSONOf(states[index]))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -151,12 +174,12 @@ func TestEncodeGraphCheckpoint(t *testing.T) {
 // FuzzDecodeGraphCheckpoint checks that whatever the canonical decoder takes,
 // json.Unmarshal decodes alike.
 func FuzzDecodeGraphCheckpoint(f *testing.F) {
-	data, err := json.Marshal(checkpointFixture(rand.New(rand.NewSource(2)), 6))
+	data, err := json.Marshal(checkpointJSONOf(checkpointFixture(rand.New(rand.NewSource(2)), 6)))
 	if err != nil {
 		f.Fatal(err)
 	}
 	f.Add(data)
-	f.Add([]byte(`{"Objects":{"k":{"ID":{"Snapshot":1,"Ordinal":2,"Kind":3},"Data":"","Children":[]}}}`))
+	f.Add([]byte(`{"Objects":{"0000000000000001-03-0000000000000002":{"ID":{"Snapshot":1,"Ordinal":2,"Kind":3},"Data":"","Children":[]}}}`))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		checkDecodesAlike(t, data)
 	})

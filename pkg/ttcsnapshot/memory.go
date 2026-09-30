@@ -316,7 +316,7 @@ func (s *Store) MemoryPageEntries(root ObjectID) ([]MemoryPageEntry, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return memoryPageEntries(root, func(id ObjectID) (Object, bool) {
-		object, ok := s.state.Objects[id.key()]
+		object, ok := s.state.Objects[id]
 		return object, ok
 	})
 }
@@ -557,7 +557,7 @@ func (s *Store) memoryTableKey(data []byte, children []Edge) uint64 {
 // with exactly data and children.
 func (s *Store) existingMemoryTableLocked(data []byte, children []Edge, reuse reuseFilter) (ObjectID, bool) {
 	for _, id := range s.memoryTables[s.memoryTableKey(data, children)] {
-		table, ok := s.state.Objects[id.key()]
+		table, ok := s.state.Objects[id]
 		if !ok || !memoryObjectIndexable(table) || !s.originAllowedLocked(id.Snapshot, reuse) {
 			continue
 		}
@@ -791,7 +791,7 @@ func (s *Store) AdoptSharedMemory(pinPrefix string, tables, chunks []Object) ([]
 		}
 		object, ok := touched[id]
 		if !ok {
-			if object, ok = s.state.Objects[id.key()]; !ok {
+			if object, ok = s.state.Objects[id]; !ok {
 				return os.ErrNotExist
 			}
 		}
@@ -814,7 +814,7 @@ func (s *Store) AdoptSharedMemory(pinPrefix string, tables, chunks []Object) ([]
 		}
 		pins[name] = table.ID
 		names = append(names, name)
-		if existing, ok := s.state.Objects[table.ID.key()]; ok {
+		if existing, ok := s.state.Objects[table.ID]; ok {
 			if !bytes.Equal(existing.Data, table.Data) || !slices.Equal(existing.Children, table.Children) {
 				return nil, fmt.Errorf("memory table %s differs from the graph's", table.ID.key())
 			}

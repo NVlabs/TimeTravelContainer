@@ -57,7 +57,7 @@ func (s *Store) ImportDeferredFilesystemRoot(origin SnapshotID, rootName, catalo
 	var object Object
 	key := deferredObjectKey(catalog, sourceRoot)
 	if existing, found := s.deferredObjects[key]; found {
-		object, found = s.state.Objects[existing.key()]
+		object, found = s.state.Objects[existing]
 		if !found || object.State != ObjectLive || object.Refs == math.MaxUint64 {
 			object = Object{}
 		}
@@ -73,7 +73,7 @@ func (s *Store) ImportDeferredFilesystemRoot(origin SnapshotID, rootName, catalo
 	}
 	object.Refs++
 	if previous, found := s.state.Roots[rootName]; found {
-		old, ok := s.state.Objects[previous.key()]
+		old, ok := s.state.Objects[previous]
 		if !ok {
 			return ObjectID{}, fmt.Errorf("root %q references missing object %s", rootName, previous)
 		}
@@ -90,7 +90,7 @@ func (s *Store) ImportDeferredFilesystemRoot(origin SnapshotID, rootName, catalo
 		return ObjectID{}, err
 	}
 	if s.deferredObjects == nil {
-		s.deferredObjects = make(map[string]ObjectID)
+		s.deferredObjects = make(map[deferredKey]ObjectID)
 	}
 	s.deferredObjects[key] = root
 	return root, nil
@@ -102,14 +102,14 @@ func (s *Store) ImportDeferredFilesystemRoot(origin SnapshotID, rootName, catalo
 func (s *Store) DeferredSource(id ObjectID) (string, ObjectID, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	object, ok := s.state.Objects[id.key()]
+	object, ok := s.state.Objects[id]
 	if !ok || object.SourceCatalog == "" || object.SourceObject.IsZero() {
 		return "", ObjectID{}, false
 	}
 	return object.SourceCatalog, object.SourceObject, true
 }
 
-func translateDeferredFilesystemData(source Object, children map[string]ObjectID) ([]byte, error) {
+func translateDeferredFilesystemData(source Object, children map[ObjectID]ObjectID) ([]byte, error) {
 	data := append([]byte(nil), source.Data...)
 	if source.ID.Kind != ObjectKindInode {
 		return data, nil
@@ -122,7 +122,7 @@ func translateDeferredFilesystemData(source Object, children map[string]ObjectID
 		if id.IsZero() {
 			return ObjectID{}, nil
 		}
-		mapped, ok := children[id.key()]
+		mapped, ok := children[id]
 		if !ok {
 			return ObjectID{}, fmt.Errorf("foreign inode %s embeds uncounted child %s", source.ID, id)
 		}
@@ -155,7 +155,7 @@ func (s *Store) resolveDeferredLocked(id ObjectID) (Object, bool, error) {
 // prevents a demand-loaded child from colliding with that private batch.
 // +checklocksignore
 func (s *Store) resolveDeferredLockedAfter(id ObjectID, ordinalFloor uint64) (Object, bool, uint64, error) {
-	object, ok := s.state.Objects[id.key()]
+	object, ok := s.state.Objects[id]
 	if !ok || !object.Deferred {
 		return object, ok, ordinalFloor, nil
 	}
@@ -173,7 +173,7 @@ func (s *Store) resolveDeferredLockedAfter(id ObjectID, ordinalFloor uint64) (Ob
 		// The leader commits the complete expansion before waking waiters.
 		// Re-read it rather than applying its source a second time. A batch
 		// may commit this expansion and then fail on another object's.
-		object, ok = s.state.Objects[id.key()]
+		object, ok = s.state.Objects[id]
 		if !ok || !object.Deferred {
 			return object, ok, ordinalFloor, nil
 		}
@@ -183,7 +183,7 @@ func (s *Store) resolveDeferredLockedAfter(id ObjectID, ordinalFloor uint64) (Ob
 		return Object{}, false, ordinalFloor, fmt.Errorf("deferred TTC object %s remained unresolved after provider load", id)
 	}
 	if s.deferredLoads == nil {
-		s.deferredLoads = make(map[string]*deferredLoad)
+		s.deferredLoads = make(map[deferredKey]*deferredLoad)
 	}
 	inFlight := &deferredLoad{done: make(chan struct{})}
 	s.deferredLoads[loadKey] = inFlight
@@ -211,7 +211,7 @@ func (s *Store) resolveDeferredLockedAfter(id ObjectID, ordinalFloor uint64) (Ob
 	defer s.endImplicitExternalMutationLocked(acquired)
 	// The graph may have advanced while provider I/O was in flight. Another
 	// path can only have expanded this exact immutable stub to the same value.
-	object, ok = s.state.Objects[id.key()]
+	object, ok = s.state.Objects[id]
 	if !ok || !object.Deferred {
 		inFlight.source = source
 		close(inFlight.done)
@@ -254,14 +254,14 @@ func (s *Store) resolveDeferredLockedAfter(id ObjectID, ordinalFloor uint64) (Ob
 	if snapshot.NextOrdinal < ordinalFloor {
 		snapshot.NextOrdinal = ordinalFloor
 	}
-	touched := make(map[string]Object)
-	mapped := make(map[string]ObjectID, len(source.Children))
+	touched := make(map[ObjectID]Object)
+	mapped := make(map[ObjectID]ObjectID, len(source.Children))
 	edges := make([]Edge, 0, len(source.Children))
-	newMappings := make(map[string]ObjectID)
+	newMappings := make(map[deferredKey]ObjectID)
 	for _, edge := range source.Children {
 		foreignKey := deferredObjectKey(object.SourceCatalog, edge.Child)
 		localID, found := s.deferredObjects[foreignKey]
-		child, live := s.state.Objects[localID.key()]
+		child, live := s.state.Objects[localID]
 		if !found || !live || child.State != ObjectLive {
 			if snapshot.NextOrdinal == math.MaxUint64 {
 				return fail(errors.New("deferred TTC object ordinal space exhausted"))
@@ -274,15 +274,15 @@ func (s *Store) resolveDeferredLockedAfter(id ObjectID, ordinalFloor uint64) (Ob
 			}
 			newMappings[foreignKey] = localID
 		}
-		if previous, exists := touched[localID.key()]; exists {
+		if previous, exists := touched[localID]; exists {
 			child = previous
 		}
 		if child.Refs == math.MaxUint64 {
 			return fail(fmt.Errorf("deferred child %s reference count overflows", localID))
 		}
 		child.Refs++
-		touched[localID.key()] = child
-		mapped[edge.Child.key()] = localID
+		touched[localID] = child
+		mapped[edge.Child] = localID
 		edges = append(edges, Edge{Slot: edge.Slot, Child: localID})
 	}
 	data, err := translateDeferredFilesystemData(source, mapped)
@@ -296,14 +296,10 @@ func (s *Store) resolveDeferredLockedAfter(id ObjectID, ordinalFloor uint64) (Ob
 	if err := validateObject(object); err != nil {
 		return fail(err)
 	}
-	keys := make([]string, 0, len(touched))
-	for key := range touched {
-		keys = append(keys, key)
-	}
-	slices.Sort(keys)
-	ops := make([]journalOp, 0, len(keys)+2)
-	for _, key := range keys {
-		child := touched[key]
+	ids := sortedIDs(touched)
+	ops := make([]journalOp, 0, len(ids)+2)
+	for _, id := range ids {
+		child := touched[id]
 		ops = append(ops, journalOp{PutObject: &child})
 	}
 	ops = append(ops, journalOp{PutObject: &object})
@@ -351,26 +347,25 @@ func (s *Store) resolveDeferredBatchLocked(ids []ObjectID) error {
 // +checklocksignore
 func (s *Store) resolveDeferredChunkLocked(ids []ObjectID) error {
 	type expansion struct {
-		key      string
+		id       ObjectID
 		catalog  string
 		sourceID ObjectID
 		load     ImmutableObjectLoader
 		source   Object
 	}
 	var work []expansion
-	selected := make(map[string]bool)
+	selected := make(map[ObjectID]bool)
 	for _, id := range ids {
-		key := id.key()
-		object, ok := s.state.Objects[key]
-		if !ok || !object.Deferred || selected[key] {
+		object, ok := s.state.Objects[id]
+		if !ok || !object.Deferred || selected[id] {
 			continue
 		}
 		resolver, attached := s.deferredResolvers[object.SourceCatalog]
 		if !attached || resolver.load == nil || s.deferredLoads[deferredObjectKey(object.SourceCatalog, object.SourceObject)] != nil {
 			continue
 		}
-		selected[key] = true
-		work = append(work, expansion{key: key, catalog: object.SourceCatalog, sourceID: object.SourceObject, load: resolver.load})
+		selected[id] = true
+		work = append(work, expansion{id: id, catalog: object.SourceCatalog, sourceID: object.SourceObject, load: resolver.load})
 	}
 	if len(work) == 0 {
 		return nil
@@ -397,14 +392,14 @@ func (s *Store) resolveDeferredChunkLocked(ids []ObjectID) error {
 	defer s.endImplicitExternalMutationLocked(acquired)
 	// The expansions not yet committed: the objects they change, the child
 	// stubs they make, and the origins whose ordinals they take.
-	touched := make(map[string]Object)
-	newMappings := make(map[string]ObjectID)
+	touched := make(map[ObjectID]Object)
+	newMappings := make(map[deferredKey]ObjectID)
 	snapshots := make(map[SnapshotID]Snapshot)
-	current := func(key string) (Object, bool) {
-		if object, ok := touched[key]; ok {
+	current := func(id ObjectID) (Object, bool) {
+		if object, ok := touched[id]; ok {
 			return object, true
 		}
-		object, ok := s.state.Objects[key]
+		object, ok := s.state.Objects[id]
 		return object, ok
 	}
 	operations := 0
@@ -412,14 +407,10 @@ func (s *Store) resolveDeferredChunkLocked(ids []ObjectID) error {
 		if len(touched) == 0 {
 			return nil
 		}
-		keys := make([]string, 0, len(touched))
-		for key := range touched {
-			keys = append(keys, key)
-		}
-		slices.Sort(keys)
-		ops := make([]journalOp, 0, len(keys)+len(snapshots))
-		for _, key := range keys {
-			object := touched[key]
+		ids := sortedIDs(touched)
+		ops := make([]journalOp, 0, len(ids)+len(snapshots))
+		for _, id := range ids {
+			object := touched[id]
 			ops = append(ops, journalOp{PutObject: &object})
 		}
 		origins := make([]SnapshotID, 0, len(snapshots))
@@ -447,7 +438,7 @@ func (s *Store) resolveDeferredChunkLocked(ids []ObjectID) error {
 		// The graph may have advanced while provider I/O was in flight.
 		// Another path can only have expanded this exact immutable stub to the
 		// same value.
-		object, ok := current(item.key)
+		object, ok := current(item.id)
 		if !ok || !object.Deferred {
 			continue
 		}
@@ -469,7 +460,7 @@ func (s *Store) resolveDeferredChunkLocked(ids []ObjectID) error {
 			}
 		}
 		allocated := false
-		mapped := make(map[string]ObjectID, len(source.Children))
+		mapped := make(map[ObjectID]ObjectID, len(source.Children))
 		edges := make([]Edge, 0, len(source.Children))
 		for _, edge := range source.Children {
 			foreignKey := deferredObjectKey(object.SourceCatalog, edge.Child)
@@ -477,7 +468,7 @@ func (s *Store) resolveDeferredChunkLocked(ids []ObjectID) error {
 			if !found {
 				localID, found = s.deferredObjects[foreignKey]
 			}
-			child, live := current(localID.key())
+			child, live := current(localID)
 			if !found || !live || child.State != ObjectLive {
 				if snapshot.NextOrdinal == math.MaxUint64 {
 					return errors.New("deferred TTC object ordinal space exhausted")
@@ -495,8 +486,8 @@ func (s *Store) resolveDeferredChunkLocked(ids []ObjectID) error {
 				return fmt.Errorf("deferred child %s reference count overflows", localID)
 			}
 			child.Refs++
-			touched[localID.key()] = child
-			mapped[edge.Child.key()] = localID
+			touched[localID] = child
+			mapped[edge.Child] = localID
 			edges = append(edges, Edge{Slot: edge.Slot, Child: localID})
 		}
 		if allocated {
@@ -513,7 +504,7 @@ func (s *Store) resolveDeferredChunkLocked(ids []ObjectID) error {
 		if err := validateObject(object); err != nil {
 			return err
 		}
-		touched[item.key] = object
+		touched[item.id] = object
 		// A record holds a thousand-odd objects, far below its limit.
 		if operations += 1 + len(edges); operations >= 1024 {
 			if err := flush(); err != nil {

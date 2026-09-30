@@ -146,7 +146,7 @@ func (s *Store) BTreeLookup(root ObjectID, kind ObjectKind, key []byte) (ObjectI
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return bTreeLookupObjects(root, kind, key, func(id ObjectID) (Object, bool) {
-		object, ok := s.state.Objects[id.key()]
+		object, ok := s.state.Objects[id]
 		return object, ok
 	})
 }
@@ -154,7 +154,7 @@ func (s *Store) BTreeLookup(root ObjectID, kind ObjectKind, key []byte) (ObjectI
 type graphMutation struct {
 	store    *Store
 	snapshot Snapshot
-	objects  map[string]Object
+	objects  map[ObjectID]Object
 	err      error
 }
 
@@ -163,11 +163,11 @@ func newGraphMutation(store *Store, origin SnapshotID) (*graphMutation, error) {
 	if !ok || snapshot.State != SnapshotWorking {
 		return nil, fmt.Errorf("snapshot %d is not working", origin)
 	}
-	return &graphMutation{store: store, snapshot: snapshot, objects: make(map[string]Object)}, nil
+	return &graphMutation{store: store, snapshot: snapshot, objects: make(map[ObjectID]Object)}, nil
 }
 
 func (mutation *graphMutation) object(id ObjectID) (Object, bool) {
-	if object, ok := mutation.objects[id.key()]; ok {
+	if object, ok := mutation.objects[id]; ok {
 		return object, true
 	}
 	object, ok, nextOrdinal, err := mutation.store.resolveDeferredLockedAfter(id, mutation.snapshot.NextOrdinal)
@@ -182,15 +182,15 @@ func (mutation *graphMutation) object(id ObjectID) (Object, bool) {
 }
 
 func (mutation *graphMutation) rawObject(id ObjectID) (Object, bool) {
-	if object, ok := mutation.objects[id.key()]; ok {
+	if object, ok := mutation.objects[id]; ok {
 		return object, true
 	}
-	object, ok := mutation.store.state.Objects[id.key()]
+	object, ok := mutation.store.state.Objects[id]
 	return object, ok
 }
 
 func (mutation *graphMutation) put(object Object) {
-	mutation.objects[object.ID.key()] = object
+	mutation.objects[object.ID] = object
 }
 
 func (mutation *graphMutation) retain(id ObjectID) error {
@@ -292,18 +292,14 @@ func (mutation *graphMutation) commit(rootName string, root ObjectID) error {
 // commitRoots writes the mutation and the new trees of roots, already set with
 // setRoots, as one transaction.
 func (mutation *graphMutation) commitRoots(roots map[string]ObjectID) error {
-	keys := make([]string, 0, len(mutation.objects))
-	for key := range mutation.objects {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	ops := make([]journalOp, 0, len(keys)+2)
-	references := make(map[string]Object)
-	for _, key := range keys {
-		object := mutation.objects[key]
-		if previous, ok := mutation.store.state.Objects[key]; ok && previous.ID == object.ID && previous.BulkLength == object.BulkLength && bytes.Equal(previous.Data, object.Data) && slices.Equal(previous.Children, object.Children) {
+	ids := sortedIDs(mutation.objects)
+	ops := make([]journalOp, 0, len(ids)+2)
+	references := make(map[ObjectID]Object)
+	for _, id := range ids {
+		object := mutation.objects[id]
+		if previous, ok := mutation.store.state.Objects[id]; ok && previous.ID == object.ID && previous.BulkLength == object.BulkLength && bytes.Equal(previous.Data, object.Data) && slices.Equal(previous.Children, object.Children) {
 			if previous.Refs != object.Refs || previous.State != object.State {
-				references[key] = object
+				references[id] = object
 			}
 			continue
 		}
@@ -637,7 +633,7 @@ func (s *Store) BTreeSet(origin SnapshotID, rootName string, kind ObjectKind, ke
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if object, ok := s.state.Objects[value.key()]; !ok || object.State != ObjectLive {
+	if object, ok := s.state.Objects[value]; !ok || object.State != ObjectLive {
 		return ObjectID{}, fmt.Errorf("b-tree value %s is not live", value.key())
 	}
 	mutation, err := newGraphMutation(s, origin)
@@ -708,14 +704,10 @@ func (s *Store) BTreeDelete(origin SnapshotID, rootName string, kind ObjectKind,
 			return false, err
 		}
 		mutation.put(old)
-		keys := make([]string, 0, len(mutation.objects))
-		for key := range mutation.objects {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-		ops := make([]journalOp, 0, len(keys)+2)
-		for _, key := range keys {
-			object := mutation.objects[key]
+		ids := sortedIDs(mutation.objects)
+		ops := make([]journalOp, 0, len(ids)+2)
+		for _, id := range ids {
+			object := mutation.objects[id]
 			ops = append(ops, journalOp{PutObject: &object})
 		}
 		ops = append(ops, journalOp{PutSnapshot: &mutation.snapshot}, journalOp{RootName: rootName, DeleteRoot: true})

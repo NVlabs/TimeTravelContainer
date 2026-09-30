@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"math/rand"
 	"reflect"
-	"slices"
 	"strings"
 	"testing"
 )
@@ -18,13 +17,8 @@ import (
 func manifestFixture(random *rand.Rand, objects int) SnapshotManifest {
 	state := checkpointFixture(random, objects)
 	manifest := SnapshotManifest{Version: sharedPackVersion, Snapshot: 1, Packs: []PackInfo{{Number: 0, Size: 1 << 20}, {Number: 3, Size: 4096}}}
-	keys := make([]string, 0, len(state.Objects))
-	for key := range state.Objects {
-		keys = append(keys, key)
-	}
-	slices.Sort(keys)
-	for _, key := range keys {
-		packed := PackedObject{Object: state.Objects[key]}
+	for _, id := range sortedIDs(state.Objects) {
+		packed := PackedObject{Object: state.Objects[id]}
 		switch random.Intn(3) {
 		case 0:
 			packed.Extents = []PackExtent{{Pack: 3, Offset: 4096, Length: int64(random.Intn(1 << 20))}}

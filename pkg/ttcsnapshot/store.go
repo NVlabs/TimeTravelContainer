@@ -61,7 +61,7 @@ type graphState struct {
 	Sequence     uint64
 	NextSnapshot SnapshotID
 	Snapshots    map[string]Snapshot
-	Objects      map[string]Object
+	Objects      map[ObjectID]Object
 	Roots        map[string]ObjectID
 	Pins         map[string]ObjectID
 	Frozen       map[string]bool
@@ -80,7 +80,7 @@ type graphState struct {
 type graphUndo struct {
 	// A nil prior value is an absent one.
 	snapshots    map[string]*Snapshot
-	objects      map[string]*Object
+	objects      map[ObjectID]*Object
 	roots        map[string]*ObjectID
 	pins         map[string]*ObjectID
 	frozen       map[string]*bool
@@ -107,7 +107,7 @@ func (state *graphState) rollbackUndo() {
 	state.NextSnapshot, state.Sequence = undo.nextSnapshot, undo.sequence
 }
 
-func restoreEntries[V any](entries map[string]V, priors map[string]*V) {
+func restoreEntries[K comparable, V any](entries map[K]V, priors map[K]*V) {
 	for key, prior := range priors {
 		if prior != nil {
 			entries[key] = *prior
@@ -119,12 +119,12 @@ func restoreEntries[V any](entries map[string]V, priors map[string]*V) {
 
 // recordEntry records, while a transaction is recorded, the prior value of
 // entries[key], unless it has recorded one already.
-func recordEntry[V any](priors *map[string]*V, entries map[string]V, key string) {
+func recordEntry[K comparable, V any](priors *map[K]*V, entries map[K]V, key K) {
 	if _, recorded := (*priors)[key]; recorded {
 		return
 	}
 	if *priors == nil {
-		*priors = make(map[string]*V)
+		*priors = make(map[K]*V)
 	}
 	if prior, ok := entries[key]; ok {
 		(*priors)[key] = &prior
@@ -150,18 +150,18 @@ func (state *graphState) deleteSnapshot(key string) {
 	delete(state.Snapshots, key)
 }
 
-func (state *graphState) putObject(key string, object Object) {
+func (state *graphState) putObject(object Object) {
 	if state.undo != nil {
-		recordEntry(&state.undo.objects, state.Objects, key)
+		recordEntry(&state.undo.objects, state.Objects, object.ID)
 	}
-	state.Objects[key] = object
+	state.Objects[object.ID] = object
 }
 
-func (state *graphState) deleteObject(key string) {
+func (state *graphState) deleteObject(id ObjectID) {
 	if state.undo != nil {
-		recordEntry(&state.undo.objects, state.Objects, key)
+		recordEntry(&state.undo.objects, state.Objects, id)
 	}
-	delete(state.Objects, key)
+	delete(state.Objects, id)
 }
 
 func (state *graphState) putRoot(name string, id ObjectID) {
@@ -225,7 +225,7 @@ func newGraphState() graphState {
 		Version:      formatVersion,
 		NextSnapshot: 1,
 		Snapshots:    make(map[string]Snapshot),
-		Objects:      make(map[string]Object),
+		Objects:      make(map[ObjectID]Object),
 		Roots:        make(map[string]ObjectID),
 		Pins:         make(map[string]ObjectID),
 		Frozen:       make(map[string]bool),
@@ -271,6 +271,19 @@ type journalOp struct {
 	BeginHandoff     *SnapshotLedgerHandoff
 	AppendHandoff    *SnapshotReferenceMutation
 	ApplyFilesystem  *filesystemJournalMutation
+}
+
+// object returns the object op puts or deletes, if any.
+func (op *journalOp) object() (ObjectID, bool) {
+	if op.PutObject != nil {
+		return op.PutObject.ID, true
+	}
+	if op.DeleteObject != "" {
+		// A record is validated before it is applied: the key is canonical.
+		id, err := parseObjectKey(op.DeleteObject)
+		return id, err == nil
+	}
+	return ObjectID{}, false
 }
 
 type journalRecord struct {
@@ -332,7 +345,7 @@ type Store struct {
 	// transaction that may span multiple Store calls.
 	implicitExternalTransaction bool
 	deferredResolvers           map[string]deferredResolver
-	deferredObjects             map[string]ObjectID
+	deferredObjects             map[deferredKey]ObjectID
 	// memoryPages is a derived index of where the graph holds each page, by
 	// the stable logical/version identity the guest's memory manager gave it,
 	// so that a capture maps pages the graph holds rather than storing them
@@ -351,15 +364,15 @@ type Store struct {
 	// deferredLoads serializes provider I/O for one foreign immutable object.
 	// Provider reads must never run while mu is held: a multi-hop filesystem
 	// graph may legitimately re-enter this Store while resolving an ancestor.
-	deferredLoads map[string]*deferredLoad
+	deferredLoads map[deferredKey]*deferredLoad
 	// collectQueue holds the zero-count objects Collect has found but not
 	// reached yet, in the order it will reach them, and collectQueued every
 	// object it has queued since it last scanned the graph. Callers repeat
 	// Collect until it returns zero, and the queue lets them scan the graph
 	// once rather than on every call. An entry may be stale: Collect skips an
 	// object that is gone, and scans again before it reports nothing left.
-	collectQueue  []string
-	collectQueued map[string]struct{}
+	collectQueue  []ObjectID
+	collectQueued map[ObjectID]struct{}
 	// collectedBulk holds, once RecordCollectedBulk asked for it, the objects
 	// with standalone bulk data collection has deleted since
 	// TakeCollectedBulk last returned them.
@@ -378,8 +391,14 @@ type deferredLoad struct {
 	err    error
 }
 
-func deferredObjectKey(catalog string, id ObjectID) string {
-	return catalog + "\x00" + id.key()
+// deferredKey names an object of a foreign catalog.
+type deferredKey struct {
+	catalog string
+	id      ObjectID
+}
+
+func deferredObjectKey(catalog string, id ObjectID) deferredKey {
+	return deferredKey{catalog: catalog, id: id}
 }
 
 var graphTemporarySequence atomic.Uint64
@@ -508,8 +527,8 @@ func open(dir string, externallyCoordinated bool) (*Store, error) {
 	}
 	store := &Store{
 		dir: dir, dirFD: dirFD, lock: lock, state: newGraphState(), externallyCoordinated: externallyCoordinated,
-		deferredResolvers: make(map[string]deferredResolver), deferredObjects: make(map[string]ObjectID),
-		deferredLoads: make(map[string]*deferredLoad), memoryTableSeed: maphash.MakeSeed(),
+		deferredResolvers: make(map[string]deferredResolver), deferredObjects: make(map[deferredKey]ObjectID),
+		deferredLoads: make(map[deferredKey]*deferredLoad), memoryTableSeed: maphash.MakeSeed(),
 	}
 	if externallyCoordinated {
 		if err := hostthread.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
@@ -912,7 +931,7 @@ func (s *Store) writeHead(head graphHead) error {
 
 func (s *Store) initializeGeneration() error {
 	state := newGraphState()
-	checkpoint, err := json.Marshal(state)
+	checkpoint, err := encodeGraphCheckpoint(&state)
 	if err != nil {
 		return err
 	}
@@ -1014,7 +1033,7 @@ type cachedGraphState struct {
 // graphIndexes are a store's indexes derived from its graph state, and the
 // seed of the hashes memoryTables is keyed by.
 type graphIndexes struct {
-	deferredObjects      map[string]ObjectID
+	deferredObjects      map[deferredKey]ObjectID
 	memoryPages          map[MemoryPageIdentity]memoryPageHolding
 	memoryPagesElsewhere map[MemoryPageIdentity][]memoryPageHolding
 	memoryTables         map[uint64][]ObjectID
@@ -1347,7 +1366,7 @@ func (s *Store) loadGeneration(head graphHead, repairTail bool) error {
 }
 
 func (s *Store) rebuildDeferredObjectsLocked() {
-	s.deferredObjects = make(map[string]ObjectID)
+	s.deferredObjects = make(map[deferredKey]ObjectID)
 	for _, object := range s.state.Objects {
 		if object.SourceCatalog != "" && !object.SourceObject.IsZero() {
 			s.deferredObjects[deferredObjectKey(object.SourceCatalog, object.SourceObject)] = object.ID
@@ -1378,25 +1397,25 @@ func validateGraphState(state *graphState) error {
 		}
 		nextOrdinals[snapshot.ID] = snapshot.NextOrdinal
 	}
-	// Counted by ID: the objects' keys are checked canonical, and forming one
-	// for each edge made validating a graph of 300,000 objects take 2.3 s.
-	expected := make(map[ObjectID]uint64, len(state.Objects))
-	for key, object := range state.Objects {
-		id, err := parseObjectKey(key)
-		if err != nil {
-			return err
-		}
+	// References are counted by sorting: the objects, and what the roots,
+	// pins and edges reference, are each sorted, and walked together once.
+	// Counting them in a table took 0.2 s of the 0.3 s it took to validate a
+	// graph of 300,000 objects, most of it waiting for memory.
+	counts := make([]referenceCount, 0, len(state.Objects))
+	edges := 0
+	for id, object := range state.Objects {
 		if id != object.ID {
-			return fmt.Errorf("object key %q does not match %s", key, object.ID.key())
+			return fmt.Errorf("object key %s does not match %s", id, object.ID)
 		}
 		if err := validateObject(object); err != nil {
 			return err
 		}
 		next, ok := nextOrdinals[object.ID.Snapshot]
 		if !ok || object.ID.Ordinal >= next {
-			return fmt.Errorf("object %s has invalid snapshot origin", key)
+			return fmt.Errorf("object %s has invalid snapshot origin", id)
 		}
-		expected[object.ID] = 0
+		counts = append(counts, referenceCount{id: id, refs: object.Refs, reclaiming: object.State == ObjectReclaiming})
+		edges += len(object.Children)
 	}
 	for key, frozen := range state.Frozen {
 		if !frozen {
@@ -1434,52 +1453,76 @@ func validateGraphState(state *graphState) error {
 			return fmt.Errorf("snapshot reference barrier %q has no handoff", key)
 		}
 	}
+	references := make([]ObjectID, 0, len(state.Roots)+len(state.Pins)+edges)
 	for name, id := range state.Roots {
 		if err := validateRootName(name); err != nil {
 			return err
 		}
-		count, ok := expected[id]
-		if !ok {
-			return fmt.Errorf("root %q references missing object %s", name, id.key())
-		}
-		expected[id] = count + 1
+		references = append(references, id)
 	}
 	for name, id := range state.Pins {
 		if err := validateRootName(name); err != nil {
 			return fmt.Errorf("invalid pin: %w", err)
 		}
-		count, ok := expected[id]
-		if !ok {
-			return fmt.Errorf("pin %q references missing object %s", name, id.key())
-		}
-		expected[id] = count + 1
+		references = append(references, id)
 	}
-	// An edge is counted in one look into the table: a missing child adds to
-	// it, which is found after.
 	for _, object := range state.Objects {
 		for _, edge := range object.Children {
-			expected[edge.Child]++
+			references = append(references, edge.Child)
 		}
 	}
-	if len(expected) != len(state.Objects) {
-		for _, object := range state.Objects {
-			for _, edge := range object.Children {
-				if _, ok := state.Objects[edge.Child.key()]; !ok {
-					return fmt.Errorf("object %s references missing child %s", object.ID.key(), edge.Child.key())
-				}
-			}
+	slices.SortFunc(counts, func(a, b referenceCount) int { return compareObjectIDs(a.id, b.id) })
+	slices.SortFunc(references, compareObjectIDs)
+	next := 0
+	for _, count := range counts {
+		if next < len(references) && compareObjectIDs(references[next], count.id) < 0 {
+			return missingReference(state, references[next])
 		}
-		return errors.New("graph state references missing objects")
+		first := next
+		for next < len(references) && references[next] == count.id {
+			next++
+		}
+		if referenced := uint64(next - first); count.refs != referenced {
+			return fmt.Errorf("object %s has %d references, graph has %d", count.id, count.refs, referenced)
+		}
+		if (count.refs == 0) != count.reclaiming {
+			return fmt.Errorf("object %s state disagrees with reference count %d", count.id, count.refs)
+		}
 	}
-	for key, object := range state.Objects {
-		if object.Refs != expected[object.ID] {
-			return fmt.Errorf("object %s has %d references, graph has %d", key, object.Refs, expected[object.ID])
-		}
-		if (object.Refs == 0) != (object.State == ObjectReclaiming) {
-			return fmt.Errorf("object %s state %q disagrees with reference count %d", key, object.State, object.Refs)
-		}
+	if next < len(references) {
+		return missingReference(state, references[next])
 	}
 	return nil
+}
+
+// referenceCount is what validateGraphState checks of an object's references.
+type referenceCount struct {
+	id         ObjectID
+	refs       uint64
+	reclaiming bool
+}
+
+// missingReference describes the reference of state to missing, an object it
+// lacks.
+func missingReference(state *graphState, missing ObjectID) error {
+	for name, id := range state.Roots {
+		if id == missing {
+			return fmt.Errorf("root %q references missing object %s", name, missing)
+		}
+	}
+	for name, id := range state.Pins {
+		if id == missing {
+			return fmt.Errorf("pin %q references missing object %s", name, missing)
+		}
+	}
+	for _, object := range state.Objects {
+		for _, edge := range object.Children {
+			if edge.Child == missing {
+				return fmt.Errorf("object %s references missing child %s", object.ID, missing)
+			}
+		}
+	}
+	return fmt.Errorf("graph state references missing object %s", missing)
 }
 
 // snapshotKey returns id in 16 hexadecimal digits, as %016x formats it.
@@ -1682,22 +1725,19 @@ func (s *Store) replayJournalSuffix(repairTail bool) error {
 }
 
 func (s *Store) applyIncrementalJournalRecord(record journalRecord) error {
-	oldObjects := make(map[string]Object, len(record.Ops)+len(record.References))
+	oldObjects := make(map[ObjectID]Object, len(record.Ops)+len(record.References))
 	for _, op := range record.Ops {
-		if op.PutObject != nil || op.DeleteObject != "" {
-			key := op.DeleteObject
-			if op.PutObject != nil {
-				key = op.PutObject.ID.key()
-			}
-			if object, ok := s.state.Objects[key]; ok {
-				oldObjects[key] = object
-			}
+		id, ok := op.object()
+		if !ok {
+			continue
+		}
+		if object, ok := s.state.Objects[id]; ok {
+			oldObjects[id] = object
 		}
 	}
 	for _, reference := range record.References {
-		key := reference.Object.key()
-		if object, ok := s.state.Objects[key]; ok {
-			oldObjects[key] = object
+		if object, ok := s.state.Objects[reference.Object]; ok {
+			oldObjects[reference.Object] = object
 		}
 	}
 	if err := applyJournalRecord(&s.state, record); err != nil {
@@ -1709,8 +1749,8 @@ func (s *Store) applyIncrementalJournalRecord(record journalRecord) error {
 		}
 		s.unindexMemoryObjectLocked(object)
 	}
-	for key := range oldObjects {
-		object, ok := s.state.Objects[key]
+	for id := range oldObjects {
+		object, ok := s.state.Objects[id]
 		if ok && object.SourceCatalog != "" && !object.SourceObject.IsZero() {
 			s.deferredObjects[deferredObjectKey(object.SourceCatalog, object.SourceObject)] = object.ID
 		}
@@ -1722,11 +1762,10 @@ func (s *Store) applyIncrementalJournalRecord(record journalRecord) error {
 		if op.PutObject == nil {
 			continue
 		}
-		key := op.PutObject.ID.key()
-		if _, existed := oldObjects[key]; existed {
+		if _, existed := oldObjects[op.PutObject.ID]; existed {
 			continue
 		}
-		object, ok := s.state.Objects[key]
+		object, ok := s.state.Objects[op.PutObject.ID]
 		if ok && object.SourceCatalog != "" && !object.SourceObject.IsZero() {
 			s.deferredObjects[deferredObjectKey(object.SourceCatalog, object.SourceObject)] = object.ID
 		}
@@ -1760,12 +1799,13 @@ func applyJournalRecord(state *graphState, record journalRecord) error {
 			if err := validateObject(*op.PutObject); err != nil {
 				return err
 			}
-			state.putObject(op.PutObject.ID.key(), cloneObject(*op.PutObject))
+			state.putObject(cloneObject(*op.PutObject))
 		case op.DeleteObject != "":
-			if _, err := parseObjectKey(op.DeleteObject); err != nil {
+			id, err := parseObjectKey(op.DeleteObject)
+			if err != nil {
 				return err
 			}
-			state.deleteObject(op.DeleteObject)
+			state.deleteObject(id)
 		case op.PutRoot != nil:
 			if err := validateRootName(op.RootName); err != nil {
 				return err
@@ -1839,14 +1879,13 @@ func applyJournalRecord(state *graphState, record journalRecord) error {
 		}
 	}
 	for _, update := range record.References {
-		key := update.Object.key()
-		object, ok := state.Objects[key]
+		object, ok := state.Objects[update.Object]
 		if !ok {
-			return fmt.Errorf("reference update selects missing object %s", key)
+			return fmt.Errorf("reference update selects missing object %s", update.Object)
 		}
 		object.Refs = update.Refs
 		object.State = update.State
-		state.putObject(key, object)
+		state.putObject(object)
 	}
 	state.Sequence = record.Sequence
 	return nil
@@ -1937,18 +1976,17 @@ func validateJournalRecord(record journalRecord) error {
 			return errors.New("invalid TTC snapshot graph journal operation selector")
 		}
 	}
-	seenReferences := make(map[string]struct{}, len(record.References))
+	seenReferences := make(map[ObjectID]struct{}, len(record.References))
 	for _, update := range record.References {
 		if err := update.Object.validate(); err != nil {
 			return fmt.Errorf("invalid materialized reference update: %w", err)
 		}
-		key := update.Object.key()
-		if _, duplicate := seenReferences[key]; duplicate {
-			return fmt.Errorf("duplicate materialized reference update for %s", key)
+		if _, duplicate := seenReferences[update.Object]; duplicate {
+			return fmt.Errorf("duplicate materialized reference update for %s", update.Object)
 		}
-		seenReferences[key] = struct{}{}
+		seenReferences[update.Object] = struct{}{}
 		if (update.Refs == 0) != (update.State == ObjectReclaiming) || (update.Refs != 0 && update.State != ObjectLive) {
-			return fmt.Errorf("materialized reference update for %s has %d references in state %q", key, update.Refs, update.State)
+			return fmt.Errorf("materialized reference update for %s has %d references in state %q", update.Object, update.Refs, update.State)
 		}
 	}
 	return nil
@@ -1958,7 +1996,7 @@ func cloneGraphState(state graphState) graphState {
 	next := graphState{
 		Version: state.Version, Sequence: state.Sequence, NextSnapshot: state.NextSnapshot,
 		Snapshots: make(map[string]Snapshot, len(state.Snapshots)),
-		Objects:   make(map[string]Object, len(state.Objects)),
+		Objects:   make(map[ObjectID]Object, len(state.Objects)),
 		Roots:     make(map[string]ObjectID, len(state.Roots)),
 		Pins:      make(map[string]ObjectID, len(state.Pins)),
 		Frozen:    make(map[string]bool, len(state.Frozen)),
@@ -2180,6 +2218,16 @@ func validateFrozenSnapshotMutation(state *graphState, frozen []SnapshotID, ops 
 	return nil
 }
 
+// sortedIDs returns the keys of objects in ID order.
+func sortedIDs[V any](objects map[ObjectID]V) []ObjectID {
+	ids := make([]ObjectID, 0, len(objects))
+	for id := range objects {
+		ids = append(ids, id)
+	}
+	slices.SortFunc(ids, compareObjectIDs)
+	return ids
+}
+
 func cloneObject(object Object) Object {
 	object.Data = append([]byte(nil), object.Data...)
 	object.Children = append([]Edge(nil), object.Children...)
@@ -2194,14 +2242,14 @@ func (s *Store) commitLocked(ops []journalOp) error {
 // and then installs reference-count-only object updates in memory. Those
 // updates are omitted from the WAL because replay derives them exactly from
 // immutable edges, roots, and pins.
-func (s *Store) commitLockedWithMaterializedReferences(ops []journalOp, references map[string]Object) error {
+func (s *Store) commitLockedWithMaterializedReferences(ops []journalOp, references map[ObjectID]Object) error {
 	return s.commitLockedPrepared(ops, references, nil)
 }
 
 // commitLockedPrepared writes ops and installs a transaction that was already
 // built against the current state. prepared avoids rebuilding high-level
 // filesystem operations after their compact WAL record has been appended.
-func (s *Store) commitLockedPrepared(ops []journalOp, references map[string]Object, prepared func(*graphState) error) error {
+func (s *Store) commitLockedPrepared(ops []journalOp, references map[ObjectID]Object, prepared func(*graphState) error) error {
 	if s.poisoned != nil {
 		return fmt.Errorf("TTC snapshot graph requires reopen after an uncertain journal commit: %w", s.poisoned)
 	}
@@ -2214,38 +2262,35 @@ func (s *Store) commitLockedPrepared(ops []journalOp, references map[string]Obje
 	if s.externallyCoordinated && !s.externalTransaction && !s.implicitExternalTransaction {
 		return errors.New("externally-coordinated TTC graph mutation requires an active writer transaction")
 	}
-	referenceKeys := make([]string, 0, len(references))
-	for key := range references {
-		referenceKeys = append(referenceKeys, key)
+	referenceIDs := make([]ObjectID, 0, len(references))
+	for id := range references {
+		referenceIDs = append(referenceIDs, id)
 	}
-	sort.Strings(referenceKeys)
-	referenceUpdates := make([]journalReference, 0, len(referenceKeys))
-	for _, key := range referenceKeys {
-		object := references[key]
+	slices.SortFunc(referenceIDs, compareObjectIDs)
+	referenceUpdates := make([]journalReference, 0, len(referenceIDs))
+	for _, id := range referenceIDs {
+		object := references[id]
 		referenceUpdates = append(referenceUpdates, journalReference{Object: object.ID, Refs: object.Refs, State: object.State})
 	}
 	// Preserve the old derived-index entries until the durable transaction has
 	// been applied successfully. Reference-only updates can move a Page object
 	// between live and reclaiming without a PutObject operation.
-	affectedObjects := make(map[string]Object, len(ops)+len(referenceKeys))
-	affectedKeys := make(map[string]struct{}, len(ops)+len(referenceKeys))
-	for _, op := range ops {
-		key := op.DeleteObject
-		if op.PutObject != nil {
-			key = op.PutObject.ID.key()
-		}
-		if key == "" {
+	affectedObjects := make(map[ObjectID]Object, len(ops)+len(referenceIDs))
+	affectedIDs := make(map[ObjectID]struct{}, len(ops)+len(referenceIDs))
+	for index := range ops {
+		id, ok := ops[index].object()
+		if !ok {
 			continue
 		}
-		affectedKeys[key] = struct{}{}
-		if object, ok := s.state.Objects[key]; ok {
-			affectedObjects[key] = object
+		affectedIDs[id] = struct{}{}
+		if object, ok := s.state.Objects[id]; ok {
+			affectedObjects[id] = object
 		}
 	}
-	for _, key := range referenceKeys {
-		affectedKeys[key] = struct{}{}
-		if object, ok := s.state.Objects[key]; ok {
-			affectedObjects[key] = object
+	for _, id := range referenceIDs {
+		affectedIDs[id] = struct{}{}
+		if object, ok := s.state.Objects[id]; ok {
+			affectedObjects[id] = object
 		}
 	}
 	record := journalRecord{Version: formatVersion, Sequence: s.state.Sequence + 1, Ops: ops, References: referenceUpdates}
@@ -2382,29 +2427,29 @@ func (s *Store) commitLockedPrepared(ops []journalOp, references map[string]Obje
 		s.poisoned = fmt.Errorf("durable TTC graph transaction could not be applied in memory: %w", applyErr)
 		return s.poisoned
 	}
-	for key, object := range references {
-		if key != object.ID.key() {
-			s.poisoned = fmt.Errorf("materialized TTC graph reference key %q does not match %s", key, object.ID.key())
+	for id, object := range references {
+		if id != object.ID {
+			s.poisoned = fmt.Errorf("materialized TTC graph reference key %s does not match %s", id, object.ID)
 			return s.poisoned
 		}
-		current, ok := s.state.Objects[key]
+		current, ok := s.state.Objects[id]
 		if !ok || current.ID != object.ID || current.BulkLength != object.BulkLength || !bytes.Equal(current.Data, object.Data) || !slices.Equal(current.Children, object.Children) {
-			s.poisoned = fmt.Errorf("materialized TTC graph reference update changes immutable object %s", key)
+			s.poisoned = fmt.Errorf("materialized TTC graph reference update changes immutable object %s", id)
 			return s.poisoned
 		}
-		s.state.Objects[key] = cloneObject(object)
+		s.state.Objects[id] = cloneObject(object)
 	}
-	for key, before := range affectedObjects {
+	for id, before := range affectedObjects {
 		// Most objects a transaction touches only gain or lose a reference,
 		// which leaves a page indexed under the same identity.
-		if after, ok := s.state.Objects[key]; ok && memoryObjectIndexedAlike(before, after) {
-			delete(affectedKeys, key)
+		if after, ok := s.state.Objects[id]; ok && memoryObjectIndexedAlike(before, after) {
+			delete(affectedIDs, id)
 			continue
 		}
 		s.unindexMemoryObjectLocked(before)
 	}
-	for key := range affectedKeys {
-		if object, ok := s.state.Objects[key]; ok {
+	for id := range affectedIDs {
+		if object, ok := s.state.Objects[id]; ok {
 			s.indexMemoryObjectLocked(object)
 		}
 	}
@@ -2665,41 +2710,37 @@ func (s *Store) sealAndForkLocked(source SnapshotID, state SnapshotState, copies
 		destinations = append(destinations, destination)
 	}
 	sort.Strings(destinations)
-	touched := make(map[string]Object)
+	touched := make(map[ObjectID]Object)
 	ops := make([]journalOp, 0, len(copies)*2+len(workingOrigins)+2)
 	for _, destination := range destinations {
 		id := s.state.Roots[copies[destination]]
-		object, ok := touched[id.key()]
+		object, ok := touched[id]
 		if !ok {
-			object = s.state.Objects[id.key()]
+			object = s.state.Objects[id]
 		}
 		if object.State != ObjectLive || object.Refs == math.MaxUint64 {
 			return fmt.Errorf("fork root object %s cannot be retained", id.key())
 		}
 		object.Refs++
-		touched[id.key()] = object
+		touched[id] = object
 		if previous, exists := s.state.Roots[destination]; exists {
-			old, ok := touched[previous.key()]
+			old, ok := touched[previous]
 			if !ok {
-				old = s.state.Objects[previous.key()]
+				old = s.state.Objects[previous]
 			}
 			var err error
 			old, err = releaseObject(old)
 			if err != nil {
 				return fmt.Errorf("replacing destination root %q: %w", destination, err)
 			}
-			touched[previous.key()] = old
+			touched[previous] = old
 		}
 		ops = append(ops, journalOp{RootName: destination, PutRoot: &id})
 	}
-	keys := make([]string, 0, len(touched))
-	for key := range touched {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	objectOps := make([]journalOp, 0, len(keys))
-	for _, key := range keys {
-		object := touched[key]
+	ids := sortedIDs(touched)
+	objectOps := make([]journalOp, 0, len(ids))
+	for _, id := range ids {
+		object := touched[id]
 		objectOps = append(objectOps, journalOp{PutObject: &object})
 	}
 	ops = append(objectOps, ops...)
@@ -2749,11 +2790,11 @@ func (s *Store) CreateObject(origin SnapshotID, pin string, kind ObjectKind, dat
 	if err := validateObject(object); err != nil {
 		return ObjectID{}, err
 	}
-	touched := make(map[string]Object, len(children))
+	touched := make(map[ObjectID]Object, len(children))
 	for _, edge := range object.Children {
-		child, ok := touched[edge.Child.key()]
+		child, ok := touched[edge.Child]
 		if !ok {
-			child, ok = s.state.Objects[edge.Child.key()]
+			child, ok = s.state.Objects[edge.Child]
 		}
 		if !ok {
 			return ObjectID{}, fmt.Errorf("child object %s does not exist", edge.Child.key())
@@ -2762,16 +2803,12 @@ func (s *Store) CreateObject(origin SnapshotID, pin string, kind ObjectKind, dat
 			return ObjectID{}, fmt.Errorf("child object %s cannot be retained", edge.Child.key())
 		}
 		child.Refs++
-		touched[edge.Child.key()] = child
+		touched[edge.Child] = child
 	}
-	keys := make([]string, 0, len(touched))
-	for key := range touched {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	ops := make([]journalOp, 0, len(keys)+3)
-	for _, key := range keys {
-		child := touched[key]
+	ids := sortedIDs(touched)
+	ops := make([]journalOp, 0, len(ids)+3)
+	for _, id := range ids {
+		child := touched[id]
 		ops = append(ops, journalOp{PutObject: &child})
 	}
 	ops = append(ops, journalOp{PutObject: &object}, journalOp{PutSnapshot: &snapshot}, journalOp{PinName: pin, PutPin: &id})
@@ -2847,15 +2884,15 @@ func (s *Store) CommitReservedObjects(reserved []ReservedObject) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	touched := make(map[string]Object, len(reserved)*2)
+	touched := make(map[ObjectID]Object, len(reserved)*2)
 	getObject := func(id ObjectID) (Object, bool) {
-		if object, ok := touched[id.key()]; ok {
+		if object, ok := touched[id]; ok {
 			return object, true
 		}
-		object, ok := s.state.Objects[id.key()]
+		object, ok := s.state.Objects[id]
 		return object, ok
 	}
-	seenIDs := make(map[string]struct{}, len(reserved))
+	seenIDs := make(map[ObjectID]struct{}, len(reserved))
 	seenPins := make(map[string]struct{}, len(reserved))
 	for _, item := range reserved {
 		if err := item.ID.validate(); err != nil {
@@ -2868,10 +2905,10 @@ func (s *Store) CommitReservedObjects(reserved []ReservedObject) error {
 		if !ok || snapshot.State != SnapshotWorking || item.ID.Ordinal >= snapshot.NextOrdinal {
 			return fmt.Errorf("object ID %s is not reserved in a working snapshot", item.ID.key())
 		}
-		if _, duplicate := seenIDs[item.ID.key()]; duplicate {
-			return fmt.Errorf("object batch repeats %s", item.ID.key())
+		if _, duplicate := seenIDs[item.ID]; duplicate {
+			return fmt.Errorf("object batch repeats %s", item.ID)
 		}
-		seenIDs[item.ID.key()] = struct{}{}
+		seenIDs[item.ID] = struct{}{}
 		if _, exists := getObject(item.ID); exists {
 			return fmt.Errorf("object %s already exists", item.ID.key())
 		}
@@ -2886,24 +2923,20 @@ func (s *Store) CommitReservedObjects(reserved []ReservedObject) error {
 		if err := validateObject(object); err != nil {
 			return err
 		}
-		touched[item.ID.key()] = object
+		touched[item.ID] = object
 		for _, edge := range object.Children {
 			child, ok := getObject(edge.Child)
 			if !ok || child.State != ObjectLive || child.Refs == math.MaxUint64 {
 				return fmt.Errorf("child object %s cannot be retained", edge.Child.key())
 			}
 			child.Refs++
-			touched[edge.Child.key()] = child
+			touched[edge.Child] = child
 		}
 	}
-	keys := make([]string, 0, len(touched))
-	for key := range touched {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	ops := make([]journalOp, 0, len(keys)+len(reserved))
-	for _, key := range keys {
-		object := touched[key]
+	ids := sortedIDs(touched)
+	ops := make([]journalOp, 0, len(ids)+len(reserved))
+	for _, id := range ids {
+		object := touched[id]
 		ops = append(ops, journalOp{PutObject: &object})
 	}
 	for _, item := range reserved {
@@ -2942,7 +2975,7 @@ func (s *Store) ResolveObjects(ids []ObjectID) error {
 func (s *Store) Object(id ObjectID) (Object, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	object, ok := s.state.Objects[id.key()]
+	object, ok := s.state.Objects[id]
 	return cloneObject(object), ok
 }
 
@@ -2955,7 +2988,7 @@ func (s *Store) UpdateWorkingBulkLength(id ObjectID, length uint64) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	object, ok := s.state.Objects[id.key()]
+	object, ok := s.state.Objects[id]
 	if !ok || object.State != ObjectLive {
 		return fmt.Errorf("working bulk object %s does not exist", id.key())
 	}
@@ -3391,7 +3424,7 @@ func (s *Store) SetPin(name string, id ObjectID) error {
 	if previous, ok := s.state.Pins[name]; ok && previous == id {
 		return nil
 	}
-	object, ok := s.state.Objects[id.key()]
+	object, ok := s.state.Objects[id]
 	if !ok {
 		return fmt.Errorf("object %s does not exist", id.key())
 	}
@@ -3401,7 +3434,7 @@ func (s *Store) SetPin(name string, id ObjectID) error {
 	object.Refs++
 	ops := []journalOp{{PutObject: &object}, {PinName: name, PutPin: &id}}
 	if previous, ok := s.state.Pins[name]; ok {
-		old, err := releaseObject(s.state.Objects[previous.key()])
+		old, err := releaseObject(s.state.Objects[previous])
 		if err != nil {
 			return err
 		}
@@ -3431,15 +3464,15 @@ func (s *Store) addPinsLocked(pins map[string]ObjectID) error {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	touched := make(map[string]Object, len(pins))
+	touched := make(map[ObjectID]Object, len(pins))
 	for _, name := range names {
 		if _, exists := s.state.Pins[name]; exists {
 			return fmt.Errorf("pin %q already exists", name)
 		}
 		id := pins[name]
-		object, ok := touched[id.key()]
+		object, ok := touched[id]
 		if !ok {
-			object, ok = s.state.Objects[id.key()]
+			object, ok = s.state.Objects[id]
 		}
 		if !ok {
 			return fmt.Errorf("object %s does not exist", id.key())
@@ -3448,16 +3481,12 @@ func (s *Store) addPinsLocked(pins map[string]ObjectID) error {
 			return fmt.Errorf("object %s cannot be retained", id.key())
 		}
 		object.Refs++
-		touched[id.key()] = object
+		touched[id] = object
 	}
 	ops := make([]journalOp, 0, len(touched)+len(names))
-	keys := make([]string, 0, len(touched))
-	for key := range touched {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		object := touched[key]
+	ids := sortedIDs(touched)
+	for _, id := range ids {
+		object := touched[id]
 		ops = append(ops, journalOp{PutObject: &object})
 	}
 	for _, name := range names {
@@ -3495,7 +3524,7 @@ func (s *Store) DeletePins(names []string) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	touched := make(map[string]Object)
+	touched := make(map[ObjectID]Object)
 	ops := make([]journalOp, 0, len(names)*2)
 	seen := make(map[string]struct{}, len(names))
 	for _, name := range names {
@@ -3507,9 +3536,9 @@ func (s *Store) DeletePins(names []string) error {
 		if !ok {
 			return os.ErrNotExist
 		}
-		object, ok := touched[id.key()]
+		object, ok := touched[id]
 		if !ok {
-			object, ok = s.state.Objects[id.key()]
+			object, ok = s.state.Objects[id]
 		}
 		if !ok {
 			return fmt.Errorf("object %s does not exist", id.key())
@@ -3518,7 +3547,7 @@ func (s *Store) DeletePins(names []string) error {
 		if err != nil {
 			return err
 		}
-		touched[id.key()] = object
+		touched[id] = object
 		ops = append(ops, journalOp{PinName: name, DeletePin: true})
 	}
 	return s.commitReleaseLocked(ops, touched)
@@ -3534,30 +3563,28 @@ func (s *Store) DeletePins(names []string) error {
 // The cascade starts from the objects released here and never scans the
 // graph. It is bounded like Collect, which finishes whatever it leaves, and
 // while an authority handoff is in progress it leaves everything to Collect.
-func (s *Store) commitReleaseLocked(ops []journalOp, touched map[string]Object) error {
-	var queue []string
-	for key, object := range touched {
+func (s *Store) commitReleaseLocked(ops []journalOp, touched map[ObjectID]Object) error {
+	var queue []ObjectID
+	for id, object := range touched {
 		if object.State == ObjectReclaiming {
-			queue = append(queue, key)
+			queue = append(queue, id)
 		}
 	}
-	sort.Strings(queue)
+	slices.SortFunc(queue, compareObjectIDs)
 	collected, err := s.collectReleasedLocked(touched, queue, maxCollectObjectsPerTransaction)
 	if err != nil {
 		return err
 	}
-	for _, key := range collected {
-		ops = append(ops, journalOp{DeleteObject: key})
+	for _, id := range collected {
+		ops = append(ops, journalOp{DeleteObject: id.key()})
 	}
 	if err := s.commitLockedWithMaterializedReferences(ops, touched); err != nil {
 		return err
 	}
 	if s.recordCollected {
-		for _, key := range collected {
-			if id, err := parseObjectKey(key); err == nil {
-				if _, err := objectKindName(id.Kind); err == nil {
-					s.collectedBulk = append(s.collectedBulk, id)
-				}
+		for _, id := range collected {
+			if _, err := objectKindName(id.Kind); err == nil {
+				s.collectedBulk = append(s.collectedBulk, id)
 			}
 		}
 	}
@@ -3568,50 +3595,50 @@ func (s *Store) commitReleaseLocked(ops []journalOp, touched map[string]Object) 
 // without references, and the objects their collection leaves without
 // references in turn, breadth first and at most limit in all. It records the
 // resulting reference changes in touched, removes the collected objects from
-// it, and returns their keys in the order collected. While an authority
-// handoff is in progress it collects nothing.
-func (s *Store) collectReleasedLocked(touched map[string]Object, queue []string, limit int) ([]string, error) {
+// it, and returns them in the order collected. While an authority handoff is
+// in progress it collects nothing.
+func (s *Store) collectReleasedLocked(touched map[ObjectID]Object, queue []ObjectID, limit int) ([]ObjectID, error) {
 	if len(s.state.Handoffs) != 0 || len(s.state.Frozen) != 0 {
 		return nil, nil
 	}
-	objectFor := func(key string) (Object, bool) {
-		if object, ok := touched[key]; ok {
+	objectFor := func(id ObjectID) (Object, bool) {
+		if object, ok := touched[id]; ok {
 			return object, true
 		}
-		object, ok := s.state.Objects[key]
+		object, ok := s.state.Objects[id]
 		return object, ok
 	}
-	queued := make(map[string]struct{}, len(queue))
-	for _, key := range queue {
-		queued[key] = struct{}{}
+	queued := make(map[ObjectID]struct{}, len(queue))
+	for _, id := range queue {
+		queued[id] = struct{}{}
 	}
-	var collected []string
+	var collected []ObjectID
 	for len(queue) != 0 && len(collected) < limit {
-		key := queue[0]
+		id := queue[0]
 		queue = queue[1:]
-		object, ok := objectFor(key)
+		object, ok := objectFor(id)
 		if !ok || object.State != ObjectReclaiming || object.Refs != 0 {
 			continue
 		}
 		for _, edge := range object.Children {
-			child, ok := objectFor(edge.Child.key())
+			child, ok := objectFor(edge.Child)
 			if !ok {
-				return nil, fmt.Errorf("reclaiming object %s references missing child %s", key, edge.Child.key())
+				return nil, fmt.Errorf("reclaiming object %s references missing child %s", id, edge.Child)
 			}
 			child, err := releaseObject(child)
 			if err != nil {
 				return nil, err
 			}
-			touched[child.ID.key()] = child
+			touched[child.ID] = child
 			if child.State == ObjectReclaiming {
-				if _, ok := queued[child.ID.key()]; !ok {
-					queue = append(queue, child.ID.key())
-					queued[child.ID.key()] = struct{}{}
+				if _, ok := queued[child.ID]; !ok {
+					queue = append(queue, child.ID)
+					queued[child.ID] = struct{}{}
 				}
 			}
 		}
-		collected = append(collected, key)
-		delete(touched, key)
+		collected = append(collected, id)
+		delete(touched, id)
 	}
 	return collected, nil
 }
@@ -3626,14 +3653,14 @@ func (s *Store) SetRoot(name string, id ObjectID) error {
 	if previous, ok := s.state.Roots[name]; ok && previous == id {
 		return nil
 	}
-	object, ok := s.state.Objects[id.key()]
+	object, ok := s.state.Objects[id]
 	if !ok || object.State != ObjectLive || object.Refs == math.MaxUint64 {
 		return fmt.Errorf("root object %s cannot be retained", id.key())
 	}
 	object.Refs++
 	ops := []journalOp{{PutObject: &object}, {RootName: name, PutRoot: &id}}
 	if previous, ok := s.state.Roots[name]; ok {
-		old := s.state.Objects[previous.key()]
+		old := s.state.Objects[previous]
 		var err error
 		old, err = releaseObject(old)
 		if err != nil {
@@ -3667,7 +3694,7 @@ func (s *Store) RetainRoots(roots map[string]ObjectID) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	touched := make(map[string]Object)
+	touched := make(map[ObjectID]Object)
 	ops := make([]journalOp, 0, len(roots)*2)
 	for _, name := range names {
 		id := roots[name]
@@ -3677,28 +3704,24 @@ func (s *Store) RetainRoots(roots map[string]ObjectID) error {
 			}
 			continue
 		}
-		object, ok := touched[id.key()]
+		object, ok := touched[id]
 		if !ok {
-			object, ok = s.state.Objects[id.key()]
+			object, ok = s.state.Objects[id]
 		}
 		if !ok || object.State != ObjectLive || object.Refs == math.MaxUint64 {
 			return fmt.Errorf("root object %s cannot be retained", id.key())
 		}
 		object.Refs++
-		touched[id.key()] = object
+		touched[id] = object
 		ops = append(ops, journalOp{RootName: name, PutRoot: &id})
 	}
 	if len(ops) == 0 {
 		return nil
 	}
-	keys := make([]string, 0, len(touched))
-	for key := range touched {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	objectOps := make([]journalOp, 0, len(keys))
-	for _, key := range keys {
-		object := touched[key]
+	ids := sortedIDs(touched)
+	objectOps := make([]journalOp, 0, len(ids))
+	for _, id := range ids {
+		object := touched[id]
 		objectOps = append(objectOps, journalOp{PutObject: &object})
 	}
 	return s.commitLocked(append(objectOps, ops...))
@@ -3734,29 +3757,25 @@ func (s *Store) CloneRoots(copies map[string]string) error {
 		destinations = append(destinations, destination)
 	}
 	sort.Strings(destinations)
-	touched := make(map[string]Object)
+	touched := make(map[ObjectID]Object)
 	ops := make([]journalOp, 0, len(copies)*2)
 	for _, destination := range destinations {
 		id := s.state.Roots[copies[destination]]
-		object, ok := touched[id.key()]
+		object, ok := touched[id]
 		if !ok {
-			object = s.state.Objects[id.key()]
+			object = s.state.Objects[id]
 		}
 		if object.State != ObjectLive || object.Refs == math.MaxUint64 {
 			return fmt.Errorf("root object %s cannot be retained", id.key())
 		}
 		object.Refs++
-		touched[id.key()] = object
+		touched[id] = object
 		ops = append(ops, journalOp{RootName: destination, PutRoot: &id})
 	}
-	keys := make([]string, 0, len(touched))
-	for key := range touched {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	objectOps := make([]journalOp, 0, len(keys))
-	for _, key := range keys {
-		object := touched[key]
+	ids := sortedIDs(touched)
+	objectOps := make([]journalOp, 0, len(ids))
+	for _, id := range ids {
+		object := touched[id]
 		objectOps = append(objectOps, journalOp{PutObject: &object})
 	}
 	return s.commitLocked(append(objectOps, ops...))
@@ -3806,16 +3825,16 @@ func (s *Store) ReleaseRetainedRoots(roots map[string]ObjectID) error {
 			return fmt.Errorf("root %q retains %s, not expected %s", name, current.key(), roots[name].key())
 		}
 	}
-	touched := make(map[string]Object)
+	touched := make(map[ObjectID]Object)
 	ops := make([]journalOp, 0, len(roots)*2)
 	for _, name := range names {
 		id, ok := s.state.Roots[name]
 		if !ok {
 			continue
 		}
-		object, ok := touched[id.key()]
+		object, ok := touched[id]
 		if !ok {
-			object, ok = s.state.Objects[id.key()]
+			object, ok = s.state.Objects[id]
 		}
 		if !ok {
 			return fmt.Errorf("object %s does not exist", id.key())
@@ -3825,19 +3844,15 @@ func (s *Store) ReleaseRetainedRoots(roots map[string]ObjectID) error {
 		if err != nil {
 			return err
 		}
-		touched[id.key()] = object
+		touched[id] = object
 		ops = append(ops, journalOp{RootName: name, DeleteRoot: true})
 	}
 	if len(ops) == 0 {
 		return nil
 	}
-	keys := make([]string, 0, len(touched))
-	for key := range touched {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		object := touched[key]
+	ids := sortedIDs(touched)
+	for _, id := range ids {
+		object := touched[id]
 		ops = append(ops, journalOp{PutObject: &object})
 	}
 	return s.commitLocked(ops)
@@ -3854,7 +3869,7 @@ func (s *Store) deleteRoots(names []string, allowMissing bool) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	touched := make(map[string]Object)
+	touched := make(map[ObjectID]Object)
 	ops := make([]journalOp, 0, len(names)*2)
 	seen := make(map[string]struct{}, len(names))
 	for _, name := range names {
@@ -3869,15 +3884,15 @@ func (s *Store) deleteRoots(names []string, allowMissing bool) error {
 			}
 			return os.ErrNotExist
 		}
-		object, ok := touched[id.key()]
+		object, ok := touched[id]
 		if !ok {
-			object = s.state.Objects[id.key()]
+			object = s.state.Objects[id]
 		}
 		object, err := releaseObject(object)
 		if err != nil {
 			return err
 		}
-		touched[id.key()] = object
+		touched[id] = object
 		ops = append(ops, journalOp{RootName: name, DeleteRoot: true})
 	}
 	if len(ops) == 0 {
@@ -3938,11 +3953,11 @@ func (s *Store) collect(limit, batchObjects, batchReferences int) (int, error) {
 	return collected, nil
 }
 
-// scanReclaimingLocked queues every zero-count object, in key order, except
+// scanReclaimingLocked queues every zero-count object, in ID order, except
 // those of a snapshot being handed off.
 func (s *Store) scanReclaimingLocked() {
-	queue := make([]string, 0)
-	for key, object := range s.state.Objects {
+	queue := make([]ObjectID, 0)
+	for id, object := range s.state.Objects {
 		if object.State != ObjectReclaiming {
 			continue
 		}
@@ -3951,12 +3966,12 @@ func (s *Store) scanReclaimingLocked() {
 				continue
 			}
 		}
-		queue = append(queue, key)
+		queue = append(queue, id)
 	}
-	sort.Strings(queue)
-	s.collectQueued = make(map[string]struct{}, len(queue))
-	for _, key := range queue {
-		s.collectQueued[key] = struct{}{}
+	slices.SortFunc(queue, compareObjectIDs)
+	s.collectQueued = make(map[ObjectID]struct{}, len(queue))
+	for _, id := range queue {
+		s.collectQueued[id] = struct{}{}
 	}
 	s.collectQueue = queue
 }
@@ -3968,44 +3983,44 @@ func (s *Store) scanReclaimingLocked() {
 // maxObjectEdges. The objects it leaves without references join the queue.
 // It returns how many it collected.
 func (s *Store) collectBatchLocked(limit, referenceLimit int) (int, error) {
-	touched := make(map[string]Object)
-	deleted := make(map[string]struct{})
-	objectFor := func(key string) (Object, bool) {
-		if object, ok := touched[key]; ok {
+	touched := make(map[ObjectID]Object)
+	deleted := make(map[ObjectID]struct{})
+	objectFor := func(id ObjectID) (Object, bool) {
+		if object, ok := touched[id]; ok {
 			return object, true
 		}
-		object, ok := s.state.Objects[key]
+		object, ok := s.state.Objects[id]
 		return object, ok
 	}
 	collected := 0
 	var bulk []ObjectID
 	for len(s.collectQueue) != 0 && collected < limit && len(touched) < referenceLimit {
-		key := s.collectQueue[0]
+		id := s.collectQueue[0]
 		s.collectQueue = s.collectQueue[1:]
-		object, ok := objectFor(key)
+		object, ok := objectFor(id)
 		if !ok || object.State != ObjectReclaiming {
 			continue
 		}
 		for _, edge := range object.Children {
-			child, ok := objectFor(edge.Child.key())
+			child, ok := objectFor(edge.Child)
 			if !ok {
-				return 0, fmt.Errorf("reclaiming object %s references missing child %s", object.ID.key(), edge.Child.key())
+				return 0, fmt.Errorf("reclaiming object %s references missing child %s", object.ID, edge.Child)
 			}
 			var err error
 			child, err = releaseObject(child)
 			if err != nil {
 				return 0, err
 			}
-			touched[child.ID.key()] = child
+			touched[child.ID] = child
 			if child.State == ObjectReclaiming {
-				if _, exists := s.collectQueued[child.ID.key()]; !exists {
-					s.collectQueue = append(s.collectQueue, child.ID.key())
-					s.collectQueued[child.ID.key()] = struct{}{}
+				if _, exists := s.collectQueued[child.ID]; !exists {
+					s.collectQueue = append(s.collectQueue, child.ID)
+					s.collectQueued[child.ID] = struct{}{}
 				}
 			}
 		}
-		delete(touched, key)
-		deleted[key] = struct{}{}
+		delete(touched, id)
+		deleted[id] = struct{}{}
 		if _, err := objectKindName(object.ID.Kind); err == nil {
 			bulk = append(bulk, object.ID)
 		}
@@ -4014,25 +4029,16 @@ func (s *Store) collectBatchLocked(limit, referenceLimit int) (int, error) {
 	if collected == 0 {
 		return 0, nil
 	}
-	keys := make([]string, 0, len(touched))
-	for key := range touched {
-		if _, removed := deleted[key]; !removed {
-			keys = append(keys, key)
+	references := make(map[ObjectID]Object, len(touched))
+	for id, object := range touched {
+		if _, removed := deleted[id]; !removed {
+			references[id] = object
 		}
 	}
-	sort.Strings(keys)
-	deletedKeys := make([]string, 0, len(deleted))
-	for key := range deleted {
-		deletedKeys = append(deletedKeys, key)
-	}
-	sort.Strings(deletedKeys)
-	ops := make([]journalOp, 0, len(deletedKeys))
-	references := make(map[string]Object, len(keys))
-	for _, key := range keys {
-		references[key] = touched[key]
-	}
-	for _, key := range deletedKeys {
-		ops = append(ops, journalOp{DeleteObject: key})
+	deletedIDs := sortedIDs(deleted)
+	ops := make([]journalOp, 0, len(deletedIDs))
+	for _, id := range deletedIDs {
+		ops = append(ops, journalOp{DeleteObject: id.key()})
 	}
 	if err := s.commitLockedWithMaterializedReferences(ops, references); err != nil {
 		return 0, err
@@ -4259,20 +4265,20 @@ func ReachableObjects(catalog ObjectCatalog, roots []ObjectID) ([]Object, error)
 	if catalog == nil || len(roots) == 0 {
 		return nil, errors.New("TTC snapshot catalog and root are required")
 	}
-	objects := make(map[string]Object)
+	objects := make(map[ObjectID]Object)
 	stack := append([]ObjectID(nil), roots...)
 	for len(stack) != 0 {
 		index := len(stack) - 1
 		id := stack[index]
 		stack = stack[:index]
-		if _, ok := objects[id.key()]; ok {
+		if _, ok := objects[id]; ok {
 			continue
 		}
 		object, ok := catalog.Object(id)
 		if !ok || object.State != ObjectLive {
 			return nil, fmt.Errorf("reachable TTC object %s is missing or not live", id)
 		}
-		objects[id.key()] = cloneObject(object)
+		objects[id] = cloneObject(object)
 		for _, edge := range object.Children {
 			stack = append(stack, edge.Child)
 		}

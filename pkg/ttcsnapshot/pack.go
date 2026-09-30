@@ -247,12 +247,12 @@ func (store *SharedPackStore) publish(ctx context.Context, graph *Store, snapsho
 	if err != nil {
 		return err
 	}
-	bulkSources := make(map[string]publicationBulkSource)
+	bulkSources := make(map[ObjectID]publicationBulkSource)
 	for index := range objects {
 		object := objects[index]
 		if !object.Deferred {
 			if object.BulkLength != 0 {
-				bulkSources[object.ID.key()] = publicationBulkSource{id: object.ID, source: source}
+				bulkSources[object.ID] = publicationBulkSource{id: object.ID, source: source}
 			}
 		} else {
 			resolved, bulk, err := store.resolveDeferredForPublication(graph, source, object)
@@ -261,7 +261,7 @@ func (store *SharedPackStore) publish(ctx context.Context, graph *Store, snapsho
 			}
 			objects[index] = resolved
 			if resolved.BulkLength != 0 {
-				bulkSources[resolved.ID.key()] = bulk
+				bulkSources[resolved.ID] = bulk
 			}
 		}
 		if alias != nil {
@@ -290,7 +290,7 @@ func (store *SharedPackStore) publish(ctx context.Context, graph *Store, snapsho
 		}
 		packed := PackedObject{Object: object}
 		if object.BulkLength != 0 {
-			bulk := bulkSources[object.ID.key()]
+			bulk := bulkSources[object.ID]
 			if bulk.source == nil || bulk.id.IsZero() {
 				temporary.Close()
 				return fmt.Errorf("object %s has no publication bulk source", object.ID)
@@ -1136,14 +1136,14 @@ func (store *SharedPackStore) Compact(snapshot SnapshotID, objects []Object, ref
 	for _, pack := range manifest.Packs {
 		stats.BeforeBytes += pack.Size
 	}
-	old := make(map[string]PackedObject, len(manifest.Objects))
+	old := make(map[ObjectID]PackedObject, len(manifest.Objects))
 	for _, object := range manifest.Objects {
-		old[object.Object.ID.key()] = object
+		old[object.Object.ID] = object
 	}
 	objects = append([]Object(nil), objects...)
 	slices.SortFunc(objects, func(a, b Object) int { return compareObjectIDs(a.ID, b.ID) })
 	for _, object := range objects {
-		packed, ok := old[object.ID.key()]
+		packed, ok := old[object.ID]
 		if !ok || object.ID.Snapshot != snapshot || object.State != ObjectLive || packed.Object.BulkLength != object.BulkLength ||
 			!slices.Equal(packed.Object.Children, object.Children) {
 			return stats, false, fmt.Errorf("shared pack compaction view contains invalid object %s", object.ID)
@@ -1188,7 +1188,7 @@ func (store *SharedPackStore) Compact(snapshot SnapshotID, objects []Object, ref
 		replacement.References[name] = object
 	}
 	for _, object := range objects {
-		previous := old[object.ID.key()]
+		previous := old[object.ID]
 		packed := PackedObject{Object: cloneObject(object)}
 		// The ledger keeps no data, nor the source an object was published
 		// in place of.

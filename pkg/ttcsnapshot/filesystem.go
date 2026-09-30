@@ -361,7 +361,7 @@ func buildFilesystemMutationBatched(store *Store, origin SnapshotID, rootName st
 	}
 	var root filesystemRoot
 	if current, ok := state.Roots[rootName]; ok {
-		object, ok := state.Objects[current.key()]
+		object, ok := state.Objects[current]
 		if !ok {
 			return nil, ObjectID{}, fmt.Errorf("filesystem root object %s is missing", current.key())
 		}
@@ -638,7 +638,7 @@ func buildFilesystemMutationSequential(state *graphState, origin SnapshotID, roo
 	}
 	var root filesystemRoot
 	if current, ok := state.Roots[rootName]; ok {
-		object, ok := state.Objects[current.key()]
+		object, ok := state.Objects[current]
 		if !ok {
 			return nil, ObjectID{}, fmt.Errorf("filesystem root object %s is missing", current.key())
 		}
@@ -877,11 +877,14 @@ func buildFilesystemMutationSequential(state *graphState, origin SnapshotID, roo
 }
 
 func installGraphMutation(state *graphState, mutation *graphMutation, rootName string, root ObjectID, releasePins []string) ([]ObjectID, error) {
-	var reclaim []string
-	for key, object := range mutation.objects {
-		state.putObject(key, cloneObject(object))
+	var reclaim []ObjectID
+	// The mutation's objects are its own, or share with the state only what
+	// no one changes, their data and edges: copying them took half the time
+	// it took to install a mutation.
+	for id, object := range mutation.objects {
+		state.putObject(object)
 		if object.State == ObjectReclaiming {
-			reclaim = append(reclaim, key)
+			reclaim = append(reclaim, id)
 		}
 	}
 	state.putSnapshot(snapshotKey(mutation.snapshot.ID), mutation.snapshot)
@@ -897,41 +900,40 @@ func installGraphMutation(state *graphState, mutation *graphMutation, rootName s
 // object is reached by cascading from a zero-reference object touched by the
 // transaction. Objects participating in an authority handoff retain the
 // existing deferred-GC behavior.
-func collectFilesystemMutationGarbage(state *graphState, queue []string) ([]ObjectID, error) {
-	queued := make(map[string]struct{}, len(queue))
+func collectFilesystemMutationGarbage(state *graphState, queue []ObjectID) ([]ObjectID, error) {
+	queued := make(map[ObjectID]struct{}, len(queue))
 	var reclaimed []ObjectID
-	for _, key := range queue {
-		queued[key] = struct{}{}
+	for _, id := range queue {
+		queued[id] = struct{}{}
 	}
 	for len(queue) != 0 {
-		key := queue[len(queue)-1]
+		id := queue[len(queue)-1]
 		queue = queue[:len(queue)-1]
-		object, ok := state.Objects[key]
+		object, ok := state.Objects[id]
 		if !ok || object.State != ObjectReclaiming || object.Refs != 0 {
 			continue
 		}
 		if _, transferring := state.Handoffs[snapshotKey(object.ID.Snapshot)]; transferring {
 			continue
 		}
-		state.deleteObject(key)
+		state.deleteObject(id)
 		if object.ID.Kind == ObjectKindFile || object.ID.Kind == ObjectKindPage || object.ID.Kind == ObjectKindMemoryChunk {
 			reclaimed = append(reclaimed, object.ID)
 		}
 		for _, edge := range object.Children {
-			childKey := edge.Child.key()
-			child, ok := state.Objects[childKey]
+			child, ok := state.Objects[edge.Child]
 			if !ok || child.State != ObjectLive || child.Refs == 0 {
-				return nil, fmt.Errorf("reclaiming object %s references unavailable child %s", key, childKey)
+				return nil, fmt.Errorf("reclaiming object %s references unavailable child %s", id, edge.Child)
 			}
 			child.Refs--
 			if child.Refs == 0 {
 				child.State = ObjectReclaiming
-				if _, ok := queued[childKey]; !ok {
-					queue = append(queue, childKey)
-					queued[childKey] = struct{}{}
+				if _, ok := queued[edge.Child]; !ok {
+					queue = append(queue, edge.Child)
+					queued[edge.Child] = struct{}{}
 				}
 			}
-			state.putObject(childKey, child)
+			state.putObject(child)
 		}
 	}
 	return reclaimed, nil
@@ -939,7 +941,7 @@ func collectFilesystemMutationGarbage(state *graphState, queue []string) ([]Obje
 
 func bTreeLookupState(state graphState, root ObjectID, kind ObjectKind, key []byte) (ObjectID, bool, error) {
 	return bTreeLookupObjects(root, kind, key, func(id ObjectID) (Object, bool) {
-		object, ok := state.Objects[id.key()]
+		object, ok := state.Objects[id]
 		return object, ok
 	})
 }
@@ -992,7 +994,7 @@ func (s *Store) ExclusiveFile(rootName string, number uint64) (ObjectID, bool, e
 		return ObjectID{}, false, fmt.Errorf("filesystem root %q does not exist", rootName)
 	}
 	sole := func(id ObjectID) (Object, bool) {
-		object, ok := s.state.Objects[id.key()]
+		object, ok := s.state.Objects[id]
 		return object, ok && object.State == ObjectLive && object.Refs == 1 && !object.Deferred
 	}
 	rootObject, ok := sole(rootID)
@@ -1348,7 +1350,7 @@ func prefetchObjects(prefetch func([]ObjectID) error, ids []ObjectID) error {
 
 func bTreeValuesState(state graphState, root ObjectID, kind ObjectKind) ([]ObjectID, error) {
 	return bTreeValuesObjects(root, kind, func(id ObjectID) (Object, bool) {
-		object, ok := state.Objects[id.key()]
+		object, ok := state.Objects[id]
 		return object, ok
 	}, nil)
 }
