@@ -5,11 +5,13 @@ package ttcchunk
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"os"
 	"path/filepath"
@@ -138,7 +140,7 @@ func TestGraphCaptureStreamImportsWithoutRepository(t *testing.T) {
 		capturedBinding(pgalloc.CapturedPageBinding{OldOffset: hostarch.PageSize, References: 2, Page: page, Version: chunk.Pages[0].Version, Chunk: chunk.Logical, Slot: chunk.Pages[0].Slot}, chunkID),
 	}
 	var stream bytes.Buffer
-	if err := writeGraphCaptureHeader(&stream, graphCaptureMagic, stored, 1); err != nil {
+	if err := writeStoredCaptureHeader(&stream, graphCaptureMagic, stored, 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := writeGraphCaptureObject(&stream, chunkID, encoded); err != nil {
@@ -232,7 +234,7 @@ func filteredSentry(conn net.Conn, chunk Chunk, object ID) <-chan [slotBitmapByt
 		defer conn.Close()
 		var answer [slotBitmapBytes]byte
 		defer func() { answered <- answer }()
-		if err := writeGraphCaptureHeader(conn, graphCaptureFilteredMagic, storedChunk(chunk, object), 1); err != nil {
+		if err := writeStoredCaptureHeader(conn, graphCaptureFilteredMagic, storedChunk(chunk, object), 1); err != nil {
 			return
 		}
 		if _, err := io.ReadFull(conn, answer[:]); err != nil {
@@ -411,7 +413,7 @@ func TestFilteredGraphCaptureSharesAnAdoptedImage(t *testing.T) {
 func TestFilteredGraphCaptureNeedsATwoWayStream(t *testing.T) {
 	chunk := testChunk()
 	var stream bytes.Buffer
-	if err := writeGraphCaptureHeader(&stream, graphCaptureFilteredMagic, storedChunk(chunk, graphCaptureObjectID(1)), 1); err != nil {
+	if err := writeStoredCaptureHeader(&stream, graphCaptureFilteredMagic, storedChunk(chunk, graphCaptureObjectID(1)), 1); err != nil {
 		t.Fatal(err)
 	}
 	directory := t.TempDir()
@@ -444,7 +446,7 @@ func TestUnfilteredGraphCaptureOfHeldPagesIsReadPast(t *testing.T) {
 		t.Fatal(err)
 	}
 	var stream bytes.Buffer
-	if err := writeGraphCaptureHeader(&stream, graphCaptureMagic, storedChunk(chunk, object), 1); err != nil {
+	if err := writeStoredCaptureHeader(&stream, graphCaptureMagic, storedChunk(chunk, object), 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := writeGraphCaptureObject(&stream, object, encoded); err != nil {
@@ -1192,5 +1194,178 @@ func BenchmarkInstallManifestSet(b *testing.B) {
 			b.Fatal(err)
 		}
 		b.StartTimer()
+	}
+}
+
+// sortedCaptureGroup is a graphCaptureGroup as planGraphCaptureBySorting
+// makes it, holding its bindings.
+type sortedCaptureGroup struct {
+	id       ID
+	logical  pgalloc.LogicalChunkID
+	bindings []pgalloc.CapturedPageBinding
+	used     [32]byte
+}
+
+// writeStoredCaptureHeader writes the header of a capture of stored.
+func writeStoredCaptureHeader(w io.Writer, magic [16]byte, stored []StoredBinding, objectCount int) error {
+	manifest, err := CompactBindings(stored)
+	if err != nil {
+		return err
+	}
+	return writeGraphCaptureHeader(w, magic, manifest, objectCount)
+}
+
+// planGraphCaptureBySorting is planGraphCapture as it was, sorting the
+// bindings' indexes by comparing the bindings: the plan it must keep.
+func planGraphCaptureBySorting(bindings []pgalloc.CapturedPageBinding) ([]sortedCaptureGroup, []StoredBinding, error) {
+	// Visit the bindings in logical chunk and slot order through their
+	// indexes: sorting the bindings themselves moved every 100-byte record
+	// many times.
+	order := make([]int32, len(bindings))
+	for i := range order {
+		order[i] = int32(i)
+	}
+	slices.SortFunc(order, func(a, b int32) int {
+		left, right := &bindings[a], &bindings[b]
+		if c := compareAllocator(left.Chunk.Allocator, right.Chunk.Allocator); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(left.Chunk.Sequence, right.Chunk.Sequence); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(left.Slot, right.Slot); c != 0 {
+			return c
+		}
+		if c := compareAllocator(left.Version.Allocator, right.Version.Allocator); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(left.Version.Sequence, right.Version.Sequence); c != 0 {
+			return c
+		}
+		return cmp.Compare(left.OldOffset, right.OldOffset)
+	})
+	groups := make([]sortedCaptureGroup, 0)
+	stored := make([]StoredBinding, len(bindings))
+	// The order keeps a logical chunk's bindings together, and a page's of
+	// one version next to each other: chunkGroups are the groups of the
+	// chunk being visited, and previous the binding before.
+	var chunkGroups []int
+	var previous *pgalloc.CapturedPageBinding
+	for _, index := range order {
+		binding := &bindings[index]
+		chunk, slot := binding.Page.Chunk()
+		if binding.Chunk != chunk || binding.Slot != slot || binding.References == 0 || binding.Version.Allocator == (pgalloc.LogicalAllocatorID{}) {
+			return nil, nil, fmt.Errorf("invalid captured page binding: %+v", *binding)
+		}
+		if previous == nil || previous.Chunk != binding.Chunk {
+			chunkGroups = chunkGroups[:0]
+		} else if previous.Page == binding.Page && previous.Version == binding.Version {
+			return nil, nil, fmt.Errorf("captured page %+v repeats version %+v", binding.Page, binding.Version)
+		}
+		previous = binding
+		groupIndex := -1
+		for _, candidate := range chunkGroups {
+			if !hasBit(&groups[candidate].used, binding.Slot) {
+				groupIndex = candidate
+				break
+			}
+		}
+		if groupIndex < 0 {
+			groupIndex = len(groups)
+			id := graphCaptureObjectID(uint64(groupIndex + 1))
+			groups = append(groups, sortedCaptureGroup{id: id, logical: binding.Chunk})
+			chunkGroups = append(chunkGroups, groupIndex)
+		}
+		group := &groups[groupIndex]
+		setBit(&group.used, binding.Slot)
+		group.bindings = append(group.bindings, *binding)
+		stored[index] = capturedBinding(*binding, group.id)
+	}
+	return groups, stored, nil
+}
+
+// captureBindings returns bindings of pages of chunks logical chunks, of
+// allocators allocators, visited a chunk at a time in a random order, as a
+// rehydrated branch's resident units are. Unless full, a quarter of the slots
+// are empty, and some pages are bound in two versions.
+func captureBindings(chunks, allocators int, full bool, seed int64) []pgalloc.CapturedPageBinding {
+	random := rand.New(rand.NewSource(seed))
+	var bindings []pgalloc.CapturedPageBinding
+	offset := uint64(0)
+	for _, chunk := range random.Perm(chunks) {
+		logical := pgalloc.LogicalChunkID{Allocator: testAllocator(byte(1 + 32*(chunk%allocators))), Sequence: uint64(chunk/allocators + 1)}
+		for slot := 0; slot < PagesPerChunk; slot++ {
+			versions := 1
+			if !full {
+				if random.Intn(4) == 0 {
+					continue
+				}
+				if random.Intn(16) == 0 {
+					versions = 2
+				}
+			}
+			for version := 0; version < versions; version++ {
+				bindings = append(bindings, pgalloc.CapturedPageBinding{
+					OldOffset: offset, StreamOffset: offset, References: 1,
+					Page:    pgalloc.LogicalPageID{Allocator: logical.Allocator, Sequence: logical.Sequence*PagesPerChunk + uint64(slot)},
+					Version: pgalloc.PageVersionID{Allocator: testAllocator(200), Sequence: uint64(chunk*2*PagesPerChunk + version*PagesPerChunk + slot)},
+					Chunk:   logical, Slot: uint8(slot),
+				})
+				offset += hostarch.PageSize
+			}
+		}
+	}
+	return bindings
+}
+
+// A capture's plan groups its bindings, and names its objects, in logical
+// chunk, slot and version order, whatever order the bindings come in.
+func TestPlanGraphCaptureKeepsItsOrder(t *testing.T) {
+	for seed := int64(0); seed < 6; seed++ {
+		bindings := captureBindings(40, 1+int(seed)%3, false, seed)
+		if seed%2 == 1 {
+			rand.New(rand.NewSource(seed)).Shuffle(len(bindings), func(i, j int) { bindings[i], bindings[j] = bindings[j], bindings[i] })
+		}
+		wantGroups, wantStored, err := planGraphCaptureBySorting(bindings)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantManifest, err := CompactBindings(wantStored)
+		if err != nil {
+			t.Fatal(err)
+		}
+		groups, manifest, err := planGraphCapture(bindings)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(groups) != len(wantGroups) {
+			t.Fatalf("seed %d: %d groups, want %d", seed, len(groups), len(wantGroups))
+		}
+		for i := range groups {
+			group, want := &groups[i], &wantGroups[i]
+			if group.id != want.id || group.logical != want.logical || group.used != want.used || len(group.bindings) != len(want.bindings) {
+				t.Fatalf("seed %d: group %d differs from the one sorting the bindings makes", seed, i)
+			}
+			for j, index := range group.bindings {
+				if bindings[index] != want.bindings[j] {
+					t.Fatalf("seed %d: group %d binding %d is %+v, want %+v", seed, i, j, bindings[index], want.bindings[j])
+				}
+			}
+		}
+		if !reflect.DeepEqual(manifest, wantManifest) {
+			t.Fatalf("seed %d: the manifest differs from the one sorting the bindings makes", seed)
+		}
+	}
+}
+
+// BenchmarkPlanGraphCapture plans the capture of 1.5 GiB, 1,550 logical
+// chunks of 256 pages.
+func BenchmarkPlanGraphCapture(b *testing.B) {
+	bindings := captureBindings(1550, 1, true, 1)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, _, err := planGraphCapture(bindings); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

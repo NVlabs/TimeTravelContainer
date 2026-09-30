@@ -116,40 +116,87 @@ func runCanAppend(run *ManifestRun, stored *StoredBinding) bool {
 
 // CompactBindings builds a deterministic run-compressed manifest.
 func CompactBindings(bindings []StoredBinding) (Manifest, error) {
+	return compactBindings(len(bindings), func(i int) StoredBinding { return bindings[i] })
+}
+
+// compactBindings is CompactBindings of count bindings, the ith of which
+// binding returns.
+func compactBindings(count int, binding func(int) StoredBinding) (Manifest, error) {
+	// The runs are counted first, so that the manifest's are allocated at
+	// once: a manifest of hundreds of thousands grew by a quarter at a time.
+	// A capture lists its bindings in order already, and they are counted
+	// as they are checked.
+	runs := 0
+	var run ManifestRun
+	countRun := func(stored *StoredBinding) {
+		if runs != 0 && runCanAppend(&run, stored) {
+			run.Pages++
+			return
+		}
+		run = newManifestRun(stored)
+		runs++
+	}
 	sorted := true
-	for i := range bindings {
-		if err := validateStoredBinding(bindings[i]); err != nil {
+	var previous StoredBinding
+	for i := 0; i < count; i++ {
+		stored := binding(i)
+		if err := validateStoredBinding(stored); err != nil {
 			return Manifest{}, err
 		}
-		sorted = sorted && (i == 0 || compareBindings(&bindings[i-1], &bindings[i]) <= 0)
+		sorted = sorted && (i == 0 || compareBindings(&previous, &stored) <= 0)
+		if sorted {
+			countRun(&stored)
+		}
+		previous = stored
 	}
-	// A capture lists its bindings in this order already.
-	ordered := bindings
+	var order []int
+	at := func(position int) StoredBinding {
+		if order != nil {
+			return binding(order[position])
+		}
+		return binding(position)
+	}
 	if !sorted {
-		ordered = slices.Clone(bindings)
-		slices.SortFunc(ordered, func(left, right StoredBinding) int { return compareBindings(&left, &right) })
+		order = make([]int, count)
+		for i := range order {
+			order[i] = i
+		}
+		slices.SortFunc(order, func(a, b int) int {
+			left, right := binding(a), binding(b)
+			return compareBindings(&left, &right)
+		})
+		runs = 0
+		for position := 0; position < count; position++ {
+			stored := at(position)
+			countRun(&stored)
+		}
 	}
-	manifest := Manifest{Runs: make([]ManifestRun, 0, len(ordered))}
-	for i := range ordered {
-		stored := &ordered[i]
-		if len(manifest.Runs) != 0 && runCanAppend(&manifest.Runs[len(manifest.Runs)-1], stored) {
-			manifest.Runs[len(manifest.Runs)-1].Pages++
+	manifest := Manifest{Runs: make([]ManifestRun, 0, runs)}
+	for position := 0; position < count; position++ {
+		stored := at(position)
+		if last := len(manifest.Runs) - 1; last >= 0 && runCanAppend(&manifest.Runs[last], &stored) {
+			manifest.Runs[last].Pages++
 			continue
 		}
-		manifest.Runs = append(manifest.Runs, ManifestRun{
-			ResourceID:   stored.Binding.ResourceID,
-			OldOffset:    stored.Binding.OldOffset,
-			References:   stored.Binding.References,
-			FirstPage:    stored.Binding.Page,
-			FirstVersion: stored.Binding.Version,
-			Logical:      stored.Binding.Chunk,
-			FirstSlot:    stored.Binding.Slot,
-			Pages:        1,
-			Object:       stored.Object,
-			ObjectPage:   stored.ObjectPage,
-		})
+		manifest.Runs = append(manifest.Runs, newManifestRun(&stored))
 	}
 	return manifest, nil
+}
+
+// newManifestRun is the run of one page, stored.
+func newManifestRun(stored *StoredBinding) ManifestRun {
+	return ManifestRun{
+		ResourceID:   stored.Binding.ResourceID,
+		OldOffset:    stored.Binding.OldOffset,
+		References:   stored.Binding.References,
+		FirstPage:    stored.Binding.Page,
+		FirstVersion: stored.Binding.Version,
+		Logical:      stored.Binding.Chunk,
+		FirstSlot:    stored.Binding.Slot,
+		Pages:        1,
+		Object:       stored.Object,
+		ObjectPage:   stored.ObjectPage,
+	}
 }
 
 func appendUint32(dst []byte, value uint32) []byte {

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"slices"
 	"sort"
 
@@ -38,15 +39,15 @@ func WriteGraphCapture(w io.Writer, snapshot *pgalloc.RemoteSnapshot, bindings [
 	if w == nil || snapshot == nil {
 		return errors.New("graph memory capture requires a writer and snapshot")
 	}
-	groups, stored, err := planGraphCapture(bindings)
+	groups, manifest, err := planGraphCapture(bindings)
 	if err != nil {
 		return err
 	}
-	if err := writeGraphCaptureHeader(w, graphCaptureMagic, stored, len(groups)); err != nil {
+	if err := writeGraphCaptureHeader(w, graphCaptureMagic, manifest, len(groups)); err != nil {
 		return err
 	}
 	for index := range groups {
-		if err := writeGraphCaptureGroup(w, snapshot, &groups[index], nil); err != nil {
+		if err := writeGraphCaptureGroup(w, snapshot, bindings, &groups[index], nil); err != nil {
 			return err
 		}
 	}
@@ -61,11 +62,11 @@ func WriteFilteredGraphCapture(stream io.ReadWriter, snapshot *pgalloc.RemoteSna
 	if stream == nil || snapshot == nil {
 		return errors.New("graph memory capture requires a stream and snapshot")
 	}
-	groups, stored, err := planGraphCapture(bindings)
+	groups, manifest, err := planGraphCapture(bindings)
 	if err != nil {
 		return err
 	}
-	if err := writeGraphCaptureHeader(stream, graphCaptureFilteredMagic, stored, len(groups)); err != nil {
+	if err := writeGraphCaptureHeader(stream, graphCaptureFilteredMagic, manifest, len(groups)); err != nil {
 		return err
 	}
 	answer := make([]byte, len(groups)*slotBitmapBytes)
@@ -84,7 +85,7 @@ func WriteFilteredGraphCapture(stream io.ReadWriter, snapshot *pgalloc.RemoteSna
 				return fmt.Errorf("the daemon asked for slot %d of memory object %s, which the capture does not hold", slot, group.id)
 			}
 		}
-		if err := writeGraphCaptureGroup(stream, snapshot, group, &need); err != nil {
+		if err := writeGraphCaptureGroup(stream, snapshot, bindings, group, &need); err != nil {
 			return err
 		}
 	}
@@ -93,38 +94,40 @@ func WriteFilteredGraphCapture(stream io.ReadWriter, snapshot *pgalloc.RemoteSna
 
 var zeroGraphCapturePage [hostarch.PageSize]byte
 
-// writeGraphCaptureGroup reads the pages of group, or only those in need if
-// it is set, and writes them as one object.
-func writeGraphCaptureGroup(w io.Writer, snapshot *pgalloc.RemoteSnapshot, group *graphCaptureGroup, need *[slotBitmapBytes]byte) error {
-	bindings := group.bindings
+// writeGraphCaptureGroup reads the pages of group, of the capture's bindings,
+// or only those in need if it is set, and writes them as one object.
+func writeGraphCaptureGroup(w io.Writer, snapshot *pgalloc.RemoteSnapshot, bindings []pgalloc.CapturedPageBinding, group *graphCaptureGroup, need *[slotBitmapBytes]byte) error {
+	indexes := group.bindings
 	if need != nil {
-		bindings = make([]pgalloc.CapturedPageBinding, 0, countBits(need))
-		for _, binding := range group.bindings {
-			if hasBit(need, binding.Slot) {
-				bindings = append(bindings, binding)
+		indexes = make([]int32, 0, countBits(need))
+		for _, index := range group.bindings {
+			if hasBit(need, bindings[index].Slot) {
+				indexes = append(indexes, index)
 			}
 		}
 	}
-	buffer := make([]byte, len(bindings)*hostarch.PageSize)
+	buffer := make([]byte, len(indexes)*hostarch.PageSize)
 	// Pages the capture stream holds one after another are read with one copy.
-	for begin := 0; begin < len(bindings); {
+	for begin := 0; begin < len(indexes); {
+		first := &bindings[indexes[begin]]
 		end := begin + 1
-		for end < len(bindings) && bindings[end].StreamOffset == bindings[end-1].StreamOffset+hostarch.PageSize {
+		for end < len(indexes) && bindings[indexes[end]].StreamOffset == bindings[indexes[end-1]].StreamOffset+hostarch.PageSize {
 			end++
 		}
 		data := buffer[begin*hostarch.PageSize : end*hostarch.PageSize]
-		n, err := snapshot.CopyStreamAt(data, int64(bindings[begin].StreamOffset))
+		n, err := snapshot.CopyStreamAt(data, int64(first.StreamOffset))
 		if err != nil || n != len(data) {
 			if err == nil {
 				err = io.ErrUnexpectedEOF
 			}
-			return fmt.Errorf("reading captured pages at stream offset %#x: %w", bindings[begin].StreamOffset, err)
+			return fmt.Errorf("reading captured pages at stream offset %#x: %w", first.StreamOffset, err)
 		}
 		begin = end
 	}
-	chunk := Chunk{Logical: group.logical, Pages: make([]Page, 0, len(bindings))}
-	for index, binding := range bindings {
-		data := buffer[index*hostarch.PageSize : (index+1)*hostarch.PageSize : (index+1)*hostarch.PageSize]
+	chunk := Chunk{Logical: group.logical, Pages: make([]Page, 0, len(indexes))}
+	for position, index := range indexes {
+		binding := &bindings[index]
+		data := buffer[position*hostarch.PageSize : (position+1)*hostarch.PageSize : (position+1)*hostarch.PageSize]
 		page := Page{Slot: binding.Slot, Version: binding.Version}
 		if bytes.Equal(data, zeroGraphCapturePage[:]) {
 			page.Zero = true
@@ -140,11 +143,7 @@ func writeGraphCaptureGroup(w io.Writer, snapshot *pgalloc.RemoteSnapshot, group
 	return writeGraphCaptureObject(w, group.id, encoded)
 }
 
-func writeGraphCaptureHeader(w io.Writer, magic [16]byte, stored []StoredBinding, objectCount int) error {
-	manifest, err := CompactBindings(stored)
-	if err != nil {
-		return err
-	}
+func writeGraphCaptureHeader(w io.Writer, magic [16]byte, manifest Manifest, objectCount int) error {
 	manifestData, err := EncodeManifest(manifest)
 	if err != nil {
 		return err
@@ -180,10 +179,14 @@ func writeGraphCaptureObject(w io.Writer, id ID, data []byte) error {
 	return writeGraphCaptureBytes(w, data)
 }
 
+// graphCaptureGroup is one object of a capture: the pages of one version of
+// a logical chunk, at most one in each slot.
 type graphCaptureGroup struct {
-	id       ID
-	logical  pgalloc.LogicalChunkID
-	bindings []pgalloc.CapturedPageBinding
+	id      ID
+	logical pgalloc.LogicalChunkID
+	// bindings are the indexes of the group's bindings among the capture's,
+	// in slot order.
+	bindings []int32
 	used     [32]byte
 }
 
@@ -196,24 +199,63 @@ func graphCaptureObjectID(sequence uint64) ID {
 
 // planGraphCapture assigns transport-local object IDs using metadata only.
 // It performs no page reads, which lets the manifest precede a bounded stream
-// of one-chunk payloads. It returns the stored bindings in the order of
-// bindings.
-func planGraphCapture(bindings []pgalloc.CapturedPageBinding) ([]graphCaptureGroup, []StoredBinding, error) {
-	// Visit the bindings in logical chunk and slot order through their
-	// indexes: sorting the bindings themselves moved every 100-byte record
-	// many times.
-	order := make([]int32, len(bindings))
-	for i := range order {
-		order[i] = int32(i)
+// of one-chunk payloads. It returns the capture's objects and its manifest.
+func planGraphCapture(bindings []pgalloc.CapturedPageBinding) ([]graphCaptureGroup, Manifest, error) {
+	if len(bindings) > math.MaxInt32 {
+		return nil, Manifest{}, fmt.Errorf("a capture of %d pages", len(bindings))
 	}
-	slices.SortFunc(order, func(a, b int32) int {
+	// Visit the bindings in logical chunk, slot and version order. A capture
+	// visits memory a resident unit at a time, which lists a chunk's
+	// bindings together and in slot order: they are gathered by chunk, in a
+	// pass that keeps their order, and only the chunks are sorted, with the
+	// bindings of any chunk not listed in order. Sorting all the bindings
+	// took most of the plan.
+	type captureChunk struct {
+		id pgalloc.LogicalChunkID
+		// count is the number of the chunk's bindings.
+		count int32
+	}
+	chunkIndexes := make(map[pgalloc.LogicalChunkID]int32)
+	var chunks []captureChunk
+	chunkOf := make([]int32, len(bindings))
+	current := int32(-1)
+	for i := range bindings {
+		if id := bindings[i].Chunk; current < 0 || chunks[current].id != id {
+			at, ok := chunkIndexes[id]
+			if !ok {
+				at = int32(len(chunks))
+				chunkIndexes[id] = at
+				chunks = append(chunks, captureChunk{id: id})
+			}
+			current = at
+		}
+		chunks[current].count++
+		chunkOf[i] = current
+	}
+	sortedChunks := make([]int32, len(chunks))
+	for i := range sortedChunks {
+		sortedChunks[i] = int32(i)
+	}
+	slices.SortFunc(sortedChunks, func(a, b int32) int {
+		if c := compareAllocator(chunks[a].id.Allocator, chunks[b].id.Allocator); c != 0 {
+			return c
+		}
+		return cmp.Compare(chunks[a].id.Sequence, chunks[b].id.Sequence)
+	})
+	// next is where each chunk's next binding goes in order.
+	next := make([]int32, len(chunks))
+	position := int32(0)
+	for _, chunk := range sortedChunks {
+		next[chunk] = position
+		position += chunks[chunk].count
+	}
+	order := make([]int32, len(bindings))
+	for i, chunk := range chunkOf {
+		order[next[chunk]] = int32(i)
+		next[chunk]++
+	}
+	compareInChunk := func(a, b int32) int {
 		left, right := &bindings[a], &bindings[b]
-		if c := compareAllocator(left.Chunk.Allocator, right.Chunk.Allocator); c != 0 {
-			return c
-		}
-		if c := cmp.Compare(left.Chunk.Sequence, right.Chunk.Sequence); c != 0 {
-			return c
-		}
 		if c := cmp.Compare(left.Slot, right.Slot); c != 0 {
 			return c
 		}
@@ -224,9 +266,16 @@ func planGraphCapture(bindings []pgalloc.CapturedPageBinding) ([]graphCaptureGro
 			return c
 		}
 		return cmp.Compare(left.OldOffset, right.OldOffset)
-	})
+	}
+	for _, chunk := range sortedChunks {
+		end := next[chunk]
+		if listed := order[end-chunks[chunk].count : end]; !slices.IsSortedFunc(listed, compareInChunk) {
+			slices.SortFunc(listed, compareInChunk)
+		}
+	}
 	groups := make([]graphCaptureGroup, 0)
-	stored := make([]StoredBinding, len(bindings))
+	// objects are the groups of the bindings, by index.
+	objects := make([]int32, len(bindings))
 	// The order keeps a logical chunk's bindings together, and a page's of
 	// one version next to each other: chunkGroups are the groups of the
 	// chunk being visited, and previous the binding before.
@@ -236,12 +285,12 @@ func planGraphCapture(bindings []pgalloc.CapturedPageBinding) ([]graphCaptureGro
 		binding := &bindings[index]
 		chunk, slot := binding.Page.Chunk()
 		if binding.Chunk != chunk || binding.Slot != slot || binding.References == 0 || binding.Version.Allocator == (pgalloc.LogicalAllocatorID{}) {
-			return nil, nil, fmt.Errorf("invalid captured page binding: %+v", *binding)
+			return nil, Manifest{}, fmt.Errorf("invalid captured page binding: %+v", *binding)
 		}
 		if previous == nil || previous.Chunk != binding.Chunk {
 			chunkGroups = chunkGroups[:0]
 		} else if previous.Page == binding.Page && previous.Version == binding.Version {
-			return nil, nil, fmt.Errorf("captured page %+v repeats version %+v", binding.Page, binding.Version)
+			return nil, Manifest{}, fmt.Errorf("captured page %+v repeats version %+v", binding.Page, binding.Version)
 		}
 		previous = binding
 		groupIndex := -1
@@ -259,10 +308,16 @@ func planGraphCapture(bindings []pgalloc.CapturedPageBinding) ([]graphCaptureGro
 		}
 		group := &groups[groupIndex]
 		setBit(&group.used, binding.Slot)
-		group.bindings = append(group.bindings, *binding)
-		stored[index] = capturedBinding(*binding, group.id)
+		group.bindings = append(group.bindings, index)
+		objects[index] = int32(groupIndex)
 	}
-	return groups, stored, nil
+	manifest, err := compactBindings(len(bindings), func(i int) StoredBinding {
+		return capturedBinding(bindings[i], groups[objects[i]].id)
+	})
+	if err != nil {
+		return nil, Manifest{}, err
+	}
+	return groups, manifest, nil
 }
 
 func writeGraphCaptureUint64(w io.Writer, value uint64) error {
