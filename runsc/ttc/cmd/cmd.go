@@ -8870,6 +8870,7 @@ func (b *runtimeBackend) attach(request attachRequest) (status uint32, retErr er
 		stderr = b.stderr
 	}
 	var waitErr error
+	drainStopped := false
 	for {
 		if b.consoleClientCanceled() {
 			return 0, errDetached
@@ -8913,6 +8914,13 @@ func (b *runtimeBackend) attach(request attachRequest) (status uint32, retErr er
 				return 0, err
 			}
 			if !active {
+				if !drainStopped {
+					// What the drain wrote before it stopped, its output's
+					// end and the exit status, may have come after the look
+					// above: look once more before judging.
+					drainStopped = true
+					continue
+				}
 				if !follower.stdoutEOF || !follower.stderrEOF {
 					return 0, consoleDrainStoppedError(paths.Error)
 				}
@@ -8922,6 +8930,8 @@ func (b *runtimeBackend) attach(request attachRequest) (status uint32, retErr er
 					}
 					return 0, consoleDrainStoppedError(paths.Error)
 				}
+			} else {
+				drainStopped = false
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
@@ -9184,6 +9194,7 @@ func (b *runtimeBackend) logs(target selector, options logsOptions) error {
 	defer follower.file.Close()
 	output := newConsoleLogOutput(options, container.LogAttributes)
 	initial := true
+	drainStopped := false
 	for {
 		if b.consoleClientCanceled() {
 			return nil
@@ -9218,8 +9229,14 @@ func (b *runtimeBackend) logs(target selector, options logsOptions) error {
 				return err
 			}
 			if !active {
-				return consoleDrainStoppedError(paths.Error)
+				if drainStopped {
+					return consoleDrainStoppedError(paths.Error)
+				}
+				// Look once more first, as attach does.
+				drainStopped = true
+				continue
 			}
+			drainStopped = false
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
