@@ -11,6 +11,7 @@ package(
 go_library(
     name = "gfxrenderer",
     srcs = [
+        "broker.go",
         "gfxstream.go",
         "nocgo.go",
         "options.go",
@@ -20,7 +21,10 @@ go_library(
     ],
     bazel_cgo = True,
     stateify = False,
-    visibility = ["//runsc:__subpackages__"],
+    visibility = [
+        "//pkg/sentry/devices/virtgpu/rendererclient:__pkg__",
+        "//runsc:__subpackages__",
+    ],
     deps = [
         "//pkg/gfxproto",
         "@org_golang_x_sys//unix:go_default_library",

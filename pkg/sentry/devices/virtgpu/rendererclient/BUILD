@@ -7,6 +7,7 @@ licenses(["notice"])
 go_library(
     name = "rendererclient",
     srcs = [
+        "broker.go",
         "client.go",
         "memory.go",
         "memory_unsafe.go",
@@ -45,6 +46,7 @@ go_test(
         "//pkg/sentry/memmap",
         "//pkg/test/testutil",
         "//pkg/unet",
+        "//runsc/ttc/gfxrenderer",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )

@@ -54,6 +54,12 @@ const (
 	MsgFenceSignaled
 )
 
+// Messages from the Sentry to the renderers' broker, which starts renderers
+// for it. The broker answers with Reply.
+const (
+	MsgStartRenderer MsgType = iota + 200
+)
+
 // String implements fmt.Stringer.String.
 func (t MsgType) String() string {
 	switch t {
@@ -85,6 +91,8 @@ func (t MsgType) String() string {
 		return "Reply"
 	case MsgFenceSignaled:
 		return "FenceSignaled"
+	case MsgStartRenderer:
+		return "StartRenderer"
 	default:
 		return fmt.Sprintf("MsgType(%d)", uint32(t))
 	}
@@ -208,6 +216,13 @@ type (
 		CtxID   uint32
 		HasRing uint32
 		Ring    uint32
+	}
+
+	// StartRenderer asks the broker to start a renderer. The broker replies
+	// with the descriptor of a connection to it, a Unix stream socket, on
+	// which the renderer sends Hello.
+	StartRenderer struct {
+		Reserved uint32
 	}
 )
 

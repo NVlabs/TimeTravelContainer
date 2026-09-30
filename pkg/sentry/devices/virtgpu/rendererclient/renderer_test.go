@@ -16,6 +16,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/test/testutil"
 	"gvisor.dev/gvisor/pkg/unet"
+	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer"
 )
 
 // TestRealRenderer drives ttc-gfx-renderer with gfxstream, whose host library
@@ -124,5 +125,57 @@ func TestRealRenderer(t *testing.T) {
 	case err := <-ev.lost:
 		t.Fatalf("lost the renderer: %v", err)
 	default:
+	}
+}
+
+// TestBroker starts a renderer through the broker, as the Sentry does.
+func TestBroker(t *testing.T) {
+	library := os.Getenv("TTC_GFXSTREAM_LIBRARY")
+	if library == "" {
+		t.Skip("TTC_GFXSTREAM_LIBRARY does not name gfxstream's host library")
+	}
+	renderer, err := testutil.FindFile("runsc/ttcgfx/ttc-gfx-renderer")
+	if err != nil {
+		t.Fatalf("finding the renderer: %v", err)
+	}
+	sentrySock, brokerSock, err := unet.SocketPair(false /* packet */)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brokerFD, err := brokerSock.Release()
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := make(chan error, 1)
+	go func() {
+		served <- gfxrenderer.ServeBroker(brokerFD, gfxrenderer.BrokerOptions{
+			Renderer: renderer,
+			Options:  gfxrenderer.Options{Library: library},
+			Stderr:   os.Stderr,
+		})
+	}()
+	sentryFD, err := sentrySock.Release()
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker, err := NewBroker(sentryFD)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two renderers, as two branches would have.
+	for i := 0; i < 2; i++ {
+		ev := &events{lost: make(chan error, 1)}
+		r, err := broker.NewRenderer(ev)
+		if err != nil {
+			t.Fatalf("NewRenderer: %v", err)
+		}
+		if err := r.CreateContext(1, linux.VIRTGPU_DRM_CAPSET_GFXSTREAM_VULKAN, "broker-test"); err != nil {
+			t.Errorf("CreateContext: %v", err)
+		}
+		r.Close()
+	}
+	broker.Close()
+	if err := <-served; err != nil {
+		t.Errorf("ServeBroker: %v", err)
 	}
 }
