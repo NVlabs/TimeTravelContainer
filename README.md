@@ -10,18 +10,17 @@ agent associate its token context with an equally forkable sandbox context,
 enabling time-traveling retrospection and parallel subagent exploration.
 
 Powered by [gVisor](https://github.com/google/gvisor)'s userspace Linux kernel,
-TTC provides this flexibility without booting a guest Linux kernel. On Linux,
-it does not require hardware virtualization. The native Apple-Silicon backend
-uses Hypervisor.framework to run application contexts and a small EL1 MMU
-monitor, while the Sentry remains the Linux kernel implementation. Unlike
-microVM-based platforms such as
+TTC provides this flexibility without hardware virtualization on a Linux host.
+Unlike microVM-based platforms such as
 [CubeSandbox](https://github.com/TencentCloud/CubeSandbox),
 [forkd](https://github.com/deeplethe/forkd), and
 [AgentENV](https://github.com/kvcache-ai/AgentENV), TTC does **not** require
 KVM, Linux kernel patches, root privileges, or special kernel modules. It runs
 rootlessly on Linux 3.17+ and can itself run inside another sandbox, such as a
-Docker container, bubblewrap, or a virtual machine. This makes TTC a portable
-foundation for agent harnesses.
+Docker container, bubblewrap, or a virtual machine.
+Apart from Linux hosts, TTC also runs on Apple Silicon Macs (natively) 
+and Windows (through WSL 2), providing a live forking Linux runtime for them.
+This makes TTC a portable foundation for agent harnesses.
 
 ![An agent forks one initialized TTC sandbox into parallel subagent branches, then combines their summaries](assets/ttc-agent-flow.svg)
 
@@ -67,70 +66,10 @@ CONTAINER  BRANCH  IMAGE         STATE    CREATED    PARENT
 myapp      main    ubuntu:26.04  running  1 day ago  -
 ```
 
-`daemon start` always launches the `ttcd` installed beside `ttc`, and requires
-both binaries to come from the same build; `ttc` does not contain a fallback
-daemon entry point. If it cannot be found or executed, startup fails
-immediately without creating a daemon socket.
-
-### Native Apple-Silicon macOS
-
-The native macOS backend requires Apple Silicon and macOS 15.0 or newer. It
-uses baseline Hypervisor.framework APIs, 4 KiB Linux pages over 16 KiB host
-allocation slabs, and does not boot a Linux VM. It omits Linux host
-namespaces, seccomp, and cgroups. Instead, `ttcd` confines itself, and every
-Sentry, gofer, and helper it starts, with the macOS sandbox, Seatbelt. The
-confinement keeps all file and network access, which containers and image pulls
-use, but denies devices, USB ones among them, and the system's services beyond
-those every process uses. Like the user namespace of a rootless Linux sandbox,
-it bounds what code execution in TTC reaches of the host; it is no boundary
-around the user's files or the network. `--unsafe-no-host-isolation` starts the
-daemon unconfined, for trusted workloads only.
-
-Use the installer to build, copy, and ad-hoc sign `ttcd` at its final path. It
-defaults to `../bin`; pass a destination directory as its first argument and
-set `BAZEL` when Bazel is not in `PATH`:
-
-```sh
-BAZEL=/path/to/bazel tools/ttc/install_macos.sh ~/projects/ttc-macos/bin
-```
-
-For a manual installation, copy the runtime first and then sign the installed
-`ttcd`. A plain Bazel output has only a linker signature and cannot use
-Hypervisor.framework. Signing before a copy is insufficient on macOS versions
-that validate the installed inode independently:
-
-```sh
-bazel build //runsc/ttc:ttc //runsc/ttcd:ttcd
-mkdir -p bin
-cp bazel-bin/runsc/ttc/ttc_/ttc bin/ttc
-cp bazel-bin/runsc/ttcd/ttcd_/ttcd bin/ttcd
-codesign --force --sign - \
-  --entitlements runsc/hvf.entitlements \
-  bin/ttcd
-```
-
-Start the daemon. `ttcd` checks its own Hypervisor.framework entitlement at
-startup:
-
-```sh
-export TTC_ROOT="$HOME/.local/share/ttc"
-bin/ttc daemon start
-```
-
-TTC_ROOT must name a new-format data root; data roots created by earlier TTC
-builds are not migrated.
-
-For OCI-runtime integration, invoke the embedded runtime as `ttcd runsc ...`,
-or install a `runsc` symlink to `ttcd`; argv-based re-execution preserves the
-same runtime mode. The Bazel configuration sets the runtime deployment target
-to macOS 15.0, and the entitlement file grants
-`com.apple.security.hypervisor`.
-
+## Usage
 `ttc` uses familiar Docker-style commands and pulls standard OCI images
 directly from Docker Hub and other registries. TTC adds branch-aware commands
 such as `fork`, `pause`, `resume`, `dehydrate`, and `rehydrate`.
-
-## Usage
 
 Type `ttc --help` or `ttc <subcommand> --help` for complete command usage.
 Existing branches are always addressed as `CONTAINER@BRANCH`; `main` is an
@@ -262,6 +201,12 @@ Host requirements are deliberately small:
   the first write after a fork.
 - (Optional) A delegated cgroup v2 subtree only when hard host CPU or memory
   limits are requested.
+
+TTC includes a native macOS backend (requires Apple Silicon and macOS 15.0+)
+so you can use TTC directly on Macs to run an ARM64 Linux shell.
+While it uses virtualization (Hypervisor.framework), it does not boot a Linux
+VM. Instead, TTC runs itself as the guest-facing kernel inside the hypervisor.
+To run TTC on macOS, the installer handles necessary ad-hoc code signatures.
 
 `TTC_ROOT` is always explicit and on a local filesystem. In standalone mode it
 contains all of the daemon's files, including its socket, which `ttc` finds
