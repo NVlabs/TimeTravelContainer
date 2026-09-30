@@ -287,6 +287,8 @@ go_library(
         "kcov.go",
         "kcov_unsafe.go",
         "kernel.go",
+        "mmap_rnd_amd64.go",
+        "mmap_rnd_arm64.go",
         "live_fork.go",
         "kernel_opts.go",
         "kernel_restore.go",

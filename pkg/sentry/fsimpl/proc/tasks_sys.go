@@ -75,6 +75,8 @@ func (fs *filesystem) newSysDir(ctx context.Context, root *auth.Credentials, k *
 			"overflowuid":        fs.newInode(ctx, root, 0444, newStaticFile(fmt.Sprintf("%d\n", auth.OverflowUID))),
 			"pid_max":            fs.newInode(ctx, root, 0644, newStaticFile(fmt.Sprintf("%d\n", kernel.TasksLimit))),
 			"randomize_va_space": fs.newInode(ctx, root, 0644, &atomicInt32File{val: &k.RandomizeVASpace, min: 0, max: 2}),
+			"kptr_restrict":      fs.newInode(ctx, root, 0644, &atomicInt32File{val: &k.KptrRestrict, min: 0, max: 2}),
+			"dmesg_restrict":     fs.newInode(ctx, root, 0644, &atomicInt32File{val: &k.DmesgRestrict, min: 0, max: 1}),
 			"random": fs.newStaticDir(ctx, root, map[string]kernfs.Inode{
 				"boot_id": fs.newInode(ctx, root, 0444, newStaticFile(randUUID())),
 				"uuid":    fs.newInode(ctx, root, 0444, &uuidData{}),
@@ -101,9 +103,11 @@ func (fs *filesystem) newSysDir(ctx context.Context, root *auth.Credentials, k *
 			"pipe-max-size": fs.newInode(ctx, root, 0644, newStaticFile(fmt.Sprintf("%d\n", pipe.MaximumPipeSize))),
 		}),
 		"vm": fs.newStaticDir(ctx, root, map[string]kernfs.Inode{
-			"max_map_count":     fs.newInode(ctx, root, 0444, newStaticFile("2147483647\n")),
-			"mmap_min_addr":     fs.newInode(ctx, root, 0444, &mmapMinAddrData{branchKernelRef: newBranchKernelRef(k)}),
-			"overcommit_memory": fs.newInode(ctx, root, 0444, newStaticFile("0\n")),
+			"max_map_count":        fs.newInode(ctx, root, 0444, newStaticFile("2147483647\n")),
+			"mmap_rnd_bits":        fs.newInode(ctx, root, 0600, &atomicInt32File{val: &k.MmapRndBits, min: kernel.MmapRndBitsMin, max: kernel.MmapRndBitsMax}),
+			"mmap_rnd_compat_bits": fs.newInode(ctx, root, 0600, &atomicInt32File{val: &k.MmapRndCompatBits, min: kernel.MmapRndCompatBitsMin, max: kernel.MmapRndCompatBitsMax}),
+			"mmap_min_addr":        fs.newInode(ctx, root, 0444, &mmapMinAddrData{branchKernelRef: newBranchKernelRef(k)}),
+			"overcommit_memory":    fs.newInode(ctx, root, 0444, newStaticFile("0\n")),
 		}),
 		"net": fs.newSysNetDir(ctx, root, k),
 	})
