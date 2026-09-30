@@ -110,6 +110,8 @@ type importedResource struct {
 type importedObject struct {
 	id      ID
 	logical pgalloc.LogicalChunkID
+	// resource is the index of the resource whose pages the object holds.
+	resource int
 	// mapped has the slots the capture maps, and slots the pages in them, in
 	// slot order.
 	mapped [slotBitmapBytes]byte
@@ -273,21 +275,23 @@ func importCapture(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, o
 	// which a disk writes a tenth as fast. An object's pages share one chunk,
 	// as rehydration loads memory a logical chunk at a time: an object that
 	// does not fit where the chunk has room left starts the next, and the
-	// room is left a hole.
+	// room is left a hole. So does an object of another resource than the
+	// chunk's, as rehydration installs a chunk in one resource's MemoryFile.
 	var incomplete []*importedObject
 	var starts []int
-	position := 0
+	position, resource := 0, -1
 	for _, object := range objects {
 		count := countBits(&object.missing)
 		if count == 0 {
 			continue
 		}
-		if used := position % PagesPerChunk; used != 0 && used+count > PagesPerChunk {
+		if used := position % PagesPerChunk; used != 0 && (used+count > PagesPerChunk || object.resource != resource) {
 			position += PagesPerChunk - used
 		}
 		incomplete = append(incomplete, object)
 		starts = append(starts, position)
 		position += count
+		resource = object.resource
 	}
 	var chunks []ttcsnapshot.ObjectID
 	if position != 0 {
@@ -457,10 +461,12 @@ func planCaptureImport(manifest Manifest, rootPrefix string) ([]*importedObject,
 		if !ok {
 			index = len(objects)
 			objectIndexes[run.Object] = index
-			objects = append(objects, &importedObject{id: run.Object, logical: run.Logical})
+			objects = append(objects, &importedObject{id: run.Object, logical: run.Logical, resource: resourceIndexes[run.ResourceID]})
 			capacities = append(capacities, 0)
 		} else if objects[index].logical != run.Logical {
 			return nil, nil, nil, fmt.Errorf("memory chunk %s has logical coordinates %+v and %+v", run.Object, objects[index].logical, run.Logical)
+		} else if objects[index].resource != resourceIndexes[run.ResourceID] {
+			return nil, nil, nil, fmt.Errorf("memory chunk %s spans resources", run.Object)
 		}
 		runObjects[position] = index
 		capacities[index] = min(capacities[index]+int(run.Pages), PagesPerChunk)

@@ -789,6 +789,67 @@ func TestGraphImportKeepsAnObjectsNewPagesInOneChunk(t *testing.T) {
 	}
 }
 
+// A chunk holds the pages of one resource, as a rehydration installs it in
+// that resource's MemoryFile: the pages of the next resource start a chunk of
+// their own, though they would fit where the last one has room.
+func TestGraphImportKeepsResourcesInChunksOfTheirOwn(t *testing.T) {
+	directory := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(directory, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(directory, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+	var stored []StoredBinding
+	byID := make(map[ID]Chunk)
+	resources := []checkpoint.ResourceID{{}, {Path: "/tmpfs"}}
+	for object := uint64(0); object < 2; object++ {
+		id := graphCaptureObjectID(object + 1)
+		chunk := Chunk{Logical: pgalloc.LogicalChunkID{Allocator: testAllocator(1), Sequence: 10 + object}}
+		for slot := 0; slot < 10; slot++ {
+			chunk.Pages = append(chunk.Pages, Page{Slot: uint8(slot), Version: pgalloc.PageVersionID{Allocator: testAllocator(2), Sequence: object*1000 + uint64(slot)}, Data: bytes.Repeat([]byte{byte(object + 1)}, hostarch.PageSize)})
+			index := chunk.Logical.Sequence*PagesPerChunk + uint64(slot)
+			stored = append(stored, capturedBinding(pgalloc.CapturedPageBinding{
+				ResourceID: resources[object], OldOffset: index * hostarch.PageSize, References: 1,
+				Page:    pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: index},
+				Version: chunk.Pages[slot].Version, Chunk: chunk.Logical, Slot: uint8(slot),
+			}, id))
+		}
+		byID[id] = chunk
+	}
+	manifest, err := CompactBindings(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := importSnapshotGraph(graph, data, origin, manifest, "apart", func(id ID) (Chunk, error) { return byID[id], nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Roots) != 2 {
+		t.Fatalf("imported roots %+v, want two", result.Roots)
+	}
+	chunks := make(map[ttcsnapshot.ObjectID]checkpoint.ResourceID)
+	for _, root := range result.Roots {
+		for _, location := range memoryLocations(t, graph, root.Root) {
+			if other, ok := chunks[location.Chunk]; ok && other != root.ResourceID {
+				t.Fatalf("chunk %s holds pages of %s and %s", location.Chunk, other, root.ResourceID)
+			}
+			chunks[location.Chunk] = root.ResourceID
+		}
+	}
+	if _, err := BuildGraphManifest(graph, result.Roots); err != nil {
+		t.Fatalf("the image does not rehydrate: %v", err)
+	}
+}
+
 func TestGraphImportCheckpointBoundsRecoveryJournal(t *testing.T) {
 	graph, err := ttcsnapshot.Open(filepath.Join(t.TempDir(), "graph"))
 	if err != nil {
