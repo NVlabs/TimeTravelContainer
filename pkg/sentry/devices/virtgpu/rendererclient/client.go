@@ -8,6 +8,7 @@ package rendererclient
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/gfxproto"
@@ -36,6 +37,10 @@ type Client struct {
 
 var _ virtgpu.Renderer = (*Client)(nil)
 
+// startTimeout is how long a renderer may take to start. gfxstream can hang
+// instead of failing to start.
+const startTimeout = time.Minute
+
 // New returns a Client of the renderer connected to the Unix stream socket
 // fd, which it takes, once the renderer says that it started.
 func New(fd int, events virtgpu.RendererEvents) (*Client, error) {
@@ -44,7 +49,14 @@ func New(fd int, events virtgpu.RendererEvents) (*Client, error) {
 		unix.Close(fd)
 		return nil, err
 	}
+	// Closing the connection ends the wait for the renderer.
+	timer := time.AfterFunc(startTimeout, func() {
+		conn.Close()
+	})
 	m, err := conn.Recv()
+	if !timer.Stop() {
+		return nil, fmt.Errorf("the renderer did not start within %v", startTimeout)
+	}
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("waiting for the renderer to start: %w", err)
