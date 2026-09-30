@@ -142,12 +142,15 @@ TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
     `gfx/vkoffscreen.c` checks;
 *   a live fork with `--gfx-fork=device-lost` while the guest renders. In the
     child, the process that was rendering must die of `SIGBUS`, not hang, and
-    a new one must render. The source must render on.
+    a new one must render. The source must render on;
+*   two branches rendering at once, each with its own renderer, and no
+    renderer left once nothing uses the GPU.
 
 It needs `ttc-gfx-renderer`, gfxstream's host library, and Mesa's gfxstream
 Vulkan driver for the guest (see `runsc/ttc/gfxrenderer/README.md`), and the
-network. On macOS the daemon runs with `--unsafe-no-host-isolation`, because
-ttcd's sandbox denies renderers the GPU.
+network. The daemon runs with host isolation unless
+`TTC_UNSAFE_NO_HOST_ISOLATION=1`; on macOS the test then checks that the
+renderers confine themselves.
 
 ```shell
 bazel build //runsc/ttc:ttc //runsc/ttcd:ttcd //runsc/ttcgfx:ttc-gfx-renderer

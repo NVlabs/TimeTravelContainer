@@ -3905,6 +3905,10 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	} else if name != "" {
 		fmt.Fprintf(stderr, "ttcd: warning: %s %q is on a network filesystem (%s); its sockets, locks, and process state may not work there\n", rootVariable, layout.root, name)
 	}
+	// GPU renderers need the GPU, which the daemon's isolation bars its
+	// children from: settle how they start first.
+	gfx := startGFXHost(unsafeNoHostIsolation, stderr)
+	defer gfx.Close()
 	// Isolate the daemon before it touches its roots.
 	if err := enterDaemonHostIsolation(unsafeNoHostIsolation); err != nil {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
@@ -4073,7 +4077,7 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	if clusterRuntime != nil {
 		cpuProfile = clusterRuntime.cpuProfile
 	}
-	if err := serveDaemonWithCluster(socket, runtimePlatform, cpuProfile, unsafeNoHostIsolation, kernelCompatibility, daemonDataRoot, roots.local, daemonRoot, daemonRunsc, manager.Capability(), clusterRuntime, stdout, stderr); err != nil {
+	if err := serveDaemonWithCluster(socket, runtimePlatform, cpuProfile, unsafeNoHostIsolation, kernelCompatibility, daemonDataRoot, roots.local, daemonRoot, daemonRunsc, manager.Capability(), clusterRuntime, gfx, stdout, stderr); err != nil {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
 		if errors.Is(err, errLeaseSelfFenced) {
 			fmt.Fprintln(stderr, "ttcd: restarting to wait for the cluster; this node's sandboxes stay stopped until it answers")
@@ -6012,10 +6016,10 @@ func serveDaemon(socket, runtimePlatform string, unsafeNoHostIsolation bool, ker
 	if err != nil {
 		return err
 	}
-	return serveDaemonWithCluster(socket, runtimePlatform, profile, unsafeNoHostIsolation, kernelCompatibility, dataRoot, dataRoot, root, runsc, volumeCapability, nil, stdout, stderr)
+	return serveDaemonWithCluster(socket, runtimePlatform, profile, unsafeNoHostIsolation, kernelCompatibility, dataRoot, dataRoot, root, runsc, volumeCapability, nil, gfxHost{unconfined: unsafeNoHostIsolation}, stdout, stderr)
 }
 
-func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPUProfile, unsafeNoHostIsolation bool, kernelCompatibility hostKernelCompatibility, dataRoot, localRoot, root, runsc string, volumeCapability ttcvolume.Capability, clusterRuntime *daemonClusterRuntime, stdout, stderr io.Writer) (err error) {
+func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPUProfile, unsafeNoHostIsolation bool, kernelCompatibility hostKernelCompatibility, dataRoot, localRoot, root, runsc string, volumeCapability ttcvolume.Capability, clusterRuntime *daemonClusterRuntime, gfx gfxHost, stdout, stderr io.Writer) (err error) {
 	snapshotGraph, err := ttcsnapshot.Open(filepath.Join(localRoot, "catalog", "snapshot-graph"))
 	if err != nil {
 		return fmt.Errorf("opening TTC snapshot graph: %w", err)
@@ -6105,7 +6109,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 	if run == "" {
 		run = filepath.Dir(socket)
 	}
-	server.gfx = newGFXService(run, !unsafeNoHostIsolation, stderr)
+	server.gfx = newGFXService(run, gfx, stderr)
 	defer server.gfx.Close()
 	if err := compactDaemonMutations(server.mutationRoot(), daemonMutationRetention); err != nil && stderr != nil {
 		fmt.Fprintf(stderr, "ttcd: warning: compacting daemon mutation history: %v\n", err)

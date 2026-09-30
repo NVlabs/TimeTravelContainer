@@ -234,8 +234,9 @@ and UVM ioctls and maps GPU memory and doorbells into the application:
         control and fence completions. Command buffers and blob memory are
         shared memory.
     *   It is confined:
-        *   macOS: Seatbelt, allowing the GPU's IOKit user clients and the
-            Metal compiler service, and nothing more.
+        *   macOS: Seatbelt, allowing the GPU's IOKit user clients, POSIX
+            shared memory of its own names, and reading system and package
+            files, and nothing more (see the A2 status).
         *   Linux: seccomp and namespaces, with the render node only.
     *   Its memory counts toward the family's memory target.
 3.  **The daemon and CLI**:
@@ -492,11 +493,11 @@ for unit tests:
 End to end, `vulkaninfo` and an offscreen render's checksum in
 `ttc run --gfx --waive-live-fork`.
 
-*Status (2026-09-30): done on macOS, with one limit.* `ttc run --gfx
---waive-live-fork` gives a Debian container a GPU whose `vulkaninfo` reports
-"Virtio-GPU GFXStream (Apple M5 Pro)", and `runsc/ttc/test/e2e_gfx.sh` checks
-that, and an offscreen compute and render whose every pixel it checks
-(`test/gfx/vkoffscreen.c`).
+*Status (2026-09-30): done on macOS.* `ttc run --gfx --waive-live-fork` gives
+a Debian container a GPU whose `vulkaninfo` reports "Virtio-GPU GFXStream
+(Apple M5 Pro)". `runsc/ttc/test/e2e_gfx.sh` checks that, and an offscreen
+compute and render whose every pixel it checks (`test/gfx/vkoffscreen.c`),
+with the daemon's host isolation on.
 
 *   `ttc-gfx-renderer` (`runsc/ttcgfx`, `runsc/ttc/gfxrenderer`) is its own
     binary because ttcd is pure Go on Linux. It loads gfxstream with `dlopen`;
@@ -520,13 +521,29 @@ that, and an offscreen compute and render whose every pixel it checks
     guest EL1 (the ring0 engine mirrors only memory that the Sentry owns, or
     that stage 2 already maps), so HVF returns it to host EL0 first. The first
     end-to-end runs found that crash.
-*   **Limit:** on macOS, ttcd confines itself, and so its children, with a
-    Seatbelt profile that denies the GPU, so `--gfx` needs a daemon started
-    with `--unsafe-no-host-isolation`. The fix is a launcher that ttcd starts
-    before it confines itself, which starts renderers that confine themselves
-    with a profile of their own (Metal's IOKit clients and compiler service,
-    POSIX shared memory, no network); a renderer must not run unconfined, since
-    it parses untrusted command streams.
+*   **Confinement.** Renderers decode untrusted command streams, so each
+    confines itself with the macOS sandbox before it loads gfxstream
+    (`seatbelt.RendererProfile`). It may read only system files, the package
+    prefixes where the Vulkan loader and MoltenVK live, and its own and
+    gfxstream's files. It gets the GPU's IOKit user clients and POSIX shared
+    memory of its own names; no writes, network, or processes. Metal needs no
+    Mach service beyond Apple's `system.sb`. macOS lets no process change its
+    profile, and ttcd's bars the GPU, so ttcd starts a launcher,
+    `ttc-gfx-renderer launch`, before it confines itself. The launcher, which
+    stays unconfined so that its children can confine themselves, starts the
+    renderers and probes. Findings on the way:
+    *   gfxstream named its POSIX shared memory after resource IDs and
+        per-process counters, and opened an existing object of the name.
+        macOS's names are global to the user, so two renderers shared
+        command rings and memory: guests could read each other's, and their
+        rings deadlocked. TTC's gfxstream patch 0002 makes the objects
+        unnamed.
+    *   A family's branches share one Sentry, so a removed branch's renderer
+        ran on until the family exited. The device now closes its renderer
+        once nothing uses it.
+    *   CoreFoundation resolves the executable's path, and the Vulkan loader
+        crashes without a main bundle, so the profile admits the metadata of
+        the admitted paths' directories.
 *   The Linux side of A2 (Phase B) needs: the renderer built with cgo, and
     gfxstream on the host's Vulkan driver; blobs that gfxstream exports as
     shared memory or dma-bufs, which the Sentry maps through their

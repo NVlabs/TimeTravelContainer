@@ -16,8 +16,9 @@
 #     the guest's architecture (runsc/ttc/gfxrenderer/guest/);
 #   network access, to install vulkan-tools and a compiler in a Debian image.
 #
-# On macOS, the daemon's sandbox denies renderers the GPU, so the daemon runs
-# with --unsafe-no-host-isolation.
+# The daemon runs with host isolation unless TTC_UNSAFE_NO_HOST_ISOLATION=1.
+# On macOS, it then starts renderers through a launcher, and each renderer
+# confines itself with the macOS sandbox.
 set -eu
 
 TTC=${TTC:-}
@@ -42,10 +43,6 @@ fail() {
 [ -f "$TTC_GFXSTREAM_LIBRARY" ] || fail "set TTC_GFXSTREAM_LIBRARY to gfxstream's host library"
 [ -f "$TTC_GFX_GUEST_DRIVER/libvulkan_gfxstream.so" ] ||
   fail "set TTC_GFX_GUEST_DRIVER to a directory with Mesa's libvulkan_gfxstream.so"
-if [ "$(uname -s)" = Darwin ]; then
-  TTC_UNSAFE_NO_HOST_ISOLATION=1
-fi
-
 owned_root=false
 if [ -z "$TTC_E2E_ROOT" ]; then
   # macOS gives TMPDIR a trailing slash; a doubled one would differ from
@@ -62,8 +59,10 @@ DRIVER_DIR="$TTC_E2E_ROOT/driver"
 mkdir -p "$BIN_DIR" "$DRIVER_DIR"
 install -m 0755 "$(readlink -f "$TTC")" "$BIN_DIR/ttc"
 install -m 0755 "$(readlink -f "$TTCD")" "$BIN_DIR/ttcd"
-# The daemon finds the renderer beside itself.
+# The daemon finds the renderer beside itself, unless TTC_GFX_RENDERER names
+# another.
 install -m 0755 "$(readlink -f "$TTC_GFX_RENDERER")" "$BIN_DIR/ttc-gfx-renderer"
+unset TTC_GFX_RENDERER
 if [ "$(uname -s)" = Darwin ]; then
   # A copy loses its ad-hoc signature; Hypervisor.framework requires the
   # entitlement on the executable at its final path.
@@ -201,20 +200,42 @@ esac
 ttc fork "$NAME@main" one two >/dev/null
 for branch in one two; do
   ttc exec -d -e "$VK_DRIVER_FILES" "$NAME@$branch" sh -c \
-    'cd /work && ./vkoffscreen compute.spv square.spv red.spv 100 10 >/tmp/pair.log 2>&1
+    'cd /work && ./vkoffscreen compute.spv square.spv red.spv 300 20 >/tmp/pair.log 2>&1
      echo "exit=$?" >>/tmp/pair.log' >/dev/null
 done
-for branch in one two; do
+# wait_pair BRANCH PATTERN waits for the pair's log in BRANCH to match
+# PATTERN, an extended regular expression.
+wait_pair() {
   deadline=$(($(date +%s) + 120))
-  until ttc exec "$NAME@$branch" grep -q "^exit=" /tmp/pair.log 2>/dev/null; do
+  until ttc exec "$NAME@$1" grep -Eq "$2" /tmp/pair.log 2>/dev/null; do
     if [ "$(date +%s)" -ge "$deadline" ]; then
-      fail "branch $branch, rendering beside another, hangs: $(ttc exec "$NAME@$branch" cat /tmp/pair.log 2>&1)"
+      fail "branch $1, rendering beside another, has no '$2': $(ttc exec "$NAME@$1" cat /tmp/pair.log 2>&1)"
     fi
     sleep 0.5
   done
+}
+wait_pair one "iteration 2 ok"
+wait_pair two "iteration 2 ok"
+# Renderers that a daemon with host isolation starts on macOS confine
+# themselves. python3 asks the kernel's sandbox.
+if [ "$(uname -s)" = Darwin ] && [ "$TTC_UNSAFE_NO_HOST_ISOLATION" != 1 ] &&
+  command -v python3 >/dev/null; then
+  renderers=$(pgrep -f "$BIN_DIR/ttc-gfx-renderer serve" || true)
+  [ -n "$renderers" ] || fail "no renderer runs while two branches render"
+  for pid in $renderers; do
+    python3 -c '
+import ctypes, sys
+check = ctypes.CDLL("/usr/lib/libSystem.dylib").sandbox_check
+check.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+sys.exit(0 if check(int(sys.argv[1]), None, 0) == 1 else 1)
+' "$pid" || fail "renderer $pid is not confined"
+  done
+fi
+for branch in one two; do
+  wait_pair "$branch" "^exit="
   pair_log=$(ttc exec "$NAME@$branch" cat /tmp/pair.log)
   case "$pair_log" in
-    *"iteration 100 ok"*"vkoffscreen: ok checksum=$WANT_CHECKSUM"*exit=0) ;;
+    *"iteration 300 ok"*"vkoffscreen: ok checksum=$WANT_CHECKSUM"*exit=0) ;;
     *) fail "branch $branch, rendering beside another: $pair_log" ;;
   esac
 done

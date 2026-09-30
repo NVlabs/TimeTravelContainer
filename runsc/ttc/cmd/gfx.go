@@ -5,7 +5,6 @@ package cmd
 
 import (
 	"bytes"
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -13,27 +12,61 @@ import (
 	"io"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
-	"time"
 
 	"golang.org/x/sys/unix"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer"
 )
 
-const (
-	// gfxRendererName is the file name of the GPU renderer, which ttcd looks
-	// for beside itself unless TTC_GFX_RENDERER names it.
-	gfxRendererName = "ttc-gfx-renderer"
+// gfxRendererName is the file name of the GPU renderer, which ttcd looks for
+// beside itself unless TTC_GFX_RENDERER names it.
+const gfxRendererName = "ttc-gfx-renderer"
 
-	// gfxProbeTimeout is how long the renderer may take to report its
-	// capability sets.
-	gfxProbeTimeout = time.Minute
-)
+// gfxHost is how the daemon starts GPU renderers, which it settles before it
+// confines itself.
+type gfxHost struct {
+	// launcher starts the renderers of a daemon that confines itself, and
+	// so its children, with the macOS sandbox, whose profile bars the GPU.
+	// It is nil where the daemon starts renderers itself.
+	launcher *gfxrenderer.Launcher
+	// err is why a daemon that needs a launcher has none.
+	err error
+	// unconfined is whether renderers run without their sandbox, as a
+	// daemon without host isolation runs its sandboxes.
+	unconfined bool
+}
+
+// startGFXHost settles how the daemon starts GPU renderers, before it
+// confines itself. On macOS, a daemon with host isolation starts a launcher
+// for them, if the renderer is installed.
+func startGFXHost(unsafeNoHostIsolation bool, stderr io.Writer) gfxHost {
+	if unsafeNoHostIsolation {
+		return gfxHost{unconfined: true}
+	}
+	if runtime.GOOS != "darwin" {
+		return gfxHost{}
+	}
+	opts, err := rendererOptions()
+	if err != nil {
+		return gfxHost{err: err}
+	}
+	opts.Stderr = stderr
+	launcher, err := gfxrenderer.StartLauncher(opts)
+	if err != nil {
+		return gfxHost{err: fmt.Errorf("starting the GPU renderers' launcher: %w", err)}
+	}
+	return gfxHost{launcher: launcher}
+}
+
+// Close closes the launcher, if any.
+func (h gfxHost) Close() {
+	if h.launcher != nil {
+		h.launcher.Close()
+	}
+}
 
 // gfxService starts GPU renderers for the daemon's sandboxes. Each Sentry of
 // a --gfx family connects, through runsc, to the service's broker socket at
@@ -41,10 +74,8 @@ const (
 type gfxService struct {
 	// socket is the path of the broker socket.
 	socket string
-	// isolated is whether the daemon confines itself, and so its children,
-	// with the macOS sandbox, whose profile does not admit the GPU.
-	isolated bool
-	stderr   io.Writer
+	host   gfxHost
+	stderr io.Writer
 
 	// mu protects the fields below, which start sets once.
 	mu       sync.Mutex
@@ -55,12 +86,12 @@ type gfxService struct {
 }
 
 // newGFXService returns a service whose broker socket is in run, the daemon's
-// run/.
-func newGFXService(run string, isolated bool, stderr io.Writer) *gfxService {
+// run/, and which starts renderers as host says.
+func newGFXService(run string, host gfxHost, stderr io.Writer) *gfxService {
 	return &gfxService{
-		socket:   filepath.Join(run, daemonRunSocketName("g", "gfx")),
-		isolated: isolated,
-		stderr:   stderr,
+		socket: filepath.Join(run, daemonRunSocketName("g", "gfx")),
+		host:   host,
+		stderr: stderr,
 	}
 }
 
@@ -122,13 +153,16 @@ func (g *gfxService) runscArgs(opts ttcbundle.GPUOptions) ([]string, error) {
 //
 // Preconditions: g.mu is locked.
 func (g *gfxService) startLocked() error {
-	if g.isolated && runtime.GOOS == "darwin" {
-		return errors.New("the daemon's macOS sandbox denies renderers the GPU; restart the daemon with --unsafe-no-host-isolation to use --gfx")
+	if g.host.err != nil {
+		return g.host.err
 	}
 	opts, err := rendererOptions()
 	if err != nil {
 		return err
 	}
+	opts.Launcher = g.host.launcher
+	opts.Unconfined = g.host.unconfined
+	opts.Stderr = g.stderr
 	capsets, err := probeRenderer(opts)
 	if err != nil {
 		return err
@@ -146,7 +180,6 @@ func (g *gfxService) startLocked() error {
 	}
 	g.capsets = capsets
 	g.listener = listener
-	opts.Stderr = g.stderr
 	go g.serve(listener, opts)
 	return nil
 }
@@ -154,36 +187,18 @@ func (g *gfxService) startLocked() error {
 // probeRenderer returns the renderer's capability sets, as runsc's
 // --gfx-capsets spells them.
 func probeRenderer(opts gfxrenderer.BrokerOptions) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), gfxProbeTimeout)
-	defer cancel()
-	args := []string{"probe"}
-	if opts.Options.Library != "" {
-		args = append(args, "--library", opts.Options.Library)
-	}
-	cmd := exec.CommandContext(ctx, opts.Renderer, args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("probing the GPU renderer: %w: %s", err, lastLine(stderr.String()))
+	output, err := gfxrenderer.ProbeRenderer(opts)
+	if err != nil {
+		return "", err
 	}
 	var capsets []gfxrenderer.Capset
-	if err := json.Unmarshal(stdout.Bytes(), &capsets); err != nil {
+	if err := json.Unmarshal(output, &capsets); err != nil {
 		return "", fmt.Errorf("the GPU renderer's capability sets: %w", err)
 	}
 	if len(capsets) == 0 {
 		return "", errors.New("the GPU renderer has no capability sets")
 	}
-	return base64.StdEncoding.EncodeToString(bytes.TrimSpace(stdout.Bytes())), nil
-}
-
-// lastLine returns the last line of s.
-func lastLine(s string) string {
-	s = strings.TrimSpace(s)
-	if i := strings.LastIndexByte(s, '\n'); i >= 0 {
-		return s[i+1:]
-	}
-	return s
+	return base64.StdEncoding.EncodeToString(bytes.TrimSpace(output)), nil
 }
 
 // serve starts a broker for each Sentry that connects.
@@ -223,7 +238,8 @@ func (g *gfxService) serve(listener *net.UnixListener, opts gfxrenderer.BrokerOp
 }
 
 // Close stops accepting Sentries. Brokers of connected Sentries, and their
-// renderers, run until the Sentries disconnect.
+// renderers, run until the Sentries disconnect; the launcher, if any, until
+// the daemon exits, since brokers may still need it.
 func (g *gfxService) Close() error {
 	if g == nil {
 		return nil
