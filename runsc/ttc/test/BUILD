@@ -52,6 +52,17 @@ sh_binary(
     ],
 )
 
+# Manual because it needs the host's GPU, gfxstream's host library, and a
+# guest Vulkan driver built from Mesa, and installs packages from Debian.
+sh_binary(
+    name = "e2e_gfx",
+    srcs = ["e2e_gfx.sh"],
+    data = glob(["gfx/*"]),
+    tags = [
+        "manual",
+    ],
+)
+
 # Manual because it installs fuse-overlayfs from a public Ubuntu repository,
 # then exercises an in-sandbox FUSE daemon across TTC lifecycle operations.
 sh_binary(

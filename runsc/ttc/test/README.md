@@ -134,6 +134,32 @@ TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
   "$PWD/runsc/ttc/test/e2e_fuse_lifecycle.sh"
 ```
 
+`e2e_gfx.sh` covers the virtual GPU, `--gfx`, in a Debian guest:
+
+*   the refusal of `--gfx` without fork semantics;
+*   the render node and its sysfs entries, and `vulkaninfo`;
+*   repeated offscreen compute and render runs, whose every pixel
+    `gfx/vkoffscreen.c` checks;
+*   a live fork with `--gfx-fork=device-lost` while the guest renders. In the
+    child, the process that was rendering must die of `SIGBUS`, not hang, and
+    a new one must render. The source must render on.
+
+It needs `ttc-gfx-renderer`, gfxstream's host library, and Mesa's gfxstream
+Vulkan driver for the guest (see `runsc/ttc/gfxrenderer/README.md`), and the
+network. On macOS the daemon runs with `--unsafe-no-host-isolation`, because
+ttcd's sandbox denies renderers the GPU.
+
+```shell
+bazel build //runsc/ttc:ttc //runsc/ttcd:ttcd //runsc/ttcgfx:ttc-gfx-renderer
+
+TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
+TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
+TTC_GFX_RENDERER="$PWD/bazel-bin/runsc/ttcgfx/ttc-gfx-renderer_/ttc-gfx-renderer" \
+TTC_GFXSTREAM_LIBRARY=/path/to/libgfxstream_backend.dylib \
+TTC_GFX_GUEST_DRIVER=/path/to/mesa/out \
+  "$PWD/runsc/ttc/test/e2e_gfx.sh"
+```
+
 `e2e_fanout_lifecycle.sh` creates 32 siblings from one source pause, writes a
 different 4 KiB page in every branch, and dehydrates/rehydrates alternating
 branches before verifying their private contents. Set
