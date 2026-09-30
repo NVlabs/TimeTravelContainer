@@ -6399,12 +6399,12 @@ type runtimeBackend struct {
 	// only those families acts on, and the placement reconciliation after it
 	// covers.
 	resolvedFamilies *familySet
-	publicationQueue    *ttcstorage.Queue
-	snapshotGraph       *ttcsnapshot.Store
-	snapshotData        *ttcsnapshot.LocalDataStore
-	snapshotResolver    *ttcsnapshot.Resolver
-	snapshotShared      *ttcsnapshot.SharedPackStore
-	sharedReferences    *sharedReferenceService
+	publicationQueue *ttcstorage.Queue
+	snapshotGraph    *ttcsnapshot.Store
+	snapshotData     *ttcsnapshot.LocalDataStore
+	snapshotResolver *ttcsnapshot.Resolver
+	snapshotShared   *ttcsnapshot.SharedPackStore
+	sharedReferences *sharedReferenceService
 	// daemonStopRequested is set only after a node-stop policy has completed.
 	// The daemon sends the command result before closing its listener.
 	daemonStopRequested bool
@@ -14798,17 +14798,20 @@ func graphCaptureStream() (daemon, sentry *os.File, err error) {
 //
 // stream is read, and for a filtered capture also answered; see
 // graphCaptureStream.
-func (b *runtimeBackend) importGraphCapture(stream io.ReadWriter, origin ttcsnapshot.SnapshotID, prefix string) (ttcchunk.GraphImportResult, error) {
-	states := []ttcsnapshot.SnapshotState{ttcsnapshot.SnapshotWorking, ttcsnapshot.SnapshotSealedLocal}
+func (b *runtimeBackend) importGraphCapture(stream io.ReadWriter, origin ttcsnapshot.SnapshotID, prefix string, images ...captureImage) (ttcchunk.GraphImportResult, error) {
+	reuse := ttcsnapshot.MemoryReuse{States: []ttcsnapshot.SnapshotState{ttcsnapshot.SnapshotWorking, ttcsnapshot.SnapshotSealedLocal}}
 	if b.distributedSource != nil && b.distributedSource.authority != nil {
 		// Concurrent and crash-interrupted cluster captures may leave committed
 		// objects in a working origin. Reusing them would let a completed capture
 		// depend on an origin that is still mutable or was never sealed. Reuse only
-		// origins whose immutability is already established. Standalone captures
+		// origins whose immutability is already established, and the shared
+		// images the branch was restored from, once claimed. Standalone captures
 		// are serialized by the foreground gate and retain their local behavior.
-		states = []ttcsnapshot.SnapshotState{ttcsnapshot.SnapshotSealedVolatile}
+		var release func()
+		reuse, release = b.captureReuse(prefix, images)
+		defer release()
 	}
-	result, err := ttcchunk.ImportGraphCaptureWithReusableStates(stream, b.snapshotGraph, b.snapshotData, origin, prefix, states)
+	result, err := ttcchunk.ImportGraphCaptureReusing(stream, b.snapshotGraph, b.snapshotData, origin, prefix, reuse)
 	if err != nil {
 		return ttcchunk.GraphImportResult{}, err
 	}
@@ -15570,7 +15573,7 @@ func (b *runtimeBackend) persistDehydration(target selector, info ttcbundle.Cont
 	// family's own, and other commands go on meanwhile.
 	if err := b.withoutLifecycleLock(info, longOperation{branch: target.branch, state: "dehydrating", shown: true}, func() error {
 		go func() {
-			result, importErr := b.importGraphCapture(reader, origin, prefix)
+			result, importErr := b.importGraphCapture(reader, origin, prefix, branchCaptureImages(persistentBranch)...)
 			_ = reader.Close()
 			imported <- graphImportOutcome{result: result, err: importErr}
 		}()

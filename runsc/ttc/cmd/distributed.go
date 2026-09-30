@@ -2054,8 +2054,9 @@ func (b *runtimeBackend) exportDistributedGraph(containerID, transactionID strin
 	}
 	imported := make(chan importResult, 1)
 	prefix := fmt.Sprintf("remote/%d/%s", origin, transactionID)
+	images := b.distributedExportImages(containerID, transactionID)
 	go func() {
-		capture, importErr := b.importGraphCapture(reader, origin, prefix)
+		capture, importErr := b.importGraphCapture(reader, origin, prefix, images...)
 		_ = reader.Close()
 		imported <- importResult{capture: capture, err: importErr}
 	}()
@@ -2172,6 +2173,29 @@ func (b *runtimeBackend) exportDistributedGraph(containerID, transactionID strin
 		GraphManifest: manifestRelative, GraphSnapshot: uint64(origin),
 		GraphRootObjects: strings.Join(rootObjects, ","),
 	}, rootNames, rootObjects, nil
+}
+
+// distributedExportImages returns the image the source branch of transaction,
+// in containerID, was restored from, whose pages its export may share.
+func (b *runtimeBackend) distributedExportImages(containerID, transactionID string) []captureImage {
+	tx, err := b.distributedSource.transactions.Load(transactionID)
+	if err != nil {
+		return nil
+	}
+	branchID := tx.SourcePhysicalBranch
+	if branchID == "" {
+		branchID = tx.Identity.SourceBranch
+	}
+	info, err := b.containerStore().LoadContainer(containerID)
+	if err != nil {
+		return nil
+	}
+	for _, branch := range info.Branches {
+		if branch.ID == branchID {
+			return branchCaptureImages(branch)
+		}
+	}
+	return nil
 }
 
 // publishGraphManifestDependencies makes every immutable chunk named by a

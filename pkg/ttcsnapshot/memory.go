@@ -10,7 +10,9 @@ import (
 	"errors"
 	"fmt"
 	"hash/maphash"
+	"math"
 	"math/bits"
+	"os"
 	"slices"
 	"sort"
 )
@@ -490,9 +492,9 @@ func (s *Store) releaseMemoryPageLocked(identity MemoryPageIdentity, location Me
 }
 
 // memoryPageLocationLocked returns where the graph holds the page with
-// identity in an origin whose state is in allowed, choosing the least chunk
-// when there are several.
-func (s *Store) memoryPageLocationLocked(identity MemoryPageIdentity, allowed map[SnapshotState]struct{}, origins map[SnapshotID]bool) (MemoryPageLocation, bool) {
+// identity in an origin reuse allows, choosing the least chunk when there are
+// several.
+func (s *Store) memoryPageLocationLocked(identity MemoryPageIdentity, reuse reuseFilter, origins map[SnapshotID]bool) (MemoryPageLocation, bool) {
 	holding, ok := s.memoryPages[identity]
 	if !ok {
 		return MemoryPageLocation{}, false
@@ -505,7 +507,7 @@ func (s *Store) memoryPageLocationLocked(identity MemoryPageIdentity, allowed ma
 		origin := candidate.location.Chunk.Snapshot
 		permitted, known := origins[origin]
 		if !known {
-			permitted = s.originAllowedLocked(origin, allowed)
+			permitted = s.originAllowedLocked(origin, reuse)
 			origins[origin] = permitted
 		}
 		if !permitted {
@@ -522,15 +524,18 @@ func (s *Store) memoryPageLocationLocked(identity MemoryPageIdentity, allowed ma
 	return selected, found
 }
 
-func (s *Store) originAllowedLocked(origin SnapshotID, allowed map[SnapshotState]struct{}) bool {
-	if len(allowed) == 0 {
+func (s *Store) originAllowedLocked(origin SnapshotID, reuse reuseFilter) bool {
+	if _, ok := reuse.origins[origin]; ok {
+		return true
+	}
+	if len(reuse.states) == 0 {
 		return true
 	}
 	snapshot, ok := s.state.Snapshots[snapshotKey(origin)]
 	if !ok {
 		return false
 	}
-	_, ok = allowed[snapshot.State]
+	_, ok = reuse.states[snapshot.State]
 	return ok
 }
 
@@ -548,12 +553,12 @@ func (s *Store) memoryTableKey(data []byte, children []Edge) uint64 {
 	return hash.Sum64()
 }
 
-// existingMemoryTableLocked returns a live table, in an origin whose state is
-// in allowed, with exactly data and children.
-func (s *Store) existingMemoryTableLocked(data []byte, children []Edge, allowed map[SnapshotState]struct{}) (ObjectID, bool) {
+// existingMemoryTableLocked returns a live table, in an origin reuse allows,
+// with exactly data and children.
+func (s *Store) existingMemoryTableLocked(data []byte, children []Edge, reuse reuseFilter) (ObjectID, bool) {
 	for _, id := range s.memoryTables[s.memoryTableKey(data, children)] {
 		table, ok := s.state.Objects[id.key()]
-		if !ok || !memoryObjectIndexable(table) || !s.originAllowedLocked(id.Snapshot, allowed) {
+		if !ok || !memoryObjectIndexable(table) || !s.originAllowedLocked(id.Snapshot, reuse) {
 			continue
 		}
 		if bytes.Equal(table.Data, data) && slices.Equal(table.Children, children) {
@@ -563,30 +568,62 @@ func (s *Store) existingMemoryTableLocked(data []byte, children []Edge, allowed 
 	return ObjectID{}, false
 }
 
-// reusableStateSet is the set of reusableStates; an empty set accepts every
-// origin.
-func reusableStateSet(reusableStates []SnapshotState) (map[SnapshotState]struct{}, error) {
-	allowed := make(map[SnapshotState]struct{}, len(reusableStates))
-	for _, state := range reusableStates {
-		if !state.valid() {
-			return nil, fmt.Errorf("invalid reusable memory snapshot state %q", state)
-		}
-		allowed[state] = struct{}{}
-	}
-	return allowed, nil
+// ErrObjectReclaiming is returned by AdoptSharedMemory for an object the graph
+// let go of and has not collected yet: a record is not taken back once its
+// count reached zero, so Collect it first.
+var ErrObjectReclaiming = errors.New("TTC graph object is being reclaimed")
+
+// MemoryReuse selects the origins whose pages and tables a capture may share:
+// those whose state is one of States, any live origin if States is empty, and
+// those of Origins whatever their state. A shared origin's objects are counted
+// by its shared ledger, which knows nothing of the references a graph's own
+// objects hold of them: a caller names one in Origins only while it holds a
+// claim there on what the capture may share, as on what AdoptSharedMemory
+// adopted of it.
+type MemoryReuse struct {
+	States  []SnapshotState
+	Origins []SnapshotID
 }
 
-// HoldMemoryPages returns where the graph holds each page of identities, in
-// an origin whose state is one of reusableStates (any live origin if none are
-// given), and the zero location for those it does not hold. Every chunk it
-// returns is pinned under pinPrefix in the same transaction, so that none is
-// collected before a capture's tables refer to it; DeletePins removes the pins
-// it returns.
+// reuseFilter is a MemoryReuse as sets: an empty states accepts every origin.
+type reuseFilter struct {
+	states  map[SnapshotState]struct{}
+	origins map[SnapshotID]struct{}
+}
+
+func (reuse MemoryReuse) filter() (reuseFilter, error) {
+	filter := reuseFilter{states: make(map[SnapshotState]struct{}, len(reuse.States))}
+	for _, state := range reuse.States {
+		if !state.valid() {
+			return reuseFilter{}, fmt.Errorf("invalid reusable memory snapshot state %q", state)
+		}
+		filter.states[state] = struct{}{}
+	}
+	if len(reuse.Origins) != 0 {
+		filter.origins = make(map[SnapshotID]struct{}, len(reuse.Origins))
+		for _, origin := range reuse.Origins {
+			filter.origins[origin] = struct{}{}
+		}
+	}
+	return filter, nil
+}
+
+// HoldMemoryPages is HoldMemoryPagesReusing for the origins whose state is
+// one of reusableStates, any live origin if none are given.
 func (s *Store) HoldMemoryPages(pinPrefix string, identities []MemoryPageIdentity, reusableStates ...SnapshotState) ([]MemoryPageLocation, []string, error) {
+	return s.HoldMemoryPagesReusing(pinPrefix, identities, MemoryReuse{States: reusableStates})
+}
+
+// HoldMemoryPagesReusing returns where the graph holds each page of
+// identities, in an origin reuse selects, and the zero location for those it
+// does not hold. Every chunk it returns is pinned under pinPrefix in the same
+// transaction, so that none is collected before a capture's tables refer to
+// it; DeletePins removes the pins it returns.
+func (s *Store) HoldMemoryPagesReusing(pinPrefix string, identities []MemoryPageIdentity, reuse MemoryReuse) ([]MemoryPageLocation, []string, error) {
 	if err := validateRootName(pinPrefix); err != nil {
 		return nil, nil, err
 	}
-	allowed, err := reusableStateSet(reusableStates)
+	allowed, err := reuse.filter()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -623,18 +660,24 @@ func (s *Store) HoldMemoryPages(pinPrefix string, identities []MemoryPageIdentit
 	return locations, names, nil
 }
 
-// CommitMemoryTables maps each of tables in its tree in the working snapshot
-// origin, in one durable transaction. A table with the same pages as a live
-// one, in an origin whose state is one of reusableStates (any live origin if
-// none are given), shares it rather than being written again. chunks are the
-// bulk chunks that tables refer to and the graph does not have yet: reserved
-// in origin with ReserveObjects, installed, and made durable. Every chunk
-// tables refer to must be one of them or be held, as by HoldMemoryPages.
+// CommitMemoryTables is CommitMemoryTablesReusing for the origins whose state
+// is one of reusableStates, any live origin if none are given.
 func (s *Store) CommitMemoryTables(origin SnapshotID, tables []NewMemoryTable, chunks []ObjectID, reusableStates ...SnapshotState) error {
+	return s.CommitMemoryTablesReusing(origin, tables, chunks, MemoryReuse{States: reusableStates})
+}
+
+// CommitMemoryTablesReusing maps each of tables in its tree in the working
+// snapshot origin, in one durable transaction. A table with the same pages as
+// a live one, in an origin reuse selects, shares it rather than being written
+// again. chunks are the bulk chunks that tables refer to and the graph does not
+// have yet: reserved in origin with ReserveObjects, installed, and made
+// durable. Every chunk tables refer to must be one of them or be held, as by
+// HoldMemoryPagesReusing.
+func (s *Store) CommitMemoryTablesReusing(origin SnapshotID, tables []NewMemoryTable, chunks []ObjectID, reuse MemoryReuse) error {
 	if len(tables) == 0 {
 		return errors.New("cannot commit an empty TTC memory table batch")
 	}
-	allowed, err := reusableStateSet(reusableStates)
+	allowed, err := reuse.filter()
 	if err != nil {
 		return err
 	}
@@ -698,6 +741,153 @@ func (s *Store) CommitMemoryTables(origin SnapshotID, tables []NewMemoryTable, c
 		return err
 	}
 	return mutation.commitRoots(roots)
+}
+
+// AdoptSharedMemory adds to the graph tables, memory tables of shared origins,
+// and those of chunks that they refer to, as far as the graph lacks them, and
+// pins each of tables under pinPrefix, in one transaction. The graph records
+// their origins as shared, whose objects the shared ledger counts: it counts
+// only the references it holds itself. A capture may then share the tables,
+// and the pages in them, with MemoryReuse naming their origins, as it shares
+// the node's own; the caller holds a claim at the shared ledger on what it
+// adopts while the graph refers to it. Every chunk a table refers to must be
+// one of chunks or be in the graph already. It returns the pins, which
+// DeletePins removes.
+func (s *Store) AdoptSharedMemory(pinPrefix string, tables, chunks []Object) ([]string, error) {
+	if err := validateRootName(pinPrefix); err != nil {
+		return nil, err
+	}
+	if len(tables) == 0 {
+		return nil, nil
+	}
+	offered := make(map[ObjectID]Object, len(chunks))
+	for _, chunk := range chunks {
+		if chunk.ID.Kind != ObjectKindMemoryChunk || chunk.BulkLength == 0 || chunk.BulkLength > MemoryChunkBytes || len(chunk.Data) != 0 || len(chunk.Children) != 0 || chunk.Deferred {
+			return nil, fmt.Errorf("object %s is not a memory chunk", chunk.ID.key())
+		}
+		offered[chunk.ID] = chunk
+	}
+	sorted := slices.Clone(tables)
+	slices.SortFunc(sorted, func(a, b Object) int { return compareObjectIDs(a.ID, b.ID) })
+	for index, table := range sorted {
+		if index != 0 && table.ID == sorted[index-1].ID {
+			return nil, fmt.Errorf("memory table %s is adopted twice", table.ID.key())
+		}
+		if _, err := decodeMemoryTable(table); err != nil {
+			return nil, err
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// added are the objects the graph lacks, with the references the
+	// adoption gives them; touched, those it has, with theirs.
+	added := make(map[ObjectID]Object)
+	touched := make(map[ObjectID]Object)
+	reference := func(id ObjectID) error {
+		if object, ok := added[id]; ok {
+			object.Refs++
+			added[id] = object
+			return nil
+		}
+		object, ok := touched[id]
+		if !ok {
+			if object, ok = s.state.Objects[id.key()]; !ok {
+				return os.ErrNotExist
+			}
+		}
+		if object.State != ObjectLive {
+			return fmt.Errorf("object %s: %w", id.key(), ErrObjectReclaiming)
+		}
+		if object.Refs == math.MaxUint64 {
+			return fmt.Errorf("object %s cannot be retained", id.key())
+		}
+		object.Refs++
+		touched[id] = object
+		return nil
+	}
+	pins := make(map[string]ObjectID, len(sorted))
+	names := make([]string, 0, len(sorted))
+	for _, table := range sorted {
+		name := pinPrefix + "/" + table.ID.key()
+		if _, exists := s.state.Pins[name]; exists {
+			return nil, fmt.Errorf("pin %q already exists", name)
+		}
+		pins[name] = table.ID
+		names = append(names, name)
+		if existing, ok := s.state.Objects[table.ID.key()]; ok {
+			if !bytes.Equal(existing.Data, table.Data) || !slices.Equal(existing.Children, table.Children) {
+				return nil, fmt.Errorf("memory table %s differs from the graph's", table.ID.key())
+			}
+			if err := reference(table.ID); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		added[table.ID] = Object{ID: table.ID, State: ObjectLive, Refs: 1, Data: slices.Clone(table.Data), Children: slices.Clone(table.Children)}
+		for _, edge := range table.Children {
+			err := reference(edge.Child)
+			if errors.Is(err, os.ErrNotExist) {
+				chunk, ok := offered[edge.Child]
+				if !ok {
+					return nil, fmt.Errorf("memory table %s refers to chunk %s, which is not adopted", table.ID.key(), edge.Child.key())
+				}
+				added[edge.Child] = Object{ID: chunk.ID, State: ObjectLive, Refs: 1, BulkLength: chunk.BulkLength}
+				err = nil
+			}
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	// The origins of what is added are shared: recorded so, or recorded
+	// anew, each up to its greatest ordinal.
+	next := make(map[SnapshotID]uint64)
+	for id := range added {
+		next[id.Snapshot] = max(next[id.Snapshot], id.Ordinal+1)
+	}
+	var ops []journalOp
+	origins := make([]SnapshotID, 0, len(next))
+	for origin := range next {
+		origins = append(origins, origin)
+	}
+	slices.Sort(origins)
+	nextSnapshot := s.state.NextSnapshot
+	for _, origin := range origins {
+		snapshot, ok := s.state.Snapshots[snapshotKey(origin)]
+		if ok && snapshot.State != SnapshotShared {
+			return nil, fmt.Errorf("snapshot %d is %s, not shared", origin, snapshot.State)
+		}
+		if ok && snapshot.NextOrdinal >= next[origin] {
+			continue
+		}
+		snapshot = Snapshot{ID: origin, State: SnapshotShared, NextOrdinal: max(snapshot.NextOrdinal, next[origin])}
+		ops = append(ops, journalOp{PutSnapshot: &snapshot})
+		if origin >= nextSnapshot {
+			nextSnapshot = origin + 1
+		}
+	}
+	if nextSnapshot != s.state.NextSnapshot {
+		ops = append(ops, journalOp{SetNextSnapshot: &nextSnapshot})
+	}
+	for _, objects := range []map[ObjectID]Object{added, touched} {
+		ids := make([]ObjectID, 0, len(objects))
+		for id := range objects {
+			ids = append(ids, id)
+		}
+		slices.SortFunc(ids, compareObjectIDs)
+		for _, id := range ids {
+			object := objects[id]
+			ops = append(ops, journalOp{PutObject: &object})
+		}
+	}
+	for _, name := range names {
+		id := pins[name]
+		ops = append(ops, journalOp{PinName: name, PutPin: &id})
+	}
+	if err := s.commitLocked(ops); err != nil {
+		return nil, err
+	}
+	return names, nil
 }
 
 // rewriteMemoryTree path-copies the memory node at level, down to the nodes

@@ -31,6 +31,9 @@ const (
 	// handed off, which keeps what its graph still references of the origin;
 	// see recordProviderReferences.
 	graphReferencePurposeProvider = "provider"
+	// graphReferencePurposeCapture is a node's own claim on a shared image
+	// whose pages its captures share; see claimCaptureImage.
+	graphReferencePurposeCapture = "capture"
 )
 
 type graphReferenceIntent struct {
@@ -46,6 +49,10 @@ type graphReferenceIntent struct {
 	// Repository names, for a provider claim, the filesystem repository whose
 	// graph the claim keeps references of; empty, the node's memory graph.
 	Repository string `json:"repository,omitempty"`
+	// Origins are, for a capture claim, the origins of every object its roots
+	// reach: the node's memory graph may share any of them, and the claim is
+	// kept while it refers to one.
+	Origins []uint64 `json:"origins,omitempty"`
 }
 
 type graphReferenceGroup struct {
@@ -82,6 +89,10 @@ func readGraphReferenceIntent(path string) (graphReferenceIntent, error) {
 	case graphReferencePurposeProvider:
 		// The node, not a branch, owns a provider claim.
 		valid = valid && intent.Container == "" && intent.Branch == "" && len(intent.Groups) == 1
+	case graphReferencePurposeCapture:
+		// And a capture claim.
+		valid = valid && intent.Container == "" && intent.Branch == "" && len(intent.Groups) == 1 &&
+			intent.Repository == "" && len(intent.Origins) != 0
 	default:
 		valid = false
 	}
@@ -464,7 +475,7 @@ func (b *runtimeBackend) reconcileDistributedGraphReferences(strictRetain bool) 
 			retryable = errors.Join(retryable, fmt.Errorf("reading graph reference intent %q: %w", entry.Name(), err))
 			continue
 		}
-		if intent.Purpose == graphReferencePurposeProvider {
+		if intent.Purpose == graphReferencePurposeProvider || intent.Purpose == graphReferencePurposeCapture {
 			// See reconcileProviderClaims.
 			continue
 		}
@@ -661,9 +672,10 @@ func (b *runtimeBackend) mutateGraphReferenceGroup(ctx context.Context, intent g
 // mutate only their exact retained root names, so cluster membership and the
 // immutable object bindings are their authority. Transfer intents remain
 // transaction-fenced even though their operation carries a prefix. A provider
-// claim has no transaction; its unguessable operation is its authority too.
+// or capture claim has no transaction; its unguessable operation is its
+// authority too.
 func graphReferenceAuthorizationTransaction(intent graphReferenceIntent) string {
-	if intent.Purpose == graphReferencePurposeProvider {
+	if intent.Purpose == graphReferencePurposeProvider || intent.Purpose == graphReferencePurposeCapture {
 		return ""
 	}
 	if intent.Purpose == graphReferencePurposeBranch && intent.Operation != intent.Transaction && !graphHandoffReferenceIntent(intent) {
@@ -1051,8 +1063,9 @@ func (p *branchPublisher) retainAtSharedLedger(ctx context.Context, origin ttcsn
 	return nil
 }
 
-// reconcileProviderClaims reconciles every provider claim of this node; see
-// reconcileProviderReferences. The handoff that records a claim retains it
+// reconcileProviderClaims reconciles every provider claim of this node, see
+// reconcileProviderReferences, and every capture claim, see
+// reconcileCaptureClaim. The handoff that records a claim retains it
 // before it commits, so execution waits for none, and it needs no lock of the
 // node's: releasing a claim waits for the shared-reference coordinator,
 // which a node's start may be what brings back, and during a failover for a
@@ -1071,7 +1084,8 @@ func (b *runtimeBackend) reconcileProviderClaims() error {
 	}
 	var result error
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "provider-") || filepath.Ext(entry.Name()) != ".json" {
+		provider, capture := strings.HasPrefix(entry.Name(), "provider-"), strings.HasPrefix(entry.Name(), captureClaimPrefix)
+		if entry.IsDir() || !provider && !capture || filepath.Ext(entry.Name()) != ".json" {
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())
@@ -1079,11 +1093,14 @@ func (b *runtimeBackend) reconcileProviderClaims() error {
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
-		if err == nil && intent.Purpose == graphReferencePurposeProvider {
+		if err == nil && provider && intent.Purpose == graphReferencePurposeProvider {
 			err = b.reconcileProviderReferences(path, intent)
 		}
+		if err == nil && capture && intent.Purpose == graphReferencePurposeCapture {
+			err = b.reconcileCaptureClaim(path, intent)
+		}
 		if err != nil {
-			result = errors.Join(result, fmt.Errorf("reconciling provider claim %q: %w", entry.Name(), err))
+			result = errors.Join(result, fmt.Errorf("reconciling claim %q: %w", entry.Name(), err))
 		}
 	}
 	return result

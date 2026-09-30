@@ -81,7 +81,7 @@ func importSnapshotGraph(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataSt
 }
 
 func importSnapshotGraphWithReusableStates(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, origin ttcsnapshot.SnapshotID, manifest Manifest, rootPrefix string, getChunk func(ID) (Chunk, error), reusableStates []ttcsnapshot.SnapshotState) (GraphImportResult, error) {
-	return importCapture(graph, data, origin, manifest, rootPrefix, captureSource{chunk: getChunk}, reusableStates)
+	return importCapture(graph, data, origin, manifest, rootPrefix, captureSource{chunk: getChunk}, ttcsnapshot.MemoryReuse{States: reusableStates})
 }
 
 // captureSource yields the pages of a capture's objects to an import.
@@ -191,7 +191,7 @@ func ReleaseHeldPagePins(graph *ttcsnapshot.Store, pins []string) error {
 // so is any table they fill exactly; only the others are read from source.
 // New pages are packed into as few new chunks as hold them, and mapped once
 // all are durable, in bounded transactions.
-func importCapture(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, origin ttcsnapshot.SnapshotID, manifest Manifest, rootPrefix string, source captureSource, reusableStates []ttcsnapshot.SnapshotState) (_ GraphImportResult, retErr error) {
+func importCapture(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, origin ttcsnapshot.SnapshotID, manifest Manifest, rootPrefix string, source captureSource, reuse ttcsnapshot.MemoryReuse) (_ GraphImportResult, retErr error) {
 	if graph == nil || data == nil || origin == 0 || rootPrefix == "" || source.chunk == nil {
 		return GraphImportResult{}, errors.New("invalid TTC memory graph import")
 	}
@@ -238,7 +238,7 @@ func importCapture(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, o
 			identities = append(identities, object.slots[index].identity)
 		}
 	}
-	locations, held, err := graph.HoldMemoryPages(rootPrefix+"/"+heldPinComponent, identities, reusableStates...)
+	locations, held, err := graph.HoldMemoryPagesReusing(rootPrefix+"/"+heldPinComponent, identities, reuse)
 	if err != nil {
 		return GraphImportResult{}, err
 	}
@@ -372,7 +372,7 @@ func importCapture(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, o
 			for _, table := range newChunks[begin:end] {
 				chunks = append(chunks, table...)
 			}
-			if err := graph.CommitMemoryTables(origin, tables[begin:end], chunks, reusableStates...); err != nil {
+			if err := graph.CommitMemoryTablesReusing(origin, tables[begin:end], chunks, reuse); err != nil {
 				return fmt.Errorf("committing graph memory tables: %w", err)
 			}
 			if err := checkpointGraphImportIfNeeded(graph, graphImportCheckpointBytes); err != nil {

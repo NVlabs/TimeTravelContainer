@@ -303,10 +303,16 @@ func ImportGraphCapture(r io.Reader, graph *ttcsnapshot.Store, data *ttcsnapshot
 // ImportGraphCaptureWithReusableStates imports a capture while limiting
 // stable-page reuse to the specified snapshot authority states. Passing nil
 // retains the standalone behavior of reusing every live immutable page.
+func ImportGraphCaptureWithReusableStates(r io.Reader, graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, origin ttcsnapshot.SnapshotID, rootPrefix string, reusableStates []ttcsnapshot.SnapshotState) (GraphImportResult, error) {
+	return ImportGraphCaptureReusing(r, graph, data, origin, rootPrefix, ttcsnapshot.MemoryReuse{States: reusableStates})
+}
+
+// ImportGraphCaptureReusing imports a capture, sharing the pages and tables
+// the graph holds of the origins reuse selects.
 //
 // A filtered capture, from WriteFilteredGraphCapture, needs r to be a two-way
 // stream: the import writes to it which pages the graph lacks.
-func ImportGraphCaptureWithReusableStates(r io.Reader, graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, origin ttcsnapshot.SnapshotID, rootPrefix string, reusableStates []ttcsnapshot.SnapshotState) (GraphImportResult, error) {
+func ImportGraphCaptureReusing(r io.Reader, graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, origin ttcsnapshot.SnapshotID, rootPrefix string, reuse ttcsnapshot.MemoryReuse) (GraphImportResult, error) {
 	if r == nil {
 		return GraphImportResult{}, errors.New("graph memory capture reader is nil")
 	}
@@ -408,7 +414,7 @@ func ImportGraphCaptureWithReusableStates(r io.Reader, graph *ttcsnapshot.Store,
 		}
 		return nil
 	}
-	return importCapture(graph, data, origin, manifest, rootPrefix, source, reusableStates)
+	return importCapture(graph, data, origin, manifest, rootPrefix, source, reuse)
 }
 
 // readGraphCaptureObject reads the next object of a capture stream, which

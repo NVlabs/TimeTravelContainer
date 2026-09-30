@@ -507,6 +507,96 @@ func TestProviderClaimKeepsTheNodesOwnReferences(t *testing.T) {
 	}
 }
 
+// A capture claim is the node's, is reported to the coordinator like any
+// claim, and is kept while the node's memory graph refers to an origin its
+// image reaches.
+func TestCaptureClaim(t *testing.T) {
+	localRoot := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(t.TempDir(), "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := graph.CreateObject(origin, "capture/adopted/0/held/x", ttcsnapshot.ObjectKindMetadata, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	operation := captureClaimPrefix + "0000000000000007-op"
+	path, err := graphReferenceIntentPath(localRoot, operation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := graphReferenceIntent{
+		Version: graphReferenceIntentVersion, Transaction: operation, Operation: operation,
+		Purpose: graphReferencePurposeCapture, State: "active", CreatedAt: time.Now().UTC(),
+		Groups:  []graphReferenceGroup{{Origin: 7, Roots: []cluster.SnapshotRootBinding{{Slot: 0, Object: "0000000000000007-04-0000000000000001"}}, Retained: true}},
+		Origins: []uint64{7, uint64(origin)},
+	}
+	if err := writeDurableJSON(path, &intent); err != nil {
+		t.Fatal(err)
+	}
+	read, err := readGraphReferenceIntent(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if graphReferenceAuthorizationTransaction(read) != "" {
+		t.Fatal("a capture claim names a transaction to authorize")
+	}
+	service := &sharedReferenceService{localRoot: localRoot, nodeID: "node-a", incarnation: "boot-a"}
+	inventory, err := service.SnapshotReferenceInventory(context.Background(), "coordinator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inventory.Claims) != 1 || inventory.Claims[0].Origin != 7 || inventory.Claims[0].Operation != operation {
+		t.Fatalf("inventory claims = %+v, want the capture claim on origin 7", inventory.Claims)
+	}
+	for _, malformed := range []func(*graphReferenceIntent){
+		func(intent *graphReferenceIntent) { intent.Origins = nil },
+		func(intent *graphReferenceIntent) { intent.Container = "family" },
+		func(intent *graphReferenceIntent) { intent.Groups = append(intent.Groups, intent.Groups[0]) },
+	} {
+		bad := read
+		bad.Groups = append([]graphReferenceGroup(nil), read.Groups...)
+		malformed(&bad)
+		badPath := filepath.Join(t.TempDir(), "bad.json")
+		if err := writeDurableJSON(badPath, &bad); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readGraphReferenceIntent(badPath); err == nil {
+			t.Fatalf("malformed capture claim %+v was read", bad)
+		}
+	}
+	// Kept while the graph pins what an origin of it holds...
+	backend := &runtimeBackend{snapshotGraph: graph, distributedSource: &distributedSourceRuntime{}}
+	if err := backend.reconcileCaptureClaim(path, read); err != nil {
+		t.Fatal(err)
+	}
+	if kept, err := readGraphReferenceIntent(path); err != nil || kept.State != "active" {
+		t.Fatalf("a needed claim is %+v (%v)", kept, err)
+	}
+	// ... and checked again only later.
+	if err := graph.DeletePin("capture/adopted/0/held/x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.reconcileCaptureClaim(path, read); err != nil {
+		t.Fatal(err)
+	}
+	if kept, err := readGraphReferenceIntent(path); err != nil || kept.State != "active" {
+		t.Fatalf("a claim checked before its time is %+v (%v)", kept, err)
+	}
+	backend.distributedSource.providerChecks.Delete(operation)
+	if err := backend.reconcileCaptureClaim(path, read); err != nil {
+		t.Fatal(err)
+	}
+	released, err := readGraphReferenceIntent(path)
+	if err != nil || released.State != "releasing" || !released.Groups[0].Retained {
+		t.Fatalf("an unneeded claim is %+v (%v), want it releasing", released, err)
+	}
+}
+
 func TestProviderReferencesNeeded(t *testing.T) {
 	object := ttcsnapshot.ObjectID{Snapshot: 7}
 	for _, test := range []struct {

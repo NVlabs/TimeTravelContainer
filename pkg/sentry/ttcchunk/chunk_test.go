@@ -310,6 +310,101 @@ func TestFilteredGraphCaptureSendsOnlyWhatTheGraphLacks(t *testing.T) {
 	}
 }
 
+// A capture shares the pages of a shared image that its graph adopted, from
+// another node's graph, only while the caller names the image's origin.
+func TestFilteredGraphCaptureSharesAnAdoptedImage(t *testing.T) {
+	first := testChunk()
+	second := testChunk()
+	second.Pages[2] = Page{Slot: 255, Version: pgalloc.PageVersionID{Allocator: testAllocator(3), Sequence: 1000}, Data: bytes.Repeat([]byte{0x77}, hostarch.PageSize)}
+	object := graphCaptureObjectID(1)
+	open := func(name string) (*ttcsnapshot.Store, *ttcsnapshot.LocalDataStore) {
+		directory := filepath.Join(t.TempDir(), name)
+		graph, err := ttcsnapshot.Open(filepath.Join(directory, "graph"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { graph.Close() })
+		data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(directory, "objects"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { data.Close() })
+		return graph, data
+	}
+	capture := func(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, origin ttcsnapshot.SnapshotID, prefix string, chunk Chunk, reuse ttcsnapshot.MemoryReuse) (GraphImportResult, [slotBitmapBytes]byte) {
+		daemon, sentry := net.Pipe()
+		answered := filteredSentry(sentry, chunk, object)
+		result, err := ImportGraphCaptureReusing(daemon, graph, data, origin, prefix, reuse)
+		daemon.Close()
+		answer := <-answered
+		if err != nil {
+			t.Fatalf("capture into %s: %v", prefix, err)
+		}
+		return result, answer
+	}
+	// The image, as another node published it.
+	provider, providerData := open("provider")
+	if err := provider.AdoptWorking(100); err != nil {
+		t.Fatal(err)
+	}
+	image, _ := capture(provider, providerData, 100, "image", first, ttcsnapshot.MemoryReuse{})
+	if err := provider.Seal(100, ttcsnapshot.SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	objects, err := provider.SnapshotObjects(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tables, chunks []ttcsnapshot.Object
+	for _, object := range objects {
+		switch object.ID.Kind {
+		case ttcsnapshot.ObjectKindMemoryTable:
+			tables = append(tables, object)
+		case ttcsnapshot.ObjectKindMemoryChunk:
+			chunks = append(chunks, object)
+		}
+	}
+	shared := memoryLocations(t, provider, image.Roots[0].Root)
+	graph, data := open("consumer")
+	pins, err := graph.AdoptSharedMemory("capture/adopted/0/held", tables, chunks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	volatile := ttcsnapshot.MemoryReuse{States: []ttcsnapshot.SnapshotState{ttcsnapshot.SnapshotSealedVolatile}}
+	for i, test := range []struct {
+		reuse ttcsnapshot.MemoryReuse
+		asks  []uint8
+	}{
+		{reuse: volatile, asks: []uint8{0, 17, 255}},
+		{reuse: ttcsnapshot.MemoryReuse{States: volatile.States, Origins: []ttcsnapshot.SnapshotID{100}}, asks: []uint8{255}},
+	} {
+		origin, err := graph.AllocateWorking()
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, answer := capture(graph, data, origin, fmt.Sprintf("capture/%d", i), second, test.reuse)
+		var want [slotBitmapBytes]byte
+		for _, slot := range test.asks {
+			setBit(&want, slot)
+		}
+		if answer != want {
+			t.Fatalf("capture %d asked for slots %x, want %x", i, answer, want)
+		}
+		mapped := memoryLocations(t, graph, result.Roots[0].Root)
+		for _, index := range []uint64{0, 17} {
+			if reused := mapped[index] == shared[index]; reused != (len(test.asks) == 1) {
+				t.Fatalf("capture %d maps page %d at %v, the image at %v", i, index, mapped[index], shared[index])
+			}
+		}
+	}
+	if err := graph.DeletePins(pins); err != nil {
+		t.Fatal(err)
+	}
+	if _, edges := graph.OriginReferences(100); !edges {
+		t.Fatal("the capture's references of the image are not reported")
+	}
+}
+
 func TestFilteredGraphCaptureNeedsATwoWayStream(t *testing.T) {
 	chunk := testChunk()
 	var stream bytes.Buffer

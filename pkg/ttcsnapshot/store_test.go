@@ -1327,6 +1327,179 @@ func TestHoldMemoryPagesFiltersSnapshotAuthorityState(t *testing.T) {
 	}
 }
 
+// sharedTestMemory returns the tables and chunks of the memory tree root of a
+// store's origin 100, which maps pages 4 and 300, each in its own chunk: as
+// another node's graph published them.
+func sharedTestMemory(t *testing.T, root string) ([]Object, []Object) {
+	t.Helper()
+	provider := openTestStore(t)
+	if err := provider.AdoptWorking(100); err != nil {
+		t.Fatal(err)
+	}
+	commitTestMemory(t, provider, 100, root, 4)
+	commitTestMemory(t, provider, 100, root, 300)
+	if err := provider.Seal(100, SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	objects, err := provider.SnapshotObjects(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tables, chunks []Object
+	for _, object := range objects {
+		switch object.ID.Kind {
+		case ObjectKindMemoryTable:
+			tables = append(tables, object)
+		case ObjectKindMemoryChunk:
+			chunks = append(chunks, object)
+		}
+	}
+	if len(tables) != 2 || len(chunks) != 2 {
+		t.Fatalf("the provider has %d tables and %d chunks", len(tables), len(chunks))
+	}
+	return tables, chunks
+}
+
+// A graph adopts another node's shared memory tables, and a capture shares
+// them, or their pages, while its caller names their origin as reusable.
+func TestAdoptSharedMemory(t *testing.T) {
+	tables, chunks := sharedTestMemory(t, "provider/memory")
+	directory := t.TempDir()
+	store, err := Open(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pins, err := store.AdoptSharedMemory("capture/adopted/held", tables, chunks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pins) != 2 {
+		t.Fatalf("adoption pinned %v", pins)
+	}
+	// It is durable, and the graph it leaves is valid.
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if store, err = Open(directory); err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if snapshot, ok := store.Snapshot(100); !ok || snapshot.State != SnapshotShared {
+		t.Fatalf("the adopted origin is %+v", snapshot)
+	}
+	first, second := testPageIdentity(4), testPageIdentity(300)
+	if locations, held, err := store.HoldMemoryPagesReusing("hold/volatile", []MemoryPageIdentity{first}, MemoryReuse{States: []SnapshotState{SnapshotSealedVolatile}}); err != nil || !locations[0].Chunk.IsZero() || len(held) != 0 {
+		t.Fatalf("pages of an origin not named were found: %v, %v", locations, err)
+	}
+	reuse := MemoryReuse{States: []SnapshotState{SnapshotSealedVolatile}, Origins: []SnapshotID{100}}
+	locations, held, err := store.HoldMemoryPagesReusing("hold/adopted", []MemoryPageIdentity{first, second}, reuse)
+	if err != nil || locations[0].Chunk.Snapshot != 100 || locations[1].Chunk.Snapshot != 100 {
+		t.Fatalf("adopted pages are at %v (%v)", locations, err)
+	}
+	// A capture that did not change the first page's table shares it; one
+	// page changed in the second's is a new table, sharing the other page.
+	capture, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := store.ReserveObjects(capture, []ObjectKind{ObjectKindMemoryChunk})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitMemoryTablesReusing(capture, []NewMemoryTable{
+		{Root: "capture/memory", Index: 0, Entries: []MemoryTableEntry{{Slot: 4, Location: locations[0], Identity: first}}},
+		{Root: "capture/memory", Index: 256, Entries: []MemoryTableEntry{
+			{Slot: 44, Location: locations[1], Identity: second},
+			{Slot: 45, Location: MemoryPageLocation{Chunk: fresh[0], Page: 0}, Identity: testPageIdentity(301)},
+		}},
+	}, fresh, reuse); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeletePins(append(held, pins...)); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		collected, err := store.Collect(4096)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if collected == 0 {
+			break
+		}
+	}
+	entries := memoryEntriesByIndex(t, store, "capture/memory")
+	if entries[4].Location != locations[0] || entries[300].Location != locations[1] || entries[301].Location.Chunk != fresh[0] {
+		t.Fatalf("the capture maps %+v", entries)
+	}
+	var shared, own int
+	objects, err := store.SnapshotObjects(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, object := range objects {
+		if object.ID.Kind == ObjectKindMemoryTable {
+			shared++
+		}
+	}
+	captured, err := store.SnapshotObjects(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, object := range captured {
+		if object.ID.Kind == ObjectKindMemoryTable {
+			own++
+		}
+	}
+	// The unchanged table is the adopted one; the changed one's adopted
+	// table is collected, but not its chunk, which the new table shares.
+	if shared != 1 || own != 1 || len(objects) != 3 {
+		t.Fatalf("origin 100 keeps %d objects, %d tables; the capture has %d tables", len(objects), shared, own)
+	}
+	if _, edges := store.OriginReferences(100); !edges {
+		t.Fatal("the capture's edges into the adopted origin are not reported")
+	}
+	// Adopting again what the graph has pins it, and adds only what it lacks.
+	again, err := store.AdoptSharedMemory("again/adopted/held", tables, chunks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeletePins(again); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteRoot("capture/memory"); err != nil {
+		t.Fatal(err)
+	}
+	for store.Stats().Objects != 0 {
+		collected, err := store.Collect(4096)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if collected == 0 {
+			t.Fatalf("GC stalled with stats %+v", store.Stats())
+		}
+	}
+	if references, edges := store.OriginReferences(100); len(references) != 0 || edges {
+		t.Fatalf("after collection the graph references %v of origin 100 (edges %v)", references, edges)
+	}
+}
+
+func TestAdoptSharedMemoryRefusals(t *testing.T) {
+	tables, chunks := sharedTestMemory(t, "provider/memory")
+	store := openTestStore(t)
+	if _, err := store.AdoptSharedMemory("adopted/held", tables, chunks[:1]); err == nil {
+		t.Fatal("a table whose chunk was not given was adopted")
+	}
+	if err := store.AdoptWorking(100); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AdoptSharedMemory("adopted/held", tables, chunks); err == nil {
+		t.Fatal("objects of an origin the graph holds as its own were adopted as shared")
+	}
+	if stats := store.Stats(); stats.Objects != 0 || stats.Pins != 0 {
+		t.Fatalf("refused adoptions left %+v", stats)
+	}
+}
+
 // Trees written before tables, a Page object per page, are read, and their
 // pages shared with tables.
 func TestLegacyMemoryPagesAreReadAndShared(t *testing.T) {
@@ -3384,7 +3557,9 @@ func TestMemoryPageIndexCompacts(t *testing.T) {
 		memoryPages:          make(map[MemoryPageIdentity]memoryPageHolding),
 		memoryPagesElsewhere: make(map[MemoryPageIdentity][]memoryPageHolding),
 	}
-	identity := func(i int) MemoryPageIdentity { return MemoryPageIdentity{LogicalSequence: uint64(i), VersionSequence: 1} }
+	identity := func(i int) MemoryPageIdentity {
+		return MemoryPageIdentity{LogicalSequence: uint64(i), VersionSequence: 1}
+	}
 	here := MemoryPageLocation{Chunk: ObjectID{Snapshot: 1, Kind: ObjectKindMemoryChunk, Ordinal: 1}}
 	there := MemoryPageLocation{Chunk: ObjectID{Snapshot: 1, Kind: ObjectKindMemoryChunk, Ordinal: 2}}
 	const held, kept = 3 * memoryIndexCompaction, memoryIndexCompaction / 2
