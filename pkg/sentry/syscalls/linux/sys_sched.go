@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package linux
 
 import (
@@ -123,12 +126,28 @@ func SchedSetscheduler(t *kernel.Task, sysno uintptr, args arch.SyscallArguments
 	return 0, nil, nil
 }
 
+// schedPriorityRange returns the static priorities of policy, as Linux's
+// sched_get_priority_min(2) and sched_get_priority_max(2) do: real-time
+// policies have 1 to MAX_RT_PRIO-1, others only 0. Callers such as Android's
+// libbinder reject a real-time policy of priority 0.
+func schedPriorityRange(policy int32) (min, max uintptr, err error) {
+	switch policy {
+	case linux.SCHED_FIFO, linux.SCHED_RR:
+		return 1, 99, nil
+	case linux.SCHED_NORMAL, linux.SCHED_BATCH, linux.SCHED_IDLE, linux.SCHED_DEADLINE:
+		return onlyPriority, onlyPriority, nil
+	}
+	return 0, 0, linuxerr.EINVAL
+}
+
 // SchedGetPriorityMax implements linux syscall sched_get_priority_max(2).
 func SchedGetPriorityMax(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
-	return onlyPriority, nil, nil
+	_, max, err := schedPriorityRange(args[0].Int())
+	return max, nil, err
 }
 
 // SchedGetPriorityMin implements linux syscall sched_get_priority_min(2).
 func SchedGetPriorityMin(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
-	return onlyPriority, nil, nil
+	min, _, err := schedPriorityRange(args[0].Int())
+	return min, nil, err
 }
