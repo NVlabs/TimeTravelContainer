@@ -377,6 +377,8 @@ type daemonServer struct {
 	consoleClientMu      sync.Mutex
 	consoleClients       map[string]map[*daemonConsoleClient]struct{}
 	closingConsoleClient map[string]int
+	// gfx starts GPU renderers for sandboxes of --gfx families.
+	gfx *gfxService
 }
 
 // retireBeforeReply completes clustered identity retirement before a
@@ -2782,6 +2784,7 @@ func (s *daemonServer) configureVolumeBackend(backend *runtimeBackend) {
 	backend.snapshotShared = s.snapshotShared
 	backend.sharedReferences = s.sharedReferences
 	backend.portIngress = s.portIngress
+	backend.gfx = s.gfx
 	backend.lockLifecycle = func() func() { return s.lockDataRoot(backend.dataRoot) }
 	backend.operations = &s.operations
 }
@@ -6098,6 +6101,12 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 	}
 	server.portIngress = newPortIngressManager(server)
 	defer server.portIngress.Close()
+	run := daemonRunDir()
+	if run == "" {
+		run = filepath.Dir(socket)
+	}
+	server.gfx = newGFXService(run, !unsafeNoHostIsolation, stderr)
+	defer server.gfx.Close()
 	if err := compactDaemonMutations(server.mutationRoot(), daemonMutationRetention); err != nil && stderr != nil {
 		fmt.Fprintf(stderr, "ttcd: warning: compacting daemon mutation history: %v\n", err)
 	}

@@ -198,6 +198,10 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.String("nvproxy-allowed-driver-capabilities", "utility,compute", "Comma separated list of NVIDIA driver capabilities that are allowed to be requested by the container. If 'all' is specified here, it is resolved to all driver capabilities supported in nvproxy. If 'all' is requested by the container, it is resolved to this list.")
 	flagSet.Bool("rdmaproxy", false, "WIP: enable RDMA support for containers with /dev/infiniband/uverbs* devices.")
 	flagSet.Bool("tpuproxy", false, "LEGACY: enable support for TPU devices. TPU support gets automatically enabled if TPU devices are present in the OCI spec.")
+	flagSet.Bool("gfx", false, "enable the virtual GPU, /dev/dri/renderD128, whose renderers the sandbox's launcher starts.")
+	flagSet.String("gfx-fork", "ineligible", `what a fork does with the virtual GPU while it is in use: "ineligible", "device-lost", or "snapshot".`)
+	flagSet.String("gfx-capsets", "", "the capability sets of the virtual GPU's renderer, as the base64 of the JSON that ttc-gfx-renderer's probe prints.")
+	flagSet.String("gfx-broker", "", "the socket of the GPU renderers' broker, which runsc connects the Sentry to.")
 	flagSet.Bool("unsafe-no-host-isolation", hostDefaultUnsafeNoHostIsolation, "UNSAFE: run Sentry and gofer as the current user without host namespaces or chroots; intended only for trusted TimeTravelContainer workloads")
 
 	// Test flags, not to be used outside tests, ever.

@@ -13,6 +13,7 @@ go_library(
     srcs = [
         "clone_darwin.go",
         "clone_linux.go",
+        "gpu.go",
         "spec.go",
         "store.go",
     ],
@@ -41,6 +42,7 @@ go_test(
     size = "small",
     srcs = [
         "clone_test.go",
+        "gpu_test.go",
         "spec_test.go",
         "store_test.go",
     ],

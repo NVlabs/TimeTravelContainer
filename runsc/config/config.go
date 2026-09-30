@@ -397,6 +397,23 @@ type Config struct {
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`
 
+	// GFX enables the virtual GPU, /dev/dri/renderD128, whose renderers the
+	// sandbox's launcher starts (see pkg/sentry/devices/virtgpu).
+	GFX bool `flag:"gfx"`
+
+	// GFXFork is what a fork does with the virtual GPU while it is in use:
+	// "ineligible" refuses the fork, "device-lost" loses the GPU's state in
+	// the child, and "snapshot" forks it.
+	GFXFork string `flag:"gfx-fork"`
+
+	// GFXCapsets are the capability sets of the virtual GPU's renderer, as the
+	// base64 of the JSON that ttc-gfx-renderer's probe prints.
+	GFXCapsets string `flag:"gfx-capsets"`
+
+	// GFXBroker is the socket of the GPU renderers' broker, which runsc
+	// connects the Sentry to.
+	GFXBroker string `flag:"gfx-broker"`
+
 	// UnsafeNoHostIsolation runs the Sentry and gofer as the invoking user
 	// without placing either process in host namespaces or chroots. The Sentry
 	// still implements the guest's namespaces and credentials, but this option

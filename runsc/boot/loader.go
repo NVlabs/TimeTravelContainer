@@ -174,6 +174,9 @@ type containerInfo struct {
 
 	// useCPUNums indicates whether to use platform assigned CPU numbers as CPU numbers in the sentry.
 	useCPUNums bool
+
+	// gfxFD is the Sentry's connection to the GPU renderers' broker, or -1.
+	gfxFD int
 }
 
 type loaderState int
@@ -526,6 +529,9 @@ type Args struct {
 	// TTCVolumeFDs are ordered according to
 	// specutils.TTCVolumeRepositories(Args.Spec).
 	TTCVolumeFDs []int
+	// GFXFD is the Sentry's connection to the GPU renderers' broker, if the
+	// sandbox has the virtual GPU.
+	GFXFD int
 	// MountTarOnExitFDs and ready FDs are ordered by MountTarOnExitPaths.
 	MountTarOnExitFDs      []int
 	MountTarOnExitReadyFDs []int
@@ -730,6 +736,13 @@ func New(args Args) (*Loader, error) {
 			return nil, fmt.Errorf("rootfs upper tar file is mutually exclusive with filesystem checkpoint restore")
 		}
 		l.root.rootfsUpperTarFD = fd.New(args.RootfsUpperTarFD)
+	}
+	l.root.gfxFD = -1
+	if args.Conf.GFX {
+		if args.GFXFD < 0 {
+			return nil, fmt.Errorf("--gfx needs the connection to the GPU renderers' broker")
+		}
+		l.root.gfxFD = args.GFXFD
 	}
 	volumeConfigs, err := specutils.TTCVolumeRepositories(args.Spec)
 	if err != nil {

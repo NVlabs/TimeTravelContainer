@@ -115,6 +115,9 @@ type Boot struct {
 	// ttcVolumeFDs are repository directory FDs for TTC-managed volumes.
 	ttcVolumeFDs sandboxsetup.IntFlags
 
+	// gfxFD is the Sentry's connection to the GPU renderers' broker.
+	gfxFD int
+
 	// mountTarOnExitFDs and markers are ordered final snapshot outputs.
 	mountTarOnExitFDs      sandboxsetup.IntFlags
 	mountTarOnExitReadyFDs sandboxsetup.IntFlags
@@ -290,6 +293,7 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&b.execFD, "exec-fd", -1, "host file descriptor used for program execution.")
 	f.Var(&b.goferFilestoreFDs, "gofer-filestore-fds", "FDs to the regular files that will back the overlayfs or tmpfs mount if a gofer mount is to be overlaid.")
 	f.Var(&b.ttcVolumeFDs, "ttc-volume-fds", "ordered TTC managed-volume repository directory FDs")
+	f.IntVar(&b.gfxFD, "ttc-gfx-fd", -1, "the Sentry's connection to the GPU renderers' broker")
 	f.Var(&b.mountTarOnExitFDs, "mount-tar-on-exit-fds", "ordered final tar output FDs for shared mounts")
 	f.Var(&b.mountTarOnExitReadyFDs, "mount-tar-on-exit-ready-fds", "ordered completion marker FDs for final shared mount tar outputs")
 	f.Var(&b.goferMountConfs, "gofer-mount-confs", "information about how the gofer mounts have been configured.")
@@ -694,6 +698,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		FSRestoreCheckpointGofer: b.fsRestoreCheckpointGofer,
 		RootfsUpperTarFD:         b.rootfsUpperTarFD,
 		TTCVolumeFDs:             b.ttcVolumeFDs.GetArray(),
+		GFXFD:                    b.gfxFD,
 		MountTarOnExitFDs:        b.mountTarOnExitFDs.GetArray(),
 		MountTarOnExitReadyFDs:   b.mountTarOnExitReadyFDs.GetArray(),
 	}

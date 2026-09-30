@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -524,6 +525,8 @@ type PrepareOptions struct {
 	WaiveLiveFork      bool
 	LiveForkWaiver     string
 	Progress           images.ProgressFunc
+	// GPUOptions are the family's GPU devices.
+	GPUOptions
 	// VolumeCopyMode is the copy policy already verified by ttcd at startup.
 	// Empty permits Store-only callers to probe either supported mode.
 	VolumeCopyMode ttcvolume.CopyMode
@@ -851,6 +854,8 @@ type ContainerInfo struct {
 	// still exist in the authority. Such a record intentionally has no local branches;
 	// user-visible branch inventory is synthesized from placement authority.
 	DistributedCatalogOnly bool `json:"distributed_catalog_only,omitempty"`
+	// GPUOptions are the family's GPU devices.
+	GPUOptions
 }
 
 // IsDistributedPhysicalRuntime reports whether info is a node-local physical
@@ -1446,6 +1451,9 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if !liveForkEligible && opts.LiveForkWaiver == "" {
 		return Prepared{}, fmt.Errorf("ineligible container requires an explicit live fork waiver")
 	}
+	if err := ValidateGPUOptions(opts.GPUOptions, liveForkEligible, runtime.GOOS); err != nil {
+		return Prepared{}, err
+	}
 	opts.SpecOptions.WaiveLiveFork = opts.WaiveLiveFork
 	opts.ExtraHosts, err = ParseExtraHosts(opts.ExtraHosts)
 	if err != nil {
@@ -1600,6 +1608,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		NetworkIP:           opts.NetworkIP,
 		NetworkMAC:          opts.NetworkMAC,
 		PublishedPorts:      append([]PortBinding(nil), opts.PublishedPorts...),
+		GPUOptions:          opts.GPUOptions,
 		LogDriver:           logDriver,
 		LogOptions:          cloneStringMap(opts.LogOptions),
 		LogAttributes:       logAttributes,
@@ -3333,6 +3342,9 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 	}
 	if !info.LiveForkEligible && info.LiveForkWaiver == "" {
 		return ContainerInfo{}, fmt.Errorf("container %q is not live-fork eligible but has no waiver", key)
+	}
+	if err := checkGPURecord(info.GPUOptions, info.LiveForkEligible); err != nil {
+		return ContainerInfo{}, fmt.Errorf("container %q has invalid GPU options: %w", key, err)
 	}
 	if len(info.PublishedPorts) != 0 && networkMode != "ttc" {
 		return ContainerInfo{}, fmt.Errorf("container %q publishes ports with network mode %q", key, networkMode)

@@ -1496,14 +1496,81 @@ func parseNetworkMode(value string) (string, error) {
 	}
 }
 
-func liveForkWaiverReason(waived bool, networkMode string) string {
+func liveForkWaiverReason(waived bool, networkMode string, gpu ttcbundle.GPUOptions) string {
 	if !waived {
 		return ""
 	}
 	if networkMode == "host" {
 		return "explicit waiver for host networking"
 	}
+	if gpu.GFX && gpu.GFXFork == "" {
+		return "explicit waiver for the virtual GPU"
+	}
 	return "explicitly waived during container creation"
+}
+
+// gpuFlags are the GPU options of ttc run and ttc create.
+type gpuFlags struct {
+	gfx         *bool
+	gfxFork     *string
+	nvproxy     nvproxyFlag
+	nvproxyFork *string
+}
+
+func addGPUFlags(fs *flag.FlagSet) *gpuFlags {
+	f := &gpuFlags{}
+	f.gfx = fs.Bool("gfx", false, "give the container a virtual GPU, /dev/dri/renderD128")
+	f.gfxFork = fs.String("gfx-fork", "", "what a live fork does with the virtual GPU while it is in use: device-lost; without it, a --gfx family must waive live forks")
+	fs.Var(&f.nvproxy, "nvproxy", "give the container the host's NVIDIA GPUs; --nvproxy=CAPS limits the driver capabilities")
+	f.nvproxyFork = fs.String("nvproxy-fork", "", "what a live fork does with NVIDIA GPUs while they are in use: device-lost or snapshot")
+	return f
+}
+
+func (f *gpuFlags) options() ttcbundle.GPUOptions {
+	return ttcbundle.GPUOptions{
+		GFX:         *f.gfx,
+		GFXFork:     *f.gfxFork,
+		NVProxy:     f.nvproxy.enabled,
+		NVProxyCaps: f.nvproxy.caps,
+		NVProxyFork: *f.nvproxyFork,
+	}
+}
+
+// nvproxyFlag is --nvproxy[=CAPS].
+type nvproxyFlag struct {
+	enabled bool
+	caps    string
+}
+
+// String implements flag.Value.String.
+func (f *nvproxyFlag) String() string {
+	if f == nil || !f.enabled {
+		return "false"
+	}
+	if f.caps != "" {
+		return f.caps
+	}
+	return "true"
+}
+
+// Set implements flag.Value.Set.
+func (f *nvproxyFlag) Set(value string) error {
+	switch value {
+	case "true":
+		f.enabled, f.caps = true, ""
+	case "false":
+		f.enabled, f.caps = false, ""
+	case "":
+		return errors.New("--nvproxy= needs driver capabilities, such as compute,utility")
+	default:
+		f.enabled, f.caps = true, value
+	}
+	return nil
+}
+
+// IsBoolFlag implements flag's boolFlag, so that --nvproxy takes no value.
+func (f *nvproxyFlag) IsBoolFlag() bool {
+	return true
 }
 
 func validateLiveForkCreationPolicy(networkMode string, waived bool) error {
@@ -1717,6 +1784,7 @@ type runRequest struct {
 	networkMode        string
 	liveForkEligible   bool
 	liveForkWaiver     string
+	gpu                ttcbundle.GPUOptions
 	networkNAT         bool
 	networkIP          string
 	networkMAC         string
@@ -1799,7 +1867,7 @@ func flagWasSet(fs *flag.FlagSet, name string) bool {
 }
 
 func runContainer(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "dit", "--name", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--ip", "--mac-address", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--memory-swap", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
+	args = expandCombinedShortBools(args, "dit", "--name", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--ip", "--mac-address", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--memory-swap", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt", "--gfx-fork", "--nvproxy-fork")
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -1831,6 +1899,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	fs.StringVar(hostname, "h", "", "container hostname")
 	networkModeValue := fs.String("network", "none", "network mode: none, host, or ttc")
 	waiveLiveFork := fs.Bool("waive-live-fork", false, "explicitly create a family that is not eligible for live fork")
+	gpu := addGPUFlags(fs)
 	networkNAT := fs.Bool("nat", false, "allow outbound host networking from a ttc virtual NIC")
 	networkIP := fs.String("ip", "", "IPv4 address for the ttc virtual NIC")
 	networkMAC := fs.String("mac-address", "", "MAC address for the ttc virtual NIC")
@@ -1907,6 +1976,10 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	if err := validateLiveForkCreationPolicy(networkMode, *waiveLiveFork); err != nil {
 		return err
 	}
+	gpuOptions := gpu.options()
+	if err := ttcbundle.ValidateGPUOptions(gpuOptions, !*waiveLiveFork, runtime.GOOS); err != nil {
+		return err
+	}
 	if *networkNAT && networkMode != "ttc" {
 		return errors.New("--nat requires --network=ttc")
 	}
@@ -2018,7 +2091,8 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		hostname:           *hostname,
 		networkMode:        networkMode,
 		liveForkEligible:   !*waiveLiveFork,
-		liveForkWaiver:     liveForkWaiverReason(*waiveLiveFork, networkMode),
+		liveForkWaiver:     liveForkWaiverReason(*waiveLiveFork, networkMode, gpuOptions),
+		gpu:                gpuOptions,
 		networkNAT:         *networkNAT,
 		networkIP:          *networkIP,
 		networkMAC:         strings.ToLower(*networkMAC),
@@ -2076,7 +2150,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 }
 
 func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "it", "--name", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--ip", "--mac-address", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--memory-swap", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
+	args = expandCombinedShortBools(args, "it", "--name", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--ip", "--mac-address", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--memory-swap", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt", "--gfx-fork", "--nvproxy-fork")
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -2106,6 +2180,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs.StringVar(hostname, "h", "", "container hostname")
 	networkModeValue := fs.String("network", "none", "network mode: none, host, or ttc")
 	waiveLiveFork := fs.Bool("waive-live-fork", false, "explicitly create a family that is not eligible for live fork")
+	gpu := addGPUFlags(fs)
 	networkNAT := fs.Bool("nat", false, "allow outbound host networking from a ttc virtual NIC")
 	networkIP := fs.String("ip", "", "IPv4 address for the ttc virtual NIC")
 	networkMAC := fs.String("mac-address", "", "MAC address for the ttc virtual NIC")
@@ -2182,6 +2257,10 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	if err := validateLiveForkCreationPolicy(networkMode, *waiveLiveFork); err != nil {
 		return err
 	}
+	gpuOptions := gpu.options()
+	if err := ttcbundle.ValidateGPUOptions(gpuOptions, !*waiveLiveFork, runtime.GOOS); err != nil {
+		return err
+	}
 	if *networkNAT && networkMode != "ttc" {
 		return errors.New("--nat requires --network=ttc")
 	}
@@ -2293,7 +2372,8 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		hostname:           *hostname,
 		networkMode:        networkMode,
 		liveForkEligible:   !*waiveLiveFork,
-		liveForkWaiver:     liveForkWaiverReason(*waiveLiveFork, networkMode),
+		liveForkWaiver:     liveForkWaiverReason(*waiveLiveFork, networkMode, gpuOptions),
+		gpu:                gpuOptions,
 		networkNAT:         *networkNAT,
 		networkIP:          *networkIP,
 		networkMAC:         strings.ToLower(*networkMAC),
@@ -6343,6 +6423,7 @@ type runtimeBackend struct {
 	consoleSidecars       consoleSidecarOwner
 	distributedSource     *distributedSourceRuntime
 	portIngress           *portIngressManager
+	gfx                   *gfxService
 	nodeID                string
 	cancelClient          func()
 	clientCanceled        <-chan struct{}
@@ -7646,6 +7727,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 		PublishedPorts:          persistedPorts,
 		WaiveLiveFork:           !request.liveForkEligible,
 		LiveForkWaiver:          request.liveForkWaiver,
+		GPUOptions:              request.gpu,
 		Progress:                b.imageProgress(),
 		VolumeCopyMode:          b.volumeCopyMode,
 		NodeID:                  b.nodeID,
@@ -7786,6 +7868,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 		PublishedPorts:     request.publishedPorts,
 		WaiveLiveFork:      !request.liveForkEligible,
 		LiveForkWaiver:     request.liveForkWaiver,
+		GPUOptions:         request.gpu,
 		Progress:           b.imageProgress(),
 		VolumeCopyMode:     b.volumeCopyMode,
 		// A created branch owns mutable local filesystem state even though it has
@@ -8028,7 +8111,10 @@ func (b *runtimeBackend) startFreshBranchBesidePeers(info ttcbundle.ContainerInf
 		return fmt.Errorf("creating branch bootstrap runtime ID: %w", err)
 	}
 	runtimeID := "ttc-bootstrap-" + hex.EncodeToString(random)
-	configured := b.configuredRunscArgsForBranch(info, branch)
+	configured, err := b.configuredRunscArgsForBranch(info, branch)
+	if err != nil {
+		return err
+	}
 	configured, err = b.withRuntimeDiagnostics(configured, info.ID)
 	if err != nil {
 		return err
@@ -10865,12 +10951,16 @@ func (b *runtimeBackend) runtimeDiagnosticSince(containerID string, since time.T
 	return ""
 }
 
-func (b *runtimeBackend) configuredRunscArgsForBranch(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) []string {
+func (b *runtimeBackend) configuredRunscArgsForBranch(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) ([]string, error) {
 	args := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
 	if branch.Quarantined {
 		args = append(args, "--ttc-network-quarantine=true")
 	}
-	return args
+	gfxArgs, err := b.gfx.runscArgs(info.GPUOptions)
+	if err != nil {
+		return nil, err
+	}
+	return append(args, gfxArgs...), nil
 }
 
 func (b *runtimeBackend) runConfiguredCommand(args ...string) (int, error) {
@@ -11213,7 +11303,10 @@ func (b *runtimeBackend) launch(info ttcbundle.ContainerInfo, target selector, b
 	if err := preflightHostResourceLimits(bundleDir); err != nil {
 		return 1, false, err
 	}
-	configuredArgs := b.configuredRunscArgsForBranch(info, branch)
+	configuredArgs, err := b.configuredRunscArgsForBranch(info, branch)
+	if err != nil {
+		return 1, false, err
+	}
 	configuredArgs, err = b.withRuntimeDiagnostics(configuredArgs, info.ID)
 	if err != nil {
 		return 1, false, err

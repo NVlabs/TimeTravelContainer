@@ -19,6 +19,7 @@ package virtgpu
 import (
 	goContext "context"
 	"fmt"
+	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
@@ -109,6 +110,11 @@ type Options struct {
 	MaxResources int
 }
 
+// processNewRenderer is the NewRendererFunc of the last device registered in
+// the process. Every branch in a Sentry process starts its renderers the same
+// way, so a device that a load creates starts its renderers with it.
+var processNewRenderer atomic.Pointer[NewRendererFunc]
+
 // Register registers a virtual GPU in vfsObj as the render node
 // /dev/dri/renderD128.
 func Register(vfsObj *vfs.VirtualFilesystem, opts Options) error {
@@ -116,6 +122,7 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts Options) error {
 	if err != nil {
 		return err
 	}
+	processNewRenderer.Store(&opts.NewRenderer)
 	return vfsObj.RegisterDevice(vfs.CharDevice, linux.DRM_MAJOR, linux.DRM_RENDER_MINOR_BASE, d, &vfs.RegisterDeviceOptions{
 		GroupName: "drm",
 		Pathname:  renderNodePath,
@@ -225,6 +232,8 @@ type contextID int
 func (d *device) afterLoad(ctx goContext.Context) {
 	if f, ok := ctx.Value(CtxNewRenderer).(NewRendererFunc); ok {
 		d.newRenderer = f
+	} else if f := processNewRenderer.Load(); f != nil {
+		d.newRenderer = *f
 	}
 	d.gen++
 	d.lost = false

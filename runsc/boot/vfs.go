@@ -200,6 +200,10 @@ func registerFilesystems(k *kernel.Kernel, info *containerInfo, rdmaSnapshot *rd
 		return err
 	}
 
+	if err := gfxRegisterDevices(info, vfsObj); err != nil {
+		return err
+	}
+
 	if err := rdmaproxyRegisterDevices(info, vfsObj, rdmaSnapshot); err != nil {
 		return err
 	}
@@ -1127,6 +1131,7 @@ func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo,
 		sysData := &sys.InternalData{
 			EnableTPUProxyPaths: specutils.TPUProxyEnabled(spec, conf),
 			RDMASysfs:           rdmaSysfs,
+			VirtualGPU:          conf.GFX,
 		}
 		if len(productName) > 0 {
 			sysData.ProductName = productName
