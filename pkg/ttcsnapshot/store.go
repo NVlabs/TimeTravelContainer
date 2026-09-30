@@ -2037,7 +2037,22 @@ func validateSnapshotLedgerHandoff(handoff SnapshotLedgerHandoff) error {
 	return nil
 }
 
+// snapshotReferences returns the references of snapshot that a handoff of it
+// names to the shared ledger: roots, pins, and edges from other origins'
+// objects, but for those of shared origins, which the ledger counts from the
+// objects' own published edges. Such an edge is the graph's alone: the
+// published object names the source of what the graph mirrors, as
+// PublishHandoffAliasing publishes it, and shared objects otherwise refer to
+// shared ones only.
 func snapshotReferences(state graphState, snapshot SnapshotID) map[string]ObjectID {
+	references, _ := snapshotReferencesAndLocalEdges(&state, snapshot)
+	return references
+}
+
+// snapshotReferencesAndLocalEdges returns what snapshotReferences does, and
+// counts, by child, the edges into snapshot from objects of shared origins,
+// which it leaves to the shared ledger.
+func snapshotReferencesAndLocalEdges(state *graphState, snapshot SnapshotID) (map[string]ObjectID, map[ObjectID]uint64) {
 	references := make(map[string]ObjectID)
 	for name, object := range state.Roots {
 		if object.Snapshot == snapshot {
@@ -2049,10 +2064,36 @@ func snapshotReferences(state graphState, snapshot SnapshotID) map[string]Object
 			references["pin/"+name] = object
 		}
 	}
+	var local map[ObjectID]uint64
+	shared := make(sharedOrigins)
 	for _, parent := range state.Objects {
-		addEdgeReferences(references, parent, snapshot)
+		if !shared.contains(state, parent.ID.Snapshot) {
+			addEdgeReferences(references, parent, snapshot)
+			continue
+		}
+		for _, edge := range parent.Children {
+			if edge.Child.Snapshot == snapshot && parent.ID.Snapshot != snapshot {
+				if local == nil {
+					local = make(map[ObjectID]uint64)
+				}
+				local[edge.Child]++
+			}
+		}
 	}
-	return references
+	return references, local
+}
+
+// sharedOrigins memoizes which origins a graph state records as shared.
+type sharedOrigins map[SnapshotID]bool
+
+func (s sharedOrigins) contains(state *graphState, origin SnapshotID) bool {
+	shared, known := s[origin]
+	if !known {
+		record, ok := state.Snapshots[snapshotKey(origin)]
+		shared = ok && record.State == SnapshotShared
+		s[origin] = shared
+	}
+	return shared
 }
 
 // addEdgeReferences adds to references parent's edges into snapshot, if
@@ -2090,11 +2131,12 @@ func (undo *graphUndo) snapshotReferenceChanges(state *graphState, snapshot Snap
 			after["pin/"+name] = current
 		}
 	}
+	shared := make(sharedOrigins)
 	for key, prior := range undo.objects {
-		if prior != nil {
+		if prior != nil && !shared.contains(state, prior.ID.Snapshot) {
 			addEdgeReferences(before, *prior, snapshot)
 		}
-		if current, ok := state.Objects[key]; ok {
+		if current, ok := state.Objects[key]; ok && !shared.contains(state, current.ID.Snapshot) {
 			addEdgeReferences(after, current, snapshot)
 		}
 	}
@@ -2998,7 +3040,7 @@ func checkSnapshotLedger(state graphState, snapshot SnapshotID) (map[string]Obje
 	if _, err := snapshotLedgerOrigin(state, snapshot); err != nil {
 		return nil, err
 	}
-	references := snapshotReferences(state, snapshot)
+	references, local := snapshotReferencesAndLocalEdges(&state, snapshot)
 	counts := make(map[ObjectID]uint64)
 	for _, parent := range state.Objects {
 		if parent.ID.Snapshot != snapshot {
@@ -3014,8 +3056,8 @@ func checkSnapshotLedger(state graphState, snapshot SnapshotID) (map[string]Obje
 		counts[object]++
 	}
 	for _, object := range state.Objects {
-		if object.ID.Snapshot == snapshot && counts[object.ID] != object.Refs {
-			return nil, fmt.Errorf("snapshot %d object %s baseline has %d references, graph records %d", snapshot, object.ID, counts[object.ID], object.Refs)
+		if object.ID.Snapshot == snapshot && counts[object.ID]+local[object.ID] != object.Refs {
+			return nil, fmt.Errorf("snapshot %d object %s baseline has %d references, graph records %d", snapshot, object.ID, counts[object.ID]+local[object.ID], object.Refs)
 		}
 	}
 	return references, nil
@@ -3034,7 +3076,7 @@ func snapshotLedger(state graphState, snapshot SnapshotID) ([]Object, map[string
 		}
 	}
 	slices.SortFunc(objects, func(a, b Object) int { return compareObjectIDs(a.ID, b.ID) })
-	references := snapshotReferences(state, snapshot)
+	references, local := snapshotReferencesAndLocalEdges(&state, snapshot)
 	// By ID, not by key: keys were a million strings for a snapshot of
 	// 300,000 objects.
 	counts := make(map[ObjectID]uint64, len(objects))
@@ -3049,9 +3091,13 @@ func snapshotLedger(state graphState, snapshot SnapshotID) ([]Object, map[string
 		counts[object]++
 	}
 	for _, object := range objects {
-		if counts[object.ID] != object.Refs {
-			return nil, nil, fmt.Errorf("snapshot %d object %s baseline has %d references, graph records %d", snapshot, object.ID, counts[object.ID], object.Refs)
+		if counts[object.ID]+local[object.ID] != object.Refs {
+			return nil, nil, fmt.Errorf("snapshot %d object %s baseline has %d references, graph records %d", snapshot, object.ID, counts[object.ID]+local[object.ID], object.Refs)
 		}
+	}
+	if len(local) != 0 {
+		// Published, the objects count what the shared ledger does.
+		objects = baselineObjects(objects, snapshot, references)
 	}
 	return objects, references, nil
 }

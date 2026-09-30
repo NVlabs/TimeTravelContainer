@@ -689,7 +689,7 @@ func (r *Repository) BranchRemoteSourceObjects(branchID string) (map[string]int6
 }
 
 // MaterializeRemoteObjects fetches all still-remote objects for a clean
-// source handoff or local durable publication.
+// source handoff, or a repository that must stand alone.
 func (r *Repository) MaterializeRemoteObjects() error {
 	// Multiple distributed transactions in one physical Sentry share this
 	// repository. Their eager drains may arrive concurrently, but detaching
@@ -697,22 +697,24 @@ func (r *Repository) MaterializeRemoteObjects() error {
 	// at a time.
 	r.lockRemoteLifecycleForMaterialization()
 	defer r.remoteLifecycleMu.Unlock()
-	return r.materializeRemoteObjects()
+	return r.materializeRemoteObjects(false)
 }
 
 // materializeRemoteObjects implements MaterializeRemoteObjects while the
 // caller retains remoteLifecycleMu across a larger lifecycle transaction.
+// With keepShared, it leaves the catalogs that expand images of the shared
+// store as they are, lazy: a publication refers to their sources.
 //
 // Preconditions: remoteLifecycleMu is held.
 //
 // +checklocks:r.remoteLifecycleMu
-func (r *Repository) materializeRemoteObjects() error {
+func (r *Repository) materializeRemoteObjects(keepShared bool) error {
 	for {
 		var work []remoteMaterialization
 		var detached []*remoteObjectClient
 		if err := r.withLock(func() error {
 			var err error
-			work, detached, err = r.materializeRemoteObjectsPassLocked()
+			work, detached, err = r.materializeRemoteObjectsPassLocked(keepShared)
 			return err
 		}); err != nil {
 			return err
@@ -753,10 +755,11 @@ type remoteMaterialization struct {
 
 // materializeRemoteObjectsPassLocked expands every deferred namespace and
 // returns unresolved bulk objects. If none remain, it detaches every provider
-// while the repository mutation fence is still held.
+// while the repository mutation fence is still held. With keepShared, it
+// passes over the catalogs that expand images of the shared store.
 //
 // Preconditions: Repository.withLock and remoteLifecycleMu are held.
-func (r *Repository) materializeRemoteObjectsPassLocked() ([]remoteMaterialization, []*remoteObjectClient, error) {
+func (r *Repository) materializeRemoteObjectsPassLocked(keepShared bool) ([]remoteMaterialization, []*remoteObjectClient, error) {
 	// Resolve every still-foreign namespace before detaching its provider.
 	// This is an explicit independence barrier and is allowed to be O(total
 	// metadata); ordinary remote start and pathname access remain lazy.
@@ -769,6 +772,7 @@ func (r *Repository) materializeRemoteObjectsPassLocked() ([]remoteMaterializati
 	}
 	r.remoteMu.Unlock()
 	var deferredBranches []string
+	kept := make(map[string]bool)
 	if len(deferredCatalogs) != 0 {
 		directory, err := r.openFile("branches", os.O_RDONLY|unix.O_DIRECTORY, 0)
 		if err != nil {
@@ -792,6 +796,10 @@ func (r *Repository) materializeRemoteObjectsPassLocked() ([]remoteMaterializati
 				return nil, nil, err
 			}
 			if _, ok := deferredCatalogs[branch.RemoteCatalog]; ok {
+				if keepShared && branch.RemoteShared {
+					kept[branch.RemoteCatalog] = true
+					continue
+				}
 				deferredBranches = append(deferredBranches, id)
 			}
 		}
@@ -857,7 +865,10 @@ func (r *Repository) materializeRemoteObjectsPassLocked() ([]remoteMaterializati
 	r.remoteMu.Lock()
 	remotes := make([]*remoteObjectClient, 0, len(r.remotes))
 	for remote := range r.remotes {
-		remotes = append(remotes, remote)
+		// A shared image's source stays, for the reads still to come.
+		if !kept[remote.catalog] {
+			remotes = append(remotes, remote)
+		}
 	}
 	r.remoteMu.Unlock()
 	if len(remotes) == 0 {

@@ -818,6 +818,148 @@ func TestPrepareBranchPublicationSealsLazyCatalog(t *testing.T) {
 	}
 }
 
+// A branch that expands an image of the shared store is published by
+// reference: its catalog stays lazy and unpublished, what it never read is not
+// fetched, and what it reaches of the catalog unchanged, the publication names
+// by the image's own identities. A fork of the branch inherits the catalog
+// until its own publication.
+func TestPrepareBranchPublicationRefersToSharedImage(t *testing.T) {
+	sourceManager := openTestManager(t)
+	source, err := sourceManager.Create("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	ino, err := source.CreateRegular(MainBranch, RootInode, "artifact", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := source.WriteAt(MainBranch, ino, bytes.Repeat([]byte("never read"), 4096), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Fork(MainBranch, "sealed"); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := source.DescribeRemoteSnapshot("sealed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor.Shared = true
+	shared, err := ttcsnapshot.OpenSharedPackStore(filepath.Join(t.TempDir(), "shared"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceOrigins := make(map[ttcsnapshot.SnapshotID]bool)
+	for _, snapshot := range source.graph.Inspect().Snapshots {
+		if snapshot.State != ttcsnapshot.SnapshotWorking {
+			if err := shared.Publish(context.Background(), source.graph, snapshot.ID, source.data); err != nil {
+				t.Fatal(err)
+			}
+			sourceOrigins[snapshot.ID] = true
+		}
+	}
+	targetManager := openTestManager(t)
+	target, err := targetManager.ImportPrivateRemoteDescriptorWithOrigins(filepath.Join(targetManager.root, "target"), "target", descriptor, "imported", 100, 101)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	serverErr := attachTestRemote(t, source, target, "sealed", "imported", testSharedCatalog{store: shared})
+	artifactIno, err := target.Lookup("imported", RootInode, "artifact")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := target.Inode("imported", artifactIno)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fork, err := target.BeginForkWithOrigins("imported", "child", 102, 103)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fork.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := target.CreateRegular("imported", RootInode, "target-local", 0644, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	imported, err := target.Branch("imported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !imported.RemoteShared || imported.RemoteInherited {
+		t.Fatalf("imported branch %+v, want its shared catalog its own", imported)
+	}
+	if child, err := target.Branch("child"); err != nil || !child.RemoteShared || !child.RemoteInherited {
+		t.Fatalf("child branch %+v (%v), want the shared catalog inherited", child, err)
+	}
+	if err := target.withLock(func() error {
+		return target.graph.Seal(ttcsnapshot.SnapshotID(imported.WorkingSnapshot), ttcsnapshot.SnapshotSealedVolatile)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	published, err := target.DescribePublishedSnapshot("imported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	origins, err := target.PrepareBranchPublication("imported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []ttcsnapshot.SnapshotID{ttcsnapshot.SnapshotID(imported.WorkingSnapshot)}; !slices.Equal(origins, want) {
+		t.Fatalf("publication origins %v, want only the branch's own %v", origins, want)
+	}
+	if record, ok := target.graph.Snapshot(101); !ok || record.State != ttcsnapshot.SnapshotWorking {
+		t.Fatalf("catalog origin %+v (%t), want it working", record, ok)
+	}
+	if kept, err := target.Branch("imported"); err != nil || kept.RemoteCatalog != imported.RemoteCatalog {
+		t.Fatalf("branch after preparation %+v (%v), want its catalog kept", kept, err)
+	}
+	if pending, err := target.remoteObjectPending(artifact.Object); err == nil && !pending {
+		if file, err := target.data.Open(mustParseObjectID(t, artifact.Object), artifact.Size); err == nil {
+			file.Close()
+			t.Fatal("the unread file was fetched for the publication")
+		}
+	}
+	for _, origin := range origins {
+		if err := target.PublishOriginHandoffByReference(context.Background(), shared, origin); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manifest, err := shared.Manifest(origins[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	referred := false
+	for _, packed := range manifest.Objects {
+		for _, edge := range packed.Object.Children {
+			if edge.Child.Snapshot == 101 {
+				t.Fatalf("published object %s names catalog object %s", packed.Object.ID, edge.Child)
+			}
+			referred = referred || sourceOrigins[edge.Child.Snapshot]
+		}
+	}
+	if !referred || published.Root.Snapshot != ttcsnapshot.SnapshotID(imported.WorkingSnapshot) {
+		t.Fatalf("publication of root %s refers to the image: %t", published.Root, referred)
+	}
+	if err := target.MarkBranchPublished("child"); err != nil {
+		t.Fatal(err)
+	}
+	if child, err := target.Branch("child"); err != nil || child.RemoteInherited {
+		t.Fatalf("child branch after its publication %+v (%v)", child, err)
+	}
+	finishTestRemote(t, target, serverErr)
+}
+
+func mustParseObjectID(t *testing.T, text string) ttcsnapshot.ObjectID {
+	t.Helper()
+	id, err := ttcsnapshot.ParseObjectID(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
 func TestPrepareRetirementPublicationSealsWorkingRemoteBranch(t *testing.T) {
 	sourceManager := openTestManager(t)
 	source, err := sourceManager.Create("source")
@@ -1325,13 +1467,16 @@ func TestRemoteCatalogs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if imported.RemoteCatalog == "" || len(catalogs) != 2 || catalogs["imported"] != imported.RemoteCatalog || catalogs["child"] != imported.RemoteCatalog {
+	if imported.RemoteCatalog == "" || len(catalogs) != 2 || catalogs["imported"].RemoteCatalog != imported.RemoteCatalog || catalogs["child"].RemoteCatalog != imported.RemoteCatalog {
 		t.Fatalf("catalogs %v, want imported and child naming %q", catalogs, imported.RemoteCatalog)
+	}
+	if catalogs["imported"].RemoteInherited || !catalogs["child"].RemoteInherited {
+		t.Fatalf("catalogs %v, want only the child's inherited", catalogs)
 	}
 	if err := target.RemoveBranch("child"); err != nil {
 		t.Fatal(err)
 	}
-	if catalogs, err := RemoteCatalogs(path); err != nil || len(catalogs) != 1 || catalogs["imported"] != imported.RemoteCatalog {
+	if catalogs, err := RemoteCatalogs(path); err != nil || len(catalogs) != 1 || catalogs["imported"].RemoteCatalog != imported.RemoteCatalog {
 		t.Fatalf("after the child's removal, catalogs %v (%v)", catalogs, err)
 	}
 	if catalogs, err := RemoteCatalogs(source.path); err != nil || len(catalogs) != 0 {

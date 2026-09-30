@@ -179,17 +179,27 @@ func writePadding(file *os.File) error {
 // pack and commits the manifest last. Retrying an already committed snapshot
 // is idempotent and never replaces its authority.
 func (store *SharedPackStore) Publish(ctx context.Context, graph *Store, snapshot SnapshotID, source ObjectSource) error {
-	return store.publish(ctx, graph, snapshot, source, false)
+	return store.publish(ctx, graph, snapshot, source, false, nil)
 }
 
 // PublishHandoff publishes a provider-to-shared handoff baseline. The graph
 // durably records reference mutations that race the bulk pack write, allowing
 // the caller to catch the shared ledger up before the short final freeze.
 func (store *SharedPackStore) PublishHandoff(ctx context.Context, graph *Store, snapshot SnapshotID, source ObjectSource) error {
-	return store.publish(ctx, graph, snapshot, source, true)
+	return store.publish(ctx, graph, snapshot, source, true, nil)
 }
 
-func (store *SharedPackStore) publish(ctx context.Context, graph *Store, snapshot SnapshotID, source ObjectSource, handoff bool) error {
+// PublishHandoffAliasing is PublishHandoff, but with each child of the
+// snapshot's objects that alias names another, and the same child embedded
+// in an inode's record, replaced by that other: alias returns an object's
+// identity for the publication, and whether it is another's. A mirror of an
+// object of the shared store in the graph so names its source, which the
+// shared ledger counts, and is not published.
+func (store *SharedPackStore) PublishHandoffAliasing(ctx context.Context, graph *Store, snapshot SnapshotID, source ObjectSource, alias func(ObjectID) (ObjectID, bool, error)) error {
+	return store.publish(ctx, graph, snapshot, source, true, alias)
+}
+
+func (store *SharedPackStore) publish(ctx context.Context, graph *Store, snapshot SnapshotID, source ObjectSource, handoff bool, alias func(ObjectID) (ObjectID, bool, error)) error {
 	if graph == nil || source == nil || snapshot == 0 {
 		return errors.New("invalid shared snapshot publication")
 	}
@@ -244,15 +254,20 @@ func (store *SharedPackStore) publish(ctx context.Context, graph *Store, snapsho
 			if object.BulkLength != 0 {
 				bulkSources[object.ID.key()] = publicationBulkSource{id: object.ID, source: source}
 			}
-			continue
+		} else {
+			resolved, bulk, err := store.resolveDeferredForPublication(graph, source, object)
+			if err != nil {
+				return fmt.Errorf("resolving deferred object %s for publication: %w", object.ID, err)
+			}
+			objects[index] = resolved
+			if resolved.BulkLength != 0 {
+				bulkSources[resolved.ID.key()] = bulk
+			}
 		}
-		resolved, bulk, err := store.resolveDeferredForPublication(graph, source, object)
-		if err != nil {
-			return fmt.Errorf("resolving deferred object %s for publication: %w", object.ID, err)
-		}
-		objects[index] = resolved
-		if resolved.BulkLength != 0 {
-			bulkSources[resolved.ID.key()] = bulk
+		if alias != nil {
+			if objects[index], err = aliasObject(objects[index], alias); err != nil {
+				return fmt.Errorf("naming the children of object %s for publication: %w", object.ID, err)
+			}
 		}
 	}
 	temporary, err := os.CreateTemp(directory, ".pack-")
@@ -386,6 +401,44 @@ func (store *SharedPackStore) publish(ctx context.Context, graph *Store, snapsho
 	}
 	store.mu.Unlock()
 	return nil
+}
+
+// aliasObject returns object with each child that alias names another, and
+// the same child embedded in an inode's record, replaced by that other.
+func aliasObject(object Object, alias func(ObjectID) (ObjectID, bool, error)) (Object, error) {
+	var aliased map[ObjectID]ObjectID
+	for index, edge := range object.Children {
+		other, ok, err := alias(edge.Child)
+		if err != nil {
+			return Object{}, err
+		}
+		if !ok {
+			continue
+		}
+		if aliased == nil {
+			aliased = make(map[ObjectID]ObjectID)
+			object.Children = slices.Clone(object.Children)
+		}
+		aliased[edge.Child] = other
+		object.Children[index].Child = other
+	}
+	if aliased == nil || object.ID.Kind != ObjectKindInode {
+		return object, nil
+	}
+	// As translateDeferredFilesystemData translated them.
+	inode, err := decodeInodeRecord(object.Data)
+	if err != nil {
+		return Object{}, err
+	}
+	for _, embedded := range []*ObjectID{&inode.File, &inode.Directory} {
+		if other, ok := aliased[*embedded]; ok {
+			*embedded = other
+		}
+	}
+	if object.Data, err = encodeRecord(inode); err != nil {
+		return Object{}, err
+	}
+	return object, nil
 }
 
 // resolveDeferredForPublication path-compresses an inherited immutable stub

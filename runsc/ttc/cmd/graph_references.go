@@ -442,6 +442,12 @@ func (b *runtimeBackend) flushGraphReferenceReleases(timeout time.Duration) erro
 		if err := b.reconcileDistributedGraphReferences(false); err != nil {
 			lastErr = err
 		}
+		// Each of the node's own claims is checked now, not when its check
+		// is next due: a claim left for later would outlive the node, and
+		// keep what it claims for as long as the node's identity lasts.
+		if b.distributedSource != nil {
+			b.distributedSource.providerChecks.Clear()
+		}
 		if err := b.reconcileProviderClaims(); err != nil {
 			lastErr = errors.Join(lastErr, err)
 		}

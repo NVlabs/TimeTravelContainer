@@ -58,6 +58,9 @@ type RemoteSnapshotDescriptor struct {
 	// lazily through the same catalog as Root and may be zero for a branch with
 	// no parent boundary.
 	BaseRoot ttcsnapshot.ObjectID `json:"base_root,omitempty"`
+	// Shared means that Root is an image of the shared store, as a durable
+	// publication's is: see Branch.RemoteShared.
+	Shared bool `json:"shared,omitempty"`
 }
 
 // BaseRootString returns the wire representation of BaseRoot, preserving an
@@ -146,6 +149,34 @@ func (r *Repository) ImportRemoteBranchDescriptor(descriptor RemoteSnapshotDescr
 	return r.importRemoteBranchDescriptor(descriptor, targetBranch, 0, 0)
 }
 
+// DescribePublishedSnapshot is DescribeRemoteSnapshot for a publication by
+// PrepareBranchPublication: a root still in a shared image's catalog, it
+// names by the image's own identity.
+func (r *Repository) DescribePublishedSnapshot(branchID string) (RemoteSnapshotDescriptor, error) {
+	descriptor, err := r.DescribeRemoteSnapshot(branchID)
+	if err != nil {
+		return RemoteSnapshotDescriptor{}, err
+	}
+	var mirrors map[ttcsnapshot.SnapshotID]struct{}
+	if err := r.withLock(func() error {
+		var err error
+		mirrors, err = r.sharedCatalogOriginsLocked()
+		return err
+	}); err != nil {
+		return RemoteSnapshotDescriptor{}, err
+	}
+	if descriptor.Root, _, err = r.publishedIdentity(mirrors, descriptor.Root); err != nil {
+		return RemoteSnapshotDescriptor{}, err
+	}
+	descriptor.Snapshot.Root = descriptor.Root.String()
+	if !descriptor.BaseRoot.IsZero() {
+		if descriptor.BaseRoot, _, err = r.publishedIdentity(mirrors, descriptor.BaseRoot); err != nil {
+			return RemoteSnapshotDescriptor{}, err
+		}
+	}
+	return descriptor, nil
+}
+
 // ImportRemoteBranchDescriptorWithOrigins installs a deferred root using
 // exact authority-allocated working and catalog origins.
 func (r *Repository) ImportRemoteBranchDescriptorWithOrigins(descriptor RemoteSnapshotDescriptor, targetBranch string, working, catalogWorking ttcsnapshot.SnapshotID) error {
@@ -216,7 +247,7 @@ func (r *Repository) importRemoteBranchDescriptor(descriptor RemoteSnapshotDescr
 				return err
 			}
 		}
-		branch := Branch{ID: targetBranch, Root: root.String(), RemoteCatalog: catalog, RemoteCatalogSnapshot: uint64(catalogWorking), RemoteLogicalBytes: snapshot.LogicalBytes, WorkingSnapshot: uint64(working), Generation: 1, CreatedAt: time.Now().UTC()}
+		branch := Branch{ID: targetBranch, Root: root.String(), RemoteCatalog: catalog, RemoteCatalogSnapshot: uint64(catalogWorking), RemoteLogicalBytes: snapshot.LogicalBytes, RemoteShared: descriptor.Shared, WorkingSnapshot: uint64(working), Generation: 1, CreatedAt: time.Now().UTC()}
 		if !baseRoot.IsZero() {
 			branch.BaseRoot = baseRoot.String()
 		}

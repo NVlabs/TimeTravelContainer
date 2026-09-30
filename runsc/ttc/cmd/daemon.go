@@ -1198,7 +1198,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 	if err := r.backend.containerStore().InstallPortableInternalMounts(info.ID, portableMounts); err != nil {
 		return fmt.Errorf("installing target-local internal mounts: %w", err)
 	}
-	filesystemConnections, err := r.backend.materializeDistributedFilesystemRoots(info, targetBranch.FilesystemBranch, session.FilesystemRoots, peer)
+	filesystemConnections, err := r.backend.materializeDistributedFilesystemRoots(info, targetBranch.FilesystemBranch, session.FilesystemRoots, peer, false)
 	if err != nil {
 		return fmt.Errorf("materializing distributed filesystem metadata: %w", err)
 	}

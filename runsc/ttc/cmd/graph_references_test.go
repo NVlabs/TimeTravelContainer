@@ -739,9 +739,9 @@ func TestCatalogClaim(t *testing.T) {
 	root := t.TempDir()
 	repository := filepath.Join(root, "repository")
 	const catalog = "repo:0000000000000007-03-0000000000000001:9"
-	writeBranch := func(id, catalog string) {
+	writeBranch := func(id, catalog string, inherited bool) {
 		t.Helper()
-		data := fmt.Sprintf(`{"id":%q,"remote_catalog":%q}`, id, catalog)
+		data := fmt.Sprintf(`{"id":%q,"remote_catalog":%q,"remote_inherited":%t}`, id, catalog, inherited)
 		if err := os.MkdirAll(filepath.Join(repository, "branches"), 0700); err != nil {
 			t.Fatal(err)
 		}
@@ -772,9 +772,9 @@ func TestCatalogClaim(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	writeBranch("c", catalog)
-	writeBranch("p", catalog)
-	writeBranch("e", catalog)
+	writeBranch("c", catalog, true)
+	writeBranch("p", catalog, false)
+	writeBranch("e", catalog, true)
 	operation := catalogClaimPrefix + "0000000000000007-op"
 	path, err := graphReferenceIntentPath(root, operation)
 	if err != nil {
@@ -833,16 +833,18 @@ func TestCatalogClaim(t *testing.T) {
 	if entries, err := os.ReadDir(filepath.Dir(path)); err != nil || len(entries) != 1 {
 		t.Fatalf("claims after a second fork: %v (%v), want the one", entries, err)
 	}
-	// Kept while the branch placed here names the catalog...
+	// Kept while the fork placed here names the catalog it inherited...
 	if err := backend.reconcileCatalogClaim(path, read); err != nil {
 		t.Fatal(err)
 	}
 	if kept, err := readGraphReferenceIntent(path); err != nil || kept.State != "active" {
 		t.Fatalf("a needed claim is %+v (%v)", kept, err)
 	}
-	// ... but not for a copy of the unplaced source, nor for a branch placed
-	// on another node.
-	writeBranch("c", "")
+	// ... but not once it is published, nor for the branch that imported the
+	// image, a copy of the unplaced source, nor for a branch placed on another
+	// node.
+	writeBranch("c", catalog, false)
+	writeBranch("p", catalog, true)
 	backend.distributedSource.providerChecks.Delete(operation)
 	if needed, err := backend.catalogClaimNeeded(read); err != nil || needed {
 		t.Fatalf("claim needed=%t (%v) once only other nodes' branches name the catalog", needed, err)

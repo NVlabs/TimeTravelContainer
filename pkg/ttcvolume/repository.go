@@ -217,10 +217,19 @@ type Branch struct {
 	// authoritative foreign filesystem root. It is needed only while Root is
 	// still an unresolved deferred stub; after the root is expanded, its graph
 	// metadata carries the current aggregate directly.
-	RemoteLogicalBytes uint64    `json:"remote_logical_bytes,omitempty"`
-	WorkingSnapshot    uint64    `json:"working_snapshot"`
-	Generation         uint64    `json:"generation"`
-	CreatedAt          time.Time `json:"created_at"`
+	RemoteLogicalBytes uint64 `json:"remote_logical_bytes,omitempty"`
+	// RemoteShared means that RemoteCatalog expands an image of the shared
+	// store. Each object of the catalog's origin mirrors its source there,
+	// which a publication refers to instead of copying the mirror: see
+	// PrepareBranchPublication.
+	RemoteShared bool `json:"remote_shared,omitempty"`
+	// RemoteInherited means that the branch was forked from one that named
+	// RemoteCatalog, and has not been published since: what it reaches of the
+	// catalog's image, no publication of its own keeps.
+	RemoteInherited bool      `json:"remote_inherited,omitempty"`
+	WorkingSnapshot uint64    `json:"working_snapshot"`
+	Generation      uint64    `json:"generation"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 // Inode is branch-resolved virtual inode metadata.
@@ -446,12 +455,40 @@ func (r *Repository) SnapshotOrigins() []ttcsnapshot.SnapshotID {
 // Materialization is repository-wide because locally forked branches may
 // share the same catalog origin. Once complete, sealing that origin is safe:
 // all of its objects are immutable and no branch needs further expansion.
+//
+// A catalog that expands an image of the shared store is neither: its origin
+// stays as it is, lazy, and is not published. Each of its objects mirrors its
+// source in the image, identities aside, and a change to the tree copies all
+// its ancestors out of the catalog, so what the branch reaches of the catalog
+// is unchanged, and PublishOriginHandoffByReference refers to the sources
+// instead. Only what the branch changed is published.
 func (r *Repository) PrepareBranchPublication(branchID string) ([]ttcsnapshot.SnapshotID, error) {
 	r.lockRemoteLifecycleForMaterialization()
 	defer r.remoteLifecycleMu.Unlock()
-	if err := r.materializeRemoteObjects(); err != nil {
+	if err := r.materializeRemoteObjects(true); err != nil {
 		return nil, fmt.Errorf("materializing lazy filesystem dependencies: %w", err)
 	}
+	return r.prepareBranchPublication(branchID, true)
+}
+
+// prepareWholeBranchPublication is PrepareBranchPublication, but publishing
+// the catalogs of shared images too, as every catalog was before: a retiring
+// node publishes all it provides, and other nodes may still read its
+// catalogs by their own identities.
+func (r *Repository) prepareWholeBranchPublication(branchID string) ([]ttcsnapshot.SnapshotID, error) {
+	r.lockRemoteLifecycleForMaterialization()
+	defer r.remoteLifecycleMu.Unlock()
+	if err := r.materializeRemoteObjects(false); err != nil {
+		return nil, fmt.Errorf("materializing lazy filesystem dependencies: %w", err)
+	}
+	return r.prepareBranchPublication(branchID, false)
+}
+
+// prepareBranchPublication is PrepareBranchPublication once the repository's
+// remote objects are materialized, all of them unless byReference.
+//
+// Preconditions: remoteLifecycleMu is held.
+func (r *Repository) prepareBranchPublication(branchID string, byReference bool) ([]ttcsnapshot.SnapshotID, error) {
 	var origins []ttcsnapshot.SnapshotID
 	err := r.withLock(func() error {
 		branch, err := r.readBranch(branchID)
@@ -465,7 +502,7 @@ func (r *Repository) PrepareBranchPublication(branchID string) ([]ttcsnapshot.Sn
 		// file bytes. The catalog expansion origin is repository-wide; leaving a
 		// sibling bound to it before sealing would make the sibling's next fork
 		// attempt to mutate an immutable origin.
-		if branch.RemoteCatalog != "" {
+		if branch.RemoteCatalog != "" && !(byReference && branch.RemoteShared) {
 			catalog := branch.RemoteCatalog
 			directory, err := r.openFile("branches", os.O_RDONLY|unix.O_DIRECTORY, 0)
 			if err != nil {
@@ -511,6 +548,8 @@ func (r *Repository) PrepareBranchPublication(branchID string) ([]ttcsnapshot.Sn
 				candidate.RemoteCatalog = ""
 				candidate.RemoteCatalogSnapshot = 0
 				candidate.RemoteLogicalBytes = 0
+				candidate.RemoteShared = false
+				candidate.RemoteInherited = false
 				if err := r.writeBranch(candidate); err != nil {
 					return fmt.Errorf("retiring branch %q remote filesystem catalog: %w", candidate.ID, err)
 				}
@@ -522,6 +561,12 @@ func (r *Repository) PrepareBranchPublication(branchID string) ([]ttcsnapshot.Sn
 		root, ok := r.graph.Root(graphRootName(branchID))
 		if !ok {
 			return os.ErrNotExist
+		}
+		var mirrors map[ttcsnapshot.SnapshotID]struct{}
+		if byReference {
+			if mirrors, err = r.sharedCatalogOriginsLocked(); err != nil {
+				return err
+			}
 		}
 		wanted := make(map[ttcsnapshot.SnapshotID]struct{})
 		dependencies := make(map[ttcsnapshot.SnapshotID]map[ttcsnapshot.SnapshotID]struct{})
@@ -535,6 +580,10 @@ func (r *Repository) PrepareBranchPublication(branchID string) ([]ttcsnapshot.Sn
 				continue
 			}
 			seen[id] = struct{}{}
+			if _, mirror := mirrors[id.Snapshot]; mirror {
+				// Published by its source's identity.
+				continue
+			}
 			object, ok := r.graph.Object(id)
 			if !ok || object.State != ttcsnapshot.ObjectLive || object.Deferred {
 				return fmt.Errorf("filesystem graph object %s is missing, deferred, or not live", id)
@@ -636,6 +685,68 @@ func (r *Repository) PrepareBranchPublication(branchID string) ([]ttcsnapshot.Sn
 	return origins, err
 }
 
+// MarkBranchPublished records that a publication of branchID's tree has
+// committed, which keeps what the tree reaches of its remote catalog's image
+// from then on: see Branch.RemoteInherited.
+func (r *Repository) MarkBranchPublished(branchID string) error {
+	return r.withLock(func() error {
+		branch, err := r.readBranch(branchID)
+		if errors.Is(err, os.ErrNotExist) || err == nil && !branch.RemoteInherited {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		branch.RemoteInherited = false
+		return r.writeBranch(branch)
+	})
+}
+
+// sharedCatalogOriginsLocked returns the origins of the catalogs by which
+// branches of r expand images of the shared store.
+//
+// Preconditions: Repository.withLock is held.
+func (r *Repository) sharedCatalogOriginsLocked() (map[ttcsnapshot.SnapshotID]struct{}, error) {
+	directory, err := r.openFile("branches", os.O_RDONLY|unix.O_DIRECTORY, 0)
+	if err != nil {
+		return nil, err
+	}
+	entries, readErr := directory.ReadDir(-1)
+	closeErr := directory.Close()
+	if readErr != nil || closeErr != nil {
+		return nil, errors.Join(readErr, closeErr)
+	}
+	origins := make(map[ttcsnapshot.SnapshotID]struct{})
+	for _, entry := range entries {
+		id, ok := strings.CutSuffix(entry.Name(), ".json")
+		if entry.IsDir() || !ok || validateName(id, "branch") != nil {
+			continue
+		}
+		branch, err := r.readBranch(id)
+		if err != nil {
+			return nil, err
+		}
+		if branch.RemoteShared && branch.RemoteCatalogSnapshot != 0 {
+			origins[ttcsnapshot.SnapshotID(branch.RemoteCatalogSnapshot)] = struct{}{}
+		}
+	}
+	return origins, nil
+}
+
+// publishedIdentity returns the identity by which a publication names id:
+// for an object of an origin of mirrors, which sharedCatalogOriginsLocked
+// returned, its source's, and whether it is one.
+func (r *Repository) publishedIdentity(mirrors map[ttcsnapshot.SnapshotID]struct{}, id ttcsnapshot.ObjectID) (ttcsnapshot.ObjectID, bool, error) {
+	if _, ok := mirrors[id.Snapshot]; !ok {
+		return id, false, nil
+	}
+	object, ok := r.graph.Object(id)
+	if !ok || object.SourceObject.IsZero() {
+		return ttcsnapshot.ObjectID{}, false, fmt.Errorf("shared catalog object %s has no source", id)
+	}
+	return object.SourceObject, true, nil
+}
+
 // PrepareRetirementPublication seals every surviving branch generation and
 // returns all provider-owned origins in dependency order. This is the terminal
 // counterpart of PrepareBranchPublication: a retiring node has no runtime that
@@ -655,7 +766,7 @@ func (r *Repository) PrepareRetirementPublication() ([]ttcsnapshot.SnapshotID, e
 	// check below, but doing it before sealing avoids creating an immutable root
 	// that still requires metadata expansion.
 	r.lockRemoteLifecycleForMaterialization()
-	materializeErr := r.materializeRemoteObjects()
+	materializeErr := r.materializeRemoteObjects(false)
 	r.remoteLifecycleMu.Unlock()
 	if materializeErr != nil {
 		return nil, fmt.Errorf("materializing repository before retirement: %w", materializeErr)
@@ -733,7 +844,7 @@ func (r *Repository) PrepareRetirementPublication() ([]ttcsnapshot.SnapshotID, e
 	seen := make(map[ttcsnapshot.SnapshotID]struct{})
 	var origins []ttcsnapshot.SnapshotID
 	for _, branchID := range branchIDs {
-		prepared, err := r.PrepareBranchPublication(branchID)
+		prepared, err := r.prepareWholeBranchPublication(branchID)
 		if err != nil {
 			return nil, fmt.Errorf("preparing branch %q for retirement: %w", branchID, err)
 		}
@@ -816,17 +927,48 @@ func (r *Repository) PublishOriginHandoff(ctx context.Context, shared *ttcsnapsh
 	if err := r.SyncMetadata(); err != nil {
 		return err
 	}
+	return r.publishOriginHandoff(ctx, shared, origin, false)
+}
+
+// PublishOriginHandoffByReference is PublishOriginHandoff for an origin that
+// PrepareBranchPublication returned: what the origin reaches of a shared
+// image's catalog, it names by the image's own identities.
+func (r *Repository) PublishOriginHandoffByReference(ctx context.Context, shared *ttcsnapshot.SharedPackStore, origin ttcsnapshot.SnapshotID) error {
+	if shared == nil {
+		return errors.New("shared snapshot pack store is unavailable")
+	}
+	if err := r.SyncMetadata(); err != nil {
+		return err
+	}
+	return r.publishOriginHandoff(ctx, shared, origin, true)
+}
+
+func (r *Repository) publishOriginHandoff(ctx context.Context, shared *ttcsnapshot.SharedPackStore, origin ttcsnapshot.SnapshotID, byReference bool) error {
 	// Install the handoff baseline while retaining the same cross-process
 	// writer fence as live Sentry mutations. The bulk pack write below is
 	// intentionally outside this short fence; reference changes that race it
 	// are recorded in the handoff suffix and consumed by FreezeOriginHandoff.
+	var mirrors map[ttcsnapshot.SnapshotID]struct{}
 	if err := r.withLock(func() error {
-		_, _, _, err := r.graph.BeginSnapshotLedgerHandoff(origin)
+		if _, _, _, err := r.graph.BeginSnapshotLedgerHandoff(origin); err != nil {
+			return err
+		}
+		if !byReference {
+			return nil
+		}
+		var err error
+		mirrors, err = r.sharedCatalogOriginsLocked()
 		return err
 	}); err != nil {
 		return err
 	}
-	return shared.PublishHandoff(ctx, r.graph, origin, r.data)
+	if !byReference {
+		return shared.PublishHandoff(ctx, r.graph, origin, r.data)
+	}
+	// A mirror's source is fixed, which the graph may read without the fence.
+	return shared.PublishHandoffAliasing(ctx, r.graph, origin, r.data, func(id ttcsnapshot.ObjectID) (ttcsnapshot.ObjectID, bool, error) {
+		return r.publishedIdentity(mirrors, id)
+	})
 }
 
 // FreezeOriginHandoff closes the provider reference-mutation suffix.
@@ -1330,17 +1472,17 @@ func ReadRepositoryInfo(path string) (VolumeInfo, error) {
 	return info, nil
 }
 
-// RemoteCatalogs returns, by branch, the remote catalog each branch of the
-// repository at path still expands lazily, reading only its branch records:
-// a branch whose tree is independent names none. Branch records are replaced
-// whole, so a repository open elsewhere reads as it is. It returns an error
-// satisfying os.ErrNotExist when path has no repository.
-func RemoteCatalogs(path string) (map[string]string, error) {
+// RemoteCatalogs returns, by ID, the records of the branches of the
+// repository at path that still expand a remote catalog lazily, reading only
+// the records: a branch whose tree is independent names none. Branch records
+// are replaced whole, so a repository open elsewhere reads as it is. It
+// returns an error satisfying os.ErrNotExist when path has no repository.
+func RemoteCatalogs(path string) (map[string]Branch, error) {
 	entries, err := os.ReadDir(filepath.Join(path, "branches"))
 	if err != nil {
 		return nil, err
 	}
-	catalogs := make(map[string]string)
+	catalogs := make(map[string]Branch)
 	for _, entry := range entries {
 		id, ok := strings.CutSuffix(entry.Name(), ".json")
 		if entry.IsDir() || !ok || validateName(id, "branch") != nil {
@@ -1357,7 +1499,7 @@ func RemoteCatalogs(path string) (map[string]string, error) {
 			return nil, fmt.Errorf("invalid branch record for %q", id)
 		}
 		if branch.RemoteCatalog != "" {
-			catalogs[id] = branch.RemoteCatalog
+			catalogs[id] = branch
 		}
 	}
 	return catalogs, nil
@@ -2203,8 +2345,9 @@ func (r *Repository) beginFork(source, child string, externalOrigins []ttcsnapsh
 		childBranch := Branch{
 			ID: child, Root: sourceBranch.Root, BaseRoot: sourceBranch.Root, WorkingSnapshot: uint64(working[1]),
 			RemoteCatalog: sourceBranch.RemoteCatalog, RemoteCatalogSnapshot: sourceBranch.RemoteCatalogSnapshot,
-			RemoteLogicalBytes: sourceBranch.RemoteLogicalBytes,
-			Generation:         sourceBranch.Generation, CreatedAt: time.Now().UTC(),
+			RemoteLogicalBytes: sourceBranch.RemoteLogicalBytes, RemoteShared: sourceBranch.RemoteShared,
+			RemoteInherited: sourceBranch.RemoteCatalog != "",
+			Generation:      sourceBranch.Generation, CreatedAt: time.Now().UTC(),
 		}
 		// Publish the source's new generation first. If the process crashes
 		// before the child pointer appears, the only effect is a conservative

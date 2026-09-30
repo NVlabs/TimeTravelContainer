@@ -195,6 +195,132 @@ func TestSharedPackHandoffUsesDurableBaseline(t *testing.T) {
 	}
 }
 
+// A publication by alias names, for the objects of another origin that its
+// objects reach, the objects alias names: in their edges and in the inode
+// records that embed them. The graph keeps its own. An origin handed off
+// after its parent was so published names no edge from the parent, which the
+// shared ledger counts from the parent's published edges.
+func TestSharedPackHandoffAliasing(t *testing.T) {
+	directory := t.TempDir()
+	graph, err := Open(filepath.Join(directory, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	local, err := OpenLocalDataStore(filepath.Join(directory, "local"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared, err := OpenSharedPackStore(filepath.Join(directory, "shared"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mirror, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := bytes.Repeat([]byte("mirrored"), 512)
+	file, err := graph.ReserveObject(mirror, ObjectKindFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := local.Install(file, bytes.NewReader(data), int64(len(data))); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.CommitReservedObject(file, "mirror/file", uint64(len(data)), nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	directoryObject, err := graph.CreateObject(mirror, "mirror/directory", ObjectKindMetadata, []byte("directory"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := encodeRecord(InodeRecord{Number: 2, Type: "regular", Mode: 0644, Nlink: 1, Size: int64(len(data)), File: file})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inode, err := graph.CreateObject(origin, "publish/inode", ObjectKindInode, record, []Edge{{Slot: 0, Child: file}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := graph.CreateObject(origin, "publish/root", ObjectKindMetadata, []byte("root"), []Edge{{Slot: 0, Child: directoryObject}, {Slot: 1, Child: inode}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Seal(origin, SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	sources := map[ObjectID]ObjectID{
+		file:            {Snapshot: 900, Ordinal: 7, Kind: ObjectKindFile},
+		directoryObject: {Snapshot: 900, Ordinal: 8, Kind: ObjectKindMetadata},
+	}
+	alias := func(id ObjectID) (ObjectID, bool, error) {
+		if id.Snapshot != mirror {
+			return id, false, nil
+		}
+		source, ok := sources[id]
+		if !ok {
+			return ObjectID{}, false, fmt.Errorf("no source for %s", id)
+		}
+		return source, true, nil
+	}
+	if err := shared.PublishHandoffAliasing(context.Background(), graph, origin, local, alias); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := shared.Manifest(origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Objects) != 2 {
+		t.Fatalf("published %d objects, want the origin's 2", len(manifest.Objects))
+	}
+	for _, packed := range manifest.Objects {
+		switch packed.Object.ID {
+		case root:
+			if want := []Edge{{Slot: 0, Child: sources[directoryObject]}, {Slot: 1, Child: inode}}; !slices.Equal(packed.Object.Children, want) {
+				t.Fatalf("published root's children %v, want %v", packed.Object.Children, want)
+			}
+		case inode:
+			published, err := decodeInodeRecord(packed.Object.Data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if published.File != sources[file] || !slices.Equal(packed.Object.Children, []Edge{{Slot: 0, Child: sources[file]}}) {
+				t.Fatalf("published inode names %s and children %v, want %s", published.File, packed.Object.Children, sources[file])
+			}
+		default:
+			t.Fatalf("published object %s", packed.Object.ID)
+		}
+	}
+	if object, ok := graph.Object(root); !ok || object.Children[0].Child != directoryObject {
+		t.Fatalf("the graph's root is %+v, want its own children", object)
+	}
+	if err := graph.MarkShared(origin); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.UnfreezeSnapshotLedger(origin); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Seal(mirror, SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	objects, references, err := graph.SnapshotLedger(mirror)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := map[string]ObjectID{"pin/mirror/file": file, "pin/mirror/directory": directoryObject}; !reflect.DeepEqual(references, want) {
+		t.Fatalf("the mirror's references %v, want only its pins %v", references, want)
+	}
+	for _, object := range objects {
+		if object.Refs != 1 {
+			t.Fatalf("the mirror's object %s counts %d references, want its pin's", object.ID, object.Refs)
+		}
+	}
+}
+
 // A handoff retried after a failure resumes where the failure left it,
 // frozen: the pack's manifest, which the retry does not replace, holds the
 // baseline that the handoff's recorded mutations follow, and the receiver,

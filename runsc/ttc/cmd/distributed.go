@@ -1827,8 +1827,10 @@ func (b *runtimeBackend) prepareDistributedFilesystem(info ttcbundle.ContainerIn
 // materializeDistributedFilesystemRoots installs the bounded graph-root
 // descriptors sent directly by the source. It performs no shared-storage I/O;
 // metadata below each root and whole-file bytes remain demand-fetched through
-// the transaction-fenced Sentry relay.
-func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.ContainerInfo, filesystemBranch string, roots []cluster.FilesystemRootDescriptor, peer bool) (_ int, retErr error) {
+// the transaction-fenced Sentry relay. shared says the roots are images of the
+// shared store, as a durable publication's are, which a later publication of
+// the branches may refer to.
+func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.ContainerInfo, filesystemBranch string, roots []cluster.FilesystemRootDescriptor, peer, shared bool) (_ int, retErr error) {
 	if len(roots) == 0 {
 		return 0, nil
 	}
@@ -1902,6 +1904,7 @@ func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.Co
 		if err != nil {
 			return 0, fmt.Errorf("decoding repository %q graph root: %w", config.Source, err)
 		}
+		descriptor.Shared = shared
 		if peer {
 			// An imported peer must join the repository already mounted by its
 			// physical runtime. If this is the first materialization for the source,

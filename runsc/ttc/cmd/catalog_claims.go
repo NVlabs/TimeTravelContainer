@@ -29,9 +29,9 @@ import (
 //
 // So a fork of a branch that expands a shared image first claims the image
 // for the node's repository. The claim is kept while a branch that the family
-// places on the node names the catalog: until the repository's next
-// publication makes its trees independent of the image, or the last of those
-// branches goes.
+// places on the node has inherited the catalog: until each such branch has
+// been published, whose publication keeps what it reaches of the image, or
+// has gone.
 
 // catalogClaimPrefix begins the operation of every catalog claim.
 const catalogClaimPrefix = "catalog-"
@@ -65,7 +65,7 @@ func (b *runtimeBackend) claimForkCatalogs(info ttcbundle.ContainerInfo, filesys
 		if err != nil {
 			return err
 		}
-		catalog := catalogs[repositoryPhysicalBranch(config, filesystemBranch)]
+		catalog := catalogs[repositoryPhysicalBranch(config, filesystemBranch)].RemoteCatalog
 		if catalog == "" {
 			continue
 		}
@@ -177,8 +177,9 @@ func (b *runtimeBackend) reconcileCatalogClaim(path string, intent graphReferenc
 
 // catalogClaimNeeded reports whether a branch that the family of intent, a
 // catalog claim, places on this node still names the claim's catalog in the
-// claim's repository. A copy of a branch placed elsewhere, as a fork of a
-// dehydrated branch leaves of its source, does not keep the image.
+// claim's repository, having inherited it: the branch that imported the image
+// is kept by its own publications. A copy of a branch placed elsewhere, as a
+// fork of a dehydrated branch leaves of its source, does not keep the image.
 func (b *runtimeBackend) catalogClaimNeeded(intent graphReferenceIntent) (bool, error) {
 	catalogs, err := ttcvolume.RemoteCatalogs(intent.Repository)
 	if errors.Is(err, os.ErrNotExist) {
@@ -187,7 +188,10 @@ func (b *runtimeBackend) catalogClaimNeeded(intent graphReferenceIntent) (bool, 
 	if err != nil {
 		return false, err
 	}
-	if !slices.Contains(slices.Collect(maps.Values(catalogs)), intent.Catalog) {
+	inherits := func(branch ttcvolume.Branch) bool {
+		return branch.RemoteCatalog == intent.Catalog && branch.RemoteInherited
+	}
+	if !slices.ContainsFunc(slices.Collect(maps.Values(catalogs)), inherits) {
 		return false, nil
 	}
 	info, err := b.containerStore().LoadContainer(intent.Container)
@@ -213,7 +217,7 @@ func (b *runtimeBackend) catalogClaimNeeded(intent graphReferenceIntent) (bool, 
 			if branch.Unplaced || branch.NodeID != b.nodeID {
 				continue
 			}
-			if catalogs[repositoryPhysicalBranch(config, branch.FilesystemBranch)] == intent.Catalog {
+			if inherits(catalogs[repositoryPhysicalBranch(config, branch.FilesystemBranch)]) {
 				return true, nil
 			}
 		}

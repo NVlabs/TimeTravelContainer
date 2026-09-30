@@ -517,7 +517,9 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 			return ttcstorage.Result{}, errors.New("existing cold manifest has a conflicting identity")
 		}
 		for _, filesystem := range existing.Filesystems {
-			if filesystem.Root.Root == "" || len(filesystem.Origins) == 0 {
+			// A tree that changed nothing of the image it was restored from
+			// publishes no origin of its own.
+			if filesystem.Root.Root == "" {
 				return ttcstorage.Result{}, errors.New("existing cold manifest has an incomplete filesystem snapshot")
 			}
 			for _, origin := range filesystem.Origins {
@@ -620,12 +622,14 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 				return ttcstorage.Result{}, fmt.Errorf("attaching shared filesystem resolver for %q: %w", config.Source, err)
 			}
 		}
-		descriptor, snapshotErr := repository.DescribeRemoteSnapshot(physicalBranch)
+		// What the branch reaches of a shared image unchanged, the publication
+		// names by the image's own identities, and does not copy.
+		descriptor, snapshotErr := repository.DescribePublishedSnapshot(physicalBranch)
 		origins, originsErr := repository.PrepareBranchPublication(physicalBranch)
 		snapshotErr = errors.Join(snapshotErr, originsErr)
 		for _, origin := range origins {
 			if snapshotErr == nil {
-				snapshotErr = repository.PublishOriginHandoff(context.Background(), p.graphShared, origin)
+				snapshotErr = repository.PublishOriginHandoffByReference(context.Background(), p.graphShared, origin)
 			}
 		}
 		closeErr := repository.Close()
@@ -1687,6 +1691,12 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 					return fmt.Errorf("completing filesystem snapshot origin %d handoff: %w", encodedOrigin, err)
 				}
 			}
+			// The publication keeps what the branch reaches of an image its
+			// repository expands: a catalog claim no longer need.
+			if err := repository.MarkBranchPublished(repositoryPhysicalBranch(config, intent.FilesystemBranch)); err != nil {
+				repository.Close()
+				return fmt.Errorf("recording the publication of filesystem source %q: %w", filesystem.Root.Source, err)
+			}
 			if err := repository.Close(); err != nil {
 				return err
 			}
@@ -2290,7 +2300,7 @@ func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, bra
 	if err := b.discardSupersededBranchFilesystems(info, branch, coldFilesystemRoots(manifest)); err != nil {
 		return err
 	}
-	if _, err := b.materializeDistributedFilesystemRoots(info, branch.FilesystemBranch, coldFilesystemRoots(manifest), true); err != nil {
+	if _, err := b.materializeDistributedFilesystemRoots(info, branch.FilesystemBranch, coldFilesystemRoots(manifest), true, true); err != nil {
 		return err
 	}
 	if manifest.ControlRoot == "" {
@@ -2447,7 +2457,7 @@ func (b *runtimeBackend) materializeColdFilesystem(info ttcbundle.ContainerInfo,
 	if err := b.discardSupersededBranchFilesystems(info, branch, coldFilesystemRoots(manifest)); err != nil {
 		return err
 	}
-	if _, err := b.materializeDistributedFilesystemRoots(info, branch.FilesystemBranch, coldFilesystemRoots(manifest), true); err != nil {
+	if _, err := b.materializeDistributedFilesystemRoots(info, branch.FilesystemBranch, coldFilesystemRoots(manifest), true, true); err != nil {
 		return err
 	}
 	// An ordinary rehydrated Sentry receives shared-pack relay FDs and keeps
