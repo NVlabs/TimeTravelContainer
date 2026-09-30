@@ -19,6 +19,7 @@ package tmpfs
 
 import (
 	"fmt"
+	"strings"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
@@ -252,7 +253,9 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 	if err := parentDir.inode.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
 		return err
 	}
-	if err := create(parentDir, name); err != nil {
+	// A name resolved from a path shares the buffer the path was read into,
+	// of hundreds of bytes, which a file keeps as long as it keeps its name.
+	if err := create(parentDir, strings.Clone(name)); err != nil {
 		return err
 	}
 
@@ -525,7 +528,8 @@ afterTrailingSymlink:
 			return nil, err
 		}
 		defer rp.Mount().EndWrite()
-		// Create and open the child.
+		// Create and open the child, under a name of its own: see doCreateAt.
+		name = strings.Clone(name)
 		creds := rp.Credentials()
 		childInode, err := fs.newRegularFile(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode, parentDir)
 		if err != nil {
@@ -787,6 +791,8 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if err := vfsObj.PrepareRenameDentry(mntns, &renamed.vfsd, replacedVFSD); err != nil {
 		return err
 	}
+	// The renamed file keeps its new name: see doCreateAt.
+	newName = strings.Clone(newName)
 	if fs.diskVolume != nil {
 		if err := fs.diskVolume.Repository.Rename(
 			fs.diskVolume.Branch,
