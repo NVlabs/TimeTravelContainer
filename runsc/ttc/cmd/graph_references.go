@@ -524,6 +524,12 @@ func (b *runtimeBackend) reconcileDistributedGraphReferences(strictRetain bool) 
 			continue
 		}
 		if txErr != nil {
+			if errors.Is(txErr, os.ErrNotExist) && intent.State == "active" {
+				// Its owner outlived the transaction's history, as a parked
+				// runtime backing may: the retain is complete, and the intent
+				// stays while its owner does.
+				continue
+			}
 			failure := fmt.Errorf("loading graph reference transaction %q: %w", intent.Transaction, txErr)
 			if strictRetain && intent.State == "retaining" {
 				return failure

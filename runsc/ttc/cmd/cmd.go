@@ -17010,6 +17010,23 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 			}
 			return fmt.Errorf("persisting deletion of %s: %w", target, err)
 		}
+		// A migration that brought the branch back into its family's own
+		// runtime left the branch's own record beside the migration's. It goes
+		// with the branch: this node's reconciliation, finding it running here
+		// while the family's runtime lives on, placed the removed branch anew.
+		if target.container == logicalFamily && target.branch != requested.branch {
+			if former, err := persistentBranchInfo(info, requested.branch); err == nil {
+				if err := b.reclaimBranchBacking(info, former); err != nil {
+					return fmt.Errorf("reclaiming the former record of %s: %w", requested, err)
+				}
+				if err := store.RemoveBranchArtifacts(target.container, former); err != nil {
+					return fmt.Errorf("removing the former artifacts of %s: %w", requested, err)
+				}
+				if err := store.RemoveBranchRecord(target.container, requested.branch); err != nil && !errors.Is(err, os.ErrNotExist) {
+					return fmt.Errorf("persisting deletion of the former record of %s: %w", requested, err)
+				}
+			}
+		}
 		if err := b.removeLogicalBranchPlacement(logicalFamily, requested.branch); err != nil {
 			return fmt.Errorf("removing cluster placement for %s: %w", requested, err)
 		}

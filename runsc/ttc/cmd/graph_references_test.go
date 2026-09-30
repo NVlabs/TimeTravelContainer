@@ -397,8 +397,9 @@ func TestReconcileKeepsOwnedGraphReferenceIntents(t *testing.T) {
 	backend := &runtimeBackend{dataRoot: root, distributedSource: &distributedSourceRuntime{
 		transactions: transactionLoadCatalog{load: func(id string) (*cluster.Transaction, error) {
 			loaded = append(loaded, id)
-			// The transaction that brought the parked branch here is done.
-			return &cluster.Transaction{State: cluster.TransactionIndependent}, nil
+			// The transaction that brought the parked branch here is gone
+			// from the authority's history.
+			return nil, os.ErrNotExist
 		}},
 	}}
 	if err := backend.reconcileDistributedGraphReferences(true); err != nil {
