@@ -878,6 +878,37 @@ func TestTranslationMutationQuiescesCPUBoundApplication(t *testing.T) {
 	}
 }
 
+// A mirror is mapped from a snapshot of the host's regions, taken earlier.
+// Memory that the Go runtime does not manage, such as malloc's or a thread
+// stack's guard, may have become inaccessible since; mapping it must fail,
+// leaving EL1's accesses to the host gate, rather than fault while committing
+// its pages.
+func TestMirrorOfPageNoLongerWritableFails(t *testing.T) {
+	backend := NewBackend()
+	vmInterface, err := backend.CreateVM(context.Background())
+	if err != nil {
+		skipWithoutHypervisor(t, err)
+	}
+	vm := vmInterface.(*hvfVM)
+	defer vm.Close()
+	host, err := backend.HostMemory().Reserve(vmm.HostSlabSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.HostMemory().Release(host, vmm.HostSlabSize)
+	page := unsafe.Slice((*byte)(unsafe.Pointer(host)), int(vmm.HostSlabSize))
+	if err := unix.Mprotect(page, unix.PROT_READ); err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Mprotect(page, unix.PROT_READ|unix.PROT_WRITE)
+	gpa := GuestRAMIPAStart - vmm.HostSlabSize
+	if err := vm.mapRing0MirrorStage2Source(uintptr(gpa), host, vmm.HostSlabSize,
+		vmm.Stage2Read|vmm.Stage2Write); err == nil {
+		vm.unmapRing0MirrorStage2GPA(gpa, vmm.HostSlabSize)
+		t.Fatal("mapped a writable mirror of a read-only page")
+	}
+}
+
 func TestRuntimeMutationRebindsTrackedStage2WhileGuestRuns(t *testing.T) {
 	backend := NewBackend()
 	vmInterface, err := backend.CreateVM(context.Background())
