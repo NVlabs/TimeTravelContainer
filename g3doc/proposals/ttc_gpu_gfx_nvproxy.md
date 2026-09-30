@@ -460,6 +460,29 @@ for unit tests:
 *   sysfs and the `/dev/dri` nodes;
 *   save and load of all state.
 
+*Status (2026-09-30): done.* `pkg/sentry/devices/virtgpu`:
+
+*   The device keeps what Linux's driver keeps: per-file contexts, whose IDs
+    it assigns at open, and GEM handles; device-wide resources, which
+    handles, mappings, and dma-bufs hold; and fences on each context's rings
+    and on a global timeline, which sync_files and each resource's implicit
+    synchronization (`WAIT`, dma-buf `poll`, `EXPORT_SYNC_FILE`) wait for.
+*   It follows Linux's behavior where Mesa or libdrm can see it: the
+    zero-extended ioctl argument sizes of `drm_ioctl`, `EACCES` for the core
+    ioctls that render nodes refuse, exact-offset whole-blob `mmap`, no
+    private mappings, dma-bufs exported once per resource, `lseek(SEEK_END)`
+    for a dma-buf's size.
+*   Differences from Linux: a classic resource's backing is the renderer's
+    memory, like a blob's; no DRM sync objects; no fence events on the file
+    (`POLL_RINGS_MASK`); no cross-device resources (`CROSS_DEVICE` is 0).
+*   sysfs presents a virtio-gpu PCI function `00ff:00:00.0` (1af4:1050, a
+    domain unlikely to collide with mirrored host trees), its `virtio0`, and
+    `drm/renderD128`, as Linux lays them out, which `drmGetDevices2` walks.
+*   A load keeps the Sentry's state and loses the renderer's: contexts and
+    resources of the old renderer fail with `ENODEV`, and their pending
+    fences signal with it. `ValidateLiveFork` refuses forks while the GPU is
+    in use unless the family's policy allows them.
+
 **A2, the renderer:**
 
 *   the process, its protocol, and its macOS backend;
@@ -468,6 +491,30 @@ for unit tests:
 
 End to end, `vulkaninfo` and an offscreen render's checksum in
 `ttc run --gfx --waive-live-fork`.
+
+*Status (2026-09-30): in progress.*
+
+*   Done, and tested on the host's GPU (MoltenVK):
+    *   `ttc-gfx-renderer` (`runsc/ttcgfx`, `runsc/ttc/gfxrenderer`), its own
+        binary because ttcd is pure Go on Linux. It loads gfxstream with
+        `dlopen`; `probe` prints the capability sets. Its README records the
+        gfxstream build and TTC's patches to it, and how to build the guest's
+        driver.
+    *   `pkg/gfxproto`, the protocol: framed messages on a Unix stream
+        socket, descriptors with `SCM_RIGHTS`; the renderer answers only
+        context creation and resource mapping, and forwards gfxstream's
+        fences, signaled on its own threads, through a pipe.
+    *   `rendererclient`, the Sentry's `virtgpu.Renderer`, and its `Broker`,
+        which asks the daemon for renderers over a socket that the daemon
+        gives the Sentry at boot (`gfxrenderer.ServeBroker` is the daemon's
+        side).
+*   Done, with unit tests on fake VMs; not yet run on Hypervisor.framework:
+    vmplatform maps a `memmap.HostMemoryFile` in place, in GuestRAM's
+    external slabs: at IPA of their own, readable and writable, never
+    executable, whole host slabs within the file's own mapping, unmapped from
+    stage 2 before the Sentry unmaps the memory.
+*   To do: the daemon's broker and `--gfx` plumbing, the runsc boot wiring,
+    the guest driver's injection, and the end-to-end test.
 
 **A3, the CLI and family:**
 
