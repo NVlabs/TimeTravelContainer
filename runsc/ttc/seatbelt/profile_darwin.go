@@ -52,15 +52,17 @@ const DaemonProfile = `(version 1)
 //     their paths reads;
 //   - the GPU's IOKit user clients, and IOSurface's;
 //   - POSIX shared memory of the names that the renderer and gfxstream give
-//     it, "/ttcgfx." and "/gfxs.", random and unlinked at once.
+//     it, "/ttcgfx." and "/gfxs.", random and unlinked at once;
+//   - if scratch is not empty, reading and writing the directory scratch,
+//     where the renderer takes and restores snapshots.
 //
 // It denies the rest, such as writing files, the network, starting
 // processes, and the services of the system that Apple's system.sb does
 // not admit: Metal needs none of them.
 //
-// A path of readable with a control character, which the profile cannot
-// spell, is an error.
-func RendererProfile(readable []string) (string, error) {
+// A path with a control character, which the profile cannot spell, is an
+// error.
+func RendererProfile(readable []string, scratch string) (string, error) {
 	var b strings.Builder
 	b.WriteString(`(version 1)
 (deny default)
@@ -72,6 +74,9 @@ func RendererProfile(readable []string) (string, error) {
     (subpath "/opt/homebrew")
     (subpath "/usr/local")`)
 	ancestors := make(map[string]bool)
+	if strings.IndexFunc(scratch, unicode.IsControl) >= 0 {
+		return "", fmt.Errorf("path %q has a control character", scratch)
+	}
 	for _, path := range readable {
 		if strings.IndexFunc(path, unicode.IsControl) >= 0 {
 			return "", fmt.Errorf("path %q has a control character", path)
@@ -93,6 +98,9 @@ func RendererProfile(readable []string) (string, error) {
     (ipc-posix-name-prefix "/ttcgfx.")
     (ipc-posix-name-prefix "/gfxs."))
 `)
+	if scratch != "" {
+		fmt.Fprintf(&b, "(allow file-read* file-write* (subpath %s))\n", quote(scratch))
+	}
 	return b.String(), nil
 }
 

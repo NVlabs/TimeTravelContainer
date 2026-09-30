@@ -23,9 +23,24 @@ type Options struct {
 	Library string
 
 	// Features are gfxstream's renderer features, such as
-	// "VulkanSnapshots:enabled".
+	// "VulkanBatchedDescriptorSetUpdate:disabled".
 	Features string
+
+	// Snapshots is whether the renderer takes snapshots and restores them.
+	Snapshots bool
+
+	// ScratchDir is, in a renderer that takes snapshots, a directory of its
+	// own, where gfxstream writes and reads them.
+	ScratchDir string
 }
+
+// snapshotFeatures are the gfxstream features of a renderer that takes
+// snapshots and restores them:
+//   - VulkanSnapshots records how to rebuild each Vulkan object, from the
+//     renderer's start;
+//   - batched descriptor set updates, which the capability sets offer the
+//     guest, are off: their replay fails to restore descriptor sets.
+const snapshotFeatures = "VulkanSnapshots:enabled,VulkanBatchedDescriptorSetUpdate:disabled"
 
 // flags returns the renderer's flags for the options.
 func (o *Options) flags() []string {
@@ -35,6 +50,9 @@ func (o *Options) flags() []string {
 	}
 	if o.Features != "" {
 		flags = append(flags, "--features", o.Features)
+	}
+	if o.Snapshots {
+		flags = append(flags, "--snapshots")
 	}
 	return flags
 }

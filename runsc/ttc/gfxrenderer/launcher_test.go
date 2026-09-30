@@ -9,6 +9,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"gvisor.dev/gvisor/pkg/gfxproto"
 )
 
 // helperEnv makes the test binary act as the renderer's executable, in the
@@ -57,21 +59,31 @@ func TestLauncher(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer l.Close()
-	for i := 0; i < 2; i++ {
-		fd, err := l.StartRenderer()
+	for _, test := range []struct {
+		flags uint32
+		want  string
+	}{
+		{0, "serve --library /lib"},
+		{gfxproto.RendererFlagSnapshots, "serve --library /lib --snapshots"},
+	} {
+		fd, err := l.StartRenderer(test.flags)
 		if err != nil {
 			t.Fatalf("StartRenderer: %v", err)
 		}
 		conn := os.NewFile(uintptr(fd), "renderer")
 		got, err := io.ReadAll(conn)
 		conn.Close()
-		if err != nil || string(got) != "serve --library /lib" {
-			t.Errorf("the renderer was started with %q, %v; want serve --library /lib", got, err)
+		if err != nil || string(got) != test.want {
+			t.Errorf("the renderer was started with %q, %v; want %s", got, err, test.want)
 		}
 	}
-	output, err := l.Probe()
+	output, err := l.Probe(0)
 	if err != nil || string(output) != "\"probe --library /lib\"\n" {
 		t.Errorf("Probe: %q, %v", output, err)
+	}
+	output, err = l.Probe(gfxproto.RendererFlagSnapshots)
+	if err != nil || string(output) != "\"probe --library /lib --snapshots\"\n" {
+		t.Errorf("Probe of a renderer for snapshots: %q, %v", output, err)
 	}
 }
 
@@ -82,11 +94,11 @@ func TestLauncherProbeFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer l.Close()
-	if _, err := l.Probe(); err == nil || !strings.Contains(err.Error(), "no GPU here") {
+	if _, err := l.Probe(0); err == nil || !strings.Contains(err.Error(), "no GPU here") {
 		t.Errorf("Probe: %v, want the probe's error", err)
 	}
 	// The launcher serves on.
-	fd, err := l.StartRenderer()
+	fd, err := l.StartRenderer(0)
 	if err != nil {
 		t.Fatalf("StartRenderer after a failed probe: %v", err)
 	}

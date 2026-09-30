@@ -1,0 +1,168 @@
+From 14bd94d371bde09b2b8f5d44c7e96f075b151352 Mon Sep 17 00:00:00 2001
+From: Zizheng Guo <zizhengg@nvidia.com>
+Date: Wed, 30 Sep 2026 20:05:20 +0800
+Subject: [PATCH 4/4] host: pause the rings' consumers for all of a snapshot
+
+VirtioGpuFrontend::snapshot saved the renderer, whose Vulkan state the
+rings' consumers change as they decode what guests write, and then the
+frontend, whose ring blobs the consumers read, while the consumers ran:
+only the ASG device's save paused them, last. A guest stopped mid-frame
+can leave commands in a ring, which its consumer decodes at any time.
+
+The address space device's save is now three steps, preSave, save, and
+postSave, and the snapshot pauses the consumers before it saves anything,
+and resumes them after it is done.
+---
+ host/address_space/address_space_device.cpp   | 57 ++++++++++++++-----
+ .../gfxstream/host/address_space_device.h     |  5 ++
+ host/virtio_gpu_frontend.cpp                  |  7 +++
+ 3 files changed, 56 insertions(+), 13 deletions(-)
+
+diff --git a/host/address_space/address_space_device.cpp b/host/address_space/address_space_device.cpp
+index caa506b..a51542f 100644
+--- a/host/address_space/address_space_device.cpp
++++ b/host/address_space/address_space_device.cpp
+@@ -147,8 +147,13 @@ class AddressSpaceDeviceState {
+         return contextDesc.device_context.get();
+     }
+ 
+-    void save(Stream* stream) const {
+-        // Pre-save
++    // preSave pauses the contexts' consumers, until postSave. A save between
++    // them saves the paused state; one without them pauses the consumers
++    // itself.
++    void preSave() {
++        if (mPausedForSave) {
++            return;
++        }
+         for (const auto &kv : mContexts) {
+             const AddressSpaceContextDescription &desc = kv.second;
+             const AddressSpaceDeviceContext *device_context = desc.device_context.get();
+@@ -156,8 +161,31 @@ class AddressSpaceDeviceState {
+                 device_context->preSave();
+             }
+         }
+-
+         AddressSpaceGraphicsContext::globalStatePreSave();
++        mPausedForSave = true;
++    }
++
++    void postSave() {
++        if (!mPausedForSave) {
++            return;
++        }
++        AddressSpaceGraphicsContext::globalStatePostSave();
++        for (const auto &kv : mContexts) {
++            const AddressSpaceContextDescription &desc = kv.second;
++            const AddressSpaceDeviceContext *device_context = desc.device_context.get();
++            if (device_context) {
++                device_context->postSave();
++            }
++        }
++        mPausedForSave = false;
++    }
++
++    void save(Stream* stream) {
++        const bool paused = mPausedForSave;
++        if (!paused) {
++            preSave();
++        }
++
+         AddressSpaceGraphicsContext::globalStateSave(stream);
+ 
+         stream->putBe32(mHandleIndex);
+@@ -180,16 +208,8 @@ class AddressSpaceDeviceState {
+             }
+         }
+ 
+-        // Post save
+-
+-        AddressSpaceGraphicsContext::globalStatePostSave();
+-
+-        for (const auto &kv : mContexts) {
+-            const AddressSpaceContextDescription &desc = kv.second;
+-            const AddressSpaceDeviceContext *device_context = desc.device_context.get();
+-            if (device_context) {
+-                device_context->postSave();
+-            }
++        if (!paused) {
++            postSave();
+         }
+     }
+ 
+@@ -352,6 +372,9 @@ class AddressSpaceDeviceState {
+ 
+     // Not saved/loaded. Externally owned resources used during load.
+     std::optional<AddressSpaceDeviceLoadResources> mLoadResources;
++
++    // mPausedForSave is whether preSave paused the consumers.
++    bool mPausedForSave = false;
+ };
+ 
+ static AddressSpaceDeviceState* sAddressSpaceDeviceState() {
+@@ -451,6 +474,14 @@ int gfxstream_address_space_set_load_resources(AddressSpaceDeviceLoadResources r
+     return 0;
+ }
+ 
++void gfxstream_address_space_pre_save() {
++    sAddressSpaceDeviceState()->preSave();
++}
++
++void gfxstream_address_space_post_save() {
++    sAddressSpaceDeviceState()->postSave();
++}
++
+ int gfxstream_address_space_save_memory_state(gfxstream::Stream *stream) {
+     sAddressSpaceDeviceState()->save(stream);
+     return 0;
+diff --git a/host/address_space/include/gfxstream/host/address_space_device.h b/host/address_space/include/gfxstream/host/address_space_device.h
+index 2dec658..e23e7cd 100644
+--- a/host/address_space/include/gfxstream/host/address_space_device.h
++++ b/host/address_space/include/gfxstream/host/address_space_device.h
+@@ -27,6 +27,11 @@ constexpr const int kAsgWriteStepSize = 262144;
+ constexpr const int kAsgDataRingSize = 524288;
+ constexpr const int kAsgDrawFlushInterval = 10000;
+ 
++// gfxstream_address_space_pre_save pauses the address space device's
++// consumers, which a save in between does not resume, until
++// gfxstream_address_space_post_save.
++void gfxstream_address_space_pre_save();
++void gfxstream_address_space_post_save();
+ int gfxstream_address_space_save_memory_state(gfxstream::Stream* stream);
+ int gfxstream_address_space_load_memory_state(gfxstream::Stream* stream);
+ 
+diff --git a/host/virtio_gpu_frontend.cpp b/host/virtio_gpu_frontend.cpp
+index 3b5eaaf..1b0ff75 100644
+--- a/host/virtio_gpu_frontend.cpp
++++ b/host/virtio_gpu_frontend.cpp
+@@ -1144,20 +1144,27 @@ int VirtioGpuFrontend::snapshot(const char* directory) {
+         return -EINVAL;
+     }
+     mRenderer->pauseAllPreSave();
++    // The rings' consumers, render threads that decode what guests write,
++    // must be paused while the renderer and the rings are saved, not only
++    // while the ASG device is; they resume once the snapshot is done.
++    gfxstream_address_space_pre_save();
+ 
+     int ret = snapshotRenderer(directory);
+     if (ret) {
+         GFXSTREAM_ERROR("Failed to save snapshot: failed to snapshot renderer.");
++        gfxstream_address_space_post_save();
+         return ret;
+     }
+ 
+     ret = snapshotFrontend(directory);
+     if (ret) {
+         GFXSTREAM_ERROR("Failed to save snapshot: failed to snapshot frontend.");
++        gfxstream_address_space_post_save();
+         return ret;
+     }
+ 
+     ret = snapshotAsg(directory);
++    gfxstream_address_space_post_save();
+     if (ret) {
+         GFXSTREAM_ERROR("Failed to save snapshot: failed to snapshot ASG device.");
+         return ret;
+-- 
+2.50.1 (Apple Git-155)
+

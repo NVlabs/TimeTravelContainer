@@ -21,6 +21,7 @@ go_library(
         "renderer.go",
         "shm_darwin.go",
         "shm_linux.go",
+        "snapshot.go",
     ],
     bazel_cgo = True,
     stateify = False,
@@ -38,6 +39,9 @@ go_library(
 go_test(
     name = "gfxrenderer_test",
     size = "small",
-    srcs = ["launcher_test.go"],
+    srcs = [
+        "launcher_test.go",
+        "snapshot_test.go",
+    ],
     library = ":gfxrenderer",
 )

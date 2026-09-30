@@ -45,6 +45,8 @@ const (
 	MsgSubmitCommand
 	MsgTransfer
 	MsgCreateFence
+	MsgSnapshot
+	MsgRestore
 )
 
 // Messages from the renderer to the Sentry.
@@ -93,6 +95,10 @@ func (t MsgType) String() string {
 		return "Transfer"
 	case MsgCreateFence:
 		return "CreateFence"
+	case MsgSnapshot:
+		return "Snapshot"
+	case MsgRestore:
+		return "Restore"
 	case MsgHello:
 		return "Hello"
 	case MsgReply:
@@ -230,27 +236,46 @@ type (
 		Ring    uint32
 	}
 
-	// StartRenderer asks the broker to start a renderer. The broker replies
-	// with the descriptor of a connection to it, a Unix stream socket, on
-	// which the renderer sends Hello.
+	// StartRenderer asks the broker to start a renderer, with Flags,
+	// RendererFlag*. The broker replies with the descriptor of a connection
+	// to it, a Unix stream socket, on which the renderer sends Hello.
 	StartRenderer struct {
-		Reserved uint32
+		Flags uint32
 	}
 
-	// LaunchRenderer asks the launcher to start a renderer, whose connection
-	// to its Sentry is the message's descriptor. The reply's trailer says
-	// why it failed, if it did.
+	// LaunchRenderer asks the launcher to start a renderer, with Flags,
+	// RendererFlag*, whose connection to its Sentry is the message's
+	// descriptor. The reply's trailer says why it failed, if it did.
 	LaunchRenderer struct {
+		Flags uint32
+	}
+
+	// Snapshot asks the renderer for a snapshot of its state. The reply's
+	// descriptor is shared memory that holds the snapshot, of the reply's
+	// Size bytes.
+	Snapshot struct {
 		Reserved uint32
 	}
 
-	// LaunchProbe asks the launcher for the renderer's capability sets. The
-	// reply's trailer is what the renderer's probe printed, or why it
-	// failed.
+	// Restore restores a renderer, which has no contexts or resources, from
+	// a snapshot, of Size bytes in the message's descriptor. The renderer
+	// replies.
+	Restore struct {
+		Size uint64
+	}
+
+	// LaunchProbe asks the launcher for the capability sets of a renderer
+	// with Flags, RendererFlag*. The reply's trailer is what the renderer's
+	// probe printed, or why it failed.
 	LaunchProbe struct {
-		Reserved uint32
+		Flags uint32
 	}
 )
+
+// RendererFlagSnapshots is a flag of StartRenderer and LaunchRenderer: the
+// renderer takes snapshots and restores them, which costs it memory from its
+// start, since it records how to rebuild its Vulkan objects.
+const RendererFlagSnapshots = 1 << 0
 
 const (
 	// headerSize is the size of a message's header: its type, the length of

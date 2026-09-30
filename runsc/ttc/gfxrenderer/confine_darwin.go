@@ -42,7 +42,7 @@ func Confine(opts Options) error {
 	}
 	add(opts.library())
 	add(os.Getenv("ANDROID_EMU_VK_LOADER_PATH"))
-	profile, err := seatbelt.RendererProfile(readable)
+	profile, err := seatbelt.RendererProfile(readable, opts.ScratchDir)
 	if err != nil {
 		return err
 	}

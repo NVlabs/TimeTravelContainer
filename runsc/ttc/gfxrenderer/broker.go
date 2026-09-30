@@ -68,7 +68,11 @@ func ServeBroker(fd int, opts BrokerOptions) error {
 		if m.Type != gfxproto.MsgStartRenderer {
 			return fmt.Errorf("unexpected %v", m.Type)
 		}
-		sentryFD, err := startRenderer(&opts)
+		var p gfxproto.StartRenderer
+		if _, err := m.Decode(&p); err != nil {
+			return err
+		}
+		sentryFD, err := startRenderer(&opts, p.Flags)
 		if err != nil {
 			log.Printf("starting a GPU renderer: %v", err)
 			if err := conn.Send(gfxproto.MsgReply, m.Seq, &gfxproto.Reply{Errno: uint32(unix.ENODEV)}, nil); err != nil {
@@ -84,11 +88,11 @@ func ServeBroker(fd int, opts BrokerOptions) error {
 	}
 }
 
-// startRenderer starts a renderer, and returns the Sentry's end of a
-// connection to it.
-func startRenderer(opts *BrokerOptions) (int, error) {
+// startRenderer starts a renderer with flags, gfxproto.RendererFlag*, and
+// returns the Sentry's end of a connection to it.
+func startRenderer(opts *BrokerOptions, flags uint32) (int, error) {
 	if opts.Launcher != nil {
-		return opts.Launcher.StartRenderer()
+		return opts.Launcher.StartRenderer(flags)
 	}
 	fds, err := socketpair()
 	if err != nil {
@@ -96,7 +100,9 @@ func startRenderer(opts *BrokerOptions) (int, error) {
 	}
 	rendererEnd := os.NewFile(uintptr(fds[1]), "gfx-renderer-connection")
 	defer rendererEnd.Close()
-	cmd := exec.Command(opts.Renderer, opts.args("serve")...)
+	withFlags := *opts
+	withFlags.Options.Snapshots = flags&gfxproto.RendererFlagSnapshots != 0
+	cmd := exec.Command(opts.Renderer, withFlags.args("serve")...)
 	// The connection is the renderer's fd 3.
 	cmd.ExtraFiles = []*os.File{rendererEnd}
 	cmd.Stdout = opts.Stderr
@@ -109,12 +115,16 @@ func startRenderer(opts *BrokerOptions) (int, error) {
 	return fds[0], nil
 }
 
-// ProbeRenderer returns the renderer's capability sets, as its probe prints
-// them, through opts.Launcher if it is not nil. If the probe fails, what it
-// logged goes to opts.Stderr.
+// ProbeRenderer returns the capability sets of a renderer with
+// opts.Options, as its probe prints them, through opts.Launcher if it is not
+// nil. If the probe fails, what it logged goes to opts.Stderr.
 func ProbeRenderer(opts BrokerOptions) ([]byte, error) {
 	if opts.Launcher != nil {
-		return opts.Launcher.Probe()
+		var flags uint32
+		if opts.Options.Snapshots {
+			flags |= gfxproto.RendererFlagSnapshots
+		}
+		return opts.Launcher.Probe(flags)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()

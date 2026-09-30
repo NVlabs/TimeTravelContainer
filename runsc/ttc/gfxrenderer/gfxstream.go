@@ -112,6 +112,9 @@ struct ttc_gfxstream {
 	int (*context_create)(uint32_t, uint32_t, const char*, uint32_t);
 	int (*create_fence)(const struct stream_renderer_fence*);
 	int (*resource_map_info)(uint32_t, uint32_t*);
+	// snapshot and restore are NULL in a library without them.
+	int (*snapshot)(const char*);
+	int (*restore)(const char*);
 };
 
 static struct ttc_gfxstream ttc_g;
@@ -180,8 +183,23 @@ static const char* ttc_gfxstream_open(const char* path) {
 	TTC_SYM(create_fence, "stream_renderer_create_fence");
 	TTC_SYM(resource_map_info, "stream_renderer_resource_map_info");
 #undef TTC_SYM
+	*(void**)(&ttc_g.snapshot) = dlsym(lib, "stream_renderer_snapshot");
+	*(void**)(&ttc_g.restore) = dlsym(lib, "stream_renderer_restore");
 	ttc_g.lib = lib;
 	return NULL;
+}
+
+static int ttc_snapshot(const char* dir) {
+	return ttc_g.snapshot != NULL ? ttc_g.snapshot(dir) : -ENOSYS;
+}
+
+static int ttc_restore(const char* dir) {
+	return ttc_g.restore != NULL ? ttc_g.restore(dir) : -ENOSYS;
+}
+
+static int ttc_attach_backing(uint32_t res_id, void* backing, uint64_t size) {
+	struct iovec iov = {.iov_base = backing, .iov_len = size};
+	return ttc_g.resource_attach_iov(res_id, &iov, 1);
 }
 
 static int ttc_gfxstream_init(uint64_t flags, const char* features, int fence_fd) {
@@ -341,6 +359,26 @@ func (g *gfxstream) init(features string, fenceFD int) error {
 
 func (g *gfxstream) teardown() {
 	C.ttc_gfxstream_teardown()
+}
+
+// snapshot saves the renderer's state into the files of dir.
+func (g *gfxstream) snapshot(dir string) int {
+	cdir := C.CString(dir)
+	defer C.free(unsafe.Pointer(cdir))
+	return int(C.ttc_snapshot(cdir))
+}
+
+// restore restores the renderer's state from the files of dir.
+func (g *gfxstream) restore(dir string) int {
+	cdir := C.CString(dir)
+	defer C.free(unsafe.Pointer(cdir))
+	return int(C.ttc_restore(cdir))
+}
+
+// attachBacking attaches backing, which a restore lost, to the classic
+// resource resID.
+func (g *gfxstream) attachBacking(resID uint32, backing []byte) int {
+	return int(C.ttc_attach_backing(C.uint32_t(resID), unsafe.Pointer(&backing[0]), C.uint64_t(len(backing))))
 }
 
 // capset returns a capability set's latest version and contents.

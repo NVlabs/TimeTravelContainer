@@ -66,15 +66,27 @@ func ServeLauncher(fd int, renderer string, opts Options) error {
 		var trailer []byte
 		switch m.Type {
 		case gfxproto.MsgLaunchRenderer:
+			var p gfxproto.LaunchRenderer
+			if _, err = m.Decode(&p); err != nil {
+				break
+			}
 			if len(m.FDs) != 1 {
 				err = fmt.Errorf("%v with %d descriptors", m.Type, len(m.FDs))
 				break
 			}
 			fd := m.FDs[0]
 			m.FDs = nil
-			err = launchRenderer(renderer, opts, fd)
+			withFlags := opts
+			withFlags.Snapshots = p.Flags&gfxproto.RendererFlagSnapshots != 0
+			err = launchRenderer(renderer, withFlags, fd)
 		case gfxproto.MsgLaunchProbe:
-			trailer, err = ProbeRenderer(BrokerOptions{Renderer: renderer, Options: opts, Stderr: os.Stderr})
+			var p gfxproto.LaunchProbe
+			if _, err = m.Decode(&p); err != nil {
+				break
+			}
+			withFlags := opts
+			withFlags.Snapshots = p.Flags&gfxproto.RendererFlagSnapshots != 0
+			trailer, err = ProbeRenderer(BrokerOptions{Renderer: renderer, Options: withFlags, Stderr: os.Stderr})
 		default:
 			m.CloseFDs()
 			return fmt.Errorf("unexpected %v", m.Type)
@@ -178,14 +190,15 @@ func (l *Launcher) call(typ gfxproto.MsgType, p any, fds ...int) ([]byte, error)
 	return trailer, nil
 }
 
-// StartRenderer asks the launcher to start a renderer, and returns the other
-// end of the renderer's connection, for its Sentry.
-func (l *Launcher) StartRenderer() (int, error) {
+// StartRenderer asks the launcher to start a renderer with flags,
+// gfxproto.RendererFlag*, and returns the other end of the renderer's
+// connection, for its Sentry.
+func (l *Launcher) StartRenderer(flags uint32) (int, error) {
 	fds, err := socketpair()
 	if err != nil {
 		return -1, err
 	}
-	_, err = l.call(gfxproto.MsgLaunchRenderer, &gfxproto.LaunchRenderer{}, fds[1])
+	_, err = l.call(gfxproto.MsgLaunchRenderer, &gfxproto.LaunchRenderer{Flags: flags}, fds[1])
 	unix.Close(fds[1])
 	if err != nil {
 		unix.Close(fds[0])
@@ -194,10 +207,10 @@ func (l *Launcher) StartRenderer() (int, error) {
 	return fds[0], nil
 }
 
-// Probe asks the launcher for the renderer's capability sets, as the
-// renderer's probe prints them.
-func (l *Launcher) Probe() ([]byte, error) {
-	return l.call(gfxproto.MsgLaunchProbe, &gfxproto.LaunchProbe{})
+// Probe asks the launcher for the capability sets of a renderer with flags,
+// gfxproto.RendererFlag*, as the renderer's probe prints them.
+func (l *Launcher) Probe(flags uint32) ([]byte, error) {
+	return l.call(gfxproto.MsgLaunchProbe, &gfxproto.LaunchProbe{Flags: flags})
 }
 
 // Close closes the connection, which makes the launcher exit.

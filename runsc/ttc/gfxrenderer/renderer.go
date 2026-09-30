@@ -12,6 +12,9 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -26,7 +29,11 @@ func start(opts Options, fenceFD int) (*gfxstream, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := g.init(opts.Features, fenceFD); err != nil {
+	features := opts.Features
+	if opts.Snapshots {
+		features = strings.Trim(features+","+snapshotFeatures, ",")
+	}
+	if err := g.init(features, fenceFD); err != nil {
 		return nil, err
 	}
 	return g, nil
@@ -74,6 +81,7 @@ type server struct {
 	conn      *gfxproto.Conn
 	g         *gfxstream
 	resources map[uint32]*resource
+	opts      Options
 }
 
 // Serve renders for the Sentry connected to the Unix stream socket fd, which
@@ -100,6 +108,7 @@ func Serve(fd int, opts Options) error {
 		conn:      conn,
 		g:         g,
 		resources: make(map[uint32]*resource),
+		opts:      opts,
 	}
 	// Free resources' memory once gfxstream no longer uses it.
 	defer func() {
@@ -279,6 +288,30 @@ func (s *server) handle(m *gfxproto.Message) error {
 			return fmt.Errorf("creating fence %d: %d", p.FenceID, ret)
 		}
 
+	case gfxproto.MsgSnapshot:
+		fd, size, err := s.snapshot()
+		if err != nil {
+			log.Printf("taking a snapshot: %v", err)
+			return s.reply(m, gfxproto.Reply{Errno: uint32(unix.EIO)})
+		}
+		err = s.reply(m, gfxproto.Reply{Size: size}, fd)
+		unix.Close(fd)
+		return err
+
+	case gfxproto.MsgRestore:
+		var p gfxproto.Restore
+		if _, err := m.Decode(&p); err != nil {
+			return err
+		}
+		if len(m.FDs) != 1 {
+			return fmt.Errorf("%v with %d descriptors", m.Type, len(m.FDs))
+		}
+		if err := s.restore(m.FDs[0], p.Size); err != nil {
+			log.Printf("restoring a snapshot: %v", err)
+			return s.reply(m, gfxproto.Reply{Errno: uint32(unix.EIO)})
+		}
+		return s.reply(m, gfxproto.Reply{})
+
 	default:
 		return fmt.Errorf("unexpected %v", m.Type)
 	}
@@ -347,5 +380,159 @@ func (s *server) releaseAll() {
 	for id, r := range s.resources {
 		r.release()
 		delete(s.resources, id)
+	}
+}
+
+// snapshot saves the renderer's state, and returns a pipe from which it
+// reads, and its size. The Sentry has quiesced the renderer: no work is
+// pending.
+func (s *server) snapshot() (int, uint64, error) {
+	dir := s.opts.ScratchDir
+	if dir == "" {
+		return -1, 0, errors.New("the renderer was not started for snapshots")
+	}
+	if ret := s.g.snapshot(dir); ret != 0 {
+		removeFiles(dir)
+		return -1, 0, fmt.Errorf("stream_renderer_snapshot: %d", ret)
+	}
+	entries, err := takeFiles(dir)
+	if err != nil {
+		return -1, 0, err
+	}
+	var resources []archivedResource
+	for id, r := range s.resources {
+		resources = append(resources, archivedResource{id: id, blob: r.blob})
+		if !r.blob && r.backing != nil {
+			entries = append(entries, archiveEntry{name: archiveBackingPrefix + strconv.FormatUint(uint64(id), 10), data: r.backing})
+		}
+	}
+	entries = append(entries, archiveEntry{name: archiveResources, data: encodeResources(resources)})
+	data := encodeArchive(entries)
+	// The Sentry reads the snapshot from a pipe: it neither creates nor
+	// maps memory of the renderer's for it.
+	r, w, err := os.Pipe()
+	if err != nil {
+		return -1, 0, err
+	}
+	go func() {
+		w.Write(data)
+		w.Close()
+	}()
+	fd, err := unix.Dup(int(r.Fd()))
+	r.Close()
+	if err != nil {
+		return -1, 0, err
+	}
+	return fd, uint64(len(data)), nil
+}
+
+// restore restores the renderer, which has no resources, from a snapshot of
+// size bytes that it reads from the pipe fd.
+func (s *server) restore(fd int, size uint64) error {
+	dir := s.opts.ScratchDir
+	if dir == "" {
+		return errors.New("the renderer was not started for snapshots")
+	}
+	if len(s.resources) != 0 {
+		return errors.New("the renderer has resources")
+	}
+	if size == 0 || size > 1<<40 {
+		return fmt.Errorf("a snapshot of %d bytes", size)
+	}
+	// The caller closes fd, so read from a copy of it, which a File owns.
+	dup, err := unix.Dup(fd)
+	if err != nil {
+		return err
+	}
+	pipe := os.NewFile(uintptr(dup), "snapshot")
+	defer pipe.Close()
+	data := make([]byte, size)
+	if _, err := io.ReadFull(pipe, data); err != nil {
+		return fmt.Errorf("reading the snapshot: %w", err)
+	}
+	entries, err := decodeArchive(data)
+	if err != nil {
+		return err
+	}
+	var resources []archivedResource
+	backings := make(map[uint32][]byte)
+	defer removeFiles(dir)
+	for _, e := range entries {
+		switch {
+		case e.name == archiveResources:
+			if resources, err = decodeResources(e.data); err != nil {
+				return err
+			}
+		case strings.HasPrefix(e.name, archiveBackingPrefix):
+			id, err := strconv.ParseUint(strings.TrimPrefix(e.name, archiveBackingPrefix), 10, 32)
+			if err != nil {
+				return fmt.Errorf("snapshot entry %q", e.name)
+			}
+			backings[uint32(id)] = e.data
+		default:
+			if err := os.WriteFile(filepath.Join(dir, e.name), e.data, 0600); err != nil {
+				return err
+			}
+		}
+	}
+	if ret := s.g.restore(dir); ret != 0 {
+		return fmt.Errorf("stream_renderer_restore: %d", ret)
+	}
+	for _, ar := range resources {
+		if ar.blob {
+			s.resources[ar.id] = &resource{fd: -1, blob: true}
+			continue
+		}
+		// gfxstream saves a classic resource, but not its backing.
+		saved := backings[ar.id]
+		if len(saved) == 0 {
+			return fmt.Errorf("classic resource %d has no backing", ar.id)
+		}
+		fd, err := createSharedMemory(uint64(len(saved)))
+		if err != nil {
+			return err
+		}
+		backing, err := unix.Mmap(fd, 0, len(saved), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
+		if err != nil {
+			unix.Close(fd)
+			return err
+		}
+		copy(backing, saved)
+		r := &resource{fd: fd, backing: backing}
+		if ret := s.g.attachBacking(ar.id, backing); ret != 0 {
+			r.release()
+			return fmt.Errorf("attaching the backing of resource %d: %d", ar.id, ret)
+		}
+		s.resources[ar.id] = r
+	}
+	return nil
+}
+
+// takeFiles returns the files of dir as archive entries, and removes them.
+func takeFiles(dir string) ([]archiveEntry, error) {
+	defer removeFiles(dir)
+	des, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var entries []archiveEntry
+	for _, de := range des {
+		if !de.Type().IsRegular() {
+			return nil, fmt.Errorf("gfxstream's snapshot has %q, not a regular file", de.Name())
+		}
+		data, err := os.ReadFile(filepath.Join(dir, de.Name()))
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, archiveEntry{name: de.Name(), data: data})
+	}
+	return entries, nil
+}
+
+// removeFiles removes the files of dir.
+func removeFiles(dir string) {
+	des, _ := os.ReadDir(dir)
+	for _, de := range des {
+		os.RemoveAll(filepath.Join(dir, de.Name()))
 	}
 }

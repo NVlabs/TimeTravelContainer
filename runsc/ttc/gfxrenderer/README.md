@@ -14,6 +14,18 @@
 *   `launch` starts renderers for the ttcd connected to its fd 3
     (`ServeLauncher`), on macOS.
 
+`--snapshots` makes a renderer, for a family with `--gfx-fork=snapshot`,
+that takes snapshots and restores them (`MsgSnapshot`, `MsgRestore`). It
+records how to rebuild its Vulkan objects from its start, which costs
+memory, and its capability sets differ: it does not offer guests batched
+descriptor set updates, whose replay fails to restore. A snapshot is an
+archive of gfxstream's snapshot files and of what gfxstream does not save:
+the renderer's resources, and its classic resources' backings. Snapshots
+travel through pipes, so that the Sentry neither creates nor maps memory for
+them. gfxstream rebuilds command buffers but not the commands recorded in
+them: a guest must record them again after a fork, as Android's renderers
+do each frame.
+
 ## Confinement
 
 A renderer decodes a guest's command streams with gfxstream, a large C++
@@ -47,7 +59,8 @@ with the patches in `patches/`:
 git clone https://github.com/google/gfxstream.git && cd gfxstream
 git checkout 62c7716251c56619cdaf2419de4b53ee6035937f
 git am /path/to/ttc/runsc/ttc/gfxrenderer/patches/*.patch
-meson setup build -Ddefault_library=shared -Dgfxstream-build=host -Dbuildtype=release
+meson setup build -Ddefault_library=shared -Dgfxstream-build=host -Dbuildtype=release \
+  -Dsnapshots=enabled
 ninja -C build   # build/host/libgfxstream_backend.{dylib,so}
 ```
 
@@ -58,6 +71,12 @@ The patches:
 *   `0002`: on macOS, shared memory is created unnamed. POSIX shared memory
     names are global to the user there, and gfxstream's repeat in every
     process, so two renderers shared their command rings and memory.
+*   `0003`: the meson build has snapshot support (`-Dsnapshots`), which needs
+    protobuf; only Android's build had it.
+*   `0004`: a snapshot pauses the rings' consumers, which decode what guests
+    write, for all of the snapshot, not only while the rings are saved.
+*   `0005`: a snapshot whose files cannot be opened fails, instead of
+    crashing the renderer.
 
 *   **macOS**: Homebrew's `molten-vk`, `vulkan-loader`, and
     `vulkan-headers`, and `meson` and `ninja`. gfxstream looks for the Vulkan
@@ -66,9 +85,8 @@ The patches:
 *   **Linux**: the host's Vulkan driver and loader.
 *   The Vulkan-only configuration (`-Ddecoders=vulkan`) does not compile at
     this commit; the default decoders build, and the renderer runs Vulkan only.
-*   Snapshots (`--gfx-fork=snapshot`) need
-    `GFXSTREAM_BUILD_WITH_SNAPSHOT_FRONTEND_SUPPORT` and protobuf, which the
-    meson build does not set up yet.
+*   Snapshots (`--gfx-fork=snapshot`) need protobuf: Homebrew's
+    `protobuf` on macOS.
 
 To test the renderer on the host's GPU:
 

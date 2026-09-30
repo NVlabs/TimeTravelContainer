@@ -17,6 +17,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer"
 )
@@ -32,11 +33,27 @@ func main() {
 	var opts gfxrenderer.Options
 	flags.StringVar(&opts.Library, "library", "", "path of gfxstream's host library")
 	flags.StringVar(&opts.Features, "features", "", "gfxstream renderer features")
+	flags.BoolVar(&opts.Snapshots, "snapshots", false, "take snapshots and restore them")
 	unconfined := flags.Bool("unconfined", false, "run without the renderer's sandbox, as ttcd does with --unsafe-no-host-isolation")
 	flags.Parse(os.Args[2:])
 	mode := os.Args[1]
 	switch mode {
 	case "serve", "probe":
+		if mode == "serve" && opts.Snapshots {
+			// gfxstream takes and restores snapshots in a directory, which
+			// is the renderer's own.
+			dir, err := os.MkdirTemp("", "ttc-gfx-snapshots.")
+			if err != nil {
+				fatal(err)
+			}
+			defer os.RemoveAll(dir)
+			// The sandbox's rules name the directory's own path, not one
+			// through a symbolic link, such as macOS's /var.
+			if dir, err = filepath.EvalSymlinks(dir); err != nil {
+				fatal(err)
+			}
+			opts.ScratchDir = dir
+		}
 		if !*unconfined {
 			if err := gfxrenderer.Confine(opts); err != nil {
 				fatal(fmt.Errorf("confining the renderer: %w", err))
@@ -52,6 +69,9 @@ func main() {
 	switch mode {
 	case "serve":
 		if err := gfxrenderer.Serve(connFD, opts); err != nil {
+			if opts.ScratchDir != "" {
+				os.RemoveAll(opts.ScratchDir)
+			}
 			fatal(err)
 		}
 	case "probe":
@@ -81,7 +101,7 @@ func fatal(err error) {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: ttc-gfx-renderer serve|probe [--library PATH] [--features FEATURES] [--unconfined]")
+	fmt.Fprintln(os.Stderr, "usage: ttc-gfx-renderer serve|probe [--library PATH] [--features FEATURES] [--snapshots] [--unconfined]")
 	fmt.Fprintln(os.Stderr, "       ttc-gfx-renderer launch [--library PATH] [--features FEATURES]")
 	os.Exit(2)
 }
