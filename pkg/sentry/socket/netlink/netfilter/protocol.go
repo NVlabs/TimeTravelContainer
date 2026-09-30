@@ -40,23 +40,24 @@ import (
 // Protocol implements netlink.Protocol.
 //
 // +stateify savable
-type Protocol struct{}
+type Protocol struct {
+	// nftables is whether the protocol has nf_tables' subsystem. Without
+	// it, the protocol has no subsystems, as a Linux without the modules of
+	// nfnetlink's subsystems has none: messages fail, but programs, such as
+	// Android's netd, may still open sockets.
+	nftables bool
+}
 
 var _ netlink.Protocol = (*Protocol)(nil)
 
 // NewProtocol creates a NETLINK_NETFILTER netlink.Protocol.
 func NewProtocol(t *kernel.Task) (netlink.Protocol, *syserr.Error) {
-	if !nftables.IsNFTablesEnabled() {
-		return nil, syserr.ErrProtocolNotSupported
-	}
-	if t.Kernel().LiveForkEligible {
-		// Upstream nftables state is not stateifiable. Keep eligible families
-		// immutable at the syscall boundary so a successful run can never turn
-		// into a later fork denial.
-		return nil, syserr.ErrProtocolNotSupported
-	}
-
-	return &Protocol{}, nil
+	// Upstream nftables state is not stateifiable. Keep eligible families
+	// immutable at the syscall boundary so a successful run can never turn
+	// into a later fork denial.
+	return &Protocol{
+		nftables: nftables.IsNFTablesEnabled() && !t.Kernel().LiveForkEligible,
+	}, nil
 }
 
 // Protocol implements netlink.Protocol.Protocol.
@@ -89,6 +90,12 @@ func (p *Protocol) Receive(ctx context.Context, s *netlink.Socket, buf []byte) *
 	// TODO: b/434785410 - Support batch messages.
 	if hdr.Type == linux.NFNL_MSG_BATCH_BEGIN {
 		ms := nlmsg.NewMessageSet(s.GetPortID(), hdr.Seq)
+		if !p.nftables {
+			// As nfnetlink_rcv_batch fails batches for subsystems it
+			// lacks.
+			netlink.DumpErrorMessage(hdr, ms, syserr.ErrNotSupported)
+			return s.SendResponse(ctx, ms)
+		}
 		if err := p.receiveBatchMessage(ctx, ms, buf); err != nil {
 			log.Debugf("Nftables: Failed to process batch message: %v", err)
 			netlink.DumpErrorMessage(hdr, ms, err.GetError())
@@ -1199,6 +1206,10 @@ func (p *Protocol) ProcessMessage(ctx context.Context, s *netlink.Socket, msg *n
 	if netlinkMsgPayloadSize(&hdr) < linux.SizeOfNetfilterGenMsg {
 		log.Debugf("Netlink message payload is too small: %d < %d", netlinkMsgPayloadSize(&hdr), linux.SizeOfNetfilterGenMsg)
 		return nil
+	}
+	if !p.nftables {
+		// As nfnetlink_rcv_msg fails messages for subsystems it lacks.
+		return syserr.ErrInvalidArgument
 	}
 
 	msgType := hdr.NetFilterMsgType()

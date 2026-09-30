@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package linux
 
 import (
@@ -195,5 +198,45 @@ type NetlinkErrorMessage struct {
 
 // RTNetlink multicast groups, from uapi/linux/rtnetlink.h.
 const (
-	RTNLGRP_LINK = 1
+	RTNLGRP_NONE          = 0
+	RTNLGRP_LINK          = 1
+	RTNLGRP_NOTIFY        = 2
+	RTNLGRP_NEIGH         = 3
+	RTNLGRP_TC            = 4
+	RTNLGRP_IPV4_IFADDR   = 5
+	RTNLGRP_IPV4_MROUTE   = 6
+	RTNLGRP_IPV4_ROUTE    = 7
+	RTNLGRP_IPV4_RULE     = 8
+	RTNLGRP_IPV6_IFADDR   = 9
+	RTNLGRP_IPV6_MROUTE   = 10
+	RTNLGRP_IPV6_ROUTE    = 11
+	RTNLGRP_IPV6_IFINFO   = 12
+	RTNLGRP_DECnet_IFADDR = 13
+	RTNLGRP_NOP2          = 14
+	RTNLGRP_DECnet_ROUTE  = 15
+	RTNLGRP_DECnet_RULE   = 16
+	RTNLGRP_NOP4          = 17
+	RTNLGRP_IPV6_PREFIX   = 18
+	RTNLGRP_IPV6_RULE     = 19
+	RTNLGRP_ND_USEROPT    = 20
+	RTNLGRP_PHONET_IFADDR = 21
+	RTNLGRP_PHONET_ROUTE  = 22
+	RTNLGRP_DCB           = 23
+	RTNLGRP_IPV4_NETCONF  = 24
+	RTNLGRP_IPV6_NETCONF  = 25
+	RTNLGRP_MDB           = 26
+	RTNLGRP_MPLS_ROUTE    = 27
+	RTNLGRP_NSID          = 28
+	RTNLGRP_MPLS_NETCONF  = 29
+	RTNLGRP_IPV4_MROUTE_R = 30
+	RTNLGRP_IPV6_MROUTE_R = 31
+	RTNLGRP_NEXTHOP       = 32
+	RTNLGRP_BRVLAN        = 33
+	RTNLGRP_MCTP_IFADDR   = 34
+	RTNLGRP_TUNNEL        = 35
+	RTNLGRP_STATS         = 36
+	RTNLGRP_IPV4_MCADDR   = 37
+	RTNLGRP_IPV6_MCADDR   = 38
+	RTNLGRP_IPV6_ACADDR   = 39
+	RTNLGRP_MAX           = RTNLGRP_IPV6_ACADDR
 )
