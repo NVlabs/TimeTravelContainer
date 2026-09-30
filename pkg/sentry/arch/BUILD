@@ -54,8 +54,18 @@ go_test(
 go_test(
     name = "arch_test",
     size = "small",
-    srcs = ["signal_fault_amd64_test.go"],
+    srcs = [
+        "signal_arm64_test.go",
+        "signal_fault_amd64_test.go",
+    ],
     library = ":arch",
+    deps = [
+        "//pkg/abi/linux",
+        "//pkg/cpuid",
+        "//pkg/hostarch",
+        "//pkg/sentry/arch/fpu",
+        "//pkg/usermem",
+    ],
 )
 
 proto_library(

@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //go:build arm64
 // +build arm64
 
@@ -38,6 +41,13 @@ type SignalContext64 struct {
 	Pstate    uint64
 	_pad      [8]byte       // __attribute__((__aligned__(16)))
 	Fpsimd64  FpsimdContext // size = 528
+	// Reserved is the rest of the 4096 bytes of struct sigcontext's
+	// __reserved, where Fpsimd64 is. Linux's frames have it all, and
+	// programs may copy it all: Android's unwinders copy the mcontext of
+	// threads that they interrupt. The sentry keeps floating point state
+	// itself, so Fpsimd64 and Reserved are zero: a list of records that
+	// ends at once.
+	Reserved [4096 - 528]byte
 }
 
 // +marshal
@@ -73,6 +83,13 @@ type UContext64 struct {
 	MContext SignalContext64
 }
 
+// sigInfoSize is sizeof(siginfo_t).
+const sigInfoSize = 128
+
+// frameRecordSize is sizeof(struct frame_record), the frame record of the
+// interrupted code that Linux puts above signal frames.
+const frameRecordSize = 16
+
 // SignalSetup implements Context.SignalSetup.
 func (c *Context64) SignalSetup(st *Stack, act *linux.SigAction, info *linux.SignalInfo, alt *linux.SignalStack, sigset linux.SignalSet, featureSet cpuid.FeatureSet) error {
 	sp := st.Bottom
@@ -93,15 +110,14 @@ func (c *Context64) SignalSetup(st *Stack, act *linux.SigAction, info *linux.Sig
 		uc.MContext.FaultAddr = info.Addr()
 	}
 
-	ucSize := uc.SizeBytes()
-
-	// frameSize = ucSize + sizeof(siginfo).
-	// sizeof(siginfo) == 128.
-	// R30 stores the restorer address.
-	frameSize := ucSize + 128
-	frameBottom := (sp - hostarch.Addr(frameSize)) & ^hostarch.Addr(15)
-	sp = frameBottom + hostarch.Addr(frameSize)
-	st.Bottom = sp
+	// The frame is Linux's (arch/arm64/kernel/signal.c:get_sigframe):
+	// struct rt_sigframe { siginfo; ucontext; }, 16-byte aligned, below a
+	// struct frame_record { fp; lr; } of the interrupted code, to which the
+	// handler's frame pointer points, for unwinders. Unwinders also find
+	// the ucontext past the siginfo.
+	recordAddr := (sp - frameRecordSize) &^ hostarch.Addr(15)
+	frameSize := hostarch.Addr(sigInfoSize + uc.SizeBytes())
+	frameBottom := (recordAddr - frameSize) &^ hostarch.Addr(15)
 
 	// Prior to proceeding, figure out if the frame will exhaust the range
 	// for the signal stack. This is not allowed, and should immediately
@@ -113,15 +129,23 @@ func (c *Context64) SignalSetup(st *Stack, act *linux.SigAction, info *linux.Sig
 	// Adjust the code.
 	info.FixSignalCodeForUser()
 
-	// Set up the stack frame.
-	if _, err := info.CopyOut(st, StackBottomMagic); err != nil {
+	// Set up the frame record, and the stack frame.
+	var record [frameRecordSize]byte
+	hostarch.ByteOrder.PutUint64(record[0:], c.Regs.Regs[29])
+	hostarch.ByteOrder.PutUint64(record[8:], c.Regs.Regs[30])
+	st.Bottom = recordAddr + frameRecordSize
+	if _, err := st.CopyOutBytes(StackBottomMagic, record[:]); err != nil {
 		return err
 	}
-	infoAddr := st.Bottom
+	st.Bottom = frameBottom + frameSize
 	if _, err := uc.CopyOut(st, StackBottomMagic); err != nil {
 		return err
 	}
 	ucAddr := st.Bottom
+	if _, err := info.CopyOut(st, StackBottomMagic); err != nil {
+		return err
+	}
+	infoAddr := st.Bottom
 
 	// Set up registers.
 	c.Regs.Sp = uint64(st.Bottom)
@@ -129,6 +153,8 @@ func (c *Context64) SignalSetup(st *Stack, act *linux.SigAction, info *linux.Sig
 	c.Regs.Regs[0] = uint64(info.Signo)
 	c.Regs.Regs[1] = uint64(infoAddr)
 	c.Regs.Regs[2] = uint64(ucAddr)
+	c.Regs.Regs[29] = uint64(recordAddr)
+	// R30 stores the restorer address.
 	c.Regs.Regs[30] = act.Restorer
 
 	// Save the thread's floating point state.
@@ -163,13 +189,14 @@ func (regs *Registers) validRegs() bool {
 
 // SignalRestore implements Context.SignalRestore.
 func (c *Context64) SignalRestore(st *Stack, rt bool, featureSet cpuid.FeatureSet) (linux.SignalSet, linux.SignalStack, error) {
-	// Copy out the stack frame.
+	// As Linux's rt_sigreturn, the frame is at the stack pointer, which is
+	// 16-byte aligned; its ucontext is past its siginfo.
+	if st.Bottom%16 != 0 {
+		return 0, linux.SignalStack{}, unix.EFAULT
+	}
+	st.Bottom += sigInfoSize
 	var uc UContext64
 	if _, err := uc.CopyIn(st, StackBottomMagic); err != nil {
-		return 0, linux.SignalStack{}, err
-	}
-	var info linux.SignalInfo
-	if _, err := info.CopyIn(st, StackBottomMagic); err != nil {
 		return 0, linux.SignalStack{}, err
 	}
 
