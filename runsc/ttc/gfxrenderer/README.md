@@ -25,6 +25,14 @@ meson setup build -Ddefault_library=shared -Dgfxstream-build=host -Dbuildtype=re
 ninja -C build   # build/host/libgfxstream_backend.{dylib,so}
 ```
 
+The patches:
+
+*   `0001`: `stream_renderer_init` fails, instead of hanging, when the
+    renderer does not start.
+*   `0002`: on macOS, shared memory is created unnamed. POSIX shared memory
+    names are global to the user there, and gfxstream's repeat in every
+    process, so two renderers shared their command rings and memory.
+
 *   **macOS**: Homebrew's `molten-vk`, `vulkan-loader`, and
     `vulkan-headers`, and `meson` and `ninja`. gfxstream looks for the Vulkan
     loader only beside the program, so the renderer sets
