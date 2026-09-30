@@ -159,7 +159,7 @@ type graphMutation struct {
 }
 
 func newGraphMutation(store *Store, origin SnapshotID) (*graphMutation, error) {
-	snapshot, ok := store.state.Snapshots[snapshotKey(origin)]
+	snapshot, ok := store.state.Snapshots[origin]
 	if !ok || snapshot.State != SnapshotWorking {
 		return nil, fmt.Errorf("snapshot %d is not working", origin)
 	}

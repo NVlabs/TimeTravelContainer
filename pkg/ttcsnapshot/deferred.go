@@ -19,7 +19,7 @@ func (s *Store) AttachDeferredResolver(catalog string, origin SnapshotID, loader
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	snapshot, ok := s.state.Snapshots[snapshotKey(origin)]
+	snapshot, ok := s.state.Snapshots[origin]
 	if !ok || snapshot.State != SnapshotWorking {
 		return fmt.Errorf("deferred TTC catalog expansion origin %d is not working", origin)
 	}
@@ -50,7 +50,7 @@ func (s *Store) ImportDeferredFilesystemRoot(origin SnapshotID, rootName, catalo
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	snapshot, ok := s.state.Snapshots[snapshotKey(origin)]
+	snapshot, ok := s.state.Snapshots[origin]
 	if !ok || snapshot.State != SnapshotWorking || snapshot.NextOrdinal == math.MaxUint64 {
 		return ObjectID{}, fmt.Errorf("snapshot %d cannot accept a deferred filesystem root", origin)
 	}
@@ -247,7 +247,7 @@ func (s *Store) resolveDeferredLockedAfter(id ObjectID, ordinalFloor uint64) (Ob
 	if source.ID != sourceID || source.State != ObjectLive || source.Deferred {
 		return fail(fmt.Errorf("deferred TTC source returned invalid object %s for %s", source.ID, sourceID))
 	}
-	snapshot, ok := s.state.Snapshots[snapshotKey(resolver.origin)]
+	snapshot, ok := s.state.Snapshots[resolver.origin]
 	if !ok || snapshot.State != SnapshotWorking {
 		return fail(fmt.Errorf("deferred TTC expansion origin %d is not working", resolver.origin))
 	}
@@ -455,7 +455,7 @@ func (s *Store) resolveDeferredChunkLocked(ids []ObjectID) error {
 		}
 		snapshot, ok := snapshots[resolver.origin]
 		if !ok {
-			if snapshot, ok = s.state.Snapshots[snapshotKey(resolver.origin)]; !ok || snapshot.State != SnapshotWorking {
+			if snapshot, ok = s.state.Snapshots[resolver.origin]; !ok || snapshot.State != SnapshotWorking {
 				return fmt.Errorf("deferred TTC expansion origin %d is not working", resolver.origin)
 			}
 		}

@@ -4,13 +4,13 @@
 package ttcsnapshot
 
 import (
+	"cmp"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/crc32"
 	"slices"
 	"sort"
-	"strconv"
 )
 
 // A graph's checkpoint and journal records are binary: integers are varints,
@@ -406,7 +406,7 @@ func encodeGraphCheckpoint(state *graphState) ([]byte, error) {
 	for _, snapshot := range state.Snapshots {
 		snapshots = append(snapshots, snapshot)
 	}
-	slices.SortFunc(snapshots, func(a, b Snapshot) int { return compareSnapshotIDs(a.ID, b.ID) })
+	slices.SortFunc(snapshots, func(a, b Snapshot) int { return cmp.Compare(a.ID, b.ID) })
 	e.uvarint(uint64(len(snapshots)))
 	for _, snapshot := range snapshots {
 		if err := e.snapshot(snapshot); err != nil {
@@ -431,14 +431,13 @@ func encodeGraphCheckpoint(state *graphState) ([]byte, error) {
 		}
 	}
 	frozen := make([]SnapshotID, 0, len(state.Frozen))
-	for key, value := range state.Frozen {
-		id, err := strconv.ParseUint(key, 16, 64)
-		if err != nil || !value || snapshotKey(SnapshotID(id)) != key {
-			return nil, fmt.Errorf("invalid snapshot reference barrier %q", key)
+	for id, value := range state.Frozen {
+		if !value {
+			return nil, fmt.Errorf("snapshot reference barrier %d is false", id)
 		}
-		frozen = append(frozen, SnapshotID(id))
+		frozen = append(frozen, id)
 	}
-	slices.SortFunc(frozen, compareSnapshotIDs)
+	slices.Sort(frozen)
 	e.uvarint(uint64(len(frozen)))
 	for _, id := range frozen {
 		e.uvarint(uint64(id))
@@ -447,22 +446,12 @@ func encodeGraphCheckpoint(state *graphState) ([]byte, error) {
 	for _, handoff := range state.Handoffs {
 		handoffs = append(handoffs, handoff)
 	}
-	slices.SortFunc(handoffs, func(a, b SnapshotLedgerHandoff) int { return compareSnapshotIDs(a.Snapshot, b.Snapshot) })
+	slices.SortFunc(handoffs, func(a, b SnapshotLedgerHandoff) int { return cmp.Compare(a.Snapshot, b.Snapshot) })
 	e.uvarint(uint64(len(handoffs)))
 	for index := range handoffs {
 		e.handoff(&handoffs[index])
 	}
 	return binary.BigEndian.AppendUint32(e.out, crc32.Checksum(e.out, castagnoli)), nil
-}
-
-func compareSnapshotIDs(a, b SnapshotID) int {
-	switch {
-	case a < b:
-		return -1
-	case a > b:
-		return 1
-	}
-	return 0
 }
 
 type graphDecoder struct {
@@ -896,10 +885,10 @@ func decodeGraphCheckpoint(data []byte) (graphState, error) {
 	if d.err != nil {
 		return graphState{}, fmt.Errorf("decoding TTC snapshot graph checkpoint: %w", d.err)
 	}
-	state.Snapshots = make(map[string]Snapshot, count)
+	state.Snapshots = make(map[SnapshotID]Snapshot, count)
 	for index := 0; index < count && d.err == nil; index++ {
 		snapshot := d.snapshot()
-		state.Snapshots[snapshotKey(snapshot.ID)] = snapshot
+		state.Snapshots[snapshot.ID] = snapshot
 	}
 	d.dataArena = make([]byte, dataBytes)
 	d.edgeArena = make([]Edge, edges)
@@ -913,15 +902,15 @@ func decodeGraphCheckpoint(data []byte) (graphState, error) {
 	}
 	state.Roots, state.Pins = d.names(), d.names()
 	count = d.count()
-	state.Frozen = make(map[string]bool, count)
+	state.Frozen = make(map[SnapshotID]bool, count)
 	for index := 0; index < count && d.err == nil; index++ {
-		state.Frozen[snapshotKey(SnapshotID(d.uvarint()))] = true
+		state.Frozen[SnapshotID(d.uvarint())] = true
 	}
 	count = d.count()
-	state.Handoffs = make(map[string]SnapshotLedgerHandoff, count)
+	state.Handoffs = make(map[SnapshotID]SnapshotLedgerHandoff, count)
 	for index := 0; index < count && d.err == nil; index++ {
 		handoff := d.handoff()
-		state.Handoffs[snapshotKey(handoff.Snapshot)] = handoff
+		state.Handoffs[handoff.Snapshot] = handoff
 	}
 	if d.err == nil && (d.pos != len(body) || len(d.dataArena) != 0 || len(d.edgeArena) != 0) {
 		d.fail("the checkpoint holds other than it declares")

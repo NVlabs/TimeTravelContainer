@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 )
 
 // A graph of legacyFormatVersion kept its checkpoint and journal as JSON.
@@ -68,8 +69,17 @@ func (checkpoint *legacyCheckpoint) state() (graphState, error) {
 	}
 	state := graphState{
 		Version: formatVersion, Sequence: checkpoint.Sequence, NextSnapshot: checkpoint.NextSnapshot,
-		Snapshots: checkpoint.Snapshots, Roots: checkpoint.Roots, Pins: checkpoint.Pins,
-		Frozen: checkpoint.Frozen, Handoffs: checkpoint.Handoffs,
+		Roots: checkpoint.Roots, Pins: checkpoint.Pins,
+	}
+	var err error
+	if state.Snapshots, err = legacySnapshotTable(checkpoint.Snapshots); err != nil {
+		return graphState{}, err
+	}
+	if state.Frozen, err = legacySnapshotTable(checkpoint.Frozen); err != nil {
+		return graphState{}, err
+	}
+	if state.Handoffs, err = legacySnapshotTable(checkpoint.Handoffs); err != nil {
+		return graphState{}, err
 	}
 	if checkpoint.Objects != nil {
 		state.Objects = make(map[ObjectID]Object, len(checkpoint.Objects))
@@ -85,6 +95,23 @@ func (checkpoint *legacyCheckpoint) state() (graphState, error) {
 		}
 	}
 	return state, validateGraphStateShape(&state)
+}
+
+// legacySnapshotTable returns table, which names snapshots by their keys, by
+// their IDs.
+func legacySnapshotTable[V any](table map[string]V) (map[SnapshotID]V, error) {
+	if table == nil {
+		return nil, nil
+	}
+	converted := make(map[SnapshotID]V, len(table))
+	for key, value := range table {
+		id, err := strconv.ParseUint(key, 16, 64)
+		if err != nil || snapshotKey(SnapshotID(id)) != key {
+			return nil, fmt.Errorf("invalid snapshot key %q", key)
+		}
+		converted[SnapshotID(id)] = value
+	}
+	return converted, nil
 }
 
 func (legacy *legacyJournalRecord) record() (journalRecord, error) {

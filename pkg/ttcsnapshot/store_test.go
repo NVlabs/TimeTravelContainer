@@ -3248,14 +3248,14 @@ func TestValidateGraphStateReferences(t *testing.T) {
 	consistent := func() graphState {
 		return graphState{
 			Version: formatVersion, NextSnapshot: 2,
-			Snapshots: map[string]Snapshot{snapshotKey(1): {ID: 1, State: SnapshotWorking, NextOrdinal: 3}},
+			Snapshots: map[SnapshotID]Snapshot{1: {ID: 1, State: SnapshotWorking, NextOrdinal: 3}},
 			Objects: map[ObjectID]Object{
 				root:  {ID: root, State: ObjectLive, Refs: 1, Children: []Edge{{Slot: 0, Child: child}}},
 				child: {ID: child, State: ObjectLive, Refs: 2},
 			},
 			Roots:  map[string]ObjectID{"filesystem/main": root},
 			Pins:   map[string]ObjectID{"construct/x": child},
-			Frozen: map[string]bool{}, Handoffs: map[string]SnapshotLedgerHandoff{},
+			Frozen: map[SnapshotID]bool{}, Handoffs: map[SnapshotID]SnapshotLedgerHandoff{},
 		}
 	}
 	state := consistent()

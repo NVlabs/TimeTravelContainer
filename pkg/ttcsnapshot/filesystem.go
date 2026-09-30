@@ -887,7 +887,7 @@ func installGraphMutation(state *graphState, mutation *graphMutation, rootName s
 			reclaim = append(reclaim, id)
 		}
 	}
-	state.putSnapshot(snapshotKey(mutation.snapshot.ID), mutation.snapshot)
+	state.putSnapshot(mutation.snapshot)
 	state.putRoot(rootName, root)
 	for _, pin := range releasePins {
 		state.deletePin(pin)
@@ -913,7 +913,7 @@ func collectFilesystemMutationGarbage(state *graphState, queue []ObjectID) ([]Ob
 		if !ok || object.State != ObjectReclaiming || object.Refs != 0 {
 			continue
 		}
-		if _, transferring := state.Handoffs[snapshotKey(object.ID.Snapshot)]; transferring {
+		if _, transferring := state.Handoffs[object.ID.Snapshot]; transferring {
 			continue
 		}
 		state.deleteObject(id)
@@ -1048,7 +1048,7 @@ func (s *Store) ExclusiveFile(rootName string, number uint64) (ObjectID, bool, e
 	if !ok || file.SourceCatalog != "" {
 		return inode.File, false, nil
 	}
-	origin := snapshotKey(inode.File.Snapshot)
+	origin := inode.File.Snapshot
 	if snapshot, ok := s.state.Snapshots[origin]; !ok || snapshot.State != SnapshotSealedLocal {
 		return inode.File, false, nil
 	}

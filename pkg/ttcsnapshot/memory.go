@@ -531,7 +531,7 @@ func (s *Store) originAllowedLocked(origin SnapshotID, reuse reuseFilter) bool {
 	if len(reuse.states) == 0 {
 		return true
 	}
-	snapshot, ok := s.state.Snapshots[snapshotKey(origin)]
+	snapshot, ok := s.state.Snapshots[origin]
 	if !ok {
 		return false
 	}
@@ -853,7 +853,7 @@ func (s *Store) AdoptSharedMemory(pinPrefix string, tables, chunks []Object) ([]
 	slices.Sort(origins)
 	nextSnapshot := s.state.NextSnapshot
 	for _, origin := range origins {
-		snapshot, ok := s.state.Snapshots[snapshotKey(origin)]
+		snapshot, ok := s.state.Snapshots[origin]
 		if ok && snapshot.State != SnapshotShared {
 			return nil, fmt.Errorf("snapshot %d is %s, not shared", origin, snapshot.State)
 		}

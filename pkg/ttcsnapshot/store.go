@@ -5,6 +5,7 @@ package ttcsnapshot
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -61,12 +62,12 @@ type graphState struct {
 	Version      int
 	Sequence     uint64
 	NextSnapshot SnapshotID
-	Snapshots    map[string]Snapshot
+	Snapshots    map[SnapshotID]Snapshot
 	Objects      map[ObjectID]Object
 	Roots        map[string]ObjectID
 	Pins         map[string]ObjectID
-	Frozen       map[string]bool
-	Handoffs     map[string]SnapshotLedgerHandoff
+	Frozen       map[SnapshotID]bool
+	Handoffs     map[SnapshotID]SnapshotLedgerHandoff
 
 	// undo records what a transaction applied for a preview has changed.
 	undo *graphUndo
@@ -80,12 +81,12 @@ type graphState struct {
 // one of 10,000 objects.
 type graphUndo struct {
 	// A nil prior value is an absent one.
-	snapshots    map[string]*Snapshot
+	snapshots    map[SnapshotID]*Snapshot
 	objects      map[ObjectID]*Object
 	roots        map[string]*ObjectID
 	pins         map[string]*ObjectID
-	frozen       map[string]*bool
-	handoffs     map[string]*SnapshotLedgerHandoff
+	frozen       map[SnapshotID]*bool
+	handoffs     map[SnapshotID]*SnapshotLedgerHandoff
 	nextSnapshot SnapshotID
 	sequence     uint64
 }
@@ -137,18 +138,18 @@ func recordEntry[K comparable, V any](priors *map[K]*V, entries map[K]V, key K) 
 // The setters below change the state's maps, recording what they change
 // while a transaction is recorded.
 
-func (state *graphState) putSnapshot(key string, snapshot Snapshot) {
+func (state *graphState) putSnapshot(snapshot Snapshot) {
 	if state.undo != nil {
-		recordEntry(&state.undo.snapshots, state.Snapshots, key)
+		recordEntry(&state.undo.snapshots, state.Snapshots, snapshot.ID)
 	}
-	state.Snapshots[key] = snapshot
+	state.Snapshots[snapshot.ID] = snapshot
 }
 
-func (state *graphState) deleteSnapshot(key string) {
+func (state *graphState) deleteSnapshot(id SnapshotID) {
 	if state.undo != nil {
-		recordEntry(&state.undo.snapshots, state.Snapshots, key)
+		recordEntry(&state.undo.snapshots, state.Snapshots, id)
 	}
-	delete(state.Snapshots, key)
+	delete(state.Snapshots, id)
 }
 
 func (state *graphState) putObject(object Object) {
@@ -193,44 +194,44 @@ func (state *graphState) deletePin(name string) {
 	delete(state.Pins, name)
 }
 
-func (state *graphState) putFrozen(key string) {
+func (state *graphState) putFrozen(id SnapshotID) {
 	if state.undo != nil {
-		recordEntry(&state.undo.frozen, state.Frozen, key)
+		recordEntry(&state.undo.frozen, state.Frozen, id)
 	}
-	state.Frozen[key] = true
+	state.Frozen[id] = true
 }
 
-func (state *graphState) deleteFrozen(key string) {
+func (state *graphState) deleteFrozen(id SnapshotID) {
 	if state.undo != nil {
-		recordEntry(&state.undo.frozen, state.Frozen, key)
+		recordEntry(&state.undo.frozen, state.Frozen, id)
 	}
-	delete(state.Frozen, key)
+	delete(state.Frozen, id)
 }
 
-func (state *graphState) putHandoff(key string, handoff SnapshotLedgerHandoff) {
+func (state *graphState) putHandoff(handoff SnapshotLedgerHandoff) {
 	if state.undo != nil {
-		recordEntry(&state.undo.handoffs, state.Handoffs, key)
+		recordEntry(&state.undo.handoffs, state.Handoffs, handoff.Snapshot)
 	}
-	state.Handoffs[key] = handoff
+	state.Handoffs[handoff.Snapshot] = handoff
 }
 
-func (state *graphState) deleteHandoff(key string) {
+func (state *graphState) deleteHandoff(id SnapshotID) {
 	if state.undo != nil {
-		recordEntry(&state.undo.handoffs, state.Handoffs, key)
+		recordEntry(&state.undo.handoffs, state.Handoffs, id)
 	}
-	delete(state.Handoffs, key)
+	delete(state.Handoffs, id)
 }
 
 func newGraphState() graphState {
 	return graphState{
 		Version:      formatVersion,
 		NextSnapshot: 1,
-		Snapshots:    make(map[string]Snapshot),
+		Snapshots:    make(map[SnapshotID]Snapshot),
 		Objects:      make(map[ObjectID]Object),
 		Roots:        make(map[string]ObjectID),
 		Pins:         make(map[string]ObjectID),
-		Frozen:       make(map[string]bool),
-		Handoffs:     make(map[string]SnapshotLedgerHandoff),
+		Frozen:       make(map[SnapshotID]bool),
+		Handoffs:     make(map[SnapshotID]SnapshotLedgerHandoff),
 	}
 }
 
@@ -1405,9 +1406,9 @@ func validateGraphState(state *graphState) error {
 		return err
 	}
 	nextOrdinals := make(map[SnapshotID]uint64, len(state.Snapshots))
-	for key, snapshot := range state.Snapshots {
-		if key != snapshotKey(snapshot.ID) || snapshot.ID == 0 || !snapshot.State.valid() || snapshot.NextOrdinal == 0 {
-			return fmt.Errorf("invalid snapshot %q", key)
+	for id, snapshot := range state.Snapshots {
+		if id != snapshot.ID || snapshot.ID == 0 || !snapshot.State.valid() || snapshot.NextOrdinal == 0 {
+			return fmt.Errorf("invalid snapshot %d", id)
 		}
 		nextOrdinals[snapshot.ID] = snapshot.NextOrdinal
 	}
@@ -1431,30 +1432,26 @@ func validateGraphState(state *graphState) error {
 		counts = append(counts, referenceCount{id: id, refs: object.Refs, reclaiming: object.State == ObjectReclaiming})
 		edges += len(object.Children)
 	}
-	for key, frozen := range state.Frozen {
+	for id, frozen := range state.Frozen {
 		if !frozen {
-			return fmt.Errorf("snapshot reference barrier %q is false", key)
+			return fmt.Errorf("snapshot reference barrier %d is false", id)
 		}
-		id, err := strconv.ParseUint(key, 16, 64)
-		if err != nil || snapshotKey(SnapshotID(id)) != key {
-			return fmt.Errorf("invalid snapshot reference barrier %q", key)
-		}
-		snapshot, ok := state.Snapshots[key]
+		snapshot, ok := state.Snapshots[id]
 		if !ok || snapshot.State == SnapshotWorking {
-			return fmt.Errorf("snapshot reference barrier %q does not select an immutable origin", key)
+			return fmt.Errorf("snapshot reference barrier %d does not select an immutable origin", id)
 		}
 	}
-	for key, handoff := range state.Handoffs {
-		if key != snapshotKey(handoff.Snapshot) {
-			return fmt.Errorf("snapshot handoff key %q does not match %d", key, handoff.Snapshot)
+	for id, handoff := range state.Handoffs {
+		if id != handoff.Snapshot {
+			return fmt.Errorf("snapshot handoff key %d does not match %d", id, handoff.Snapshot)
 		}
 		if err := validateSnapshotLedgerHandoff(handoff); err != nil {
 			return err
 		}
-		if handoff.Frozen != state.Frozen[key] {
+		if handoff.Frozen != state.Frozen[id] {
 			return fmt.Errorf("snapshot %d handoff and final barrier disagree", handoff.Snapshot)
 		}
-		snapshot, ok := state.Snapshots[key]
+		snapshot, ok := state.Snapshots[id]
 		if !ok {
 			return fmt.Errorf("snapshot %d handoff has no origin", handoff.Snapshot)
 		}
@@ -1462,9 +1459,9 @@ func validateGraphState(state *graphState) error {
 			return fmt.Errorf("snapshot %d handoff selects a working origin", handoff.Snapshot)
 		}
 	}
-	for key := range state.Frozen {
-		if _, ok := state.Handoffs[key]; !ok {
-			return fmt.Errorf("snapshot reference barrier %q has no handoff", key)
+	for id := range state.Frozen {
+		if _, ok := state.Handoffs[id]; !ok {
+			return fmt.Errorf("snapshot reference barrier %d has no handoff", id)
 		}
 	}
 	references := make([]ObjectID, 0, len(state.Roots)+len(state.Pins)+edges)
@@ -1792,9 +1789,9 @@ func applyJournalRecord(state *graphState, record journalRecord) error {
 	for _, op := range record.Ops {
 		switch {
 		case op.PutSnapshot != nil:
-			state.putSnapshot(snapshotKey(op.PutSnapshot.ID), *op.PutSnapshot)
+			state.putSnapshot(*op.PutSnapshot)
 		case op.DeleteSnapshot != 0:
-			state.deleteSnapshot(snapshotKey(op.DeleteSnapshot))
+			state.deleteSnapshot(op.DeleteSnapshot)
 		case op.PutObject != nil:
 			if err := validateObject(*op.PutObject); err != nil {
 				return err
@@ -1828,31 +1825,28 @@ func applyJournalRecord(state *graphState, record journalRecord) error {
 		case op.SetNextSnapshot != nil:
 			state.NextSnapshot = *op.SetNextSnapshot
 		case op.FreezeSnapshot != 0:
-			key := snapshotKey(op.FreezeSnapshot)
-			handoff, ok := state.Handoffs[key]
+			handoff, ok := state.Handoffs[op.FreezeSnapshot]
 			if !ok {
 				return fmt.Errorf("snapshot %d has no active reference handoff", op.FreezeSnapshot)
 			}
 			handoff.Frozen = true
-			state.putHandoff(key, handoff)
-			state.putFrozen(key)
+			state.putHandoff(handoff)
+			state.putFrozen(op.FreezeSnapshot)
 		case op.UnfreezeSnapshot != 0:
-			state.deleteFrozen(snapshotKey(op.UnfreezeSnapshot))
-			state.deleteHandoff(snapshotKey(op.UnfreezeSnapshot))
+			state.deleteFrozen(op.UnfreezeSnapshot)
+			state.deleteHandoff(op.UnfreezeSnapshot)
 		case op.BeginHandoff != nil:
 			handoff := cloneSnapshotLedgerHandoff(*op.BeginHandoff)
-			key := snapshotKey(handoff.Snapshot)
-			if _, ok := state.Handoffs[key]; ok {
+			if _, ok := state.Handoffs[handoff.Snapshot]; ok {
 				return fmt.Errorf("snapshot %d already has an active reference handoff", handoff.Snapshot)
 			}
-			state.putHandoff(key, handoff)
+			state.putHandoff(handoff)
 			if handoff.Frozen {
-				state.putFrozen(key)
+				state.putFrozen(handoff.Snapshot)
 			}
 		case op.AppendHandoff != nil:
 			mutation := *op.AppendHandoff
-			key := snapshotKey(mutation.Object.Snapshot)
-			handoff, ok := state.Handoffs[key]
+			handoff, ok := state.Handoffs[mutation.Object.Snapshot]
 			if !ok {
 				return fmt.Errorf("snapshot %d has no active reference handoff", mutation.Object.Snapshot)
 			}
@@ -1861,7 +1855,7 @@ func applyJournalRecord(state *graphState, record journalRecord) error {
 			}
 			handoff.Mutations = append(handoff.Mutations, mutation)
 			handoff.NextSequence++
-			state.putHandoff(key, handoff)
+			state.putHandoff(handoff)
 		case op.ApplyFilesystem != nil:
 			mutation, root, err := buildFilesystemMutation(state, op.ApplyFilesystem.Origin, op.ApplyFilesystem.RootName, op.ApplyFilesystem.Operations, op.ApplyFilesystem.ReleasePins)
 			if err != nil {
@@ -1994,12 +1988,12 @@ func validateJournalRecord(record journalRecord) error {
 func cloneGraphState(state graphState) graphState {
 	next := graphState{
 		Version: state.Version, Sequence: state.Sequence, NextSnapshot: state.NextSnapshot,
-		Snapshots: make(map[string]Snapshot, len(state.Snapshots)),
+		Snapshots: make(map[SnapshotID]Snapshot, len(state.Snapshots)),
 		Objects:   make(map[ObjectID]Object, len(state.Objects)),
 		Roots:     make(map[string]ObjectID, len(state.Roots)),
 		Pins:      make(map[string]ObjectID, len(state.Pins)),
-		Frozen:    make(map[string]bool, len(state.Frozen)),
-		Handoffs:  make(map[string]SnapshotLedgerHandoff, len(state.Handoffs)),
+		Frozen:    make(map[SnapshotID]bool, len(state.Frozen)),
+		Handoffs:  make(map[SnapshotID]SnapshotLedgerHandoff, len(state.Handoffs)),
 	}
 	for key, value := range state.Snapshots {
 		next.Snapshots[key] = value
@@ -2126,7 +2120,7 @@ type sharedOrigins map[SnapshotID]bool
 func (s sharedOrigins) contains(state *graphState, origin SnapshotID) bool {
 	shared, known := s[origin]
 	if !known {
-		record, ok := state.Snapshots[snapshotKey(origin)]
+		record, ok := state.Snapshots[origin]
 		shared = ok && record.State == SnapshotShared
 		s[origin] = shared
 	}
@@ -2308,24 +2302,16 @@ func (s *Store) commitLockedPrepared(ops []journalOp, references map[ObjectID]Ob
 		// Apply the transaction in place to learn what it changes of the
 		// snapshots in handoff, then undo it: it is applied for good below,
 		// once its record, with the handoffs' catch-up, is written.
-		handoffKeys := make([]string, 0, len(s.state.Handoffs))
-		for key := range s.state.Handoffs {
-			handoffKeys = append(handoffKeys, key)
+		handoffs := make([]SnapshotLedgerHandoff, 0, len(s.state.Handoffs))
+		for _, handoff := range s.state.Handoffs {
+			handoffs = append(handoffs, handoff)
 		}
-		sort.Strings(handoffKeys)
-		handoffs := make([]SnapshotLedgerHandoff, 0, len(handoffKeys))
-		for _, key := range handoffKeys {
-			handoffs = append(handoffs, s.state.Handoffs[key])
-		}
+		slices.SortFunc(handoffs, func(a, b SnapshotLedgerHandoff) int { return cmp.Compare(a.Snapshot, b.Snapshot) })
 		frozen := make([]SnapshotID, 0, len(s.state.Frozen))
-		for key := range s.state.Frozen {
-			parsed, err := strconv.ParseUint(key, 16, 64)
-			if err != nil {
-				return err
-			}
-			frozen = append(frozen, SnapshotID(parsed))
+		for id := range s.state.Frozen {
+			frozen = append(frozen, id)
 		}
-		sort.Slice(frozen, func(i, j int) bool { return frozen[i] < frozen[j] })
+		slices.Sort(frozen)
 		s.state.beginUndo()
 		var previewErr error
 		if prepared != nil {
@@ -2570,7 +2556,7 @@ func (s *Store) AdoptWorking(id SnapshotID) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if existing, ok := s.state.Snapshots[snapshotKey(id)]; ok {
+	if existing, ok := s.state.Snapshots[id]; ok {
 		if existing.State == SnapshotWorking {
 			return nil
 		}
@@ -2592,7 +2578,7 @@ func (s *Store) Seal(id SnapshotID, state SnapshotState) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	snapshot, ok := s.state.Snapshots[snapshotKey(id)]
+	snapshot, ok := s.state.Snapshots[id]
 	if !ok {
 		return fmt.Errorf("snapshot %d does not exist", id)
 	}
@@ -2609,7 +2595,7 @@ func (s *Store) Seal(id SnapshotID, state SnapshotState) error {
 func (s *Store) MarkShared(id SnapshotID) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	snapshot, ok := s.state.Snapshots[snapshotKey(id)]
+	snapshot, ok := s.state.Snapshots[id]
 	if !ok {
 		return fmt.Errorf("snapshot %d does not exist", id)
 	}
@@ -2665,7 +2651,7 @@ func (s *Store) SealAndForkWithOrigins(source SnapshotID, state SnapshotState, c
 }
 
 func (s *Store) sealAndForkLocked(source SnapshotID, state SnapshotState, copies map[string]string, workingOrigins []SnapshotID) error {
-	snapshot, ok := s.state.Snapshots[snapshotKey(source)]
+	snapshot, ok := s.state.Snapshots[source]
 	if !ok || snapshot.State != SnapshotWorking {
 		return fmt.Errorf("snapshot %d is not working", source)
 	}
@@ -2679,7 +2665,7 @@ func (s *Store) sealAndForkLocked(source SnapshotID, state SnapshotState, copies
 			return fmt.Errorf("fresh working snapshot ID %d is repeated", id)
 		}
 		seenOrigins[id] = struct{}{}
-		if existing, exists := s.state.Snapshots[snapshotKey(id)]; exists {
+		if existing, exists := s.state.Snapshots[id]; exists {
 			return fmt.Errorf("fresh working snapshot ID %d is already %s", id, existing.State)
 		}
 		if id >= next {
@@ -2764,7 +2750,7 @@ func (s *Store) CreateObject(origin SnapshotID, pin string, kind ObjectKind, dat
 	if _, ok := s.state.Pins[pin]; ok {
 		return ObjectID{}, fmt.Errorf("construction pin %q already exists", pin)
 	}
-	snapshot, ok := s.state.Snapshots[snapshotKey(origin)]
+	snapshot, ok := s.state.Snapshots[origin]
 	if !ok {
 		return ObjectID{}, fmt.Errorf("snapshot %d does not exist", origin)
 	}
@@ -2833,7 +2819,7 @@ func (s *Store) ReserveObjects(origin SnapshotID, kinds []ObjectKind) ([]ObjectI
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	snapshot, ok := s.state.Snapshots[snapshotKey(origin)]
+	snapshot, ok := s.state.Snapshots[origin]
 	if !ok || snapshot.State != SnapshotWorking {
 		return nil, fmt.Errorf("snapshot %d is not working", origin)
 	}
@@ -2891,7 +2877,7 @@ func (s *Store) CommitReservedObjects(reserved []ReservedObject) error {
 		if err := validateRootName(item.Pin); err != nil {
 			return fmt.Errorf("invalid construction pin: %w", err)
 		}
-		snapshot, ok := s.state.Snapshots[snapshotKey(item.ID.Snapshot)]
+		snapshot, ok := s.state.Snapshots[item.ID.Snapshot]
 		if !ok || snapshot.State != SnapshotWorking || item.ID.Ordinal >= snapshot.NextOrdinal {
 			return fmt.Errorf("object ID %s is not reserved in a working snapshot", item.ID.key())
 		}
@@ -2982,7 +2968,7 @@ func (s *Store) UpdateWorkingBulkLength(id ObjectID, length uint64) error {
 	if !ok || object.State != ObjectLive {
 		return fmt.Errorf("working bulk object %s does not exist", id.key())
 	}
-	snapshot, ok := s.state.Snapshots[snapshotKey(id.Snapshot)]
+	snapshot, ok := s.state.Snapshots[id.Snapshot]
 	if !ok || snapshot.State != SnapshotWorking {
 		return fmt.Errorf("bulk object %s origin is not working", id.key())
 	}
@@ -3011,7 +2997,7 @@ func (s *Store) DeletePinIfPresent(name string) error {
 func (s *Store) Snapshot(id SnapshotID) (Snapshot, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	snapshot, ok := s.state.Snapshots[snapshotKey(id)]
+	snapshot, ok := s.state.Snapshots[id]
 	return snapshot, ok
 }
 
@@ -3020,7 +3006,7 @@ func (s *Store) Snapshot(id SnapshotID) (Snapshot, bool) {
 func (s *Store) SnapshotObjects(snapshot SnapshotID) ([]Object, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if _, ok := s.state.Snapshots[snapshotKey(snapshot)]; !ok {
+	if _, ok := s.state.Snapshots[snapshot]; !ok {
 		return nil, os.ErrNotExist
 	}
 	objects := make([]Object, 0)
@@ -3047,7 +3033,7 @@ func (s *Store) SnapshotLedger(snapshot SnapshotID) ([]Object, map[string]Object
 // snapshotLedgerOrigin returns the record of snapshot, whose ledger is to be
 // read: it must be sealed.
 func snapshotLedgerOrigin(state graphState, snapshot SnapshotID) (Snapshot, error) {
-	record, ok := state.Snapshots[snapshotKey(snapshot)]
+	record, ok := state.Snapshots[snapshot]
 	if !ok {
 		return Snapshot{}, os.ErrNotExist
 	}
@@ -3154,7 +3140,7 @@ func (s *Store) OriginReferences(snapshot SnapshotID) (map[string]ObjectID, bool
 		if !known {
 			// An object of an origin this graph has no record of is not the
 			// graph's to count either.
-			record, ok := s.state.Snapshots[snapshotKey(parent.ID.Snapshot)]
+			record, ok := s.state.Snapshots[parent.ID.Snapshot]
 			parentShared = !ok || record.State == SnapshotShared
 			shared[parent.ID.Snapshot] = parentShared
 		}
@@ -3186,8 +3172,7 @@ func (s *Store) BeginSnapshotLedgerHandoff(snapshot SnapshotID) ([]Object, map[s
 	if err != nil {
 		return nil, nil, 0, err
 	}
-	key := snapshotKey(snapshot)
-	if handoff, ok := s.state.Handoffs[key]; ok {
+	if handoff, ok := s.state.Handoffs[snapshot]; ok {
 		baseline := cloneObjectReferences(handoff.Baseline)
 		return baselineObjects(objects, snapshot, baseline), baseline, handoff.NextSequence - 1, nil
 	}
@@ -3208,7 +3193,7 @@ func (s *Store) BeginSnapshotLedgerHandoff(snapshot SnapshotID) ([]Object, map[s
 func (s *Store) SnapshotLedgerHandoffChanges(snapshot SnapshotID, cursor uint64) ([]SnapshotReferenceMutation, uint64, bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	handoff, ok := s.state.Handoffs[snapshotKey(snapshot)]
+	handoff, ok := s.state.Handoffs[snapshot]
 	if !ok {
 		return nil, 0, false, os.ErrNotExist
 	}
@@ -3236,7 +3221,7 @@ func (s *Store) FreezeSnapshotLedgerHandoff(snapshot SnapshotID) error {
 	if err != nil {
 		return err
 	}
-	handoff, exists := s.state.Handoffs[snapshotKey(snapshot)]
+	handoff, exists := s.state.Handoffs[snapshot]
 	if !exists {
 		handoff = SnapshotLedgerHandoff{
 			Snapshot:     snapshot,
@@ -3265,8 +3250,7 @@ func (s *Store) FreezeSnapshotLedger(snapshot SnapshotID) ([]Object, map[string]
 	if err != nil {
 		return nil, nil, err
 	}
-	key := snapshotKey(snapshot)
-	handoff, exists := s.state.Handoffs[key]
+	handoff, exists := s.state.Handoffs[snapshot]
 	if !exists {
 		handoff = SnapshotLedgerHandoff{
 			Snapshot:     snapshot,
@@ -3323,8 +3307,7 @@ func baselineObjects(objects []Object, snapshot SnapshotID, baseline map[string]
 func (s *Store) UnfreezeSnapshotLedger(snapshot SnapshotID) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	key := snapshotKey(snapshot)
-	if _, ok := s.state.Handoffs[key]; !ok {
+	if _, ok := s.state.Handoffs[snapshot]; !ok {
 		return nil
 	}
 	return s.commitLocked([]journalOp{{UnfreezeSnapshot: snapshot}})
@@ -3335,7 +3318,7 @@ func (s *Store) UnfreezeSnapshotLedger(snapshot SnapshotID) error {
 func (s *Store) SnapshotLedgerFrozen(snapshot SnapshotID) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.state.Frozen[snapshotKey(snapshot)]
+	return s.state.Frozen[snapshot]
 }
 
 // FrozenSnapshotLedger returns a snapshot whose reference ledger is frozen for
@@ -3343,15 +3326,10 @@ func (s *Store) SnapshotLedgerFrozen(snapshot SnapshotID) bool {
 func (s *Store) FrozenSnapshotLedger() (SnapshotID, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	for key, frozen := range s.state.Frozen {
-		if !frozen {
-			continue
+	for id, frozen := range s.state.Frozen {
+		if frozen {
+			return id, true
 		}
-		parsed, err := strconv.ParseUint(key, 16, 64)
-		if err != nil {
-			continue
-		}
-		return SnapshotID(parsed), true
 	}
 	return 0, false
 }
@@ -3362,17 +3340,12 @@ func (s *Store) FrozenSnapshotLedgers() []SnapshotID {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var snapshots []SnapshotID
-	for key, frozen := range s.state.Frozen {
-		if !frozen {
-			continue
+	for id, frozen := range s.state.Frozen {
+		if frozen {
+			snapshots = append(snapshots, id)
 		}
-		parsed, err := strconv.ParseUint(key, 16, 64)
-		if err != nil {
-			continue
-		}
-		snapshots = append(snapshots, SnapshotID(parsed))
 	}
-	sort.Slice(snapshots, func(i, j int) bool { return snapshots[i] < snapshots[j] })
+	slices.Sort(snapshots)
 	return snapshots
 }
 
@@ -3952,7 +3925,7 @@ func (s *Store) scanReclaimingLocked() {
 			continue
 		}
 		if len(s.state.Handoffs) != 0 {
-			if _, transferring := s.state.Handoffs[snapshotKey(object.ID.Snapshot)]; transferring {
+			if _, transferring := s.state.Handoffs[object.ID.Snapshot]; transferring {
 				continue
 			}
 		}
@@ -4084,7 +4057,7 @@ func (s *Store) CollectEmptySnapshots(retain []SnapshotID) (int, error) {
 		if _, keep := retained[snapshot.ID]; keep {
 			continue
 		}
-		if _, transferring := s.state.Handoffs[snapshotKey(snapshot.ID)]; transferring {
+		if _, transferring := s.state.Handoffs[snapshot.ID]; transferring {
 			continue
 		}
 		if _, used := occupied[snapshot.ID]; used {

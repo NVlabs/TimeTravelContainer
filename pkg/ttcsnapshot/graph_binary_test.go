@@ -21,13 +21,13 @@ import (
 func checkpointFixture(random *rand.Rand, objects int) graphState {
 	state := graphState{
 		Version: formatVersion, Sequence: random.Uint64(), NextSnapshot: 4,
-		Snapshots: map[string]Snapshot{
-			snapshotKey(1): {ID: 1, State: SnapshotWorking, NextOrdinal: uint64(objects) + 10},
-			snapshotKey(2): {ID: 2, State: SnapshotSealedVolatile, NextOrdinal: 3},
+		Snapshots: map[SnapshotID]Snapshot{
+			1: {ID: 1, State: SnapshotWorking, NextOrdinal: uint64(objects) + 10},
+			2: {ID: 2, State: SnapshotSealedVolatile, NextOrdinal: 3},
 		},
 		Objects: make(map[ObjectID]Object), Roots: make(map[string]ObjectID), Pins: make(map[string]ObjectID),
-		Frozen:   map[string]bool{snapshotKey(2): true},
-		Handoffs: map[string]SnapshotLedgerHandoff{snapshotKey(2): {Snapshot: 2, NextSequence: 5, Frozen: true, Baseline: map[string]ObjectID{"root/a": {Snapshot: 2, Kind: ObjectKindMetadata, Ordinal: 1}}, Mutations: []SnapshotReferenceMutation{{Sequence: 4, Operation: "op", Name: "root/b", Object: ObjectID{Snapshot: 2, Kind: ObjectKindMetadata, Ordinal: 2}, Retain: true}}}},
+		Frozen:   map[SnapshotID]bool{2: true},
+		Handoffs: map[SnapshotID]SnapshotLedgerHandoff{2: {Snapshot: 2, NextSequence: 5, Frozen: true, Baseline: map[string]ObjectID{"root/a": {Snapshot: 2, Kind: ObjectKindMetadata, Ordinal: 1}}, Mutations: []SnapshotReferenceMutation{{Sequence: 4, Operation: "op", Name: "root/b", Object: ObjectID{Snapshot: 2, Kind: ObjectKindMetadata, Ordinal: 2}, Retain: true}}}},
 	}
 	for ordinal := 1; ordinal <= objects; ordinal++ {
 		id := ObjectID{Snapshot: 1, Kind: ObjectKind(1 + random.Intn(8)), Ordinal: uint64(ordinal)}
