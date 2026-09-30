@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -121,13 +124,31 @@ TEST_F(XattrTest, SecurityCapacityXattr) {
   SKIP_IF(!IsRunningOnGvisor());
   const char* path = test_file_name_.c_str();
   const char name[] = "security.capacity";
-  const std::string val = "";
-  EXPECT_THAT(lsetxattr(path, name, &val, val.size(), 0),
-              SyscallFailsWithErrno(EOPNOTSUPP));
-  int buf = 0;
-  EXPECT_THAT(lgetxattr(path, name, &buf, /*size=*/128),
-              SyscallFailsWithErrno(AnyOf(ENODATA, EOPNOTSUPP)));
-  EXPECT_THAT(lremovexattr(path, name), SyscallFailsWithErrno(EOPNOTSUPP));
+  const std::string val = "u:object_r:test:s0";
+  if (ASSERT_NO_ERRNO_AND_VALUE(IsGoferfs(test_file_name_))) {
+    // The gofer passes no write in the "security" namespace to the host.
+    EXPECT_THAT(lsetxattr(path, name, val.data(), val.size(), 0),
+                SyscallFailsWithErrno(EOPNOTSUPP));
+    int buf = 0;
+    EXPECT_THAT(lgetxattr(path, name, &buf, /*size=*/128),
+                SyscallFailsWithErrno(AnyOf(ENODATA, EOPNOTSUPP)));
+    EXPECT_THAT(lremovexattr(path, name), SyscallFailsWithErrno(EOPNOTSUPP));
+    return;
+  }
+  // As in Linux without a security module, the rest of the "security"
+  // namespace belongs to CAP_SYS_ADMIN, and memory filesystems keep it.
+  if (!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN))) {
+    EXPECT_THAT(lsetxattr(path, name, val.data(), val.size(), 0),
+                SyscallFailsWithErrno(EPERM));
+    return;
+  }
+  ASSERT_THAT(lsetxattr(path, name, val.data(), val.size(), 0),
+              SyscallSucceeds());
+  char buf[64] = {};
+  EXPECT_THAT(lgetxattr(path, name, buf, sizeof(buf)),
+              SyscallSucceedsWithValue(val.size()));
+  EXPECT_EQ(std::string(buf, val.size()), val);
+  EXPECT_THAT(lremovexattr(path, name), SyscallSucceeds());
 }
 
 TEST_F(XattrTest, WriteRemovesSecurityCapability) {

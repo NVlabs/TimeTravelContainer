@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package vfs
 
 import (
@@ -338,7 +341,16 @@ func CheckXattrPermissions(creds *auth.Credentials, ats AccessTypes, mode linux.
 		if name == linux.XATTR_SECURITY_CAPABILITY {
 			return nil
 		}
-		return linuxerr.EOPNOTSUPP
+		// Without a security module, as the sentry is, Linux leaves the
+		// rest of the "security" namespace to CAP_SYS_ADMIN
+		// (security/commoncap.c:cap_inode_setxattr()), and filesystems that
+		// keep extended attributes in memory, such as tmpfs, keep these
+		// too: Android's init labels its property files so. Filesystems
+		// decide which they keep; the gofer passes none to the host.
+		if creds.HasRootCapability(linux.CAP_SYS_ADMIN) {
+			return nil
+		}
+		return linuxerr.EPERM
 	}
 	return nil
 }
