@@ -71,7 +71,8 @@ func decodeBTreeNode(object Object, kind ObjectKind) (bTreeNode, error) {
 		if length == 0 || length > bTreeMaxKeyBytes || offset+length > len(object.Data) {
 			return bTreeNode{}, fmt.Errorf("object %s has invalid TTC B-tree key length", object.ID.key())
 		}
-		key := append([]byte(nil), object.Data[offset:offset+length]...)
+		// A key shares the object's data, which no one changes.
+		key := object.Data[offset : offset+length : offset+length]
 		offset += length
 		if index != 0 && bytes.Compare(node.keys[index-1], key) >= 0 {
 			return bTreeNode{}, fmt.Errorf("object %s has unordered TTC B-tree keys", object.ID.key())
@@ -203,13 +204,15 @@ func (mutation *graphMutation) retain(id ObjectID) error {
 	return nil
 }
 
+// create adds an object of kind, with data and children, which it takes: the
+// caller does not change them after.
 func (mutation *graphMutation) create(kind ObjectKind, data []byte, children []Edge) (ObjectID, error) {
 	if mutation.snapshot.NextOrdinal == 0 || mutation.snapshot.NextOrdinal == math.MaxUint64 {
 		return ObjectID{}, fmt.Errorf("snapshot %d object ordinal space exhausted", mutation.snapshot.ID)
 	}
 	id := ObjectID{Snapshot: mutation.snapshot.ID, Ordinal: mutation.snapshot.NextOrdinal, Kind: kind}
 	mutation.snapshot.NextOrdinal++
-	object := Object{ID: id, State: ObjectLive, Data: append([]byte(nil), data...), Children: append([]Edge(nil), children...)}
+	object := Object{ID: id, State: ObjectLive, Data: data, Children: children}
 	if err := validateObject(object); err != nil {
 		return ObjectID{}, err
 	}
