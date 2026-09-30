@@ -627,10 +627,42 @@ a VNC server in the guest, or a scanout sink.
 `nullDescriptor` feature of `VK_EXT_robustness2`, and OpenGL falls back to
 llvmpipe. Mesa's gfxstream guest driver offers guests only the device
 extensions of its allowlist (`ResourceTracker.cpp`), which lacks
-`VK_EXT_robustness2`. gfxstream's host can turn the extension on for its
-devices (its `VulkanRobustness` feature), and MoltenVK has it. So Zink needs
-the guest driver to allow the extension and pass its feature structures,
-and the renderer to enable `VulkanRobustness`. Not attempted.
+`VK_EXT_robustness2`.
+
+*Status (2026-10-01):* real workloads run on the virtual GPU, and live forks
+of them (`--gfx-fork=snapshot`) resume on the child's restored renderer:
+
+*   **Guest driver:** ttcd injects TTC's build of Mesa's gfxstream driver
+    into `--gfx` containers (mounts and `VK_LOADER_DRIVERS_DISABLE`, which
+    hides the gfxstream driver that Debian's Mesa now packages; see
+    `runsc/ttc/gfxrenderer/README.md`). The guest's patch allows
+    robustness2.
+*   **OpenGL:** Zink renders OpenGL 2.1 and OpenGL ES 2.0 on MoltenVK
+    (gfxstream patch `0006` reports `nullDescriptor`); every pixel checks, and
+    a render loop survives a fork. MoltenVK lacks transform feedback and
+    geometry shaders, which OpenGL 3 needs, so on macOS Zink is opt-in
+    (`MESA_LOADER_DRIVER_OVERRIDE=zink`): forcing it broke applications that
+    llvmpipe serves with OpenGL 4.6. Elsewhere a driconf file selects it.
+*   **Chromium:** ANGLE on Vulkan (`--use-angle=vulkan`) renders WebGL on the
+    GPU once the device offers `VK_EXT_provoking_vertex` (patch `0007`;
+    MoltenVK lacks it and ANGLE requires it for OpenGL ES 3; flat varyings
+    take the first vertex). A headless Chromium drawing and checking WebGL
+    frames continues in both branches of a fork. WebGPU falls back to
+    SwiftShader: Chromium matches adapters to the GPU it finds in sysfs, a
+    virtio PCI device, and the guest driver cannot export non-dedicated
+    memory as file descriptors. Chromium's own Vulkan compositing
+    (`--enable-features=Vulkan`) hangs or crashes now and then; it is off by
+    default on Linux.
+*   **llama.cpp:** its Vulkan backend runs once the device offers the
+    extensions Vulkan 1.1 and 1.2 promoted (patch `0008`): qwen2.5-0.5b
+    Q4_K_M processes prompts at 6600 tokens/s and generates 257 tokens/s on
+    an M5 Pro, against 250 tokens/s generation on 8 CPU threads. A fork in
+    the middle of greedy generation gives both branches the text of an
+    unforked run. The fork took 38 s: the snapshot carries the model's
+    470 MB of device memory, and the source waits for it.
+*   **Found in passing:** the Sentry's CPU generation with as many threads as
+    host cores (18) collapses to 3 tokens/s, ggml's spinning thread pool
+    starving the Sentry; with 8 threads it is fine.
 
 ### Handing off to Phase B
 
@@ -759,8 +791,9 @@ redroid's arm64 images could then run on macOS too.
 *   gfxstream's Vulkan snapshots are young, and gated by a feature flag.
     *Found (A5):* they restore Vulkan objects and memory, but not recorded
     commands, and fail to restore batched descriptor set updates.
-*   No distribution packages Mesa's gfxstream driver, so TTC builds and
-    injects it.
+*   No distribution packaged Mesa's gfxstream driver, so TTC builds and
+    injects it. *Update:* Debian's Mesa now packages one, without
+    robustness2; TTC's containers hide it.
 *   gfxstream's `SystemBlob` path, which TTC's renderer relies on for
     cross-process blobs, is tested upstream only on Windows. *Resolved on
     macOS,* with patch 0002, which keeps renderers' memory apart.
