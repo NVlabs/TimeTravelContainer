@@ -195,5 +195,38 @@ case "$source_log" in
   *) fail "the source's render loop: $source_log" ;;
 esac
 
+# Two new branches render at once, each with a renderer of its own. Their
+# resource IDs start alike, which once made their renderers share command
+# rings through macOS's global shared memory names.
+ttc fork "$NAME@main" one two >/dev/null
+for branch in one two; do
+  ttc exec -d -e "$VK_DRIVER_FILES" "$NAME@$branch" sh -c \
+    'cd /work && ./vkoffscreen compute.spv square.spv red.spv 100 10 >/tmp/pair.log 2>&1
+     echo "exit=$?" >>/tmp/pair.log' >/dev/null
+done
+for branch in one two; do
+  deadline=$(($(date +%s) + 120))
+  until ttc exec "$NAME@$branch" grep -q "^exit=" /tmp/pair.log 2>/dev/null; do
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      fail "branch $branch, rendering beside another, hangs: $(ttc exec "$NAME@$branch" cat /tmp/pair.log 2>&1)"
+    fi
+    sleep 0.5
+  done
+  pair_log=$(ttc exec "$NAME@$branch" cat /tmp/pair.log)
+  case "$pair_log" in
+    *"iteration 100 ok"*"vkoffscreen: ok checksum=$WANT_CHECKSUM"*exit=0) ;;
+    *) fail "branch $branch, rendering beside another: $pair_log" ;;
+  esac
+done
+
+# Nothing uses the GPU now, so no renderer runs.
+deadline=$(($(date +%s) + 30))
+while pgrep -f "$BIN_DIR/ttc-gfx-renderer serve" >/dev/null; do
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    fail "renderers outlive their GPU's use: $(pgrep -fl "$BIN_DIR/ttc-gfx-renderer serve")"
+  fi
+  sleep 0.5
+done
+
 ttc rm -f "$NAME" >/dev/null
 echo "ttc gfx e2e: ok"
