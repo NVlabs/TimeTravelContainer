@@ -12881,9 +12881,10 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 		}
 		return b.forkDehydratedMany(source, logicalSource.branch, containerInfo, sourceRecord, destinations, paused, sourceRecord.Quarantined || quarantine)
 	}
+	// A source that no transaction produced has shared-only roots, and its
+	// forks' intents have no transaction: see graphReferenceIntent.
 	referenceTransaction := transactionIDForBranch(containerInfo, sourceRecord)
 	referenceOperations := make([]string, len(destinations))
-	referenceTransactions := make([]string, len(destinations))
 	referenceRequired := referenceTransaction != ""
 	if len(sourceRecord.MemoryRootObjects) != 0 && b.distributedSource != nil {
 		localRoots, err := b.graphMemoryRootsLocal(sourceRecord.MemoryRoots)
@@ -12899,14 +12900,11 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 				return nil, fmt.Errorf("allocating graph reference identity for %q: %w", destinations[index], err)
 			}
 			referenceOperations[index] = operation
-			referenceTransactions[index] = referenceTransaction
-			if referenceTransactions[index] == "" {
-				// Shared-only roots have no fork transaction to authorize. The
-				// unique operation is a durable local ownership fence and also
-				// satisfies the intent format's non-empty transaction identity.
-				referenceTransactions[index] = operation
-			}
 		}
+	}
+	// The forks share whatever of the shared image the source still expands.
+	if err := b.claimForkCatalogs(containerInfo, sourceRecord.FilesystemBranch); err != nil {
+		return nil, err
 	}
 	args := []string{"timetravel", "--source", source.branch}
 	if paused {
@@ -13036,7 +13034,7 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 			if records[i].DistributedGraphReferenceOperation == "" {
 				continue
 			}
-			if err := b.retainDistributedGraphReferences(referenceTransactions[i], records[i].DistributedGraphReferenceOperation, containerInfo.ID, records[i].ID, branchGraphRootObjects(records[i])); err != nil {
+			if err := b.retainDistributedGraphReferences(referenceTransaction, records[i].DistributedGraphReferenceOperation, containerInfo.ID, records[i].ID, branchGraphRootObjects(records[i])); err != nil {
 				var cleanupErr error
 				for _, cleanupDestination := range destinations {
 					cleanupErr = errors.Join(cleanupErr, b.destroy(selector{container: source.container, branch: cleanupDestination}, true))
@@ -13128,6 +13126,10 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, logicalParent strin
 	if err != nil {
 		return nil, fmt.Errorf("reading dehydrated source metadata: %w", err)
 	}
+	// The forks share whatever of the shared image the source expands.
+	if err := b.claimForkCatalogs(info, capture.FilesystemBranch); err != nil {
+		return nil, err
+	}
 
 	type preparedChild struct {
 		target selector
@@ -13162,7 +13164,6 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, logicalParent strin
 	createdAt := time.Now().UTC()
 	records := make([]ttcbundle.BranchInfo, 0, len(destinations))
 	referenceTransaction := transactionIDForBranch(info, sourceBranch)
-	referenceTransactions := make([]string, len(destinations))
 	externalMemoryRoots := false
 	if len(sourceBranch.MemoryRootObjects) != 0 && b.distributedSource != nil {
 		localRoots, err := b.graphMemoryRootsLocal(sourceBranch.MemoryRoots)
@@ -13171,7 +13172,7 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, logicalParent strin
 		}
 		externalMemoryRoots = !localRoots
 	}
-	for destinationIndex, destination := range destinations {
+	for _, destination := range destinations {
 		filesystemBranch, err := ttcvolume.NewScopedBranchID(info.ID, destination)
 		if err != nil {
 			return nil, fmt.Errorf("allocating filesystem identity for %s@%s: %w", source.container, destination, err)
@@ -13186,10 +13187,6 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, logicalParent strin
 				branch.DistributedForkTransactionID = referenceTransaction
 			}
 			branch.DistributedGraphReferenceOperation = operation
-			referenceTransactions[destinationIndex] = referenceTransaction
-			if referenceTransactions[destinationIndex] == "" {
-				referenceTransactions[destinationIndex] = operation
-			}
 		}
 		childDir := memoryBranchDir(b.activeDataRoot(), info.ID, "dehydrated", branch)
 		children = append(children, preparedChild{target: selector{container: source.container, branch: destination}, branch: branch, dir: childDir})
@@ -13267,7 +13264,7 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, logicalParent strin
 		if records[i].DistributedGraphReferenceOperation == "" {
 			continue
 		}
-		if err := b.retainDistributedGraphReferences(referenceTransactions[i], records[i].DistributedGraphReferenceOperation, info.ID, records[i].ID, branchGraphRootObjects(records[i])); err != nil {
+		if err := b.retainDistributedGraphReferences(referenceTransaction, records[i].DistributedGraphReferenceOperation, info.ID, records[i].ID, branchGraphRootObjects(records[i])); err != nil {
 			return nil, fmt.Errorf("retaining graph origins for dehydrated branch %q: %w", records[i].ID, err)
 		}
 	}

@@ -1286,3 +1286,58 @@ func TestMaterializeRemoteObjectsAfterImportedBranchRemoval(t *testing.T) {
 		t.Fatal("surviving child lost data after its imported parent was removed")
 	}
 }
+
+// RemoteCatalogs names, by branch, the catalog each branch of a repository
+// still expands, a local fork inheriting its source's, from the branch
+// records alone.
+func TestRemoteCatalogs(t *testing.T) {
+	sourceManager := openTestManager(t)
+	source, err := sourceManager.Create("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	if _, err := source.CreateRegular(MainBranch, RootInode, "file", 0644, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Fork(MainBranch, "sealed"); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := source.DescribeRemoteSnapshot("sealed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetManager := openTestManager(t)
+	path := filepath.Join(targetManager.root, "target")
+	target, err := targetManager.ImportPrivateRemoteDescriptor(path, "target", descriptor, "imported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	if err := target.Fork("imported", "child"); err != nil {
+		t.Fatal(err)
+	}
+	catalogs, err := RemoteCatalogs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	imported, err := target.Branch("imported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imported.RemoteCatalog == "" || len(catalogs) != 2 || catalogs["imported"] != imported.RemoteCatalog || catalogs["child"] != imported.RemoteCatalog {
+		t.Fatalf("catalogs %v, want imported and child naming %q", catalogs, imported.RemoteCatalog)
+	}
+	if err := target.RemoveBranch("child"); err != nil {
+		t.Fatal(err)
+	}
+	if catalogs, err := RemoteCatalogs(path); err != nil || len(catalogs) != 1 || catalogs["imported"] != imported.RemoteCatalog {
+		t.Fatalf("after the child's removal, catalogs %v (%v)", catalogs, err)
+	}
+	if catalogs, err := RemoteCatalogs(source.path); err != nil || len(catalogs) != 0 {
+		t.Fatalf("the source repository's catalogs %v (%v), want none", catalogs, err)
+	}
+	if _, err := RemoteCatalogs(filepath.Join(targetManager.root, "missing")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a missing repository's catalogs: %v", err)
+	}
+}

@@ -14,6 +14,7 @@ go_library(
     force_add_state_pkg = True,
     srcs = [
         "capture_reuse.go",
+        "catalog_claims.go",
         "checkpoint.go",
         "cmd.go",
         "cmd_host_darwin.go",

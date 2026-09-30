@@ -34,10 +34,18 @@ const (
 	// graphReferencePurposeCapture is a node's own claim on a shared image
 	// whose pages its captures share; see claimCaptureImage.
 	graphReferencePurposeCapture = "capture"
+	// graphReferencePurposeCatalog is a node's own claim on a shared
+	// filesystem image that branches of one of its repositories expand
+	// lazily; see claimForkCatalogs.
+	graphReferencePurposeCatalog = "catalog"
 )
 
 type graphReferenceIntent struct {
-	Version     int                   `json:"version"`
+	Version int `json:"version"`
+	// Transaction is the cluster transaction that authorizes the references.
+	// A branch that no transaction produced, such as one rehydrated from its
+	// durable image, has none: its intent is authorized by its unguessable
+	// operation and lives as long as the branch does.
 	Transaction string                `json:"transaction"`
 	Operation   string                `json:"operation"`
 	Purpose     string                `json:"purpose"`
@@ -53,6 +61,9 @@ type graphReferenceIntent struct {
 	// reach: the node's memory graph may share any of them, and the claim is
 	// kept while it refers to one.
 	Origins []uint64 `json:"origins,omitempty"`
+	// Catalog is, for a catalog claim, the remote catalog by which branches
+	// of Repository expand the image; Container is their family.
+	Catalog string `json:"catalog,omitempty"`
 }
 
 type graphReferenceGroup struct {
@@ -81,18 +92,22 @@ func readGraphReferenceIntent(path string) (graphReferenceIntent, error) {
 	if err := decoder.Decode(&intent); err != nil {
 		return graphReferenceIntent{}, err
 	}
-	valid := intent.Version == graphReferenceIntentVersion && intent.Transaction != "" && intent.Operation != "" &&
-		len(intent.Groups) != 0 && (intent.State == "retaining" || intent.State == "active" || intent.State == "releasing")
+	valid := intent.Version == graphReferenceIntentVersion && (intent.Transaction != "" || intent.Purpose == graphReferencePurposeBranch) &&
+		intent.Operation != "" && len(intent.Groups) != 0 && (intent.State == "retaining" || intent.State == "active" || intent.State == "releasing")
 	switch intent.Purpose {
 	case graphReferencePurposeBranch, graphReferencePurposeTransfer:
-		valid = valid && intent.Container != "" && intent.Branch != "" && intent.Repository == ""
+		valid = valid && intent.Container != "" && intent.Branch != "" && intent.Repository == "" && intent.Catalog == ""
 	case graphReferencePurposeProvider:
 		// The node, not a branch, owns a provider claim.
-		valid = valid && intent.Container == "" && intent.Branch == "" && len(intent.Groups) == 1
+		valid = valid && intent.Container == "" && intent.Branch == "" && len(intent.Groups) == 1 && intent.Catalog == ""
 	case graphReferencePurposeCapture:
 		// And a capture claim.
 		valid = valid && intent.Container == "" && intent.Branch == "" && len(intent.Groups) == 1 &&
-			intent.Repository == "" && len(intent.Origins) != 0
+			intent.Repository == "" && len(intent.Origins) != 0 && intent.Catalog == ""
+	case graphReferencePurposeCatalog:
+		// And a catalog claim, which retains one image's filesystem root.
+		valid = valid && intent.Container != "" && intent.Branch == "" && len(intent.Groups) == 1 && len(intent.Groups[0].Roots) == 1 &&
+			intent.Repository != "" && intent.Catalog != "" && len(intent.Origins) == 0
 	default:
 		valid = false
 	}
@@ -479,15 +494,23 @@ func (b *runtimeBackend) reconcileDistributedGraphReferences(strictRetain bool) 
 			retryable = errors.Join(retryable, fmt.Errorf("reading graph reference intent %q: %w", entry.Name(), err))
 			continue
 		}
-		if intent.Purpose == graphReferencePurposeProvider || intent.Purpose == graphReferencePurposeCapture {
+		if intent.Purpose == graphReferencePurposeProvider || intent.Purpose == graphReferencePurposeCapture || intent.Purpose == graphReferencePurposeCatalog {
 			// See reconcileProviderClaims.
 			continue
 		}
-		tx, txErr := b.distributedSource.transactions.Load(intent.Transaction)
-		branchPresent := false
-		if info, loadErr := b.containerStore().LoadContainer(intent.Container); loadErr == nil {
-			branchPresent = containerHasGraphReferenceIntent(info, intent)
+		var tx *cluster.Transaction
+		var txErr error
+		if graphReferenceAuthorizationTransaction(intent) != "" {
+			tx, txErr = b.distributedSource.transactions.Load(intent.Transaction)
 		}
+		info, loadErr := b.containerStore().LoadContainer(intent.Container)
+		if loadErr != nil && !errors.Is(loadErr, os.ErrNotExist) {
+			// No more proof that the branch is gone than a failed transaction
+			// lookup is that the transaction is.
+			retryable = errors.Join(retryable, fmt.Errorf("loading the family of graph reference %q: %w", intent.Operation, loadErr))
+			continue
+		}
+		branchPresent := loadErr == nil && containerHasGraphReferenceIntent(info, intent)
 		if graphReferenceIntentShouldRelease(intent, tx, txErr, branchPresent) {
 			if err := b.releaseDistributedGraphReferences(intent.Operation); err != nil {
 				retryable = errors.Join(retryable, fmt.Errorf("resuming graph reference release %q: %w", intent.Operation, err))
@@ -520,10 +543,16 @@ func (b *runtimeBackend) reconcileDistributedGraphReferences(strictRetain bool) 
 // latter, and the old name may immediately be reused by a different branch.
 // Treating intent.Branch as identity made the reconciler release a live
 // branch's roots after rename and allowed GC to retire memory still needed by
-// that branch.
+// that branch. A removed branch's runtime backing, which a sibling's runtime
+// may still load pages from, owns the intent the branch did.
 func containerHasGraphReferenceIntent(info ttcbundle.ContainerInfo, intent graphReferenceIntent) bool {
 	for _, branch := range info.Branches {
 		if transactionIDForBranch(info, branch) == intent.Transaction && graphReferenceOperationForBranch(info, branch) == intent.Operation {
+			return true
+		}
+	}
+	for _, backing := range info.RuntimeMemoryBackings {
+		if backing.DistributedGraphReferenceOperation == intent.Operation {
 			return true
 		}
 	}
@@ -540,6 +569,12 @@ func graphReferenceIntentShouldRelease(intent graphReferenceIntent, tx *cluster.
 		// cutover has already replaced the visible branch metadata. A failed
 		// post-cutover migration deliberately retains its source for recovery.
 		return txErr == nil && tx != nil && (tx.State == cluster.TransactionIndependent || tx.State == cluster.TransactionCanceled)
+	}
+	if graphReferenceAuthorizationTransaction(intent) == "" {
+		// A descendant's references are its branch's alone, whatever became
+		// of the transaction that brought its ancestor here, and so are those
+		// of a branch that no transaction produced.
+		return !branchPresent
 	}
 	if txErr != nil {
 		// A catalog or authority failure does not prove that the authorizing
@@ -675,11 +710,11 @@ func (b *runtimeBackend) mutateGraphReferenceGroup(ctx context.Context, intent g
 // Descendant operations have fresh, unguessable operation identities and can
 // mutate only their exact retained root names, so cluster membership and the
 // immutable object bindings are their authority. Transfer intents remain
-// transaction-fenced even though their operation carries a prefix. A provider
-// or capture claim has no transaction; its unguessable operation is its
-// authority too.
+// transaction-fenced even though their operation carries a prefix. A node's
+// provider, capture or catalog claim has no transaction; its unguessable
+// operation is its authority too.
 func graphReferenceAuthorizationTransaction(intent graphReferenceIntent) string {
-	if intent.Purpose == graphReferencePurposeProvider || intent.Purpose == graphReferencePurposeCapture {
+	if intent.Purpose == graphReferencePurposeProvider || intent.Purpose == graphReferencePurposeCapture || intent.Purpose == graphReferencePurposeCatalog {
 		return ""
 	}
 	if intent.Purpose == graphReferencePurposeBranch && intent.Operation != intent.Transaction && !graphHandoffReferenceIntent(intent) {
@@ -1068,8 +1103,9 @@ func (p *branchPublisher) retainAtSharedLedger(ctx context.Context, origin ttcsn
 }
 
 // reconcileProviderClaims reconciles every provider claim of this node, see
-// reconcileProviderReferences, and every capture claim, see
-// reconcileCaptureClaim. The handoff that records a claim retains it
+// reconcileProviderReferences, every capture claim, see
+// reconcileCaptureClaim, and every catalog claim, see
+// reconcileCatalogClaim. The handoff that records a claim retains it
 // before it commits, so execution waits for none, and it needs no lock of the
 // node's: releasing a claim waits for the shared-reference coordinator,
 // which a node's start may be what brings back, and during a failover for a
@@ -1088,8 +1124,8 @@ func (b *runtimeBackend) reconcileProviderClaims() error {
 	}
 	var result error
 	for _, entry := range entries {
-		provider, capture := strings.HasPrefix(entry.Name(), "provider-"), strings.HasPrefix(entry.Name(), captureClaimPrefix)
-		if entry.IsDir() || !provider && !capture || filepath.Ext(entry.Name()) != ".json" {
+		provider, capture, catalog := strings.HasPrefix(entry.Name(), "provider-"), strings.HasPrefix(entry.Name(), captureClaimPrefix), strings.HasPrefix(entry.Name(), catalogClaimPrefix)
+		if entry.IsDir() || !provider && !capture && !catalog || filepath.Ext(entry.Name()) != ".json" {
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())
@@ -1102,6 +1138,9 @@ func (b *runtimeBackend) reconcileProviderClaims() error {
 		}
 		if err == nil && capture && intent.Purpose == graphReferencePurposeCapture {
 			err = b.reconcileCaptureClaim(path, intent)
+		}
+		if err == nil && catalog && intent.Purpose == graphReferencePurposeCatalog {
+			err = b.reconcileCatalogClaim(path, intent)
 		}
 		if err != nil {
 			result = errors.Join(result, fmt.Errorf("reconciling claim %q: %w", entry.Name(), err))

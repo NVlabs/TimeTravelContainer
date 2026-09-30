@@ -1330,6 +1330,39 @@ func ReadRepositoryInfo(path string) (VolumeInfo, error) {
 	return info, nil
 }
 
+// RemoteCatalogs returns, by branch, the remote catalog each branch of the
+// repository at path still expands lazily, reading only its branch records:
+// a branch whose tree is independent names none. Branch records are replaced
+// whole, so a repository open elsewhere reads as it is. It returns an error
+// satisfying os.ErrNotExist when path has no repository.
+func RemoteCatalogs(path string) (map[string]string, error) {
+	entries, err := os.ReadDir(filepath.Join(path, "branches"))
+	if err != nil {
+		return nil, err
+	}
+	catalogs := make(map[string]string)
+	for _, entry := range entries {
+		id, ok := strings.CutSuffix(entry.Name(), ".json")
+		if entry.IsDir() || !ok || validateName(id, "branch") != nil {
+			continue
+		}
+		var branch Branch
+		if err := readJSON(filepath.Join(path, "branches", entry.Name()), &branch); errors.Is(err, os.ErrNotExist) {
+			// Removed since the directory was read.
+			continue
+		} else if err != nil {
+			return nil, err
+		}
+		if branch.ID != id {
+			return nil, fmt.Errorf("invalid branch record for %q", id)
+		}
+		if branch.RemoteCatalog != "" {
+			catalogs[id] = branch.RemoteCatalog
+		}
+	}
+	return catalogs, nil
+}
+
 // OpenRepositoryFD opens a repository from an already-open O_DIRECTORY file.
 // The descriptor is duplicated, so the caller retains ownership of dir.
 func OpenRepositoryFD(dir *os.File, mode CopyMode) (*Repository, error) {

@@ -6,6 +6,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
+	"gvisor.dev/gvisor/runsc/specutils"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 )
@@ -62,6 +64,12 @@ func TestGraphReferenceAuthorizationTransaction(t *testing.T) {
 			name: "local descendant",
 			intent: graphReferenceIntent{
 				Purpose: graphReferencePurposeBranch, Transaction: "fork-1", Operation: "branch-2",
+			},
+		},
+		{
+			name: "fork of a branch no transaction produced",
+			intent: graphReferenceIntent{
+				Purpose: graphReferencePurposeBranch, Operation: "branch-2",
 			},
 		},
 		{
@@ -241,7 +249,7 @@ func TestGraphReferenceTransferLifetimeFollowsTransaction(t *testing.T) {
 	if graphReferenceIntentShouldRelease(intent, nil, os.ErrNotExist, false) {
 		t.Fatal("transfer intent released while transaction authority was unavailable")
 	}
-	branch := graphReferenceIntent{Purpose: graphReferencePurposeBranch, State: "active"}
+	branch := graphReferenceIntent{Purpose: graphReferencePurposeBranch, State: "active", Transaction: "fork-1", Operation: "fork-1"}
 	for _, state := range []cluster.TransactionState{
 		cluster.TransactionPreparing,
 		cluster.TransactionTargetReserved,
@@ -272,6 +280,137 @@ func TestGraphReferenceTransferLifetimeFollowsTransaction(t *testing.T) {
 	}
 	if graphReferenceIntentShouldRelease(branch, &cluster.Transaction{State: cluster.TransactionIndependent}, nil, true) {
 		t.Fatal("live branch intent was released after transaction independence")
+	}
+}
+
+// A local fork's references, whether or not a transaction brought its source
+// here, are kept exactly as long as the fork is: rehydrated from a durable
+// image, a branch has no transaction, and a transaction that brought its
+// ancestor may be canceled or retired while the fork lives on.
+func TestDescendantGraphReferenceIntentFollowsItsBranch(t *testing.T) {
+	for _, intent := range []graphReferenceIntent{
+		{Purpose: graphReferencePurposeBranch, State: "active", Transaction: "fork-1", Operation: "branch-2"},
+		{Purpose: graphReferencePurposeBranch, State: "active", Operation: "branch-3"},
+	} {
+		for _, tx := range []*cluster.Transaction{
+			nil,
+			{State: cluster.TransactionPublished},
+			{State: cluster.TransactionIndependent},
+			{State: cluster.TransactionCanceled},
+			{State: cluster.TransactionFailed},
+		} {
+			for _, txErr := range []error{nil, os.ErrNotExist} {
+				if graphReferenceIntentShouldRelease(intent, tx, txErr, true) {
+					t.Fatalf("intent %+v of a live branch released with transaction %+v (%v)", intent, tx, txErr)
+				}
+				if !graphReferenceIntentShouldRelease(intent, tx, txErr, false) {
+					t.Fatalf("intent %+v of a removed branch kept with transaction %+v (%v)", intent, tx, txErr)
+				}
+			}
+		}
+	}
+	info := ttcbundle.ContainerInfo{
+		Branches: []ttcbundle.BranchInfo{{ID: "c", DistributedGraphReferenceOperation: "branch-3"}},
+		RuntimeMemoryBackings: []ttcbundle.RuntimeMemoryBacking{{
+			ID: "parked", DistributedGraphReferenceOperation: "fork-1",
+		}},
+	}
+	if !containerHasGraphReferenceIntent(info, graphReferenceIntent{Operation: "branch-3"}) {
+		t.Fatal("a branch that no transaction produced does not own its intent")
+	}
+	if !containerHasGraphReferenceIntent(info, graphReferenceIntent{Transaction: "fork-1", Operation: "fork-1"}) {
+		t.Fatal("a parked runtime backing does not own the intent its branch did")
+	}
+	if containerHasGraphReferenceIntent(info, graphReferenceIntent{Operation: "branch-4"}) {
+		t.Fatal("an intent nothing records is owned")
+	}
+	group := []graphReferenceGroup{{Origin: 1, Roots: []cluster.SnapshotRootBinding{{Slot: 0, Object: "0000000000000001-03-0000000000000001"}}}}
+	for _, test := range []struct {
+		purpose string
+		valid   bool
+	}{
+		{purpose: graphReferencePurposeBranch, valid: true},
+		{purpose: graphReferencePurposeTransfer},
+	} {
+		path := filepath.Join(t.TempDir(), "intent.json")
+		intent := graphReferenceIntent{
+			Version: graphReferenceIntentVersion, Operation: "branch-3", Purpose: test.purpose,
+			Container: "family", Branch: "c", State: "active", Groups: group, CreatedAt: time.Now().UTC(),
+		}
+		if err := writeDurableJSON(path, &intent); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readGraphReferenceIntent(path); (err == nil) != test.valid {
+			t.Fatalf("reading a %s intent without a transaction: %v, want valid %t", test.purpose, err, test.valid)
+		}
+	}
+}
+
+// The reconciler loads no transaction for an intent that none authorizes,
+// and keeps the intents that a branch or a parked runtime backing owns.
+func TestReconcileKeepsOwnedGraphReferenceIntents(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "family")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+		ID: "family", Name: "family", BundleDir: bundleDir,
+		Branches: []ttcbundle.BranchInfo{
+			{ID: "c", DistributedGraphReferenceOperation: "branch-c"},
+			{ID: "d", DistributedForkTransactionID: "fork-1", DistributedGraphReferenceOperation: "branch-d"},
+		},
+		RuntimeMemoryBackings: []ttcbundle.RuntimeMemoryBacking{{
+			ID: "parked", SnapshotID: 1, MemoryRoots: []string{"root"}, MemoryRootObjects: []string{"0000000000000001-03-0000000000000001"},
+			DistributedGraphReferenceOperation: "fork-2",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	group := []graphReferenceGroup{{Origin: 1, Roots: []cluster.SnapshotRootBinding{{Slot: 0, Object: "0000000000000001-03-0000000000000001"}}, Retained: true}}
+	intents := []graphReferenceIntent{
+		{Operation: "branch-c", Branch: "c"},
+		{Transaction: "fork-1", Operation: "branch-d", Branch: "d"},
+		{Transaction: "fork-2", Operation: "fork-2", Branch: "parked"},
+	}
+	paths := make([]string, len(intents))
+	for i := range intents {
+		intents[i].Version, intents[i].Purpose, intents[i].Container = graphReferenceIntentVersion, graphReferencePurposeBranch, "family"
+		intents[i].State, intents[i].Groups, intents[i].CreatedAt = "active", group, time.Now().UTC()
+		path, err := graphReferenceIntentPath(root, intents[i].Operation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeDurableJSON(path, &intents[i]); err != nil {
+			t.Fatal(err)
+		}
+		paths[i] = path
+	}
+	var loaded []string
+	backend := &runtimeBackend{dataRoot: root, distributedSource: &distributedSourceRuntime{
+		transactions: transactionLoadCatalog{load: func(id string) (*cluster.Transaction, error) {
+			loaded = append(loaded, id)
+			// The transaction that brought the parked branch here is done.
+			return &cluster.Transaction{State: cluster.TransactionIndependent}, nil
+		}},
+	}}
+	if err := backend.reconcileDistributedGraphReferences(true); err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded) != 1 || loaded[0] != "fork-2" {
+		t.Fatalf("loaded transactions %q, want only the parked import's", loaded)
+	}
+	for _, path := range paths {
+		if intent, err := readGraphReferenceIntent(path); err != nil || intent.State != "active" {
+			t.Fatalf("owned intent %s is %+v (%v)", filepath.Base(path), intent, err)
+		}
 	}
 }
 
@@ -585,6 +724,130 @@ func TestCaptureClaim(t *testing.T) {
 	}
 	backend.distributedSource.providerChecks.Delete(operation)
 	if err := backend.reconcileCaptureClaim(path, read); err != nil {
+		t.Fatal(err)
+	}
+	released, err := readGraphReferenceIntent(path)
+	if err != nil || released.State != "releasing" || !released.Groups[0].Retained {
+		t.Fatalf("an unneeded claim is %+v (%v), want it releasing", released, err)
+	}
+}
+
+// A catalog claim is the node's, is reported to the coordinator like any
+// claim, and is kept while a branch that its family places on the node names
+// its catalog in its repository.
+func TestCatalogClaim(t *testing.T) {
+	root := t.TempDir()
+	repository := filepath.Join(root, "repository")
+	const catalog = "repo:0000000000000007-03-0000000000000001:9"
+	writeBranch := func(id, catalog string) {
+		t.Helper()
+		data := fmt.Sprintf(`{"id":%q,"remote_catalog":%q}`, id, catalog)
+		if err := os.MkdirAll(filepath.Join(repository, "branches"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(repository, "branches", id+".json"), []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	containerDir := filepath.Join(root, "containers", "family")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	repositories := fmt.Sprintf(`[{"source":"/upper","path":%q,"branch":"main","copy_mode":"full-copy","private":true}]`, repository)
+	config, err := json.Marshal(map[string]any{"annotations": map[string]string{specutils.AnnotationTTCVolumeRepositories: repositories}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), config, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+		ID: "family", Name: "family", BundleDir: bundleDir,
+		Branches: []ttcbundle.BranchInfo{
+			{ID: "c", NodeID: "node-a"},
+			{ID: "p", Unplaced: true, StorageState: "shared"},
+			{ID: "e", NodeID: "node-b"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writeBranch("c", catalog)
+	writeBranch("p", catalog)
+	writeBranch("e", catalog)
+	operation := catalogClaimPrefix + "0000000000000007-op"
+	path, err := graphReferenceIntentPath(root, operation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := graphReferenceIntent{
+		Version: graphReferenceIntentVersion, Transaction: operation, Operation: operation,
+		Purpose: graphReferencePurposeCatalog, Container: "family", State: "active", CreatedAt: time.Now().UTC(),
+		Groups:     []graphReferenceGroup{{Origin: 7, Roots: []cluster.SnapshotRootBinding{{Slot: 0, Object: "0000000000000007-03-0000000000000001"}}, Retained: true}},
+		Repository: repository, Catalog: catalog,
+	}
+	if err := writeDurableJSON(path, &intent); err != nil {
+		t.Fatal(err)
+	}
+	read, err := readGraphReferenceIntent(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if graphReferenceAuthorizationTransaction(read) != "" {
+		t.Fatal("a catalog claim names a transaction to authorize")
+	}
+	for _, malformed := range []func(*graphReferenceIntent){
+		func(intent *graphReferenceIntent) { intent.Catalog = "" },
+		func(intent *graphReferenceIntent) { intent.Repository = "" },
+		func(intent *graphReferenceIntent) { intent.Container = "" },
+		func(intent *graphReferenceIntent) { intent.Branch = "c" },
+		func(intent *graphReferenceIntent) {
+			intent.Groups[0].Roots = append(intent.Groups[0].Roots, intent.Groups[0].Roots[0])
+		},
+	} {
+		bad := read
+		bad.Groups = []graphReferenceGroup{read.Groups[0]}
+		bad.Groups[0].Roots = append([]cluster.SnapshotRootBinding(nil), read.Groups[0].Roots...)
+		malformed(&bad)
+		badPath := filepath.Join(t.TempDir(), "bad.json")
+		if err := writeDurableJSON(badPath, &bad); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readGraphReferenceIntent(badPath); err == nil {
+			t.Fatalf("malformed catalog claim %+v was read", bad)
+		}
+	}
+	service := &sharedReferenceService{localRoot: root, nodeID: "node-a", incarnation: "boot-a"}
+	inventory, err := service.SnapshotReferenceInventory(context.Background(), "coordinator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inventory.Claims) != 1 || inventory.Claims[0].Origin != 7 || inventory.Claims[0].Operation != operation {
+		t.Fatalf("inventory claims = %+v, want the catalog claim on origin 7", inventory.Claims)
+	}
+	backend := &runtimeBackend{dataRoot: root, nodeID: "node-a", distributedSource: &distributedSourceRuntime{}}
+	// A second fork finds the claim.
+	if err := backend.claimCatalog("family", repository, catalog, ttcsnapshot.ObjectID{Snapshot: 7, Ordinal: 1, Kind: ttcsnapshot.ObjectKindMetadata}); err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := os.ReadDir(filepath.Dir(path)); err != nil || len(entries) != 1 {
+		t.Fatalf("claims after a second fork: %v (%v), want the one", entries, err)
+	}
+	// Kept while the branch placed here names the catalog...
+	if err := backend.reconcileCatalogClaim(path, read); err != nil {
+		t.Fatal(err)
+	}
+	if kept, err := readGraphReferenceIntent(path); err != nil || kept.State != "active" {
+		t.Fatalf("a needed claim is %+v (%v)", kept, err)
+	}
+	// ... but not for a copy of the unplaced source, nor for a branch placed
+	// on another node.
+	writeBranch("c", "")
+	backend.distributedSource.providerChecks.Delete(operation)
+	if needed, err := backend.catalogClaimNeeded(read); err != nil || needed {
+		t.Fatalf("claim needed=%t (%v) once only other nodes' branches name the catalog", needed, err)
+	}
+	if err := backend.reconcileCatalogClaim(path, read); err != nil {
 		t.Fatal(err)
 	}
 	released, err := readGraphReferenceIntent(path)

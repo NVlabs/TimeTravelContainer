@@ -256,16 +256,16 @@ func (b *runtimeBackend) claimCaptureImage(image captureImage, origins []ttcsnap
 	if err != nil {
 		// The next reconciliation releases it: the capture does not wait for
 		// a coordinator it could not reach.
-		return errors.Join(err, abandonCaptureClaim(path, intent))
+		return errors.Join(err, abandonGraphReferenceClaim(path, intent))
 	}
 	return nil
 }
 
-// abandonCaptureClaim marks the capture claim at path for release. What was
-// never retained is released too, as a retain may have reached the
+// abandonGraphReferenceClaim marks the node's claim at path for release. What
+// was never retained is released too, as a retain may have reached the
 // coordinator though its answer did not, and a release of what the ledger does
 // not hold does nothing.
-func abandonCaptureClaim(path string, intent graphReferenceIntent) error {
+func abandonGraphReferenceClaim(path string, intent graphReferenceIntent) error {
 	intent.State = "releasing"
 	for index := range intent.Groups {
 		intent.Groups[index].Retained = true
@@ -303,7 +303,7 @@ func (b *runtimeBackend) reconcileCaptureClaim(path string, intent graphReferenc
 		}
 	}
 	b.distributedSource.providerChecks.Delete(intent.Operation)
-	if err := abandonCaptureClaim(path, intent); err != nil {
+	if err := abandonGraphReferenceClaim(path, intent); err != nil {
 		return err
 	}
 	return b.releaseDistributedGraphReferences(intent.Operation)
