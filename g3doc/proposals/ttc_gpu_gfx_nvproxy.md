@@ -764,6 +764,49 @@ compatible nodes.
 
 redroid's arm64 images could then run on macOS too.
 
+*Status (2026-10-01): redroid runs on macOS, ahead of Phase B, and renders
+on the virtual GPU.* redroid 14's arm64 image
+(`redroid/redroid:14.0.0_64only-latest`) boots with its own init as the
+container's in about 40 s; SurfaceFlinger and apps render with ANGLE on
+gfxstream's Vulkan driver, and apps from F-Droid install and run.
+`runsc/ttc/test/e2e_redroid.sh` checks that.
+
+*   **Sentry:** what Android's init and daemons required:
+    *   binder, and binderfs for `binder`, `hwbinder`, and `vndbinder`;
+        memfd serves as ashmem (`androidboot.use_memfd=true`);
+    *   a kernel log (`/dev/kmsg`, `syslog(2)`), `reboot(2)` as in a PID
+        namespace, securebits, `security.*` extended attributes, and cgroup2
+        always;
+    *   `bpf(2)` maps, the bpf filesystem, and cgroup attachments, for
+        bpfloader and netd. The Sentry runs no BPF programs, so Android's
+        traffic accounting and firewall see nothing;
+    *   netd's netlink sockets and options, raw sockets for containers that
+        add `CAP_NET_RAW`, alarm clocks for AlarmManager, `/proc/pressure`
+        for lmkd, and real-time scheduling policies, recorded without effect,
+        for Bluetooth;
+    *   fixes: arm64 signal frames laid out as Linux lays them out, which ART's
+        unwinder reads; `setsid(2)` deadlocked with children in an orphaned
+        process group; `SOCK_SEQPACKET` peer credentials; and container roots
+        reported a disk of 8 EiB, which overflowed Android's storage
+        arithmetic.
+*   **Graphics:** gfxstream's Vulkan driver for Android, built with the NDK
+    alone (guest patch `0002`), and `guest/redroid/gpu_config.sh`, which
+    selects it, redroid's minigbm, and ANGLE. SurfaceFlinger crashed while
+    MoltenVK's four identical queue families showed; gfxstream patch `0009`
+    hides the duplicates.
+*   **Not done:**
+    *   networking. Android adopts only interfaces named `eth\d`, not
+        `ttc0`, and brings a network up only with rtnetlink notifications,
+        policy routing, `/sys/class/net`, and per-interface IPv6 sysctls,
+        which the Sentry lacks. Apps have no network;
+    *   display (scrcpy or VNC), forks of Android (it runs with
+        `--waive-live-fork`), and the device-lost experiment.
+*   **Found in the image:** its simulated Bluetooth HAL aborts on any
+    kernel ("Invalid address"): it links two different
+    `bluetooth::hci::Address` classes, and tests the parsed address's
+    `std::optional` at the wrong offset. The Bluetooth service restarts
+    until Android gives up.
+
 ## Testing
 
 *   **Unit tests:** the Sentry's device against a fake renderer:
