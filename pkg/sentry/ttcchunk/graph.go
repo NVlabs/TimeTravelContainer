@@ -675,50 +675,74 @@ func GraphChunkObjects(manifest Manifest) (map[ID]ttcsnapshot.ObjectID, error) {
 
 // BuildGraphManifest enumerates graph roots for rehydration. Enumeration is
 // intentionally an O(mapped pages) rehydrate operation; fork and lookup share
-// roots directly and never call it.
+// roots directly and never call it. Its manifest is the one CompactBindings
+// makes of the roots' pages, built as they are enumerated.
 func BuildGraphManifest(graph ttcsnapshot.MemoryCatalog, roots []GraphMemoryRoot) (GraphManifestResult, error) {
 	if graph == nil || len(roots) == 0 {
 		return GraphManifestResult{}, errors.New("memory graph roots are unavailable")
 	}
-	var bindings []StoredBinding
+	// A root's pages are enumerated in index order: with the roots in
+	// resource order, they come in the order CompactBindings sorts them in.
+	ordered := slices.Clone(roots)
+	slices.SortStableFunc(ordered, func(left, right GraphMemoryRoot) int {
+		if c := cmp.Compare(left.ResourceID.ContainerName, right.ResourceID.ContainerName); c != 0 {
+			return c
+		}
+		return cmp.Compare(left.ResourceID.Path, right.ResourceID.Path)
+	})
 	result := GraphManifestResult{Chunks: make(map[ID]ttcsnapshot.ObjectID)}
 	chunkResources := make(map[ttcsnapshot.ObjectID]checkpoint.ResourceID)
-	for _, root := range roots {
-		entries, err := graph.MemoryPageEntries(root.Root)
-		if err != nil {
+	var (
+		runs []ManifestRun
+		// runChunk is the chunk of the last run.
+		runChunk ttcsnapshot.ObjectID
+	)
+	for index, root := range ordered {
+		if index != 0 && root.ResourceID == ordered[index-1].ResourceID {
+			return GraphManifestResult{}, fmt.Errorf("memory roots %q and %q map one resource %s", ordered[index-1].Name, root.Name, root.ResourceID)
+		}
+		// A run of the root's resource extends only a run of the same.
+		rootRuns := len(runs)
+		if err := graph.VisitMemoryPages(root.Root, func(entry *ttcsnapshot.MemoryPageEntry) error {
+			identity := &entry.Identity
+			page := pgalloc.LogicalPageID{Allocator: pgalloc.LogicalAllocatorID(identity.LogicalAllocator), Sequence: identity.LogicalSequence}
+			version := pgalloc.PageVersionID{Allocator: pgalloc.LogicalAllocatorID(identity.VersionAllocator), Sequence: identity.VersionSequence}
+			if identity.References == 0 || version.Allocator == (pgalloc.LogicalAllocatorID{}) {
+				return fmt.Errorf("page %d has an incomplete identity", entry.Index)
+			}
+			oldOffset := entry.Index * hostarch.PageSize
+			logical, slot := page.Chunk()
+			chunk := entry.Location.Chunk
+			if len(runs) > rootRuns && chunk == runChunk {
+				run := &runs[len(runs)-1]
+				delta := uint64(run.Pages)
+				if run.Pages != PagesPerChunk && run.References == identity.References && run.Logical == logical &&
+					oldOffset == run.OldOffset+delta*hostarch.PageSize &&
+					page.Allocator == run.FirstPage.Allocator && page.Sequence == run.FirstPage.Sequence+delta &&
+					version.Allocator == run.FirstVersion.Allocator && version.Sequence == run.FirstVersion.Sequence+delta &&
+					uint16(slot) == uint16(run.FirstSlot)+run.Pages && uint16(entry.Location.Page) == uint16(run.ObjectPage)+run.Pages {
+					run.Pages++
+					return nil
+				}
+			}
+			if previous, ok := chunkResources[chunk]; ok && previous != root.ResourceID {
+				return fmt.Errorf("memory chunk %s spans resources %s and %s", chunk, previous, root.ResourceID)
+			}
+			chunkResources[chunk] = root.ResourceID
+			residency := graphChunkResidencyID(chunk)
+			result.Chunks[residency] = chunk
+			runs = append(runs, ManifestRun{
+				ResourceID: root.ResourceID, OldOffset: oldOffset, References: identity.References,
+				FirstPage: page, FirstVersion: version, Logical: logical, FirstSlot: slot, Pages: 1,
+				Object: residency, ObjectPage: entry.Location.Page,
+			})
+			runChunk = chunk
+			return nil
+		}); err != nil {
 			return GraphManifestResult{}, fmt.Errorf("enumerating memory root %q: %w", root.Name, err)
 		}
-		for _, entry := range entries {
-			identity := entry.Identity
-			chunkObject := entry.Location.Chunk
-			if previous, ok := chunkResources[chunkObject]; ok && previous != root.ResourceID {
-				return GraphManifestResult{}, fmt.Errorf("memory chunk %s spans resources %s and %s", chunkObject, previous, root.ResourceID)
-			}
-			chunkResources[chunkObject] = root.ResourceID
-			residency := graphChunkResidencyID(chunkObject)
-			result.Chunks[residency] = chunkObject
-			logicalPage := pgalloc.LogicalPageID{Allocator: pgalloc.LogicalAllocatorID(identity.LogicalAllocator), Sequence: identity.LogicalSequence}
-			logicalChunk, slot := logicalPage.Chunk()
-			bindings = append(bindings, StoredBinding{
-				Binding: pgalloc.CapturedPageBinding{
-					ResourceID: root.ResourceID,
-					OldOffset:  entry.Index * hostarch.PageSize,
-					References: identity.References,
-					Page:       logicalPage,
-					Version:    pgalloc.PageVersionID{Allocator: pgalloc.LogicalAllocatorID(identity.VersionAllocator), Sequence: identity.VersionSequence},
-					Chunk:      logicalChunk,
-					Slot:       slot,
-				},
-				Object:     residency,
-				ObjectPage: entry.Location.Page,
-			})
-		}
 	}
-	manifest, err := CompactBindings(bindings)
-	if err != nil {
-		return GraphManifestResult{}, err
-	}
-	result.Manifest = manifest
+	result.Manifest = Manifest{Runs: runs}
 	return result, nil
 }
 

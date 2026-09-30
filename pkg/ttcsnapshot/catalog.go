@@ -16,7 +16,10 @@ import (
 // local state; ImmutableCatalog implements it for shared or peer metadata
 // without creating a second reference-count authority.
 type MemoryCatalog interface {
-	MemoryPageEntries(ObjectID) ([]MemoryPageEntry, error)
+	// VisitMemoryPages calls visit with each page the memory tree at root
+	// maps, in ascending index order, until visit fails. The entry is
+	// visit's only for the call.
+	VisitMemoryPages(root ObjectID, visit func(*MemoryPageEntry) error) error
 }
 
 // FilesystemCatalog is the immutable read surface needed by a graph-backed
@@ -165,6 +168,19 @@ func (catalog *LazyImmutableCatalog) MemoryPageEntries(root ObjectID) ([]MemoryP
 	return immutable.MemoryPageEntries(root)
 }
 
+// VisitMemoryPages is MemoryPageEntries, a page at a time.
+func (catalog *LazyImmutableCatalog) VisitMemoryPages(root ObjectID, visit func(*MemoryPageEntry) error) error {
+	objects, err := ReachableObjects(catalog, []ObjectID{root})
+	if err != nil {
+		return catalog.operationError(err)
+	}
+	immutable, err := NewImmutableCatalog(objects)
+	if err != nil {
+		return err
+	}
+	return immutable.VisitMemoryPages(root, visit)
+}
+
 func osErrNotExist(id ObjectID) error {
 	return fmt.Errorf("immutable TTC object %s is missing", id)
 }
@@ -283,10 +299,20 @@ func (catalog *ImmutableCatalog) MemoryPageEntries(root ObjectID) ([]MemoryPageE
 	if catalog == nil {
 		return nil, fmt.Errorf("nil immutable TTC catalog")
 	}
-	return memoryPageEntries(root, func(id ObjectID) (Object, bool) {
-		object, ok := catalog.objects[id]
-		return object, ok
-	})
+	return memoryPageEntries(root, catalog.lookupObject)
+}
+
+// VisitMemoryPages is MemoryPageEntries, a page at a time.
+func (catalog *ImmutableCatalog) VisitMemoryPages(root ObjectID, visit func(*MemoryPageEntry) error) error {
+	if catalog == nil {
+		return fmt.Errorf("nil immutable TTC catalog")
+	}
+	return visitMemoryPages(root, catalog.lookupObject, visit)
+}
+
+func (catalog *ImmutableCatalog) lookupObject(id ObjectID) (Object, bool) {
+	object, ok := catalog.objects[id]
+	return object, ok
 }
 
 var _ MemoryCatalog = (*Store)(nil)

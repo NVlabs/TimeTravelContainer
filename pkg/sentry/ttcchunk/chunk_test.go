@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -727,6 +728,121 @@ func TestGraphImportPacksNewPagesOfSeveralObjects(t *testing.T) {
 	}
 	if !reflect.DeepEqual(decoded, built.Manifest) {
 		t.Fatalf("decoded %+v, encoded %+v", decoded, built.Manifest)
+	}
+}
+
+// compactedGraphManifest is the manifest CompactBindings makes of the pages
+// roots map, each bound to where the graph holds it.
+func compactedGraphManifest(t *testing.T, graph *ttcsnapshot.Store, roots []GraphMemoryRoot) Manifest {
+	t.Helper()
+	var stored []StoredBinding
+	for _, root := range roots {
+		entries, err := graph.MemoryPageEntries(root.Root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range entries {
+			page := pgalloc.LogicalPageID{Allocator: pgalloc.LogicalAllocatorID(entry.Identity.LogicalAllocator), Sequence: entry.Identity.LogicalSequence}
+			chunk, slot := page.Chunk()
+			stored = append(stored, StoredBinding{
+				Binding: pgalloc.CapturedPageBinding{
+					ResourceID: root.ResourceID, OldOffset: entry.Index * hostarch.PageSize, References: entry.Identity.References, Page: page,
+					Version: pgalloc.PageVersionID{Allocator: pgalloc.LogicalAllocatorID(entry.Identity.VersionAllocator), Sequence: entry.Identity.VersionSequence},
+					Chunk:   chunk, Slot: slot,
+				},
+				Object: graphChunkResidencyID(entry.Location.Chunk), ObjectPage: entry.Location.Page,
+			})
+		}
+	}
+	manifest, err := CompactBindings(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return manifest
+}
+
+// A rehydration's manifest has the runs CompactBindings makes of the pages its
+// roots map, whatever the roots' order: a run ends where a page's resource,
+// references, chunk, logical chunk, offset, identities or place in its chunk
+// do not follow the page before.
+func TestBuildGraphManifestCompactsPages(t *testing.T) {
+	directory := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(directory, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(directory, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+	var stored []StoredBinding
+	byID := make(map[ID]Chunk)
+	// capture adds an object holding the pages of logical chunk sequence at
+	// slots [first, end), mapped from page index base + slot.
+	capture := func(resource checkpoint.ResourceID, sequence, base uint64, first, end int, references, version func(int) uint64) {
+		id := graphCaptureObjectID(uint64(len(byID) + 1))
+		chunk := Chunk{Logical: pgalloc.LogicalChunkID{Allocator: testAllocator(1), Sequence: sequence}}
+		for slot := first; slot < end; slot++ {
+			pageVersion := pgalloc.PageVersionID{Allocator: testAllocator(2), Sequence: version(slot)}
+			chunk.Pages = append(chunk.Pages, Page{Slot: uint8(slot), Version: pageVersion, Data: bytes.Repeat([]byte{byte(slot) + 1}, hostarch.PageSize)})
+			stored = append(stored, capturedBinding(pgalloc.CapturedPageBinding{
+				ResourceID: resource, OldOffset: (base + uint64(slot)) * hostarch.PageSize, References: references(slot),
+				Page:    pgalloc.LogicalPageID{Allocator: testAllocator(1), Sequence: sequence*PagesPerChunk + uint64(slot)},
+				Version: pageVersion, Chunk: chunk.Logical, Slot: uint8(slot),
+			}, id))
+		}
+		byID[id] = chunk
+	}
+	one := func(int) uint64 { return 1 }
+	consecutive := func(slot int) uint64 { return 1 + uint64(slot) }
+	capture(checkpoint.ResourceID{}, 5, 1000, 0, 120, func(slot int) uint64 { return 1 + uint64(slot/60) }, func(slot int) uint64 {
+		if slot >= 100 {
+			return 500 + uint64(slot)
+		}
+		return 1 + uint64(slot)
+	})
+	capture(checkpoint.ResourceID{}, 6, 1256, 0, 10, one, consecutive)
+	// Only their logical chunks part these two.
+	capture(checkpoint.ResourceID{}, 9, 4000, 250, 256, one, consecutive)
+	capture(checkpoint.ResourceID{}, 10, 4256, 0, 4, one, func(slot int) uint64 { return 257 + uint64(slot) })
+	capture(checkpoint.ResourceID{Path: "/tmpfs"}, 7, 0, 3, 41, one, consecutive)
+	manifest, err := CompactBindings(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := importSnapshotGraph(graph, data, origin, manifest, "compacted", func(id ID) (Chunk, error) { return byID[id], nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Roots) != 2 {
+		t.Fatalf("imported roots %+v, want two", result.Roots)
+	}
+	want := compactedGraphManifest(t, graph, result.Roots)
+	if len(want.Runs) < 6 {
+		t.Fatalf("the pages compact to %d runs, too few to tell", len(want.Runs))
+	}
+	for _, roots := range [][]GraphMemoryRoot{result.Roots, {result.Roots[1], result.Roots[0]}} {
+		built, err := BuildGraphManifest(graph, roots)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(built.Manifest, want) {
+			t.Fatalf("built manifest %+v, want %+v", built.Manifest, want)
+		}
+		for _, run := range built.Manifest.Runs {
+			if object, ok := built.Chunks[run.Object]; !ok || graphChunkResidencyID(object) != run.Object {
+				t.Fatalf("run %+v has chunk (%v, %t)", run, object, ok)
+			}
+		}
+	}
+	if _, err := BuildGraphManifest(graph, append(slices.Clone(result.Roots), result.Roots[0])); err == nil {
+		t.Fatal("two roots of one resource were enumerated")
 	}
 }
 

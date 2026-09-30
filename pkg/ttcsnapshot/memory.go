@@ -157,6 +157,12 @@ func encodeMemoryTable(entries []MemoryTableEntry) ([]byte, []Edge, error) {
 
 // decodeMemoryTable returns the entries of table in ascending slot order.
 func decodeMemoryTable(table Object) ([]MemoryTableEntry, error) {
+	return appendMemoryTable(nil, table)
+}
+
+// appendMemoryTable appends to entries those of table, in ascending slot
+// order.
+func appendMemoryTable(entries []MemoryTableEntry, table Object) ([]MemoryTableEntry, error) {
 	data := table.Data
 	if table.ID.Kind != ObjectKindMemoryTable || len(data) < memoryTableHeaderSize || data[0] != memoryTableFormat {
 		return nil, fmt.Errorf("object %s is not a memory table", table.ID.key())
@@ -176,7 +182,7 @@ func decodeMemoryTable(table Object) ([]MemoryTableEntry, error) {
 			return nil, fmt.Errorf("memory table %s child %d is %s in slot %d", table.ID.key(), index, edge.Child.key(), edge.Slot)
 		}
 	}
-	entries := make([]MemoryTableEntry, 0, count)
+	entries = slices.Grow(entries, count)
 	offset := memoryTableHeaderSize
 	for slot := 0; slot < PagesPerMemoryTable; slot++ {
 		if data[1+slot/8]&(1<<(slot%8)) == 0 {
@@ -243,34 +249,61 @@ func validateMemoryNode(object Object, level int) error {
 // names is a whole memory chunk.
 func memoryPageEntries(root ObjectID, lookup func(ObjectID) (Object, bool)) ([]MemoryPageEntry, error) {
 	var entries []MemoryPageEntry
+	if err := visitMemoryPages(root, lookup, func(entry *MemoryPageEntry) error {
+		entries = append(entries, *entry)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
+// visitMemoryPages calls visit with each page the memory tree at root maps,
+// in ascending index order, reading its objects with lookup, until visit
+// fails. Every chunk it names is a whole memory chunk. The entry is visit's
+// only for the call.
+func visitMemoryPages(root ObjectID, lookup func(ObjectID) (Object, bool), visit func(*MemoryPageEntry) error) error {
 	chunks := make(map[ObjectID]struct{})
+	// Most pages are in the chunk of the page before.
+	var checked ObjectID
 	checkChunk := func(chunk ObjectID) error {
-		if _, ok := chunks[chunk]; ok {
+		if chunk == checked && chunk != (ObjectID{}) {
 			return nil
 		}
-		object, ok := lookup(chunk)
-		if !ok || object.ID.Kind != ObjectKindMemoryChunk || object.BulkLength != MemoryChunkBytes {
-			return fmt.Errorf("memory chunk %s is missing or incomplete", chunk.key())
+		if _, ok := chunks[chunk]; !ok {
+			object, ok := lookup(chunk)
+			if !ok || object.ID.Kind != ObjectKindMemoryChunk || object.BulkLength != MemoryChunkBytes {
+				return fmt.Errorf("memory chunk %s is missing or incomplete", chunk.key())
+			}
+			chunks[chunk] = struct{}{}
 		}
-		chunks[chunk] = struct{}{}
+		checked = chunk
 		return nil
 	}
-	var visit func(ObjectID, int, uint64) error
-	visit = func(id ObjectID, level int, prefix uint64) error {
+	var (
+		table []MemoryTableEntry
+		entry MemoryPageEntry
+	)
+	var visitNode func(ObjectID, int, uint64) error
+	visitNode = func(id ObjectID, level int, prefix uint64) error {
 		object, ok := lookup(id)
 		if !ok {
 			return fmt.Errorf("memory tree object %s does not exist", id.key())
 		}
 		if level == 0 && object.ID.Kind == ObjectKindMemoryTable {
-			table, err := decodeMemoryTable(object)
-			if err != nil {
+			var err error
+			if table, err = appendMemoryTable(table[:0], object); err != nil {
 				return err
 			}
-			for _, entry := range table {
-				if err := checkChunk(entry.Location.Chunk); err != nil {
+			for i := range table {
+				page := &table[i]
+				if err := checkChunk(page.Location.Chunk); err != nil {
 					return err
 				}
-				entries = append(entries, MemoryPageEntry{Index: prefix | uint64(entry.Slot), Location: entry.Location, Identity: entry.Identity})
+				entry = MemoryPageEntry{Index: prefix | uint64(page.Slot), Location: page.Location, Identity: page.Identity}
+				if err := visit(&entry); err != nil {
+					return err
+				}
 			}
 			return nil
 		}
@@ -283,7 +316,7 @@ func memoryPageEntries(root ObjectID, lookup func(ObjectID) (Object, bool)) ([]M
 			}
 			child := prefix | uint64(edge.Slot)<<(8*level)
 			if level != 0 {
-				if err := visit(edge.Child, level-1, child); err != nil {
+				if err := visitNode(edge.Child, level-1, child); err != nil {
 					return err
 				}
 				continue
@@ -299,14 +332,14 @@ func memoryPageEntries(root ObjectID, lookup func(ObjectID) (Object, bool)) ([]M
 			if err := checkChunk(location.Chunk); err != nil {
 				return err
 			}
-			entries = append(entries, MemoryPageEntry{Index: child, Location: location, Identity: identity})
+			entry = MemoryPageEntry{Index: child, Location: location, Identity: identity}
+			if err := visit(&entry); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
-	if err := visit(root, memoryTreeLevels-1, 0); err != nil {
-		return nil, err
-	}
-	return entries, nil
+	return visitNode(root, memoryTreeLevels-1, 0)
 }
 
 // MemoryPageEntries enumerates, in ascending index order, the pages mapped by
@@ -315,10 +348,24 @@ func memoryPageEntries(root ObjectID, lookup func(ObjectID) (Object, bool)) ([]M
 func (s *Store) MemoryPageEntries(root ObjectID) ([]MemoryPageEntry, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return memoryPageEntries(root, func(id ObjectID) (Object, bool) {
-		object, ok := s.state.Objects[id]
-		return object, ok
-	})
+	return memoryPageEntries(root, s.lookupObjectLocked)
+}
+
+// VisitMemoryPages calls visit with each page the memory tree at root maps,
+// in ascending index order, until visit fails. The entry is visit's only for
+// the call, and visit must not call s.
+func (s *Store) VisitMemoryPages(root ObjectID, visit func(*MemoryPageEntry) error) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return visitMemoryPages(root, s.lookupObjectLocked, visit)
+}
+
+// lookupObjectLocked returns the object id names.
+//
+// Preconditions: s.mu is locked.
+func (s *Store) lookupObjectLocked(id ObjectID) (Object, bool) {
+	object, ok := s.state.Objects[id]
+	return object, ok
 }
 
 // memoryPageHolding is a place the graph holds a page, and how many live
