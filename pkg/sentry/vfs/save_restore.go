@@ -18,8 +18,10 @@
 package vfs
 
 import (
+	"cmp"
 	goContext "context"
 	"fmt"
+	"slices"
 	"sort"
 	"sync/atomic"
 
@@ -266,11 +268,22 @@ func (vfs *VirtualFilesystem) PrepareSave(ctx context.Context) error {
 			}
 		}
 	}
+	// Devices prepare last: what they prepare, such as a GPU's snapshot, is
+	// wasted if a filesystem fails.
+	devices := vfs.saveRestoreDevices()
+	for i, dev := range devices {
+		if err := dev.PrepareSave(ctx); err != nil {
+			for _, prepared := range devices[:i] {
+				prepared.BeforeResume(ctx)
+			}
+			return err
+		}
+	}
 	return nil
 }
 
 // BeforeResume is called before the kernel is resumed after save and allows
-// filesystems to clean up S/R state.
+// filesystems and devices to clean up S/R state.
 func (vfs *VirtualFilesystem) BeforeResume(ctx context.Context) {
 	for _, fs := range vfs.GetFilesystems() {
 		if ext, ok := fs.impl.(FilesystemImplSaveRestoreExtension); ok {
@@ -278,6 +291,42 @@ func (vfs *VirtualFilesystem) BeforeResume(ctx context.Context) {
 		}
 		fs.DecRef(ctx)
 	}
+	for _, dev := range vfs.saveRestoreDevices() {
+		dev.BeforeResume(ctx)
+	}
+}
+
+// DeviceSaveRestoreExtension is a Device with state outside the sandbox that
+// it prepares for a save, of a checkpoint or a live fork.
+type DeviceSaveRestoreExtension interface {
+	Device
+
+	// PrepareSave prepares the device for a save. An error fails the save.
+	PrepareSave(ctx context.Context) error
+
+	// BeforeResume undoes PrepareSave, once the save is done.
+	BeforeResume(ctx context.Context)
+}
+
+// saveRestoreDevices returns the registered devices that implement
+// DeviceSaveRestoreExtension, in the order of their device numbers.
+func (vfs *VirtualFilesystem) saveRestoreDevices() []DeviceSaveRestoreExtension {
+	vfs.devicesMu.RLock()
+	defer vfs.devicesMu.RUnlock()
+	tuples := make([]devTuple, 0, len(vfs.devices))
+	for tup, rd := range vfs.devices {
+		if _, ok := rd.dev.(DeviceSaveRestoreExtension); ok {
+			tuples = append(tuples, tup)
+		}
+	}
+	slices.SortFunc(tuples, func(a, b devTuple) int {
+		return cmp.Or(cmp.Compare(a.kind, b.kind), cmp.Compare(a.major, b.major), cmp.Compare(a.minor, b.minor))
+	})
+	devices := make([]DeviceSaveRestoreExtension, 0, len(tuples))
+	for _, tup := range tuples {
+		devices = append(devices, vfs.devices[tup].dev.(DeviceSaveRestoreExtension))
+	}
+	return devices
 }
 
 // CompleteRestore completes restoration from checkpoint for all filesystems
