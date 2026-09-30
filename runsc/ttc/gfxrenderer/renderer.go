@@ -82,6 +82,8 @@ type server struct {
 	g         *gfxstream
 	resources map[uint32]*resource
 	opts      Options
+	// restoring is the snapshot that MsgRestoreData sent, for MsgRestore.
+	restoring []byte
 }
 
 // Serve renders for the Sentry connected to the Unix stream socket fd, which
@@ -298,15 +300,29 @@ func (s *server) handle(m *gfxproto.Message) error {
 		unix.Close(fd)
 		return err
 
+	case gfxproto.MsgRestoreData:
+		var p gfxproto.RestoreData
+		data, err := m.Decode(&p)
+		if err != nil {
+			return err
+		}
+		if uint64(len(s.restoring))+uint64(len(data)) > maxSnapshotSize {
+			return fmt.Errorf("a snapshot of more than %d bytes", maxSnapshotSize)
+		}
+		s.restoring = append(s.restoring, data...)
+
 	case gfxproto.MsgRestore:
 		var p gfxproto.Restore
 		if _, err := m.Decode(&p); err != nil {
 			return err
 		}
-		if len(m.FDs) != 1 {
-			return fmt.Errorf("%v with %d descriptors", m.Type, len(m.FDs))
+		snapshot := s.restoring
+		s.restoring = nil
+		if uint64(len(snapshot)) != p.Size {
+			log.Printf("restoring a snapshot of %d bytes, of which %d came", p.Size, len(snapshot))
+			return s.reply(m, gfxproto.Reply{Errno: uint32(unix.EINVAL)})
 		}
-		if err := s.restore(m.FDs[0], p.Size); err != nil {
+		if err := s.restore(snapshot); err != nil {
 			log.Printf("restoring a snapshot: %v", err)
 			return s.reply(m, gfxproto.Reply{Errno: uint32(unix.EIO)})
 		}
@@ -426,29 +442,18 @@ func (s *server) snapshot() (int, uint64, error) {
 	return fd, uint64(len(data)), nil
 }
 
-// restore restores the renderer, which has no resources, from a snapshot of
-// size bytes that it reads from the pipe fd.
-func (s *server) restore(fd int, size uint64) error {
+// maxSnapshotSize is the size of the largest snapshot that a renderer
+// restores.
+const maxSnapshotSize = 16 << 30
+
+// restore restores the renderer, which has no resources, from data.
+func (s *server) restore(data []byte) error {
 	dir := s.opts.ScratchDir
 	if dir == "" {
 		return errors.New("the renderer was not started for snapshots")
 	}
 	if len(s.resources) != 0 {
 		return errors.New("the renderer has resources")
-	}
-	if size == 0 || size > 1<<40 {
-		return fmt.Errorf("a snapshot of %d bytes", size)
-	}
-	// The caller closes fd, so read from a copy of it, which a File owns.
-	dup, err := unix.Dup(fd)
-	if err != nil {
-		return err
-	}
-	pipe := os.NewFile(uintptr(dup), "snapshot")
-	defer pipe.Close()
-	data := make([]byte, size)
-	if _, err := io.ReadFull(pipe, data); err != nil {
-		return fmt.Errorf("reading the snapshot: %w", err)
 	}
 	entries, err := decodeArchive(data)
 	if err != nil {

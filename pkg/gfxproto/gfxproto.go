@@ -46,6 +46,7 @@ const (
 	MsgTransfer
 	MsgCreateFence
 	MsgSnapshot
+	MsgRestoreData
 	MsgRestore
 )
 
@@ -97,6 +98,8 @@ func (t MsgType) String() string {
 		return "CreateFence"
 	case MsgSnapshot:
 		return "Snapshot"
+	case MsgRestoreData:
+		return "RestoreData"
 	case MsgRestore:
 		return "Restore"
 	case MsgHello:
@@ -257,9 +260,16 @@ type (
 		Reserved uint32
 	}
 
+	// RestoreData is part of a snapshot to restore, its trailer, which
+	// follows the parts before it. The renderer does not reply.
+	RestoreData struct {
+		Reserved uint32
+	}
+
 	// Restore restores a renderer, which has no contexts or resources, from
-	// a snapshot, of Size bytes in the message's descriptor. The renderer
-	// replies.
+	// the snapshot of Size bytes that RestoreData sent. The renderer replies.
+	// The snapshot comes inline, so that the Sentry, whose system calls
+	// Linux restricts, creates no descriptors for it.
 	Restore struct {
 		Size uint64
 	}

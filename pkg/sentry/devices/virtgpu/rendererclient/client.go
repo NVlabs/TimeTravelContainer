@@ -7,8 +7,6 @@ package rendererclient
 
 import (
 	"fmt"
-	"io"
-	"os"
 	"sync"
 	"time"
 
@@ -356,44 +354,45 @@ func (c *Client) Snapshot() ([]byte, error) {
 		m.CloseFDs()
 		return nil, fmt.Errorf("the snapshot came with %d file descriptors", len(m.FDs))
 	}
-	pipe := os.NewFile(uintptr(m.FDs[0]), "gfx-snapshot")
-	m.FDs = nil
-	defer pipe.Close()
+	defer m.CloseFDs()
 	if reply.Size > maxSnapshotSize {
 		return nil, fmt.Errorf("the snapshot is %d bytes, more than %d", reply.Size, maxSnapshotSize)
 	}
+	// The pipe blocks: read it without the runtime's poller.
 	snapshot := make([]byte, reply.Size)
-	if _, err := io.ReadFull(pipe, snapshot); err != nil {
-		return nil, fmt.Errorf("reading the snapshot: %w", err)
+	for done := 0; done < len(snapshot); {
+		n, err := unix.Read(m.FDs[0], snapshot[done:])
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("reading the snapshot: %w", err)
+		}
+		if n == 0 {
+			return nil, fmt.Errorf("the snapshot ended after %d of %d bytes", done, len(snapshot))
+		}
+		done += n
 	}
 	return snapshot, nil
 }
 
-// Restore implements virtgpu.Renderer.Restore. The snapshot goes through a
-// pipe, whose read end the request carries.
+// restoreChunkSize is the size of the parts in which Restore sends a
+// snapshot.
+const restoreChunkSize = 16 << 20
+
+// Restore implements virtgpu.Renderer.Restore. The snapshot goes inline, in
+// parts that fit in messages.
 func (c *Client) Restore(snapshot []byte, sizes map[uint32]uint64) error {
-	r, w, err := os.Pipe()
-	if err != nil {
+	for rest := snapshot; len(rest) != 0; {
+		chunk := rest[:min(len(rest), restoreChunkSize)]
+		rest = rest[len(chunk):]
+		if err := c.send(gfxproto.MsgRestoreData, &gfxproto.RestoreData{}, chunk); err != nil {
+			return err
+		}
+	}
+	if _, _, err := c.call(gfxproto.MsgRestore, &gfxproto.Restore{Size: uint64(len(snapshot))}, nil); err != nil {
 		return err
 	}
-	// Only the renderer holds the read end once the request is sent, so the
-	// writer fails, rather than waits, if the renderer does not read.
-	rfd, err := unix.Dup(int(r.Fd()))
-	r.Close()
-	if err != nil {
-		w.Close()
-		return err
-	}
-	go func() {
-		w.Write(snapshot)
-		w.Close()
-	}()
-	m, _, err := c.call(gfxproto.MsgRestore, &gfxproto.Restore{Size: uint64(len(snapshot))}, nil, rfd)
-	unix.Close(rfd)
-	if err != nil {
-		return err
-	}
-	m.CloseFDs()
 	c.mu.Lock()
 	for id, size := range sizes {
 		c.sizes[id] = size
