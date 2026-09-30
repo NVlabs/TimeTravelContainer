@@ -678,63 +678,54 @@ func TestDistributedSourceReclamationIsSerializedAcrossFamilies(t *testing.T) {
 	<-done
 }
 
-func TestDistributedForegroundCapturePreemptsQueuedHandoffs(t *testing.T) {
+// Captures share the snapshot handoff gate, and a final switch of an
+// origin's references holds it alone: it waits for the captures under way,
+// and new captures wait for it.
+func TestSnapshotCapturesShareTheHandoffGate(t *testing.T) {
 	runtime := &distributedSourceRuntime{}
-	active := make(chan struct{}, distributedHandoffConcurrency)
-	releaseActive := make(chan struct{})
-	for range distributedHandoffConcurrency {
-		runtime.scheduleHandoff(func() {
-			finish := runtime.beginBackgroundSnapshotWork()
-			defer finish()
-			active <- struct{}{}
-			<-releaseActive
-		})
+	first := runtime.beginCapture()
+	second, ok := runtime.tryBeginCapture()
+	if !ok {
+		t.Fatal("a capture waited for another")
 	}
-	for range distributedHandoffConcurrency {
-		select {
-		case <-active:
-		case <-time.After(time.Second):
-			t.Fatal("initial handoffs did not start")
-		}
+	switched := make(chan func())
+	go func() { switched <- runtime.beginFinalSnapshotSwitch() }()
+	select {
+	case <-switched:
+		t.Fatal("a final switch passed captures under way")
+	case <-time.After(20 * time.Millisecond):
 	}
-
-	foregroundEntered := make(chan struct{})
-	releaseForeground := make(chan struct{})
-	go func() {
-		finish := runtime.beginForegroundCapture()
-		close(foregroundEntered)
-		<-releaseForeground
+	if finish, ok := runtime.tryBeginCapture(); ok {
 		finish()
-	}()
+		t.Fatal("a capture passed a waiting final switch")
+	}
+	later := make(chan func())
+	go func() { later <- runtime.beginCapture() }()
+	first()
+	second()
+	var finishSwitch func()
 	select {
-	case <-foregroundEntered:
-		t.Fatal("foreground entered while active handoffs held the gate")
+	case finishSwitch = <-switched:
+	case <-time.After(time.Second):
+		t.Fatal("the final switch did not start once the captures ended")
+	}
+	select {
+	case <-later:
+		t.Fatal("a capture started during the final switch")
 	case <-time.After(20 * time.Millisecond):
 	}
-
-	queuedStarted := make(chan struct{})
-	runtime.scheduleHandoff(func() {
-		finish := runtime.beginBackgroundSnapshotWork()
-		defer finish()
-		close(queuedStarted)
-	})
-	close(releaseActive)
+	finishSwitch()
 	select {
-	case <-foregroundEntered:
+	case finish := <-later:
+		finish()
 	case <-time.After(time.Second):
-		t.Fatal("foreground did not enter after active handoffs completed")
+		t.Fatal("the waiting capture did not start after the switch")
 	}
-	select {
-	case <-queuedStarted:
-		t.Fatal("queued handoff passed a waiting foreground capture")
-	case <-time.After(20 * time.Millisecond):
+	abandoned := runtime.beginCapture()
+	if _, ok := runtime.beginFinalSnapshotSwitchUnless(func() bool { return true }); ok {
+		t.Fatal("an abandoned switch took the gate from a capture")
 	}
-	close(releaseForeground)
-	select {
-	case <-queuedStarted:
-	case <-time.After(time.Second):
-		t.Fatal("queued handoff did not resume after foreground capture")
-	}
+	abandoned()
 }
 
 func TestDistributedColdCollectionCoalescesRequests(t *testing.T) {

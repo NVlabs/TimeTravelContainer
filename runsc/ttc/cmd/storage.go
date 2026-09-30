@@ -1339,7 +1339,7 @@ func (p *branchPublisher) publishVolatileGraphOrigin(ctx context.Context, snapsh
 		return fmt.Errorf("publishing snapshot origin %d: %w", snapshot, err)
 	}
 
-	finishHandoff := p.peers.beginBackgroundSnapshotWork()
+	finishHandoff := p.peers.beginFinalSnapshotSwitch()
 	defer finishHandoff()
 	ledgerFrozen := false
 	defer func() {
@@ -1399,7 +1399,7 @@ func (p *branchPublisher) BeginCompletion(abandon func() bool) (func(), bool) {
 	if p.authority == nil {
 		return func() {}, true
 	}
-	return p.peers.beginBackgroundSnapshotWorkUnless(abandon)
+	return p.peers.beginFinalSnapshotSwitchUnless(abandon)
 }
 
 // rollForwardFrozenOrigin completes, in the background, the handoff of
@@ -1474,7 +1474,7 @@ func (p *branchPublisher) resumeFrozenGraphOrigin(ctx context.Context, snapshot 
 	if err := p.graphShared.CheckManifest(snapshot); err != nil {
 		return fmt.Errorf("reading frozen snapshot origin %d manifest: %w", snapshot, err)
 	}
-	finishHandoff := p.peers.beginBackgroundSnapshotWork()
+	finishHandoff := p.peers.beginFinalSnapshotSwitch()
 	defer finishHandoff()
 	if volatile {
 		changes, _, frozen, err := p.graph.SnapshotLedgerHandoffChanges(snapshot, 0)

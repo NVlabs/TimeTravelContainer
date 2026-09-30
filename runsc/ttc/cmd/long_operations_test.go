@@ -506,7 +506,10 @@ func TestCaptureWaitsForTheGateWithoutTheLifecycleLock(t *testing.T) {
 	}
 	finish()
 
-	finishStreamed := source.beginForegroundCapture()
+	// A capture that streamed without the lifecycle lock waits to take it
+	// back, holding the gate; a final switch waits for the gate, and so holds
+	// new captures back.
+	finishStreamed := source.beginCapture()
 	streamed := make(chan struct{})
 	go func() {
 		defer close(streamed)
@@ -514,6 +517,19 @@ func TestCaptureWaitsForTheGateWithoutTheLifecycleLock(t *testing.T) {
 		finishStreamed()
 		unlock()
 	}()
+	switched := make(chan struct{})
+	go func() {
+		defer close(switched)
+		source.beginFinalSnapshotSwitch()()
+	}()
+	for {
+		finish, ok := source.tryBeginCapture()
+		if !ok {
+			break
+		}
+		finish()
+		time.Sleep(time.Millisecond)
+	}
 	captured := make(chan error, 1)
 	go func() {
 		finish, err := b.beginForegroundCapture(info, longOperation{branch: "main", state: "forking"})
@@ -531,6 +547,7 @@ func TestCaptureWaitsForTheGateWithoutTheLifecycleLock(t *testing.T) {
 		t.Fatal("the capture waits for the gate holding the lock that the gate's holder waits for")
 	}
 	<-streamed
+	<-switched
 	if !b.lifecycleLockHeld {
 		t.Error("the capture does not know it holds the lifecycle lock again")
 	}

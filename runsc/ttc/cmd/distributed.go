@@ -249,19 +249,23 @@ func activateRemoteMigration(ctx context.Context, peer *cluster.Client, transact
 }
 
 type distributedSourceRuntime struct {
-	capabilities  cluster.Capabilities
-	incarnation   string
-	peers         map[string]*cluster.Client
-	directory     cluster.NodeCatalog
-	placements    cluster.PlacementCatalog
-	transactions  cluster.TransactionCatalog
-	authority     *cluster.AuthorityCatalog
-	authToken     string
-	peerMu        sync.Mutex
-	dynamicPeers  map[string]dynamicClusterPeer
-	handoffOnce   sync.Once
-	handoffSlots  chan struct{}
-	handoffCount  atomic.Int64
+	capabilities cluster.Capabilities
+	incarnation  string
+	peers        map[string]*cluster.Client
+	directory    cluster.NodeCatalog
+	placements   cluster.PlacementCatalog
+	transactions cluster.TransactionCatalog
+	authority    *cluster.AuthorityCatalog
+	authToken    string
+	peerMu       sync.Mutex
+	dynamicPeers map[string]dynamicClusterPeer
+	handoffOnce  sync.Once
+	handoffSlots chan struct{}
+	handoffCount atomic.Int64
+	// handoffGate keeps captures, which add edges to immutable origins,
+	// apart from the final switch of an origin's references to the shared
+	// ledger, which freezes them: captures share it, and a switch holds it
+	// alone. See beginCapture and beginFinalSnapshotSwitch.
 	handoffGate   sync.RWMutex
 	collectNeeded atomic.Bool
 	collectActive atomic.Bool
@@ -637,28 +641,32 @@ func (r *distributedSourceRuntime) waitForBackgroundTasks(ctx context.Context) e
 	}
 }
 
-func (r *distributedSourceRuntime) beginBackgroundSnapshotWork() func() {
+// beginFinalSnapshotSwitch takes the snapshot handoff gate alone, for the
+// final switch of an origin's references to the shared ledger, short and
+// never under the lifecycle lock. sync.RWMutex holds new captures back while
+// a switch waits, so one waits for the captures under way only.
+func (r *distributedSourceRuntime) beginFinalSnapshotSwitch() func() {
 	if r == nil {
 		return func() {}
 	}
-	r.handoffGate.RLock()
-	return r.handoffGate.RUnlock
+	r.handoffGate.Lock()
+	return r.handoffGate.Unlock
 }
 
-// beginBackgroundSnapshotWorkUnless is beginBackgroundSnapshotWork for work
+// beginFinalSnapshotSwitchUnless is beginFinalSnapshotSwitch for a switch
 // that must stop waiting for the gate once abandon reports true; it then
 // returns false.
-func (r *distributedSourceRuntime) beginBackgroundSnapshotWorkUnless(abandon func() bool) (func(), bool) {
+func (r *distributedSourceRuntime) beginFinalSnapshotSwitchUnless(abandon func() bool) (func(), bool) {
 	if r == nil {
 		return func() {}, true
 	}
-	for !r.handoffGate.TryRLock() {
+	for !r.handoffGate.TryLock() {
 		if abandon() {
 			return nil, false
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	return r.handoffGate.RUnlock, true
+	return r.handoffGate.Unlock, true
 }
 
 // sourceTransactionTerminalAction resolves handoff liveness from the cluster
@@ -690,42 +698,43 @@ func terminalSourceAction(tx *cluster.Transaction, err error) (string, bool) {
 	}
 }
 
-// beginForegroundCapture prevents queued background graph handoffs from
-// starving a user-requested live capture. sync.RWMutex gives a waiting writer
-// priority over new readers, so the capture waits for at most the currently
-// active bounded handoffs rather than the entire queue.
-func (r *distributedSourceRuntime) beginForegroundCapture() func() {
+// beginCapture takes the snapshot handoff gate for a capture, which shares it
+// with the node's other captures. They took it alone, which kept a node's
+// captures one at a time: sixteen small families dehydrated at once waited
+// up to 4 s for the gate, as long as they took one by one.
+func (r *distributedSourceRuntime) beginCapture() func() {
 	if r == nil {
 		return func() {}
 	}
-	r.handoffGate.Lock()
-	return r.handoffGate.Unlock
+	r.handoffGate.RLock()
+	return r.handoffGate.RUnlock
 }
 
-// tryBeginForegroundCapture is beginForegroundCapture, if the gate is free.
-func (r *distributedSourceRuntime) tryBeginForegroundCapture() (func(), bool) {
+// tryBeginCapture is beginCapture, if no final switch holds the gate or waits
+// for it.
+func (r *distributedSourceRuntime) tryBeginCapture() (func(), bool) {
 	if r == nil {
 		return func() {}, true
 	}
-	if !r.handoffGate.TryLock() {
+	if !r.handoffGate.TryRLock() {
 		return nil, false
 	}
-	return r.handoffGate.Unlock, true
+	return r.handoffGate.RUnlock, true
 }
 
 // beginForegroundCapture takes the snapshot handoff gate for a capture of a
-// branch of info's family, as distributedSourceRuntime.beginForegroundCapture
-// does. A command that holds the gate may wait for the lifecycle lock, as a
+// branch of info's family, as distributedSourceRuntime.beginCapture does. A
+// command that holds the gate may wait for the lifecycle lock, as a
 // dehydration that streamed its memory without the lock waits to take it
-// again; so a command that finds the gate taken waits for it without the
-// lock, as the long operation op.
+// again; so a command that finds the gate held by a final switch, or awaited
+// by one, waits for it without the lock, as the long operation op.
 func (b *runtimeBackend) beginForegroundCapture(info ttcbundle.ContainerInfo, op longOperation) (func(), error) {
-	if finish, ok := b.distributedSource.tryBeginForegroundCapture(); ok {
+	if finish, ok := b.distributedSource.tryBeginCapture(); ok {
 		return finish, nil
 	}
 	var finish func()
 	if err := b.withoutLifecycleLock(info, op, func() error {
-		finish = b.distributedSource.beginForegroundCapture()
+		finish = b.distributedSource.beginCapture()
 		return nil
 	}); err != nil {
 		if finish != nil {
@@ -2060,10 +2069,10 @@ func (b *runtimeBackend) exportDistributedGraph(containerID, transactionID strin
 		_ = reader.Close()
 		imported <- importResult{capture: capture, err: importErr}
 	}()
-	// Only the Sentry export competes with a foreground live capture. Shared
-	// publication and reference-ledger work may take arbitrarily long on a slow
-	// shared filesystem and must never hold the foreground-priority gate.
-	finishBackgroundWork := b.distributedSource.beginBackgroundSnapshotWork()
+	// The Sentry export is a capture. Shared publication and reference-ledger
+	// work may take arbitrarily long on a slow shared filesystem and must
+	// never hold the gate.
+	finishBackgroundWork := b.distributedSource.beginCapture()
 	_, exportErr := b.commandWithFiles([]*os.File{writer}, "timetravel", "--dehydration-graph-stream-fd=3", "--dehydration-graph-stream-filtered", containerID, "distributed-export", transactionID)
 	_ = writer.Close()
 	finishBackgroundWork()
@@ -2122,7 +2131,7 @@ func (b *runtimeBackend) exportDistributedGraph(containerID, transactionID strin
 	// captures. The potentially slow shared-pack write above remains outside the
 	// gate. Once a foreground writer owns the gate, it may add references to
 	// this origin; the later freeze will include them in its baseline.
-	finishFinalHandoff := b.distributedSource.beginBackgroundSnapshotWork()
+	finishFinalHandoff := b.distributedSource.beginFinalSnapshotSwitch()
 	defer finishFinalHandoff()
 	if err := b.snapshotGraph.FreezeSnapshotLedgerHandoff(origin); err != nil {
 		return cluster.GraphHandoffDescriptor{}, nil, nil, err
