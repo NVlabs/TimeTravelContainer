@@ -29,7 +29,9 @@ const (
 	sharedPackAlignment = int64(4096)
 	sharedPackExtent    = int64(1 << 20)
 	sharedPackMagic     = "TTCSGPK1"
-	sharedManifestName  = "manifest.json"
+	// sharedManifestName is the manifest's name from when it was JSON: a
+	// store may hold snapshots an earlier release published.
+	sharedManifestName = "manifest.json"
 )
 
 // PackExtent is one independently range-readable portion of an immutable

@@ -53,53 +53,6 @@ func appendObjectIDJSON(out []byte, id ObjectID) []byte {
 	return append(out, '}')
 }
 
-// appendObjectJSON appends object as json.Marshal writes it.
-func appendObjectJSON(out []byte, object Object) []byte {
-	return appendObjectJSONEscaping(out, object, true)
-}
-
-// appendObjectJSONEscaping appends object as a json.Encoder writes it that
-// escapes HTML, or does not.
-func appendObjectJSONEscaping(out []byte, object Object, escapeHTML bool) []byte {
-	out = append(out, `{"ID":`...)
-	out = appendObjectIDJSON(out, object.ID)
-	out = append(out, `,"State":`...)
-	out = appendJSONStringEscaping(out, string(object.State), escapeHTML)
-	out = append(out, `,"Refs":`...)
-	out = strconv.AppendUint(out, object.Refs, 10)
-	out = append(out, `,"BulkLength":`...)
-	out = strconv.AppendUint(out, object.BulkLength, 10)
-	out = append(out, `,"Data":`...)
-	out = appendJSONBytes(out, object.Data)
-	out = append(out, `,"Children":`...)
-	if object.Children == nil {
-		out = append(out, "null"...)
-	} else {
-		out = append(out, '[')
-		for index, edge := range object.Children {
-			if index != 0 {
-				out = append(out, ',')
-			}
-			out = append(out, `{"Slot":`...)
-			out = strconv.AppendUint(out, uint64(edge.Slot), 10)
-			out = append(out, `,"Child":`...)
-			out = appendObjectIDJSON(out, edge.Child)
-			out = append(out, '}')
-		}
-		out = append(out, ']')
-	}
-	if object.SourceCatalog != "" {
-		out = append(out, `,"SourceCatalog":`...)
-		out = appendJSONStringEscaping(out, object.SourceCatalog, escapeHTML)
-	}
-	out = append(out, `,"SourceObject":`...)
-	out = appendObjectIDJSON(out, object.SourceObject)
-	if object.Deferred {
-		out = append(out, `,"Deferred":true`...)
-	}
-	return append(out, '}')
-}
-
 // jsonDecoder reads the canonical form of the JSON of a shared manifest or a
 // filesystem record: each field once and known, each string ASCII without
 // escapes, each number an integer.

@@ -4,94 +4,16 @@
 package ttcsnapshot
 
 import (
-	"encoding/base64"
 	"encoding/json"
-	"slices"
-	"strconv"
 )
 
-// encodeSharedManifest encodes manifest as a json.Encoder that does not
-// escape HTML encodes it, byte for byte, its objects, nearly all of it,
-// without reflection: encoding/json took 0.5 s for the manifest of a branch
-// of 100,000 files.
-func encodeSharedManifest(manifest *SnapshotManifest) ([]byte, error) {
-	// The packs are few: encoding/json encodes them.
-	packs, err := json.Marshal(manifest.Packs)
-	if err != nil {
-		return nil, err
-	}
-	size := 64 + len(packs) + 48*len(manifest.References)
-	for index := range manifest.Objects {
-		object := &manifest.Objects[index].Object
-		size += 230 + len(object.State) + base64.StdEncoding.EncodedLen(len(object.Data)) + 64*len(object.Children) + len(object.SourceCatalog) + 64*len(manifest.Objects[index].Extents)
-	}
-	out := make([]byte, 0, size)
-	out = append(out, `{"version":`...)
-	out = strconv.AppendInt(out, int64(manifest.Version), 10)
-	out = append(out, `,"snapshot":`...)
-	out = strconv.AppendUint(out, uint64(manifest.Snapshot), 10)
-	out = append(out, `,"packs":`...)
-	out = append(out, packs...)
-	out = append(out, `,"objects":`...)
-	if manifest.Objects == nil {
-		out = append(out, "null"...)
-	} else {
-		out = append(out, '[')
-		for index := range manifest.Objects {
-			packed := &manifest.Objects[index]
-			if index != 0 {
-				out = append(out, ',')
-			}
-			out = append(out, `{"object":`...)
-			out = appendObjectJSONEscaping(out, packed.Object, false)
-			if len(packed.Extents) != 0 {
-				out = append(out, `,"extents":[`...)
-				for extent, value := range packed.Extents {
-					if extent != 0 {
-						out = append(out, ',')
-					}
-					out = append(out, `{"pack":`...)
-					out = strconv.AppendUint(out, uint64(value.Pack), 10)
-					out = append(out, `,"offset":`...)
-					out = strconv.AppendInt(out, value.Offset, 10)
-					out = append(out, `,"length":`...)
-					out = strconv.AppendInt(out, value.Length, 10)
-					out = append(out, '}')
-				}
-				out = append(out, ']')
-			}
-			out = append(out, '}')
-		}
-		out = append(out, ']')
-	}
-	if len(manifest.References) != 0 {
-		names := make([]string, 0, len(manifest.References))
-		for name := range manifest.References {
-			names = append(names, name)
-		}
-		slices.Sort(names)
-		out = append(out, `,"references":{`...)
-		for index, name := range names {
-			if index != 0 {
-				out = append(out, ',')
-			}
-			out = appendJSONStringEscaping(out, name, false)
-			out = append(out, ':')
-			out = appendObjectIDJSON(out, manifest.References[name])
-		}
-		out = append(out, '}')
-	}
-	return append(out, '}', '\n'), nil
-}
-
-// decodeSharedManifest decodes a shared snapshot manifest as json.Unmarshal
-// does. A manifest as writeAtomicJSON writes one has its objects, nearly all
-// of it, decoded as a graph checkpoint's are, without reflection: the
-// manifest of a branch of 100,000 files is 110 MB, which encoding/json took
-// 1.4 s to decode, and each node that reads the snapshot decodes it. Anything
-// else, however valid, is left to encoding/json whole, so that the two can
-// never differ.
-func decodeSharedManifest(data []byte) (SnapshotManifest, error) {
+// decodeJSONManifest decodes a shared snapshot manifest of an earlier
+// release, JSON, as json.Unmarshal does. A manifest as it wrote one has its
+// objects, nearly all of it, decoded without reflection: the manifest of a
+// branch of 100,000 files was 110 MB, which encoding/json took 1.4 s to
+// decode. Anything else, however valid, is left to encoding/json whole, so
+// that the two can never differ.
+func decodeJSONManifest(data []byte) (SnapshotManifest, error) {
 	if manifest, ok := decodeCanonicalManifest(data); ok {
 		return manifest, nil
 	}
