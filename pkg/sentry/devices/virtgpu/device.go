@@ -29,7 +29,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	ktime "gvisor.dev/gvisor/pkg/sentry/ktime"
-	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
@@ -71,7 +70,9 @@ const (
 	// ForkIneligible refuses the fork.
 	ForkIneligible ForkPolicy = iota
 
-	// ForkDeviceLost forks, and the child's GPU state is lost.
+	// ForkDeviceLost forks, and the child's GPU state is lost: its contexts
+	// fail, its fences signal with an error, and its mappings of GPU memory
+	// raise SIGBUS. Its new contexts get a renderer of its own.
 	ForkDeviceLost
 
 	// ForkSnapshot forks the GPU's state with a snapshot of the renderer.
@@ -219,10 +220,6 @@ type device struct {
 	// clock timestamps fences. It is the kernel's monotonic clock, once a
 	// file of the device is opened.
 	clock ktime.Clock `state:"nosave"`
-
-	// mf is, in a loaded device, the MemoryFile of the memory that lost
-	// resources map instead of their renderer's.
-	mf *pgalloc.MemoryFile `state:"nosave"`
 }
 
 // CtxNewRenderer is a Context.Value key for the NewRendererFunc of a loaded
@@ -240,7 +237,6 @@ func (d *device) afterLoad(ctx goContext.Context) {
 	} else if f := processNewRenderer.Load(); f != nil {
 		d.newRenderer = *f
 	}
-	d.mf = pgalloc.MemoryFileFromContext(ctx)
 	d.gen++
 	d.lost = false
 	d.contexts = 0

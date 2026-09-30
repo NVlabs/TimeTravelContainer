@@ -5,7 +5,6 @@ package virtgpu
 
 import (
 	"bytes"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"strings"
@@ -1301,7 +1300,7 @@ func TestSaveAndLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := file.Impl().(*renderFD).dev
-	child := loadDevice(t, d, e.fakes.newRenderer, e.k.MemoryFile())
+	child := loadDevice(t, d, e.fakes.newRenderer)
 	if child.gen != d.gen+1 {
 		t.Errorf("the loaded device's generation is %d, want %d", child.gen, d.gen+1)
 	}
@@ -1315,9 +1314,9 @@ func TestSaveAndLoad(t *testing.T) {
 		if r.memory != nil || len(r.fences) != 0 {
 			t.Errorf("a loaded resource has memory %v and fences %v", r.memory, r.fences)
 		}
-		// Its renderer is lost, so it maps memory of its own.
-		if got := readTranslation(t, r, 0, 8); !bytes.Equal(got, make([]byte, 8)) {
-			t.Errorf("a loaded resource's memory is %q, want zeros", got)
+		// Its memory was the lost renderer's, so accesses to it fault.
+		if err := translateAll(r); !isBusError(err) {
+			t.Errorf("translating a loaded resource: %v, want a bus error", err)
 		}
 	}
 	if child.newRenderer == nil {
@@ -1325,9 +1324,8 @@ func TestSaveAndLoad(t *testing.T) {
 	}
 }
 
-// loadDevice saves d and loads a copy of it, as a fork does, with mf as the
-// child's MemoryFile.
-func loadDevice(t *testing.T, d *device, newRenderer NewRendererFunc, mf *pgalloc.MemoryFile) *device {
+// loadDevice saves d and loads a copy of it, as a fork does.
+func loadDevice(t *testing.T, d *device, newRenderer NewRendererFunc) *device {
 	t.Helper()
 	var buf bytes.Buffer
 	ctx := context.Background()
@@ -1335,11 +1333,7 @@ func loadDevice(t *testing.T, d *device, newRenderer NewRendererFunc, mf *pgallo
 		t.Fatalf("state.Save: %v", err)
 	}
 	child := &device{}
-	loadCtx := context.WithValues(ctx, map[any]any{
-		CtxNewRenderer:        newRenderer,
-		pgalloc.CtxMemoryFile: mf,
-	})
-	if _, err := state.Load(loadCtx, &buf, child); err != nil {
+	if _, err := state.Load(context.WithValue(ctx, CtxNewRenderer, newRenderer), &buf, child); err != nil {
 		t.Fatalf("state.Load: %v", err)
 	}
 	return child
@@ -1365,9 +1359,22 @@ func readTranslation(t *testing.T, r *resource, offset, n uint64) []byte {
 	return buf
 }
 
+// translateAll translates the whole of a resource.
+func translateAll(r *resource) error {
+	whole := memmap.MappableRange{Start: 0, End: r.size}
+	_, err := r.Translate(context.Background(), whole, whole, hostarch.Read)
+	return err
+}
+
+// isBusError returns whether err makes a fault raise SIGBUS.
+func isBusError(err error) bool {
+	var busErr *memmap.BusError
+	return errors.As(err, &busErr)
+}
+
 // TestDeviceLostFork loads a device as a fork's child with ForkDeviceLost
-// does: its resources map memory of its own, zeros but for a copy of the
-// command ring, which says that it is in error.
+// does: the child's mappings of GPU memory fault, and the source's still map
+// the renderer's memory.
 func TestDeviceLostFork(t *testing.T) {
 	e := newTestEnv(t, ForkDeviceLost)
 	file := e.open()
@@ -1375,63 +1382,37 @@ func TestDeviceLostFork(t *testing.T) {
 		t.Fatal(err)
 	}
 	const size = 64 << 10
-	ringHandle, _, err := e.createBlob(file, linux.VIRTGPU_BLOB_MEM_HOST3D, linux.VIRTGPU_BLOB_FLAG_USE_MAPPABLE, 0, size, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	otherHandle, _, err := e.createBlob(file, linux.VIRTGPU_BLOB_MEM_HOST3D, linux.VIRTGPU_BLOB_FLAG_USE_MAPPABLE, 5, size, nil)
+	handle, _, err := e.createBlob(file, linux.VIRTGPU_BLOB_MEM_HOST3D, linux.VIRTGPU_BLOB_FLAG_USE_MAPPABLE, 0, size, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	fd := file.Impl().(*renderFD)
-	ring, other := fd.objects[ringHandle], fd.objects[otherHandle]
-	if !ring.ring || other.ring {
-		t.Fatalf("command rings: %t and %t, want the first blob only", ring.ring, other.ring)
+	r := fd.objects[handle]
+	addr, err := e.mmap(file, r.mapOffset, size)
+	if err != nil {
+		t.Fatalf("mmap: %v", err)
 	}
-	// The guest writes into both.
-	for _, r := range []*resource{ring, other} {
-		addr, err := e.mmap(file, r.mapOffset, size)
-		if err != nil {
-			t.Fatalf("mmap: %v", err)
-		}
-		if _, err := e.task.CopyOutBytes(addr, []byte("guest")); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := e.task.CopyOutBytes(addr+ringStorageSize, []byte("transfer")); err != nil {
-			t.Fatal(err)
-		}
-		// A fork invalidates the translations, which it cannot save; the
-		// mapping translates again.
-		if err := r.InvalidateUnsavable(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-		if got := string(e.get(addr, 5)); got != "guest" {
-			t.Errorf("after invalidation, the guest reads %q", got)
-		}
-		// This test saves only the device, which a mapping would tie to the
-		// whole memory manager.
-		e.munmap(addr, size)
+	if _, err := e.task.CopyOutBytes(addr, []byte("guest")); err != nil {
+		t.Fatal(err)
 	}
+	// A fork invalidates the translations, which it cannot save; the
+	// source's mapping translates again.
+	if err := r.InvalidateUnsavable(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(e.get(addr, 5)); got != "guest" {
+		t.Errorf("after invalidation, the guest reads %q", got)
+	}
+	// This test saves only the device, which a mapping would tie to the
+	// whole memory manager.
+	e.munmap(addr, size)
 
-	child := loadDevice(t, fd.dev, e.fakes.newRenderer, e.k.MemoryFile())
-	lostRing := child.resources[ring.id]
-	lostOther := child.resources[other.id]
-	if got := string(readTranslation(t, lostRing, 0, 5)); got != "guest" {
-		t.Errorf("the child's ring starts %q, want the parent's", got)
+	child := loadDevice(t, fd.dev, e.fakes.newRenderer)
+	if err := translateAll(child.resources[r.id]); !isBusError(err) {
+		t.Errorf("translating the child's blob: %v, want a bus error", err)
 	}
-	inError := readTranslation(t, lostRing, ringInErrorOffset, 4)
-	if binary.LittleEndian.Uint32(inError) != 1 {
-		t.Errorf("the child's ring is not in error: %v", inError)
-	}
-	if got := readTranslation(t, lostRing, ringStorageSize, 8); !bytes.Equal(got, make([]byte, 8)) {
-		t.Errorf("the child's ring's transfer buffer is %q, want zeros", got)
-	}
-	if got := readTranslation(t, lostOther, 0, 5); !bytes.Equal(got, make([]byte, 5)) {
-		t.Errorf("the child's other blob is %q, want zeros", got)
-	}
-	// The parent's memory is still the renderer's.
-	if got := string(readTranslation(t, other, 0, 5)); got != "guest" {
-		t.Errorf("the parent's blob is %q", got)
+	if got := string(readTranslation(t, r, 0, 5)); got != "guest" {
+		t.Errorf("the source's blob is %q", got)
 	}
 }
 
