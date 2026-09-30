@@ -37,7 +37,7 @@ type GPUOptions struct {
 // errGFXNeedsForkSemantics and errNVProxyNeedsForkSemantics explain the rule
 // that a family's GPU devices and its live-fork eligibility must agree.
 var (
-	errGFXNeedsForkSemantics     = errors.New("the virtual GPU refuses live forks unless --gfx-fork says what a fork does with it; pass --gfx-fork=device-lost, or --waive-live-fork")
+	errGFXNeedsForkSemantics     = errors.New("the virtual GPU refuses live forks unless --gfx-fork says what a fork does with it; pass --gfx-fork=device-lost or --gfx-fork=snapshot, or --waive-live-fork")
 	errNVProxyNeedsForkSemantics = errors.New("NVIDIA GPUs refuse live forks unless --nvproxy-fork says what a fork does with them; pass --nvproxy-fork=device-lost, or --waive-live-fork")
 )
 
@@ -53,9 +53,6 @@ func ValidateGPUOptions(opts GPUOptions, liveForkEligible bool, goos string) err
 			return errors.New("--nvproxy uses the host's NVIDIA GPUs, which macOS hosts do not have")
 		}
 		return errors.New("--nvproxy is not supported yet")
-	}
-	if opts.GFXFork == GPUForkSnapshot {
-		return errors.New("--gfx-fork=snapshot is not supported yet")
 	}
 	return nil
 }

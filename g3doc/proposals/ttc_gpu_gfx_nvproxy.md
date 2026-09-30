@@ -309,18 +309,19 @@ carried in the capture and load context as nvproxy's device remapping is:
 
 **gfx, `snapshot`:**
 
-*   With the source paused, stop its submissions and wait for its fences. Then,
-    in the source's renderer: `stream_renderer_suspend`,
-    `stream_renderer_snapshot(dir)`, `stream_renderer_resume`.
-*   The child's renderer runs `stream_renderer_restore(dir)`, lazily on the
+*   With the source paused, stop its submissions and wait for its fences.
+    Then the source's renderer takes a snapshot, `stream_renderer_snapshot`,
+    with its rings' consumers paused, and sends it to the Sentry, whose saved
+    state carries it.
+*   The child's renderer runs `stream_renderer_restore`, lazily on the
     child's first GPU use. The child's blob mappings are re-established, at the
     same guest addresses, against its own renderer.
 *   The cost grows with the GPU memory in use, since device memory has no copy
     on write. Neither does memory the GPU writes that the CPU also maps: the
     GPU's writes bypass the CPU's page tables, so such memory is copied at the
     fork, never shared copy-on-write.
-*   Dehydration, remote forks, and migrations carry the snapshot directory with
-    the image, and restore only where the renderer profile matches.
+*   Dehydration, remote forks, and migrations carry the snapshot with the
+    image, and restore only where the renderer profile matches.
 *   A snapshot family's device profile hides what gfxstream cannot capture:
     acceleration structures, and buffer device address capture and replay.
     Multisampled image contents are not preserved.
@@ -584,6 +585,40 @@ survive the loss of its renderer. Its reads spin until data arrives, whatever
 
 **A5**, `--gfx-fork=snapshot`: local forks first, then dehydration and remote
 forks with renderer-profile checks.
+
+*Status (2026-09-30): done for local forks on macOS.* `e2e_gfx.sh` forks a
+snapshot family's container while it renders. In the child, the process
+that was rendering continues its loop, 300 checked frames, on a renderer
+restored from the source's snapshot, and so does the source on its own. The
+fork of that 5.5 MB snapshot took 0.2 s.
+
+*   **Device.** A save prepares at `vfs.PrepareSave`, through
+    `vfs.DeviceSaveRestoreExtension`: it waits for the renderer's fences, for
+    up to 10 s, then takes the snapshot. A failure there fails the fork
+    cleanly, not in `beforeSave`. The snapshot is part of the device's saved
+    state. The loaded device keeps the snapshot's contexts and resources. Its
+    first use of a renderer, an ioctl or a fault on GPU memory, starts one
+    that restores the snapshot. A failed restore loses them, as
+    `device-lost` does.
+*   **Renderer.** `--snapshots` starts gfxstream with `VulkanSnapshots`, and
+    gives it a scratch directory. A snapshot archives gfxstream's snapshot
+    files, the renderer's resources, and the backings of classic resources,
+    which gfxstream does not save. Snapshots travel through pipes: the Sentry
+    cannot create POSIX shared memory under ttcd's sandbox, and mapping
+    memory on a task goroutine is the EL1 hazard.
+*   **gfxstream patches:** the meson build gains snapshot support (0003); a
+    snapshot pauses the rings' consumers for all of its duration, not only
+    while the ASG device saves (0004); and a snapshot that cannot open its
+    files fails, where it crashed the source's renderer (0005).
+*   **Limits:**
+    *   gfxstream rebuilds command buffers, but not the commands recorded in
+        them, so guests must record them again after a fork. Android's
+        renderers do so each frame; `vkoffscreen` has a `rerecord` mode.
+    *   Batched descriptor set updates are off in snapshot families: their
+        replay fails to restore descriptor sets. The daemon probes such
+        renderers' capability sets separately.
+    *   Checkpoints of a family with the virtual GPU remain host-bound, since
+        nothing checks another host's renderer profile.
 
 **A6 (optional)**, Zink for OpenGL in Linux guests, and a way to see the output:
 a VNC server in the guest, or a scanout sink.

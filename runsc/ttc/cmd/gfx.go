@@ -81,8 +81,12 @@ type gfxService struct {
 	mu       sync.Mutex
 	started  bool
 	err      error
-	capsets  string
+	opts     gfxrenderer.BrokerOptions
 	listener *net.UnixListener
+	// capsets are the renderer's capability sets, as runsc's --gfx-capsets
+	// spells them, by whether the renderer takes snapshots: the features of
+	// such renderers, which the capability sets offer guests, differ.
+	capsets map[bool]string
 }
 
 // newGFXService returns a service whose broker socket is in run, the daemon's
@@ -137,6 +141,10 @@ func (g *gfxService) runscArgs(opts ttcbundle.GPUOptions) ([]string, error) {
 	if g.err != nil {
 		return nil, fmt.Errorf("the virtual GPU is unavailable: %w", g.err)
 	}
+	capsets, err := g.capsetsLocked(opts.GFXFork == ttcbundle.GPUForkSnapshot)
+	if err != nil {
+		return nil, fmt.Errorf("the virtual GPU is unavailable: %w", err)
+	}
 	fork := "ineligible"
 	if opts.GFXFork != "" {
 		fork = opts.GFXFork
@@ -144,9 +152,27 @@ func (g *gfxService) runscArgs(opts ttcbundle.GPUOptions) ([]string, error) {
 	return []string{
 		"--gfx=true",
 		"--gfx-fork=" + fork,
-		"--gfx-capsets=" + g.capsets,
+		"--gfx-capsets=" + capsets,
 		"--gfx-broker=" + g.socket,
 	}, nil
+}
+
+// capsetsLocked returns the capability sets of a renderer that takes
+// snapshots or not, probing it the first time.
+//
+// Preconditions: g.mu is locked. The service started.
+func (g *gfxService) capsetsLocked(snapshots bool) (string, error) {
+	if capsets, ok := g.capsets[snapshots]; ok {
+		return capsets, nil
+	}
+	opts := g.opts
+	opts.Options.Snapshots = snapshots
+	capsets, err := probeRenderer(opts)
+	if err != nil {
+		return "", err
+	}
+	g.capsets[snapshots] = capsets
+	return capsets, nil
 }
 
 // startLocked probes the renderer, and serves the broker socket.
@@ -163,8 +189,10 @@ func (g *gfxService) startLocked() error {
 	opts.Launcher = g.host.launcher
 	opts.Unconfined = g.host.unconfined
 	opts.Stderr = g.stderr
-	capsets, err := probeRenderer(opts)
-	if err != nil {
+	g.opts = opts
+	g.capsets = make(map[bool]string)
+	// A renderer that does not start fails the service, not only a family.
+	if _, err := g.capsetsLocked(false); err != nil {
 		return err
 	}
 	if err := os.Remove(g.socket); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -178,7 +206,6 @@ func (g *gfxService) startLocked() error {
 		listener.Close()
 		return err
 	}
-	g.capsets = capsets
 	g.listener = listener
 	go g.serve(listener, opts)
 	return nil

@@ -56,6 +56,8 @@ fi
 TEST_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 BIN_DIR="$TTC_E2E_ROOT/bin"
 DRIVER_DIR="$TTC_E2E_ROOT/driver"
+# The test programs, which one container builds for all.
+WORK_DIR="$TTC_E2E_ROOT/work"
 mkdir -p "$BIN_DIR" "$DRIVER_DIR"
 install -m 0755 "$(readlink -f "$TTC")" "$BIN_DIR/ttc"
 install -m 0755 "$(readlink -f "$TTCD")" "$BIN_DIR/ttcd"
@@ -133,6 +135,7 @@ ttc exec "$NAME@main" sh -c '
   glslangValidator -V /src/red.frag -o red.spv >/dev/null
   gcc -O2 -Wall -o vkoffscreen /src/vkoffscreen.c -lvulkan
 ' || fail "preparing the container"
+ttc cp "$NAME@main:/work" "$WORK_DIR" >/dev/null || fail "copying the test programs out"
 
 VK_DRIVER_FILES=VK_DRIVER_FILES=/opt/ttc-gfx/gfxstream_icd.json
 summary=$(ttc exec -e "$VK_DRIVER_FILES" "$NAME@main" vulkaninfo --summary 2>&1) ||
@@ -153,13 +156,13 @@ for i in 1 2 3; do
   esac
 done
 
-# wait_log BRANCH PATTERN SECONDS waits for the render loop's log in BRANCH to
-# match PATTERN, an extended regular expression.
+# wait_log CONTAINER@BRANCH PATTERN SECONDS waits for the render loop's log
+# in the branch to match PATTERN, an extended regular expression.
 wait_log() {
   deadline=$(($(date +%s) + $3))
-  until ttc exec "$NAME@$1" grep -Eq "$2" /tmp/loop.log 2>/dev/null; do
+  until ttc exec "$1" grep -Eq "$2" /tmp/loop.log 2>/dev/null; do
     if [ "$(date +%s)" -ge "$deadline" ]; then
-      fail "$1's render loop has no '$2' after $3s: $(ttc exec "$NAME@$1" cat /tmp/loop.log 2>&1)"
+      fail "$1's render loop has no '$2' after $3s: $(ttc exec "$1" cat /tmp/loop.log 2>&1)"
     fi
     sleep 0.5
   done
@@ -172,9 +175,9 @@ wait_log() {
 ttc exec -d -e "$VK_DRIVER_FILES" "$NAME@main" sh -c \
   'cd /work && ./vkoffscreen compute.spv square.spv red.spv 600 50 >/tmp/loop.log 2>&1
    echo "exit=$?" >>/tmp/loop.log' >/dev/null
-wait_log main "iteration 3 ok" 60
+wait_log "$NAME@main" "iteration 3 ok" 60
 ttc fork "$NAME@main" lost >/dev/null
-wait_log lost "^exit=" 60
+wait_log "$NAME@lost" "^exit=" 60
 lost_log=$(ttc exec "$NAME@lost" cat /tmp/loop.log)
 case "$lost_log" in
   *exit=0) fail "the child's render loop survived the fork: $lost_log" ;;
@@ -187,7 +190,7 @@ case "$result" in
   *"vkoffscreen: ok checksum=$WANT_CHECKSUM"*) ;;
   *) fail "vkoffscreen in the fork's child: $result" ;;
 esac
-wait_log main "^exit=" 180
+wait_log "$NAME@main" "^exit=" 180
 source_log=$(ttc exec "$NAME@main" cat /tmp/loop.log)
 case "$source_log" in
   *"iteration 600 ok"*"vkoffscreen: ok checksum=$WANT_CHECKSUM"*exit=0) ;;
@@ -250,4 +253,32 @@ while pgrep -f "$BIN_DIR/ttc-gfx-renderer serve" >/dev/null; do
 done
 
 ttc rm -f "$NAME" >/dev/null
+
+# A family with --gfx-fork=snapshot: a fork's child resumes the GPU's state,
+# in a renderer that restores the source's snapshot. gfxstream's snapshots
+# rebuild Vulkan objects and memory, but not the commands of recorded
+# command buffers, so the render loop records them again each time.
+SNAP="$NAME-snap"
+ttc run -d --name "$SNAP" --gfx --gfx-fork=snapshot --network ttc --nat \
+  -v "$DRIVER_DIR:/opt/ttc-gfx:ro" -v "$WORK_DIR:/work:ro" \
+  "$DEBIAN_IMAGE" sleep infinity >/dev/null
+ttc exec "$SNAP@main" sh -c '
+  set -e
+  apt-get update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libvulkan1 libdrm2 libexpat1 >/dev/null 2>&1
+' || fail "preparing the snapshot family's container"
+ttc exec -d -e "$VK_DRIVER_FILES" "$SNAP@main" sh -c \
+  'cd /work && ./vkoffscreen compute.spv square.spv red.spv 300 20 rerecord >/tmp/loop.log 2>&1
+   echo "exit=$?" >>/tmp/loop.log' >/dev/null
+wait_log "$SNAP@main" "iteration 3 ok" 60
+ttc fork "$SNAP@main" kid >/dev/null
+for target in "$SNAP@main" "$SNAP@kid"; do
+  wait_log "$target" "^exit=" 180
+  loop_log=$(ttc exec "$target" cat /tmp/loop.log)
+  case "$loop_log" in
+    *"iteration 300 ok"*"vkoffscreen: ok checksum=$WANT_CHECKSUM"*exit=0) ;;
+    *) fail "$target's render loop, across a snapshot fork: $loop_log" ;;
+  esac
+done
+ttc rm -f "$SNAP" >/dev/null
 echo "ttc gfx e2e: ok"

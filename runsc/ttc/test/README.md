@@ -144,7 +144,11 @@ TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
     child, the process that was rendering must die of `SIGBUS`, not hang, and
     a new one must render. The source must render on;
 *   two branches rendering at once, each with its own renderer, and no
-    renderer left once nothing uses the GPU.
+    renderer left once nothing uses the GPU;
+*   a live fork of a family with `--gfx-fork=snapshot` while the guest
+    renders: both the source's and the child's render loops must finish,
+    every frame checked, the child's on a renderer restored from the source's
+    snapshot.
 
 It needs `ttc-gfx-renderer`, gfxstream's host library, and Mesa's gfxstream
 Vulkan driver for the guest (see `runsc/ttc/gfxrenderer/README.md`), and the

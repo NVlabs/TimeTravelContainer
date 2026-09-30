@@ -8,10 +8,13 @@
 //     edges lie on pixel boundaries, so every pixel is determined; the image is
 //     copied to a host-visible buffer, and the program prints its checksum.
 //
-// Usage: vkoffscreen COMPUTE.spv VERTEX.spv FRAGMENT.spv [ITERATIONS [DELAY_MS]]
+// Usage: vkoffscreen COMPUTE.spv VERTEX.spv FRAGMENT.spv [ITERATIONS [DELAY_MS [rerecord]]]
 // It exits 0 and prints "vkoffscreen: ok checksum=..." if every check passes.
 // With ITERATIONS, it repeats the submission and the checks on one device,
-// DELAY_MS apart, and prints "vkoffscreen: iteration N ok" after each.
+// DELAY_MS apart, and prints "vkoffscreen: iteration N ok" after each. With
+// rerecord, it records the command buffer again before each submission, as
+// a renderer restored from a snapshot, which has the command buffer but not
+// its commands, needs.
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -99,13 +102,63 @@ static void buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryProperty
 	CHECK(vkBindBufferMemory(dev, *buf, *mem, 0));
 }
 
+// recording is what the command buffer's recording uses.
+struct recording {
+	VkCommandBuffer cb;
+	const VkCommandBufferBeginInfo *begin;
+	VkPipeline compute_pipeline;
+	VkPipelineLayout compute_layout;
+	VkDescriptorSet ds;
+	VkRenderPass render_pass;
+	VkFramebuffer framebuffer;
+	VkPipeline graphics_pipeline;
+	VkImage image;
+	VkBuffer readback;
+};
+
+// record records the compute dispatch and the render, and the copies of
+// their results to host-visible memory.
+static void record(const struct recording *r) {
+	CHECK(vkBeginCommandBuffer(r->cb, r->begin));
+	vkCmdBindPipeline(r->cb, VK_PIPELINE_BIND_POINT_COMPUTE, r->compute_pipeline);
+	vkCmdBindDescriptorSets(r->cb, VK_PIPELINE_BIND_POINT_COMPUTE, r->compute_layout, 0, 1, &r->ds, 0, NULL);
+	vkCmdDispatch(r->cb, N / 64, 1, 1);
+	VkClearValue clear = {.color = {.float32 = {0.0f, 0.0f, 1.0f, 1.0f}}};
+	VkRenderPassBeginInfo rp_begin = {
+	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+	    .renderPass = r->render_pass,
+	    .framebuffer = r->framebuffer,
+	    .renderArea = {{0, 0}, {W, H}},
+	    .clearValueCount = 1,
+	    .pClearValues = &clear,
+	};
+	vkCmdBeginRenderPass(r->cb, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
+	vkCmdBindPipeline(r->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, r->graphics_pipeline);
+	vkCmdDraw(r->cb, 6, 1, 0, 0);
+	vkCmdEndRenderPass(r->cb);
+	VkBufferImageCopy region = {
+	    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .imageExtent = {W, H, 1},
+	};
+	vkCmdCopyImageToBuffer(r->cb, r->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r->readback, 1, &region);
+	VkMemoryBarrier to_host = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+	};
+	vkCmdPipelineBarrier(r->cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                     VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &to_host, 0, NULL, 0, NULL);
+	CHECK(vkEndCommandBuffer(r->cb));
+}
+
 int main(int argc, char **argv) {
-	if (argc < 4 || argc > 6) {
-		fprintf(stderr, "usage: vkoffscreen COMPUTE.spv VERTEX.spv FRAGMENT.spv [ITERATIONS [DELAY_MS]]\n");
+	if (argc < 4 || argc > 7 || (argc == 7 && strcmp(argv[6], "rerecord") != 0)) {
+		fprintf(stderr, "usage: vkoffscreen COMPUTE.spv VERTEX.spv FRAGMENT.spv [ITERATIONS [DELAY_MS [rerecord]]]\n");
 		return 2;
 	}
 	long iterations = argc > 4 ? atol(argv[4]) : 1;
 	long delay_ms = argc > 5 ? atol(argv[5]) : 0;
+	int rerecord = argc > 6;
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	VkApplicationInfo app = {
 	    .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -165,6 +218,8 @@ int main(int argc, char **argv) {
 
 	VkCommandPoolCreateInfo pool_info = {
 	    .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+	    // Recording again resets the command buffer.
+	    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
 	    .queueFamilyIndex = family,
 	};
 	VkCommandPool pool;
@@ -394,37 +449,20 @@ int main(int argc, char **argv) {
 	VkDeviceMemory readback_mem;
 	buffer(W * H * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, host, &readback, &readback_mem);
 
-	// Record both, and submit them once.
-	CHECK(vkBeginCommandBuffer(cb, &begin));
-	vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, compute_pipeline);
-	vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, compute_layout, 0, 1, &ds, 0, NULL);
-	vkCmdDispatch(cb, N / 64, 1, 1);
-	VkClearValue clear = {.color = {.float32 = {0.0f, 0.0f, 1.0f, 1.0f}}};
-	VkRenderPassBeginInfo rp_begin = {
-	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-	    .renderPass = render_pass,
+	// Record both, to submit together.
+	struct recording rec = {
+	    .cb = cb,
+	    .begin = &begin,
+	    .compute_pipeline = compute_pipeline,
+	    .compute_layout = compute_layout,
+	    .ds = ds,
+	    .render_pass = render_pass,
 	    .framebuffer = framebuffer,
-	    .renderArea = {{0, 0}, {W, H}},
-	    .clearValueCount = 1,
-	    .pClearValues = &clear,
+	    .graphics_pipeline = graphics_pipeline,
+	    .image = image,
+	    .readback = readback,
 	};
-	vkCmdBeginRenderPass(cb, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
-	vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, graphics_pipeline);
-	vkCmdDraw(cb, 6, 1, 0, 0);
-	vkCmdEndRenderPass(cb);
-	VkBufferImageCopy region = {
-	    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-	    .imageExtent = {W, H, 1},
-	};
-	vkCmdCopyImageToBuffer(cb, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1, &region);
-	VkMemoryBarrier to_host = {
-	    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-	    .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
-	    .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
-	};
-	vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                     VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &to_host, 0, NULL, 0, NULL);
-	CHECK(vkEndCommandBuffer(cb));
+	record(&rec);
 	VkFenceCreateInfo fence_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
 	VkFence fence;
 	CHECK(vkCreateFence(dev, &fence_info, NULL, &fence));
@@ -445,6 +483,9 @@ int main(int argc, char **argv) {
 		memset(values, 0, N * 4);
 		memset(pixels, 0, W * H * 4);
 		CHECK(vkResetFences(dev, 1, &fence));
+		if (rerecord && iteration > 1) {
+			record(&rec);
+		}
 		CHECK(vkQueueSubmit(queue, 1, &submit, fence));
 		CHECK(vkWaitForFences(dev, 1, &fence, VK_TRUE, 10ull * 1000 * 1000 * 1000));
 		for (uint32_t i = 0; i < N; i++) {

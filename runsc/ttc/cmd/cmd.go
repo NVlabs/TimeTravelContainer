@@ -1520,7 +1520,7 @@ type gpuFlags struct {
 func addGPUFlags(fs *flag.FlagSet) *gpuFlags {
 	f := &gpuFlags{}
 	f.gfx = fs.Bool("gfx", false, "give the container a virtual GPU, /dev/dri/renderD128")
-	f.gfxFork = fs.String("gfx-fork", "", "what a live fork does with the virtual GPU while it is in use: device-lost; without it, a --gfx family must waive live forks")
+	f.gfxFork = fs.String("gfx-fork", "", "what a live fork does with the virtual GPU while it is in use: device-lost or snapshot; without it, a --gfx family must waive live forks")
 	fs.Var(&f.nvproxy, "nvproxy", "give the container the host's NVIDIA GPUs; --nvproxy=CAPS limits the driver capabilities")
 	f.nvproxyFork = fs.String("nvproxy-fork", "", "what a live fork does with NVIDIA GPUs while they are in use: device-lost or snapshot")
 	return f

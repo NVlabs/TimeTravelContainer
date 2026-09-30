@@ -18,11 +18,11 @@ func TestValidateGPUOptions(t *testing.T) {
 	}{
 		{name: "no GPU", eligible: true, goos: "darwin"},
 		{name: "no GPU, waived", eligible: false, goos: "darwin"},
-		{name: "gfx needs a waiver", opts: GPUOptions{GFX: true}, eligible: true, goos: "darwin", wantErr: "--gfx-fork=device-lost, or --waive-live-fork"},
+		{name: "gfx needs a waiver", opts: GPUOptions{GFX: true}, eligible: true, goos: "darwin", wantErr: "--gfx-fork=device-lost or --gfx-fork=snapshot, or --waive-live-fork"},
 		{name: "gfx waived", opts: GPUOptions{GFX: true}, eligible: false, goos: "darwin"},
 		{name: "gfx device-lost", opts: GPUOptions{GFX: true, GFXFork: GPUForkDeviceLost}, eligible: true, goos: "darwin"},
 		{name: "gfx device-lost and waived", opts: GPUOptions{GFX: true, GFXFork: GPUForkDeviceLost}, eligible: false, goos: "linux", wantErr: "drop --gfx-fork"},
-		{name: "gfx snapshot", opts: GPUOptions{GFX: true, GFXFork: GPUForkSnapshot}, eligible: true, goos: "linux", wantErr: "not supported yet"},
+		{name: "gfx snapshot", opts: GPUOptions{GFX: true, GFXFork: GPUForkSnapshot}, eligible: true, goos: "darwin"},
 		{name: "gfx-fork without gfx", opts: GPUOptions{GFXFork: GPUForkDeviceLost}, eligible: true, goos: "linux", wantErr: "requires --gfx"},
 		{name: "unknown gfx-fork", opts: GPUOptions{GFX: true, GFXFork: "reset"}, eligible: true, goos: "linux", wantErr: `--gfx-fork="reset"`},
 		{name: "nvproxy on macOS", opts: GPUOptions{NVProxy: true}, eligible: false, goos: "darwin", wantErr: "macOS hosts do not have"},
