@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -54,6 +55,74 @@ func TestBranchSyncLeavesOtherFilesDataToTheFullFence(t *testing.T) {
 	repo.dirtyMu.Unlock()
 	if remaining != 0 {
 		t.Fatalf("the full fence left %d dirty payloads", remaining)
+	}
+}
+
+// A new file has nothing to sync but its name until something opens it to
+// write: then, and not before, the next full fence syncs its payload.
+func TestFenceSyncsANewFileOnceOpenedToWrite(t *testing.T) {
+	root := t.TempDir()
+	manager, err := OpenManager(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := manager.Create("new-files")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirty := func(object string) bool {
+		repo.dirtyMu.Lock()
+		defer repo.dirtyMu.Unlock()
+		_, ok := repo.dirtyData[object]
+		return ok
+	}
+	empty, err := repo.CreateRegularInode(MainBranch, RootInode, "empty", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read, err := repo.Inode(MainBranch, empty.Number); err != nil || !reflect.DeepEqual(read, empty) {
+		t.Fatalf("created %+v, read (%+v, %v)", empty, read, err)
+	}
+	written, err := repo.CreateRegularInode(MainBranch, RootInode, "written", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dirty(empty.Object) || dirty(written.Object) {
+		t.Fatal("a new empty file's payload is to be synced")
+	}
+	file, _, _, err := repo.OpenDataFile(MainBranch, written.Number, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !dirty(written.Object) {
+		t.Fatal("a file opened to write is not to be synced")
+	}
+	if _, err := file.WriteAt([]byte("bytes"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SyncMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	if dirty(written.Object) {
+		t.Fatal("the full fence left the written file's payload unsynced")
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if repo, err = manager.Open("new-files"); err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	file, _, _, err = repo.OpenDataFile(MainBranch, empty.Number, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if info, err := file.Stat(); err != nil || info.Size() != 0 {
+		t.Fatalf("the empty file after a reopen: (%v, %v)", info, err)
 	}
 }
 

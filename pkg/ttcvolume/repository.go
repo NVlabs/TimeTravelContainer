@@ -2454,10 +2454,17 @@ func (r *Repository) ForkWithOrigins(source, child string, sourceWorking, childW
 
 // CreateRegular creates one empty regular file.
 func (r *Repository) CreateRegular(branchID string, parent uint64, name string, mode uint32, uid, gid uint32) (uint64, error) {
+	inode, err := r.CreateRegularInode(branchID, parent, name, mode, uid, gid)
+	return inode.Number, err
+}
+
+// CreateRegularInode is CreateRegular, returning the file's inode as Inode
+// would without reading it anew.
+func (r *Repository) CreateRegularInode(branchID string, parent uint64, name string, mode uint32, uid, gid uint32) (Inode, error) {
 	if err := validateEntryName(name); err != nil {
-		return 0, err
+		return Inode{}, err
 	}
-	var created uint64
+	var result Inode
 	err := r.withLock(func() error {
 		branch, err := r.readBranch(branchID)
 		if err != nil {
@@ -2483,7 +2490,7 @@ func (r *Repository) CreateRegular(branchID string, parent uint64, name string, 
 		if err != nil {
 			return fmt.Errorf("creating branch %q entry %d/%q data object: %w", branchID, parent, name, err)
 		}
-		created, err = r.allocateInodeLocked()
+		created, err := r.allocateInodeLocked()
 		if err != nil {
 			return err
 		}
@@ -2495,12 +2502,16 @@ func (r *Repository) CreateRegular(branchID string, parent uint64, name string, 
 			AtimeNsec:      now, BtimeNsec: now, CtimeNsec: now, MtimeNsec: now,
 		}
 		entry := DirectoryEntry{Name: name, Inode: created}
-		return r.commitMetadata(&branch, state, []metadataOp{
+		if err := r.commitMetadata(&branch, state, []metadataOp{
 			{Kind: metadataSetInode, Inode: &inode},
 			{Kind: metadataSetEntry, Parent: parent, Entry: &entry},
-		})
+		}); err != nil {
+			return err
+		}
+		result, err = r.metadataInode(state, created)
+		return err
 	})
-	return created, err
+	return result, err
 }
 
 // CreateDirectory creates an empty directory.
@@ -3181,8 +3192,12 @@ func (r *Repository) OpenDataFileWithCoW(branchID string, ino uint64, writable b
 		if writable {
 			flags = os.O_RDWR
 		}
-		file, err = r.openObject(inode.Object, flags)
-		return err
+		if file, err = r.openObject(inode.Object, flags); err != nil || !writable {
+			return err
+		}
+		// What is written through file, or a mapping of it, is to be synced
+		// at the next fence.
+		return r.MarkDataDirty(inode.Object)
 	}
 	var err error
 	if writable {
@@ -4280,8 +4295,13 @@ func (r *Repository) createObject(origin uint64, source string) (string, error) 
 	}
 	r.pendingBulk[id.String()] = ttcsnapshot.ReservedObject{ID: id, Pin: graphConstructionPin(id), BulkLength: uint64(length)}
 	r.dirtyMu.Unlock()
-	if err := r.MarkDataDirty(id.String()); err != nil {
-		return "", err
+	// An empty object has no bytes to sync, only its name, which the next
+	// fence syncs as it does every new name: what writes it opens it
+	// writable, and so marks it dirty then.
+	if source != "" {
+		if err := r.MarkDataDirty(id.String()); err != nil {
+			return "", err
+		}
 	}
 	return id.String(), nil
 }

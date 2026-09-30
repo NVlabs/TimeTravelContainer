@@ -532,16 +532,12 @@ afterTrailingSymlink:
 			return nil, err
 		}
 		if fs.diskVolume != nil {
-			ino, err := fs.diskVolume.Repository.CreateRegular(
+			meta, err := fs.diskVolume.Repository.CreateRegularInode(
 				fs.diskVolume.Branch, parentDir.inode.ino, name,
 				childInode.mode.Load()&07777, childInode.uid.Load(), childInode.gid.Load())
 			if err != nil {
 				childInode.decLinksLocked(ctx)
 				return nil, diskVolumeError("create regular file", err)
-			}
-			meta, err := fs.diskVolume.Repository.Inode(fs.diskVolume.Branch, ino)
-			if err != nil {
-				return nil, diskVolumeError("read created file metadata", err)
 			}
 			fs.applyDiskMetadata(childInode, meta)
 		}
