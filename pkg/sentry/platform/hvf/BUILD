@@ -74,6 +74,7 @@ go_test(
             "backend_darwin_arm64_test.go",
             "ring0_engine_darwin_arm64_test.go",
             "ring0_parking_darwin_arm64_test.go",
+            "shared_memory_darwin_arm64_test.go",
         ],
         linux = [],
     ),
