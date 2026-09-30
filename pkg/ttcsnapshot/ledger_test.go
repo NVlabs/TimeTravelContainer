@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"testing"
 )
@@ -851,28 +852,28 @@ func checkLedgerIndexes(t *testing.T, ledger *ReferenceLedger) {
 	t.Helper()
 	ledger.mu.RLock()
 	defer ledger.mu.RUnlock()
-	byOrigin := make(map[SnapshotID]map[string]struct{})
-	reclaiming := make(map[string]struct{})
-	for key, object := range ledger.state.Objects {
-		if byOrigin[object.ID.Snapshot] == nil {
-			byOrigin[object.ID.Snapshot] = make(map[string]struct{})
+	byOrigin := make(map[SnapshotID]map[ObjectID]struct{})
+	reclaiming := make(map[ObjectID]struct{})
+	for id, entry := range ledger.state.Objects {
+		if byOrigin[id.Snapshot] == nil {
+			byOrigin[id.Snapshot] = make(map[ObjectID]struct{})
 		}
-		byOrigin[object.ID.Snapshot][key] = struct{}{}
-		if object.State == ObjectReclaiming {
-			reclaiming[key] = struct{}{}
+		byOrigin[id.Snapshot][id] = struct{}{}
+		if entry.State == ObjectReclaiming {
+			reclaiming[id] = struct{}{}
 		}
 	}
-	for origin, keys := range byOrigin {
-		if !reflect.DeepEqual(ledger.state.originKeys(origin), keys) {
-			t.Fatalf("origin %d indexes objects %v, has %v", origin, ledger.state.originKeys(origin), keys)
+	for origin, ids := range byOrigin {
+		if !reflect.DeepEqual(ledger.state.originIDs(origin), ids) {
+			t.Fatalf("origin %d indexes objects %v, has %v", origin, ledger.state.originIDs(origin), ids)
 		}
 	}
 	for origin, entry := range ledger.state.byOrigin {
 		if _, ok := ledger.state.Origins[origin]; !ok {
 			t.Fatalf("origin %d is indexed but not owned", origin)
 		}
-		if len(entry.keys) != len(byOrigin[origin]) {
-			t.Fatalf("origin %d indexes %d objects, has %d", origin, len(entry.keys), len(byOrigin[origin]))
+		if len(entry.ids) != len(byOrigin[origin]) {
+			t.Fatalf("origin %d indexes %d objects, has %d", origin, len(entry.ids), len(byOrigin[origin]))
 		}
 	}
 	if !reflect.DeepEqual(ledger.state.reclaiming, reclaiming) {
@@ -909,9 +910,9 @@ func TestReferenceLedgerIndexesFollowMutations(t *testing.T) {
 	live := func() []ObjectID {
 		var result []ObjectID
 		ledger.mu.RLock()
-		for _, object := range ledger.state.Objects {
-			if object.State == ObjectLive {
-				result = append(result, object.ID)
+		for id, entry := range ledger.state.Objects {
+			if entry.State == ObjectLive {
+				result = append(result, id)
 			}
 		}
 		ledger.mu.RUnlock()
@@ -1260,5 +1261,36 @@ func TestFreezeSnapshotLedgerHandoff(t *testing.T) {
 	}
 	if err := graph.FreezeSnapshotLedgerHandoff(working + 100); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("froze an absent snapshot: %v", err)
+	}
+}
+
+// BenchmarkReferenceLedgerMemory reports what the ledger keeps per object of
+// an origin shaped like a filesystem tree: each object refers to the next
+// two, as directories and entries refer to inodes and files.
+func BenchmarkReferenceLedgerMemory(b *testing.B) {
+	const count = 300000
+	objects := make([]Object, count)
+	for index := range objects {
+		object := Object{ID: ObjectID{Snapshot: 1, Ordinal: uint64(index + 1), Kind: ObjectKindMetadata}, State: ObjectLive, Data: []byte("an inode record")}
+		for slot, child := range []int{2*index + 2, 2*index + 3} {
+			if child <= count {
+				object.Children = append(object.Children, Edge{Slot: uint16(slot), Child: ObjectID{Snapshot: 1, Ordinal: uint64(child), Kind: ObjectKindMetadata}})
+			}
+		}
+		objects[index] = object
+	}
+	references := map[string]ObjectID{"root": objects[0].ID}
+	for i := 0; i < b.N; i++ {
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		ledger := NewReferenceLedger()
+		if err := ledger.ImportOrigin(1, objects, references); err != nil {
+			b.Fatal(err)
+		}
+		runtime.GC()
+		runtime.ReadMemStats(&after)
+		b.ReportMetric(float64(after.HeapAlloc-before.HeapAlloc)/count, "bytes/object")
+		runtime.KeepAlive(ledger)
 	}
 }

@@ -1190,7 +1190,10 @@ func (store *SharedPackStore) Compact(snapshot SnapshotID, objects []Object, ref
 	for _, object := range objects {
 		previous := old[object.ID.key()]
 		packed := PackedObject{Object: cloneObject(object)}
+		// The ledger keeps no data, nor the source an object was published
+		// in place of.
 		packed.Object.Data = slices.Clone(previous.Object.Data)
+		packed.Object.SourceCatalog, packed.Object.SourceObject = previous.Object.SourceCatalog, previous.Object.SourceObject
 		for _, extent := range previous.Extents {
 			source, err := os.Open(filepath.Join(directory, packName(extent.Pack)))
 			if err != nil {
