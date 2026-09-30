@@ -87,6 +87,10 @@ The patches:
 *   `0008`: guests get the host's extensions that Vulkan 1.1 and 1.2
     promoted, such as `VK_KHR_16bit_storage`, which llama.cpp's Vulkan
     backend enables by name.
+*   `0009`: guests see the host's queue families less the trailing ones that
+    duplicate an earlier one, as MoltenVK's four general families do. ANGLE's
+    Vulkan backend, which Android's SurfaceFlinger uses, defers creating its
+    device when several families do graphics, and crashes.
 
 *   **macOS**: Homebrew's `molten-vk`, `vulkan-loader`, and
     `vulkan-headers`, and `meson` and `ninja`. gfxstream looks for the Vulkan
@@ -112,6 +116,8 @@ builds it in a Debian container, with the patches in `guest/patches/`:
 
 *   `0001`: guests get `VK_EXT_robustness2` and `VK_KHR_robustness2`, which
     Zink requires, when the host has them.
+*   `0002`: the driver builds for Android with the NDK alone, as the next
+    section describes.
 
 ttcd gives it to the containers of `--gfx` families: it mounts, read-only,
 
@@ -140,5 +146,36 @@ on Vulkan (`--use-angle=vulkan`), which offers OpenGL ES 3 with
 `VK_EXT_provoking_vertex` (patch `0007`). The driver has no window systems
 (`-Dplatforms=`), which would link libxcb and libwayland: X11 and Wayland
 applications render in software.
+
+### Android
+
+`guest/build_mesa_gfxstream_android.sh` builds the driver for Android
+(arm64) with the NDK, on macOS or Linux, into `vulkan.gfxstream.so`, which
+Android loads as the Vulkan HAL of `ro.hardware.vulkan=gfxstream`. Mesa
+builds the Android driver for AOSP, with AOSP's libraries for the
+emulator's goldfish devices; patch `0002` builds it with the NDK alone,
+for virtio-gpu, as Cuttlefish's GPU and TTC's are: without goldfish, with
+the Linux driver's stubs, and with minigbm's gralloc, which images for
+virtio-gpu have, and whose buffers the driver imports as the host's
+resources.
+
+redroid, an Android image for containers, runs in TTC with the GPU: its init
+is the container's, and `guest/redroid/gpu_config.sh`, which replaces the
+image's `/vendor/bin/gpu_config.sh`, has it use the image's minigbm
+(`ro.hardware.gralloc=cros`), the driver, and the image's ANGLE, OpenGL ES
+on Vulkan, for SurfaceFlinger and apps:
+
+```sh
+ttc create --name android --gfx --waive-live-fork --cap-add ALL --network ttc --nat \
+  --entrypoint /init redroid/redroid:14.0.0_64only-latest \
+  qemu=1 androidboot.hardware=redroid androidboot.use_memfd=true
+ttc cp out-android/lib64/hw/vulkan.gfxstream.so android@main:/vendor/lib64/hw/
+ttc cp guest/redroid/gpu_config.sh android@main:/vendor/bin/gpu_config.sh
+ttc start android
+ttc exec android@main /system/bin/dumpsys SurfaceFlinger | grep GLES
+```
+
+`runsc/ttc/test/e2e_redroid.sh` boots it so, checks that SurfaceFlinger and
+apps render with ANGLE on the GPU, and installs and runs an APK.
 
 [gfxstream]: https://github.com/google/gfxstream

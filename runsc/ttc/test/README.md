@@ -171,6 +171,23 @@ TTC_GFX_GUEST_DRIVER=/path/to/dir/of/libvulkan_gfxstream.so \
   "$PWD/runsc/ttc/test/e2e_gfx.sh"
 ```
 
+`e2e_redroid.sh` boots Android with the virtual GPU: redroid's arm64 image,
+whose init is the container's, with gfxstream's Vulkan driver for Android
+and `runsc/ttc/gfxrenderer/guest/redroid/gpu_config.sh`. It checks that
+SurfaceFlinger composes with ANGLE on the GPU, and that Settings, and the
+app of `APK` once it installs, render on it. Their screens are left in
+`out/` of `TTC_E2E_ROOT`, when that is set. Besides what `e2e_gfx.sh`
+needs, it needs the driver that
+`runsc/ttc/gfxrenderer/guest/build_mesa_gfxstream_android.sh` builds:
+
+```shell
+TTC=... TTCD=... TTC_GFX_RENDERER=... TTC_GFXSTREAM_LIBRARY=... \
+TTC_GFX_GUEST_DRIVER=... \
+ANDROID_GFX_DRIVER=/path/to/vulkan.gfxstream.so \
+APK=/path/to/app.apk \
+  "$PWD/runsc/ttc/test/e2e_redroid.sh"
+```
+
 `e2e_fanout_lifecycle.sh` creates 32 siblings from one source pause, writes a
 different 4 KiB page in every branch, and dehydrates/rehydrates alternating
 branches before verifying their private contents. Set

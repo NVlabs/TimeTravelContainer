@@ -45,3 +45,6 @@ go_test(
     ],
     library = ":gfxrenderer",
 )
+
+# redroid's graphics configuration for the virtual GPU, for e2e_redroid.
+exports_files(["guest/redroid/gpu_config.sh"])
