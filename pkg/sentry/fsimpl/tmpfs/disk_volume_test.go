@@ -612,3 +612,40 @@ func TestDiskNamespaceSaveAcceptsRegularFileRoot(t *testing.T) {
 	}
 	fs.restoreDiskNamespaceAfterSave()
 }
+
+func TestDiskVolumeStatFSReportsTheHostFilesystem(t *testing.T) {
+	manager, err := ttcvolume.OpenManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenManager: %v", err)
+	}
+	repository, err := manager.Create("statfs-test")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer repository.Close()
+	capacity, err := repository.Capacity()
+	if err != nil {
+		t.Fatalf("Capacity: %v", err)
+	}
+	if capacity.TotalBytes == 0 || capacity.AvailableBytes > capacity.TotalBytes {
+		t.Fatalf("Capacity() = %+v, want a nonzero total no smaller than what is available", capacity)
+	}
+
+	fs := &filesystem{
+		maxSizeInPages: getDefaultSizeLimit(true) / hostarch.PageSize,
+		diskVolume:     &diskVolumeState{Repository: repository, Branch: ttcvolume.MainBranch},
+	}
+	st := fs.statFS()
+	if want := capacity.TotalBytes / hostarch.PageSize; st.Blocks != want {
+		t.Errorf("Blocks = %d, want the host's %d", st.Blocks, want)
+	}
+	if st.BlocksAvailable == 0 || st.BlocksAvailable > st.Blocks || st.BlocksFree > st.Blocks {
+		t.Errorf("statFS() = %+v, want free and available blocks within the host's", st)
+	}
+
+	// A size limit is the volume's size.
+	fs.maxSizeInPages = 256
+	if st := fs.statFS(); st.Blocks != 256 || st.BlocksAvailable != 256 {
+		t.Errorf("with a limit of 256 pages, statFS() = %+v", st)
+	}
+}

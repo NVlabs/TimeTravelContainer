@@ -1562,6 +1562,24 @@ func (r *Repository) HostPath() string {
 	return r.path
 }
 
+// Capacity describes the host filesystem that stores a repository.
+type Capacity struct {
+	TotalBytes     uint64
+	FreeBytes      uint64
+	AvailableBytes uint64
+	TotalFiles     uint64
+	FreeFiles      uint64
+}
+
+// Capacity returns the capacity of the host filesystem that stores the
+// repository.
+func (r *Repository) Capacity() (Capacity, error) {
+	if r == nil || r.dir == nil {
+		return Capacity{}, errors.New("repository is closed")
+	}
+	return hostCapacity(r.dir)
+}
+
 func (r *Repository) withLock(fn func() error) (result error) {
 	r.viewMu.Lock()
 	defer r.viewMu.Unlock()

@@ -700,6 +700,22 @@ func (fs *filesystem) statFS() linux.Statfs {
 		st.FilesFree = fs.maxInodes - inodesUsed
 	}
 
+	// A TTC volume without a size limit is as large as the host filesystem
+	// that stores it, as Linux's overlayfs is with an upper layer on a disk.
+	// The placeholder limit would overflow the arithmetic of applications
+	// that scale it, as Android's storage services do.
+	if fs.diskVolume != nil && fs.maxSizeInPages >= getDefaultSizeLimit(true)/hostarch.PageSize {
+		if capacity, err := fs.diskVolume.Repository.Capacity(); err == nil {
+			st.Blocks = capacity.TotalBytes / hostarch.PageSize
+			st.BlocksFree = capacity.FreeBytes / hostarch.PageSize
+			st.BlocksAvailable = capacity.AvailableBytes / hostarch.PageSize
+			if fs.maxInodes == 0 {
+				st.Files = capacity.TotalFiles
+				st.FilesFree = capacity.FreeFiles
+			}
+		}
+	}
+
 	return st
 }
 
