@@ -1023,12 +1023,18 @@ func ensureNetworkMountpoints(rootfs string) error {
 	if err != nil {
 		return fmt.Errorf("loading rootfs ownership for network mountpoints: %w", err)
 	}
-	etc := filepath.Join(rootfs, "etc")
+	// Android's images link /etc to /system/etc: the container's mounts on
+	// /etc follow the link, and so do their mountpoints.
+	etcPath, err := resolveInRootfs(rootfs, "etc")
+	if err != nil {
+		return fmt.Errorf("resolving rootfs /etc: %w", err)
+	}
+	etc := filepath.Join(rootfs, etcPath)
 	if info, err := os.Lstat(etc); os.IsNotExist(err) {
 		if err := os.Mkdir(etc, 0755); err != nil {
 			return fmt.Errorf("creating rootfs /etc mountpoint directory: %w", err)
 		}
-		manifest.Entries["etc"] = ownership.Owner{}
+		manifest.Entries[filepath.ToSlash(etcPath)] = ownership.Owner{}
 	} else if err != nil {
 		return fmt.Errorf("checking rootfs /etc mountpoint directory: %w", err)
 	} else if !info.IsDir() {
@@ -1042,7 +1048,7 @@ func ensureNetworkMountpoints(rootfs string) error {
 		case err != nil:
 			return fmt.Errorf("checking rootfs /etc/%s mountpoint: %w", base, err)
 		case info.Mode().IsRegular():
-			manifest.Entries[filepath.ToSlash(filepath.Join("etc", base))] = ownership.Owner{}
+			manifest.Entries[filepath.ToSlash(filepath.Join(etcPath, base))] = ownership.Owner{}
 			continue
 		case info.Mode()&os.ModeSymlink != 0:
 			if err := os.Remove(name); err != nil {
@@ -1054,12 +1060,67 @@ func ensureNetworkMountpoints(rootfs string) error {
 		if err := os.WriteFile(name, nil, 0644); err != nil {
 			return fmt.Errorf("creating rootfs /etc/%s mountpoint: %w", base, err)
 		}
-		manifest.Entries[filepath.ToSlash(filepath.Join("etc", base))] = ownership.Owner{}
+		manifest.Entries[filepath.ToSlash(filepath.Join(etcPath, base))] = ownership.Owner{}
 	}
 	if err := ownership.Write(manifestName, manifest); err != nil {
 		return fmt.Errorf("updating rootfs ownership for network mountpoints: %w", err)
 	}
 	return nil
+}
+
+// resolveInRootfs returns the path, relative to rootfs, that the container
+// reaches by name, a path relative to its root: it follows the symbolic
+// links on the way, as the container would, without leaving rootfs. The
+// components after the first that does not exist are taken as they are.
+func resolveInRootfs(rootfs, name string) (string, error) {
+	const maxLinks = 40
+	links := 0
+	missing := false
+	var resolved []string
+	pending := strings.Split(filepath.ToSlash(name), "/")
+	for len(pending) != 0 {
+		component := pending[0]
+		pending = pending[1:]
+		switch component {
+		case "", ".":
+			continue
+		case "..":
+			if len(resolved) != 0 {
+				resolved = resolved[:len(resolved)-1]
+			}
+			continue
+		}
+		if missing {
+			resolved = append(resolved, component)
+			continue
+		}
+		host := filepath.Join(append([]string{rootfs}, append(resolved, component)...)...)
+		info, err := os.Lstat(host)
+		if os.IsNotExist(err) {
+			missing = true
+			resolved = append(resolved, component)
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			resolved = append(resolved, component)
+			continue
+		}
+		if links++; links > maxLinks {
+			return "", fmt.Errorf("%q: %w", name, syscall.ELOOP)
+		}
+		target, err := os.Readlink(host)
+		if err != nil {
+			return "", err
+		}
+		if strings.HasPrefix(target, "/") {
+			resolved = nil
+		}
+		pending = append(strings.Split(target, "/"), pending...)
+	}
+	return filepath.Join(resolved...), nil
 }
 
 // rehomeInternalMounts gives a distributed target its own copies of TTC's

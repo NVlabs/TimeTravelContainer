@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1521,6 +1522,86 @@ func TestEnsureNetworkMountpoints(t *testing.T) {
 		if owner, ok := updated.Entries[name]; !ok || owner != (ownership.Owner{}) {
 			t.Errorf("mountpoint owner %s=(%+v, %t), want root", name, owner, ok)
 		}
+	}
+}
+
+// Android's images link /etc to /system/etc.
+func TestEnsureNetworkMountpointsFollowsEtcLink(t *testing.T) {
+	rootfs := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(rootfs, "system", "etc"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rootfs, "system", "etc", "hosts"), []byte("127.0.0.1 localhost\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/system/etc", filepath.Join(rootfs, "etc")); err != nil {
+		t.Fatal(err)
+	}
+	manifest := ownership.NewManifest()
+	manifest.Entries["."] = ownership.Owner{}
+	if err := ownership.Write(ownership.ManifestPath(rootfs), manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureNetworkMountpoints(rootfs); err != nil {
+		t.Fatalf("ensureNetworkMountpoints: %v", err)
+	}
+	for _, base := range []string{"hostname", "hosts", "resolv.conf"} {
+		if info, err := os.Lstat(filepath.Join(rootfs, "system", "etc", base)); err != nil || !info.Mode().IsRegular() {
+			t.Errorf("mountpoint /system/etc/%s: info=%v err=%v", base, info, err)
+		}
+	}
+	if info, err := os.Lstat(filepath.Join(rootfs, "etc")); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("/etc is no longer a link: info=%v err=%v", info, err)
+	}
+	updated, err := ownership.Read(ownership.ManifestPath(rootfs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"system/etc/hostname", "system/etc/hosts", "system/etc/resolv.conf"} {
+		if _, ok := updated.Entries[name]; !ok {
+			t.Errorf("no ownership of mountpoint %s", name)
+		}
+	}
+}
+
+func TestResolveInRootfs(t *testing.T) {
+	rootfs := t.TempDir()
+	for _, dir := range []string{"system/etc", "vendor"} {
+		if err := os.MkdirAll(filepath.Join(rootfs, dir), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for link, target := range map[string]string{
+		"etc":        "/system/etc",
+		"relative":   "system/./etc",
+		"escape":     "../../../../vendor",
+		"loop":       "loop",
+		"vendor/sys": "../system",
+		"dangling":   "/nowhere/at/all",
+	} {
+		if err := os.Symlink(target, filepath.Join(rootfs, link)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, test := range []struct {
+		name, want string
+	}{
+		{"etc", "system/etc"},
+		{"etc/hosts", "system/etc/hosts"},
+		{"/relative/", "system/etc"},
+		{"escape", "vendor"},
+		{"vendor/sys/etc", "system/etc"},
+		{"dangling/x", "nowhere/at/all/x"},
+		{"missing/../a", "a"},
+		{"missing/../../../x", "x"},
+	} {
+		got, err := resolveInRootfs(rootfs, test.name)
+		if err != nil || got != test.want {
+			t.Errorf("resolveInRootfs(%q) = %q, %v; want %q", test.name, got, err, test.want)
+		}
+	}
+	if _, err := resolveInRootfs(rootfs, "loop"); !errors.Is(err, syscall.ELOOP) {
+		t.Errorf("resolveInRootfs(loop) = %v, want ELOOP", err)
 	}
 }
 
