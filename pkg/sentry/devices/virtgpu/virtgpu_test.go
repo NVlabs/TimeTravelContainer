@@ -201,6 +201,12 @@ func (r *fakeRenderer) CreateFence(f Fence) error {
 }
 
 // Close implements Renderer.Close.
+func (r *fakeRenderer) isClosed() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.closed
+}
+
 func (r *fakeRenderer) Close() {
 	r.mu.Lock()
 	r.closed = true
@@ -1244,12 +1250,66 @@ func TestRelease(t *testing.T) {
 	if err := e.ioctl(syncFile, linux.SYNC_IOC_FILE_INFO, &info); err != nil || info.Status != -int32(linuxerr.ECANCELED.Errno()) {
 		t.Errorf("the status of a fence of a destroyed context: %+v, %v", info, err)
 	}
-	// The context ID is free again.
+	// Nothing uses the renderer, so the device closed it.
+	if !r.isClosed() {
+		t.Error("the idle renderer is open")
+	}
+	// The context ID is free again, and the next context has a new renderer.
 	next := e.open()
 	if err := e.contextInit(next, 3, 1, "next"); err != nil {
 		t.Fatal(err)
 	}
-	wantCalls(t, r, `CreateContext 1 capset 3 "next"`)
+	if e.fakes.last(t) == r {
+		t.Fatal("the next context has the closed renderer")
+	}
+	wantCalls(t, e.fakes.last(t), `CreateContext 1 capset 3 "next"`)
+}
+
+// TestIdleRenderer checks that the device keeps its renderer while a context
+// or a resource of it is left, and no longer.
+func TestIdleRenderer(t *testing.T) {
+	e := newTestEnv(t, ForkIneligible)
+	// The test releases the file itself.
+	file, err := e.k.VFS().OpenAt(e.task, e.creds, pathOp(e.root, "/dev/"+renderNodePath), &vfs.OpenOptions{Flags: linux.O_RDWR})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.contextInit(file, 3, 1, "idle"); err != nil {
+		t.Fatal(err)
+	}
+	r := e.fakes.last(t)
+	handle, _ := e.mustCreateBlob(file, linux.VIRTGPU_BLOB_FLAG_USE_MAPPABLE, hostarch.PageSize)
+	addr, err := e.mmap(file, file.Impl().(*renderFD).objects[handle].mapOffset, hostarch.PageSize)
+	if err != nil {
+		t.Fatalf("mmap: %v", err)
+	}
+	// A fence on the global timeline, which outlives its context.
+	fenceFD, err := e.execbuffer(file, linux.VIRTGPU_EXECBUF_FENCE_FD_OUT, 0, -1, []byte("global"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncFile := e.file(fenceFD)
+	file.DecRef(e.task)
+	if r.isClosed() {
+		t.Fatal("the renderer was closed while a mapping kept a resource")
+	}
+	e.munmap(addr, hostarch.PageSize)
+	if !r.isClosed() {
+		t.Fatal("the renderer is open after its last resource was destroyed")
+	}
+	info := linux.SyncFileInfo{}
+	if err := e.ioctl(syncFile, linux.SYNC_IOC_FILE_INFO, &info); err != nil || info.Status != -int32(linuxerr.ECANCELED.Errno()) {
+		t.Errorf("the status of a global fence of a closed renderer: %+v, %v", info, err)
+	}
+	// Late events of the closed renderer are ignored.
+	r.events.RendererLost(errors.New("exited"))
+	next := e.open()
+	if err := e.contextInit(next, 3, 1, "next"); err != nil {
+		t.Fatalf("creating a context after the renderer was closed: %v", err)
+	}
+	if e.fakes.count() != 2 {
+		t.Errorf("%d renderers were started, want 2", e.fakes.count())
+	}
 }
 
 func TestLiveForkValidation(t *testing.T) {

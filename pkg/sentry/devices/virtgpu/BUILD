@@ -67,6 +67,7 @@ go_library(
         "//pkg/abi/linux",
         "//pkg/atomicbitops",
         "//pkg/context",
+        "//pkg/errors",
         "//pkg/errors/linuxerr",
         "//pkg/hostarch",
         "//pkg/log",

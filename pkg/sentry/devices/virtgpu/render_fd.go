@@ -100,6 +100,7 @@ func (fd *renderFD) Release(ctx context.Context) {
 	}
 	d.ctxIDs.release(fd.ctxID)
 	d.mu.Unlock()
+	d.closeIdleRenderer()
 }
 
 // contextDestroyedLocked cleans up after a context of generation gen: the
@@ -626,6 +627,9 @@ func (fd *renderFD) newResource(t *kernel.Task, params resourceParams, create fu
 	// Reserve the ID and offset while the renderer creates the resource.
 	d.resources[id] = r
 	d.mapOffsets[r.mapOffset] = r
+	if gen == d.gen {
+		d.genResources++
+	}
 	d.mu.Unlock()
 
 	d.submitMu.Lock()
@@ -641,6 +645,9 @@ func (fd *renderFD) newResource(t *kernel.Task, params resourceParams, create fu
 		d.mu.Lock()
 		delete(d.resources, id)
 		delete(d.mapOffsets, r.mapOffset)
+		if gen == d.gen {
+			d.genResources--
+		}
 		d.mu.Unlock()
 		// The renderer has nothing to destroy.
 		r.resourceRefs.DecRef(nil)

@@ -84,6 +84,9 @@ func (d *device) destroyResource(r *resource) {
 	d.mu.Lock()
 	delete(d.resources, r.id)
 	delete(d.mapOffsets, r.mapOffset)
+	if r.gen == d.gen {
+		d.genResources--
+	}
 	for _, f := range r.fences {
 		f.unobserveLocked(r)
 	}
@@ -100,6 +103,7 @@ func (d *device) destroyResource(r *resource) {
 	if mem != nil {
 		mem.Release()
 	}
+	d.closeIdleRenderer()
 }
 
 // fenceSignaledLocked implements fenceObserver.fenceSignaledLocked.

@@ -23,6 +23,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
@@ -206,8 +207,11 @@ type device struct {
 	gen uint64
 	// lost is whether the renderer of generation gen was lost.
 	lost bool
-	// contexts is the number of contexts of generation gen.
-	contexts int
+	// contexts is the number of contexts of generation gen, and genResources
+	// the number of its resources. The device closes its renderer when both
+	// drop to zero.
+	contexts     int
+	genResources int
 
 	ctxIDs        idAllocator
 	nextResID     uint32
@@ -240,6 +244,7 @@ func (d *device) afterLoad(ctx goContext.Context) {
 	d.gen++
 	d.lost = false
 	d.contexts = 0
+	d.genResources = 0
 	for key, tl := range d.timelines {
 		for _, f := range tl.pending {
 			// Blocked waiters are not saved, and epoll rechecks the readiness
@@ -341,6 +346,7 @@ func (d *device) startRendererLocked() (uint64, error) {
 		d.gen++
 		d.lost = false
 		d.contexts = 0
+		d.genResources = 0
 		gen = d.gen
 		d.mu.Unlock()
 	}
@@ -351,6 +357,33 @@ func (d *device) startRendererLocked() (uint64, error) {
 	}
 	d.renderer = r
 	return gen, nil
+}
+
+// closeIdleRenderer closes the device's renderer if nothing of its generation
+// is left: no context, and no resource. A renderer is a host process that
+// holds the host GPU's memory, which a device that nothing uses, such as that
+// of a branch that was removed, must not keep. The next context starts
+// another.
+func (d *device) closeIdleRenderer() {
+	d.submitMu.Lock()
+	defer d.submitMu.Unlock()
+	if d.renderer == nil {
+		return
+	}
+	d.mu.Lock()
+	if d.contexts != 0 || d.genResources != 0 {
+		d.mu.Unlock()
+		return
+	}
+	// Only fences on the global timeline can be pending, and the contexts
+	// that submitted them are gone, as those of fences on their rings are.
+	d.endPendingFencesLocked(linuxerr.ECANCELED)
+	// Events of the closed renderer are ignored.
+	d.gen++
+	d.lost = false
+	d.mu.Unlock()
+	d.renderer.Close()
+	d.renderer = nil
 }
 
 // rendererEvents receives the events of the renderer of one generation.
@@ -397,17 +430,17 @@ func (e *rendererEvents) RendererLost(err error) {
 	}
 	log.Warningf("virtgpu: lost the renderer: %v", err)
 	d.lost = true
-	d.failPendingFencesLocked()
+	d.endPendingFencesLocked(linuxerr.ENODEV)
 }
 
-// failPendingFencesLocked signals every pending fence with ENODEV.
+// endPendingFencesLocked signals every pending fence with the error err.
 //
 // Preconditions: d.mu is locked.
-func (d *device) failPendingFencesLocked() {
+func (d *device) endPendingFencesLocked(err *errors.Error) {
 	now := d.nowLocked()
 	for key, tl := range d.timelines {
 		for _, f := range tl.pending {
-			f.signalLocked(-int32(linuxerr.ENODEV.Errno()), now, true /* notify */)
+			f.signalLocked(-int32(err.Errno()), now, true /* notify */)
 		}
 		delete(d.timelines, key)
 	}
