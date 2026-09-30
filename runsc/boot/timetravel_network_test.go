@@ -216,7 +216,7 @@ func TestTimeTravelNetworkRuntimeLinkReplacementPreservesListener(t *testing.T) 
 	defer listener.Close()
 	port := uint16(listener.Addr().(*net.TCPAddr).Port)
 
-	// Distributed restore replaces the runtime-only side of ttc0 after the
+	// Distributed restore replaces the runtime-only side of the NIC after the
 	// guest's complete netstack, including this listener, has been decoded.
 	s.Pause()
 	if err := configureTimeTravelNetwork(s, TimeTravelNetworkConfig{NAT: true}, false, false); err != nil {

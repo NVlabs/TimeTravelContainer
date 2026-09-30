@@ -34,7 +34,7 @@ covers:
 - persisted `--network host` startup using an unmodified BusyBox HTTP server,
   Docker inspect projection, host-loopback reachability, and live-fork
   rejection for the externally shared network stack;
-- rootless `--network ttc` startup with the `ttc0` virtual NIC, NAT-disabled
+- rootless `--network ttc` startup with the `eth0` virtual NIC, NAT-disabled
   isolation, optional IPv4 TCP/UDP user-mode NAT, Docker-style persistent TCP
   publication, branch-aware live publication and removal, daemon-restart
   listener reconciliation, listener cleanup on branch deletion, parent listener

@@ -376,7 +376,7 @@ The current implementation accepts:
 
 The TTC NIC has an explicit external-flow policy. The source keeps its
 gateway/proxy, published listener, and host-facing connections. The child
-reconstructs a fresh link and proxy realm, retains internal loopback/`ttc0`
+reconstructs a fresh link and proxy realm, retains internal loopback/`eth0`
 queues, resets inherited TCP endpoints that terminate outside the branch, and
 starts unpublished. Hostinet, plugin stacks, and arbitrary external links are
 available only to families created with an explicit live-fork waiver. Nftables

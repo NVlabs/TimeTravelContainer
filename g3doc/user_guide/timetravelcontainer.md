@@ -1038,10 +1038,11 @@ a new netstack and loopback endpoint, clones protocol/socket state, and
 preserves internal connections and unread data independently in both branches.
 
 `ttc` adds a rootless, Sentry-managed IPv4 interface without TAP, veth, a host
-network namespace, CNI, or elevated network capabilities:
+network namespace, CNI, or elevated network capabilities. It is `eth0`, as a
+Docker container's interface is:
 
 ```text
-ttc0       10.0.2.15/24           MAC 02:42:0a:00:02:0f
+eth0       10.0.2.15/24           MAC 02:42:0a:00:02:0f
 gateway     10.0.2.2
 ```
 
@@ -1114,7 +1115,7 @@ Live-fork policy deliberately distinguishes internal from external flows:
 * the source branch retains its published-port listener and accepted flows;
 * the child receives a fresh virtual link and proxy realm;
 * every inherited child TCP flow to the host, internet, or a published-port
-  proxy is reset, while internal loopback and `ttc0` connections remain; and
+  proxy is reset, while internal loopback and `eth0` connections remain; and
 * no host port is automatically published for a child branch.
 
 Thus a fork is not rejected merely because an external TCP flow is open. Child

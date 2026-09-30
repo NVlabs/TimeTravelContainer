@@ -32,7 +32,7 @@ import (
 
 const (
 	timeTravelNICID   = tcpip.NICID(2)
-	timeTravelNICName = "ttc0"
+	timeTravelNICName = "eth0"
 	timeTravelMTU     = uint32(65535)
 )
 
