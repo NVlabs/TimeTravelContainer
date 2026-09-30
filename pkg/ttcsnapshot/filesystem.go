@@ -6,7 +6,6 @@ package ttcsnapshot
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -162,19 +161,17 @@ func directoryKey(parent uint64, name string) ([]byte, error) {
 	return key, nil
 }
 
+// encodeRecord encodes an InodeRecord or a DirectoryEntryRecord as the data of
+// its object.
 func encodeRecord(value any) ([]byte, error) {
 	var data []byte
-	var err error
 	switch record := value.(type) {
 	case InodeRecord:
-		data, err = appendInodeRecordJSON(nil, &record)
+		data = appendInodeRecord(nil, &record)
 	case DirectoryEntryRecord:
-		data, err = appendDirectoryEntryRecordJSON(nil, &record)
+		data = appendDirectoryEntryRecord(nil, &record)
 	default:
-		data, err = json.Marshal(value)
-	}
-	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("TTC filesystem metadata record of type %T", value)
 	}
 	if len(data) > maxObjectDataBytes {
 		return nil, errors.New("TTC filesystem metadata record is too large")

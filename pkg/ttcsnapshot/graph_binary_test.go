@@ -375,3 +375,88 @@ func FuzzDecodeJournalRecord(f *testing.F) {
 		}
 	})
 }
+
+// An inode's record and a directory entry's decode from the data of their
+// objects to what was encoded, and from the JSON of an earlier release too.
+func TestFilesystemRecordData(t *testing.T) {
+	random := rand.New(rand.NewSource(6))
+	inodes := []InodeRecord{{Number: 3, Type: "symlink", Target: "../\xff\xfe/target", Xattrs: map[string][]byte{"user.\xff": []byte("binary\x00value"), "user.nil": nil}}}
+	for round := 0; round < 200; round++ {
+		inodes = append(inodes, randomInodeRecord(random))
+	}
+	for _, inode := range inodes {
+		data, err := encodeRecord(inode)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if data[0] != recordMagic {
+			t.Fatalf("an inode record begins with %#x", data[0])
+		}
+		got, err := decodeInodeRecord(data)
+		if err != nil || !reflect.DeepEqual(got, inode) {
+			t.Fatalf("inode %+v decodes (%v) as %+v", inode, err, got)
+		}
+		legacy, err := json.Marshal(inode)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, err := decodeInodeRecord(legacy); err != nil || !reflect.DeepEqual(got, inode) {
+			t.Fatalf("inode %+v decodes (%v) from JSON as %+v", inode, err, got)
+		}
+		for length := 1; length < len(data); length++ {
+			if _, err := decodeInodeRecord(data[:length]); err == nil {
+				t.Fatalf("an inode record of %d bytes of %d was taken", length, len(data))
+			}
+		}
+	}
+	for _, entry := range []DirectoryEntryRecord{{Parent: 1, Name: "plain", Inode: 2}, {Parent: 1 << 40, Name: "a\x80b\xfe\x01", Inode: 1 << 50}} {
+		data, err := encodeRecord(entry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, err := decodeDirectoryEntryRecord(data); err != nil || got != entry {
+			t.Fatalf("entry %+v decodes (%v) as %+v", entry, err, got)
+		}
+		legacy, err := json.Marshal(entry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, err := decodeDirectoryEntryRecord(legacy); err != nil || got != entry {
+			t.Fatalf("entry %+v decodes (%v) from JSON as %+v", entry, err, got)
+		}
+	}
+	if _, err := encodeRecord(Snapshot{}); err == nil {
+		t.Fatal("a snapshot was encoded as a filesystem record")
+	}
+}
+
+// BenchmarkInodeRecord decodes a regular file's inode record, from its
+// binary data and from its JSON, and reports their sizes.
+func BenchmarkInodeRecord(b *testing.B) {
+	inode := InodeRecord{
+		Number: 123456, Type: "regular", Mode: 0100644, UID: 1000, GID: 1000, Nlink: 1, Size: 4096,
+		File:      ObjectID{Snapshot: 7, Kind: ObjectKindFile, Ordinal: 234567},
+		AtimeNsec: 1790000000123456789, BtimeNsec: 1790000000123456789, CtimeNsec: 1790000000123456789, MtimeNsec: 1790000000123456789,
+	}
+	binaryData, err := encodeRecord(inode)
+	if err != nil {
+		b.Fatal(err)
+	}
+	jsonData, err := appendInodeRecordJSON(nil, &inode)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, format := range []struct {
+		name string
+		data []byte
+	}{{"binary", binaryData}, {"json", jsonData}} {
+		b.Run(format.name, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				if _, err := decodeInodeRecord(format.data); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportMetric(float64(len(format.data)), "bytes")
+		})
+	}
+}

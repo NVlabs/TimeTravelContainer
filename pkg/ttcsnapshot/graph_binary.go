@@ -707,8 +707,27 @@ func (d *graphDecoder) handoff() SnapshotLedgerHandoff {
 
 func (d *graphDecoder) inode() *InodeRecord {
 	inode := &InodeRecord{}
+	d.inodeRecord(inode)
+	return inode
+}
+
+// inodeTypes are the types of inodes, which a decoded record shares, rather
+// than a string of its own.
+var inodeTypes = [...]string{"regular", "directory", "symlink", "fifo", "char", "block", "socket"}
+
+func (d *graphDecoder) inodeType() string {
+	value := d.take(d.uvarint())
+	for _, known := range inodeTypes {
+		if string(value) == known {
+			return known
+		}
+	}
+	return string(value)
+}
+
+func (d *graphDecoder) inodeRecord(inode *InodeRecord) {
 	inode.Number = d.uvarint()
-	inode.Type = d.string()
+	inode.Type = d.inodeType()
 	inode.Mode = uint32(d.integer(32))
 	inode.UID = uint32(d.integer(32))
 	inode.GID = uint32(d.integer(32))
@@ -730,7 +749,6 @@ func (d *graphDecoder) inode() *InodeRecord {
 			inode.Xattrs[name] = d.nullableBytes()
 		}
 	}
-	return inode
 }
 
 func (d *graphDecoder) entry() *DirectoryEntryRecord {
@@ -930,4 +948,47 @@ func (d *graphDecoder) names() map[string]ObjectID {
 		names[name] = d.objectID()
 	}
 	return names
+}
+
+// The data of an inode's object, and of a directory entry's, is its record:
+// recordMagic, then the record as a journal holds it. A record that begins
+// with '{' is JSON, as an earlier release wrote it. As JSON, a regular
+// file's inode record took some 220 bytes, and decoding one 3 us.
+const recordMagic = 0x01
+
+func appendInodeRecord(out []byte, inode *InodeRecord) []byte {
+	e := graphEncoder{out: append(out, recordMagic)}
+	e.inode(inode)
+	return e.out
+}
+
+func appendDirectoryEntryRecord(out []byte, entry *DirectoryEntryRecord) []byte {
+	e := graphEncoder{out: append(out, recordMagic)}
+	e.entry(entry)
+	return e.out
+}
+
+func decodeBinaryInodeRecord(data []byte) (InodeRecord, error) {
+	d := graphDecoder{data: data, pos: 1}
+	var inode InodeRecord
+	d.inodeRecord(&inode)
+	if d.err == nil && d.pos != len(data) {
+		d.fail("trailing bytes")
+	}
+	if d.err != nil {
+		return InodeRecord{}, fmt.Errorf("decoding TTC inode record: %w", d.err)
+	}
+	return inode, nil
+}
+
+func decodeBinaryDirectoryEntryRecord(data []byte) (DirectoryEntryRecord, error) {
+	d := graphDecoder{data: data, pos: 1}
+	entry := DirectoryEntryRecord{Parent: d.uvarint(), Name: d.string(), Inode: d.uvarint()}
+	if d.err == nil && d.pos != len(data) {
+		d.fail("trailing bytes")
+	}
+	if d.err != nil {
+		return DirectoryEntryRecord{}, fmt.Errorf("decoding TTC directory entry record: %w", d.err)
+	}
+	return entry, nil
 }

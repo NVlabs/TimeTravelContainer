@@ -262,7 +262,7 @@ func FuzzDecodeFilesystemRecords(f *testing.F) {
 // are.
 var oddStrings = []string{"", "plain", "<&>", "tab\there", "quote\"back\\slash", "café", "line sep", "\xff\xfe", "nul\x00"}
 
-// A record encodes as encoding/json encodes it, byte for byte.
+// A record's JSON is encoding/json's, byte for byte.
 func TestEncodeFilesystemRecords(t *testing.T) {
 	random := rand.New(rand.NewSource(5))
 	for round := 0; round < 500; round++ {
@@ -285,7 +285,6 @@ func TestEncodeFilesystemRecords(t *testing.T) {
 			func() ([]byte, error) { return appendInodeRecordJSON(nil, &inode) },
 			inode.MarshalJSON,
 			func() ([]byte, error) { return json.Marshal(inode) },
-			func() ([]byte, error) { return encodeRecord(inode) },
 		} {
 			if got, err := encode(); err != nil || !bytes.Equal(got, want) {
 				t.Fatalf("round %d: inode encodes (%v) as\n%s\nwant\n%s", round, err, got, want)
@@ -299,7 +298,6 @@ func TestEncodeFilesystemRecords(t *testing.T) {
 			func() ([]byte, error) { return appendDirectoryEntryRecordJSON(nil, &entry) },
 			entry.MarshalJSON,
 			func() ([]byte, error) { return json.Marshal(entry) },
-			func() ([]byte, error) { return encodeRecord(entry) },
 		} {
 			if got, err := encode(); err != nil || !bytes.Equal(got, want) {
 				t.Fatalf("round %d: entry encodes (%v) as\n%s\nwant\n%s", round, err, got, want)

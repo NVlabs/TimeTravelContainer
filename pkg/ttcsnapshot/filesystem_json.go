@@ -188,6 +188,9 @@ func marshalInodeRecord(r *InodeRecord) ([]byte, error) {
 // encoding/json took 20-40 us a record, 3.9 s of the 34 s it took to make a
 // lazily imported tree of 100,000 files durable.
 func decodeInodeRecord(data []byte) (InodeRecord, error) {
+	if len(data) != 0 && data[0] == recordMagic {
+		return decodeBinaryInodeRecord(data)
+	}
 	if inode, ok := decodeCanonicalInodeRecord(data); ok {
 		return inode, nil
 	}
@@ -198,6 +201,9 @@ func decodeInodeRecord(data []byte) (InodeRecord, error) {
 
 // decodeDirectoryEntryRecord is decodeInodeRecord for a directory entry.
 func decodeDirectoryEntryRecord(data []byte) (DirectoryEntryRecord, error) {
+	if len(data) != 0 && data[0] == recordMagic {
+		return decodeBinaryDirectoryEntryRecord(data)
+	}
 	if entry, ok := decodeCanonicalDirectoryEntryRecord(data); ok {
 		return entry, nil
 	}
