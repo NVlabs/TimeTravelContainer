@@ -157,6 +157,12 @@ func (cp Capability) String() string {
 		return "CAP_BLOCK_SUSPEND"
 	case CAP_AUDIT_READ:
 		return "CAP_AUDIT_READ"
+	case CAP_PERFMON:
+		return "CAP_PERFMON"
+	case CAP_BPF:
+		return "CAP_BPF"
+	case CAP_CHECKPOINT_RESTORE:
+		return "CAP_CHECKPOINT_RESTORE"
 	default:
 		return "UNKNOWN"
 	}

@@ -583,11 +583,11 @@ func ttcMaxTasks(spec *specs.Spec) (uint64, error) {
 	return uint64(limit), nil
 }
 
-func getRootCredentials(spec *specs.Spec, conf *config.Config, userNs *auth.UserNamespace) *auth.Credentials {
+func getRootCredentials(spec *specs.Spec, conf *config.Config, userNs *auth.UserNamespace) (*auth.Credentials, error) {
 	// Create capabilities.
 	caps, err := specutils.Capabilities(conf.EnableRaw, spec.Process.Capabilities)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 
 	// Convert the spec's additional GIDs to KGIDs.
@@ -606,7 +606,7 @@ func getRootCredentials(spec *specs.Spec, conf *config.Config, userNs *auth.User
 		extraKGIDs,
 		caps,
 		userNs)
-	return creds
+	return creds, nil
 }
 
 // New initializes a new kernel loader configured by spec.
@@ -858,9 +858,9 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("enabling strace: %w", err)
 	}
 
-	creds := getRootCredentials(args.Spec, args.Conf, nil /* UserNamespace */)
-	if creds == nil {
-		return nil, fmt.Errorf("getting root credentials")
+	creds, err := getRootCredentials(args.Spec, args.Conf, nil /* UserNamespace */)
+	if err != nil {
+		return nil, fmt.Errorf("getting root credentials: %w", err)
 	}
 	// Create root network namespace/stack.
 	netns, err := newRootNetworkNamespace(args.Conf, tk.TCPIPClock(), creds.UserNamespace, l.k)
@@ -1671,9 +1671,9 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 	// sentry currently supports only 1 mount namespace, which is tied to a
 	// single user namespace. Thus we must run in the same user namespace
 	// to access mounts.
-	creds := getRootCredentials(spec, conf, l.k.RootUserNamespace())
-	if creds == nil {
-		return fmt.Errorf("getting root credentials")
+	creds, err := getRootCredentials(spec, conf, l.k.RootUserNamespace())
+	if err != nil {
+		return fmt.Errorf("getting root credentials: %w", err)
 	}
 	var pidns *kernel.PIDNamespace
 	if ns, ok := specutils.GetNS(specs.PIDNamespace, spec); ok {
@@ -1710,7 +1710,6 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 		nvproxyDevInfo:     l.root.nvproxyDevInfo,
 		rootfsUpperTarFD:   rootfsUpperTarFD,
 	}
-	var err error
 	info.procArgs, err = createProcessArgs(cid, spec, conf, creds, l.k, pidns)
 	if err != nil {
 		return fmt.Errorf("creating new process: %w", err)

@@ -109,6 +109,7 @@ go_test(
     name = "linux_test",
     size = "small",
     srcs = [
+        "capability_test.go",
         "drm_test.go",
         "netfilter_test.go",
     ],
