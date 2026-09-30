@@ -80,7 +80,11 @@ func (r *GuestRAM) externalFrames(hostAddress uintptr, length uint64) ([]pgalloc
 		}
 		runLength := a - runStart
 		gpa := r.nextGPA
-		if err := r.vm.MapStage2(gpa, uintptr(runStart), runLength, Stage2Read|Stage2Write); err != nil {
+		mapStage2 := r.vm.MapStage2
+		if shared, ok := r.vm.(SharedStage2Mapper); ok {
+			mapStage2 = shared.MapSharedStage2
+		}
+		if err := mapStage2(gpa, uintptr(runStart), runLength, Stage2Read|Stage2Write); err != nil {
 			return nil, fmt.Errorf("mapping external memory [%#x, %#x) at stage 2: %w", runStart, a, err)
 		}
 		r.nextGPA += runLength

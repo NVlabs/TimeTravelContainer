@@ -26,6 +26,7 @@ type Exit = vmm.Exit
 type HostMemory = vmm.HostMemory
 type HostRange = vmm.HostRange
 type HostRangeReleaser = vmm.HostRangeReleaser
+type SharedStage2Mapper = vmm.SharedStage2Mapper
 type MonitorPoolExpansion = vmm.MonitorPoolExpansion
 type MonitorPoolExpander = vmm.MonitorPoolExpander
 

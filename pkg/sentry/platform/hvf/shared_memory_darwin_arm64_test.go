@@ -21,7 +21,9 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	sentryplatform "gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/platform/hvf"
+	"gvisor.dev/gvisor/pkg/sentry/platform/hvf/ring0asm"
 	"gvisor.dev/gvisor/pkg/sentry/platform/vmplatform"
 	vmarm64 "gvisor.dev/gvisor/pkg/sentry/platform/vmplatform/arm64"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
@@ -126,9 +128,12 @@ func TestRing0PlatformMapsSharedHostMemoryInPlace(t *testing.T) {
 		codeVA   = hostarch.Addr(0x600000)
 		sharedVA = hostarch.Addr(0x800000)
 	)
-	// Read the word at sharedVA, and store it plus one after it.
+	// Make a syscall, then read the word at sharedVA, and store it plus one
+	// after it.
 	var code []byte
 	for _, insn := range []uint32{
+		0xd2801588, // movz x8, #172
+		0xd4000001, // svc #0
 		0xd2a01009, // movz x9, #0x80, lsl #16 (x9 = sharedVA)
 		0xb940012a, // ldr w10, [x9]
 		0x1100054a, // add w10, w10, #1
@@ -157,6 +162,26 @@ func TestRing0PlatformMapsSharedHostMemoryInPlace(t *testing.T) {
 	if err := as.MapFile(codeVA, mf, codeRange, hostarch.ReadExecute, false); err != nil {
 		t.Fatal(err)
 	}
+	platformCtx := p.NewContext(gcontext.Background())
+	defer platformCtx.Release()
+	mm := &compactionTestMemoryManager{as: as}
+
+	// As in a Sentry, the guest faults on the memory first, and the fault's
+	// handler maps it wherever the continuation that ran the guest is. In a
+	// Sentry that is guest EL1 after a syscall, where the Sentry can touch
+	// only memory that it owns, or that stage 2 already maps; in this test's
+	// process, whose runtime cannot stay at EL1, it is host EL0.
+	binary.LittleEndian.PutUint32(shared.mapping[0:], 41)
+	ac := arch.New(arch.ARM64)
+	ac.SetIP(uintptr(codeVA))
+	if _, _, err := platformCtx.Switch(gcontext.Background(), mm, ac, -1); err != nil || ac.Regs.Regs[8] != 172 {
+		t.Fatalf("the guest's first syscall: %v, x8=%d", err, ac.Regs.Regs[8])
+	}
+	info, _, err := platformCtx.Switch(gcontext.Background(), mm, ac, -1)
+	if err != sentryplatform.ErrContextSignal || info.Addr() != uint64(sharedVA) {
+		t.Fatalf("running the guest before the memory is mapped: %v, %+v; want a fault at %#x", err, info, sharedVA)
+	}
+	t.Logf("mapping the memory at EL%d", ring0asm.CurrentEL())
 	sharedRange := memmap.FileRange{Start: 0, End: hostarch.PageSize}
 	if err := as.MapFile(sharedVA, shared, sharedRange, hostarch.ReadWrite, false); err != nil {
 		t.Fatalf("mapping shared memory: %v", err)
@@ -164,16 +189,19 @@ func TestRing0PlatformMapsSharedHostMemoryInPlace(t *testing.T) {
 	if err := as.MapFile(sharedVA+hostarch.PageSize, shared, sharedRange, hostarch.AnyAccess, false); err == nil {
 		t.Fatal("mapped shared memory executable")
 	}
+	if _, _, err := platformCtx.Switch(gcontext.Background(), mm, ac, -1); err != nil {
+		t.Fatalf("resuming the guest: %v", err)
+	}
+	if got := binary.LittleEndian.Uint32(shared.mapping[4:]); ac.Regs.Regs[8] != 172 || got != 42 {
+		t.Fatalf("after resuming, the guest wrote %d and made syscall %d; want 42 and 172", got, ac.Regs.Regs[8])
+	}
 
-	platformCtx := p.NewContext(gcontext.Background())
-	defer platformCtx.Release()
-	mm := &compactionTestMemoryManager{as: as}
-	for _, value := range []uint32{41, 1000} {
+	for _, value := range []uint32{1000, 7} {
 		// The host's write is the guest's read, and the guest's write is the
 		// host's read: nothing staged the memory.
 		binary.LittleEndian.PutUint32(shared.mapping[0:], value)
 		ac := arch.New(arch.ARM64)
-		ac.SetIP(uintptr(codeVA))
+		ac.SetIP(uintptr(codeVA) + 8)
 		if _, _, err := platformCtx.Switch(gcontext.Background(), mm, ac, -1); err != nil {
 			t.Fatalf("running the guest: %v", err)
 		}

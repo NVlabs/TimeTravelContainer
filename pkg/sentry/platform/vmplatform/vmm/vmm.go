@@ -30,6 +30,15 @@ type VM interface {
 	Close() error
 }
 
+// SharedStage2Mapper is implemented by VMs that must prepare to map host
+// memory that the Sentry shares with another process, such as a GPU
+// renderer's, and does not own. Mapping touches the memory, which the Sentry
+// may be unable to do where it runs until the memory is mapped.
+type SharedStage2Mapper interface {
+	// MapSharedStage2 is MapStage2 for such memory.
+	MapSharedStage2(gpa uint64, hostAddress uintptr, length uint64, access Stage2Access) error
+}
+
 // MonitorPoolExpansion describes one permanently leased stage-2 range that
 // may be admitted to the monitor's private page-table allocator. It is an
 // execution cache and is never checkpointed.
