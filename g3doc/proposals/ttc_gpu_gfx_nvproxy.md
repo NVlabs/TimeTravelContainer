@@ -263,17 +263,22 @@ and UVM ioctls and maps GPU memory and doorbells into the application:
             own, and stage 1 maps them into the application;
         *   libkrun (krunkit) maps MoltenVK's memory into its guests the same
             way, with `hv_vm_map`;
-        *   the pages must first be mapped in the Sentry's process, so the
-            renderer must share them (A0 decides how);
+        *   the pages must first be mapped in the Sentry's process. With
+            gfxstream's `ExternalBlob` and `SystemBlob` features, every blob
+            is POSIX shared memory, which the renderer exports as a file
+            descriptor and the Sentry maps (A0);
         *   they are never executable: mapping host-executable pages in stage 2
             panics macOS;
         *   they are aligned to 16 KiB pages.
     *   **Linux.** gfxstream exports blobs as file descriptors, which the Sentry
         maps as nvproxy maps device memory: a host-FD-backed `memmap.File`.
-    *   **Better, where the backend allows it**, the renderer imports memory
-        that the Sentry allocates, through a host-pointer import. Blobs are
-        then ordinary guest memory, which a fork copies on write. A0 checks
-        whether MoltenVK and gfxstream support it.
+    *   **Memory the Sentry allocates.** The protocol can back host-visible
+        allocations with guest memory instead (`GETPARAM` 10,
+        `CREATE_GUEST_HANDLE`), and MoltenVK can import such memory by host
+        pointer, but gfxstream implements the host side only on Linux and
+        Android, through dma-buf. It would give the family's memory accounting
+        the GPU's memory, not copy-on-write forks: the GPU's writes bypass the
+        CPU's page tables, so memory it writes is copied at fork either way.
 
 ### Fork semantics
 
@@ -293,11 +298,14 @@ carried in the capture and load context as nvproxy's device remapping is:
 
 *   The child's device loads with every inherited context lost. Its submissions
     fail, its waits return, and its fences signal with an error.
-*   Its mappings of the source's blob memory become inaccessible, since they
-    belong to the source's renderer.
-*   The child's next context gets a new renderer. Its guest driver should
-    report `VK_ERROR_DEVICE_LOST`; A0 checks what Mesa's gfxstream driver
-    does.
+*   The guest driver busy-waits on its command rings, and gives up only when a
+    ring's `in_error` field is set (see the A0 findings). So the child gets
+    private copies of its rings with `in_error` set.
+*   Its other mappings of the source's blob memory become inaccessible, since
+    they belong to the source's renderer.
+*   The child's next context gets a new renderer. The guest driver reports
+    `VK_ERROR_DEVICE_LOST` from fence waits; what it does elsewhere, and what
+    applications do, is for A4 to find out.
 
 **gfx, `snapshot`:**
 
@@ -308,7 +316,9 @@ carried in the capture and load context as nvproxy's device remapping is:
     child's first GPU use. The child's blob mappings are re-established, at the
     same guest addresses, against its own renderer.
 *   The cost grows with the GPU memory in use, since device memory has no copy
-    on write.
+    on write. Neither does memory the GPU writes that the CPU also maps: the
+    GPU's writes bypass the CPU's page tables, so such memory is copied at the
+    fork, never shared copy-on-write.
 *   Dehydration, remote forks, and migrations carry the snapshot directory with
     the image, and restore only where the renderer profile matches.
 *   A snapshot family's device profile hides what gfxstream cannot capture:
@@ -371,6 +381,76 @@ A container may have both `/dev/nvidia*` and the virtual GPU's render node:
     Candidates: host-pointer import into memory the Sentry allocates, IOSurface,
     or Mach memory entries.
 *   What does Mesa's gfxstream driver do when its host context is lost?
+
+**A0 findings (2026-09-30)**, with gfxstream at 62c7716, Mesa at 49162a0, and
+MoltenVK 1.4.2 on an Apple M5 Pro:
+
+*   **The renderer runs on MoltenVK.**
+    *   gfxstream's host side builds on macOS with meson
+        (`-Dgfxstream-build=host`). The Vulkan-only configuration
+        (`-Ddecoders=vulkan`) does not compile: `frame_buffer.h` includes a
+        `gles_compat.h` that does not exist. The default decoders build, and
+        initializing with only `STREAM_RENDERER_FLAGS_USE_VK_BIT` runs Vulkan
+        only.
+    *   It needs `ANDROID_EMU_VK_LOADER_PATH` to find the Vulkan loader: it
+        looks only beside the program, then for `libvulkan.dylib`.
+    *   If initialization fails, `stream_renderer_init` hangs instead of
+        returning an error: `GetRenderer` waits for a frame buffer that will
+        never exist. Our build must patch that.
+    *   Its host compositor cannot create its pipelines under MoltenVK (a
+        SPIR-V to MSL argument-buffer error). Headless rendering does not use
+        it.
+*   **What the renderer offers the guest:** capset 3 is 112 bytes, protocol
+    1, a 12 KiB command ring and 1 MiB buffer, 16 KiB blob alignment, and
+    deferred mapping.
+*   **Blob memory crosses processes as POSIX shared memory.** With
+    `STREAM_RENDERER_FLAGS_USE_EXTERNAL_BLOB | USE_SYSTEM_BLOB`:
+    *   the command ring is `shm_open` memory, which `stream_renderer_export_blob`
+        returns as a `STREAM_HANDLE_TYPE_MEM_SHM` descriptor that another
+        process can map (verified);
+    *   host-visible Vulkan memory is such shared memory too, imported into
+        Vulkan with `VK_EXT_external_memory_host` (read, not yet run; gfxstream
+        warns that `SystemBlob` "has only been tested on Windows");
+    *   MoltenVK imports shared memory by host pointer at 16 KiB alignment, and
+        a second mapping of it, as the Sentry's would be, sees the GPU's writes
+        and the GPU sees its writes (verified with a probe).
+*   **Snapshots need a snapshot-enabled build.** `stream_renderer_snapshot` and
+    `stream_renderer_restore` return `-EINVAL` unless
+    `GFXSTREAM_BUILD_WITH_SNAPSHOT_FRONTEND_SUPPORT` is defined, which only
+    the Bazel and Android builds do. It needs protobuf for five host `.proto`
+    files. A round trip means something only with guest traffic, so it waits
+    for A2.
+*   **No distribution packages the guest driver.** Debian sid, Ubuntu 26.04,
+    Fedora, and Alpine edge on arm64 ship venus and lavapipe, not Mesa's
+    gfxstream driver. So `--gfx` should provide it: build Mesa with
+    `-Dvulkan-drivers=gfxstream`, and inject the driver into the container, as
+    NVIDIA's container toolkit injects NVIDIA's libraries; one build per libc
+    and architecture. Mesa's driver builds in a Debian sid arm64 TTC container
+    (`libvulkan_gfxstream.so` and `gfxstream_vk_icd.aarch64.json`). Without a
+    device, `vulkaninfo` with it fails cleanly after it finds no `/dev/dri`.
+*   **What the guest driver needs** (from Mesa's source; A2 confirms with
+    traces):
+    *   discovery: libdrm's `drmGetDevices2` over `/dev/dri` and sysfs finds a
+        PCI device `1af4:1050`, or any platform device, with a render node;
+        `DRM_IOCTL_VERSION` must say `virtio_gpu`, major version 0;
+    *   `GETPARAM` 1 to 8, and ChromeOS's 9 (fence passing) and 10 (create
+        guest handle). Upstream Linux defines 9 as blob alignment, so the
+        Sentry answers 9 and 10 as unknown (`EINVAL`);
+    *   `GET_CAPS` for capset 3, and `CONTEXT_INIT` with two rings, capset 3,
+        and an optional debug name;
+    *   `RESOURCE_CREATE`, `RESOURCE_CREATE_BLOB` (host blobs, mappable, or
+        shareable and cross-device), `RESOURCE_INFO`, `MAP` and `mmap` of the
+        device, `EXECBUFFER` with at most one buffer, a ring index, and a
+        fence out, `WAIT`, `TRANSFER_TO_HOST`, `TRANSFER_FROM_HOST`,
+        `GEM_CLOSE`, and PRIME export and import;
+    *   sync_file descriptors that `poll` reports, with `SYNC_IOC_FILE_INFO`
+        for debugging.
+*   **The command transport is a ring in shared memory.** The guest writes
+    commands into a host blob with blob ID 0, which it maps, and pings with
+    `EXECBUFFER` only when the host is not consuming. It busy-waits for the
+    host, falling back to `usleep` after 50 million spins, and gives up only
+    when the ring's `in_error` field is set. Its Vulkan driver reports
+    `VK_ERROR_DEVICE_LOST` from fence waits.
 
 **A1, the Sentry's device**, independent of the platform, with a fake renderer
 for unit tests:
@@ -473,7 +553,10 @@ redroid's arm64 images could then run on macOS too.
     explicit go-ahead.
 *   MoltenVK's coverage limits what Zink and ANGLE can offer on macOS.
 *   gfxstream's Vulkan snapshots are young, and gated by a feature flag.
-*   Mesa's gfxstream driver may not be packaged by distributions.
+*   No distribution packages Mesa's gfxstream driver, so TTC builds and
+    injects it.
+*   gfxstream's `SystemBlob` path, which TTC's renderer relies on for
+    cross-process blobs, is tested upstream only on Windows.
 *   It is unknown how Mesa's gfxstream driver, and Android, behave when a
     device is lost.
 *   A renderer per branch costs memory. Starting them lazily limits that.
