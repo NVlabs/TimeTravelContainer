@@ -14314,20 +14314,16 @@ func (b *runtimeBackend) reconcileVolatileSnapshotOrigins() (int, error) {
 	// once for each origin.
 	locked, unlockOrigins := b.distributedSource.tryLockSnapshotOrigins(stale)
 	defer unlockOrigins()
-	if len(locked) != 0 {
-		if filesystem, err = b.containerStore().FilesystemSnapshotOrigins(); err != nil {
-			return 0, fmt.Errorf("rechecking orphan snapshot origins: %w", err)
-		}
-	}
-	var orphans []uint64
-	for _, encoded := range locked {
-		live, err := b.lockedOriginLive(ttcsnapshot.SnapshotID(encoded), filesystem)
-		if err != nil {
-			return 0, fmt.Errorf("rechecking orphan snapshot origin %d: %w", encoded, err)
-		}
-		if !live {
-			orphans = append(orphans, encoded)
-		}
+	orphans, err := staleOriginOrphans(locked,
+		func(origin uint64) bool {
+			return b.distributedSource.buildingOrigin(ttcsnapshot.SnapshotID(origin))
+		},
+		b.containerStore().FilesystemSnapshotOrigins,
+		func(origin uint64, filesystem map[ttcsnapshot.SnapshotID]struct{}) (bool, error) {
+			return b.lockedOriginLive(ttcsnapshot.SnapshotID(origin), filesystem)
+		})
+	if err != nil {
+		return 0, err
 	}
 	// The orphans are independent, and each costs an authority proposal:
 	// several go at once, and the authority commits theirs together.
@@ -14354,6 +14350,43 @@ func (b *runtimeBackend) reconcileVolatileSnapshotOrigins() (int, error) {
 		return 0, err
 	}
 	return abandoned + len(stale), nil
+}
+
+// staleOriginOrphans returns those of locked, stale origins whose locks the
+// caller holds, that nothing holds: neither a scope that builds one, nor a
+// repository, as inventory lists them all once, nor what live finds. Which
+// are building is read before the repositories are: one still building then
+// is held, and one whose building ended before was installed in its
+// repository, which inventory then lists. Read after, an origin a
+// rehydration installed after the listing, and finished building before the
+// read, was in neither, and was abandoned: the branch's next publication
+// named an origin the authority no longer knew, and never completed.
+func staleOriginOrphans(locked []uint64, building func(uint64) bool, inventory func() (map[ttcsnapshot.SnapshotID]struct{}, error), live func(uint64, map[ttcsnapshot.SnapshotID]struct{}) (bool, error)) ([]uint64, error) {
+	if len(locked) == 0 {
+		return nil, nil
+	}
+	built := make(map[uint64]bool, len(locked))
+	for _, origin := range locked {
+		built[origin] = building(origin)
+	}
+	filesystem, err := inventory()
+	if err != nil {
+		return nil, fmt.Errorf("rechecking orphan snapshot origins: %w", err)
+	}
+	var orphans []uint64
+	for _, origin := range locked {
+		if built[origin] {
+			continue
+		}
+		held, err := live(origin, filesystem)
+		if err != nil {
+			return nil, fmt.Errorf("rechecking orphan snapshot origin %d: %w", origin, err)
+		}
+		if !held {
+			orphans = append(orphans, origin)
+		}
+	}
+	return orphans, nil
 }
 
 // staleOriginWorkers is how many stale origins a reconciliation abandons at

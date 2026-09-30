@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -1265,5 +1266,36 @@ func TestSnapshotReferenceInventoryPassesOverReleasedClaims(t *testing.T) {
 	}
 	if len(inventory.Claims) != 0 {
 		t.Fatalf("inventory claims = %+v", inventory.Claims)
+	}
+}
+
+// A stale origin whose building ends while the repositories are listed, as a
+// rehydration's does once it has installed the origin, which the listing may
+// miss, is not an orphan: which origins are building is read first.
+func TestStaleOriginOrphansReadsBuildingFirst(t *testing.T) {
+	building := map[uint64]bool{7: true}
+	inventory := func() (map[ttcsnapshot.SnapshotID]struct{}, error) {
+		listing := map[ttcsnapshot.SnapshotID]struct{}{9: {}}
+		// Origin 7 is installed in a repository after the listing, and then
+		// stops building.
+		building[7] = false
+		return listing, nil
+	}
+	live := func(origin uint64, filesystem map[ttcsnapshot.SnapshotID]struct{}) (bool, error) {
+		if building[origin] {
+			return true, nil
+		}
+		_, ok := filesystem[ttcsnapshot.SnapshotID(origin)]
+		return ok, nil
+	}
+	orphans, err := staleOriginOrphans([]uint64{7, 8, 9}, func(origin uint64) bool { return building[origin] }, inventory, live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(orphans, []uint64{8}) {
+		t.Fatalf("orphans %v, want [8]", orphans)
+	}
+	if orphans, err := staleOriginOrphans(nil, nil, nil, nil); err != nil || orphans != nil {
+		t.Fatalf("no locked origin gave orphans %v, %v", orphans, err)
 	}
 }
