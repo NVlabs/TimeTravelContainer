@@ -640,6 +640,11 @@ type HostMemoryFile interface {
 	// HostAddress returns the address of fr in the Sentry's mapping of the
 	// memory. The mapping is stable while any page of the File is referenced.
 	HostAddress(fr FileRange) (uintptr, error)
+
+	// OnRelease arranges for f to be called once, before the Sentry unmaps
+	// the memory, after nothing references the File's pages. A platform that
+	// maps the memory into guests itself unmaps it there then.
+	OnRelease(f func())
 }
 
 // MemoryFileRange identifies one range whose ownership is serialized as part

@@ -201,3 +201,55 @@ func TestCloseIsNotLoss(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 }
+
+func TestHostMemoryRelease(t *testing.T) {
+	shm, err := os.CreateTemp(t.TempDir(), "blob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shm.Close()
+	hostPage := int64(unix.Getpagesize())
+	if err := shm.Truncate(hostPage); err != nil {
+		t.Fatal(err)
+	}
+	fd, err := unix.Dup(int(shm.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := newHostMemory(fd, uint64(hostPage))
+	if err != nil {
+		t.Fatalf("newHostMemory: %v", err)
+	}
+	fr := memmap.FileRange{Start: 0, End: hostarch.PageSize}
+	m.IncRef(fr, 0)
+	released := 0
+	m.OnRelease(func() {
+		// The memory is still mapped.
+		if _, err := m.HostAddress(fr); err != nil {
+			t.Errorf("HostAddress in a release hook: %v", err)
+		}
+		released++
+	})
+	m.Release()
+	if released != 0 {
+		t.Fatal("released memory whose pages are referenced")
+	}
+	m.DecRef(fr)
+	if released != 1 {
+		t.Errorf("release hooks ran %d times, want 1", released)
+	}
+	// Memory that is not whole host pages is refused.
+	if hostPage > hostarch.PageSize {
+		fd, err := unix.Dup(int(shm.Fd()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := shm.Truncate(hostPage - hostarch.PageSize); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := newHostMemory(fd, uint64(hostPage-hostarch.PageSize)); err == nil {
+			t.Error("mapped shared memory shorter than a host page")
+		}
+		unix.Close(fd)
+	}
+}

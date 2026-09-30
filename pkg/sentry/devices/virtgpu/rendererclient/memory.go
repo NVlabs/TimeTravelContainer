@@ -5,6 +5,7 @@ package rendererclient
 
 import (
 	"fmt"
+	"sync"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -26,6 +27,11 @@ type hostMemory struct {
 	fd      int
 	mapping []byte
 	size    uint64
+
+	// releaseMu protects releaseHooks, which run before the memory is
+	// unmapped.
+	releaseMu    sync.Mutex
+	releaseHooks []func()
 }
 
 var _ virtgpu.ResourceMemory = (*hostMemory)(nil)
@@ -33,8 +39,11 @@ var _ memmap.HostMemoryFile = (*hostMemory)(nil)
 
 // newHostMemory maps size bytes of the shared memory fd, which it takes.
 func newHostMemory(fd int, size uint64) (*hostMemory, error) {
-	length, ok := hostarch.PageRoundUp(size)
-	if !ok || length == 0 {
+	// Map whole host pages, which platforms that map the memory into guests
+	// map whole.
+	hostPage := uint64(unix.Getpagesize())
+	length := (size + hostPage - 1) &^ (hostPage - 1)
+	if length < size || length == 0 || length%hostarch.PageSize != 0 {
 		return nil, fmt.Errorf("shared memory of %d bytes", size)
 	}
 	var st unix.Stat_t
@@ -72,8 +81,22 @@ func (m *hostMemory) Release() {
 	m.MappableRelease()
 }
 
+// OnRelease implements memmap.HostMemoryFile.OnRelease.
+func (m *hostMemory) OnRelease(f func()) {
+	m.releaseMu.Lock()
+	defer m.releaseMu.Unlock()
+	m.releaseHooks = append(m.releaseHooks, f)
+}
+
 // Close is called once the memory is released and no page is referenced.
 func (m *hostMemory) Close() error {
+	m.releaseMu.Lock()
+	hooks := m.releaseHooks
+	m.releaseHooks = nil
+	m.releaseMu.Unlock()
+	for _, f := range hooks {
+		f()
+	}
 	err := unix.Munmap(m.mapping)
 	m.mapping = nil
 	if closeErr := unix.Close(m.fd); err == nil {

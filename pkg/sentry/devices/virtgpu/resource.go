@@ -201,6 +201,9 @@ func (r *resource) configureMMap(opts *memmap.MMapOpts, offset uint64) error {
 	opts.Offset = offset
 	opts.Mappable = r
 	opts.MappingIdentity = r
+	// The renderer's memory is never executable: platforms that map it into
+	// guests in place do not let it be.
+	opts.MaxPerms.Execute = false
 	r.IncRef()
 	return nil
 }

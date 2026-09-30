@@ -69,6 +69,17 @@ type Platform struct {
 	transitionDone chan struct{}
 	epochErr       error
 	closed         bool
+
+	// hostMemoryMu protects hostMemories, the parts of each
+	// memmap.HostMemoryFile that guests may map, which the platform maps in
+	// place until the file is released.
+	hostMemoryMu sync.Mutex
+	hostMemories map[memmap.HostMemoryFile]hostRange
+}
+
+// hostRange is a range of host addresses.
+type hostRange struct {
+	start, end uintptr
 }
 
 // New constructs the common VM platform.
@@ -135,6 +146,8 @@ func New(config Config) (*Platform, error) {
 		newEngine: engineFactory,
 		vcpus:     config.VCPUs,
 		spaces:    make(map[uint64]*addressSpace),
+
+		hostMemories: make(map[memmap.HostMemoryFile]hostRange),
 	}
 	ram.SetRevoker(p)
 	ram.SetRelocator(p)
@@ -597,6 +610,10 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, file memmap.File, fr memmap.
 		var err error
 		if resolver, ok := file.(frameResolver); ok {
 			frames, frameLease, err = resolver.AcquireBackingFrames(fr, at)
+			stagedPages = nil
+		} else if hostMemory, ok := file.(memmap.HostMemoryFile); ok {
+			frames, err = as.platform.hostMemoryFrames(hostMemory, fr, at)
+			frameLease = nil
 			stagedPages = nil
 		} else {
 			frames, stagedPages, err = as.platform.staging.resolve(file, fr, at)

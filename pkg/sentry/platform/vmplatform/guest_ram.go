@@ -95,6 +95,11 @@ type guestSlab struct {
 	releasing   bool
 	frames      [FramesPerSlab]*guestFrame
 
+	// external is whether the slab is host memory that another process
+	// shares (see externalFrames), rather than GuestRAM's: its frames belong
+	// to no backing, never move, and are never executable.
+	external bool
+
 	// inPartial and partialOccupancy record the slab's membership in
 	// GuestRAM.partialSlabs and the occupancy that GuestRAM.partialFree and
 	// GuestRAM.partialByOccupancy account for. They are protected by
@@ -204,6 +209,9 @@ type GuestRAM struct {
 	allocationSlab *guestSlab
 	logicalBytes   uint64
 	logicalLimit   uint64
+
+	// external maps the host addresses of external slabs to them.
+	external map[uintptr]*guestSlab
 }
 
 type guestMappingLease struct {
@@ -284,6 +292,7 @@ func NewGuestRAM(config GuestRAMConfig) (*GuestRAM, error) {
 		frames:       make(map[pgalloc.FrameID]*guestFrame),
 		slabs:        make(map[slabKey]*guestSlab),
 		partialSlabs: make(map[slabKey]*guestSlab),
+		external:     make(map[uintptr]*guestSlab),
 	}
 	r.cond = sync.NewCond(&r.mu)
 	return r, nil
@@ -626,7 +635,7 @@ func betterAllocationSlab(candidate, current *guestSlab) bool {
 }
 
 func (r *GuestRAM) considerAllocationSlabLocked(candidate *guestSlab) {
-	if candidate == nil {
+	if candidate == nil || candidate.external {
 		return
 	}
 	occupancy := slabOccupancy(candidate)
@@ -1268,7 +1277,7 @@ func (r *GuestRAM) compactExclusive(ctx context.Context) (GuestRAMCompaction, er
 	var live uint64
 	for _, slab := range r.slabs {
 		occupancy := slabOccupancy(slab)
-		if occupancy == 0 {
+		if occupancy == 0 || slab.external {
 			continue
 		}
 		live += occupancy
@@ -1483,7 +1492,7 @@ func (r *GuestRAM) beginEpochRebind(vm VM) (*epochRebindPlan, error) {
 	nextGPA := r.ipaStart
 	for _, key := range keys {
 		slab := r.slabs[key]
-		if err := vm.MapStage2(nextGPA, slab.hostAddress, HostSlabSize, Stage2Read|Stage2Write|Stage2Execute); err != nil {
+		if err := vm.MapStage2(nextGPA, slab.hostAddress, HostSlabSize, slab.stage2Access()); err != nil {
 			for i := len(plan.bindings) - 1; i >= 0; i-- {
 				_ = vm.UnmapStage2(plan.bindings[i].gpa, HostSlabSize)
 			}
@@ -1548,7 +1557,7 @@ func (r *GuestRAM) Metrics() GuestRAMMetrics {
 	defer r.mu.Unlock()
 	return GuestRAMMetrics{
 		LogicalBytes:      r.logicalBytes,
-		HostResidentBytes: uint64(len(r.slabs)) * HostSlabSize,
+		HostResidentBytes: uint64(len(r.slabs)-len(r.external)) * HostSlabSize,
 		IPABytesConsumed:  r.nextGPA - r.ipaStart,
 		LogicalLimitBytes: r.logicalLimit,
 		Epoch:             r.epoch,
