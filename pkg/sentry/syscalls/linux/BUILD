@@ -91,6 +91,7 @@ go_library(
         "//pkg/rand",
         "//pkg/safemem",
         "//pkg/sentry/arch",
+        "//pkg/sentry/fsimpl/bpffs",
         "//pkg/sentry/fsimpl/ebpffd",
         "//pkg/sentry/fsimpl/devpts",
         "//pkg/sentry/fsimpl/eventfd",

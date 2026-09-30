@@ -89,6 +89,7 @@ go_library(
         "//pkg/sentry/fdimport",
         "//pkg/sentry/fscheckpoint",
         "//pkg/sentry/fsimpl/binderfs",
+        "//pkg/sentry/fsimpl/bpffs",
         "//pkg/sentry/fsimpl/cgroup2fs",
         "//pkg/sentry/fsimpl/cgroupfs",
         "//pkg/sentry/fsimpl/dev",

@@ -131,6 +131,8 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	if k.CgroupRegistry() != nil {
 		fsDirChildren["cgroup"] = fs.newCgroupDir(ctx, creds, defaultSysDirMode, nil)
 	}
+	// The mount point of the bpf filesystem, as Linux's bpf_init makes it.
+	fsDirChildren["bpf"] = fs.newDir(ctx, creds, defaultSysDirMode, nil)
 
 	classSub := map[string]kernfs.Inode{ // /sys/class
 		"power_supply": fs.newDir(ctx, creds, defaultSysDirMode, nil),

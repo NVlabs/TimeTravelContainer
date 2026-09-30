@@ -53,6 +53,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/devutil"
+	"gvisor.dev/gvisor/pkg/ebpf"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/eventchannel"
 	"gvisor.dev/gvisor/pkg/fdnotifier"
@@ -458,6 +459,9 @@ type Kernel struct {
 	MmapRndBits       atomicbitops.Int32
 	MmapRndCompatBits atomicbitops.Int32
 
+	// ebpf is the kernel's eBPF state.
+	ebpf ebpf.Registry
+
 	// devGofers maps containers (using its name) to its device gofer client.
 	devGofers   map[string]*devutil.GoferClient `state:"nosave"`
 	devGofersMu sync.Mutex                      `state:"nosave"`
@@ -673,6 +677,7 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 	k.RandomizeVASpace.Store(2)
 	k.MmapRndBits.Store(MmapRndBitsMin)
 	k.MmapRndCompatBits.Store(MmapRndCompatBitsMin)
+	k.ebpf.Init()
 	k.containerNames = make(map[string]string)
 	k.CheckpointWait.k = k
 
@@ -2721,4 +2726,9 @@ func (k *Kernel) ContainerName(cid string) string {
 	k.extMu.Lock()
 	defer k.extMu.Unlock()
 	return k.containerNames[cid]
+}
+
+// EBPF returns the kernel's eBPF state.
+func (k *Kernel) EBPF() *ebpf.Registry {
+	return &k.ebpf
 }

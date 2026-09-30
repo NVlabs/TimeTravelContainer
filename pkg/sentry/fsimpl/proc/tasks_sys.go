@@ -77,6 +77,8 @@ func (fs *filesystem) newSysDir(ctx context.Context, root *auth.Credentials, k *
 			"randomize_va_space": fs.newInode(ctx, root, 0644, &atomicInt32File{val: &k.RandomizeVASpace, min: 0, max: 2}),
 			"kptr_restrict":      fs.newInode(ctx, root, 0644, &atomicInt32File{val: &k.KptrRestrict, min: 0, max: 2}),
 			"dmesg_restrict":     fs.newInode(ctx, root, 0644, &atomicInt32File{val: &k.DmesgRestrict, min: 0, max: 1}),
+			"unprivileged_bpf_disabled": fs.newInode(ctx, root, 0644, &bpfSysctlFile{
+				val: &k.EBPF().UnprivilegedDisabled, max: 2, sticky: true}),
 			"random": fs.newStaticDir(ctx, root, map[string]kernfs.Inode{
 				"boot_id": fs.newInode(ctx, root, 0444, newStaticFile(randUUID())),
 				"uuid":    fs.newInode(ctx, root, 0444, &uuidData{}),
@@ -178,15 +180,18 @@ func (fs *filesystem) newSysNetDir(ctx context.Context, root *auth.Credentials, 
 		contents = map[string]kernfs.Inode{
 			"ipv4": fs.newStaticDir(ctx, root, ipv4Contents),
 			"core": fs.newStaticDir(ctx, root, map[string]kernfs.Inode{
-				"default_qdisc": fs.newInode(ctx, root, 0444, newStaticFile("pfifo_fast")),
-				"message_burst": fs.newInode(ctx, root, 0444, newStaticFile("10")),
-				"message_cost":  fs.newInode(ctx, root, 0444, newStaticFile("5")),
-				"optmem_max":    fs.newInode(ctx, root, 0444, newStaticFile("0")),
-				"rmem_default":  fs.newInode(ctx, root, 0444, newStaticFile("212992")),
-				"rmem_max":      fs.newInode(ctx, root, 0444, newStaticFile("212992")),
-				"somaxconn":     fs.newInode(ctx, root, 0444, newStaticFile("1024")),
-				"wmem_default":  fs.newInode(ctx, root, 0444, newStaticFile("212992")),
-				"wmem_max":      fs.newInode(ctx, root, 0444, newStaticFile("212992")),
+				"bpf_jit_enable":   fs.newInode(ctx, root, 0644, &bpfSysctlFile{val: &k.EBPF().JITEnable, max: 2}),
+				"bpf_jit_harden":   fs.newInode(ctx, root, 0600, &bpfSysctlFile{val: &k.EBPF().JITHarden, max: 2}),
+				"bpf_jit_kallsyms": fs.newInode(ctx, root, 0600, &bpfSysctlFile{val: &k.EBPF().JITKallsyms, max: 1}),
+				"default_qdisc":    fs.newInode(ctx, root, 0444, newStaticFile("pfifo_fast")),
+				"message_burst":    fs.newInode(ctx, root, 0444, newStaticFile("10")),
+				"message_cost":     fs.newInode(ctx, root, 0444, newStaticFile("5")),
+				"optmem_max":       fs.newInode(ctx, root, 0444, newStaticFile("0")),
+				"rmem_default":     fs.newInode(ctx, root, 0444, newStaticFile("212992")),
+				"rmem_max":         fs.newInode(ctx, root, 0444, newStaticFile("212992")),
+				"somaxconn":        fs.newInode(ctx, root, 0444, newStaticFile("1024")),
+				"wmem_default":     fs.newInode(ctx, root, 0444, newStaticFile("212992")),
+				"wmem_max":         fs.newInode(ctx, root, 0444, newStaticFile("212992")),
 			}),
 		}
 	}
@@ -788,6 +793,51 @@ func (f *atomicInt32File) Write(ctx context.Context, _ *vfs.FileDescription, src
 		return 0, linuxerr.EINVAL
 	}
 
+	f.val.Store(buf[0])
+	return n, nil
+}
+
+// bpfSysctlFile is a sysctl of eBPF, whose value is in [0, max]. Only
+// CAP_SYS_ADMIN may write it. If sticky, a value of 1 can't be changed, as
+// Linux's kernel.unprivileged_bpf_disabled can't.
+//
+// +stateify savable
+type bpfSysctlFile struct {
+	kernfs.DynamicBytesFile
+
+	val    *atomicbitops.Int32
+	max    int32
+	sticky bool
+}
+
+var _ vfs.WritableDynamicBytesSource = (*bpfSysctlFile)(nil)
+
+// Generate implements vfs.DynamicBytesSource.Generate.
+func (f *bpfSysctlFile) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	_, err := fmt.Fprintf(buf, "%d\n", f.val.Load())
+	return err
+}
+
+// Write implements vfs.WritableDynamicBytesSource.Write.
+func (f *bpfSysctlFile) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
+	if !auth.CredentialsFromContext(ctx).HasRootCapability(linux.CAP_SYS_ADMIN) {
+		return 0, linuxerr.EPERM
+	}
+	if offset != 0 {
+		// Ignore partial writes.
+		return 0, linuxerr.EINVAL
+	}
+	buf := make([]int32, 1)
+	n, err := ParseInt32Vec(ctx, src, buf)
+	if err != nil || n == 0 {
+		return 0, err
+	}
+	if buf[0] < 0 || buf[0] > f.max {
+		return 0, linuxerr.EINVAL
+	}
+	if f.sticky && f.val.Load() == 1 && buf[0] != 1 {
+		return 0, linuxerr.EPERM
+	}
 	f.val.Store(buf[0])
 	return n, nil
 }

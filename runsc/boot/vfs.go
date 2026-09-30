@@ -51,6 +51,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/devices/ttydev"
 	"gvisor.dev/gvisor/pkg/sentry/devices/tundev"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/binderfs"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/bpffs"
 	cgroup2fs "gvisor.dev/gvisor/pkg/sentry/fsimpl/cgroup2fs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/cgroupfs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/dev"
@@ -143,6 +144,12 @@ func registerFilesystems(k *kernel.Kernel, info *containerInfo, rdmaSnapshot *rd
 	})
 	// Android's init mounts binderfs, and allocates its binder devices.
 	vfsObj.MustRegisterFilesystemType(binderfs.Name, &binderfs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
+		AllowUserMount: true,
+		AllowUserList:  true,
+	})
+	// Android's init mounts the bpf filesystem, where its bpfloader pins
+	// eBPF maps and programs.
+	vfsObj.MustRegisterFilesystemType(bpffs.Name, &bpffs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
 		AllowUserMount: true,
 		AllowUserList:  true,
 	})

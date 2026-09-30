@@ -12,10 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package ebpf
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 )
 
 // CgroupAttachType is an attachment type that is valid for a cgroup eBPF program.
@@ -151,5 +155,103 @@ func ParseAttachmentType(b linux.BPFAttachType) AttachType {
 		return CGROUP_INET_SOCK_RELEASE
 	}
 
+	return nil
+}
+
+// SupportedProgType returns whether programs of type t may be loaded. They
+// never run. Programs that attach to BTF types, or to other programs, are
+// not supported.
+func SupportedProgType(t linux.BPFProgramType) bool {
+	switch t {
+	case linux.BPF_PROG_TYPE_UNSPEC, linux.BPF_PROG_TYPE_TRACING, linux.BPF_PROG_TYPE_STRUCT_OPS,
+		linux.BPF_PROG_TYPE_EXT, linux.BPF_PROG_TYPE_LSM, linux.BPF_PROG_TYPE_SYSCALL:
+		return false
+	}
+	return t <= linux.BPF_PROG_TYPE_NETFILTER
+}
+
+// IsNetAdminProgType returns whether loading programs of type t needs
+// CAP_NET_ADMIN, as Linux's is_net_admin_prog_type does.
+func IsNetAdminProgType(t linux.BPFProgramType) bool {
+	switch t {
+	case linux.BPF_PROG_TYPE_SCHED_CLS, linux.BPF_PROG_TYPE_SCHED_ACT, linux.BPF_PROG_TYPE_XDP,
+		linux.BPF_PROG_TYPE_LWT_IN, linux.BPF_PROG_TYPE_LWT_OUT, linux.BPF_PROG_TYPE_LWT_XMIT,
+		linux.BPF_PROG_TYPE_LWT_SEG6LOCAL, linux.BPF_PROG_TYPE_SK_SKB, linux.BPF_PROG_TYPE_SK_MSG,
+		linux.BPF_PROG_TYPE_FLOW_DISSECTOR, linux.BPF_PROG_TYPE_CGROUP_DEVICE,
+		linux.BPF_PROG_TYPE_CGROUP_SOCK, linux.BPF_PROG_TYPE_CGROUP_SOCK_ADDR,
+		linux.BPF_PROG_TYPE_CGROUP_SOCKOPT, linux.BPF_PROG_TYPE_CGROUP_SYSCTL,
+		linux.BPF_PROG_TYPE_SOCK_OPS, linux.BPF_PROG_TYPE_EXT, linux.BPF_PROG_TYPE_NETFILTER:
+		return true
+	}
+	return false
+}
+
+// IsPerfmonProgType returns whether loading programs of type t needs
+// CAP_PERFMON, as Linux's is_perfmon_prog_type does.
+func IsPerfmonProgType(t linux.BPFProgramType) bool {
+	switch t {
+	case linux.BPF_PROG_TYPE_KPROBE, linux.BPF_PROG_TYPE_TRACEPOINT, linux.BPF_PROG_TYPE_PERF_EVENT,
+		linux.BPF_PROG_TYPE_RAW_TRACEPOINT, linux.BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE,
+		linux.BPF_PROG_TYPE_TRACING, linux.BPF_PROG_TYPE_LSM, linux.BPF_PROG_TYPE_STRUCT_OPS,
+		linux.BPF_PROG_TYPE_EXT:
+		return true
+	}
+	return false
+}
+
+// FixupExpectedAttachType returns the attachment type that a program of
+// type t, loaded with expected attachment type a, expects, as Linux's
+// bpf_prog_load_fixup_attach_type does: 0, which is BPF_CGROUP_INET_INGRESS,
+// also means none.
+func FixupExpectedAttachType(t linux.BPFProgramType, a linux.BPFAttachType) linux.BPFAttachType {
+	if a != 0 {
+		return a
+	}
+	switch t {
+	case linux.BPF_PROG_TYPE_CGROUP_SOCK:
+		return linux.BPF_CGROUP_INET_SOCK_CREATE
+	case linux.BPF_PROG_TYPE_SK_REUSEPORT:
+		return linux.BPF_SK_REUSEPORT_SELECT
+	}
+	return a
+}
+
+// CheckExpectedAttachType checks that programs of type t may expect to
+// attach as a, as Linux's bpf_prog_load_check_attach does.
+func CheckExpectedAttachType(t linux.BPFProgramType, a linux.BPFAttachType) error {
+	var ok bool
+	switch t {
+	case linux.BPF_PROG_TYPE_CGROUP_SOCK:
+		switch a {
+		case linux.BPF_CGROUP_INET_SOCK_CREATE, linux.BPF_CGROUP_INET_SOCK_RELEASE,
+			linux.BPF_CGROUP_INET4_POST_BIND, linux.BPF_CGROUP_INET6_POST_BIND:
+			ok = true
+		}
+	case linux.BPF_PROG_TYPE_CGROUP_SOCK_ADDR:
+		switch a {
+		case linux.BPF_CGROUP_INET4_BIND, linux.BPF_CGROUP_INET6_BIND,
+			linux.BPF_CGROUP_INET4_CONNECT, linux.BPF_CGROUP_INET6_CONNECT, linux.BPF_CGROUP_UNIX_CONNECT,
+			linux.BPF_CGROUP_INET4_GETPEERNAME, linux.BPF_CGROUP_INET6_GETPEERNAME, linux.BPF_CGROUP_UNIX_GETPEERNAME,
+			linux.BPF_CGROUP_INET4_GETSOCKNAME, linux.BPF_CGROUP_INET6_GETSOCKNAME, linux.BPF_CGROUP_UNIX_GETSOCKNAME,
+			linux.BPF_CGROUP_UDP4_SENDMSG, linux.BPF_CGROUP_UDP6_SENDMSG, linux.BPF_CGROUP_UNIX_SENDMSG,
+			linux.BPF_CGROUP_UDP4_RECVMSG, linux.BPF_CGROUP_UDP6_RECVMSG, linux.BPF_CGROUP_UNIX_RECVMSG:
+			ok = true
+		}
+	case linux.BPF_PROG_TYPE_CGROUP_SKB:
+		ok = a == linux.BPF_CGROUP_INET_INGRESS || a == linux.BPF_CGROUP_INET_EGRESS
+	case linux.BPF_PROG_TYPE_CGROUP_SOCKOPT:
+		ok = a == linux.BPF_CGROUP_SETSOCKOPT || a == linux.BPF_CGROUP_GETSOCKOPT
+	case linux.BPF_PROG_TYPE_SK_LOOKUP:
+		ok = a == linux.BPF_SK_LOOKUP
+	case linux.BPF_PROG_TYPE_SK_REUSEPORT:
+		ok = a == linux.BPF_SK_REUSEPORT_SELECT || a == linux.BPF_SK_REUSEPORT_SELECT_OR_MIGRATE
+	case linux.BPF_PROG_TYPE_NETFILTER:
+		ok = a == linux.BPF_NETFILTER
+	default:
+		ok = true
+	}
+	if !ok {
+		return linuxerr.EINVAL
+	}
 	return nil
 }
