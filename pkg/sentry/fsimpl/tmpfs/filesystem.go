@@ -374,6 +374,7 @@ func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 				return diskVolumeError("read created directory metadata", err)
 			}
 			fs.applyDiskMetadata(&childDir.inode, meta)
+			childDir.diskComplete = true
 		}
 		parentDir.inode.incLinksLocked() // from child's ".."
 		parentDir.inode.incRef()         // child directory holds a reference to parent

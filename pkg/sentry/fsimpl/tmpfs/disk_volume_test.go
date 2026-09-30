@@ -612,3 +612,47 @@ func TestDiskNamespaceSaveAcceptsRegularFileRoot(t *testing.T) {
 	}
 	fs.restoreDiskNamespaceAfterSave()
 }
+
+// A directory this filesystem made holds every child it has on its volume:
+// a name missing from it is none, even one the volume has, as nothing but
+// this filesystem names files in a running branch. A directory it did not
+// make asks the volume.
+func TestDiskChildOfADirectoryItMadeIsNotLookedUp(t *testing.T) {
+	manager, err := ttcvolume.OpenManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenManager: %v", err)
+	}
+	repository, err := manager.Create("complete-directory-test")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer repository.Close()
+	ino, err := repository.CreateRegular(ttcvolume.MainBranch, ttcvolume.RootInode, "behind", 0644, 0, 0)
+	if err != nil {
+		t.Fatalf("CreateRegular: %v", err)
+	}
+	file := &regularFile{}
+	fs := &filesystem{
+		diskVolume: &diskVolumeState{Repository: repository, Branch: ttcvolume.MainBranch},
+		diskInodes: map[uint64]*inode{ino: &file.inode},
+	}
+	file.inode.fs = fs
+	file.inode.impl = file
+	file.inode.ino = ino
+	file.inode.mode.Store(uint32(linux.S_IFREG | 0644))
+	dir := &directory{}
+	dir.inode.fs = fs
+	dir.inode.ino = ttcvolume.RootInode
+	dir.dentry.inode = &dir.inode
+	dir.dentry.vfsd.Init(&dir.dentry)
+
+	dir.diskComplete = true
+	if _, err := fs.diskChildLocked(dir, "behind"); !linuxerr.Equals(linuxerr.ENOENT, err) {
+		t.Fatalf("a directory the filesystem made looked a name up in the volume: %v", err)
+	}
+	dir.diskComplete = false
+	child, err := fs.diskChildLocked(dir, "behind")
+	if err != nil || child.inode != &file.inode {
+		t.Fatalf("a directory the filesystem did not make found (%v, %v), want the volume's file", child, err)
+	}
+}

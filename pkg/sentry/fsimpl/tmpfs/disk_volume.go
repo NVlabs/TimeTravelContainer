@@ -22,6 +22,7 @@ import (
 	"fmt"
 	stdfs "io/fs"
 	"os"
+	"strings"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -329,7 +330,7 @@ func (fs *filesystem) diskChildLocked(dir *directory, name string) (*dentry, err
 	if child, ok := dir.childMap[name]; ok {
 		return child, nil
 	}
-	if fs.diskVolume == nil {
+	if fs.diskVolume == nil || dir.diskComplete {
 		return nil, linuxerr.ENOENT
 	}
 	ino, err := fs.diskVolume.Repository.Lookup(fs.diskVolume.Branch, dir.inode.ino, name)
@@ -351,7 +352,9 @@ func (fs *filesystem) diskChildLocked(dir *directory, name string) (*dentry, err
 		child = fs.newDentry(childInode)
 	}
 	// insertChildLocked updates the logical child count; the count already
-	// came from repository metadata, so insert only into the runtime cache.
+	// came from repository metadata, so insert only into the runtime cache,
+	// under a name of its own: see doCreateAt.
+	name = strings.Clone(name)
 	genericSetParentAndName(fs, child, &dir.dentry, name)
 	if dir.childMap == nil {
 		dir.childMap = make(map[string]*dentry)

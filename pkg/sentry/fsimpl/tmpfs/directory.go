@@ -48,6 +48,14 @@ type directory struct {
 	// efficiently. childList is protected by iterMu.
 	iterMu    iterMutex `state:"nosave"`
 	childList dentryList
+
+	// diskComplete is whether childMap holds every child the directory has
+	// on its disk volume, as it does of a directory this filesystem made:
+	// nothing else names files in a running branch, so a name childMap
+	// lacks is none, and a file created there need not be looked up in the
+	// volume first. It is protected by filesystem.mu. It is not saved: a
+	// restored filesystem looks names up in the volume.
+	diskComplete bool `state:"nosave"`
 }
 
 // newDirectory creates a new directory.
