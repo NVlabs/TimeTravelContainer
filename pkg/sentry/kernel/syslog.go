@@ -12,41 +12,79 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package kernel
 
 import (
+	"bytes"
 	"fmt"
 	"math/rand"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
-// syslog represents a sentry-global kernel log.
+// SyslogRecord is a record of the kernel log.
 //
-// Currently, it contains only fun messages for a dmesg easter egg.
+// +stateify savable
+type SyslogRecord struct {
+	// Seq is the record's sequence number.
+	Seq uint64
+	// Prio is the record's facility and level, facility<<3 | level.
+	Prio uint32
+	// Time is when the record was logged, since boot.
+	Time time.Duration
+	// Msg is the record's message.
+	Msg string
+}
+
+const (
+	// SyslogMaxBytes bounds the messages that the kernel log keeps: it drops
+	// its oldest records to take new ones. It is the log's size, as
+	// syslog(2)'s SYSLOG_ACTION_SIZE_BUFFER reports it.
+	SyslogMaxBytes = 1 << 20
+	// SyslogMaxMessage bounds a record's message.
+	SyslogMaxMessage = 8 << 10
+)
+
+// syslog represents a sentry-global kernel log: the records that /dev/kmsg
+// writes, and syslog(2) and /dev/kmsg read. It starts with fun messages for
+// a dmesg easter egg.
 //
 // +stateify savable
 type syslog struct {
 	// mu protects the below.
 	mu sync.Mutex `state:"nosave"`
 
-	// msg is the syslog message buffer. It is lazily initialized.
-	msg []byte
+	// initialized is whether records has the easter egg's messages.
+	initialized bool
+
+	// records are the log's records, oldest first, with consecutive
+	// sequence numbers.
+	records []SyslogRecord
+
+	// size is the total length of the records' messages.
+	size int
+
+	// nextSeq is the sequence number of the next record.
+	nextSeq uint64
+
+	// queue is notified of new records.
+	queue waiter.Queue
 }
 
-// Log returns a copy of the syslog.
-func (s *syslog) Log() []byte {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.msg != nil {
-		// Already initialized, just return a copy.
-		o := make([]byte, len(s.msg))
-		copy(o, s.msg)
-		return o
+// initLocked adds the easter egg's messages to the log once.
+//
+// Preconditions: s.mu is locked.
+func (s *syslog) initLocked() {
+	if s.initialized {
+		return
 	}
+	s.initialized = true
 
-	// Not initialized, create message.
 	allMessages := []string{
 		"Synthesizing system calls...",
 		"Mounting deweydecimalfs...",
@@ -99,21 +137,112 @@ func (s *syslog) Log() []byte {
 		return m
 	}
 
-	const format = "<6>[%11.6f] %s\n"
-
-	s.msg = append(s.msg, []byte(fmt.Sprintf(format, 0.0, "Starting gVisor..."))...)
-
-	time := 0.1
+	// The messages are the kernel's, at level 6, KERN_INFO.
+	const prio = 6
+	var eggs []SyslogRecord
+	eggs = append(eggs, SyslogRecord{Prio: prio, Msg: "Starting gVisor..."})
+	t := 0.1
 	for i := 0; i < 10; i++ {
-		time += rand.Float64() / 2
-		s.msg = append(s.msg, []byte(fmt.Sprintf(format, time, selectMessage()))...)
+		t += rand.Float64() / 2
+		eggs = append(eggs, SyslogRecord{Prio: prio, Time: time.Duration(t * float64(time.Second)), Msg: selectMessage()})
 	}
+	t += rand.Float64() / 2
+	eggs = append(eggs, SyslogRecord{Prio: prio, Time: time.Duration(t * float64(time.Second)), Msg: "Ready!"})
 
-	time += rand.Float64() / 2
-	s.msg = append(s.msg, []byte(fmt.Sprintf(format, time, "Ready!"))...)
+	// Records logged before the easter egg follow it.
+	records := s.records
+	s.records = nil
+	s.size = 0
+	s.nextSeq = 0
+	for _, r := range eggs {
+		s.appendLocked(r.Prio, r.Time, r.Msg)
+	}
+	for _, r := range records {
+		s.appendLocked(r.Prio, r.Time, r.Msg)
+	}
+}
 
-	// Return a copy.
-	o := make([]byte, len(s.msg))
-	copy(o, s.msg)
-	return o
+// appendLocked adds a record.
+//
+// Preconditions: s.mu is locked.
+func (s *syslog) appendLocked(prio uint32, t time.Duration, msg string) {
+	if len(msg) > SyslogMaxMessage {
+		msg = msg[:SyslogMaxMessage]
+	}
+	s.records = append(s.records, SyslogRecord{Seq: s.nextSeq, Prio: prio, Time: t, Msg: msg})
+	s.nextSeq++
+	s.size += len(msg)
+	drop := 0
+	for s.size > SyslogMaxBytes && drop < len(s.records)-1 {
+		s.size -= len(s.records[drop].Msg)
+		drop++
+	}
+	if drop != 0 {
+		s.records = append(s.records[:0], s.records[drop:]...)
+	}
+}
+
+// Append adds a record, of message msg, with facility and level prio,
+// logged t after boot.
+func (s *syslog) Append(prio uint32, t time.Duration, msg string) {
+	s.mu.Lock()
+	s.initLocked()
+	s.appendLocked(prio, t, msg)
+	s.mu.Unlock()
+	s.queue.Notify(waiter.ReadableEvents)
+}
+
+// Log returns the log, as syslog(2) reads it.
+func (s *syslog) Log() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initLocked()
+	var buf bytes.Buffer
+	for _, r := range s.records {
+		fmt.Fprintf(&buf, "<%d>[%12.6f] %s\n", r.Prio&7, r.Time.Seconds(), r.Msg)
+	}
+	return buf.Bytes()
+}
+
+// FirstSeq returns the sequence number of the log's oldest record.
+func (s *syslog) FirstSeq() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initLocked()
+	return s.records[0].Seq
+}
+
+// NextSeq returns the sequence number of the log's next record.
+func (s *syslog) NextSeq() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initLocked()
+	return s.nextSeq
+}
+
+// Record returns the record of sequence number seq. If the log has dropped
+// it, it returns ok false and the oldest record's sequence number; if the
+// log has no such record yet, it returns ok false and seq.
+func (s *syslog) Record(seq uint64) (r SyslogRecord, next uint64, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initLocked()
+	first := s.records[0].Seq
+	if seq < first {
+		return SyslogRecord{}, first, false
+	}
+	if seq >= s.nextSeq {
+		return SyslogRecord{}, seq, false
+	}
+	return s.records[seq-first], seq + 1, true
+}
+
+// EventRegister registers e for new records.
+func (s *syslog) EventRegister(e *waiter.Entry) {
+	s.queue.EventRegister(e)
+}
+
+// EventUnregister unregisters e.
+func (s *syslog) EventUnregister(e *waiter.Entry) {
+	s.queue.EventUnregister(e)
 }

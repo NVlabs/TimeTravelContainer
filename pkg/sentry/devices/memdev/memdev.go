@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package memdev implements "mem" character devices, as implemented in Linux
 // by drivers/char/mem.c and drivers/char/random.c.
 package memdev
@@ -32,6 +35,7 @@ func Register(vfsObj *vfs.VirtualFilesystem) error {
 		fullDevMinor:    {fullDevice{}, "full"},
 		randomDevMinor:  {randomDevice{}, "random"},
 		urandomDevMinor: {randomDevice{}, "urandom"},
+		kmsgDevMinor:    {kmsgDevice{}, ""},
 	} {
 		if err := vfsObj.RegisterDevice(vfs.CharDevice, linux.MEM_MAJOR, minor, spec.dev, &vfs.RegisterDeviceOptions{
 			GroupName: "mem",
