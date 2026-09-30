@@ -52,8 +52,9 @@ type renderFD struct {
 	ctxCreated bool
 	ctxGen     uint64
 	// numRings is the number of the context's rings, which have timelines
-	// of their own.
+	// of their own, and capsetID is its capability set.
 	numRings uint32
+	capsetID uint32
 
 	// handles allocates GEM handles, and objects maps them to resources.
 	handles idAllocator
@@ -498,6 +499,7 @@ func (fd *renderFD) createContextLocked(capsetID, numRings uint32, name string) 
 	fd.ctxCreated = true
 	fd.ctxGen = gen
 	fd.numRings = numRings
+	fd.capsetID = capsetID
 	return gen, nil
 }
 
@@ -583,6 +585,7 @@ type resourceParams struct {
 	blobMem   uint32
 	blobFlags uint32
 	size      uint64
+	ring      bool
 }
 
 // newResource creates a resource with create, which asks the renderer to
@@ -618,6 +621,7 @@ func (fd *renderFD) newResource(t *kernel.Task, params resourceParams, create fu
 		blob:      params.blob,
 		blobMem:   params.blobMem,
 		blobFlags: params.blobFlags,
+		ring:      params.ring,
 		size:      uint64(size),
 		mapOffset: d.nextMapOffset,
 	}
@@ -731,11 +735,15 @@ func (fd *renderFD) resourceCreateBlob(t *kernel.Task, cmd uint32, addr hostarch
 		ID:    rc.BlobID,
 		Size:  rc.Size,
 	}
+	fd.mu.Lock()
+	capsetID := fd.capsetID
+	fd.mu.Unlock()
 	params := resourceParams{
 		blob:      true,
 		blobMem:   rc.BlobMem,
 		blobFlags: rc.BlobFlags,
 		size:      rc.Size,
+		ring:      isCommandRing(capsetID, rc.BlobMem, rc.BlobFlags, rc.BlobID),
 	}
 	r, handle, err := fd.newResource(t, params, func(renderer Renderer, ctxID, resID uint32) error {
 		if blobCmd != nil {

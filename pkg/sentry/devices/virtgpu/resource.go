@@ -35,6 +35,11 @@ type resource struct {
 	// mapOffset is the fake offset at which the render node maps the
 	// resource.
 	mapOffset uint64
+	// ring is whether the resource is a gfxstream command ring.
+	ring bool
+	// ringContents is, in a resource that a fork lost, what its command ring
+	// held when the fork saved it.
+	ringContents []byte `state:".([]byte)"`
 
 	// The following fields are protected by device.mu.
 
@@ -49,6 +54,10 @@ type resource struct {
 	memory ResourceMemory `state:"nosave"`
 	// dmabuf is the resource's dma-buf, while it has one.
 	dmabuf *dmabufFD
+	// lost is the memory of the device's MemoryFile that the resource maps
+	// instead of its renderer's, once a load lost the renderer. It is not
+	// saved: a later fork's child makes its own.
+	lost memmap.FileRange `state:"nosave"`
 
 	// mapsMu protects mappings.
 	mapsMu resourceMapsMutex `state:"nosave"`
@@ -90,7 +99,12 @@ func (d *device) destroyResource(r *resource) {
 	r.fences = nil
 	mem := r.memory
 	r.memory = nil
+	lost := r.lost
+	r.lost = memmap.FileRange{}
 	d.mu.Unlock()
+	if lost.Length() != 0 {
+		d.mf.DecRef(lost)
+	}
 
 	d.submitMu.Lock()
 	if renderer, err := d.rendererLocked(r.gen); err == nil {
@@ -252,12 +266,18 @@ func (r *resource) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcA
 func (r *resource) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
 	d := r.dev
 	d.mu.Lock()
-	mem := r.memory
-	d.mu.Unlock()
-	if mem == nil {
-		// The memory belonged to a renderer that is gone.
+	var file memmap.File
+	var offset uint64
+	if mem := r.memory; mem != nil {
+		file, offset = mem.File(), mem.Offset()
+	} else if lostOffset, err := r.lostMemoryLocked(); err == nil {
+		file, offset = d.mf, lostOffset
+	} else {
+		d.mu.Unlock()
+		log.Warningf("virtgpu: mapping resource %d: %v", r.id, err)
 		return nil, &memmap.BusError{Err: linuxerr.EFAULT}
 	}
+	d.mu.Unlock()
 	var err error
 	if required.End > r.size {
 		err = &memmap.BusError{Err: linuxerr.EFAULT}
@@ -269,15 +289,20 @@ func (r *resource) Translate(ctx context.Context, required, optional memmap.Mapp
 	return []memmap.Translation{
 		{
 			Source: source,
-			File:   mem.File(),
-			Offset: mem.Offset() + source.Start,
+			File:   file,
+			Offset: offset + source.Start,
 			Perms:  hostarch.AnyAccess,
 		},
 	}, err
 }
 
-// InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.
+// InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable. No
+// translation of the resource can be saved: they map the renderer's memory,
+// which a save cannot encode, or memory that a child makes its own.
 func (r *resource) InvalidateUnsavable(ctx context.Context) error {
+	r.mapsMu.Lock()
+	defer r.mapsMu.Unlock()
+	r.mappings.InvalidateAll(memmap.InvalidateOpts{InvalidatePrivate: true})
 	return nil
 }
 
