@@ -623,6 +623,63 @@ fork of that 5.5 MB snapshot took 0.2 s.
 **A6 (optional)**, Zink for OpenGL in Linux guests, and a way to see the output:
 a VNC server in the guest, or a scanout sink.
 
+### Handing off to Phase B
+
+Phase A is done on macOS (A0-A5); A6 is optional. What Phase B inherits:
+
+*   **Code map** for `--gfx`:
+    *   the Sentry's device, `pkg/sentry/devices/virtgpu`: `device.go`,
+        `render_fd.go` (the ioctls), `resource.go`, `fence.go`,
+        `sync_file.go`, `dmabuf.go`, and `snapshot.go`; its sysfs entries in
+        `pkg/sentry/fsimpl/sys/virtgpu.go`;
+    *   the renderer's client, the broker's client, and the renderer's memory
+        in the Sentry, `.../virtgpu/rendererclient`; the protocol,
+        `pkg/gfxproto`;
+    *   the renderer, `runsc/ttcgfx` and `runsc/ttc/gfxrenderer`: the cgo shim
+        over gfxstream, the broker, the launcher, confinement, and snapshots;
+        TTC's gfxstream patches in `patches/`, and the guest driver's build in
+        `guest/`;
+    *   the daemon and runsc: `runsc/ttc/cmd/gfx.go` (`gfxHost`,
+        `gfxService`), `runsc/ttc/bundle/gpu.go` (the flags and the family
+        record), `runsc/boot/gfx.go`, and `runsc/sandbox/gfx.go`;
+    *   the save hook for devices, `vfs.DeviceSaveRestoreExtension`;
+    *   tests: `virtgpu_test.go`, against a fake renderer; the
+        `rendererclient` tests, against a real one (`TTC_GFXSTREAM_LIBRARY`);
+        and `runsc/ttc/test/e2e_gfx.sh`.
+*   **B1 needs, on Linux:**
+    *   the renderer built with cgo: `runsc/ttcgfx`'s `pure` is `auto` on
+        Linux, which builds `nocgo.go`, a renderer that fails;
+    *   gfxstream built on the host's Vulkan driver, with TTC's patches.
+        Patch 0002 matters only on macOS, where shared memory has names;
+        gfxstream uses `memfd_create` on Linux;
+    *   blob memory that the Sentry maps through its descriptor: `SystemBlob`
+        memory is a memfd. The Sentry's `hostMemory` offers `DataFD`, for
+        systrap; KVM maps what the Sentry maps;
+    *   seccomp rules for the Sentry's broker and renderer connections:
+        `sendmsg` and `recvmsg` with descriptors, `mmap` of the memfds they
+        carry, and `read` of a snapshot's pipe. The client already avoids
+        `pipe2` and the runtime's poller;
+    *   confinement for renderers: `gfxrenderer.Confine` does nothing on
+        Linux, so renderers run as ttcd's children, with its privileges.
+        Linux's namespaces and seccomp filters nest, so no launcher is needed:
+        renderers can confine themselves under a confined ttcd;
+    *   the guest driver for x86-64 guests: `guest/build_mesa_gfxstream.sh`
+        builds for the architecture of the container it runs in;
+    *   `e2e_gfx.sh` on x86-64 and arm64 hosts.
+*   **Lessons that carry over:**
+    *   gfxstream's guest driver spins, rather than fails, when its renderer
+        is gone; `device-lost` ends such processes with `SIGBUS`;
+    *   a family's branches share one Sentry, so a branch's host resources
+        need explicit release: the device closes renderers that nothing uses;
+    *   a fork fails cleanly at `vfs.PrepareSave`, not in `beforeSave`, which
+        is where a device captures state outside the sandbox;
+    *   gfxstream's snapshots rebuild Vulkan objects and memory, but not
+        recorded commands. They need `VulkanSnapshots` from the renderer's
+        start, and batched descriptor set updates off;
+    *   nvproxy can follow the same structure: a fork policy on the device,
+        its checks in `ValidateLiveFork` and `ValidateLiveForkMapping`, and
+        `cuda-checkpoint` in a `DeviceSaveRestoreExtension`.
+
 ### Phase B: Linux (x86-64 and arm64, NVIDIA GPUs)
 
 **B1, `--gfx` on Linux:**
@@ -687,17 +744,22 @@ redroid's arm64 images could then run on macOS too.
 ## Risks and open questions
 
 *   Stage-2 mappings of the renderer's memory are new to TTC's HVF engine.
-    libkrun does the same, but probes that could panic the host still need an
-    explicit go-ahead.
+    *Resolved:* they work, read-write and never executable (A2). The Sentry
+    must return to host EL0 before it touches the renderer's memory.
 *   MoltenVK's coverage limits what Zink and ANGLE can offer on macOS.
 *   gfxstream's Vulkan snapshots are young, and gated by a feature flag.
+    *Found (A5):* they restore Vulkan objects and memory, but not recorded
+    commands, and fail to restore batched descriptor set updates.
 *   No distribution packages Mesa's gfxstream driver, so TTC builds and
     injects it.
 *   gfxstream's `SystemBlob` path, which TTC's renderer relies on for
-    cross-process blobs, is tested upstream only on Windows.
+    cross-process blobs, is tested upstream only on Windows. *Resolved on
+    macOS,* with patch 0002, which keeps renderers' memory apart.
 *   It is unknown how Mesa's gfxstream driver, and Android, behave when a
-    device is lost.
-*   A renderer per branch costs memory. Starting them lazily limits that.
+    device is lost. *Found (A4):* the driver spins forever, so `device-lost`
+    ends its processes with `SIGBUS`. Android's behavior is for B6.
+*   A renderer per branch costs memory. Starting them lazily, and closing
+    them once nothing uses them, limits that.
 *   nvproxy's save hook panics on objects it cannot re-create. TTC must refuse
     those forks first.
 *   `cuda-checkpoint` does not support UVM memory or exported IPC memory, and
