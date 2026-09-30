@@ -51,6 +51,7 @@ go_test(
         "graph_binary_test.go",
 		"hosttree_test.go",
 		"ledger_test.go",
+		"memory_bench_test.go",
 		"names_test.go",
         "pack_binary_test.go",
 		"pack_json_test.go",

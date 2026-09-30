@@ -112,13 +112,21 @@ func compareObjectIDs(a, b ObjectID) int {
 	}
 }
 
-// encodeMemoryTable returns the data and children of the table of entries,
-// which are in ascending slot order.
-func encodeMemoryTable(entries []MemoryTableEntry) ([]byte, []Edge, error) {
+// memoryTableEncoder encodes tables in room it reuses: the data and children
+// of a table it encodes are the encoder's until it encodes the next.
+type memoryTableEncoder struct {
+	data     []byte
+	children []Edge
+	chunks   []ObjectID
+}
+
+// encode returns the data and children of the table of entries, which are in
+// ascending slot order.
+func (e *memoryTableEncoder) encode(entries []MemoryTableEntry) ([]byte, []Edge, error) {
 	if len(entries) == 0 || len(entries) > PagesPerMemoryTable {
 		return nil, nil, fmt.Errorf("a memory table of %d pages", len(entries))
 	}
-	var chunks []ObjectID
+	chunks := e.chunks[:0]
 	for index, entry := range entries {
 		if index != 0 && entry.Slot <= entries[index-1].Slot {
 			return nil, nil, fmt.Errorf("memory table slot %d follows slot %d", entry.Slot, entries[index-1].Slot)
@@ -129,14 +137,19 @@ func encodeMemoryTable(entries []MemoryTableEntry) ([]byte, []Edge, error) {
 		if !entry.Identity.complete() {
 			return nil, nil, fmt.Errorf("memory table slot %d has an incomplete identity", entry.Slot)
 		}
-		chunks = append(chunks, entry.Location.Chunk)
+		// Most pages are in the chunk of the page before.
+		if len(chunks) == 0 || chunks[len(chunks)-1] != entry.Location.Chunk {
+			chunks = append(chunks, entry.Location.Chunk)
+		}
 	}
 	slices.SortFunc(chunks, compareObjectIDs)
 	chunks = slices.Compact(chunks)
+	e.chunks = chunks
 	if len(chunks) > maxObjectEdges {
 		return nil, nil, fmt.Errorf("a memory table refers to %d chunks", len(chunks))
 	}
-	data := make([]byte, memoryTableHeaderSize, memoryTableHeaderSize+len(entries)*memoryTableEntrySize)
+	data := slices.Grow(e.data[:0], memoryTableHeaderSize+len(entries)*memoryTableEntrySize)[:memoryTableHeaderSize]
+	clear(data)
 	data[0] = memoryTableFormat
 	for _, entry := range entries {
 		data[1+entry.Slot/8] |= 1 << (entry.Slot % 8)
@@ -148,10 +161,11 @@ func encodeMemoryTable(entries []MemoryTableEntry) ([]byte, []Edge, error) {
 		data = binary.BigEndian.AppendUint64(data, entry.Identity.VersionSequence)
 		data = binary.BigEndian.AppendUint64(data, entry.Identity.References)
 	}
-	children := make([]Edge, len(chunks))
+	children := slices.Grow(e.children[:0], len(chunks))
 	for index, chunk := range chunks {
-		children[index] = Edge{Slot: uint16(index), Child: chunk}
+		children = append(children, Edge{Slot: uint16(index), Child: chunk})
 	}
+	e.data, e.children = data, children
 	return data, children, nil
 }
 
@@ -375,6 +389,217 @@ type memoryPageHolding struct {
 	holders  uint32
 }
 
+// memoryPageIndex is where the graph holds each page, by the stable
+// logical/version identity the guest's memory manager gave it: see
+// Store.memoryPages. It keeps the pages of each 256 logical pages of an
+// allocator together, a block. Tables and captures list pages a block at a
+// time, which then share one lookup of their block, and a search of it;
+// a map of every page sent each lookup to its own place among tens of
+// megabytes, which the processor's caches missed.
+type memoryPageIndex struct {
+	blocks map[memoryPageBlockKey]*memoryPageBlock
+	// released is how many blocks have left blocks since it was made: see
+	// compact.
+	released int
+}
+
+// memoryPageBlockKey names a block: its allocator and the sequence of its
+// first page, divided by memoryPageBlockPages.
+type memoryPageBlockKey struct {
+	allocator [16]byte
+	block     uint64
+}
+
+// memoryPageBlockPages is the number of logical pages of a block.
+const memoryPageBlockPages = 256
+
+// memoryPageBlock is the places the graph holds pages of a block, by their
+// slots, the pages' sequences in the block, then the rest of the pages'
+// identities, then the places. Most slots have one.
+type memoryPageBlock struct {
+	records []memoryPageRecord
+}
+
+// memoryPageRecord is a place the graph holds a page of a block.
+type memoryPageRecord struct {
+	slot             uint8
+	versionAllocator [16]byte
+	versionSequence  uint64
+	references       uint64
+	holding          memoryPageHolding
+}
+
+func newMemoryPageIndex() *memoryPageIndex {
+	return &memoryPageIndex{blocks: make(map[memoryPageBlockKey]*memoryPageBlock)}
+}
+
+// memoryPageRecordOf returns the block of the page with identity, and its
+// record at location, which holds nothing.
+func memoryPageRecordOf(identity *MemoryPageIdentity, location MemoryPageLocation) (memoryPageBlockKey, memoryPageRecord) {
+	return memoryPageBlockKey{allocator: identity.LogicalAllocator, block: identity.LogicalSequence / memoryPageBlockPages},
+		memoryPageRecord{
+			slot: uint8(identity.LogicalSequence % memoryPageBlockPages), versionAllocator: identity.VersionAllocator,
+			versionSequence: identity.VersionSequence, references: identity.References, holding: memoryPageHolding{location: location},
+		}
+}
+
+// comparePage orders records by their pages.
+func (r *memoryPageRecord) comparePage(other *memoryPageRecord) int {
+	if c := cmp.Compare(r.slot, other.slot); c != 0 {
+		return c
+	}
+	if c := bytes.Compare(r.versionAllocator[:], other.versionAllocator[:]); c != 0 {
+		return c
+	}
+	if c := cmp.Compare(r.versionSequence, other.versionSequence); c != 0 {
+		return c
+	}
+	return cmp.Compare(r.references, other.references)
+}
+
+// compare orders records as a block holds them: a page's by place, the
+// place with no chunk first.
+func (r *memoryPageRecord) compare(other *memoryPageRecord) int {
+	if c := r.comparePage(other); c != 0 {
+		return c
+	}
+	if c := compareObjectIDs(r.holding.location.Chunk, other.holding.location.Chunk); c != 0 {
+		return c
+	}
+	return cmp.Compare(r.holding.location.Page, other.holding.location.Page)
+}
+
+// samePage reports whether records are of one page.
+func (r *memoryPageRecord) samePage(other *memoryPageRecord) bool {
+	return r.slot == other.slot && r.versionSequence == other.versionSequence && r.references == other.references &&
+		r.versionAllocator == other.versionAllocator
+}
+
+// slot returns the records of slot, from begin to end.
+func (block *memoryPageBlock) slot(slot uint8) (begin, end int) {
+	records := block.records
+	// Most blocks hold a record of each slot, at its index.
+	if at := int(slot); at < len(records) && records[at].slot == slot && (at == 0 || records[at-1].slot < slot) {
+		begin = at
+	} else {
+		begin = sort.Search(len(records), func(i int) bool { return records[i].slot >= slot })
+	}
+	end = begin
+	for end < len(records) && records[end].slot == slot {
+		end++
+	}
+	return begin, end
+}
+
+// search returns where record goes in block, and whether block has it
+// there.
+func (block *memoryPageBlock) search(record *memoryPageRecord) (int, bool) {
+	records := block.records
+	// Tables list most pages in slot order: they go last.
+	if n := len(records); n == 0 || records[n-1].compare(record) < 0 {
+		return n, false
+	}
+	begin, end := block.slot(record.slot)
+	for at := begin; at < end; at++ {
+		if c := records[at].compare(record); c >= 0 {
+			return at, c == 0
+		}
+	}
+	return end, false
+}
+
+// hold records that one more live table or page maps the page with identity
+// at location.
+func (index *memoryPageIndex) hold(identity *MemoryPageIdentity, location MemoryPageLocation) {
+	key, record := memoryPageRecordOf(identity, location)
+	block := index.blocks[key]
+	if block == nil {
+		block = &memoryPageBlock{}
+		index.blocks[key] = block
+	}
+	at, found := block.search(&record)
+	if found {
+		block.records[at].holding.holders++
+		return
+	}
+	record.holding.holders = 1
+	block.records = slices.Insert(block.records, at, record)
+}
+
+// release records that one fewer live table or page maps the page with
+// identity at location.
+func (index *memoryPageIndex) release(identity *MemoryPageIdentity, location MemoryPageLocation) {
+	key, record := memoryPageRecordOf(identity, location)
+	block := index.blocks[key]
+	if block == nil {
+		return
+	}
+	at, found := block.search(&record)
+	if !found {
+		return
+	}
+	if block.records[at].holding.holders > 1 {
+		block.records[at].holding.holders--
+		return
+	}
+	block.records = slices.Delete(block.records, at, at+1)
+	if len(block.records) == 0 {
+		delete(index.blocks, key)
+		index.released++
+		index.compact()
+	}
+}
+
+// holdings returns the records of the places the graph holds the page with
+// identity, in order.
+func (index *memoryPageIndex) holdings(identity *MemoryPageIdentity) []memoryPageRecord {
+	key, probe := memoryPageRecordOf(identity, MemoryPageLocation{})
+	block := index.blocks[key]
+	if block == nil {
+		return nil
+	}
+	begin, end := block.slot(probe.slot)
+	for begin < end && !block.records[begin].samePage(&probe) {
+		begin++
+	}
+	last := begin
+	for last < end && block.records[last].samePage(&probe) {
+		last++
+	}
+	return block.records[begin:last]
+}
+
+// memoryIndexCompaction is how many blocks must leave the page index, as
+// many as it still holds at least, before compact makes it anew.
+const memoryIndexCompaction = 1 << 4
+
+// compact copies the blocks into a map of their present size once those that
+// left it outnumber those left: a map keeps the room of its largest size,
+// however few blocks it holds since. Each block that left pays for the copy
+// of one that stays.
+func (index *memoryPageIndex) compact() {
+	if index.released < memoryIndexCompaction || index.released < len(index.blocks) {
+		return
+	}
+	blocks := make(map[memoryPageBlockKey]*memoryPageBlock, len(index.blocks))
+	for key, block := range index.blocks {
+		blocks[key] = block
+	}
+	index.blocks, index.released = blocks, 0
+}
+
+// appendMemoryObjectPages appends to pages those of a table or legacy page.
+func appendMemoryObjectPages(pages []MemoryTableEntry, object Object) ([]MemoryTableEntry, error) {
+	if object.ID.Kind == ObjectKindPage {
+		location, identity, err := decodeLegacyMemoryPage(object)
+		if err != nil {
+			return nil, err
+		}
+		return append(pages, MemoryTableEntry{Location: location, Identity: identity}), nil
+	}
+	return appendMemoryTable(pages, object)
+}
+
 // memoryObjectIndexable reports whether object is a live, materialized table
 // or page, whose pages the memory indexes know.
 func memoryObjectIndexable(object Object) bool {
@@ -392,28 +617,28 @@ func memoryObjectIndexedAlike(before, after Object) bool {
 		bytes.Equal(before.Data, after.Data) && slices.Equal(before.Children, after.Children)
 }
 
-// memoryObjectPages returns the pages of a table or legacy page.
-func memoryObjectPages(object Object) ([]MemoryTableEntry, error) {
-	if object.ID.Kind == ObjectKindPage {
-		location, identity, err := decodeLegacyMemoryPage(object)
-		if err != nil {
-			return nil, err
-		}
-		return []MemoryTableEntry{{Location: location, Identity: identity}}, nil
+// memoryObjectPagesLocked returns the pages of a table or legacy page,
+// decoded where the next call decodes them.
+//
+// Preconditions: s.mu is locked.
+func (s *Store) memoryObjectPagesLocked(object Object) ([]MemoryTableEntry, error) {
+	pages, err := appendMemoryObjectPages(s.memoryPageScratch[:0], object)
+	if err == nil {
+		s.memoryPageScratch = pages
 	}
-	return decodeMemoryTable(object)
+	return pages, err
 }
 
 func (s *Store) indexMemoryObjectLocked(object Object) {
 	if !memoryObjectIndexable(object) {
 		return
 	}
-	pages, err := memoryObjectPages(object)
+	pages, err := s.memoryObjectPagesLocked(object)
 	if err != nil {
 		return
 	}
-	for _, page := range pages {
-		s.holdMemoryPageLocked(page.Identity, page.Location)
+	for index := range pages {
+		s.memoryPages.hold(&pages[index].Identity, pages[index].Location)
 	}
 	if object.ID.Kind == ObjectKindMemoryTable {
 		key := s.memoryTableKey(object.Data, object.Children)
@@ -425,12 +650,12 @@ func (s *Store) unindexMemoryObjectLocked(object Object) {
 	if !memoryObjectIndexable(object) {
 		return
 	}
-	pages, err := memoryObjectPages(object)
+	pages, err := s.memoryObjectPagesLocked(object)
 	if err != nil {
 		return
 	}
-	for _, page := range pages {
-		s.releaseMemoryPageLocked(page.Identity, page.Location)
+	for index := range pages {
+		s.memoryPages.release(&pages[index].Identity, pages[index].Location)
 	}
 	if object.ID.Kind == ObjectKindMemoryTable {
 		key := s.memoryTableKey(object.Data, object.Children)
@@ -441,100 +666,13 @@ func (s *Store) unindexMemoryObjectLocked(object Object) {
 			s.memoryTables[key] = tables
 		}
 	}
-	s.compactMemoryIndexesLocked()
-}
-
-// memoryIndexCompaction is how many pages must leave the page index, as many
-// as it still holds at least, before compactMemoryIndexesLocked makes it anew.
-const memoryIndexCompaction = 1 << 12
-
-// compactMemoryIndexesLocked copies the page indexes into maps of their
-// present size once the pages that left them outnumber those left: a map
-// keeps the room of its largest size, 50 MB after a capture of 1.5 GiB was
-// indexed, however few pages it holds since. Each page that left pays for
-// the copy of one that stays.
-func (s *Store) compactMemoryIndexesLocked() {
-	if s.memoryPagesReleased < memoryIndexCompaction || s.memoryPagesReleased < len(s.memoryPages) {
-		return
-	}
-	pages := make(map[MemoryPageIdentity]memoryPageHolding, len(s.memoryPages))
-	for identity, holding := range s.memoryPages {
-		pages[identity] = holding
-	}
-	elsewhere := make(map[MemoryPageIdentity][]memoryPageHolding, len(s.memoryPagesElsewhere))
-	for identity, holdings := range s.memoryPagesElsewhere {
-		elsewhere[identity] = holdings
-	}
-	s.memoryPages, s.memoryPagesElsewhere, s.memoryPagesReleased = pages, elsewhere, 0
 }
 
 func (s *Store) rebuildMemoryIndexesLocked() {
-	s.memoryPages = make(map[MemoryPageIdentity]memoryPageHolding)
-	s.memoryPagesElsewhere = make(map[MemoryPageIdentity][]memoryPageHolding)
+	s.memoryPages = newMemoryPageIndex()
 	s.memoryTables = make(map[uint64][]ObjectID)
-	s.memoryPagesReleased = 0
 	for _, object := range s.state.Objects {
 		s.indexMemoryObjectLocked(object)
-	}
-}
-
-func (s *Store) holdMemoryPageLocked(identity MemoryPageIdentity, location MemoryPageLocation) {
-	holding, ok := s.memoryPages[identity]
-	if !ok {
-		s.memoryPages[identity] = memoryPageHolding{location: location, holders: 1}
-		return
-	}
-	if holding.location == location {
-		holding.holders++
-		s.memoryPages[identity] = holding
-		return
-	}
-	elsewhere := s.memoryPagesElsewhere[identity]
-	for index := range elsewhere {
-		if elsewhere[index].location == location {
-			elsewhere[index].holders++
-			return
-		}
-	}
-	s.memoryPagesElsewhere[identity] = append(elsewhere, memoryPageHolding{location: location, holders: 1})
-}
-
-func (s *Store) releaseMemoryPageLocked(identity MemoryPageIdentity, location MemoryPageLocation) {
-	holding, ok := s.memoryPages[identity]
-	if !ok {
-		return
-	}
-	elsewhere := s.memoryPagesElsewhere[identity]
-	if holding.location == location {
-		if holding.holders > 1 {
-			holding.holders--
-			s.memoryPages[identity] = holding
-			return
-		}
-		if len(elsewhere) == 0 {
-			delete(s.memoryPages, identity)
-			s.memoryPagesReleased++
-			return
-		}
-		s.memoryPages[identity] = elsewhere[0]
-		elsewhere = elsewhere[1:]
-	} else {
-		for index := range elsewhere {
-			if elsewhere[index].location != location {
-				continue
-			}
-			if elsewhere[index].holders > 1 {
-				elsewhere[index].holders--
-			} else {
-				elsewhere = slices.Delete(elsewhere, index, index+1)
-			}
-			break
-		}
-	}
-	if len(elsewhere) == 0 {
-		delete(s.memoryPagesElsewhere, identity)
-	} else {
-		s.memoryPagesElsewhere[identity] = elsewhere
 	}
 }
 
@@ -542,33 +680,20 @@ func (s *Store) releaseMemoryPageLocked(identity MemoryPageIdentity, location Me
 // identity in an origin reuse allows, choosing the least chunk when there are
 // several.
 func (s *Store) memoryPageLocationLocked(identity MemoryPageIdentity, reuse reuseFilter, origins map[SnapshotID]bool) (MemoryPageLocation, bool) {
-	holding, ok := s.memoryPages[identity]
-	if !ok {
-		return MemoryPageLocation{}, false
-	}
-	var selected MemoryPageLocation
-	found := false
-	consider := func(candidate memoryPageHolding) {
+	for _, record := range s.memoryPages.holdings(&identity) {
 		// An origin's state is found by a formatted key: remember it for
 		// the many pages a capture looks up in the same few origins.
-		origin := candidate.location.Chunk.Snapshot
+		origin := record.holding.location.Chunk.Snapshot
 		permitted, known := origins[origin]
 		if !known {
 			permitted = s.originAllowedLocked(origin, reuse)
 			origins[origin] = permitted
 		}
-		if !permitted {
-			return
-		}
-		if order := compareObjectIDs(candidate.location.Chunk, selected.Chunk); !found || order < 0 || (order == 0 && candidate.location.Page < selected.Page) {
-			selected, found = candidate.location, true
+		if permitted {
+			return record.holding.location, true
 		}
 	}
-	consider(holding)
-	for _, candidate := range s.memoryPagesElsewhere[identity] {
-		consider(candidate)
-	}
-	return selected, found
+	return MemoryPageLocation{}, false
 }
 
 func (s *Store) originAllowedLocked(origin SnapshotID, reuse reuseFilter) bool {
@@ -679,6 +804,8 @@ func (s *Store) HoldMemoryPagesReusing(pinPrefix string, identities []MemoryPage
 	locations := make([]MemoryPageLocation, len(identities))
 	chunks := make(map[ObjectID]struct{})
 	origins := make(map[SnapshotID]bool)
+	// Most pages are in the chunk of the page before.
+	var chunk ObjectID
 	for index, identity := range identities {
 		if !identity.complete() {
 			return nil, nil, fmt.Errorf("memory page %d has an incomplete identity", index)
@@ -688,7 +815,10 @@ func (s *Store) HoldMemoryPagesReusing(pinPrefix string, identities []MemoryPage
 			continue
 		}
 		locations[index] = location
-		chunks[location.Chunk] = struct{}{}
+		if location.Chunk != chunk {
+			chunk = location.Chunk
+			chunks[chunk] = struct{}{}
+		}
 	}
 	// A pin is named once per chunk, not per page: a chunk holds up to 256
 	// of them.
@@ -743,6 +873,8 @@ func (s *Store) CommitMemoryTablesReusing(origin SnapshotID, tables []NewMemoryT
 		}
 	}
 	trees := make(map[string]map[uint64]ObjectID)
+	// Most tables are shared, and their encodings only looked up.
+	var encoder memoryTableEncoder
 	for _, table := range tables {
 		if err := validateRootName(table.Root); err != nil {
 			return err
@@ -750,13 +882,13 @@ func (s *Store) CommitMemoryTablesReusing(origin SnapshotID, tables []NewMemoryT
 		if table.Index%PagesPerMemoryTable != 0 || table.Index >= uint64(1)<<(8*memoryTreeLevels) {
 			return fmt.Errorf("memory table at page index %#x", table.Index)
 		}
-		data, children, err := encodeMemoryTable(table.Entries)
+		data, children, err := encoder.encode(table.Entries)
 		if err != nil {
 			return fmt.Errorf("memory table at page index %#x of %q: %w", table.Index, table.Root, err)
 		}
 		id, ok := s.existingMemoryTableLocked(data, children, allowed)
 		if !ok {
-			if id, err = mutation.create(ObjectKindMemoryTable, data, children); err != nil {
+			if id, err = mutation.create(ObjectKindMemoryTable, bytes.Clone(data), slices.Clone(children)); err != nil {
 				return err
 			}
 		}

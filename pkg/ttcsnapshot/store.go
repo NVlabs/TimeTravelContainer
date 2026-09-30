@@ -353,17 +353,15 @@ type Store struct {
 	// the stable logical/version identity the guest's memory manager gave it,
 	// so that a capture maps pages the graph holds rather than storing them
 	// again. It counts, for each place, the live tables and pages that map the
-	// page there. Most pages are held in one place; memoryPagesElsewhere has
-	// the others. memoryTables finds live tables by their content, so that a
+	// page there. memoryTables finds live tables by their content, so that a
 	// capture mapping the same pages as one shares it. They are rebuilt from
 	// authoritative graph metadata on open and are never persisted.
-	memoryPages          map[MemoryPageIdentity]memoryPageHolding
-	memoryPagesElsewhere map[MemoryPageIdentity][]memoryPageHolding
-	memoryTables         map[uint64][]ObjectID
-	memoryTableSeed      maphash.Seed
-	// memoryPagesReleased is how many pages have left memoryPages since it
-	// was last made: see compactMemoryIndexesLocked.
-	memoryPagesReleased int
+	memoryPages     *memoryPageIndex
+	memoryTables    map[uint64][]ObjectID
+	memoryTableSeed maphash.Seed
+	// memoryPageScratch is where the pages of a table are decoded to index
+	// them.
+	memoryPageScratch []MemoryTableEntry
 	// deferredLoads serializes provider I/O for one foreign immutable object.
 	// Provider reads must never run while mu is held: a multi-hop filesystem
 	// graph may legitimately re-enter this Store while resolving an ancestor.
@@ -1054,11 +1052,10 @@ type cachedGraphState struct {
 // graphIndexes are a store's indexes derived from its graph state, and the
 // seed of the hashes memoryTables is keyed by.
 type graphIndexes struct {
-	deferredObjects      map[deferredKey]ObjectID
-	memoryPages          map[MemoryPageIdentity]memoryPageHolding
-	memoryPagesElsewhere map[MemoryPageIdentity][]memoryPageHolding
-	memoryTables         map[uint64][]ObjectID
-	memoryTableSeed      maphash.Seed
+	deferredObjects map[deferredKey]ObjectID
+	memoryPages     *memoryPageIndex
+	memoryTables    map[uint64][]ObjectID
+	memoryTableSeed maphash.Seed
 }
 
 type graphStateCache struct {
@@ -1224,8 +1221,7 @@ func (s *Store) cacheStateLocked() {
 		checkpointObjects: s.checkpointObjects, journalEnd: s.journalEnd, journalWeight: s.journalWeight, state: s.state,
 		indexes: graphIndexes{
 			deferredObjects: s.deferredObjects, memoryPages: s.memoryPages,
-			memoryPagesElsewhere: s.memoryPagesElsewhere, memoryTables: s.memoryTables,
-			memoryTableSeed: s.memoryTableSeed,
+			memoryTables: s.memoryTables, memoryTableSeed: s.memoryTableSeed,
 		},
 	})
 }
@@ -1276,7 +1272,6 @@ func (s *Store) loadCachedGeneration(head graphHead, repairTail bool) (bool, err
 	if cached.indexes.deferredObjects != nil && cached.indexes.memoryPages != nil {
 		s.deferredObjects = cached.indexes.deferredObjects
 		s.memoryPages = cached.indexes.memoryPages
-		s.memoryPagesElsewhere = cached.indexes.memoryPagesElsewhere
 		s.memoryTables = cached.indexes.memoryTables
 		s.memoryTableSeed = cached.indexes.memoryTableSeed
 	} else {
@@ -2430,7 +2425,10 @@ func (s *Store) commitLockedPrepared(ops []journalOp, references map[ObjectID]Ob
 			s.poisoned = fmt.Errorf("materialized TTC graph reference update changes immutable object %s", id)
 			return s.poisoned
 		}
-		s.state.Objects[id] = cloneObject(object)
+		// The object keeps its data and children, which are the same: a
+		// memory table's, compared again below, is 15 KB.
+		object.Data, object.Children = current.Data, current.Children
+		s.state.Objects[id] = object
 	}
 	for id, before := range affectedObjects {
 		// Most objects a transaction touches only gain or lose a reference,

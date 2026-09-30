@@ -3634,15 +3634,19 @@ func TestGraphReopenKeepsIndexes(t *testing.T) {
 	defer third.Close()
 	third.mu.Lock()
 	defer third.mu.Unlock()
-	taken := graphIndexes{third.deferredObjects, third.memoryPages, third.memoryPagesElsewhere, third.memoryTables, third.memoryTableSeed}
+	taken := graphIndexes{third.deferredObjects, third.memoryPages, third.memoryTables, third.memoryTableSeed}
 	third.rebuildDeferredObjectsLocked()
 	third.rebuildMemoryIndexesLocked()
-	rebuilt := graphIndexes{third.deferredObjects, third.memoryPages, third.memoryPagesElsewhere, third.memoryTables, third.memoryTableSeed}
+	rebuilt := graphIndexes{third.deferredObjects, third.memoryPages, third.memoryTables, third.memoryTableSeed}
 	if !reflect.DeepEqual(taken, rebuilt) {
 		t.Fatalf("taken indexes\n%+v\nrebuilt\n%+v", taken, rebuilt)
 	}
-	if len(rebuilt.deferredObjects) != 2 || len(rebuilt.memoryPages) != 2 {
-		t.Fatalf("indexes of %d deferred objects and %d pages, want 2 and 2", len(rebuilt.deferredObjects), len(rebuilt.memoryPages))
+	pages := 0
+	for _, block := range rebuilt.memoryPages.blocks {
+		pages += len(block.records)
+	}
+	if len(rebuilt.deferredObjects) != 2 || pages != 2 {
+		t.Fatalf("indexes of %d deferred objects and %d pages, want 2 and 2", len(rebuilt.deferredObjects), pages)
 	}
 }
 
@@ -3736,49 +3740,50 @@ func TestSnapshotKeysAndObjectPaths(t *testing.T) {
 	}
 }
 
-// Once most of the pages the page index held have left it, it is made anew at
-// the size of those left, which it still holds, where in place it kept the
+// Once most of the blocks the page index held have left it, it is made anew
+// at the size of those left, which it still holds, where in place it kept the
 // room of all it ever held.
 func TestMemoryPageIndexCompacts(t *testing.T) {
-	s := &Store{
-		memoryPages:          make(map[MemoryPageIdentity]memoryPageHolding),
-		memoryPagesElsewhere: make(map[MemoryPageIdentity][]memoryPageHolding),
-	}
-	identity := func(i int) MemoryPageIdentity {
-		return MemoryPageIdentity{LogicalSequence: uint64(i), VersionSequence: 1}
+	index := newMemoryPageIndex()
+	identity := func(block int) *MemoryPageIdentity {
+		return &MemoryPageIdentity{LogicalSequence: uint64(block) * memoryPageBlockPages, VersionSequence: 1}
 	}
 	here := MemoryPageLocation{Chunk: ObjectID{Snapshot: 1, Kind: ObjectKindMemoryChunk, Ordinal: 1}}
 	there := MemoryPageLocation{Chunk: ObjectID{Snapshot: 1, Kind: ObjectKindMemoryChunk, Ordinal: 2}}
 	const held, kept = 3 * memoryIndexCompaction, memoryIndexCompaction / 2
 	for i := range held {
-		s.holdMemoryPageLocked(identity(i), here)
+		index.hold(identity(i), here)
 	}
-	s.holdMemoryPageLocked(identity(0), there)
-	before := reflect.ValueOf(s.memoryPages).Pointer()
+	index.hold(identity(0), there)
+	before := reflect.ValueOf(index.blocks).Pointer()
 	for i := kept; i < held; i++ {
-		s.releaseMemoryPageLocked(identity(i), here)
+		index.release(identity(i), here)
 	}
-	s.compactMemoryIndexesLocked()
-	if reflect.ValueOf(s.memoryPages).Pointer() == before {
-		t.Fatalf("the page index was not made anew after %d of %d pages left it", held-kept, held)
+	if reflect.ValueOf(index.blocks).Pointer() == before {
+		t.Fatalf("the page index was not made anew after %d of %d blocks left it", held-kept, held)
 	}
-	if s.memoryPagesReleased != 0 || len(s.memoryPages) != kept || len(s.memoryPagesElsewhere) != 1 {
-		t.Fatalf("after compaction: %d released, %d pages, %d held elsewhere; want 0, %d, 1", s.memoryPagesReleased, len(s.memoryPages), len(s.memoryPagesElsewhere), kept)
+	if index.released != 0 || len(index.blocks) != kept {
+		t.Fatalf("after compaction: %d released, %d blocks; want 0, %d", index.released, len(index.blocks), kept)
 	}
 	for i := range kept {
-		if holding := s.memoryPages[identity(i)]; holding.location != here || holding.holders != 1 {
-			t.Fatalf("page %d is held %+v after compaction", i, holding)
+		holdings := index.holdings(identity(i))
+		want := 1
+		if i == 0 {
+			// Here and there.
+			want = 2
+		}
+		if len(holdings) != want || holdings[0].holding.location != here || holdings[0].holding.holders != 1 {
+			t.Fatalf("page %d is held %+v after compaction", i, holdings)
 		}
 	}
-	if holdings := s.memoryPagesElsewhere[identity(0)]; len(holdings) != 1 || holdings[0].location != there {
-		t.Fatalf("page 0 is held elsewhere %+v after compaction", holdings)
+	if holdings := index.holdings(identity(0)); holdings[1].holding.location != there || holdings[1].holding.holders != 1 {
+		t.Fatalf("page 0 is held %+v after compaction", holdings)
 	}
-	// Fewer released pages than those left make no copy.
-	after := reflect.ValueOf(s.memoryPages).Pointer()
-	s.releaseMemoryPageLocked(identity(1), here)
-	s.compactMemoryIndexesLocked()
-	if reflect.ValueOf(s.memoryPages).Pointer() != after {
-		t.Fatal("the page index was made anew after one page left it")
+	// Fewer released blocks than those left make no copy.
+	after := reflect.ValueOf(index.blocks).Pointer()
+	index.release(identity(1), here)
+	if reflect.ValueOf(index.blocks).Pointer() != after {
+		t.Fatal("the page index was made anew after one block left it")
 	}
 }
 
