@@ -18,6 +18,16 @@ import (
 // not needed for durability.
 func startWriteback(*os.File) {}
 
+// createEmptyFile creates the empty regular file path, relative to
+// directoryFD, which must not exist. Darwin's mknodat makes no regular files.
+func createEmptyFile(directoryFD int, path string) error {
+	fd, err := unix.Openat(directoryFD, path, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0600)
+	if err != nil {
+		return err
+	}
+	return unix.Close(fd)
+}
+
 // cloneFile uses APFS clonefile semantics. Darwin requires the destination
 // not to exist, whereas Linux FICLONE fills an already-open destination, so
 // replace the empty destination at destinationPath (relative to

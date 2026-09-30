@@ -18,6 +18,13 @@ func startWriteback(file *os.File) {
 	_ = unix.SyncFileRange(int(file.Fd()), 0, 0, unix.SYNC_FILE_RANGE_WRITE)
 }
 
+// createEmptyFile creates the empty regular file path, relative to
+// directoryFD, which must not exist. mknodat creates it without opening it:
+// opening and closing it took an eighth of creating a file in a repository.
+func createEmptyFile(directoryFD int, path string) error {
+	return unix.Mknodat(directoryFD, path, unix.S_IFREG|0600, 0)
+}
+
 // cloneFile reflinks source into the open, empty destination. It returns the
 // file that holds the destination afterward, which is destination itself.
 func cloneFile(source, destination *os.File, _ int, _ string) (*os.File, error) {

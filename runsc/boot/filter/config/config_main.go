@@ -523,6 +523,13 @@ func ttcVolumeFilters() seccomp.SyscallRules {
 			seccomp.AnyValue{},
 			seccomp.AnyValue{},
 		},
+		// Empty objects are created as regular files without being opened.
+		unix.SYS_MKNODAT: seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.AnyValue{},
+			seccomp.EqualTo(unix.S_IFREG | 0600),
+			seccomp.EqualTo(0),
+		},
 		// Snapshot-graph checkpoint rotation enumerates the donated graph
 		// directory to retire obsolete checkpoint and journal generations. The
 		// directory itself is opened by runsc and all names remain relative to

@@ -668,33 +668,31 @@ func (store *LocalDataStore) createEmpty(id ObjectID) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	var file *os.File
+	directoryFD, name := unix.AT_FDCWD, relative
 	if store.rootFD != nil {
-		file, err = store.createRelative(relative, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL, 0600)
-	} else {
-		destination, pathErr := store.objectPath(id)
-		if pathErr != nil {
-			return false, pathErr
-		}
-		for attempt := 0; ; attempt++ {
-			// Reclamation may remove an emptied directory, as createRelative
-			// says.
-			file, err = os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-			if !errors.Is(err, fs.ErrNotExist) || attempt == 3 {
-				break
-			}
-			if err := os.MkdirAll(filepath.Dir(destination), 0700); err != nil {
-				return false, err
-			}
-		}
-	}
-	if errors.Is(err, fs.ErrExist) {
-		return false, nil
-	}
-	if err != nil {
+		directoryFD = int(store.rootFD.Fd())
+	} else if name, err = store.objectPath(id); err != nil {
 		return false, err
 	}
-	return true, file.Close()
+	for attempt := 0; ; attempt++ {
+		// Reclamation may remove an emptied directory, as createRelative says.
+		err = createEmptyFile(directoryFD, name)
+		if !errors.Is(err, unix.ENOENT) || attempt == 3 {
+			break
+		}
+		if store.rootFD != nil {
+			err = store.mkdirAllRelative(filepath.Dir(relative))
+		} else {
+			err = os.MkdirAll(filepath.Dir(name), 0700)
+		}
+		if err != nil {
+			return false, err
+		}
+	}
+	if errors.Is(err, unix.EEXIST) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // checkExistingEmpty checks that the object id, which createEmpty found
