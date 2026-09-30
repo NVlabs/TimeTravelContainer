@@ -137,7 +137,12 @@ func (state *referenceLedgerState) rollback() {
 	}
 	for origin, present := range undo.origins {
 		if !present {
-			// It had no objects, as it has none again.
+			// It had no objects, as it has none again: the objects the
+			// mutation added to it are not recorded (see recordObject).
+			for id := range state.originIDs(origin) {
+				delete(state.Objects, id)
+				delete(state.reclaiming, id)
+			}
 			delete(state.byOrigin, origin)
 		}
 	}
@@ -190,6 +195,13 @@ func (state *referenceLedgerState) setOrigin(origin SnapshotID, present bool) {
 
 func (state *referenceLedgerState) recordObject(id ObjectID, prior *ledgerEntry) {
 	if undo := state.undo; undo != nil {
+		// An object of an origin the mutation added is new, and undoing the
+		// mutation removes the origin's objects whole: recording each of an
+		// origin's 300,000 objects as it was imported took a quarter of the
+		// time importing it took.
+		if present, recorded := undo.origins[id.Snapshot]; recorded && !present {
+			return
+		}
 		if _, recorded := undo.objects[id]; !recorded {
 			if undo.objects == nil {
 				undo.objects = make(map[ObjectID]*ledgerEntry)
