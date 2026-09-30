@@ -623,6 +623,15 @@ fork of that 5.5 MB snapshot took 0.2 s.
 **A6 (optional)**, Zink for OpenGL in Linux guests, and a way to see the output:
 a VNC server in the guest, or a scanout sink.
 
+*Finding (2026-09-30):* Zink refuses the device, since it requires the
+`nullDescriptor` feature of `VK_EXT_robustness2`, and OpenGL falls back to
+llvmpipe. Mesa's gfxstream guest driver offers guests only the device
+extensions of its allowlist (`ResourceTracker.cpp`), which lacks
+`VK_EXT_robustness2`. gfxstream's host can turn the extension on for its
+devices (its `VulkanRobustness` feature), and MoltenVK has it. So Zink needs
+the guest driver to allow the extension and pass its feature structures,
+and the renderer to enable `VulkanRobustness`. Not attempted.
+
 ### Handing off to Phase B
 
 Phase A is done on macOS (A0-A5); A6 is optional. What Phase B inherits:
