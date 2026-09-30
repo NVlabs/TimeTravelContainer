@@ -15573,7 +15573,7 @@ func (b *runtimeBackend) persistDehydration(target selector, info ttcbundle.Cont
 	// family's own, and other commands go on meanwhile.
 	if err := b.withoutLifecycleLock(info, longOperation{branch: target.branch, state: "dehydrating", shown: true}, func() error {
 		go func() {
-			result, importErr := b.importGraphCapture(reader, origin, prefix, branchCaptureImages(persistentBranch)...)
+			result, importErr := b.importGraphCapture(reader, origin, prefix, branchCaptureImages(info, persistentBranch.ID)...)
 			_ = reader.Close()
 			imported <- graphImportOutcome{result: result, err: importErr}
 		}()

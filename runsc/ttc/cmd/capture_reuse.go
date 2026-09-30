@@ -44,12 +44,35 @@ type captureImage struct {
 	roots    []string
 }
 
-// branchCaptureImages returns the image branch was restored from, if any.
-func branchCaptureImages(branch ttcbundle.BranchInfo) []captureImage {
-	if branch.SnapshotID == 0 || len(branch.MemoryRootObjects) == 0 {
-		return nil
+// captureImagesLimit bounds the images one capture adopts.
+const captureImagesLimit = 4
+
+// branchCaptureImages returns the images a capture of branchID in info may
+// share pages with: the one it was restored from, then those of the family's
+// other branches and the images the family's memory still loads from. A fork
+// of a rehydrated branch, which has no image of its own, holds its source's
+// pages.
+func branchCaptureImages(info ttcbundle.ContainerInfo, branchID string) []captureImage {
+	var images []captureImage
+	add := func(snapshot uint64, roots []string) {
+		if snapshot == 0 || len(roots) == 0 || len(images) == captureImagesLimit ||
+			slices.ContainsFunc(images, func(image captureImage) bool { return image.snapshot == snapshot }) {
+			return
+		}
+		images = append(images, captureImage{snapshot: snapshot, roots: slices.Clone(roots)})
 	}
-	return []captureImage{{snapshot: branch.SnapshotID, roots: slices.Clone(branch.MemoryRootObjects)}}
+	for _, branch := range info.Branches {
+		if branch.ID == branchID {
+			add(branch.SnapshotID, branch.MemoryRootObjects)
+		}
+	}
+	for _, branch := range info.Branches {
+		add(branch.SnapshotID, branch.MemoryRootObjects)
+	}
+	for _, backing := range info.RuntimeMemoryBackings {
+		add(backing.SnapshotID, backing.MemoryRootObjects)
+	}
+	return images
 }
 
 // captureReuse returns what a capture into prefix of the node's cluster graph
@@ -231,24 +254,23 @@ func (b *runtimeBackend) claimCaptureImage(image captureImage, origins []ttcsnap
 	cancel()
 	b.sharedReferences.claimMu.Unlock()
 	if err != nil {
-		return errors.Join(err, b.abandonCaptureClaim(path, intent))
+		// The next reconciliation releases it: the capture does not wait for
+		// a coordinator it could not reach.
+		return errors.Join(err, abandonCaptureClaim(path, intent))
 	}
 	return nil
 }
 
-// abandonCaptureClaim releases the capture claim at path. What was never
-// retained is released too, as a retain may have reached the coordinator
-// though its answer did not, and a release of what the ledger does not hold
-// does nothing. A release that fails is left to the next reconciliation.
-func (b *runtimeBackend) abandonCaptureClaim(path string, intent graphReferenceIntent) error {
+// abandonCaptureClaim marks the capture claim at path for release. What was
+// never retained is released too, as a retain may have reached the
+// coordinator though its answer did not, and a release of what the ledger does
+// not hold does nothing.
+func abandonCaptureClaim(path string, intent graphReferenceIntent) error {
 	intent.State = "releasing"
 	for index := range intent.Groups {
 		intent.Groups[index].Retained = true
 	}
-	if err := writeDurableJSON(path, &intent); err != nil {
-		return err
-	}
-	return b.releaseDistributedGraphReferences(intent.Operation)
+	return writeDurableJSON(path, &intent)
 }
 
 // reconcileCaptureClaim releases the capture claim at path once the node's
@@ -281,5 +303,8 @@ func (b *runtimeBackend) reconcileCaptureClaim(path string, intent graphReferenc
 		}
 	}
 	b.distributedSource.providerChecks.Delete(intent.Operation)
-	return b.abandonCaptureClaim(path, intent)
+	if err := abandonCaptureClaim(path, intent); err != nil {
+		return err
+	}
+	return b.releaseDistributedGraphReferences(intent.Operation)
 }

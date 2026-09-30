@@ -593,6 +593,41 @@ func TestCaptureClaim(t *testing.T) {
 	}
 }
 
+// A capture shares the image its branch was restored from first, then those
+// of its family, each once.
+func TestBranchCaptureImages(t *testing.T) {
+	info := ttcbundle.ContainerInfo{
+		Branches: []ttcbundle.BranchInfo{
+			{ID: "main", SnapshotID: 7, MemoryRootObjects: []string{"root-7"}},
+			{ID: "fork"},
+			{ID: "other", SnapshotID: 9, MemoryRootObjects: []string{"root-9"}},
+			{ID: "sibling", SnapshotID: 7, MemoryRootObjects: []string{"root-7"}},
+		},
+		RuntimeMemoryBackings: []ttcbundle.RuntimeMemoryBacking{{ID: "parked", SnapshotID: 11, MemoryRootObjects: []string{"root-11"}}},
+	}
+	for _, test := range []struct {
+		branch string
+		want   []uint64
+	}{
+		{branch: "other", want: []uint64{9, 7, 11}},
+		{branch: "fork", want: []uint64{7, 9, 11}},
+	} {
+		var got []uint64
+		for _, image := range branchCaptureImages(info, test.branch) {
+			got = append(got, image.snapshot)
+		}
+		if fmt.Sprint(got) != fmt.Sprint(test.want) {
+			t.Errorf("images of %s = %v, want %v", test.branch, got, test.want)
+		}
+	}
+	for i := 0; i < 2*captureImagesLimit; i++ {
+		info.Branches = append(info.Branches, ttcbundle.BranchInfo{ID: fmt.Sprint(i), SnapshotID: uint64(100 + i), MemoryRootObjects: []string{"root"}})
+	}
+	if images := branchCaptureImages(info, "fork"); len(images) != captureImagesLimit {
+		t.Errorf("a capture shares %d images, want at most %d", len(images), captureImagesLimit)
+	}
+}
+
 func TestProviderReferencesNeeded(t *testing.T) {
 	object := ttcsnapshot.ObjectID{Snapshot: 7}
 	for _, test := range []struct {

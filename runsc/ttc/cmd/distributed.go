@@ -2175,8 +2175,8 @@ func (b *runtimeBackend) exportDistributedGraph(containerID, transactionID strin
 	}, rootNames, rootObjects, nil
 }
 
-// distributedExportImages returns the image the source branch of transaction,
-// in containerID, was restored from, whose pages its export may share.
+// distributedExportImages returns the images whose pages an export of the
+// source branch of transaction, in containerID, may share.
 func (b *runtimeBackend) distributedExportImages(containerID, transactionID string) []captureImage {
 	tx, err := b.distributedSource.transactions.Load(transactionID)
 	if err != nil {
@@ -2190,12 +2190,7 @@ func (b *runtimeBackend) distributedExportImages(containerID, transactionID stri
 	if err != nil {
 		return nil
 	}
-	for _, branch := range info.Branches {
-		if branch.ID == branchID {
-			return branchCaptureImages(branch)
-		}
-	}
-	return nil
+	return branchCaptureImages(info, branchID)
 }
 
 // publishGraphManifestDependencies makes every immutable chunk named by a
