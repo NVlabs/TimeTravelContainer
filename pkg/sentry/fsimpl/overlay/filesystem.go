@@ -199,7 +199,9 @@ func (fs *filesystem) getChildLocked(ctx context.Context, parent *dentry, name s
 //   - parent.dirMu must be locked.
 func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name string) (*dentry, lookupLayer, error) {
 	childPath := fspath.Parse(name)
-	child := fs.newDentry()
+	// child is made once a layer has the file: a lookup of a file to be
+	// created finds none, and each made a dentry only to destroy it.
+	var child *dentry
 	topLookupLayer := lookupLayerNone
 	var lookupErr error
 
@@ -260,6 +262,9 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 		}
 
 		// Update child to include this layer.
+		if child == nil {
+			child = fs.newDentry()
+		}
 		childVD.IncRef()
 		if isUpper {
 			child.upperVD = childVD
@@ -306,13 +311,14 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 		return !(err == nil && opaqueVal == "y")
 	})
 
-	if lookupErr != nil {
-		child.destroyLocked(ctx)
+	if lookupErr != nil || !topLookupLayer.existsInOverlay() {
+		if child != nil {
+			child.destroyLocked(ctx)
+		}
+		if lookupErr == nil {
+			lookupErr = linuxerr.ENOENT
+		}
 		return nil, topLookupLayer, lookupErr
-	}
-	if !topLookupLayer.existsInOverlay() {
-		child.destroyLocked(ctx)
-		return nil, topLookupLayer, linuxerr.ENOENT
 	}
 
 	// Device and inode numbers were copied from the topmost layer above for
