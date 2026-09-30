@@ -1829,11 +1829,11 @@ func (p *branchPublisher) publishSharedReferenceLedger(snapshot ttcsnapshot.Snap
 	// the equivalent cold branch root. Authority reconciliation retains the
 	// final cold roots before releasing these bridge roots after the atomic
 	// provider-to-shared transition.
-	manifest, err := p.graphShared.Manifest(snapshot)
+	bridges, err := p.publicationBridges(snapshot)
 	if err != nil {
 		return fmt.Errorf("reading publication bridge roots: %w", err)
 	}
-	for _, bridge := range publicationBridgeReferences(snapshot, manifest.References) {
+	for _, bridge := range bridges {
 		if err := retainBridge(ctx, uint64(snapshot), bridge.RetainOperation, bridge.Name, bridge.Object.String()); err != nil {
 			return fmt.Errorf("retaining publication bridge %q: %w", bridge.Name, err)
 		}
@@ -1859,6 +1859,18 @@ func (p *branchPublisher) publishSharedReferenceLedger(snapshot ttcsnapshot.Snap
 		changes = changes[count:]
 	}
 	return flushOrigin(ctx, uint64(snapshot))
+}
+
+// publicationBridges returns the bridges of the roots and pins of
+// snapshot's manifest, which it reads in place: copying it, of hundreds of
+// thousands of objects, for its few references took 50-70 ms each time.
+func (p *branchPublisher) publicationBridges(snapshot ttcsnapshot.SnapshotID) ([]publicationBridgeReference, error) {
+	var bridges []publicationBridgeReference
+	err := p.graphShared.ViewManifest(snapshot, func(manifest *ttcsnapshot.SnapshotManifest) error {
+		bridges = publicationBridgeReferences(snapshot, manifest.References)
+		return nil
+	})
+	return bridges, err
 }
 
 type publicationBridgeReference struct {
@@ -1897,7 +1909,7 @@ func (p *branchPublisher) releaseSharedPublicationBridge(snapshot ttcsnapshot.Sn
 	if p == nil || p.authority == nil || p.graphShared == nil || p.sharedRefs == nil || snapshot == 0 {
 		return errors.New("shared publication bridge release is unavailable")
 	}
-	manifest, err := p.graphShared.Manifest(snapshot)
+	bridges, err := p.publicationBridges(snapshot)
 	if err != nil {
 		return fmt.Errorf("reading publication bridge roots: %w", err)
 	}
@@ -1914,7 +1926,7 @@ func (p *branchPublisher) releaseSharedPublicationBridge(snapshot ttcsnapshot.Sn
 		if err := p.sharedRefs.reconcileAuthoritativeColdReferences(); err != nil {
 			return fmt.Errorf("reconciling replacement roots: %w", err)
 		}
-		for _, bridge := range publicationBridgeReferences(snapshot, manifest.References) {
+		for _, bridge := range bridges {
 			if err := p.sharedRefs.mutateReference(bridge.ReleaseOperation, bridge.Name, bridge.Object, false); err != nil {
 				return fmt.Errorf("releasing publication bridge %q: %w", bridge.Name, err)
 			}
@@ -1927,7 +1939,7 @@ func (p *branchPublisher) releaseSharedPublicationBridge(snapshot ttcsnapshot.Sn
 		if err != nil {
 			return err
 		}
-		for _, bridge := range publicationBridgeReferences(snapshot, manifest.References) {
+		for _, bridge := range bridges {
 			if err := peer.ApplySharedSnapshotReference(ctx, uint64(snapshot), bridge.ReleaseOperation, bridge.Name, bridge.Object.String(), false); err != nil {
 				return fmt.Errorf("releasing publication bridge %q: %w", bridge.Name, err)
 			}
