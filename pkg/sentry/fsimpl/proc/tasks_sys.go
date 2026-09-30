@@ -177,6 +177,7 @@ func (fs *filesystem) newSysNetDir(ctx context.Context, root *auth.Credentials, 
 			ipv4Contents["tcp_syn_retries"] = fs.newInode(ctx, root, 0644, &tcpRetriesData{stack: stack, kind: tcpSynRetries})
 			ipv4Contents["tcp_retries2"] = fs.newInode(ctx, root, 0644, &tcpRetriesData{stack: stack, kind: tcpMaxRetries})
 		}
+		ipv4Contents["conf"], ipv4Contents["neigh"] = fs.newNetConfDirs(ctx, root, stack, false /* ipv6 */)
 		contents = map[string]kernfs.Inode{
 			"ipv4": fs.newStaticDir(ctx, root, ipv4Contents),
 			"core": fs.newStaticDir(ctx, root, map[string]kernfs.Inode{
@@ -193,6 +194,13 @@ func (fs *filesystem) newSysNetDir(ctx context.Context, root *auth.Credentials, 
 				"wmem_default":     fs.newInode(ctx, root, 0444, newStaticFile("212992")),
 				"wmem_max":         fs.newInode(ctx, root, 0444, newStaticFile("212992")),
 			}),
+		}
+		if stack.SupportsIPv6() {
+			ipv6Conf, ipv6Neigh := fs.newNetConfDirs(ctx, root, stack, true /* ipv6 */)
+			contents["ipv6"] = fs.newStaticDir(ctx, root, map[string]kernfs.Inode{
+				"conf":  ipv6Conf,
+				"neigh": ipv6Neigh,
+			})
 		}
 	}
 

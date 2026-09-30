@@ -82,6 +82,7 @@ go_library(
         "pressure.go",
         "subtasks.go",
         "subtasks_inode_refs.go",
+        "sys_net_conf.go",
         "task.go",
         "task_fds.go",
         "task_files.go",
