@@ -42,6 +42,7 @@ go_library(
         "sys_process_vm.go",
         "sys_random.go",
         "sys_read_write.go",
+        "sys_reboot.go",
         "sys_rlimit.go",
         "sys_rseq.go",
         "sys_rusage.go",

@@ -65,6 +65,7 @@ go_library(
         "personality.go",
         "pidfd.go",
         "poll.go",
+        "reboot.go",
         "prctl.go",
         "ptrace.go",
         "ptrace_amd64.go",

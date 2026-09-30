@@ -1,0 +1,22 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+package linux
+
+// reboot(2)'s magic numbers and commands, from include/uapi/linux/reboot.h.
+const (
+	LINUX_REBOOT_MAGIC1  = 0xfee1dead
+	LINUX_REBOOT_MAGIC2  = 672274793
+	LINUX_REBOOT_MAGIC2A = 85072278
+	LINUX_REBOOT_MAGIC2B = 369367448
+	LINUX_REBOOT_MAGIC2C = 537993216
+
+	LINUX_REBOOT_CMD_RESTART    = 0x01234567
+	LINUX_REBOOT_CMD_HALT       = 0xcdef0123
+	LINUX_REBOOT_CMD_CAD_ON     = 0x89abcdef
+	LINUX_REBOOT_CMD_CAD_OFF    = 0x00000000
+	LINUX_REBOOT_CMD_POWER_OFF  = 0x4321fedc
+	LINUX_REBOOT_CMD_RESTART2   = 0xa1b2c3d4
+	LINUX_REBOOT_CMD_SW_SUSPEND = 0xd000fce2
+	LINUX_REBOOT_CMD_KEXEC      = 0x45584543
+)
