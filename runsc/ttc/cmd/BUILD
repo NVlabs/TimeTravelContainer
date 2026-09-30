@@ -111,6 +111,7 @@ go_test(
         "graph_references_test.go",
         "idempotency_test.go",
         "long_operations_test.go",
+        "net_raw_test.go",
         "runtime_command_test.go",
     ],
     library = ":cmd",

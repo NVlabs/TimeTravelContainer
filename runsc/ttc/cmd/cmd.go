@@ -10968,11 +10968,34 @@ func (b *runtimeBackend) configuredRunscArgsForBranch(info ttcbundle.ContainerIn
 	if branch.Quarantined {
 		args = append(args, "--ttc-network-quarantine=true")
 	}
+	if rawSocketsRequested(info.CapAdd, info.CapDrop) {
+		args = append(args, "--net-raw=true")
+	}
 	gfxArgs, err := b.gfx.runscArgs(info.GPUOptions)
 	if err != nil {
 		return nil, err
 	}
 	return append(args, gfxArgs...), nil
+}
+
+// rawSocketsRequested returns whether a container's capability options ask
+// for CAP_NET_RAW explicitly. runsc drops CAP_NET_RAW, which Docker's
+// defaults include, unless raw sockets are on: TTC turns them on for
+// containers that add the capability, by name or with ALL, as Android's
+// netd, which requires it, needs.
+func rawSocketsRequested(capAdd, capDrop []string) bool {
+	added := false
+	for _, c := range capAdd {
+		if c == "ALL" || c == "NET_RAW" {
+			added = true
+		}
+	}
+	for _, c := range capDrop {
+		if c == "ALL" || c == "NET_RAW" {
+			return false
+		}
+	}
+	return added
 }
 
 func (b *runtimeBackend) runConfiguredCommand(args ...string) (int, error) {
