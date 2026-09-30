@@ -4,9 +4,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Manual end-to-end coverage for the virtual GPU, --gfx: vulkaninfo, an
-# offscreen render's checksum (test/gfx/vkoffscreen.c), and a fork with
-# --gfx-fork=device-lost, in a container whose renderer is ttc-gfx-renderer
-# and gfxstream on the host's GPU.
+# offscreen render's checksum (test/gfx/vkoffscreen.c), OpenGL ES by Zink
+# (test/gfx/gloffscreen.c), and forks with --gfx-fork=device-lost and
+# --gfx-fork=snapshot, in containers whose renderer is ttc-gfx-renderer and
+# gfxstream on the host's GPU, and whose Vulkan driver is the daemon's.
 #
 # It needs:
 #   TTC and TTCD, the binaries;
@@ -14,7 +15,9 @@
 #     host library (see runsc/ttc/gfxrenderer/README.md);
 #   TTC_GFX_GUEST_DRIVER, a directory with Mesa's libvulkan_gfxstream.so for
 #     the guest's architecture (runsc/ttc/gfxrenderer/guest/);
-#   network access, to install vulkan-tools and a compiler in a Debian image.
+#   network access, to install vulkan-tools, Mesa, and a compiler in a
+#     Debian image. Debian's Mesa has a gfxstream driver of its own, which
+#     the daemon's containers skip.
 #
 # The daemon runs with host isolation unless TTC_UNSAFE_NO_HOST_ISOLATION=1.
 # On macOS, it then starts renderers through a launcher, and each renderer
@@ -29,8 +32,10 @@ TTC_GFX_GUEST_DRIVER=${TTC_GFX_GUEST_DRIVER:-}
 TTC_E2E_ROOT=${TTC_E2E_ROOT:-}
 TTC_UNSAFE_NO_HOST_ISOLATION=${TTC_UNSAFE_NO_HOST_ISOLATION:-0}
 DEBIAN_IMAGE=${DEBIAN_IMAGE:-debian:sid}
-# The checksum of vkoffscreen's image, whose every pixel it checks.
+# The checksums of vkoffscreen's and gloffscreen's images, whose every pixel
+# they check.
 WANT_CHECKSUM=98d8b7be2dda8383
+WANT_GL_CHECKSUM=1175f5d01ae9db25
 
 fail() {
   echo "ttc gfx e2e: $*" >&2
@@ -72,17 +77,9 @@ if [ "$(uname -s)" = Darwin ]; then
     --entitlements "$TEST_DIR/../../hvf.entitlements" "$BIN_DIR/ttcd" >/dev/null
 fi
 export TTC_GFXSTREAM_LIBRARY
+# The daemon gives --gfx containers the guest's driver.
 install -m 0644 "$TTC_GFX_GUEST_DRIVER/libvulkan_gfxstream.so" "$DRIVER_DIR/"
-cat >"$DRIVER_DIR/gfxstream_icd.json" <<'EOF'
-{
-    "ICD": {
-        "api_version": "1.1.363",
-        "library_arch": "64",
-        "library_path": "/opt/ttc-gfx/libvulkan_gfxstream.so"
-    },
-    "file_format_version": "1.0.1"
-}
-EOF
+export TTC_GFX_GUEST_DRIVER="$DRIVER_DIR"
 
 ttc() {
   "$BIN_DIR/ttc" "$@"
@@ -118,7 +115,7 @@ case "$output" in
 esac
 
 ttc run -d --name "$NAME" --gfx --gfx-fork=device-lost --network ttc --nat \
-  -v "$DRIVER_DIR:/opt/ttc-gfx:ro" -v "$TEST_DIR/gfx:/src:ro" \
+  -v "$TEST_DIR/gfx:/src:ro" \
   "$DEBIAN_IMAGE" sleep infinity >/dev/null
 ttc exec "$NAME@main" test -c /dev/dri/renderD128 || fail "no render node"
 [ "$(ttc exec "$NAME@main" cat /sys/dev/char/226:128/device/../device)" = 0x1050 ] ||
@@ -127,27 +124,41 @@ ttc exec "$NAME@main" sh -c '
   set -e
   apt-get update -qq
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq vulkan-tools libdrm2 libexpat1 \
-    gcc libc6-dev libvulkan-dev glslang-tools >/dev/null 2>&1
+    gcc libc6-dev libvulkan-dev glslang-tools mesa-vulkan-drivers libegl-mesa0 \
+    libgl1-mesa-dri libegl-dev libgles-dev >/dev/null 2>&1
   mkdir -p /work
   cd /work
   glslangValidator -V /src/compute.comp -o compute.spv >/dev/null
   glslangValidator -V /src/square.vert -o square.spv >/dev/null
   glslangValidator -V /src/red.frag -o red.spv >/dev/null
   gcc -O2 -Wall -o vkoffscreen /src/vkoffscreen.c -lvulkan
+  gcc -O2 -Wall -o gloffscreen /src/gloffscreen.c -lEGL -lGLESv2
 ' || fail "preparing the container"
 ttc cp "$NAME@main:/work" "$WORK_DIR" >/dev/null || fail "copying the test programs out"
 
-VK_DRIVER_FILES=VK_DRIVER_FILES=/opt/ttc-gfx/gfxstream_icd.json
-summary=$(ttc exec -e "$VK_DRIVER_FILES" "$NAME@main" vulkaninfo --summary 2>&1) ||
+summary=$(ttc exec "$NAME@main" vulkaninfo --summary 2>&1) ||
   fail "vulkaninfo: $summary"
 case "$summary" in
   *"Virtio-GPU GFXStream"*) ;;
   *) fail "vulkaninfo found no virtual GPU: $summary" ;;
 esac
+# Debian's gfxstream driver would be a second device of the GPU.
+[ "$(echo "$summary" | grep -c "deviceName *= Virtio-GPU GFXStream")" = 1 ] ||
+  fail "the virtual GPU is not one device: $summary"
+
+# OpenGL ES renders on the GPU, by Zink. On macOS, where Zink has only
+# OpenGL 2.1 and OpenGL ES 2.0, applications opt in to it; elsewhere, the
+# daemon's configuration of Mesa has them use it.
+ZINK=MESA_LOADER_DRIVER_OVERRIDE=zink
+result=$(ttc exec -e "$ZINK" "$NAME@main" /work/gloffscreen 2>&1) || fail "gloffscreen: $result"
+case "$result" in
+  *"renderer zink"*"GFXStream"*"gloffscreen: ok checksum=$WANT_GL_CHECKSUM"*) ;;
+  *) fail "gloffscreen: $result" ;;
+esac
 
 # Repeat the render: each run creates a context of the branch's renderer.
 for i in 1 2 3; do
-  result=$(ttc exec -e "$VK_DRIVER_FILES" "$NAME@main" sh -c \
+  result=$(ttc exec "$NAME@main" sh -c \
     'cd /work && ./vkoffscreen compute.spv square.spv red.spv' 2>&1) ||
     fail "vkoffscreen run $i: $result"
   case "$result" in
@@ -156,13 +167,15 @@ for i in 1 2 3; do
   esac
 done
 
-# wait_log CONTAINER@BRANCH PATTERN SECONDS waits for the render loop's log
-# in the branch to match PATTERN, an extended regular expression.
+# wait_log CONTAINER@BRANCH PATTERN SECONDS [LOG] waits for the render
+# loop's log in the branch, LOG or /tmp/loop.log, to match PATTERN, an
+# extended regular expression.
 wait_log() {
+  log=${4:-/tmp/loop.log}
   deadline=$(($(date +%s) + $3))
-  until ttc exec "$1" grep -Eq "$2" /tmp/loop.log 2>/dev/null; do
+  until ttc exec "$1" grep -Eq "$2" "$log" 2>/dev/null; do
     if [ "$(date +%s)" -ge "$deadline" ]; then
-      fail "$1's render loop has no '$2' after $3s: $(ttc exec "$1" cat /tmp/loop.log 2>&1)"
+      fail "$1's render loop has no '$2' in $log after $3s: $(ttc exec "$1" cat "$log" 2>&1)"
     fi
     sleep 0.5
   done
@@ -172,7 +185,7 @@ wait_log() {
 # 30s. The child's copy of the rendering process loses the GPU: it must end,
 # not hang. A new process in the child renders with a renderer of the
 # child's own, and the source renders on, unaffected.
-ttc exec -d -e "$VK_DRIVER_FILES" "$NAME@main" sh -c \
+ttc exec -d "$NAME@main" sh -c \
   'cd /work && ./vkoffscreen compute.spv square.spv red.spv 600 50 >/tmp/loop.log 2>&1
    echo "exit=$?" >>/tmp/loop.log' >/dev/null
 wait_log "$NAME@main" "iteration 3 ok" 60
@@ -183,7 +196,7 @@ case "$lost_log" in
   *exit=0) fail "the child's render loop survived the fork: $lost_log" ;;
 esac
 echo "the child's render loop ended: $(echo "$lost_log" | tail -n 2 | tr '\n' ' ')"
-result=$(ttc exec -e "$VK_DRIVER_FILES" "$NAME@lost" sh -c \
+result=$(ttc exec "$NAME@lost" sh -c \
   'cd /work && ./vkoffscreen compute.spv square.spv red.spv' 2>&1) ||
   fail "vkoffscreen in the fork's child: $result"
 case "$result" in
@@ -202,7 +215,7 @@ esac
 # rings through macOS's global shared memory names.
 ttc fork "$NAME@main" one two >/dev/null
 for branch in one two; do
-  ttc exec -d -e "$VK_DRIVER_FILES" "$NAME@$branch" sh -c \
+  ttc exec -d "$NAME@$branch" sh -c \
     'cd /work && ./vkoffscreen compute.spv square.spv red.spv 300 20 >/tmp/pair.log 2>&1
      echo "exit=$?" >>/tmp/pair.log' >/dev/null
 done
@@ -257,20 +270,26 @@ ttc rm -f "$NAME" >/dev/null
 # A family with --gfx-fork=snapshot: a fork's child resumes the GPU's state,
 # in a renderer that restores the source's snapshot. gfxstream's snapshots
 # rebuild Vulkan objects and memory, but not the commands of recorded
-# command buffers, so the render loop records them again each time.
+# command buffers, so the Vulkan render loop records them again each time;
+# Zink records its own for each draw.
 SNAP="$NAME-snap"
 ttc run -d --name "$SNAP" --gfx --gfx-fork=snapshot --network ttc --nat \
-  -v "$DRIVER_DIR:/opt/ttc-gfx:ro" -v "$WORK_DIR:/work:ro" \
+  -v "$WORK_DIR:/work:ro" \
   "$DEBIAN_IMAGE" sleep infinity >/dev/null
 ttc exec "$SNAP@main" sh -c '
   set -e
   apt-get update -qq
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libvulkan1 libdrm2 libexpat1 >/dev/null 2>&1
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libvulkan1 libdrm2 libexpat1 \
+    libegl1 libgles2 libegl-mesa0 libgl1-mesa-dri >/dev/null 2>&1
 ' || fail "preparing the snapshot family's container"
-ttc exec -d -e "$VK_DRIVER_FILES" "$SNAP@main" sh -c \
+ttc exec -d "$SNAP@main" sh -c \
   'cd /work && ./vkoffscreen compute.spv square.spv red.spv 300 20 rerecord >/tmp/loop.log 2>&1
    echo "exit=$?" >>/tmp/loop.log' >/dev/null
+ttc exec -d -e "$ZINK" "$SNAP@main" sh -c \
+  'cd /work && ./gloffscreen 300 20 >/tmp/gl.log 2>&1
+   echo "exit=$?" >>/tmp/gl.log' >/dev/null
 wait_log "$SNAP@main" "iteration 3 ok" 60
+wait_log "$SNAP@main" "iteration 3 ok" 60 /tmp/gl.log
 ttc fork "$SNAP@main" kid >/dev/null
 for target in "$SNAP@main" "$SNAP@kid"; do
   wait_log "$target" "^exit=" 180
@@ -278,6 +297,12 @@ for target in "$SNAP@main" "$SNAP@kid"; do
   case "$loop_log" in
     *"iteration 300 ok"*"vkoffscreen: ok checksum=$WANT_CHECKSUM"*exit=0) ;;
     *) fail "$target's render loop, across a snapshot fork: $loop_log" ;;
+  esac
+  wait_log "$target" "^exit=" 180 /tmp/gl.log
+  gl_log=$(ttc exec "$target" cat /tmp/gl.log)
+  case "$gl_log" in
+    *"iteration 300 ok"*"gloffscreen: ok checksum=$WANT_GL_CHECKSUM"*exit=0) ;;
+    *) fail "$target's OpenGL loop, across a snapshot fork: $gl_log" ;;
   esac
 done
 ttc rm -f "$SNAP" >/dev/null

@@ -107,6 +107,7 @@ go_test(
         "elastic_capacity_test.go",
         "elastic_cluster_test.go",
         "events_test.go",
+        "gfx_test.go",
         "graph_references_test.go",
         "idempotency_test.go",
         "long_operations_test.go",

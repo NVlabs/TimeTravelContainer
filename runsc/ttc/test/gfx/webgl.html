@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+webgl.html checks a browser's WebGL and WebGPU: WebGL clears a 64x64 canvas
+to blue and draws a red square whose edges lie on pixel boundaries, and the
+page checks every pixel; WebGPU requests an adapter and runs a compute
+shader that squares 256 numbers. The page writes its results into its body,
+and its console, as lines "webgl: ..." and "webgpu: ...": a headless
+browser's --dump-dom has WebGL's, and its log (--enable-logging=stderr
+--log-level=0) has both, once WebGPU's promises resolve.
+
+webgl.html#loop=N draws N frames, one an animation frame, alternating the
+square's color between red and green, and checks each; it logs
+"webgl: frame F ok" every 60 frames, and "webgl: loop ok" at the end.
+-->
+<html>
+<body>
+<canvas id="c" width="64" height="64"></canvas>
+<pre id="out"></pre>
+<script>
+const out = document.getElementById("out");
+function log(line) {
+  out.textContent += line + "\n";
+  console.log(line);
+}
+
+function webgl() {
+  const gl = document.getElementById("c").getContext("webgl", {preserveDrawingBuffer: true, antialias: false});
+  if (!gl) {
+    log("webgl: no context");
+    return;
+  }
+  const info = gl.getExtension("WEBGL_debug_renderer_info");
+  log("webgl: renderer " + (info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER)));
+  function shader(type, source) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, source);
+    gl.compileShader(s);
+    return s;
+  }
+  const p = gl.createProgram();
+  gl.attachShader(p, shader(gl.VERTEX_SHADER,
+      "attribute vec2 position; void main() { gl_Position = vec4(position, 0.0, 1.0); }"));
+  gl.attachShader(p, shader(gl.FRAGMENT_SHADER,
+      "precision mediump float; uniform vec4 color; void main() { gl_FragColor = color; }"));
+  gl.linkProgram(p);
+  gl.useProgram(p);
+  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-0.5, -0.5, 0.5, -0.5, -0.5, 0.5, 0.5, 0.5]), gl.STATIC_DRAW);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.enableVertexAttribArray(0);
+  gl.viewport(0, 0, 64, 64);
+  const color = gl.getUniformLocation(p, "color");
+  const pixels = new Uint8Array(64 * 64 * 4);
+  // draw draws a frame, whose square is red, or green if green, and returns
+  // how many of its pixels are wrong.
+  function draw(green) {
+    gl.clearColor(0, 0, 1, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.uniform4f(color, green ? 0 : 1, green ? 1 : 0, 0, 1);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.readPixels(0, 0, 64, 64, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+    let bad = 0;
+    for (let y = 0; y < 64; y++) {
+      for (let x = 0; x < 64; x++) {
+        const inside = x >= 16 && x < 48 && y >= 16 && y < 48;
+        const want = inside ? (green ? [0, 255, 0, 255] : [255, 0, 0, 255]) : [0, 0, 255, 255];
+        for (let c = 0; c < 4; c++) {
+          if (pixels[(y * 64 + x) * 4 + c] !== want[c]) {
+            bad++;
+            break;
+          }
+        }
+      }
+    }
+    return bad;
+  }
+  const loop = /^#loop=(\d+)$/.exec(location.hash);
+  if (!loop) {
+    const bad = draw(false);
+    log(bad === 0 ? "webgl: ok" : "webgl: " + bad + " pixels differ");
+    return;
+  }
+  const frames = Number(loop[1]);
+  let frame = 1;
+  function step() {
+    const bad = draw(frame % 2 === 0);
+    if (bad !== 0) {
+      log("webgl: frame " + frame + ": " + bad + " pixels differ");
+      return;
+    }
+    if (frame % 60 === 0) {
+      log("webgl: frame " + frame + " ok");
+    }
+    if (frame === frames) {
+      log("webgl: loop ok");
+      return;
+    }
+    frame++;
+    requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+}
+
+async function webgpu() {
+  if (!navigator.gpu) {
+    log("webgpu: unavailable");
+    return;
+  }
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) {
+    log("webgpu: no adapter");
+    return;
+  }
+  const info = adapter.info || {};
+  log("webgpu: adapter " + [info.vendor, info.architecture, info.device, info.description].join(" / "));
+  const device = await adapter.requestDevice();
+  const n = 256;
+  const buffer = device.createBuffer({size: n * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST});
+  device.queue.writeBuffer(buffer, 0, new Uint32Array([...Array(n).keys()]));
+  const readback = device.createBuffer({size: n * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST});
+  const module = device.createShaderModule({code: `
+    @group(0) @binding(0) var<storage, read_write> data: array<u32>;
+    @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3u) {
+      data[id.x] = data[id.x] * data[id.x];
+    }`});
+  const pipeline = device.createComputePipeline({layout: "auto", compute: {module, entryPoint: "main"}});
+  const bind = device.createBindGroup({layout: pipeline.getBindGroupLayout(0), entries: [{binding: 0, resource: {buffer}}]});
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bind);
+  pass.dispatchWorkgroups(n / 64);
+  pass.end();
+  encoder.copyBufferToBuffer(buffer, 0, readback, 0, n * 4);
+  device.queue.submit([encoder.finish()]);
+  await readback.mapAsync(GPUMapMode.READ);
+  const result = new Uint32Array(readback.getMappedRange());
+  let bad = 0;
+  for (let i = 0; i < n; i++) {
+    if (result[i] !== i * i) {
+      bad++;
+    }
+  }
+  log(bad === 0 ? "webgpu: ok" : "webgpu: " + bad + " values differ");
+}
+
+try {
+  webgl();
+} catch (e) {
+  log("webgl: " + e);
+}
+webgpu().catch(e => log("webgpu: " + e));
+</script>
+</body>
+</html>

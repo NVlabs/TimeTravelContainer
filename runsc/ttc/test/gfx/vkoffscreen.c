@@ -171,11 +171,23 @@ int main(int argc, char **argv) {
 	};
 	VkInstance instance;
 	CHECK(vkCreateInstance(&instance_info, NULL, &instance));
-	uint32_t count = 1;
-	VkResult r = vkEnumeratePhysicalDevices(instance, &count, &phys);
+	VkPhysicalDevice devices[16];
+	uint32_t count = 16;
+	VkResult r = vkEnumeratePhysicalDevices(instance, &count, devices);
 	if ((r != VK_SUCCESS && r != VK_INCOMPLETE) || count == 0) {
 		fprintf(stderr, "vkoffscreen: no Vulkan device: %d\n", (int)r);
 		return 1;
+	}
+	// Prefer a GPU to a CPU implementation, such as lavapipe, which images
+	// may install beside the virtual GPU's driver.
+	phys = devices[0];
+	for (uint32_t i = 0; i < count; i++) {
+		VkPhysicalDeviceProperties p;
+		vkGetPhysicalDeviceProperties(devices[i], &p);
+		if (p.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU) {
+			phys = devices[i];
+			break;
+		}
 	}
 	VkPhysicalDeviceProperties props;
 	vkGetPhysicalDeviceProperties(phys, &props);

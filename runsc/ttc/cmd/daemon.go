@@ -6109,7 +6109,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 	if run == "" {
 		run = filepath.Dir(socket)
 	}
-	server.gfx = newGFXService(run, gfx, stderr)
+	server.gfx = newGFXService(run, filepath.Join(localRoot, "gfx"), gfx, stderr)
 	defer server.gfx.Close()
 	if err := compactDaemonMutations(server.mutationRoot(), daemonMutationRetention); err != nil && stderr != nil {
 		fmt.Fprintf(stderr, "ttcd: warning: compacting daemon mutation history: %v\n", err)

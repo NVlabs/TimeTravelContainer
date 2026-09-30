@@ -527,6 +527,14 @@ type PrepareOptions struct {
 	Progress           images.ProgressFunc
 	// GPUOptions are the family's GPU devices.
 	GPUOptions
+	// DeviceMounts are read-only mounts of the guest's side of the family's
+	// devices, which the daemon provides: user-space drivers, and the files
+	// that make the guest's libraries find them.
+	DeviceMounts []HostMount
+	// DeviceEnv are the environment variables, NAME=VALUE, that make the
+	// guest's libraries use the family's devices. A container gets those that
+	// its image and options leave unset.
+	DeviceEnv []string
 	// VolumeCopyMode is the copy policy already verified by ttcd at startup.
 	// Empty permits Store-only callers to probe either supported mode.
 	VolumeCopyMode ttcvolume.CopyMode
@@ -1619,6 +1627,11 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		return Prepared{}, err
 	}
 	opts.HostMounts = append(opts.HostMounts, internalMounts...)
+	for _, mount := range opts.DeviceMounts {
+		mount.Readonly = true
+		mount.Internal = true
+		opts.HostMounts = append(opts.HostMounts, mount)
+	}
 	opts.SpecOptions.RootFS = rootfs
 	if hasHardResourceLimits(opts.SpecOptions) {
 		opts.SpecOptions.CgroupsPath = filepath.Join("ttc", id)
@@ -1627,6 +1640,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if err != nil {
 		return Prepared{}, err
 	}
+	spec.Process.Env = addDefaultEnv(spec.Process.Env, opts.DeviceEnv)
 	if s.CPUFeatures != "" {
 		if spec.Annotations == nil {
 			spec.Annotations = make(map[string]string)

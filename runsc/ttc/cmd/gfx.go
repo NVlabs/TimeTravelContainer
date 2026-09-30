@@ -25,6 +25,53 @@ import (
 // beside itself unless TTC_GFX_RENDERER names it.
 const gfxRendererName = "ttc-gfx-renderer"
 
+// The guest's Vulkan driver, Mesa's gfxstream driver, which ttcd gives the
+// containers of --gfx families. ttcd looks for it in gfx-guest/ARCH beside
+// itself, ARCH being the guest's, aarch64 or x86_64, unless
+// TTC_GFX_GUEST_DRIVER names its directory.
+const (
+	gfxGuestDriverName = "libvulkan_gfxstream.so"
+	// gfxGuestDriverPath is where containers find the driver.
+	gfxGuestDriverPath = "/usr/lib/ttc-gfx/" + gfxGuestDriverName
+	// gfxGuestManifestPath is where the Vulkan loader of containers finds the
+	// driver's manifest, among those of the drivers that images install.
+	gfxGuestManifestPath = "/usr/share/vulkan/icd.d/ttc_gfxstream_icd.json"
+	// gfxGuestDriconfPath is where Mesa's OpenGL in containers finds the
+	// configuration that has it drive the virtual GPU by Zink, over the
+	// Vulkan driver: the GPU has no OpenGL driver.
+	gfxGuestDriconfPath = "/usr/share/drirc.d/50-ttc-gfx.conf"
+)
+
+// gfxGuestEnv are the environment variables of the containers of --gfx
+// families, unless they set them. The Vulkan loader skips the gfxstream
+// drivers that images install, of Mesa before TTC's patches, which would
+// drive the virtual GPU as a second device, the one that applications
+// prefer.
+var gfxGuestEnv = []string{"VK_LOADER_DRIVERS_DISABLE=gfxstream_vk_icd*"}
+
+// gfxGuestDriconf has Mesa's OpenGL drive virtio-gpu devices by Zink. If
+// Zink fails, as without a Vulkan driver for the device, Mesa renders in
+// software, as it would without the configuration.
+//
+// Containers get it where Zink offers OpenGL 3 and more on the host's GPU,
+// which takes transform feedback and geometry shaders. MoltenVK, macOS's
+// Vulkan, has neither, and Zink on it offers only OpenGL 2.1 and OpenGL ES
+// 2.0: applications that need more, Chromium's default ANGLE on OpenGL
+// among them, would fail instead of rendering in software. There,
+// applications opt in with MESA_LOADER_DRIVER_OVERRIDE=zink.
+var gfxGuestZinkByDefault = runtime.GOOS != "darwin"
+
+const gfxGuestDriconf = `<?xml version="1.0" standalone="yes"?>
+<!-- TTC's virtual GPU has no OpenGL driver: drive it by Zink. -->
+<driconf>
+    <device driver="loader" kernel_driver="virtio_gpu">
+        <application name="Default">
+            <option name="dri_driver" value="zink" />
+        </application>
+    </device>
+</driconf>
+`
+
 // gfxHost is how the daemon starts GPU renderers, which it settles before it
 // confines itself.
 type gfxHost struct {
@@ -74,8 +121,14 @@ func (h gfxHost) Close() {
 type gfxService struct {
 	// socket is the path of the broker socket.
 	socket string
+	// dir is the service's directory, which holds files that it gives
+	// containers.
+	dir    string
 	host   gfxHost
 	stderr io.Writer
+
+	// noGuestDriver reports, once, that the daemon has no guest driver.
+	noGuestDriver sync.Once
 
 	// mu protects the fields below, which start sets once.
 	mu       sync.Mutex
@@ -90,13 +143,125 @@ type gfxService struct {
 }
 
 // newGFXService returns a service whose broker socket is in run, the daemon's
-// run/, and which starts renderers as host says.
-func newGFXService(run string, host gfxHost, stderr io.Writer) *gfxService {
+// run/, whose files are in dir, and which starts renderers as host says.
+func newGFXService(run, dir string, host gfxHost, stderr io.Writer) *gfxService {
 	return &gfxService{
 		socket: filepath.Join(run, daemonRunSocketName("g", "gfx")),
+		dir:    dir,
 		host:   host,
 		stderr: stderr,
 	}
+}
+
+// guestArch returns the architecture of the daemon's guests, as Linux spells
+// it.
+func guestArch() string {
+	switch runtime.GOARCH {
+	case "arm64":
+		return "aarch64"
+	case "amd64":
+		return "x86_64"
+	default:
+		return runtime.GOARCH
+	}
+}
+
+// guestDriver returns the path of the guest's Vulkan driver.
+func guestDriver() (string, error) {
+	dir := os.Getenv("TTC_GFX_GUEST_DRIVER")
+	if dir == "" {
+		exe, err := os.Executable()
+		if err != nil {
+			return "", err
+		}
+		dir = filepath.Join(filepath.Dir(exe), "gfx-guest", guestArch())
+	}
+	driver := filepath.Join(dir, gfxGuestDriverName)
+	if _, err := os.Stat(driver); err != nil {
+		return "", err
+	}
+	return driver, nil
+}
+
+// guestEdits returns what gives the containers of a family with the given
+// GPU options the guest's side of the virtual GPU: the mounts of the guest's
+// Vulkan driver, of the manifest that the Vulkan loader finds it by, and,
+// with gfxGuestZinkByDefault, of Mesa's OpenGL configuration, and the
+// environment variables of gfxGuestEnv. Without a driver for the guest's architecture, it returns
+// none: the containers must bring their own.
+func (g *gfxService) guestEdits(opts ttcbundle.GPUOptions) ([]ttcbundle.HostMount, []string, error) {
+	if !opts.GFX || g == nil {
+		return nil, nil, nil
+	}
+	driver, err := guestDriver()
+	if err != nil {
+		g.noGuestDriver.Do(func() {
+			if g.stderr != nil {
+				fmt.Fprintf(g.stderr, "ttcd: no guest Vulkan driver for --gfx (%v); containers must bring their own\n", err)
+			}
+		})
+		return nil, nil, nil
+	}
+	manifest, err := json.MarshalIndent(map[string]any{
+		"file_format_version": "1.0.1",
+		"ICD": map[string]string{
+			"library_path": gfxGuestDriverPath,
+			"library_arch": "64",
+			"api_version":  "1.1.363",
+		},
+	}, "", "    ")
+	if err != nil {
+		return nil, nil, err
+	}
+	manifestPath, err := g.writeGuestFile(filepath.Base(gfxGuestManifestPath), append(manifest, '\n'))
+	if err != nil {
+		return nil, nil, fmt.Errorf("the guest's Vulkan driver manifest: %w", err)
+	}
+	mounts := []ttcbundle.HostMount{
+		{Source: driver, Destination: gfxGuestDriverPath},
+		{Source: manifestPath, Destination: gfxGuestManifestPath},
+	}
+	if gfxGuestZinkByDefault {
+		driconfPath, err := g.writeGuestFile(filepath.Base(gfxGuestDriconfPath), []byte(gfxGuestDriconf))
+		if err != nil {
+			return nil, nil, fmt.Errorf("the guest's OpenGL configuration: %w", err)
+		}
+		mounts = append(mounts, ttcbundle.HostMount{Source: driconfPath, Destination: gfxGuestDriconfPath})
+	}
+	return mounts, append([]string(nil), gfxGuestEnv...), nil
+}
+
+// writeGuestFile writes a file, named name, of the guest's side of the
+// virtual GPU in the service's directory, unless it has it already, and
+// returns its path.
+func (g *gfxService) writeGuestFile(name string, content []byte) (string, error) {
+	if err := os.MkdirAll(g.dir, 0700); err != nil {
+		return "", err
+	}
+	path := filepath.Join(g.dir, name)
+	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, content) {
+		return path, nil
+	}
+	tmp, err := os.CreateTemp(g.dir, name+".*")
+	if err != nil {
+		return "", err
+	}
+	_, err = tmp.Write(content)
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	// Every user of a container reads it, as they read /etc/hosts.
+	if err == nil {
+		err = os.Chmod(tmp.Name(), 0444)
+	}
+	if err == nil {
+		err = os.Rename(tmp.Name(), path)
+	}
+	if err != nil {
+		os.Remove(tmp.Name())
+		return "", err
+	}
+	return path, nil
 }
 
 // rendererOptions returns where the renderer and gfxstream are.

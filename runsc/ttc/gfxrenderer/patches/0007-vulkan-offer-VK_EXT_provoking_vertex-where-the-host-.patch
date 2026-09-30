@@ -1,0 +1,193 @@
+From 5532d8b411b3ab93ac6e645d3c3ea3ff19c84193 Mon Sep 17 00:00:00 2001
+From: Zizheng Guo <zizhengg@nvidia.com>
+Date: Thu, 1 Oct 2026 01:40:15 +0800
+Subject: [PATCH] vulkan: offer VK_EXT_provoking_vertex where the host's driver
+ lacks it
+
+ANGLE's Vulkan backend offers OpenGL ES 3 only with VK_EXT_provoking_vertex,
+for flat shading's last-vertex convention, and MoltenVK lacks it: Metal
+takes flat values from a primitive's first vertex. Chromium's GPU process,
+which needs OpenGL ES 3, failed on a virtual GPU on macOS.
+
+Where the host's driver lacks it, offer the extension anyway: report
+provokingVertexLast and provokingVertexModePerPipeline, and keep the
+extension, its feature struct, and pipelines' provoking vertex state from
+the host's driver. Pipelines that ask for the last vertex get the first,
+as they did before ANGLE required the extension.
+---
+ host/vulkan/vk_decoder_global_state.cpp   | 102 ++++++++++++++++++++++
+ host/vulkan/vk_decoder_internal_structs.h |   3 +
+ 2 files changed, 105 insertions(+)
+
+diff --git a/host/vulkan/vk_decoder_global_state.cpp b/host/vulkan/vk_decoder_global_state.cpp
+index d495108..c54b4dc 100644
+--- a/host/vulkan/vk_decoder_global_state.cpp
++++ b/host/vulkan/vk_decoder_global_state.cpp
+@@ -1577,6 +1577,16 @@ class VkDecoderGlobalState::Impl {
+             robustness2Features->nullDescriptor = VK_TRUE;
+         }
+ 
++        // VK_EXT_provoking_vertex, where the host's driver lacks it (see
++        // hostSupportsProvokingVertex).
++        if (auto* provokingVertexFeatures = static_cast<VkPhysicalDeviceProvokingVertexFeaturesEXT*>(
++                findStructOfType(pFeatures,
++                                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT));
++            provokingVertexFeatures != nullptr && !hostSupportsProvokingVertex(physicalDevice, vk)) {
++            provokingVertexFeatures->provokingVertexLast = VK_TRUE;
++            provokingVertexFeatures->transformFeedbackPreservesProvokingVertex = VK_FALSE;
++        }
++
+         // Disable a set of Vulkan features if BypassVulkanDeviceFeatureOverrides is NOT enabled.
+         if (!m_vkEmulation->getFeatures().BypassVulkanDeviceFeatureOverrides.enabled()) {
+             VkPhysicalDeviceVulkan11Features* vk11Features =
+@@ -1909,6 +1919,16 @@ class VkDecoderGlobalState::Impl {
+             }
+         }
+ 
++        if (auto* provokingVertexProperties =
++                static_cast<VkPhysicalDeviceProvokingVertexPropertiesEXT*>(findStructOfType(
++                    pProperties, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_PROPERTIES_EXT));
++            provokingVertexProperties != nullptr &&
++            !hostSupportsProvokingVertex(physicalDevice, vk)) {
++            provokingVertexProperties->provokingVertexModePerPipeline = VK_TRUE;
++            provokingVertexProperties->transformFeedbackPreservesTriangleFanProvokingVertex =
++                VK_FALSE;
++        }
++
+         m_vkEmulation->applyApiVersionLimits(pProperties->properties.apiVersion);
+     }
+ 
+@@ -2118,6 +2138,15 @@ class VkDecoderGlobalState::Impl {
+         }
+ #endif
+ 
++        if (!hasDeviceExtension(properties, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME)) {
++            // See hostSupportsProvokingVertex.
++            VkExtensionProperties provokingVertexProps;
++            strncpy(provokingVertexProps.extensionName, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
++                    sizeof(provokingVertexProps.extensionName));
++            provokingVertexProps.specVersion = VK_EXT_PROVOKING_VERTEX_SPEC_VERSION;
++            properties.push_back(provokingVertexProps);
++        }
++
+         if (enableProtectedMemoryEmulation() ) {
+             // Enable VK_EXT_pipeline_protected_access extension support
+             VkExtensionProperties ycbcr_props;
+@@ -2229,6 +2258,20 @@ class VkDecoderGlobalState::Impl {
+             featuresToFilter.emplace_back(&features2->features);
+         }
+ 
++        // VK_EXT_provoking_vertex, where the host's driver lacks it, is not
++        // enabled in it (see hostSupportsProvokingVertex).
++        const bool emulateProvokingVertex = !hostSupportsProvokingVertex(physicalDevice, vk);
++        if (emulateProvokingVertex) {
++            updatedDeviceExtensions.erase(
++                std::remove_if(updatedDeviceExtensions.begin(), updatedDeviceExtensions.end(),
++                               [](const char* name) {
++                                   return strcmp(name, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME) == 0;
++                               }),
++                updatedDeviceExtensions.end());
++            removeStructsOfType(&createInfoFiltered,
++                                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT);
++        }
++
+         // Null descriptors that the host's driver lacks are not enabled in
+         // it (see on_vkGetPhysicalDeviceFeatures2).
+         {
+@@ -2481,6 +2524,7 @@ class VkDecoderGlobalState::Impl {
+         deviceInfo.emulateTextureEtc2 = emulateTextureEtc2;
+         deviceInfo.emulateTextureAstc = emulateTextureAstc;
+         deviceInfo.emulateProtectedMemory = emulateProtectedMemory;
++        deviceInfo.emulateProvokingVertex = emulateProvokingVertex;
+         deviceInfo.useAstcCpuDecompression =
+             m_vkEmulation->getAstcLdrEmulationMode() == AstcEmulationMode::Cpu &&
+             AstcCpuDecompressor::get().available();
+@@ -5307,6 +5351,24 @@ class VkDecoderGlobalState::Impl {
+         auto device = unbox_VkDevice(boxed_device);
+         auto deviceDispatch = dispatch_VkDevice(boxed_device);
+ 
++        bool emulateProvokingVertex = false;
++        {
++            std::lock_guard<std::mutex> lock(mMutex);
++            auto* deviceInfo = gfxstream::base::find(mDeviceInfo, device);
++            emulateProvokingVertex = deviceInfo && deviceInfo->emulateProvokingVertex;
++        }
++        if (emulateProvokingVertex) {
++            // The decoder owns the create infos, which it decoded.
++            for (uint32_t i = 0; i < createInfoCount; i++) {
++                if (pCreateInfos[i].pRasterizationState != nullptr) {
++                    removeStructsOfType(
++                        const_cast<VkPipelineRasterizationStateCreateInfo*>(
++                            pCreateInfos[i].pRasterizationState),
++                        VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT);
++                }
++            }
++        }
++
+         VkResult result = deviceDispatch->vkCreateGraphicsPipelines(
+             device, pipelineCache, createInfoCount, pCreateInfos, nullptr, pPipelines);
+         if (result != VK_SUCCESS && result != VK_PIPELINE_COMPILE_REQUIRED) {
+@@ -10590,6 +10652,46 @@ class VkDecoderGlobalState::Impl {
+         return false;
+     }
+ 
++    // hostSupportsProvokingVertex returns whether the host's driver has
++    // VK_EXT_provoking_vertex. Where it does not, as MoltenVK does not (Metal
++    // takes flat values from a primitive's first vertex), the device offers
++    // it anyway, because ANGLE's Vulkan backend offers OpenGL ES 3 only with
++    // it: pipelines that ask for the last vertex get the first, as they did
++    // before ANGLE required the extension.
++    bool hostSupportsProvokingVertex(VkPhysicalDevice physicalDevice, VulkanDispatch* vk) {
++        std::vector<VkExtensionProperties> properties;
++        if (enumerateDeviceExtensionProperties(vk, physicalDevice, nullptr, properties) !=
++            VK_SUCCESS) {
++            return false;
++        }
++        return hasDeviceExtension(properties, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
++    }
++
++    // findStructOfType returns the struct of sType in chain's pNext chain, or
++    // nullptr.
++    static void* findStructOfType(const void* chain, VkStructureType sType) {
++        for (auto* s = reinterpret_cast<const VkBaseInStructure*>(chain)->pNext; s != nullptr;
++             s = s->pNext) {
++            if (s->sType == sType) {
++                return const_cast<VkBaseInStructure*>(s);
++            }
++        }
++        return nullptr;
++    }
++
++    // removeStructsOfType removes the structs of sType from chain's pNext
++    // chain.
++    static void removeStructsOfType(void* chain, VkStructureType sType) {
++        auto* s = reinterpret_cast<VkBaseOutStructure*>(chain);
++        while (s->pNext != nullptr) {
++            if (s->pNext->sType == sType) {
++                s->pNext = s->pNext->pNext;
++            } else {
++                s = s->pNext;
++            }
++        }
++    }
++
+     // hostSupportsNullDescriptor returns whether the host's driver has
+     // robustness2's nullDescriptor.
+     bool hostSupportsNullDescriptor(VkPhysicalDevice physicalDevice, VulkanDispatch* vk) {
+diff --git a/host/vulkan/vk_decoder_internal_structs.h b/host/vulkan/vk_decoder_internal_structs.h
+index 711d31a..1c29905 100644
+--- a/host/vulkan/vk_decoder_internal_structs.h
++++ b/host/vulkan/vk_decoder_internal_structs.h
+@@ -242,6 +242,9 @@ struct DeviceInfo {
+     bool emulateTextureAstc = false;
+     bool useAstcCpuDecompression = false;
+     bool emulateProtectedMemory = false;
++    // emulateProvokingVertex is whether the device offers
++    // VK_EXT_provoking_vertex, which the host's driver lacks.
++    bool emulateProvokingVertex = false;
+ 
+     ExternalFenceInfo externalFenceInfo;
+     VkPhysicalDevice physicalDevice;
+-- 
+2.50.1 (Apple Git-155)
+

@@ -11,10 +11,12 @@
 #   ttc cp mesabuild@main:/out - | tar -x
 #
 # It installs lib/<triple>/libvulkan_gfxstream.so and a Vulkan ICD manifest
-# under share/vulkan/icd.d. The driver needs libdrm2, libexpat1, and
-# libstdc++6 in the guest.
+# under share/vulkan/icd.d. It applies TTC's patches, in patches/ beside the
+# script. The driver links libdrm and the C++ runtime statically, and needs
+# no expat, so it needs only the C library in the guest.
 set -eu
 PREFIX=${PREFIX:-/out}
+PATCHES=${PATCHES:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/patches}
 # The commit that the virtual GPU was developed against.
 MESA_COMMIT=${MESA_COMMIT:-49162a0ba8f3647917bc4c94d13eea6b51a1e49f}
 export DEBIAN_FRONTEND=noninteractive
@@ -29,11 +31,18 @@ if [ ! -d mesa ]; then
     git init -q mesa
     git -C mesa fetch -q --depth 1 https://gitlab.freedesktop.org/mesa/mesa.git "$MESA_COMMIT"
     git -C mesa checkout -q FETCH_HEAD
+    for patch in "$PATCHES"/*.patch; do
+        [ -e "$patch" ] || continue
+        git -C mesa apply "$patch"
+    done
 fi
 cd mesa
 meson setup build -Dprefix="$PREFIX" -Dvulkan-drivers=gfxstream -Dgallium-drivers= \
     -Dplatforms= -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dopengl=false \
     -Dgles1=disabled -Dgles2=disabled -Dllvm=disabled -Dvideo-codecs= \
+    -Dxmlconfig=disabled -Dallow-fallback-for=libdrm --force-fallback-for=libdrm \
+    -Dlibdrm:default_library=static \
+    "-Dcpp_link_args=['-static-libstdc++', '-static-libgcc']" \
     -Dbuildtype=release >"$BUILD/meson-setup.log" 2>&1 || { tail -30 "$BUILD/meson-setup.log"; exit 1; }
 ninja -C build >"$BUILD/ninja.log" 2>&1 || { grep -m5 -B2 -A8 'error:' "$BUILD/ninja.log"; exit 1; }
 ninja -C build install >/dev/null

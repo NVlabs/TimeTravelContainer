@@ -7669,6 +7669,10 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 	if err != nil {
 		return containerRunResult{}, err
 	}
+	deviceMounts, deviceEnv, err := b.gfx.guestEdits(request.gpu)
+	if err != nil {
+		return containerRunResult{}, err
+	}
 	filesystemOrigins, finishFilesystemOrigins := b.newFilesystemOriginScope()
 	persistedPorts := request.publishedPorts
 	if b.portIngress.Clustered() {
@@ -7728,6 +7732,8 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 		WaiveLiveFork:           !request.liveForkEligible,
 		LiveForkWaiver:          request.liveForkWaiver,
 		GPUOptions:              request.gpu,
+		DeviceMounts:            deviceMounts,
+		DeviceEnv:               deviceEnv,
 		Progress:                b.imageProgress(),
 		VolumeCopyMode:          b.volumeCopyMode,
 		NodeID:                  b.nodeID,
@@ -7815,6 +7821,10 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	deviceMounts, deviceEnv, err := b.gfx.guestEdits(request.gpu)
+	if err != nil {
+		return "", err
+	}
 	filesystemOrigins, finishFilesystemOrigins := b.newFilesystemOriginScope()
 	createdNodeID := b.nodeID
 	prepared, err := store.Prepare(context.Background(), ttcbundle.PrepareOptions{
@@ -7869,6 +7879,8 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 		WaiveLiveFork:      !request.liveForkEligible,
 		LiveForkWaiver:     request.liveForkWaiver,
 		GPUOptions:         request.gpu,
+		DeviceMounts:       deviceMounts,
+		DeviceEnv:          deviceEnv,
 		Progress:           b.imageProgress(),
 		VolumeCopyMode:     b.volumeCopyMode,
 		// A created branch owns mutable local filesystem state even though it has

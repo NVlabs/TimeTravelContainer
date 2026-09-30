@@ -77,6 +77,16 @@ The patches:
     write, for all of the snapshot, not only while the rings are saved.
 *   `0005`: a snapshot whose files cannot be opened fails, instead of
     crashing the renderer.
+*   `0006`: guests get robustness2's `nullDescriptor`, which Zink requires.
+    MoltenVK lacks it: the host's device takes the guest's null descriptors
+    to it as they are, and MoltenVK binds nil Metal resources for them.
+*   `0007`: guests get `VK_EXT_provoking_vertex`, which ANGLE's Vulkan
+    backend requires for OpenGL ES 3, and so Chromium. MoltenVK lacks it, as
+    Metal takes flat values from a primitive's first vertex: pipelines that
+    ask for the last vertex get the first.
+*   `0008`: guests get the host's extensions that Vulkan 1.1 and 1.2
+    promoted, such as `VK_KHR_16bit_storage`, which llama.cpp's Vulkan
+    backend enables by name.
 
 *   **macOS**: Homebrew's `molten-vk`, `vulkan-loader`, and
     `vulkan-headers`, and `meson` and `ninja`. gfxstream looks for the Vulkan
@@ -97,7 +107,38 @@ bazel test //pkg/sentry/devices/virtgpu/rendererclient:rendererclient_test \
 
 ## The guest's driver
 
-Guests use Mesa's gfxstream Vulkan driver, which no distribution packages.
-`guest/build_mesa_gfxstream.sh` builds it in a Debian container.
+Guests use Mesa's gfxstream Vulkan driver. `guest/build_mesa_gfxstream.sh`
+builds it in a Debian container, with the patches in `guest/patches/`:
+
+*   `0001`: guests get `VK_EXT_robustness2` and `VK_KHR_robustness2`, which
+    Zink requires, when the host has them.
+
+ttcd gives it to the containers of `--gfx` families: it mounts, read-only,
+
+*   the driver, from `gfx-guest/ARCH/libvulkan_gfxstream.so` beside ttcd
+    (`TTC_GFX_GUEST_DRIVER` names another directory), at
+    `/usr/lib/ttc-gfx/libvulkan_gfxstream.so`;
+*   its manifest, which the Vulkan loader finds it by, at
+    `/usr/share/vulkan/icd.d/ttc_gfxstream_icd.json`;
+*   on hosts other than macOS, a configuration of Mesa's OpenGL, at
+    `/usr/share/drirc.d/50-ttc-gfx.conf`, which has it drive the virtual GPU
+    by Zink, OpenGL on Vulkan: the GPU has no OpenGL driver. If Zink fails,
+    Mesa renders in software, as it would without the configuration.
+
+It also sets `VK_LOADER_DRIVERS_DISABLE=gfxstream_vk_icd*` unless the image
+or the container sets it: Mesa's gfxstream driver that distributions package
+(Debian's `mesa-vulkan-drivers`, for one) would drive the GPU as a second
+device, which applications prefer, and it lacks robustness2. Applications
+need no change: Vulkan ones find the GPU, and OpenGL ones that use Mesa's
+EGL on its surfaceless platform render on it by Zink. On macOS, Zink on
+MoltenVK has only OpenGL 2.1 and OpenGL ES 2.0, as MoltenVK has neither
+transform feedback nor geometry shaders, and applications that need more
+would fail rather than render in software (Mesa's llvmpipe has OpenGL 4.6):
+there, OpenGL renders in software unless an application sets
+`MESA_LOADER_DRIVER_OVERRIDE=zink`. Chromium renders on the GPU with ANGLE
+on Vulkan (`--use-angle=vulkan`), which offers OpenGL ES 3 with
+`VK_EXT_provoking_vertex` (patch `0007`). The driver has no window systems
+(`-Dplatforms=`), which would link libxcb and libwayland: X11 and Wayland
+applications render in software.
 
 [gfxstream]: https://github.com/google/gfxstream

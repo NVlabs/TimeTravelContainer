@@ -137,18 +137,22 @@ TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
 `e2e_gfx.sh` covers the virtual GPU, `--gfx`, in a Debian guest:
 
 *   the refusal of `--gfx` without fork semantics;
-*   the render node and its sysfs entries, and `vulkaninfo`;
+*   the render node and its sysfs entries, and `vulkaninfo`, which must find
+    the GPU once although Debian's Mesa brings a gfxstream driver of its own;
 *   repeated offscreen compute and render runs, whose every pixel
     `gfx/vkoffscreen.c` checks;
+*   OpenGL ES on EGL's surfaceless platform, which must render by Zink on the
+    GPU, every pixel checked (`gfx/gloffscreen.c`). On macOS, where Zink has
+    only OpenGL ES 2.0, the test opts in with `MESA_LOADER_DRIVER_OVERRIDE`;
 *   a live fork with `--gfx-fork=device-lost` while the guest renders. In the
     child, the process that was rendering must die of `SIGBUS`, not hang, and
     a new one must render. The source must render on;
 *   two branches rendering at once, each with its own renderer, and no
     renderer left once nothing uses the GPU;
 *   a live fork of a family with `--gfx-fork=snapshot` while the guest
-    renders: both the source's and the child's render loops must finish,
-    every frame checked, the child's on a renderer restored from the source's
-    snapshot.
+    renders with Vulkan and OpenGL ES: both the source's and the child's
+    render loops must finish, every frame checked, the child's on a renderer
+    restored from the source's snapshot.
 
 It needs `ttc-gfx-renderer`, gfxstream's host library, and Mesa's gfxstream
 Vulkan driver for the guest (see `runsc/ttc/gfxrenderer/README.md`), and the
@@ -163,7 +167,7 @@ TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
 TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
 TTC_GFX_RENDERER="$PWD/bazel-bin/runsc/ttcgfx/ttc-gfx-renderer_/ttc-gfx-renderer" \
 TTC_GFXSTREAM_LIBRARY=/path/to/libgfxstream_backend.dylib \
-TTC_GFX_GUEST_DRIVER=/path/to/mesa/out \
+TTC_GFX_GUEST_DRIVER=/path/to/dir/of/libvulkan_gfxstream.so \
   "$PWD/runsc/ttc/test/e2e_gfx.sh"
 ```
 
