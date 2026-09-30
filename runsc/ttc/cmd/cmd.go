@@ -24,6 +24,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -11092,6 +11093,11 @@ func preflightHostResourceLimits(bundleDir string) error {
 	}
 	if len(required) == 0 {
 		return nil
+	}
+	if runtime.GOOS == "darwin" {
+		// Without this, runsc starts the sandbox without the limits, and only
+		// their verification, which reads Linux's /proc, fails.
+		return fmt.Errorf("hard %s limits require host cgroups, which macOS does not have; omit --memory and CPU limit options", strings.Join(required, " and "))
 	}
 	return preflightCgroupV2Delegation("/proc/self/cgroup", "/sys/fs/cgroup", required)
 }

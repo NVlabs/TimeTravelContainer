@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -4111,6 +4112,38 @@ func TestPreflightCgroupV2Delegation(t *testing.T) {
 	}
 	if err := preflightCgroupV2Delegation(proc, root, []string{"io"}); err == nil || !strings.Contains(err.Error(), `controller "io"`) {
 		t.Fatalf("missing-controller preflight error=%v", err)
+	}
+}
+
+func TestPreflightHostResourceLimitsRefusesHardLimitsOnMacOS(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS only: Linux preflight depends on the host's cgroups")
+	}
+	limit := int64(1 << 30)
+	spec := specs.Spec{Linux: &specs.Linux{
+		CgroupsPath: "ttc/test",
+		Resources:   &specs.LinuxResources{Memory: &specs.LinuxMemory{Limit: &limit}},
+	}}
+	data, err := json.Marshal(&spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bundle, "config.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := preflightHostResourceLimits(bundle); err == nil || !strings.Contains(err.Error(), "macOS") {
+		t.Fatalf("preflight of a hard memory limit on macOS: %v, want a refusal that names macOS", err)
+	}
+	spec.Linux.Resources = &specs.LinuxResources{}
+	if data, err = json.Marshal(&spec); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundle, "config.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := preflightHostResourceLimits(bundle); err != nil {
+		t.Fatalf("preflight without hard limits on macOS: %v", err)
 	}
 }
 
