@@ -21,6 +21,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/hostthread"
@@ -1006,6 +1007,8 @@ type cachedGraphState struct {
 	// rebuilt instead, they took 0.4 s for a graph of 300,000 objects.
 	indexes graphIndexes
 	used    uint64
+	// cachedAt is when a store closed and cached it.
+	cachedAt time.Time
 }
 
 // graphIndexes are a store's indexes derived from its graph state, and the
@@ -1081,6 +1084,7 @@ func (c *graphStateCache) put(directory graphFileIdentity, entry *cachedGraphSta
 	}
 	c.uses++
 	entry.used = c.uses
+	entry.cachedAt = time.Now()
 	c.entries[directory] = entry
 	c.objects += len(entry.state.Objects)
 	for c.objects > graphStateCacheObjects {
@@ -1094,6 +1098,26 @@ func (c *graphStateCache) put(directory graphFileIdentity, entry *cachedGraphSta
 		c.objects -= len(oldestEntry.state.Objects)
 		delete(c.entries, oldest)
 	}
+}
+
+// ExpireGraphStates forgets the states cached of graphs no store has opened
+// for idle, and returns how many objects they held. A filesystem
+// repository's graph is opened several times in one operation, and a
+// dehydrated branch's then not for hours: its state, 129 MB for 100,000
+// files, stayed until newer ones outgrew the cache.
+func ExpireGraphStates(idle time.Duration) int {
+	graphStates.mu.Lock()
+	defer graphStates.mu.Unlock()
+	now := time.Now()
+	expired := 0
+	for key, entry := range graphStates.entries {
+		if now.Sub(entry.cachedAt) > idle {
+			expired += len(entry.state.Objects)
+			graphStates.objects -= len(entry.state.Objects)
+			delete(graphStates.entries, key)
+		}
+	}
+	return expired
 }
 
 // cacheStateLocked records the store's state in graphStates. Close calls it,

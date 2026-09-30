@@ -3666,3 +3666,61 @@ func TestEvictDeadCachedChunks(t *testing.T) {
 		}
 	}
 }
+
+// A closed graph's cached state is forgotten once nothing has opened it for
+// the idle time given.
+func TestExpireGraphStates(t *testing.T) {
+	graphStates.mu.Lock()
+	graphStates.entries = make(map[graphFileIdentity]*cachedGraphState)
+	graphStates.objects = 0
+	graphStates.mu.Unlock()
+	dir := filepath.Join(t.TempDir(), "graph")
+	graph, err := OpenExternallyCoordinated(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.BeginExternalTransaction(); err != nil {
+		t.Fatal(err)
+	}
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := graph.CreateObject(origin, "build/one", ObjectKindFile, []byte{1}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.CheckpointExternallyCoordinated(); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.EndExternalTransaction(); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cached := func() int {
+		graphStates.mu.Lock()
+		defer graphStates.mu.Unlock()
+		return len(graphStates.entries)
+	}
+	if cached() != 1 {
+		t.Fatalf("%d states cached, want the closed graph's", cached())
+	}
+	if expired := ExpireGraphStates(time.Minute); expired != 0 || cached() != 1 {
+		t.Fatalf("a state cached a moment ago expired: %d objects, %d left", expired, cached())
+	}
+	graphStates.mu.Lock()
+	for _, entry := range graphStates.entries {
+		entry.cachedAt = time.Now().Add(-2 * time.Minute)
+	}
+	graphStates.mu.Unlock()
+	if expired := ExpireGraphStates(time.Minute); expired == 0 || cached() != 0 {
+		t.Fatalf("an idle state did not expire: %d objects, %d left", expired, cached())
+	}
+	graphStates.mu.Lock()
+	objects := graphStates.objects
+	graphStates.mu.Unlock()
+	if objects != 0 {
+		t.Fatalf("the cache counts %d objects with no state", objects)
+	}
+}

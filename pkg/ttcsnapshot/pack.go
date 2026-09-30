@@ -608,19 +608,22 @@ func (store *SharedPackStore) cacheManifestLocked(snapshot SnapshotID, entry cac
 	}
 }
 
-// ExpireManifests forgets the cached manifests that none has read for idle.
-// The cache keeps the manifests of the images a daemon restored or published
-// a moment ago, up to its bound, and would keep them for as long as the daemon
-// then ran without them.
-func (store *SharedPackStore) ExpireManifests(idle time.Duration) {
+// ExpireManifests forgets the cached manifests that none has read for idle,
+// and returns how many. The cache keeps the manifests of the images a daemon
+// restored or published a moment ago, up to its bound, and would keep them for
+// as long as the daemon then ran without them.
+func (store *SharedPackStore) ExpireManifests(idle time.Duration) int {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	now := time.Now()
+	expired := 0
 	for snapshot, cached := range store.manifests {
 		if now.Sub(cached.usedAt) > idle {
 			store.forgetManifestLocked(snapshot)
+			expired++
 		}
 	}
+	return expired
 }
 
 // forgetManifestLocked drops snapshot's cached manifest.

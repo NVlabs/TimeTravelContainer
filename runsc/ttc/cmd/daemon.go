@@ -22,6 +22,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"slices"
 	"sort"
 	"strconv"
@@ -6650,6 +6651,11 @@ func validateClusterTopology(runtime *daemonClusterRuntime, self cluster.NodeRec
 // shared GC reads those it counts on each pass.
 const sharedManifestIdle = 2 * time.Minute
 
+// cachedGraphStateIdle is how long a daemon keeps the state of a closed
+// graph cached that nothing opens again: an operation on a repository opens
+// its graph several times in a row, and a dehydrated branch's not for hours.
+const cachedGraphStateIdle = 2 * time.Minute
+
 func maintainDistributedGraphReferences(backend *runtimeBackend, stderr io.Writer, done <-chan struct{}, lock func() func()) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -6666,8 +6672,8 @@ func maintainDistributedGraphReferences(backend *runtimeBackend, stderr io.Write
 		err := backend.reconcileDistributedGraphReferences(false)
 		backingErr := backend.reconcileConsumedMemoryBacking()
 		unlock()
-		if backend.snapshotShared != nil {
-			backend.snapshotShared.ExpireManifests(sharedManifestIdle)
+		if backend.snapshotShared != nil && backend.snapshotShared.ExpireManifests(sharedManifestIdle) != 0 {
+			debug.FreeOSMemory()
 		}
 		if backend.snapshotData != nil && backend.snapshotGraph != nil {
 			if _, err := backend.snapshotData.EvictDeadCachedChunks(backend.snapshotGraph); err != nil && stderr != nil {
@@ -6871,6 +6877,11 @@ func maintainRepositories(dataRoot, localRoot, runtimeRoot, runsc string, public
 		case <-timer.C:
 			full = true
 		case <-consumption.C:
+		}
+		if ttcsnapshot.ExpireGraphStates(cachedGraphStateIdle) != 0 {
+			// What the cache held is given back at once: the heap it grew
+			// to is left for the runtime to return slowly otherwise.
+			debug.FreeOSMemory()
 		}
 		unlock := func() {}
 		if lock != nil {
