@@ -27,6 +27,18 @@ type Options struct {
 	Features string
 }
 
+// flags returns the renderer's flags for the options.
+func (o *Options) flags() []string {
+	var flags []string
+	if o.Library != "" {
+		flags = append(flags, "--library", o.Library)
+	}
+	if o.Features != "" {
+		flags = append(flags, "--features", o.Features)
+	}
+	return flags
+}
+
 // libraryName is the file name of gfxstream's host library.
 func libraryName() string {
 	if runtime.GOOS == "darwin" {

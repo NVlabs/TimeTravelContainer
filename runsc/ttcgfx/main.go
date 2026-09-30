@@ -4,8 +4,12 @@
 // Binary ttc-gfx-renderer is TTC's GPU renderer. ttcd starts one for each
 // branch whose virtual GPU is in use:
 //
-//	ttc-gfx-renderer serve [flags]  renders for the Sentry connected to fd 3
-//	ttc-gfx-renderer probe [flags]  prints the renderer's capability sets
+//	ttc-gfx-renderer serve [flags]   renders for the Sentry connected to fd 3
+//	ttc-gfx-renderer probe [flags]   prints the renderer's capability sets
+//	ttc-gfx-renderer launch [flags]  starts renderers, with flags, for the
+//	                                 ttcd connected to fd 3
+//
+// A renderer confines itself before it loads gfxstream, unless --unconfined.
 package main
 
 import (
@@ -28,29 +32,56 @@ func main() {
 	var opts gfxrenderer.Options
 	flags.StringVar(&opts.Library, "library", "", "path of gfxstream's host library")
 	flags.StringVar(&opts.Features, "features", "", "gfxstream renderer features")
+	unconfined := flags.Bool("unconfined", false, "run without the renderer's sandbox, as ttcd does with --unsafe-no-host-isolation")
 	flags.Parse(os.Args[2:])
-	switch os.Args[1] {
-	case "serve":
-		if err := gfxrenderer.Serve(connFD, opts); err != nil {
-			fmt.Fprintf(os.Stderr, "ttc-gfx-renderer: %v\n", err)
-			os.Exit(1)
+	mode := os.Args[1]
+	switch mode {
+	case "serve", "probe":
+		if !*unconfined {
+			if err := gfxrenderer.Confine(opts); err != nil {
+				fatal(fmt.Errorf("confining the renderer: %w", err))
+			}
 		}
-	case "probe":
-		capsets, err := gfxrenderer.Probe(opts)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "ttc-gfx-renderer: %v\n", err)
-			os.Exit(1)
-		}
-		if err := json.NewEncoder(os.Stdout).Encode(capsets); err != nil {
-			fmt.Fprintf(os.Stderr, "ttc-gfx-renderer: %v\n", err)
-			os.Exit(1)
+	case "launch":
+		if *unconfined {
+			usage()
 		}
 	default:
 		usage()
 	}
+	switch mode {
+	case "serve":
+		if err := gfxrenderer.Serve(connFD, opts); err != nil {
+			fatal(err)
+		}
+	case "probe":
+		capsets, err := gfxrenderer.Probe(opts)
+		if err != nil {
+			fatal(err)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(capsets); err != nil {
+			fatal(err)
+		}
+	case "launch":
+		// The launcher stays unconfined, so that its renderers can confine
+		// themselves: see gfxrenderer.ServeLauncher.
+		exe, err := os.Executable()
+		if err != nil {
+			fatal(err)
+		}
+		if err := gfxrenderer.ServeLauncher(connFD, exe, opts); err != nil {
+			fatal(err)
+		}
+	}
+}
+
+func fatal(err error) {
+	fmt.Fprintf(os.Stderr, "ttc-gfx-renderer: %v\n", err)
+	os.Exit(1)
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: ttc-gfx-renderer serve|probe [--library PATH] [--features FEATURES]")
+	fmt.Fprintln(os.Stderr, "usage: ttc-gfx-renderer serve|probe [--library PATH] [--features FEATURES] [--unconfined]")
+	fmt.Fprintln(os.Stderr, "       ttc-gfx-renderer launch [--library PATH] [--features FEATURES]")
 	os.Exit(2)
 }

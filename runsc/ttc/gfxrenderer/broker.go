@@ -4,6 +4,8 @@
 package gfxrenderer
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -25,16 +27,21 @@ type BrokerOptions struct {
 
 	// Stderr receives the renderers' logs.
 	Stderr io.Writer
+
+	// Launcher, if not nil, starts the renderers, for a daemon whose sandbox
+	// bars its children from the GPU.
+	Launcher *Launcher
+
+	// Unconfined runs the renderers without their sandbox, as a daemon
+	// without host isolation runs its sandboxes.
+	Unconfined bool
 }
 
-// args returns the arguments of a renderer.
-func (o *BrokerOptions) args() []string {
-	args := []string{"serve"}
-	if o.Options.Library != "" {
-		args = append(args, "--library", o.Options.Library)
-	}
-	if o.Options.Features != "" {
-		args = append(args, "--features", o.Options.Features)
+// args returns the arguments of a renderer in mode, "serve" or "probe".
+func (o *BrokerOptions) args(mode string) []string {
+	args := append([]string{mode}, o.Options.flags()...)
+	if o.Unconfined {
+		args = append(args, "--unconfined")
 	}
 	return args
 }
@@ -80,15 +87,16 @@ func ServeBroker(fd int, opts BrokerOptions) error {
 // startRenderer starts a renderer, and returns the Sentry's end of a
 // connection to it.
 func startRenderer(opts *BrokerOptions) (int, error) {
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if opts.Launcher != nil {
+		return opts.Launcher.StartRenderer()
+	}
+	fds, err := socketpair()
 	if err != nil {
 		return -1, err
 	}
-	unix.CloseOnExec(fds[0])
-	unix.CloseOnExec(fds[1])
 	rendererEnd := os.NewFile(uintptr(fds[1]), "gfx-renderer-connection")
 	defer rendererEnd.Close()
-	cmd := exec.Command(opts.Renderer, opts.args()...)
+	cmd := exec.Command(opts.Renderer, opts.args("serve")...)
 	// The connection is the renderer's fd 3.
 	cmd.ExtraFiles = []*os.File{rendererEnd}
 	cmd.Stdout = opts.Stderr
@@ -99,4 +107,26 @@ func startRenderer(opts *BrokerOptions) (int, error) {
 	}
 	go cmd.Wait()
 	return fds[0], nil
+}
+
+// ProbeRenderer returns the renderer's capability sets, as its probe prints
+// them, through opts.Launcher if it is not nil. If the probe fails, what it
+// logged goes to opts.Stderr.
+func ProbeRenderer(opts BrokerOptions) ([]byte, error) {
+	if opts.Launcher != nil {
+		return opts.Launcher.Probe()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, opts.Renderer, opts.args("probe")...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if opts.Stderr != nil {
+			opts.Stderr.Write(stderr.Bytes())
+		}
+		return nil, fmt.Errorf("probing the GPU renderer: %w: %s", err, lastLine(stderr.String()))
+	}
+	return stdout.Bytes(), nil
 }

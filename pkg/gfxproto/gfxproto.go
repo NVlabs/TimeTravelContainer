@@ -60,6 +60,14 @@ const (
 	MsgStartRenderer MsgType = iota + 200
 )
 
+// Messages from ttcd to the renderers' launcher, which starts renderers for
+// a daemon whose sandbox would bar them from the GPU. The launcher answers
+// with Reply.
+const (
+	MsgLaunchRenderer MsgType = iota + 300
+	MsgLaunchProbe
+)
+
 // String implements fmt.Stringer.String.
 func (t MsgType) String() string {
 	switch t {
@@ -93,6 +101,10 @@ func (t MsgType) String() string {
 		return "FenceSignaled"
 	case MsgStartRenderer:
 		return "StartRenderer"
+	case MsgLaunchRenderer:
+		return "LaunchRenderer"
+	case MsgLaunchProbe:
+		return "LaunchProbe"
 	default:
 		return fmt.Sprintf("MsgType(%d)", uint32(t))
 	}
@@ -222,6 +234,20 @@ type (
 	// with the descriptor of a connection to it, a Unix stream socket, on
 	// which the renderer sends Hello.
 	StartRenderer struct {
+		Reserved uint32
+	}
+
+	// LaunchRenderer asks the launcher to start a renderer, whose connection
+	// to its Sentry is the message's descriptor. The reply's trailer says
+	// why it failed, if it did.
+	LaunchRenderer struct {
+		Reserved uint32
+	}
+
+	// LaunchProbe asks the launcher for the renderer's capability sets. The
+	// reply's trailer is what the renderer's probe printed, or why it
+	// failed.
+	LaunchProbe struct {
 		Reserved uint32
 	}
 )

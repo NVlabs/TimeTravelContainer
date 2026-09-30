@@ -6,9 +6,35 @@
 
 *   `serve` renders for the Sentry connected to its fd 3, speaking
     `pkg/gfxproto`. The daemon starts one per branch whose GPU is in use,
-    through the broker (`ServeBroker`), which the Sentry asks.
+    through the broker (`ServeBroker`), which the Sentry asks. A renderer
+    exits when its Sentry closes it: once no context or resource of the
+    branch's GPU is left.
 *   `probe` prints the renderer's capability sets as JSON. The Sentry needs
     them before any renderer runs.
+*   `launch` starts renderers for the ttcd connected to its fd 3
+    (`ServeLauncher`), on macOS.
+
+## Confinement
+
+A renderer decodes a guest's command streams with gfxstream, a large C++
+library, so it confines itself before it loads gfxstream or reads anything
+from its Sentry (`Confine`). On macOS it applies
+`seatbelt.RendererProfile`: reading only Apple's system files, the package
+prefixes `/opt/homebrew` and `/usr/local`, and its own, gfxstream's, and the
+Vulkan loader's files; the GPU's IOKit user clients; and POSIX shared memory
+of its own names. It cannot write files, use the network, or start
+processes. So the Vulkan loader and MoltenVK must be installed under a
+package prefix. `--unconfined` skips this, as ttcd with
+`--unsafe-no-host-isolation` does.
+
+macOS lets no process change its sandbox profile, and ttcd's bars the GPU,
+so ttcd's children cannot confine themselves to the renderer's. A ttcd with
+host isolation therefore starts `ttc-gfx-renderer launch` before it confines
+itself, and has it start the renderers and probes. The launcher stays
+unconfined, so that its children can confine themselves, and does nothing
+but start the renderer's executable with fixed arguments.
+
+On Linux, renderers do not confine themselves yet (plan item B1).
 
 ## gfxstream
 
