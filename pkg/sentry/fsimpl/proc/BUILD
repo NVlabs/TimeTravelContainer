@@ -79,6 +79,7 @@ go_library(
         "filesystem.go",
         "keys.go",
         "nvproxy.go",
+        "pressure.go",
         "subtasks.go",
         "subtasks_inode_refs.go",
         "task.go",
