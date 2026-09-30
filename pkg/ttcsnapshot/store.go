@@ -1492,8 +1492,15 @@ func validateGraphState(state *graphState) error {
 			references = append(references, edge.Child)
 		}
 	}
+	// The two sorts are apart, and took most of the time: they run at once.
+	var sorted sync.WaitGroup
+	sorted.Add(1)
+	go func() {
+		defer sorted.Done()
+		slices.SortFunc(references, compareObjectIDs)
+	}()
 	slices.SortFunc(counts, func(a, b referenceCount) int { return compareObjectIDs(a.id, b.id) })
-	slices.SortFunc(references, compareObjectIDs)
+	sorted.Wait()
 	next := 0
 	for _, count := range counts {
 		if next < len(references) && compareObjectIDs(references[next], count.id) < 0 {
