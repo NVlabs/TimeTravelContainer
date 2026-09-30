@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package proc
 
 import (
@@ -846,16 +849,26 @@ func (s *taskStatData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	fmt.Fprintf(buf, "%d ", linux.ClockTFromDuration(s.task.StartTime().Sub(s.task.Kernel().Timekeeper().BootTime())))
 
 	var vss, rss uint64
+	// The addresses of the task's stack and arguments, which Linux shows
+	// those who may trace the task. Android's bionic finds the main thread's
+	// stack by startstack; the sentry reports the start of the arguments,
+	// which are at the top of the stack mapping.
+	var startStack, argStart, argEnd, envStart, envEnd hostarch.Addr
 	if mm := getMM(s.task); mm != nil {
 		vss = mm.VirtualMemorySize()
 		rss = mm.ResidentSetSize()
+		if kernel.ContextCanTrace(ctx, s.task, false) {
+			argStart, argEnd = mm.ArgvStart(), mm.ArgvEnd()
+			envStart, envEnd = mm.EnvvStart(), mm.EnvvEnd()
+			startStack = argStart
+		}
 	}
 	fmt.Fprintf(buf, "%d %d ", vss, rss/hostarch.PageSize)
 
 	// rsslim.
 	fmt.Fprintf(buf, "%d ", s.task.ThreadGroup().Limits().Get(limits.Rss).Cur)
 
-	fmt.Fprintf(buf, "0 0 0 0 0 " /* startcode endcode startstack kstkesp kstkeip */)
+	fmt.Fprintf(buf, "0 0 %d 0 0 " /* startcode endcode startstack kstkesp kstkeip */, startStack)
 	fmt.Fprintf(buf, "0 0 0 0 0 " /* signal blocked sigignore sigcatch wchan */)
 	fmt.Fprintf(buf, "0 0 " /* nswap cnswap */)
 	terminationSignal := linux.Signal(0)
@@ -865,7 +878,7 @@ func (s *taskStatData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	fmt.Fprintf(buf, "%d ", terminationSignal)
 	fmt.Fprintf(buf, "0 0 0 " /* processor rt_priority policy */)
 	fmt.Fprintf(buf, "0 0 0 " /* delayacct_blkio_ticks guest_time cguest_time */)
-	fmt.Fprintf(buf, "0 0 0 0 0 0 0 " /* start_data end_data start_brk arg_start arg_end env_start env_end */)
+	fmt.Fprintf(buf, "0 0 0 %d %d %d %d " /* start_data end_data start_brk arg_start arg_end env_start env_end */, argStart, argEnd, envStart, envEnd)
 	fmt.Fprintf(buf, "0\n" /* exit_code */)
 
 	return nil
