@@ -50,6 +50,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/devices/tpuproxy/vfio"
 	"gvisor.dev/gvisor/pkg/sentry/devices/ttydev"
 	"gvisor.dev/gvisor/pkg/sentry/devices/tundev"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/binderfs"
 	cgroup2fs "gvisor.dev/gvisor/pkg/sentry/fsimpl/cgroup2fs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/cgroupfs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/dev"
@@ -137,6 +138,11 @@ func registerFilesystems(k *kernel.Kernel, info *containerInfo, rdmaSnapshot *rd
 	// they mount: Android's init groups processes in it. It takes effect only
 	// once mounted.
 	vfsObj.MustRegisterFilesystemType(cgroup2fs.Name, &cgroup2fs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
+		AllowUserMount: true,
+		AllowUserList:  true,
+	})
+	// Android's init mounts binderfs, and allocates its binder devices.
+	vfsObj.MustRegisterFilesystemType(binderfs.Name, &binderfs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
 		AllowUserMount: true,
 		AllowUserList:  true,
 	})
