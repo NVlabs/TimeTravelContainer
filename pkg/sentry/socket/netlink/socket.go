@@ -489,6 +489,19 @@ func (s *Socket) HandleInterfaceDeleteEvent(ctx context.Context, idx int32, i in
 	s.SendResponse(ctx, ms)
 }
 
+// HandleInterfaceAddrEvent implements inet.NetlinkSocket.HandleInterfaceAddrEvent.
+func (s *Socket) HandleInterfaceAddrEvent(ctx context.Context, idx int32, addr inet.InterfaceAddr, added bool) {
+	routeProtocol, ok := s.protocol.(RouteProtocol)
+	if !ok {
+		panic(fmt.Sprintf("Non-ROUTE netlink socket (protocol %d) cannot handle address events", s.Protocol()))
+	}
+
+	// Multicast messages from the kernel leave hdr->nlmsg_pid at 0.
+	ms := nlmsg.NewMessageSet(0 /*portID*/, 0 /*seq*/)
+	routeProtocol.AddAddrMessage(ms, idx, addr, added)
+	s.SendResponse(ctx, ms)
+}
+
 // Bind implements socket.Socket.Bind.
 func (s *Socket) Bind(t *kernel.Task, sockaddr []byte) *syserr.Error {
 	a, err := ExtractSockAddr(sockaddr)

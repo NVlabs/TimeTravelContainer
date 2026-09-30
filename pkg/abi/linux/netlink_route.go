@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package linux
 
 import (
@@ -215,6 +218,32 @@ const (
 	IFA_MULTICAST = 7
 	IFA_FLAGS     = 8
 )
+
+// Interface address flags, from uapi/linux/if_addr.h.
+const (
+	IFA_F_SECONDARY      = 0x01
+	IFA_F_TEMPORARY      = IFA_F_SECONDARY
+	IFA_F_NODAD          = 0x02
+	IFA_F_OPTIMISTIC     = 0x04
+	IFA_F_DADFAILED      = 0x08
+	IFA_F_HOMEADDRESS    = 0x10
+	IFA_F_DEPRECATED     = 0x20
+	IFA_F_TENTATIVE      = 0x40
+	IFA_F_PERMANENT      = 0x80
+	IFA_F_MANAGETEMPADDR = 0x100
+	IFA_F_NOPREFIXROUTE  = 0x200
+	IFA_F_MCAUTOJOIN     = 0x400
+	IFA_F_STABLE_PRIVACY = 0x800
+)
+
+// InterfaceAddrCacheInfoSize is the size of struct ifa_cacheinfo, from
+// uapi/linux/if_addr.h: the preferred and valid lifetimes of an address, and
+// the times at which it was created and updated.
+const InterfaceAddrCacheInfoSize = 16
+
+// InfinityLifeTime is an address lifetime that does not expire, from
+// include/net/addrconf.h.
+const InfinityLifeTime = 0xffffffff
 
 // Device types, from uapi/linux/if_arp.h.
 const (

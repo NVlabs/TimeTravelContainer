@@ -15,6 +15,7 @@ go_library(
         "//pkg/abi/linux",
         "//pkg/context",
         "//pkg/errors/linuxerr",
+        "//pkg/hostarch",
         "//pkg/marshal/primitive",
         "//pkg/sentry/inet",
         "//pkg/sentry/kernel",

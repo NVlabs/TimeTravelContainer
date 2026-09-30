@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package netlink
 
 import (
@@ -62,6 +65,11 @@ type RouteProtocol interface {
 
 	// AddDelLinkMessage is called when an interface is deleted by the stack.
 	AddDelLinkMessage(ms *nlmsg.MessageSet, idx int32, i inet.Interface)
+
+	// AddAddrMessage appends an RTM_NEWADDR message for an address of the
+	// given interface into the message set, or with added false, an
+	// RTM_DELADDR message.
+	AddAddrMessage(ms *nlmsg.MessageSet, idx int32, addr inet.InterfaceAddr, added bool)
 }
 
 // Provider is a function that creates a new Protocol for a specific netlink
