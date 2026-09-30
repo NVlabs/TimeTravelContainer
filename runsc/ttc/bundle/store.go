@@ -5394,6 +5394,13 @@ func (s Store) RemoveBranchFilesystems(name string, branch BranchInfo) error {
 // from every named and family-private repository in the data root. Repository
 // GC shares the mutation flock with Sentry, so this is safe while containers
 // are running.
+// collectedRepositories holds, for each repository path, the version of its
+// graph when GarbageCollectRepositories last collected it: one unchanged
+// since has nothing new to collect. Opening each repository every five
+// minutes read its whole graph, and kept it in the process's cache of graph
+// states, 129 MB for a dehydrated branch of 100,000 files.
+var collectedRepositories sync.Map
+
 func (s Store) GarbageCollectRepositories() (int, error) {
 	manager, err := ttcvolume.OpenManager(s.activeRoot())
 	if err != nil {
@@ -5410,6 +5417,12 @@ func (s Store) GarbageCollectRepositories() (int, error) {
 	sort.Strings(ordered)
 	collected := 0
 	for _, path := range ordered {
+		graphDir := filepath.Join(path, "graph")
+		if version, err := ttcsnapshot.GraphVersionAt(graphDir); err == nil {
+			if last, ok := collectedRepositories.Load(path); ok && last.(ttcsnapshot.GraphVersion) == version {
+				continue
+			}
+		}
 		repository, err := manager.OpenPrivate(path)
 		if err != nil {
 			// Cluster metadata describes the family on every node, while private
@@ -5425,13 +5438,18 @@ func (s Store) GarbageCollectRepositories() (int, error) {
 			}
 			return collected, fmt.Errorf("opening repository %q: %w", path, err)
 		}
-		gcErr := repository.GarbageCollect()
+		ran, gcErr := repository.GarbageCollectIdle()
 		closeErr := repository.Close()
 		if gcErr != nil {
 			return collected, fmt.Errorf("collecting repository %q: %w", path, gcErr)
 		}
 		if closeErr != nil {
 			return collected, fmt.Errorf("closing repository %q: %w", path, closeErr)
+		}
+		if ran {
+			if version, err := ttcsnapshot.GraphVersionAt(graphDir); err == nil {
+				collectedRepositories.Store(path, version)
+			}
 		}
 		collected++
 	}

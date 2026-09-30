@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -896,10 +897,34 @@ func ReadOriginReferencesIfIdle(path string, origin ttcsnapshot.SnapshotID) (map
 	return readOriginReferences(path, origin, true)
 }
 
+// originReferenceRead is what readOriginReferences read of an origin in a
+// graph at the version it had.
+type originReferenceRead struct {
+	version    ttcsnapshot.GraphVersion
+	references map[string]ttcsnapshot.ObjectID
+	edges      bool
+	frozen     bool
+}
+
+// originReferenceReads holds the last originReferenceRead of each graph
+// directory and origin. A claim on an origin is checked every two minutes
+// while a graph refers to it, and each check read the whole graph, 129 MB
+// for 100,000 files, and kept it in the process's cache of graph states: a
+// graph unchanged since the last check is not read again.
+var originReferenceReads sync.Map
+
 func readOriginReferences(path string, origin ttcsnapshot.SnapshotID, ifIdle bool) (map[string]ttcsnapshot.ObjectID, bool, bool, error) {
 	dir := filepath.Join(path, "graph")
 	if _, err := os.Stat(dir); err != nil {
 		return nil, false, false, err
+	}
+	key := fmt.Sprintf("%s\x00%d", dir, origin)
+	before, versionErr := ttcsnapshot.GraphVersionAt(dir)
+	if versionErr == nil {
+		if last, ok := originReferenceReads.Load(key); ok && last.(originReferenceRead).version == before {
+			read := last.(originReferenceRead)
+			return maps.Clone(read.references), read.edges, read.frozen, nil
+		}
 	}
 	if ifIdle {
 		if held, err := ttcsnapshot.GraphHeld(dir); err != nil {
@@ -914,7 +939,14 @@ func readOriginReferences(path string, origin ttcsnapshot.SnapshotID, ifIdle boo
 	}
 	references, edges := graph.OriginReferences(origin)
 	frozen := graph.SnapshotLedgerFrozen(origin)
-	return references, edges, frozen, graph.Close()
+	if err := graph.Close(); err != nil {
+		return nil, false, false, err
+	}
+	// What was read is of the version before only if no commit came between.
+	if after, err := ttcsnapshot.GraphVersionAt(dir); versionErr == nil && err == nil && after == before {
+		originReferenceReads.Store(key, originReferenceRead{version: before, references: maps.Clone(references), edges: edges, frozen: frozen})
+	}
+	return references, edges, frozen, nil
 }
 
 // CompleteOriginHandoff changes the local graph into a non-authoritative

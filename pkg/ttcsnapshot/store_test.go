@@ -3724,3 +3724,52 @@ func TestExpireGraphStates(t *testing.T) {
 		t.Fatalf("the cache counts %d objects with no state", objects)
 	}
 }
+
+// A graph's version stays while nothing commits, and changes with every
+// commit and checkpoint, of this process or another.
+func TestGraphVersionAt(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "graph")
+	graph, err := OpenExternallyCoordinated(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	version := func() GraphVersion {
+		t.Helper()
+		v, err := GraphVersionAt(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	first := version()
+	if again := version(); again != first {
+		t.Fatalf("an unchanged graph's version moved: %+v, then %+v", first, again)
+	}
+	if err := graph.BeginExternalTransaction(); err != nil {
+		t.Fatal(err)
+	}
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := graph.CreateObject(origin, "build/one", ObjectKindFile, []byte{1}, nil); err != nil {
+		t.Fatal(err)
+	}
+	committed := version()
+	if committed == first {
+		t.Fatal("a commit left the version as it was")
+	}
+	if err := graph.CheckpointExternallyCoordinated(); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.EndExternalTransaction(); err != nil {
+		t.Fatal(err)
+	}
+	if checkpointed := version(); checkpointed == committed || checkpointed == first {
+		t.Fatal("a checkpoint left the version as it was")
+	}
+	if _, err := GraphVersionAt(filepath.Join(t.TempDir(), "absent")); err == nil {
+		t.Fatal("an absent graph has a version")
+	}
+}

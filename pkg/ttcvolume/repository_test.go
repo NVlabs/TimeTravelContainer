@@ -3271,3 +3271,58 @@ func TestRandomForkHardlinkOrphanAndNameReuse(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// What a graph references of an origin is read again once the graph changes,
+// and only then.
+func TestReadOriginReferencesFollowsTheGraph(t *testing.T) {
+	path := t.TempDir()
+	dir := filepath.Join(path, "graph")
+	change := func(f func(*ttcsnapshot.Store)) {
+		t.Helper()
+		graph, err := ttcsnapshot.OpenExternallyCoordinated(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := graph.BeginExternalTransaction(); err != nil {
+			t.Fatal(err)
+		}
+		f(graph)
+		if err := graph.EndExternalTransaction(); err != nil {
+			t.Fatal(err)
+		}
+		if err := graph.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var origin ttcsnapshot.SnapshotID
+	change(func(graph *ttcsnapshot.Store) {
+		var err error
+		if origin, err = graph.AllocateWorking(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := graph.CreateObject(origin, "keep", ttcsnapshot.ObjectKindMetadata, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	})
+	for i := 0; i < 2; i++ {
+		references, _, _, err := ReadOriginReferences(path, origin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := references["pin/keep"]; !ok || len(references) != 1 {
+			t.Fatalf("read %d: references %v", i, references)
+		}
+	}
+	change(func(graph *ttcsnapshot.Store) {
+		if err := graph.DeletePin("keep"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	references, _, _, err := ReadOriginReferences(path, origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(references) != 0 {
+		t.Fatalf("after the pin went, references %v", references)
+	}
+}

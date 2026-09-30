@@ -30,8 +30,15 @@ var ErrEmptyRepository = errors.New("repository has no published branches")
 // Sentry repositories intentionally omit their host path and only unlink
 // branch pointers; ttcd performs collection after the Kernel is gone.
 func (r *Repository) GarbageCollect() error {
+	_, err := r.GarbageCollectIdle()
+	return err
+}
+
+// GarbageCollectIdle is GarbageCollect, and reports whether it collected: it
+// passes over a repository a runtime has open.
+func (r *Repository) GarbageCollectIdle() (bool, error) {
 	if r == nil || r.path == "" {
-		return errors.New("garbage collection requires a path-backed repository")
+		return false, errors.New("garbage collection requires a path-backed repository")
 	}
 	// A live Sentry may have installed complete bulk bytes whose corresponding
 	// graph objects are intentionally still in its bounded metadata batch. That
@@ -41,20 +48,20 @@ func (r *Repository) GarbageCollect() error {
 	// pass (including crash recovery) can then collect safely.
 	active, err := os.OpenFile(filepath.Join(r.path, "active.lock"), os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
-		return fmt.Errorf("opening repository lifecycle lock: %w", err)
+		return false, fmt.Errorf("opening repository lifecycle lock: %w", err)
 	}
 	if err := unix.Flock(int(active.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		closeErr := active.Close()
 		if errors.Is(err, unix.EWOULDBLOCK) {
-			return closeErr
+			return false, closeErr
 		}
-		return errors.Join(fmt.Errorf("locking repository lifecycle: %w", err), closeErr)
+		return false, errors.Join(fmt.Errorf("locking repository lifecycle: %w", err), closeErr)
 	}
 	defer func() {
 		_ = unix.Flock(int(active.Fd()), unix.LOCK_UN)
 		_ = active.Close()
 	}()
-	return r.withLock(func() error { return r.garbageCollectLocked(true) })
+	return true, r.withLock(func() error { return r.garbageCollectLocked(true) })
 }
 
 // GarbageCollectActive performs collection from a descriptor-backed runtime

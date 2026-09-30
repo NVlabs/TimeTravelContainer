@@ -1100,6 +1100,44 @@ func (c *graphStateCache) put(directory graphFileIdentity, entry *cachedGraphSta
 	}
 }
 
+// GraphVersion identifies a graph's committed state by its files: the
+// generation its head names, and the identities of that generation's
+// checkpoint and journal, the journal's size among them. A commit appends to
+// the journal, and a checkpoint starts a generation: an unchanged version is
+// an unchanged graph.
+type GraphVersion struct {
+	generation uint64
+	checkpoint graphFileIdentity
+	journal    graphFileIdentity
+}
+
+// GraphVersionAt returns the version of the graph at dir, without opening it.
+func GraphVersionAt(dir string) (GraphVersion, error) {
+	data, err := os.ReadFile(filepath.Join(dir, headFileName))
+	if err != nil {
+		return GraphVersion{}, err
+	}
+	head, err := decodeHead(data)
+	if err != nil {
+		return GraphVersion{}, err
+	}
+	identity := func(name string) (graphFileIdentity, error) {
+		var stat unix.Stat_t
+		if err := unix.Stat(filepath.Join(dir, name), &stat); err != nil {
+			return graphFileIdentity{}, err
+		}
+		return graphFileIdentity{dev: uint64(stat.Dev), ino: stat.Ino, size: stat.Size, mtime: stat.Mtim.Sec*1e9 + stat.Mtim.Nsec}, nil
+	}
+	version := GraphVersion{generation: head.Generation}
+	if version.checkpoint, err = identity(graphCheckpointName(head.Generation)); err != nil {
+		return GraphVersion{}, err
+	}
+	if version.journal, err = identity(graphJournalName(head.Generation)); err != nil {
+		return GraphVersion{}, err
+	}
+	return version, nil
+}
+
 // ExpireGraphStates forgets the states cached of graphs no store has opened
 // for idle, and returns how many objects they held. A filesystem
 // repository's graph is opened several times in one operation, and a
