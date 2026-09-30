@@ -132,12 +132,14 @@ func registerFilesystems(k *kernel.Kernel, info *containerInfo, rdmaSnapshot *rd
 		AllowUserMount: true,
 		AllowUserList:  true,
 	})
-	if info.conf.MountCgroupV2 {
-		vfsObj.MustRegisterFilesystemType(cgroup2fs.Name, &cgroup2fs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
-			AllowUserMount: true,
-			AllowUserList:  true,
-		})
-	}
+	// The cgroup v2 hierarchy is mountable beside the v1 hierarchies too, as
+	// in Linux's hybrid setups, where the v1 hierarchies hold the controllers
+	// they mount: Android's init groups processes in it. It takes effect only
+	// once mounted.
+	vfsObj.MustRegisterFilesystemType(cgroup2fs.Name, &cgroup2fs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
+		AllowUserMount: true,
+		AllowUserList:  true,
+	})
 	vfsObj.MustRegisterFilesystemType(devpts.Name, &devpts.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
 		AllowUserList:  true,
 		AllowUserMount: true,
