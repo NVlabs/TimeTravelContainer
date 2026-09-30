@@ -187,6 +187,50 @@ func TestConcurrentMetadataReadsStayOnLiveGraphGeneration(t *testing.T) {
 	}
 }
 
+// A batch of more updates than a journal transaction holds, as a file
+// system's flush of every inode it changed before a live fork, is published.
+func TestUpdateMetadataBatchLargerThanTransaction(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("large-batch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	// 1200 inodes with 8 KiB of extended attributes are some 10 MB.
+	const files = 1200
+	value := strings.Repeat("x", 8<<10)
+	updates := make([]Inode, 0, files)
+	for i := 0; i < files; i++ {
+		ino, err := repository.CreateRegular(MainBranch, RootInode, fmt.Sprintf("file-%04d", i), 0644, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inode, err := repository.Inode(MainBranch, ino)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inode.Xattrs = map[string]string{"user.value": value}
+		inode.MtimeNsec = int64(i + 1)
+		updates = append(updates, inode)
+	}
+	if err := repository.UpdateMetadataBatch(MainBranch, updates); err != nil {
+		t.Fatalf("UpdateMetadataBatch: %v", err)
+	}
+	if err := repository.SyncMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	for _, updated := range []Inode{updates[0], updates[files/2], updates[files-1]} {
+		inode, err := repository.Inode(MainBranch, updated.Number)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if inode.MtimeNsec != updated.MtimeNsec || inode.Xattrs["user.value"] != value {
+			t.Errorf("inode %d: mtime %d, %d bytes of xattr; want mtime %d, %d bytes",
+				updated.Number, inode.MtimeNsec, len(inode.Xattrs["user.value"]), updated.MtimeNsec, len(value))
+		}
+	}
+}
+
 func TestForkWritesDivergeAcrossGenerations(t *testing.T) {
 	manager := openTestManager(t)
 	repo, err := manager.Create("state")
