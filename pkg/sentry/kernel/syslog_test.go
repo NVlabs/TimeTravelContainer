@@ -30,7 +30,7 @@ func TestSyslogRecords(t *testing.T) {
 
 	// The log drops its oldest records past its size.
 	msg := strings.Repeat("x", SyslogMaxMessage)
-	for i := 0; i < syslogMaxBytes/SyslogMaxMessage+2; i++ {
+	for i := 0; i < SyslogMaxBytes/SyslogMaxMessage+2; i++ {
 		s.Append(6, 0, msg)
 	}
 	oldest := s.FirstSeq()
@@ -40,8 +40,8 @@ func TestSyslogRecords(t *testing.T) {
 	if _, after, ok := s.Record(first); ok || after != oldest {
 		t.Errorf("Record of a dropped record = %d, %t; want %d, false", after, ok, oldest)
 	}
-	if s.size > syslogMaxBytes {
-		t.Errorf("the log keeps %d bytes, more than %d", s.size, syslogMaxBytes)
+	if s.size > SyslogMaxBytes {
+		t.Errorf("the log keeps %d bytes, more than %d", s.size, SyslogMaxBytes)
 	}
 
 	// Messages are bounded.

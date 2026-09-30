@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package proc
 
 import (
@@ -61,6 +64,7 @@ var (
 		"meminfo":        linux.DT_REG,
 		"mounts":         linux.DT_LNK,
 		"net":            linux.DT_LNK,
+		"pressure":       linux.DT_DIR,
 		"self":           linux.DT_LNK,
 		"sentry-meminfo": linux.DT_REG,
 		"stat":           linux.DT_REG,
