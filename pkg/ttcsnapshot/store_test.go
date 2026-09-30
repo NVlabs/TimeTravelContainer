@@ -1898,6 +1898,182 @@ func TestFilesystemLargeBatchCopiesEachTreePathOnce(t *testing.T) {
 	}
 }
 
+// TestFilesystemCopiesTakeReferences applies random filesystem transactions,
+// some to a tree other roots share, and checks every object's references
+// after each: a copy of a node a transaction replaces takes the node's
+// references to the children it keeps if the node goes, and retains them
+// anew if it stays.
+func TestFilesystemCopiesTakeReferences(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const rootName = "branch/main/filesystem"
+	random := rand.New(rand.NewSource(7))
+	// The model: each directory's entries, and where each file is.
+	type location struct {
+		parent uint64
+		name   string
+	}
+	directories := map[uint64]map[string]uint64{1: {}}
+	directoryNumbers := []uint64{1}
+	files := map[uint64]location{}
+	next := uint64(2)
+	operations := []FilesystemOperation{{PutInode: &InodeRecord{Number: 1, Type: "directory", Mode: 0755, Nlink: 2}}}
+	for index := 0; index < 8; index++ {
+		inode := InodeRecord{Number: next, Type: "directory", Mode: 0755, Nlink: 2}
+		entry := DirectoryEntryRecord{Parent: 1, Name: fmt.Sprintf("d%d", index), Inode: next}
+		operations = append(operations, FilesystemOperation{PutInode: &inode}, FilesystemOperation{PutEntry: &entry})
+		directories[next] = map[string]uint64{}
+		directories[1][entry.Name] = next
+		directoryNumbers = append(directoryNumbers, next)
+		next++
+	}
+	root, err := store.ApplyFilesystem(origin, rootName, operations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := func(step int, root ObjectID) {
+		t.Helper()
+		for parent, entries := range directories {
+			listed, err := store.FilesystemDirectory(root, parent)
+			if err != nil {
+				t.Fatalf("step %d: listing %d: %v", step, parent, err)
+			}
+			if len(listed) != len(entries) {
+				t.Fatalf("step %d: directory %d lists %d entries, want %d", step, parent, len(listed), len(entries))
+			}
+			for _, entry := range listed {
+				if entries[entry.Name] != entry.Inode {
+					t.Fatalf("step %d: directory %d lists %q as %d, want %d", step, parent, entry.Name, entry.Inode, entries[entry.Name])
+				}
+			}
+		}
+	}
+	var copies []string
+	for step := 0; step < 300; step++ {
+		switch choice := random.Intn(10); {
+		case choice == 0:
+			// Another root shares the tree: the copies the next transaction
+			// makes replace nodes that stay.
+			name := fmt.Sprintf("branch/copy-%d/filesystem", step)
+			if err := store.SetRoot(name, root); err != nil {
+				t.Fatalf("step %d: %v", step, err)
+			}
+			copies = append(copies, name)
+		case choice == 1 && len(copies) != 0:
+			index := random.Intn(len(copies))
+			if err := store.DeleteRoot(copies[index]); err != nil {
+				t.Fatalf("step %d: %v", step, err)
+			}
+			copies = append(copies[:index], copies[index+1:]...)
+			if _, err := store.Collect(1 << 20); err != nil {
+				t.Fatalf("step %d: %v", step, err)
+			}
+		default:
+			operations = operations[:0]
+			touched := map[uint64]bool{}
+			numbers := make([]uint64, 0, len(files))
+			for number := range files {
+				numbers = append(numbers, number)
+			}
+			sort.Slice(numbers, func(i, j int) bool { return numbers[i] < numbers[j] })
+			for count := 1 + random.Intn(160); count > 0; count-- {
+				// A file is changed once a transaction at most.
+				number := uint64(0)
+				if len(numbers) != 0 {
+					number = numbers[random.Intn(len(numbers))]
+				}
+				switch kind := random.Intn(10); {
+				case kind < 6 || number == 0:
+					parent := directoryNumbers[random.Intn(len(directoryNumbers))]
+					inode := InodeRecord{Number: next, Type: "regular", Mode: 0644, Nlink: 1}
+					entry := DirectoryEntryRecord{Parent: parent, Name: fmt.Sprintf("f%06d", next), Inode: next}
+					operations = append(operations, FilesystemOperation{PutInode: &inode}, FilesystemOperation{PutEntry: &entry})
+					directories[parent][entry.Name] = next
+					files[next] = location{parent, entry.Name}
+					touched[next] = true
+					next++
+				case kind < 8:
+					if touched[number] {
+						continue
+					}
+					at := files[number]
+					operations = append(operations,
+						FilesystemOperation{DeleteEntry: &DirectoryEntryRecord{Parent: at.parent, Name: at.name}},
+						FilesystemOperation{DeleteInode: number})
+					delete(directories[at.parent], at.name)
+					delete(files, number)
+					touched[number] = true
+				case kind < 9:
+					if touched[number] {
+						continue
+					}
+					inode := InodeRecord{Number: number, Type: "regular", Mode: uint32(0600 + random.Intn(0100)), Nlink: 1}
+					operations = append(operations, FilesystemOperation{PutInode: &inode})
+					touched[number] = true
+				default:
+					if touched[number] {
+						continue
+					}
+					at := files[number]
+					parent := directoryNumbers[random.Intn(len(directoryNumbers))]
+					if parent == at.parent {
+						continue
+					}
+					entry := DirectoryEntryRecord{Parent: parent, Name: at.name, Inode: number}
+					operations = append(operations,
+						FilesystemOperation{DeleteEntry: &DirectoryEntryRecord{Parent: at.parent, Name: at.name}},
+						FilesystemOperation{PutEntry: &entry})
+					delete(directories[at.parent], at.name)
+					directories[parent][at.name] = number
+					files[number] = location{parent, at.name}
+					touched[number] = true
+				}
+			}
+			if len(operations) == 0 {
+				continue
+			}
+			if root, err = store.ApplyFilesystem(origin, rootName, operations); err != nil {
+				t.Fatalf("step %d: %v", step, err)
+			}
+		}
+		// A reference miscounted stays so: checking every few steps finds it.
+		if step%5 == 0 {
+			if err := store.Verify(); err != nil {
+				t.Fatalf("step %d: %v", step, err)
+			}
+		}
+		if step%25 == 0 {
+			check(step, root)
+		}
+	}
+	if err := store.Verify(); err != nil {
+		t.Fatal(err)
+	}
+	check(-1, root)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ExpireGraphStates(-1)
+	if store, err = Open(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if replayed, ok := store.Root(rootName); !ok || replayed != root {
+		t.Fatalf("replayed root=(%s,%t), want %s", replayed, ok, root)
+	}
+	if err := store.Verify(); err != nil {
+		t.Fatal(err)
+	}
+	check(-2, root)
+}
+
 func TestLocalDataStoreReserveInstallCloneAndReclaim(t *testing.T) {
 	dir := t.TempDir()
 	graph, err := Open(filepath.Join(dir, "graph"))

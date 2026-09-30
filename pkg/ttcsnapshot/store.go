@@ -4363,14 +4363,14 @@ func (s *Store) JournalBytes() int64 {
 // operation in some 50 bytes, but replaying it rebuilds the paths it changes
 // of the filesystem's trees, and counts anew the references of what those
 // paths reference. For a filesystem of 100,000 files, created 128 files a
-// transaction, as a repository commits them, an operation took 19 us; 1,024
-// files a transaction, 7 us; and a checkpoint loads in 27 ns a byte. Half a
-// kilobyte keeps what replaying a journal costs within about one and a half
-// times what loading its checkpoint does. Counted by what it costs, the
-// journal was folded so often that creating files took half as long again;
-// weighed a kilobyte, creating them took 53-55 us each, against 47-49; a
-// quarter, 43 us, but the graph then opened in up to twice the time.
-const filesystemOperationWeight = 1 << 9
+// transaction, as a repository commits them, an operation took 10 us; 1,024
+// files a transaction, 5.6 us; and a checkpoint loads in 27 ns a byte. A
+// quarter of a kilobyte keeps what replaying a journal costs within about
+// one and a half times what loading its checkpoint does. Counted by what it
+// costs, the journal was folded so often that creating files took half as
+// long again; weighed half a kilobyte, creating them took 27-29 us each,
+// against 23-25.
+const filesystemOperationWeight = 1 << 8
 
 // journalRecordWeight returns the weight of record, which a journal holds in
 // frameBytes: what replaying it costs, as loading so many bytes of checkpoint

@@ -156,7 +156,12 @@ type graphMutation struct {
 	store    *Store
 	snapshot Snapshot
 	objects  map[ObjectID]Object
-	err      error
+	// lent holds, for each object of the graph that a copy the mutation made
+	// of it replaces, the indexes of its edges whose references the copy took
+	// rather than retaining their children anew, in ascending order. See
+	// bTreeBuilder.lends and collectFilesystemMutationGarbage.
+	lent map[ObjectID][]int
+	err  error
 }
 
 func newGraphMutation(store *Store, origin SnapshotID) (*graphMutation, error) {
@@ -207,6 +212,13 @@ func (mutation *graphMutation) retain(id ObjectID) error {
 // create adds an object of kind, with data and children, which it takes: the
 // caller does not change them after.
 func (mutation *graphMutation) create(kind ObjectKind, data []byte, children []Edge) (ObjectID, error) {
+	return mutation.createFrom(kind, data, children, ObjectID{}, nil)
+}
+
+// createFrom is create for a copy of lender, unless lender is zero: each
+// edge whose from is not negative takes the reference of lender's edge of
+// that index to the same child, rather than retaining it anew.
+func (mutation *graphMutation) createFrom(kind ObjectKind, data []byte, children []Edge, lender ObjectID, from []int) (ObjectID, error) {
 	if mutation.snapshot.NextOrdinal == 0 || mutation.snapshot.NextOrdinal == math.MaxUint64 {
 		return ObjectID{}, fmt.Errorf("snapshot %d object ordinal space exhausted", mutation.snapshot.ID)
 	}
@@ -216,7 +228,18 @@ func (mutation *graphMutation) create(kind ObjectKind, data []byte, children []E
 	if err := validateObject(object); err != nil {
 		return ObjectID{}, err
 	}
-	for _, edge := range object.Children {
+	for index, edge := range object.Children {
+		if !lender.IsZero() && from[index] >= 0 {
+			if mutation.lent == nil {
+				mutation.lent = make(map[ObjectID][]int)
+			}
+			lent := mutation.lent[lender]
+			if len(lent) != 0 && lent[len(lent)-1] >= from[index] {
+				return ObjectID{}, fmt.Errorf("object %s lends its edge %d out of order", lender, from[index])
+			}
+			mutation.lent[lender] = append(lent, from[index])
+			continue
+		}
 		if err := mutation.retain(edge.Child); err != nil {
 			return ObjectID{}, err
 		}
@@ -328,6 +351,10 @@ func sortedRootNames(roots map[string]ObjectID) []string {
 type bTreeBuilder struct {
 	mutation *graphMutation
 	kind     ObjectKind
+	// final is whether the nodes apply makes are the last copies the
+	// transaction makes of their tree: none is copied again before it
+	// commits. See lends.
+	final bool
 }
 
 type bTreeEdit struct {
@@ -337,11 +364,35 @@ type bTreeEdit struct {
 }
 
 func (builder *bTreeBuilder) makeNode(node bTreeNode) (ObjectID, error) {
+	return builder.makeNodeFrom(node, ObjectID{}, nil)
+}
+
+// makeNodeFrom is makeNode for a copy of lender: see createFrom.
+func (builder *bTreeBuilder) makeNodeFrom(node bTreeNode, lender ObjectID, from []int) (ObjectID, error) {
 	data, edges, err := encodeBTreeNode(node)
 	if err != nil {
 		return ObjectID{}, err
 	}
-	return builder.mutation.create(builder.kind, data, edges)
+	return builder.mutation.createFrom(builder.kind, data, edges, lender, from)
+}
+
+// lends reports whether the copies apply makes of current, whose object is
+// object, take its references to the children they keep. They do if they
+// are the transaction's last copies of their tree and current is the
+// graph's, referenced by nothing but the node it was reached from: current
+// then goes as that node goes, and its copies keep what it referenced
+// without each reference being counted up by retaining it anew, then down
+// by collecting current. A current that stays after all keeps its
+// references, and its copies take their own: see
+// collectFilesystemMutationGarbage. Counting those references up and down
+// took almost half of what creating files 128 a transaction took, and of
+// what replaying the journal of their creation took.
+func (builder *bTreeBuilder) lends(current ObjectID, object Object) bool {
+	if !builder.final || object.Refs != 1 {
+		return false
+	}
+	_, committed := builder.mutation.store.state.Objects[current]
+	return committed
 }
 
 // apply path-copies every node touched by a sorted set of edits exactly once.
@@ -389,7 +440,7 @@ func (builder *bTreeBuilder) buildTree(leaf bool, keys [][]byte, children []Obje
 	if len(keys) == 0 {
 		return ObjectID{}, nil
 	}
-	ids, minima, err := builder.makeLevel(leaf, keys, children)
+	ids, minima, err := builder.makeLevel(leaf, keys, children, ObjectID{}, nil)
 	if err != nil {
 		return ObjectID{}, err
 	}
@@ -399,7 +450,7 @@ func (builder *bTreeBuilder) buildTree(leaf bool, keys [][]byte, children []Obje
 func (builder *bTreeBuilder) buildUpper(ids []ObjectID, minima [][]byte) (ObjectID, error) {
 	for len(ids) > 1 {
 		var err error
-		ids, minima, err = builder.makeLevel(false, minima, ids)
+		ids, minima, err = builder.makeLevel(false, minima, ids, ObjectID{}, nil)
 		if err != nil {
 			return ObjectID{}, err
 		}
@@ -410,15 +461,22 @@ func (builder *bTreeBuilder) buildUpper(ids []ObjectID, minima [][]byte) (Object
 	return ids[0], nil
 }
 
-func (builder *bTreeBuilder) makeLevel(leaf bool, keys [][]byte, children []ObjectID) ([]ObjectID, [][]byte, error) {
-	if len(keys) != len(children) {
+// makeLevel makes the nodes that hold keys and children in order. They are
+// copies of lender, unless it is zero, and each child's from is the index of
+// lender's edge to it, or -1: see createFrom.
+func (builder *bTreeBuilder) makeLevel(leaf bool, keys [][]byte, children []ObjectID, lender ObjectID, from []int) ([]ObjectID, [][]byte, error) {
+	if len(keys) != len(children) || (!lender.IsZero() && len(from) != len(children)) {
 		return nil, nil, errors.New("invalid TTC B-tree batch level")
 	}
 	ids := make([]ObjectID, 0, (len(keys)+bTreeMaxEntries-1)/bTreeMaxEntries)
 	minima := make([][]byte, 0, cap(ids))
 	for start := 0; start < len(keys); start += bTreeMaxEntries {
 		end := min(start+bTreeMaxEntries, len(keys))
-		id, err := builder.makeNode(bTreeNode{leaf: leaf, keys: keys[start:end], children: children[start:end]})
+		var kept []int
+		if !lender.IsZero() {
+			kept = from[start:end]
+		}
+		id, err := builder.makeNodeFrom(bTreeNode{leaf: leaf, keys: keys[start:end], children: children[start:end]}, lender, kept)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -437,15 +495,23 @@ func (builder *bTreeBuilder) applyNode(current ObjectID, edits []bTreeEdit) ([]O
 	if err != nil {
 		return nil, nil, false, err
 	}
+	// from holds, for each child of the node's copies, the index of the
+	// node's edge to it, or -1 for a child the node did not have.
+	var lender ObjectID
+	if builder.lends(current, object) {
+		lender = current
+	}
 	if node.leaf {
 		keys := make([][]byte, 0, len(node.keys)+len(edits))
 		children := make([]ObjectID, 0, len(node.children)+len(edits))
+		from := make([]int, 0, cap(children))
 		changed := false
 		oldIndex, editIndex := 0, 0
 		for oldIndex < len(node.keys) || editIndex < len(edits) {
 			if editIndex == len(edits) || (oldIndex < len(node.keys) && bytes.Compare(node.keys[oldIndex], edits[editIndex].key) < 0) {
 				keys = append(keys, node.keys[oldIndex])
 				children = append(children, node.children[oldIndex])
+				from = append(from, oldIndex)
 				oldIndex++
 				continue
 			}
@@ -453,6 +519,7 @@ func (builder *bTreeBuilder) applyNode(current ObjectID, edits []bTreeEdit) ([]O
 				if !edits[editIndex].delete {
 					keys = append(keys, append([]byte(nil), edits[editIndex].key...))
 					children = append(children, edits[editIndex].value)
+					from = append(from, -1)
 					changed = true
 				}
 				editIndex++
@@ -461,10 +528,15 @@ func (builder *bTreeBuilder) applyNode(current ObjectID, edits []bTreeEdit) ([]O
 			// Equal keys replace or remove the existing value.
 			if edits[editIndex].delete {
 				changed = true
+			} else if value := edits[editIndex].value; value == node.children[oldIndex] {
+				keys = append(keys, node.keys[oldIndex])
+				children = append(children, value)
+				from = append(from, oldIndex)
 			} else {
 				keys = append(keys, node.keys[oldIndex])
-				children = append(children, edits[editIndex].value)
-				changed = changed || node.children[oldIndex] != edits[editIndex].value
+				children = append(children, value)
+				from = append(from, -1)
+				changed = true
 			}
 			oldIndex++
 			editIndex++
@@ -472,7 +544,7 @@ func (builder *bTreeBuilder) applyNode(current ObjectID, edits []bTreeEdit) ([]O
 		if !changed {
 			return []ObjectID{current}, [][]byte{append([]byte(nil), node.keys[0]...)}, false, nil
 		}
-		ids, minima, err := builder.makeLevel(true, keys, children)
+		ids, minima, err := builder.makeLevel(true, keys, children, lender, from)
 		return ids, minima, true, err
 	}
 
@@ -483,11 +555,13 @@ func (builder *bTreeBuilder) applyNode(current ObjectID, edits []bTreeEdit) ([]O
 	}
 	keys := make([][]byte, 0, len(node.keys)+len(edits))
 	children := make([]ObjectID, 0, len(node.children)+len(edits))
+	from := make([]int, 0, cap(children))
 	changed := false
 	for index, child := range node.children {
 		if len(grouped[index]) == 0 {
 			keys = append(keys, node.keys[index])
 			children = append(children, child)
+			from = append(from, index)
 			continue
 		}
 		ids, minima, childChanged, err := builder.applyNode(child, grouped[index])
@@ -497,6 +571,15 @@ func (builder *bTreeBuilder) applyNode(current ObjectID, edits []bTreeEdit) ([]O
 		changed = changed || childChanged
 		keys = append(keys, minima...)
 		children = append(children, ids...)
+		// An unchanged child is the node's; a changed one is replaced by its
+		// copies, or by its one remaining child, which is not the node's.
+		for range ids {
+			if childChanged {
+				from = append(from, -1)
+			} else {
+				from = append(from, index)
+			}
+		}
 	}
 	if !changed {
 		return []ObjectID{current}, [][]byte{append([]byte(nil), node.keys[0]...)}, false, nil
@@ -512,7 +595,7 @@ func (builder *bTreeBuilder) applyNode(current ObjectID, edits []bTreeEdit) ([]O
 		}
 		return []ObjectID{children[0]}, [][]byte{append([]byte(nil), childNode.keys[0]...)}, true, nil
 	}
-	ids, minima, err := builder.makeLevel(false, keys, children)
+	ids, minima, err := builder.makeLevel(false, keys, children, lender, from)
 	return ids, minima, true, err
 }
 

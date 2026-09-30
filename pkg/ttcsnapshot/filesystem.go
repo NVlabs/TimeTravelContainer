@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 )
 
@@ -510,6 +511,17 @@ func buildFilesystemMutationBatched(store *Store, origin SnapshotID, rootName st
 		}
 		putEdits = append(putEdits, bTreeEdit{key: InodeKey(number), value: object})
 	}
+	// The inode tree is applied the inodes put, then the directories whose
+	// entries changed, then the inodes deleted: each copies what the one
+	// before made, and only the last one's copies are final.
+	parentsChange := false
+	for parent := range directoryEdits {
+		if _, deleted := inodeDeletes[parent]; !deleted {
+			parentsChange = true
+			break
+		}
+	}
+	inodeBuilder.final = !parentsChange && len(inodeDeletes) == 0
 	root.inodes, err = inodeBuilder.apply(root.inodes, putEdits)
 	if err != nil {
 		return nil, ObjectID{}, err
@@ -567,7 +579,7 @@ func buildFilesystemMutationBatched(store *Store, origin SnapshotID, rootName st
 			}
 			entryEdits = append(entryEdits, bTreeEdit{key: []byte(name), value: object})
 		}
-		directoryBuilder := bTreeBuilder{mutation: mutation, kind: ObjectKindDirectoryNode}
+		directoryBuilder := bTreeBuilder{mutation: mutation, kind: ObjectKindDirectoryNode, final: true}
 		parent.Directory, err = directoryBuilder.apply(parent.Directory, entryEdits)
 		if err != nil {
 			return nil, ObjectID{}, err
@@ -578,6 +590,7 @@ func buildFilesystemMutationBatched(store *Store, origin SnapshotID, rootName st
 		}
 		parentEdits = append(parentEdits, bTreeEdit{key: InodeKey(parentNumber), value: object})
 	}
+	inodeBuilder.final = len(inodeDeletes) == 0
 	root.inodes, err = inodeBuilder.apply(root.inodes, parentEdits)
 	if err != nil {
 		return nil, ObjectID{}, err
@@ -592,6 +605,7 @@ func buildFilesystemMutationBatched(store *Store, origin SnapshotID, rootName st
 	for _, number := range deletedNumbers {
 		deleteEdits = append(deleteEdits, bTreeEdit{key: InodeKey(number), delete: true})
 	}
+	inodeBuilder.final = true
 	root.inodes, err = inodeBuilder.apply(root.inodes, deleteEdits)
 	if err != nil {
 		return nil, ObjectID{}, err
@@ -889,7 +903,7 @@ func installGraphMutation(state *graphState, mutation *graphMutation, rootName s
 	for _, pin := range releasePins {
 		state.deletePin(pin)
 	}
-	return collectFilesystemMutationGarbage(state, reclaim)
+	return collectFilesystemMutationGarbage(state, reclaim, mutation.lent)
 }
 
 // collectFilesystemMutationGarbage eagerly collapses the obsolete path that
@@ -897,7 +911,12 @@ func installGraphMutation(state *graphState, mutation *graphMutation, rootName s
 // object is reached by cascading from a zero-reference object touched by the
 // transaction. Objects participating in an authority handoff retain the
 // existing deferred-GC behavior.
-func collectFilesystemMutationGarbage(state *graphState, queue []ObjectID) ([]ObjectID, error) {
+//
+// lent holds the edges whose references the transaction's copies of their
+// objects took (see graphMutation.lent): an object that goes gives those
+// references to its copies, and one that stays keeps them, its copies
+// retaining their children anew.
+func collectFilesystemMutationGarbage(state *graphState, queue []ObjectID, lent map[ObjectID][]int) ([]ObjectID, error) {
 	queued := make(map[ObjectID]struct{}, len(queue))
 	var reclaimed []ObjectID
 	for _, id := range queue {
@@ -917,7 +936,12 @@ func collectFilesystemMutationGarbage(state *graphState, queue []ObjectID) ([]Ob
 		if object.ID.Kind == ObjectKindFile || object.ID.Kind == ObjectKindPage || object.ID.Kind == ObjectKindMemoryChunk {
 			reclaimed = append(reclaimed, object.ID)
 		}
-		for _, edge := range object.Children {
+		given := lent[id]
+		for index, edge := range object.Children {
+			if len(given) != 0 && given[0] == index {
+				given = given[1:]
+				continue
+			}
 			child, ok := state.Objects[edge.Child]
 			if !ok || child.State != ObjectLive || child.Refs == 0 {
 				return nil, fmt.Errorf("reclaiming object %s references unavailable child %s", id, edge.Child)
@@ -930,6 +954,20 @@ func collectFilesystemMutationGarbage(state *graphState, queue []ObjectID) ([]Ob
 					queued[edge.Child] = struct{}{}
 				}
 			}
+			state.putObject(child)
+		}
+	}
+	for lender, indexes := range lent {
+		object, ok := state.Objects[lender]
+		if !ok {
+			continue
+		}
+		for _, index := range indexes {
+			child, ok := state.Objects[object.Children[index].Child]
+			if !ok || child.State != ObjectLive || child.Refs == math.MaxUint64 {
+				return nil, fmt.Errorf("object %s lent its reference to unavailable child %s", lender, object.Children[index].Child)
+			}
+			child.Refs++
 			state.putObject(child)
 		}
 	}
