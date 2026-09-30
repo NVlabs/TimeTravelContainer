@@ -240,18 +240,27 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	}
 	devicesSub["system"] = fs.newDir(ctx, creds, defaultSysDirMode, systemSub)
 
+	virtualSub := make(map[string]kernfs.Inode) // /sys/devices/virtual
+	// RDMA's sysfs shows the host's network devices that it passes through;
+	// the sentry's own are for sandboxes without them.
+	if _, ok := classSub["net"]; !ok {
+		netDevices, netClass := fs.newNetDirs(ctx, creds)
+		virtualSub["net"] = fs.newDir(ctx, creds, defaultSysDirMode, netDevices)
+		classSub["net"] = fs.newDir(ctx, creds, defaultSysDirMode, netClass)
+	}
 	if len(productName) > 0 {
 		log.Debugf("Setting product_name: %q", productName)
 		classSub["dmi"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
 			"id": kernfs.NewStaticSymlink(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "../../devices/virtual/dmi/id"),
 		})
-		devicesSub["virtual"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-			"dmi": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-				"id": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-					"product_name": fs.newStaticFile(ctx, creds, defaultSysMode, productName+"\n"),
-				}),
+		virtualSub["dmi"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+			"id": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+				"product_name": fs.newStaticFile(ctx, creds, defaultSysMode, productName+"\n"),
 			}),
 		})
+	}
+	if _, ok := devicesSub["virtual"]; !ok {
+		devicesSub["virtual"] = fs.newDir(ctx, creds, defaultSysDirMode, virtualSub)
 	}
 	root := fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
 		"block": fs.newDir(ctx, creds, defaultSysDirMode, nil),
