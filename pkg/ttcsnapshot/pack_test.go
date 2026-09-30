@@ -661,6 +661,12 @@ func TestSharedPackCompactionUsesLedgerViewAndWaitsForReaders(t *testing.T) {
 	}
 	dead := install("dead", 0xd0)
 	live := install("live", 0x1a)
+	// The ledger keeps no object's data: compaction takes it from the
+	// manifest.
+	meta, err := graph.CreateObject(origin, "meta", ObjectKindMetadata, []byte("an inode record"), []Edge{{Slot: 0, Child: live}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := graph.Seal(origin, SnapshotSealedLocal); err != nil {
 		t.Fatal(err)
 	}
@@ -675,7 +681,7 @@ func TestSharedPackCompactionUsesLedgerViewAndWaitsForReaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cached, err := otherNode.Manifest(origin); err != nil || len(cached.Objects) != 2 {
+	if cached, err := otherNode.Manifest(origin); err != nil || len(cached.Objects) != 3 {
 		t.Fatalf("other-node initial manifest=%+v err=%v", cached, err)
 	}
 	oldPack := filepath.Join(shared.snapshotDirectory(origin), packName(manifest.Packs[0].Number))
@@ -704,7 +710,8 @@ func TestSharedPackCompactionUsesLedgerViewAndWaitsForReaders(t *testing.T) {
 		t.Fatalf("Collect()=(%d,%v), want (1,nil)", collected, err)
 	}
 	liveObjects, liveReferences, ok := ledger.OriginManifest(origin)
-	if !ok || len(liveObjects) != 1 || liveObjects[0].ID != live {
+	if !ok || len(liveObjects) != 2 || !slices.ContainsFunc(liveObjects, func(object Object) bool { return object.ID == live }) ||
+		!slices.ContainsFunc(liveObjects, func(object Object) bool { return object.ID == meta && len(object.Data) == 0 }) {
 		t.Fatalf("live origin view=%+v ok=%t", liveObjects, ok)
 	}
 
@@ -722,8 +729,17 @@ func TestSharedPackCompactionUsesLedgerViewAndWaitsForReaders(t *testing.T) {
 	if err != nil || busy {
 		t.Fatalf("Compact=(%+v,busy=%t,err=%v)", stats, busy, err)
 	}
-	if stats.BeforeObjects != 2 || stats.AfterObjects != 1 || stats.AfterBytes >= stats.BeforeBytes {
+	if stats.BeforeObjects != 3 || stats.AfterObjects != 2 || stats.AfterBytes >= stats.BeforeBytes {
 		t.Fatalf("compaction stats=%+v", stats)
+	}
+	compacted, err := shared.Manifest(origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, object := range compacted.Objects {
+		if object.Object.ID == meta && string(object.Object.Data) != "an inode record" {
+			t.Fatalf("compaction wrote %s with data %q", meta, object.Object.Data)
+		}
 	}
 	if _, err := os.Stat(oldPack); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("old pack survived compaction: %v", err)
@@ -740,7 +756,7 @@ func TestSharedPackCompactionUsesLedgerViewAndWaitsForReaders(t *testing.T) {
 	if _, _, err := shared.Fetch(context.Background(), dead); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("collected object fetch error=%v, want not-exist", err)
 	}
-	if reopened, err := otherNode.Manifest(origin); err != nil || len(reopened.Objects) != 1 || reopened.Objects[0].Object.ID != live {
+	if reopened, err := otherNode.Manifest(origin); err != nil || len(reopened.Objects) != 2 {
 		t.Fatalf("reopened compacted manifest=%+v err=%v", reopened, err)
 	}
 	residue := filepath.Join(shared.snapshotDirectory(origin), packName(0x99))

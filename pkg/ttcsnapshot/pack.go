@@ -1052,9 +1052,10 @@ type PackCompactionStats struct {
 }
 
 // Compact rewrites one partially-live origin into a single pack using the
-// exact object/reference view supplied by its authoritative reference ledger.
-// It takes the same directory lease as retirement, so no cooperating reader
-// can retain an old pack FD while it is unlinked (important on NFS).
+// exact object/reference view supplied by its authoritative reference ledger,
+// with each object's data from the manifest, as the ledger keeps none. It
+// takes the same directory lease as retirement, so no cooperating reader can
+// retain an old pack FD while it is unlinked (important on NFS).
 func (store *SharedPackStore) Compact(snapshot SnapshotID, objects []Object, references map[string]ObjectID) (PackCompactionStats, bool, error) {
 	var stats PackCompactionStats
 	if snapshot == 0 || len(objects) == 0 {
@@ -1087,7 +1088,8 @@ func (store *SharedPackStore) Compact(snapshot SnapshotID, objects []Object, ref
 	slices.SortFunc(objects, func(a, b Object) int { return compareObjectIDs(a.ID, b.ID) })
 	for _, object := range objects {
 		packed, ok := old[object.ID.key()]
-		if !ok || object.ID.Snapshot != snapshot || object.State != ObjectLive || packed.Object.BulkLength != object.BulkLength {
+		if !ok || object.ID.Snapshot != snapshot || object.State != ObjectLive || packed.Object.BulkLength != object.BulkLength ||
+			!slices.Equal(packed.Object.Children, object.Children) {
 			return stats, false, fmt.Errorf("shared pack compaction view contains invalid object %s", object.ID)
 		}
 		if err := validateObject(object); err != nil {
@@ -1132,6 +1134,7 @@ func (store *SharedPackStore) Compact(snapshot SnapshotID, objects []Object, ref
 	for _, object := range objects {
 		previous := old[object.ID.key()]
 		packed := PackedObject{Object: cloneObject(object)}
+		packed.Object.Data = slices.Clone(previous.Object.Data)
 		for _, extent := range previous.Extents {
 			source, err := os.Open(filepath.Join(directory, packName(extent.Pack)))
 			if err != nil {

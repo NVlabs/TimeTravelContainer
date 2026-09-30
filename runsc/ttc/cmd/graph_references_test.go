@@ -387,11 +387,7 @@ func TestSharedSingleReleaseSurvivesCoordinatorReceiptLoss(t *testing.T) {
 }
 
 func TestSharedReferenceBatchesLargeReconciliation(t *testing.T) {
-	ledger, err := ttcsnapshot.OpenReferenceLedger(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ledger.Close()
+	ledger := ttcsnapshot.NewReferenceLedger()
 	origin := ttcsnapshot.SnapshotID(29)
 	object := ttcsnapshot.Object{ID: ttcsnapshot.ObjectID{Snapshot: origin, Kind: ttcsnapshot.ObjectKindMemoryNode, Ordinal: 1}}
 	references := make(map[string]ttcsnapshot.ObjectID, 2050)

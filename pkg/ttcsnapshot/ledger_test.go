@@ -4,9 +4,6 @@
 package ttcsnapshot
 
 import (
-	"bytes"
-	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -46,28 +43,6 @@ func TestReferenceLedgerInternalCascade(t *testing.T) {
 	}
 	if got := len(ledger.Inspect().Objects); got != 0 {
 		t.Fatalf("objects after cascade=%d, want 0", got)
-	}
-}
-
-func TestReferenceLedgerNoOpCollectionDoesNotGrowJournal(t *testing.T) {
-	directory := filepath.Join(t.TempDir(), "ledger")
-	ledger, err := OpenReferenceLedger(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ledger.Close()
-	object := ledgerObject(1, 1, ObjectKindMemoryChunk)
-	if err := ledger.ImportOrigin(1, []Object{object}, map[string]ObjectID{"branch/a": object.ID}); err != nil {
-		t.Fatal(err)
-	}
-	before := ledger.JournalBytes()
-	for i := 0; i < 8; i++ {
-		if collected, err := ledger.Collect(64 << 10); err != nil || collected != 0 {
-			t.Fatalf("Collect()=(%d, %v), want (0, nil)", collected, err)
-		}
-	}
-	if after := ledger.JournalBytes(); after != before {
-		t.Fatalf("no-op collection grew journal from %d to %d bytes", before, after)
 	}
 }
 
@@ -178,7 +153,7 @@ func TestReferenceLedgerCrossOwnerOrderingAndDeduplication(t *testing.T) {
 	}
 }
 
-func TestReferenceLedgerBatchedDeliveryAndReplay(t *testing.T) {
+func TestReferenceLedgerBatchedDelivery(t *testing.T) {
 	childOwner := NewReferenceLedger()
 	childA := ledgerObject(1, 1, ObjectKindFile)
 	childB := ledgerObject(1, 2, ObjectKindFile)
@@ -187,11 +162,7 @@ func TestReferenceLedgerBatchedDeliveryAndReplay(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	directory := filepath.Join(t.TempDir(), "ledger")
-	parentOwner, err := OpenReferenceLedger(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
+	parentOwner := NewReferenceLedger()
 	parent := ledgerObject(2, 1, ObjectKindInode,
 		Edge{Slot: 1, Child: childA.ID}, Edge{Slot: 2, Child: childB.ID})
 	if err := parentOwner.ImportOrigin(2, []Object{parent}, map[string]ObjectID{"target": parent.ID}); err != nil {
@@ -220,20 +191,8 @@ func TestReferenceLedgerBatchedDeliveryAndReplay(t *testing.T) {
 	if got := parentOwner.PendingOutbound(); len(got) != 0 {
 		t.Fatalf("pending outbound after batch acknowledgement=%+v", got)
 	}
-	if err := parentOwner.Close(); err != nil {
-		t.Fatal(err)
-	}
-	parentOwner, err = OpenReferenceLedger(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer parentOwner.Close()
-	inspection := parentOwner.Inspect()
-	if len(inspection.PendingOutbound) != 0 {
-		t.Fatalf("replayed pending outbound=%+v", inspection.PendingOutbound)
-	}
-	if inspection.Objects[parent.ID] != 1 {
-		t.Fatalf("replayed parent references=%d, want 1", inspection.Objects[parent.ID])
+	if got := parentOwner.Inspect().Objects[parent.ID]; got != 1 {
+		t.Fatalf("parent references=%d, want 1", got)
 	}
 	if err := parentOwner.AcknowledgeOutboundThrough(pending[1].Sequence); err != nil {
 		t.Fatalf("repeated batch acknowledgement: %v", err)
@@ -254,233 +213,8 @@ func TestReferenceLedgerImportRequiresCompleteBaseline(t *testing.T) {
 	}
 }
 
-func TestReferenceLedgerDurableReplayAndPartialTail(t *testing.T) {
-	directory := filepath.Join(t.TempDir(), "ledger")
-	ledger, err := OpenReferenceLedger(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	object := ledgerObject(9, 1, ObjectKindMemoryChunk)
-	if err := ledger.ImportOrigin(9, []Object{object}, map[string]ObjectID{"branch": object.ID}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := OpenReferenceLedger(directory); err == nil {
-		t.Fatal("second writer opened a locked reference ledger")
-	}
-	if err := ledger.ApplyReference("release-branch", "branch", object.ID, false); err != nil {
-		t.Fatal(err)
-	}
-	if err := ledger.Close(); err != nil {
-		t.Fatal(err)
-	}
-	journal, err := os.OpenFile(filepath.Join(directory, "ledger.log"), os.O_WRONLY|os.O_APPEND, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := journal.Write([]byte{0, 0, 0, 0}); err != nil {
-		t.Fatal(err)
-	}
-	journal.Close()
-
-	reopened, err := OpenReferenceLedger(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reopened.Close()
-	inspection := reopened.Inspect()
-	if got := inspection.Objects[object.ID]; got != 0 {
-		t.Fatalf("replayed references=%d, want 0", got)
-	}
-	if collected, err := reopened.Collect(1); err != nil || collected != 1 {
-		t.Fatalf("replayed Collect=(%d,%v)", collected, err)
-	}
-	if err := reopened.Close(); err != nil {
-		t.Fatal(err)
-	}
-	final, err := OpenReferenceLedger(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer final.Close()
-	if got := len(final.Inspect().Objects); got != 0 {
-		t.Fatalf("objects after collection replay=%d, want 0", got)
-	}
-}
-
-func largeLedgerImport(t *testing.T, origin SnapshotID) ([]Object, map[string]ObjectID) {
-	t.Helper()
-	objects := make([]Object, 4)
-	references := make(map[string]ObjectID, len(objects))
-	for index := range objects {
-		objects[index] = ledgerObject(origin, uint64(index+1), ObjectKindMetadata)
-		objects[index].Data = make([]byte, 2<<20)
-		objects[index].Data[0] = byte(index + 1)
-		references["root/large/"+string(rune('a'+index))] = objects[index].ID
-	}
-	record, err := json.Marshal(referenceLedgerRecord{Version: referenceLedgerVersion, Sequence: 1, Import: &ledgerImportRecord{
-		Origin: origin, Objects: objects, References: references,
-	}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(record) <= maxReferenceLedgerRecord {
-		t.Fatalf("fixture import is %d bytes, want more than %d", len(record), maxReferenceLedgerRecord)
-	}
-	return objects, references
-}
-
-func referenceLedgerFrameOffsets(t *testing.T, data []byte) []int {
-	t.Helper()
-	offsets := []int{len(referenceLedgerHeader)}
-	for offset := len(referenceLedgerHeader); offset < len(data); {
-		if len(data)-offset < 8 {
-			t.Fatalf("partial frame at %d", offset)
-		}
-		length := int(binary.BigEndian.Uint64(data[offset : offset+8]))
-		offset += 8 + length
-		if offset > len(data) {
-			t.Fatalf("frame ends at %d past %d", offset, len(data))
-		}
-		offsets = append(offsets, offset)
-	}
-	return offsets
-}
-
-func TestReferenceLedgerLargeImportIsBoundedAtomicAndDurable(t *testing.T) {
-	directory := filepath.Join(t.TempDir(), "ledger")
-	objects, references := largeLedgerImport(t, 71)
-	ledger, err := OpenReferenceLedger(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := ledger.ImportOrigin(71, objects, references); err != nil {
-		t.Fatal(err)
-	}
-	if got := len(ledger.Inspect().Objects); got != len(objects) {
-		t.Fatalf("objects=%d, want %d", got, len(objects))
-	}
-	if err := ledger.Close(); err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(filepath.Join(directory, "ledger.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	offsets := referenceLedgerFrameOffsets(t, data)
-	if len(offsets) < 4 {
-		t.Fatalf("large import used %d frames, want begin, payload, and commit", len(offsets)-1)
-	}
-	for index := 1; index < len(offsets); index++ {
-		if size := offsets[index] - offsets[index-1] - 8; size <= 0 || size > maxReferenceLedgerRecord {
-			t.Fatalf("frame %d size=%d", index, size)
-		}
-	}
-	reopened, err := OpenReferenceLedger(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reopened.Close()
-	if got := len(reopened.Inspect().Objects); got != len(objects) {
-		t.Fatalf("replayed objects=%d, want %d", got, len(objects))
-	}
-	if err := reopened.ImportOrigin(71, objects, references); err != nil {
-		t.Fatalf("idempotent import retry: %v", err)
-	}
-}
-
-// An import of more objects than a record holds at their shortest goes to
-// the journal in chunks, which replay.
-func TestReferenceLedgerImportOfManyObjectsIsChunked(t *testing.T) {
-	directory := filepath.Join(t.TempDir(), "ledger")
-	objects := make([]Object, maxReferenceLedgerRecord/minimalObjectJSON+1)
-	references := make(map[string]ObjectID, len(objects))
-	for index := range objects {
-		objects[index] = ledgerObject(73, uint64(index+1), ObjectKindMetadata)
-		references[fmt.Sprintf("root/many/%d", index)] = objects[index].ID
-	}
-	ledger, err := OpenReferenceLedger(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := ledger.ImportOrigin(73, objects, references); err != nil {
-		t.Fatal(err)
-	}
-	if err := ledger.Close(); err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(filepath.Join(directory, "ledger.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if frames := len(referenceLedgerFrameOffsets(t, data)) - 1; frames < 4 {
-		t.Fatalf("the import used %d frames, want begin, payload, and commit", frames)
-	}
-	reopened, err := OpenReferenceLedger(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reopened.Close()
-	if got := len(reopened.Inspect().Objects); got != len(objects) {
-		t.Fatalf("replayed objects=%d, want %d", got, len(objects))
-	}
-}
-
-func TestReferenceLedgerIncompleteLargeImportRollsBack(t *testing.T) {
-	source := filepath.Join(t.TempDir(), "source")
-	objects, references := largeLedgerImport(t, 72)
-	ledger, err := OpenReferenceLedger(source)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := ledger.ImportOrigin(72, objects, references); err != nil {
-		t.Fatal(err)
-	}
-	if err := ledger.Close(); err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(filepath.Join(source, "ledger.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	offsets := referenceLedgerFrameOffsets(t, data)
-	for name, length := range map[string]int{
-		"before-commit":   offsets[len(offsets)-2],
-		"partial-payload": offsets[1] + (offsets[2]-offsets[1])/2,
-	} {
-		t.Run(name, func(t *testing.T) {
-			directory := filepath.Join(t.TempDir(), "ledger")
-			if err := os.MkdirAll(directory, 0700); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(filepath.Join(directory, "ledger.log"), data[:length], 0600); err != nil {
-				t.Fatal(err)
-			}
-			reopened, err := OpenReferenceLedger(directory)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got := reopened.Inspect(); len(got.Origins) != 0 || len(got.Objects) != 0 {
-				t.Fatalf("partial import became visible: %+v", got)
-			}
-			if got := reopened.JournalBytes(); got != int64(len(referenceLedgerHeader)) {
-				t.Fatalf("rolled-back journal is %d bytes", got)
-			}
-			if err := reopened.ImportOrigin(72, objects, references); err != nil {
-				t.Fatalf("retry after rollback: %v", err)
-			}
-			if err := reopened.Close(); err != nil {
-				t.Fatal(err)
-			}
-		})
-	}
-}
-
-func TestReferenceLedgerHandoffCursorIsAtomicAndDurable(t *testing.T) {
-	directory := filepath.Join(t.TempDir(), "ledger")
-	ledger, err := OpenReferenceLedger(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestReferenceLedgerHandoffCursorIsAtomic(t *testing.T) {
+	ledger := NewReferenceLedger()
 	first := ledgerObject(12, 1, ObjectKindMemoryChunk)
 	second := ledgerObject(12, 2, ObjectKindMemoryChunk)
 	baseline := map[string]ObjectID{"root/branch": first.ID, "pin/next": second.ID}
@@ -510,80 +244,8 @@ func TestReferenceLedgerHandoffCursorIsAtomicAndDurable(t *testing.T) {
 	if err := ledger.ApplyHandoff(12, 4, nil); err == nil {
 		t.Fatal("accepted a skipped handoff cursor")
 	}
-	if got := ledger.Inspect().HandoffCursors[12]; got != 3 {
-		t.Fatalf("handoff cursor=%d, want 3", got)
-	}
-	if err := ledger.Close(); err != nil {
-		t.Fatal(err)
-	}
-	reopened, err := OpenReferenceLedger(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reopened.Close()
-	inspection := reopened.Inspect()
-	if inspection.HandoffCursors[12] != 3 || inspection.References["root/branch"] != second.ID {
-		t.Fatalf("replayed handoff=%+v", inspection)
-	}
-}
-
-func TestReferenceLedgerCheckpointAndOldWALCrashPrefix(t *testing.T) {
-	directory := filepath.Join(t.TempDir(), "ledger")
-	ledger, err := OpenReferenceLedger(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	object := ledgerObject(12, 1, ObjectKindFile)
-	if err := ledger.ImportOrigin(12, []Object{object}, map[string]ObjectID{"branch": object.ID}); err != nil {
-		t.Fatal(err)
-	}
-	if err := ledger.ApplyReference("pin", "runtime", object.ID, true); err != nil {
-		t.Fatal(err)
-	}
-	oldWAL, err := os.ReadFile(filepath.Join(directory, "ledger.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := ledger.Checkpoint(); err != nil {
-		t.Fatal(err)
-	}
-	if got := ledger.JournalBytes(); got != int64(len(referenceLedgerHeader)) {
-		t.Fatalf("compacted journal is %d bytes, want %d", got, len(referenceLedgerHeader))
-	}
-	if err := ledger.ApplyReference("drop-runtime", "runtime", object.ID, false); err != nil {
-		t.Fatal(err)
-	}
-	if err := ledger.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	// Emulate a crash after checkpoint publication but before the old WAL was
-	// replaced. Reopen must skip the prefix incorporated by the checkpoint.
-	if err := os.WriteFile(filepath.Join(directory, "ledger.log"), oldWAL, 0600); err != nil {
-		t.Fatal(err)
-	}
-	reopened, err := OpenReferenceLedger(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	inspection := reopened.Inspect()
-	if got := inspection.Objects[object.ID]; got != 2 {
-		t.Fatalf("references after old-WAL replay=%d, want 2", got)
-	}
-	if err := reopened.ApplyReference("drop-runtime", "runtime", object.ID, false); err != nil {
-		t.Fatal(err)
-	}
-	if err := reopened.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	final, err := OpenReferenceLedger(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer final.Close()
-	if got := final.Inspect().Objects[object.ID]; got != 1 {
-		t.Fatalf("references after post-checkpoint replay=%d, want 1", got)
+	if inspection := ledger.Inspect(); inspection.HandoffCursors[12] != 3 || inspection.References["root/branch"] != second.ID {
+		t.Fatalf("handoff=%+v", inspection)
 	}
 }
 
@@ -1114,14 +776,10 @@ func TestReferenceLedgerCompactionWaitsForAllDeadParentEdges(t *testing.T) {
 	}
 }
 
-func TestReferenceLedgerRetirementRecovers(t *testing.T) {
-	directory := filepath.Join(t.TempDir(), "ledger")
+func TestReferenceLedgerRetirement(t *testing.T) {
 	origin := SnapshotID(52)
 	object := Object{ID: ObjectID{Snapshot: origin, Kind: ObjectKindMemoryChunk, Ordinal: 1}, BulkLength: 4096}
-	ledger, err := OpenReferenceLedger(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ledger := NewReferenceLedger()
 	if err := ledger.ImportOrigin(origin, []Object{object}, map[string]ObjectID{}); err != nil {
 		t.Fatal(err)
 	}
@@ -1131,27 +789,15 @@ func TestReferenceLedgerRetirementRecovers(t *testing.T) {
 	if err := ledger.RetireOrigin(origin); err != nil {
 		t.Fatal(err)
 	}
-	if err := ledger.Close(); err != nil {
-		t.Fatal(err)
-	}
-	ledger, err = OpenReferenceLedger(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ledger.Close()
 	if got := ledger.Inspect(); len(got.Origins) != 0 || len(got.Objects) != 0 {
-		t.Fatalf("retired origin reappeared after replay: %+v", got)
+		t.Fatalf("retired origin remains: %+v", got)
 	}
 }
 
-// A mutation works on the ledger's state in place: one refused part way, or
-// one whose journal record is not written, must leave the state as it was.
+// A mutation works on the ledger's state in place: one refused part way must
+// leave the state as it was.
 func TestReferenceLedgerRefusedMutationChangesNothing(t *testing.T) {
-	directory := filepath.Join(t.TempDir(), "ledger")
-	ledger, err := OpenReferenceLedger(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ledger := NewReferenceLedger()
 	a := ledgerObject(1, 1, ObjectKindMemoryChunk)
 	b := ledgerObject(1, 2, ObjectKindMemoryChunk)
 	if err := ledger.ImportOrigin(1, []Object{a, b}, map[string]ObjectID{"root/a": a.ID, "root/b": b.ID}); err != nil {
@@ -1197,83 +843,6 @@ func TestReferenceLedgerRefusedMutationChangesNothing(t *testing.T) {
 		t.Fatal("an import whose baseline names an unknown object was applied")
 	}
 	unchanged("an import refused part way")
-
-	// A mutation whose record cannot be written is undone, and the ledger
-	// refuses further mutations until it is reopened.
-	if err := ledger.journal.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := ledger.ApplyReference("release-a", "root/a", a.ID, false); err == nil {
-		t.Fatal("a mutation whose record was not written was applied")
-	}
-	unchanged("a mutation whose record was not written")
-	if err := ledger.ApplyReference("retain-y", "root/y", b.ID, true); err == nil {
-		t.Fatal("a poisoned ledger applied a mutation")
-	}
-	unchanged("a poisoned ledger's mutation")
-	ledger.journal = nil
-	if err := ledger.Close(); err != nil {
-		t.Fatal(err)
-	}
-	reopened, err := OpenReferenceLedger(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reopened.Close()
-	if replayed := reopened.Inspect(); !reflect.DeepEqual(replayed, before) {
-		t.Fatalf("replayed ledger differs:\nwant %+v\ngot  %+v", before, replayed)
-	}
-}
-
-// A ledger's checkpoint is due once its journal has grown to the minimum and
-// to the size of its last checkpoint, written or read.
-func TestReferenceLedgerCheckpointDueGrowsWithTheLedger(t *testing.T) {
-	directory := filepath.Join(t.TempDir(), "ledger")
-	ledger, err := OpenReferenceLedger(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { ledger.Close() }()
-	objects := []Object{ledgerObject(7, 1, ObjectKindMemoryChunk), ledgerObject(7, 2, ObjectKindMemoryChunk)}
-	references := map[string]ObjectID{"root/a": objects[0].ID, "root/b": objects[1].ID}
-	if err := ledger.ImportOrigin(7, objects, references); err != nil {
-		t.Fatal(err)
-	}
-	journal := ledger.JournalBytes()
-	if !ledger.CheckpointDue(journal) || ledger.CheckpointDue(journal+1) {
-		t.Fatalf("with no checkpoint, a checkpoint of a %d-byte journal is due only at a minimum up to it", journal)
-	}
-	if err := ledger.Checkpoint(); err != nil {
-		t.Fatal(err)
-	}
-	checkpoint := ledger.checkpointBytes
-	if checkpoint == 0 {
-		t.Fatal("the checkpoint's size was not kept")
-	}
-	if ledger.CheckpointDue(1) {
-		t.Fatalf("a checkpoint is due over a %d-byte journal", ledger.JournalBytes())
-	}
-	for index := 0; ledger.JournalBytes() < checkpoint; index++ {
-		if ledger.CheckpointDue(1) {
-			t.Fatalf("a checkpoint is due over a %d-byte journal, under the last checkpoint's %d bytes", ledger.JournalBytes(), checkpoint)
-		}
-		name := fmt.Sprintf("root/due-%d", index)
-		if err := ledger.ApplyReference("retain-"+name, name, objects[0].ID, true); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if !ledger.CheckpointDue(1) {
-		t.Fatalf("no checkpoint is due over a %d-byte journal, over the last checkpoint's %d bytes", ledger.JournalBytes(), checkpoint)
-	}
-	if err := ledger.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if ledger, err = OpenReferenceLedger(directory); err != nil {
-		t.Fatal(err)
-	}
-	if ledger.checkpointBytes != checkpoint {
-		t.Fatalf("a reopened ledger's checkpoint is %d bytes, want %d", ledger.checkpointBytes, checkpoint)
-	}
 }
 
 // checkLedgerIndexes fails unless the ledger's indexes of its objects are
@@ -1315,12 +884,7 @@ func checkLedgerIndexes(t *testing.T, ledger *ReferenceLedger) {
 // indexes must follow every mutation, refused ones included, and an origin's
 // change count must advance whenever its live objects change.
 func TestReferenceLedgerIndexesFollowMutations(t *testing.T) {
-	directory := filepath.Join(t.TempDir(), "ledger")
-	ledger, err := OpenReferenceLedger(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { ledger.Close() }()
+	ledger := NewReferenceLedger()
 	random := rand.New(rand.NewSource(1))
 	type liveView struct {
 		changes uint64
@@ -1449,24 +1013,6 @@ func TestReferenceLedgerIndexesFollowMutations(t *testing.T) {
 	}
 	if retired == 0 {
 		t.Fatal("no origin emptied to be retired")
-	}
-	for _, reopen := range []string{"replayed", "checkpointed"} {
-		if reopen == "checkpointed" {
-			if err := ledger.Checkpoint(); err != nil {
-				t.Fatal(err)
-			}
-		}
-		before := ledger.Inspect()
-		if err := ledger.Close(); err != nil {
-			t.Fatal(err)
-		}
-		if ledger, err = OpenReferenceLedger(directory); err != nil {
-			t.Fatal(err)
-		}
-		if after := ledger.Inspect(); !reflect.DeepEqual(after, before) {
-			t.Fatalf("%s ledger differs:\nwant %+v\ngot  %+v", reopen, before, after)
-		}
-		checkLedgerIndexes(t, ledger)
 	}
 }
 
@@ -1628,43 +1174,6 @@ func TestSnapshotLedgerHandoffCatchupFollowsRandomMutations(t *testing.T) {
 	}
 }
 
-// A ledger checkpoint encodes as json.Marshal writes it, byte for byte.
-func TestEncodeReferenceLedgerCheckpoint(t *testing.T) {
-	random := rand.New(rand.NewSource(4))
-	states := []referenceLedgerState{{}, newReferenceLedgerState()}
-	for round := 0; round < 20; round++ {
-		state := newReferenceLedgerState()
-		state.Objects = checkpointFixture(random, random.Intn(200)).Objects
-		for origin := SnapshotID(1); origin <= SnapshotID(random.Intn(4)); origin++ {
-			state.Origins[origin] = struct{}{}
-			state.HandoffCursor[origin] = random.Uint64()
-		}
-		id := ObjectID{Snapshot: 1, Kind: ObjectKindMetadata, Ordinal: random.Uint64()}
-		state.References[fmt.Sprintf("root/%d", random.Intn(100))] = id
-		state.Applied[fmt.Sprintf("op-%d", random.Intn(100))] = appliedReference{Name: "root/applied", Object: id, Retain: random.Intn(2) == 0}
-		for index := 0; index < random.Intn(3); index++ {
-			state.Outbox = append(state.Outbox, OutboundReference{Sequence: random.Uint64(), Operation: "op", Name: "edge/<&>", Parent: id, Child: id, Retain: true})
-		}
-		state.NextSequence, state.Acknowledged = random.Uint64(), random.Uint64()
-		states = append(states, state)
-	}
-	odd := newReferenceLedgerState()
-	odd.Objects = map[string]Object{"key <&> \"quoted\"   \xff": {ID: ObjectID{Snapshot: 1, Kind: 1, Ordinal: 1}, State: "odd\tstate", SourceCatalog: "<catalog>"}}
-	odd.References["ré <&>"] = ObjectID{Snapshot: 1, Kind: 1, Ordinal: 1}
-	states = append(states, odd)
-	for index := range states {
-		checkpoint := referenceLedgerCheckpoint{Version: referenceLedgerVersion, Sequence: random.Uint64(), State: states[index]}
-		want, err := json.Marshal(checkpoint)
-		if err != nil {
-			t.Fatal(err)
-		}
-		got, err := encodeReferenceLedgerCheckpoint(&checkpoint)
-		if err != nil || !bytes.Equal(got, want) {
-			t.Fatalf("state %d encodes (%v) as\n%.400s\nwant\n%.400s", index, err, got, want)
-		}
-	}
-}
-
 // An edge's reference name parses back to its parent and slot; no other
 // name does.
 func TestEdgeReferenceNames(t *testing.T) {
@@ -1751,56 +1260,5 @@ func TestFreezeSnapshotLedgerHandoff(t *testing.T) {
 	}
 	if err := graph.FreezeSnapshotLedgerHandoff(working + 100); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("froze an absent snapshot: %v", err)
-	}
-}
-
-// An import's records of objects are those encodeReferenceLedgerRecord
-// writes, byte for byte, of as many objects as a record fits.
-func TestEncodeLedgerImportObjects(t *testing.T) {
-	random := rand.New(rand.NewSource(7))
-	object := func(ordinal uint64, data int) Object {
-		payload := make([]byte, data)
-		random.Read(payload)
-		o := Object{
-			ID: ObjectID{Snapshot: 9, Ordinal: ordinal, Kind: ObjectKindMemoryTable}, State: ObjectLive,
-			Refs: uint64(random.Intn(3)), BulkLength: uint64(random.Intn(1 << 20)), Data: payload,
-			SourceObject: ObjectID{Snapshot: 4, Ordinal: ordinal, Kind: ObjectKindMemoryChunk},
-		}
-		if ordinal%3 == 0 {
-			o.Children = []Edge{{Slot: 1, Child: ObjectID{Snapshot: 9, Ordinal: ordinal + 1, Kind: ObjectKindMemoryChunk}}}
-		}
-		if ordinal%5 == 0 {
-			o.SourceCatalog, o.Deferred = "catalog<&>", true
-		}
-		return o
-	}
-	check := func(name string, objects []Object, wantCount int) {
-		t.Helper()
-		data, count, err := encodeLedgerImportObjects(41, 9, 17, objects)
-		if err != nil {
-			t.Fatalf("%s: %v", name, err)
-		}
-		if count != wantCount {
-			t.Fatalf("%s: a record of %d objects, want %d", name, count, wantCount)
-		}
-		want, err := encodeReferenceLedgerRecord(referenceLedgerRecord{Sequence: 41, ImportObjects: &ledgerImportObjectsRecord{Origin: 9, Offset: 17, Objects: objects[:count]}})
-		if err != nil {
-			t.Fatalf("%s: %v", name, err)
-		}
-		if !bytes.Equal(data, want) {
-			t.Fatalf("%s: the record is\n%.300q\nwant\n%.300q", name, data, want)
-		}
-	}
-	var small, large []Object
-	for ordinal := uint64(1); ordinal <= 300; ordinal++ {
-		small = append(small, object(ordinal, 64))
-		large = append(large, object(ordinal, 128<<10))
-	}
-	check("small objects", small, ledgerImportObjectsBatch)
-	check("one object", small[:1], 1)
-	// Each large object takes about 171 KiB of the 8 MiB a record holds.
-	check("large objects", large, 47)
-	if _, _, err := encodeLedgerImportObjects(1, 9, 0, []Object{object(1, maxReferenceLedgerRecord)}); err == nil {
-		t.Fatal("encoded a record larger than the ledger holds")
 	}
 }

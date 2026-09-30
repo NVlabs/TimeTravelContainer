@@ -17,11 +17,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
-	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 )
@@ -283,15 +281,17 @@ type sharedReferenceService struct {
 	claimMu      sync.Mutex
 	authority    *cluster.AuthorityCatalog
 	packs        *ttcsnapshot.SharedPackStore
-	directory    string
-	localRoot    string
-	sharedRoot   string
-	nodeID       string
-	incarnation  string
-	graph        *ttcsnapshot.Store
-	peers        *distributedSourceRuntime
-	lease        cluster.SharedGCLease
-	ledger       *ttcsnapshot.ReferenceLedger
+	// directory is where the ledger was journaled before it was kept in
+	// memory; see rebuildLedger.
+	directory   string
+	localRoot   string
+	sharedRoot  string
+	nodeID      string
+	incarnation string
+	graph       *ttcsnapshot.Store
+	peers       *distributedSourceRuntime
+	lease       cluster.SharedGCLease
+	ledger      *ttcsnapshot.ReferenceLedger
 	// compactionExamined is protected by mu. It holds, for each origin found
 	// not to need shared-pack compaction, or compacted, the ledger's
 	// OriginChanges count then: shared-pack compaction is needed only once
@@ -301,8 +301,6 @@ type sharedReferenceService struct {
 	// collection instead, and each one by scanning all the ledger's objects,
 	// took 1.9 s of a 100,000-file family's removal.
 	compactionExamined map[ttcsnapshot.SnapshotID]uint64
-	// checkpointing is set while the ledger is checkpointed after a request.
-	checkpointing atomic.Bool
 }
 
 // unexaminedOrigin is the compactionExamined count of an origin that a new
@@ -674,17 +672,18 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 	if state.SharedGC.NodeID != lease.NodeID || state.SharedGC.Incarnation != lease.Incarnation || state.SharedGC.Generation != lease.Generation || !time.Now().Before(state.SharedGC.ExpiresAt) {
 		return nil, errors.New("shared reference lease changed before rebuild")
 	}
-	generationDir := filepath.Join(s.directory, fmt.Sprintf("generation-%016x", lease.Generation))
-	if err := os.RemoveAll(generationDir); err != nil {
+	// The ledger is kept in memory. A coordinator builds it anew whenever it
+	// takes the lease, from the shared manifests and every node's claims, and
+	// never reads what an earlier one kept: journaled, each of its changes
+	// was a write and a sync, an import a record of every object, and each
+	// build and every 16 MB of changes a checkpoint of the whole ledger, for
+	// nothing. The directory holds what an earlier TTC wrote.
+	if err := os.RemoveAll(s.directory); err != nil {
 		return nil, err
 	}
-	ledger, err := ttcsnapshot.OpenReferenceLedger(generationDir)
-	if err != nil {
-		return nil, err
-	}
+	ledger := ttcsnapshot.NewReferenceLedger()
 	fail := func(err error) (*ttcsnapshot.ReferenceLedger, error) {
 		_ = ledger.Close()
-		_ = os.RemoveAll(generationDir)
 		return nil, err
 	}
 
@@ -940,9 +939,6 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 			return fail(fmt.Errorf("publication bridge references shared origin %d without a committed manifest", origin))
 		}
 	}
-	if err := ledger.Checkpoint(); err != nil {
-		return fail(err)
-	}
 	return ledger, nil
 }
 
@@ -994,14 +990,6 @@ func (s *sharedReferenceService) activate(lease cluster.SharedGCLease) error {
 	s.ledger, s.lease = ledger, current
 	s.compactionExamined = nil
 	s.mu.Unlock()
-	if entries, err := os.ReadDir(s.directory); err == nil {
-		keep := fmt.Sprintf("generation-%016x", current.Generation)
-		for _, entry := range entries {
-			if entry.IsDir() && strings.HasPrefix(entry.Name(), "generation-") && entry.Name() != keep {
-				_ = os.RemoveAll(filepath.Join(s.directory, entry.Name()))
-			}
-		}
-	}
 	return nil
 }
 
@@ -1039,32 +1027,8 @@ func (s *sharedReferenceService) withLedger(fn func(*ttcsnapshot.ReferenceLedger
 	if current.NodeID != s.lease.NodeID || current.Incarnation != s.lease.Incarnation || current.Generation != s.lease.Generation || !time.Now().Before(current.ExpiresAt) {
 		return errors.New("shared reference lease is stale")
 	}
-	if err := fn(s.ledger); err != nil {
-		return err
-	}
-	// The semantic WAL records crash-safe transitions, not retained history.
-	// Long migration chains can perform millions of short-lived edge updates
-	// while converging back to a tiny live graph. Bound restart time and local
-	// scratch growth by checkpointing the resulting state once the WAL reaches
-	// the same scale as other snapshot-graph journals.
-	//
-	// The request's changes are in the WAL already: the checkpoint is made
-	// after it returns, one at a time, and the ledger's next change waits for
-	// it. Made before, it took 1.3 s of a large snapshot's import. One that
-	// fails is due again at the next request.
-	if s.ledger.CheckpointDue(sharedReferenceLedgerCheckpointBytes) && s.checkpointing.CompareAndSwap(false, true) {
-		ledger := s.ledger
-		go func() {
-			defer s.checkpointing.Store(false)
-			if err := ledger.Checkpoint(); err != nil {
-				log.Warningf("ttcd: checkpointing the shared reference ledger: %v", err)
-			}
-		}()
-	}
-	return nil
+	return fn(s.ledger)
 }
-
-const sharedReferenceLedgerCheckpointBytes = 16 << 20
 
 func (s *sharedReferenceService) authorizeProvider(peer string, snapshot uint64) error {
 	provider, volatile, err := s.authority.SnapshotProvider(snapshot)
