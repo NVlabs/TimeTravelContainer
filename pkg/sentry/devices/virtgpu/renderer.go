@@ -58,6 +58,16 @@ type Renderer interface {
 	// submitted to its timeline before it is done.
 	CreateFence(f Fence) error
 
+	// Snapshot returns a snapshot of the renderer's state: its contexts and
+	// resources, and what they hold. The Sentry calls it with no fence
+	// pending, and the guest stopped.
+	Snapshot() ([]byte, error)
+
+	// Restore gives a new renderer the state of a snapshot. sizes are the
+	// sizes of the snapshot's resources, which the Sentry maps as it maps
+	// those that it creates.
+	Restore(snapshot []byte, sizes map[uint32]uint64) error
+
 	// Close releases the Renderer. It reports nothing afterward.
 	Close()
 }

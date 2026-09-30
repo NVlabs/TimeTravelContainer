@@ -254,10 +254,12 @@ func (r *resource) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcA
 
 // Translate implements memmap.Mappable.Translate.
 //
-// A mapping of a resource that a load lost, in a fork's child, has no memory:
-// what it mapped is the source's renderer's. Accesses to it raise SIGBUS, as
-// accesses to memory of a device that is gone may. That is the fail-fast end
-// of ForkDeviceLost for the processes that used the GPU: gfxstream's guest
+// A loaded resource's mapping has no memory until the device maps it again:
+// what it mapped is the source's renderer's. With ForkSnapshot, the device
+// maps the memory of the renderer that restores the source's snapshot.
+// Otherwise the resource was lost, and accesses raise SIGBUS, as accesses to
+// memory of a device that is gone may. That is the fail-fast end of
+// ForkDeviceLost for the processes that used the GPU: gfxstream's guest
 // driver waits for its renderer's replies by spinning on its command ring,
 // and treats a reply that cannot come as fatal.
 func (r *resource) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
@@ -265,6 +267,11 @@ func (r *resource) Translate(ctx context.Context, required, optional memmap.Mapp
 	d.mu.Lock()
 	mem := r.memory
 	d.mu.Unlock()
+	if mem == nil && d.forkPolicy == ForkSnapshot {
+		d.submitMu.Lock()
+		mem, _ = r.memoryLocked()
+		d.submitMu.Unlock()
+	}
 	if mem == nil {
 		return nil, &memmap.BusError{Err: linuxerr.EFAULT}
 	}

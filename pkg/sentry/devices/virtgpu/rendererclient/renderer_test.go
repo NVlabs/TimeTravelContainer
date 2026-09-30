@@ -179,3 +179,122 @@ func TestBroker(t *testing.T) {
 		t.Errorf("ServeBroker: %v", err)
 	}
 }
+
+// TestRealSnapshot takes a snapshot of a renderer, restores it in another,
+// and checks that the other's blob holds what the first's did.
+func TestRealSnapshot(t *testing.T) {
+	library := os.Getenv("TTC_GFXSTREAM_LIBRARY")
+	if library == "" {
+		t.Skip("TTC_GFXSTREAM_LIBRARY does not name gfxstream's host library")
+	}
+	renderer, err := testutil.FindFile("runsc/ttcgfx/ttc-gfx-renderer")
+	if err != nil {
+		t.Fatalf("finding the renderer: %v", err)
+	}
+	sentrySock, brokerSock, err := unet.SocketPair(false /* packet */)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brokerFD, err := brokerSock.Release()
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := make(chan error, 1)
+	go func() {
+		served <- gfxrenderer.ServeBroker(brokerFD, gfxrenderer.BrokerOptions{
+			Renderer: renderer,
+			Options:  gfxrenderer.Options{Library: library},
+			Stderr:   os.Stderr,
+		})
+	}()
+	sentryFD, err := sentrySock.Release()
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker, err := NewBroker(sentryFD)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker.Snapshots = true
+	defer func() {
+		broker.Close()
+		if err := <-served; err != nil {
+			t.Errorf("ServeBroker: %v", err)
+		}
+	}()
+
+	// A command ring's blob, whose transfer buffer, past the rings' storage,
+	// holds a message.
+	const ringSize = 1<<20 + 12<<10
+	const offset = ringSize - hostarch.PageSize
+	message := []byte("taken with a snapshot")
+	source, err := broker.NewRenderer(&events{lost: make(chan error, 1)})
+	if err != nil {
+		t.Fatalf("NewRenderer: %v", err)
+	}
+	defer source.Close()
+	if err := source.CreateContext(1, linux.VIRTGPU_DRM_CAPSET_GFXSTREAM_VULKAN, "snapshot-test"); err != nil {
+		t.Fatalf("CreateContext: %v", err)
+	}
+	if err := source.CreateBlob(1, 1, virtgpu.BlobArgs{
+		Mem:   linux.VIRTGPU_BLOB_MEM_HOST3D,
+		Flags: linux.VIRTGPU_BLOB_FLAG_USE_MAPPABLE | linux.VIRTGPU_BLOB_FLAG_USE_SHAREABLE,
+		Size:  ringSize,
+	}); err != nil {
+		t.Fatalf("CreateBlob: %v", err)
+	}
+	source.AttachResource(1, 1)
+	sourceMem, err := source.MapResource(1)
+	if err != nil {
+		t.Fatalf("MapResource: %v", err)
+	}
+	defer sourceMem.Release()
+	copyMemory(t, sourceMem, offset, message, true)
+
+	snapshot, err := source.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	// The source renders on after its snapshot.
+	if err := source.CreateContext(2, linux.VIRTGPU_DRM_CAPSET_GFXSTREAM_VULKAN, "after-snapshot"); err != nil {
+		t.Errorf("CreateContext after a snapshot: %v", err)
+	}
+
+	child, err := broker.NewRenderer(&events{lost: make(chan error, 1)})
+	if err != nil {
+		t.Fatalf("NewRenderer: %v", err)
+	}
+	defer child.Close()
+	if err := child.Restore(snapshot, map[uint32]uint64{1: ringSize}); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	childMem, err := child.MapResource(1)
+	if err != nil {
+		t.Fatalf("MapResource after Restore: %v", err)
+	}
+	defer childMem.Release()
+	got := make([]byte, len(message))
+	copyMemory(t, childMem, offset, got, false)
+	if string(got) != string(message) {
+		t.Errorf("the restored blob holds %q, want %q", got, message)
+	}
+}
+
+// copyMemory copies between buf and the memory of a resource at offset.
+func copyMemory(t *testing.T, mem virtgpu.ResourceMemory, offset uint64, buf []byte, toMemory bool) {
+	t.Helper()
+	fr := memmap.FileRange{Start: mem.Offset() + offset, End: mem.Offset() + offset + uint64(len(buf))}
+	ims, err := mem.File().MapInternal(fr, hostarch.ReadWrite)
+	if err != nil {
+		t.Fatalf("MapInternal: %v", err)
+	}
+	blocks := safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buf))
+	if toMemory {
+		_, err = safemem.CopySeq(ims, blocks)
+	} else {
+		_, err = safemem.CopySeq(blocks, ims)
+	}
+	if err != nil {
+		t.Fatalf("copying: %v", err)
+	}
+}

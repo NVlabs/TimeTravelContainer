@@ -15,6 +15,10 @@ import (
 // Broker asks the renderers' broker, ttcd, which the Sentry cannot be since
 // it starts no processes, for renderers.
 type Broker struct {
+	// Snapshots is whether the renderers take snapshots and restore them.
+	// It is set before the Broker's first use.
+	Snapshots bool
+
 	// mu serializes requests: each waits for its own reply.
 	mu   sync.Mutex
 	conn *gfxproto.Conn
@@ -46,7 +50,11 @@ func (b *Broker) NewRenderer(events virtgpu.RendererEvents) (virtgpu.Renderer, e
 func (b *Broker) start() (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if err := b.conn.Send(gfxproto.MsgStartRenderer, 1, &gfxproto.StartRenderer{}, nil); err != nil {
+	var flags uint32
+	if b.Snapshots {
+		flags |= gfxproto.RendererFlagSnapshots
+	}
+	if err := b.conn.Send(gfxproto.MsgStartRenderer, 1, &gfxproto.StartRenderer{Flags: flags}, nil); err != nil {
 		return -1, fmt.Errorf("asking for a renderer: %w", err)
 	}
 	m, err := b.conn.Recv()

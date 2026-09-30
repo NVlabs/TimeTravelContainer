@@ -59,6 +59,7 @@ go_library(
         "resource.go",
         "resource_maps_mutex.go",
         "resource_refs.go",
+        "snapshot.go",
         "submit_mutex.go",
         "sync_file.go",
     ],

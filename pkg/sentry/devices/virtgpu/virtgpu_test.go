@@ -5,8 +5,11 @@ package virtgpu
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -52,6 +55,11 @@ type fakeRenderer struct {
 	fences    []Fence
 	closed    bool
 	rejectCtx bool
+	// restored is the memory of resources that a restore gave the renderer,
+	// which their mappings start with.
+	restored map[uint32][]byte
+	// failRestore makes restores fail.
+	failRestore bool
 }
 
 // fakeRenderers starts fakeRenderers.
@@ -62,17 +70,20 @@ type fakeRenderers struct {
 	renderers []*fakeRenderer
 	// rejectCapset0 makes new renderers reject contexts of capability set 0.
 	rejectCapset0 bool
+	// failRestore makes new renderers fail to restore snapshots.
+	failRestore bool
 }
 
 func (f *fakeRenderers) newRenderer(events RendererEvents) (Renderer, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	r := &fakeRenderer{
-		mf:        f.mf,
-		events:    events,
-		sizes:     make(map[uint32]uint64),
-		memory:    make(map[uint32]*fakeMemory),
-		rejectCtx: f.rejectCapset0,
+		mf:          f.mf,
+		events:      events,
+		sizes:       make(map[uint32]uint64),
+		memory:      make(map[uint32]*fakeMemory),
+		rejectCtx:   f.rejectCapset0,
+		failRestore: f.failRestore,
 	}
 	f.renderers = append(f.renderers, r)
 	return r, nil
@@ -160,8 +171,61 @@ func (r *fakeRenderer) MapResource(resID uint32) (ResourceMemory, error) {
 		return nil, err
 	}
 	mem := &fakeMemory{mf: r.mf, fr: fr}
+	if data, ok := r.restored[resID]; ok {
+		if err := mem.copyIn(data); err != nil {
+			return nil, err
+		}
+	}
 	r.memory[resID] = mem
 	return mem, nil
+}
+
+// fakeSnapshot is a fakeRenderer's snapshot: its resources' sizes, and what
+// their memory holds.
+type fakeSnapshot struct {
+	Sizes  map[uint32]uint64
+	Memory map[uint32][]byte
+}
+
+// Snapshot implements Renderer.Snapshot.
+func (r *fakeRenderer) Snapshot() ([]byte, error) {
+	r.record("Snapshot")
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	snapshot := fakeSnapshot{Sizes: maps.Clone(r.sizes), Memory: make(map[uint32][]byte)}
+	for id, mem := range r.memory {
+		if mem.released {
+			continue
+		}
+		data, err := mem.copyOut()
+		if err != nil {
+			return nil, err
+		}
+		snapshot.Memory[id] = data
+	}
+	return json.Marshal(&snapshot)
+}
+
+// Restore implements Renderer.Restore.
+func (r *fakeRenderer) Restore(data []byte, sizes map[uint32]uint64) error {
+	r.record("Restore %v", slices.Sorted(maps.Keys(sizes)))
+	var snapshot fakeSnapshot
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.failRestore {
+		return errors.New("the restore failed")
+	}
+	for id, size := range sizes {
+		if snapshot.Sizes[id] != size {
+			return fmt.Errorf("resource %d is %d bytes, but %d in the snapshot", id, size, snapshot.Sizes[id])
+		}
+	}
+	r.sizes = snapshot.Sizes
+	r.restored = snapshot.Memory
+	return nil
 }
 
 // AttachResource implements Renderer.AttachResource.
@@ -245,6 +309,27 @@ func (m *fakeMemory) Offset() uint64    { return m.fr.Start }
 func (m *fakeMemory) Release() {
 	m.released = true
 	m.mf.DecRef(m.fr)
+}
+
+// copyOut returns what the memory holds.
+func (m *fakeMemory) copyOut() ([]byte, error) {
+	buf := make([]byte, m.fr.Length())
+	ims, err := m.mf.MapInternal(m.fr, hostarch.Read)
+	if err != nil {
+		return nil, err
+	}
+	_, err = safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buf)), ims)
+	return buf, err
+}
+
+// copyIn fills the memory from data.
+func (m *fakeMemory) copyIn(data []byte) error {
+	ims, err := m.mf.MapInternal(m.fr, hostarch.Write)
+	if err != nil {
+		return err
+	}
+	_, err = safemem.CopySeq(ims, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(data[:min(uint64(len(data)), m.fr.Length())])))
+	return err
 }
 
 func (m *fakeMemory) read(t *testing.T, off, n uint64) []byte {
@@ -1313,7 +1398,7 @@ func TestIdleRenderer(t *testing.T) {
 }
 
 func TestLiveForkValidation(t *testing.T) {
-	for _, policy := range []ForkPolicy{ForkIneligible, ForkDeviceLost} {
+	for _, policy := range []ForkPolicy{ForkIneligible, ForkDeviceLost, ForkSnapshot} {
 		t.Run(policy.String(), func(t *testing.T) {
 			e := newTestEnv(t, policy)
 			file := e.open()
@@ -1473,6 +1558,130 @@ func TestDeviceLostFork(t *testing.T) {
 	}
 	if got := string(readTranslation(t, r, 0, 5)); got != "guest" {
 		t.Errorf("the source's blob is %q", got)
+	}
+}
+
+// forkWithSnapshot prepares d's save, as a fork with ForkSnapshot does,
+// loads a copy of it, and ends the save.
+func forkWithSnapshot(t *testing.T, e *testEnv, d *device) *device {
+	t.Helper()
+	if err := d.PrepareSave(context.Background()); err != nil {
+		t.Fatalf("PrepareSave: %v", err)
+	}
+	child := loadDevice(t, d, e.fakes.newRenderer)
+	d.BeforeResume(context.Background())
+	if d.snapshot != nil {
+		t.Error("the source kept its snapshot after the save")
+	}
+	return child
+}
+
+// TestSnapshotFork forks a device with ForkSnapshot: the child's contexts
+// and resources survive, in a renderer that restores the source's snapshot
+// on the child's first use, and its mappings map what the guest wrote.
+func TestSnapshotFork(t *testing.T) {
+	e := newTestEnv(t, ForkSnapshot)
+	file := e.open()
+	if err := e.contextInit(file, linux.VIRTGPU_DRM_CAPSET_GFXSTREAM_VULKAN, 1, "snap"); err != nil {
+		t.Fatal(err)
+	}
+	const size = 64 << 10
+	handle, _, err := e.createBlob(file, linux.VIRTGPU_BLOB_MEM_HOST3D, linux.VIRTGPU_BLOB_FLAG_USE_MAPPABLE, 0, size, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd := file.Impl().(*renderFD)
+	r := fd.objects[handle]
+	addr, err := e.mmap(file, r.mapOffset, size)
+	if err != nil {
+		t.Fatalf("mmap: %v", err)
+	}
+	if _, err := e.task.CopyOutBytes(addr, []byte("before the fork")); err != nil {
+		t.Fatal(err)
+	}
+	source := e.fakes.last(t)
+	if err := r.InvalidateUnsavable(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	e.munmap(addr, size)
+	source.takeCalls()
+
+	child := forkWithSnapshot(t, e, fd.dev)
+	wantCalls(t, source, "Snapshot")
+	if child.gen != fd.dev.gen || child.contexts != 1 || child.genResources != 1 {
+		t.Errorf("the child has generation %d, %d contexts, and %d resources; want %d, 1, and 1", child.gen, child.contexts, child.genResources, fd.dev.gen)
+	}
+	if e.fakes.count() != 1 {
+		t.Fatalf("the fork started %d renderers, want none", e.fakes.count()-1)
+	}
+	// The child's first use of the GPU, a fault on its mapping, restores
+	// the snapshot in a renderer of its own.
+	if got := string(readTranslation(t, child.resources[r.id], 0, 15)); got != "before the fork" {
+		t.Errorf("the child's blob holds %q", got)
+	}
+	restored := e.fakes.last(t)
+	if restored == source {
+		t.Fatal("the child uses the source's renderer")
+	}
+	wantCalls(t, restored, fmt.Sprintf("Restore [%d]", r.id), fmt.Sprintf("MapResource %d", r.id))
+	// The source's memory is its renderer's.
+	if got := string(readTranslation(t, r, 0, 15)); got != "before the fork" {
+		t.Errorf("the source's blob holds %q", got)
+	}
+}
+
+// TestSnapshotForkWaitsForFences checks that a save waits for the renderer's
+// pending fences, and fails if they stay pending.
+func TestSnapshotForkWaitsForFences(t *testing.T) {
+	e := newTestEnv(t, ForkSnapshot)
+	file := e.open()
+	if err := e.contextInit(file, 3, 1, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.execbuffer(file, linux.VIRTGPU_EXECBUF_RING_IDX|linux.VIRTGPU_EXECBUF_FENCE_FD_OUT, 0, -1, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	d := file.Impl().(*renderFD).dev
+	d.submitMu.Lock()
+	err := d.waitForFencesLocked(20 * time.Millisecond)
+	d.submitMu.Unlock()
+	if err == nil {
+		t.Error("the save did not wait for a pending fence")
+	}
+	e.fakes.last(t).signal(t, 1)
+	if err := d.PrepareSave(context.Background()); err != nil {
+		t.Errorf("PrepareSave with no fence pending: %v", err)
+	}
+	d.BeforeResume(context.Background())
+}
+
+// TestSnapshotRestoreFails checks that a child whose renderer fails to
+// restore the snapshot loses the snapshot's contexts, and makes new ones.
+func TestSnapshotRestoreFails(t *testing.T) {
+	e := newTestEnv(t, ForkSnapshot)
+	file := e.open()
+	if err := e.contextInit(file, 3, 1, ""); err != nil {
+		t.Fatal(err)
+	}
+	fd := file.Impl().(*renderFD)
+	child := forkWithSnapshot(t, e, fd.dev)
+	e.fakes.mu.Lock()
+	e.fakes.failRestore = true
+	e.fakes.mu.Unlock()
+	child.submitMu.Lock()
+	_, err := child.rendererLocked(child.gen)
+	child.submitMu.Unlock()
+	if !linuxerr.Equals(linuxerr.ENODEV, err) {
+		t.Errorf("using a context of the failed snapshot: %v, want ENODEV", err)
+	}
+	if child.contexts != 0 || child.snapshot != nil {
+		t.Errorf("after a failed restore, the child has %d contexts, and a snapshot of %d bytes", child.contexts, len(child.snapshot))
+	}
+	child.submitMu.Lock()
+	_, err = child.startRendererLocked()
+	child.submitMu.Unlock()
+	if err != nil {
+		t.Errorf("starting a renderer after a failed restore: %v", err)
 	}
 }
 

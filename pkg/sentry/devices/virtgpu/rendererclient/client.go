@@ -7,6 +7,8 @@ package rendererclient
 
 import (
 	"fmt"
+	"io"
+	"os"
 	"sync"
 	"time"
 
@@ -158,7 +160,7 @@ func (c *Client) send(typ gfxproto.MsgType, p any, trailer []byte) error {
 }
 
 // call sends a request, and returns its reply.
-func (c *Client) call(typ gfxproto.MsgType, p any, trailer []byte) (*gfxproto.Message, *gfxproto.Reply, error) {
+func (c *Client) call(typ gfxproto.MsgType, p any, trailer []byte, fds ...int) (*gfxproto.Message, *gfxproto.Reply, error) {
 	ch := make(chan *gfxproto.Message, 1)
 	c.mu.Lock()
 	if c.err != nil {
@@ -170,7 +172,7 @@ func (c *Client) call(typ gfxproto.MsgType, p any, trailer []byte) (*gfxproto.Me
 	c.nextSeq++
 	c.pending[seq] = ch
 	c.mu.Unlock()
-	if err := c.conn.Send(typ, seq, p, trailer); err != nil {
+	if err := c.conn.Send(typ, seq, p, trailer, fds...); err != nil {
 		c.lose(err)
 		return nil, nil, err
 	}
@@ -336,6 +338,68 @@ func (c *Client) CreateFence(f virtgpu.Fence) error {
 		HasRing: hasRing,
 		Ring:    f.Ring,
 	}, nil)
+}
+
+// maxSnapshotSize is the size of the largest snapshot that the client takes
+// from a renderer.
+const maxSnapshotSize = 16 << 30
+
+// Snapshot implements virtgpu.Renderer.Snapshot. The renderer sends the
+// snapshot through a pipe, whose read end its reply carries: the Sentry
+// neither creates nor maps memory for it.
+func (c *Client) Snapshot() ([]byte, error) {
+	m, reply, err := c.call(gfxproto.MsgSnapshot, &gfxproto.Snapshot{}, nil)
+	if err != nil {
+		return nil, err
+	}
+	if len(m.FDs) != 1 {
+		m.CloseFDs()
+		return nil, fmt.Errorf("the snapshot came with %d file descriptors", len(m.FDs))
+	}
+	pipe := os.NewFile(uintptr(m.FDs[0]), "gfx-snapshot")
+	m.FDs = nil
+	defer pipe.Close()
+	if reply.Size > maxSnapshotSize {
+		return nil, fmt.Errorf("the snapshot is %d bytes, more than %d", reply.Size, maxSnapshotSize)
+	}
+	snapshot := make([]byte, reply.Size)
+	if _, err := io.ReadFull(pipe, snapshot); err != nil {
+		return nil, fmt.Errorf("reading the snapshot: %w", err)
+	}
+	return snapshot, nil
+}
+
+// Restore implements virtgpu.Renderer.Restore. The snapshot goes through a
+// pipe, whose read end the request carries.
+func (c *Client) Restore(snapshot []byte, sizes map[uint32]uint64) error {
+	r, w, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	// Only the renderer holds the read end once the request is sent, so the
+	// writer fails, rather than waits, if the renderer does not read.
+	rfd, err := unix.Dup(int(r.Fd()))
+	r.Close()
+	if err != nil {
+		w.Close()
+		return err
+	}
+	go func() {
+		w.Write(snapshot)
+		w.Close()
+	}()
+	m, _, err := c.call(gfxproto.MsgRestore, &gfxproto.Restore{Size: uint64(len(snapshot))}, nil, rfd)
+	unix.Close(rfd)
+	if err != nil {
+		return err
+	}
+	m.CloseFDs()
+	c.mu.Lock()
+	for id, size := range sizes {
+		c.sizes[id] = size
+	}
+	c.mu.Unlock()
+	return nil
 }
 
 // Close implements virtgpu.Renderer.Close.

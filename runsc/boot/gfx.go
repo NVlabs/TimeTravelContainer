@@ -70,6 +70,9 @@ func gfxRegisterDevices(info *containerInfo, vfsObj *vfs.VirtualFilesystem) erro
 	if err != nil {
 		return fmt.Errorf("connecting to the GPU renderers' broker: %w", err)
 	}
+	// Only renderers that record how to rebuild their Vulkan objects from
+	// their start can take snapshots.
+	broker.Snapshots = policy == virtgpu.ForkSnapshot
 	if err := virtgpu.Register(vfsObj, virtgpu.Options{
 		Capsets:     capsets,
 		NewRenderer: broker.NewRenderer,

@@ -194,8 +194,18 @@ type device struct {
 
 	// renderer is the device's renderer, or nil if the device has not
 	// started one. It is protected by submitMu. It is not saved: what it held
-	// is lost to a load.
+	// is lost to a load, unless snapshot saves it.
 	renderer Renderer `state:"nosave"`
+
+	// snapshot is, with ForkSnapshot, a snapshot of the renderer of
+	// generation gen: during a save, the one that the save's preparation
+	// took; in a loaded device, the one that its next renderer restores, and
+	// with it the contexts and resources of generation gen. It is protected
+	// by submitMu.
+	snapshot []byte
+	// snapshotTaken is whether the save's preparation took snapshot, which
+	// the source drops once the save is done.
+	snapshotTaken bool `state:"nosave"`
 
 	// mu protects the fields below, and the state of the device's contexts,
 	// resources, and fences that their comments say it protects.
@@ -240,6 +250,13 @@ func (d *device) afterLoad(ctx goContext.Context) {
 		d.newRenderer = f
 	} else if f := processNewRenderer.Load(); f != nil {
 		d.newRenderer = *f
+	}
+	if d.snapshot != nil {
+		// The next renderer restores the snapshot, and with it the contexts
+		// and resources of generation gen. No fence was pending when the
+		// snapshot was taken.
+		d.lost = false
+		return
 	}
 	d.gen++
 	d.lost = false
@@ -319,6 +336,17 @@ func (d *device) rendererLocked(gen uint64) (Renderer, error) {
 	if gen != cur || lost {
 		return nil, linuxerr.ENODEV
 	}
+	if d.renderer == nil && d.snapshot != nil {
+		// A load left the snapshot of generation gen for the next renderer.
+		started, err := d.startRendererLocked()
+		if err != nil {
+			return nil, err
+		}
+		if started != gen {
+			// The restore failed.
+			return nil, linuxerr.ENODEV
+		}
+	}
 	if d.renderer == nil {
 		return nil, linuxerr.ENODEV
 	}
@@ -351,6 +379,9 @@ func (d *device) startRendererLocked() (uint64, error) {
 		d.mu.Unlock()
 	}
 	r, err := d.newRenderer(&rendererEvents{dev: d, gen: gen})
+	if err == nil && d.snapshot != nil {
+		r, gen, err = d.restoreLocked(r, gen)
+	}
 	if err != nil {
 		log.Warningf("virtgpu: starting a renderer: %v", err)
 		return 0, linuxerr.ENODEV
@@ -367,11 +398,14 @@ func (d *device) startRendererLocked() (uint64, error) {
 func (d *device) closeIdleRenderer() {
 	d.submitMu.Lock()
 	defer d.submitMu.Unlock()
-	if d.renderer == nil {
-		return
-	}
 	d.mu.Lock()
 	if d.contexts != 0 || d.genResources != 0 {
+		d.mu.Unlock()
+		return
+	}
+	// Nothing needs a snapshot that a load left, either.
+	d.snapshot = nil
+	if d.renderer == nil {
 		d.mu.Unlock()
 		return
 	}
@@ -531,7 +565,7 @@ func (d *device) allocResourceIDLocked() (uint32, error) {
 // it is in use.
 func (d *device) validateLiveFork() error {
 	switch d.forkPolicy {
-	case ForkDeviceLost:
+	case ForkDeviceLost, ForkSnapshot:
 		return nil
 	case ForkIneligible:
 		return fmt.Errorf("the virtual GPU is in use, and its fork semantics are %s (see --gfx-fork)", d.forkPolicy)
