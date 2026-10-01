@@ -132,6 +132,15 @@ func (m *Manager) Capability() Capability {
 	return m.capability
 }
 
+// probedCapabilities are the capabilities probeCapability found, by volume
+// store: a probe writes, syncs and clones files, and commands open a Manager
+// several times each. One is found again only once its store is on another
+// filesystem.
+var probedCapabilities struct {
+	mu     sync.Mutex
+	byRoot map[string]Capability
+}
+
 func probeCapability(root string) (Capability, error) {
 	var statfs unix.Statfs_t
 	if err := unix.Statfs(root, &statfs); err != nil {
@@ -145,7 +154,25 @@ func probeCapability(root string) (Capability, error) {
 	if !ok {
 		return Capability{}, errors.New("volume backing filesystem has unsupported stat data")
 	}
-	capability := Capability{Mode: CopyModeReflink, FilesystemType: int64(statfs.Type), Device: uint64(stat.Dev)}
+	probedCapabilities.mu.Lock()
+	defer probedCapabilities.mu.Unlock()
+	if probed, ok := probedCapabilities.byRoot[root]; ok && probed.FilesystemType == int64(statfs.Type) && probed.Device == uint64(stat.Dev) {
+		return probed, nil
+	}
+	capability, err := probeCopyMode(root, Capability{Mode: CopyModeReflink, FilesystemType: int64(statfs.Type), Device: uint64(stat.Dev)})
+	if err != nil {
+		return Capability{}, err
+	}
+	if probedCapabilities.byRoot == nil {
+		probedCapabilities.byRoot = make(map[string]Capability)
+	}
+	probedCapabilities.byRoot[root] = capability
+	return capability, nil
+}
+
+// probeCopyMode returns capability, with the whole-file copy mode if root's
+// filesystem cannot clone a file.
+func probeCopyMode(root string, capability Capability) (Capability, error) {
 	probeDir := filepath.Join(root, ".probe")
 	if err := os.MkdirAll(probeDir, 0700); err != nil {
 		return Capability{}, err
