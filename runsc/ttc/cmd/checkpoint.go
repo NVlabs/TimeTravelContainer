@@ -284,15 +284,18 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest, output io.Writer)
 		return err
 	}
 	// The branch's memory streams into the archive as it is captured; the
-	// rest of the checkpoint is staged, and packed after it. An archive
-	// streamed to the client is its to keep: the daemon's copy is not made
-	// durable.
-	stream := request.destination == "-"
-	archiveDir := filepath.Dir(stage)
-	if !stream {
-		archiveDir = filepath.Dir(request.destination)
+	// rest of the checkpoint is staged, and packed after it. An archive for
+	// the client is its to keep: it is written into the file the client
+	// passed, or else streamed from a copy the daemon does not make durable.
+	var archive *ttccheckpoint.Archive
+	switch {
+	case request.destination != "-":
+		archive, err = ttccheckpoint.CreateArchive(filepath.Dir(request.destination))
+	case b.archiveFile != nil:
+		archive = ttccheckpoint.WriteArchive(b.archiveFile)
+	default:
+		archive, err = ttccheckpoint.CreateArchive(filepath.Dir(stage))
 	}
-	archive, err := ttccheckpoint.CreateArchive(archiveDir)
 	if err != nil {
 		return err
 	}
@@ -339,11 +342,15 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest, output io.Writer)
 		if err := archive.Finish(stage); err != nil {
 			return err
 		}
-		if stream {
+		switch {
+		case request.destination != "-":
+			return archive.Publish(request.destination)
+		case b.archiveFile != nil:
+			return nil
+		default:
 			_, err := io.Copy(output, archive.Contents())
 			return err
 		}
-		return archive.Publish(request.destination)
 	})
 }
 
@@ -726,10 +733,11 @@ func (b *runtimeBackend) restoreCheckpoint(source, name string) (id string, retE
 	defer os.RemoveAll(stageBase)
 	stage := filepath.Join(stageBase, "checkpoint")
 	// The memory, most of a checkpoint, is not unpacked, but imported from
-	// the archive.
+	// the archive: the file the client passed, or else the one it names, or
+	// the one its stream is received into.
 	var archive *os.File
 	defer func() {
-		if archive != nil {
+		if archive != nil && archive != b.archiveFile {
 			_ = archive.Close()
 		}
 	}()
@@ -739,21 +747,22 @@ func (b *runtimeBackend) restoreCheckpoint(source, name string) (id string, retE
 	// and one that names the family to be is refused.
 	if err := b.withoutLifecycleLock(ttcbundle.ContainerInfo{ID: "restore:" + stageBase, Name: name}, longOperation{state: "restoring", shown: true}, func() error {
 		var err error
-		if source == "-" {
-			if b.stdin == nil {
-				return errors.New("checkpoint restore from '-' requires standard input")
+		switch {
+		case source != "-":
+			if archive, err = os.Open(source); err != nil {
+				return err
 			}
+		case b.archiveFile != nil:
+			archive = b.archiveFile
+		case b.stdin == nil:
+			return errors.New("checkpoint restore from '-' requires standard input")
+		default:
 			if archive, err = os.OpenFile(filepath.Join(stageBase, "input.ttc"), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600); err != nil {
 				return err
 			}
 			if _, err := io.Copy(archive, b.stdin); err != nil {
 				return fmt.Errorf("receiving checkpoint archive: %w", err)
 			}
-			if _, err := archive.Seek(0, io.SeekStart); err != nil {
-				return err
-			}
-		} else if archive, err = os.Open(source); err != nil {
-			return err
 		}
 		sections, err := ttccheckpoint.Unpack(archive, stage, checkpointMemoryMember)
 		if err != nil {

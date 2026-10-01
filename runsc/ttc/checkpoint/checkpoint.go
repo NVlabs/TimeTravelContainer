@@ -169,25 +169,35 @@ const blockSize = 512
 
 // Archive is a checkpoint archive being written: first the members whose
 // content is streamed, each as it is made, then, by Finish, the other entries
-// of a staging tree, as Pack writes them. Once finished, it is published, or
-// read and discarded.
+// of a staging tree, as Pack writes them. Once finished, a temporary archive
+// is published, or read and discarded.
 type Archive struct {
-	temp *os.File
+	file *os.File
+	// temporary is set if the archive created file, which it removes unless
+	// it is published.
+	temporary bool
 	// end is where the next member begins, and once the archive is
 	// finished, its size.
 	end       int64
 	streamed  map[string]struct{}
+	finished  bool
 	published bool
 }
 
-// CreateArchive begins an archive in dir, which Publish can make a file of
-// dir.
+// CreateArchive begins a temporary archive in dir, which Publish can make a
+// file of dir.
 func CreateArchive(dir string) (*Archive, error) {
-	temp, err := os.CreateTemp(dir, ".ttc-checkpoint-*")
+	file, err := os.CreateTemp(dir, ".ttc-checkpoint-*")
 	if err != nil {
 		return nil, err
 	}
-	return &Archive{temp: temp, streamed: make(map[string]struct{})}, nil
+	return &Archive{file: file, temporary: true, streamed: make(map[string]struct{})}, nil
+}
+
+// WriteArchive begins an archive in file, an empty regular file its caller
+// keeps, which Abort empties again unless the archive was finished.
+func WriteArchive(file *os.File) *Archive {
+	return &Archive{file: file, streamed: make(map[string]struct{})}
 }
 
 // Stream writes name, a regular file of mode, whose content write writes to
@@ -202,13 +212,13 @@ func (a *Archive) Stream(name string, mode fs.FileMode, write func(*os.File) err
 		return fmt.Errorf("duplicate checkpoint archive path %q", name)
 	}
 	start := a.end + blockSize
-	if _, err := a.temp.Seek(start, io.SeekStart); err != nil {
+	if _, err := a.file.Seek(start, io.SeekStart); err != nil {
 		return err
 	}
-	if err := write(a.temp); err != nil {
+	if err := write(a.file); err != nil {
 		return err
 	}
-	end, err := a.temp.Seek(0, io.SeekCurrent)
+	end, err := a.file.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return err
 	}
@@ -217,11 +227,11 @@ func (a *Archive) Stream(name string, mode fs.FileMode, write func(*os.File) err
 	if err != nil {
 		return err
 	}
-	if _, err := a.temp.WriteAt(header, a.end); err != nil {
+	if _, err := a.file.WriteAt(header, a.end); err != nil {
 		return err
 	}
 	padding := (blockSize - size%blockSize) % blockSize
-	if _, err := a.temp.WriteAt(make([]byte, padding), end); err != nil {
+	if _, err := a.file.WriteAt(make([]byte, padding), end); err != nil {
 		return err
 	}
 	a.end = end + padding
@@ -245,22 +255,27 @@ func streamedHeader(name string, mode fs.FileMode, size int64) ([]byte, error) {
 	return header.Bytes(), nil
 }
 
-// Abort removes the archive, unless it was published.
+// Abort removes a temporary archive, unless it was published, and empties its
+// caller's file, unless the archive was finished.
 func (a *Archive) Abort() {
-	if a.published {
-		return
+	switch {
+	case !a.temporary:
+		if !a.finished {
+			_ = a.file.Truncate(0)
+		}
+	case !a.published:
+		_ = a.file.Close()
+		_ = os.Remove(a.file.Name())
 	}
-	_ = a.temp.Close()
-	_ = os.Remove(a.temp.Name())
 }
 
 // Finish writes the entries of the staging tree at root that were not
 // streamed, as Pack does, and ends the archive.
 func (a *Archive) Finish(root string) error {
-	if _, err := a.temp.Seek(a.end, io.SeekStart); err != nil {
+	if _, err := a.file.Seek(a.end, io.SeekStart); err != nil {
 		return err
 	}
-	writer := tar.NewWriter(a.temp)
+	writer := tar.NewWriter(a.file)
 	type packReadResult struct {
 		data []byte
 		err  error
@@ -412,37 +427,41 @@ func (a *Archive) Finish(root string) error {
 	if err := writer.Close(); err != nil {
 		return err
 	}
-	end, err := a.temp.Seek(0, io.SeekCurrent)
+	end, err := a.file.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return err
 	}
 	a.end = end
+	a.finished = true
 	return nil
 }
 
 // Contents returns the finished archive, to be read from its start.
 func (a *Archive) Contents() io.Reader {
-	return io.NewSectionReader(a.temp, 0, a.end)
+	return io.NewSectionReader(a.file, 0, a.end)
 }
 
-// Publish makes the finished archive destination, durably, unless destination
-// exists.
+// Publish makes the finished temporary archive destination, durably, unless
+// destination exists.
 func (a *Archive) Publish(destination string) error {
+	if !a.temporary {
+		return errors.New("only a temporary checkpoint archive is published")
+	}
 	if _, err := os.Lstat(destination); err == nil {
 		return fmt.Errorf("checkpoint destination %q already exists", destination)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if err := a.temp.Sync(); err != nil {
+	if err := a.file.Sync(); err != nil {
 		return err
 	}
-	if err := a.temp.Close(); err != nil {
+	if err := a.file.Close(); err != nil {
 		return err
 	}
-	if err := os.Link(a.temp.Name(), destination); err != nil {
+	if err := os.Link(a.file.Name(), destination); err != nil {
 		return fmt.Errorf("publishing checkpoint: %w", err)
 	}
-	if err := os.Remove(a.temp.Name()); err != nil {
+	if err := os.Remove(a.file.Name()); err != nil {
 		_ = os.Remove(destination)
 		return err
 	}
@@ -456,10 +475,10 @@ type Section struct {
 	Offset, Size int64
 }
 
-// Unpack extracts the TTC checkpoint archive into an empty destination, but
-// for the regular files named in leave, which it leaves in the archive, and
-// returns the sections of. It accepts safe symbolic links and rejects hard
-// links, special files, duplicate paths, and traversal.
+// Unpack extracts the TTC checkpoint archive, a regular file, into an empty
+// destination, but for the regular files named in leave, which it leaves in
+// the archive, and returns the sections of. It accepts safe symbolic links
+// and rejects hard links, special files, duplicate paths, and traversal.
 func Unpack(archive *os.File, destination string, leave ...string) (map[string]Section, error) {
 	if err := os.Mkdir(destination, 0700); err != nil {
 		return nil, err
@@ -470,7 +489,14 @@ func Unpack(archive *os.File, destination string, leave ...string) (map[string]S
 			_ = os.RemoveAll(destination)
 		}
 	}()
-	reader := tar.NewReader(archive)
+	info, err := archive.Stat()
+	if err != nil {
+		return nil, err
+	}
+	// The archive is read by offset: what reads it before, or after, does not
+	// move where this reads.
+	contents := io.NewSectionReader(archive, 0, info.Size())
+	reader := tar.NewReader(contents)
 	sections := make(map[string]Section, len(leave))
 	seen := make(map[string]struct{})
 	type archivedSymlink struct {
@@ -511,7 +537,7 @@ func Unpack(archive *os.File, destination string, leave ...string) (map[string]S
 			if slices.Contains(leave, header.Name) {
 				// tar reads no further than a header: the member's content
 				// begins where the archive is read to.
-				offset, err := archive.Seek(0, io.SeekCurrent)
+				offset, err := contents.Seek(0, io.SeekCurrent)
 				if err != nil {
 					return nil, err
 				}

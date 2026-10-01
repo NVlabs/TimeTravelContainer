@@ -178,6 +178,10 @@ type daemonRequest struct {
 	StderrWidth    int      `json:"stderr_width,omitempty"`
 	Args           []string `json:"args,omitempty"`
 	Stdin          bool     `json:"stdin,omitempty"`
+	// ArchiveFile says the client passed, with the header, the regular file
+	// a checkpoint is written into or a restore reads, which it would
+	// otherwise stream as its operand "-".
+	ArchiveFile bool `json:"archive_file,omitempty"`
 	// TerminalControl keeps the daemon stream full-duplex for terminal-size
 	// requests even when guest stdin is detached. This is distinct from Stdin:
 	// `exec -td` needs resize frames, but must not attach the client's input.
@@ -5721,6 +5725,108 @@ func serveControlOnlyDaemon(socket, sharedRoot string, control *controlOnlyClust
 	}
 }
 
+// readDaemonRequestHeader reads a request's header line from conn, and the
+// files the client passed with it, which come with its first bytes.
+func readDaemonRequestHeader(conn net.Conn) (*bufio.Reader, string, []*os.File, error) {
+	unixConn, ok := conn.(*net.UnixConn)
+	if !ok {
+		reader := bufio.NewReader(conn)
+		header, err := reader.ReadString('\n')
+		return reader, header, nil, err
+	}
+	first := make([]byte, 4096)
+	// Room for one file: the kernel closes any more, and says so.
+	oob := make([]byte, unix.CmsgSpace(4))
+	n, oobn, flags, _, err := unixConn.ReadMsgUnix(first, oob)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	var files []*os.File
+	if oobn != 0 {
+		messages, err := unix.ParseSocketControlMessage(oob[:oobn])
+		if err != nil {
+			return nil, "", nil, err
+		}
+		for index := range messages {
+			fds, err := unix.ParseUnixRights(&messages[index])
+			if err != nil {
+				continue
+			}
+			for _, fd := range fds {
+				files = append(files, os.NewFile(uintptr(fd), "client-archive"))
+			}
+		}
+	}
+	if flags&unix.MSG_CTRUNC != 0 {
+		return nil, "", files, errors.New("the client passed more files than a request takes")
+	}
+	reader := bufio.NewReader(io.MultiReader(bytes.NewReader(first[:n]), conn))
+	header, err := reader.ReadString('\n')
+	return reader, header, files, err
+}
+
+// daemonRequestArchiveFile returns the archive file a request passed: one
+// regular file, for a checkpoint or a restore that says it passes one, and
+// none otherwise.
+func daemonRequestArchiveFile(request daemonRequest, files []*os.File) (*os.File, error) {
+	if !request.ArchiveFile {
+		if len(files) != 0 {
+			return nil, errors.New("the request passed a file it does not name")
+		}
+		return nil, nil
+	}
+	if request.Action != "command" || len(request.Args) == 0 || (request.Args[0] != "checkpoint" && request.Args[0] != "restore") {
+		return nil, errors.New("only a checkpoint or a restore passes an archive file")
+	}
+	if len(files) != 1 {
+		return nil, fmt.Errorf("the request passed %d files, not its archive", len(files))
+	}
+	info, err := files[0].Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("the request's archive is not a regular file")
+	}
+	return files[0], nil
+}
+
+// proxyDaemonArchiveFile runs on peer a request that passed its archive file,
+// streaming the archive, which a peer cannot be passed: a restore's is read
+// from the file as the command's input, and a checkpoint's written to it from
+// the command's output, and emptied again if the checkpoint fails. The client
+// hears the rest of what the peer says.
+func proxyDaemonArchiveFile(peer *cluster.Client, request daemonRequest, archive *os.File, conn net.Conn, writeMu *sync.Mutex) error {
+	request.ArchiveFile = false
+	var stdin io.Reader = strings.NewReader("")
+	var stdout io.Writer = io.NewOffsetWriter(archive, 0)
+	if request.Args[0] == "restore" {
+		info, err := archive.Stat()
+		if err != nil {
+			return err
+		}
+		request.Stdin = true
+		stdin = io.NewSectionReader(archive, 0, info.Size())
+		stdout = daemonFrameWriter{conn: conn, mu: writeMu, typ: daemonFrameStdout}
+	}
+	local, remote := net.Pipe()
+	proxied := make(chan error, 1)
+	go func() {
+		proxied <- peer.ProxyDaemon(context.Background(), remote, remote)
+		_ = remote.Close()
+	}()
+	status, err := exchangeDaemon(local, request, stdin, stdout, daemonFrameWriter{conn: conn, mu: writeMu, typ: daemonFrameStderr})
+	_ = local.Close()
+	proxyErr := <-proxied
+	if request.Args[0] == "checkpoint" && (err != nil || status != 0) {
+		err = errors.Join(err, archive.Truncate(0))
+	}
+	if err != nil {
+		return errors.Join(err, proxyErr)
+	}
+	return writeDaemonStatus(conn, writeMu, status)
+}
+
 func (s *controlOnlyDaemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	defer conn.Close()
 	if err := checkDaemonPeer(conn); err != nil {
@@ -5729,8 +5835,12 @@ func (s *controlOnlyDaemonServer) handle(conn net.Conn, serverErrors io.Writer) 
 		}
 		return
 	}
-	reader := bufio.NewReader(conn)
-	header, err := reader.ReadString('\n')
+	reader, header, files, err := readDaemonRequestHeader(conn)
+	defer func() {
+		for _, file := range files {
+			_ = file.Close()
+		}
+	}()
 	if err != nil {
 		return
 	}
@@ -5742,6 +5852,11 @@ func (s *controlOnlyDaemonServer) handle(conn net.Conn, serverErrors io.Writer) 
 	writeError := func(err error) {
 		_ = writeDaemonFrame(conn, &writeMu, daemonFrameStderr, []byte("ttcd: "+err.Error()+"\n"))
 		_ = writeDaemonStatus(conn, &writeMu, 1)
+	}
+	archiveFile, err := daemonRequestArchiveFile(request, files)
+	if err != nil {
+		writeError(err)
+		return
 	}
 	if request.Action != "stop" && request.Version != daemonAPIVersion {
 		writeError(fmt.Errorf("unsupported API version %d (server uses %d)", request.Version, daemonAPIVersion))
@@ -5867,6 +5982,13 @@ func (s *controlOnlyDaemonServer) handle(conn net.Conn, serverErrors io.Writer) 
 		if err := proxyDistributedCopyDownload(context.Background(), client, s.localRoot, request, copyRoute, conn, &writeMu); err != nil {
 			s.cluster.active.Add(1)
 			writeError(fmt.Errorf("proxying distributed cp through compute seed %s: %w", peer.url, err))
+		}
+		return
+	}
+	if archiveFile != nil {
+		if err := proxyDaemonArchiveFile(client, request, archiveFile, conn, &writeMu); err != nil {
+			s.cluster.active.Add(1)
+			writeError(fmt.Errorf("proxying through compute seed %s: %w", peer.url, err))
 		}
 		return
 	}
@@ -6961,8 +7083,12 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		}
 		return
 	}
-	reader := bufio.NewReader(conn)
-	header, err := reader.ReadString('\n')
+	reader, header, files, err := readDaemonRequestHeader(conn)
+	defer func() {
+		for _, file := range files {
+			_ = file.Close()
+		}
+	}()
 	if err != nil {
 		return
 	}
@@ -6974,6 +7100,11 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	writeError := func(err error) {
 		_ = writeDaemonFrame(conn, &writeMu, daemonFrameStderr, []byte("ttcd: "+err.Error()+"\n"))
 		_ = writeDaemonStatus(conn, &writeMu, 1)
+	}
+	archiveFile, err := daemonRequestArchiveFile(request, files)
+	if err != nil {
+		writeError(err)
+		return
 	}
 	// Stop is deliberately a minimal, stable escape hatch. In particular, a
 	// newly installed client must be able to stop an older daemon before
@@ -7267,6 +7398,12 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			}
 			proxiedRequest := request
 			proxiedRequest.Route = append(append([]string(nil), request.Route...), s.clusterCapabilities.NodeID)
+			if archiveFile != nil {
+				if err := proxyDaemonArchiveFile(peer, proxiedRequest, archiveFile, conn, &writeMu); err != nil {
+					writeError(fmt.Errorf("proxying command to node %q: %w", owner, err))
+				}
+				return
+			}
 			copyRoute, copyCommand, err := parseDistributedCopyRoute(proxiedRequest.Args)
 			if err != nil {
 				writeError(err)
@@ -7386,6 +7523,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStdout},
 		daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStderr})
 	s.configureCommandBackend(backend)
+	backend.archiveFile = archiveFile
 	backend.clientTERM = request.ClientTERM
 	backend.progressTerminal = request.StderrTerminal
 	backend.progressWidth = request.StderrWidth
@@ -7568,6 +7706,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		s.configureVolumeBackend(mutationBackend)
 		mutationBackend.lifecycleLockHeld = holdsLifecycleLock
 		mutationBackend.clientGone = backend.clientGone
+		mutationBackend.archiveFile = backend.archiveFile
 		mutationBackend.heldFamilies = families
 		mutationBackend.resolvedFamilies = backend.resolvedFamilies
 		mutationBackend.mutating = backend.mutating

@@ -66,6 +66,7 @@ type request struct {
 	StderrWidth     int      `json:"stderr_width,omitempty"`
 	Args            []string `json:"args,omitempty"`
 	Stdin           bool     `json:"stdin,omitempty"`
+	ArchiveFile     bool     `json:"archive_file,omitempty"`
 	TerminalControl bool     `json:"terminal_control,omitempty"`
 	ManageStop      bool     `json:"manage_stop,omitempty"`
 }
@@ -126,7 +127,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ttc: %v\n", err)
 		return 2
 	}
-	args, stdin, stdout, closeCheckpoint, err := prepareCheckpointArchiveIO(args, stdin, stdout)
+	args, stdin, stdout, archive, closeCheckpoint, err := prepareCheckpointArchiveIO(args, stdin, stdout)
 	if err != nil {
 		_ = closeArchive()
 		fmt.Fprintf(stderr, "ttc: %v\n", err)
@@ -140,7 +141,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ttc: %v\n", err)
 		return 2
 	}
-	status, err := runCommand(opts.socket, args, stdin, stdout, stderr)
+	status, err := runCommand(opts.socket, args, stdin, stdout, stderr, archive)
 	closeErr := errors.Join(closeCheckpoint(), closeArchive())
 	if err != nil {
 		fmt.Fprintf(stderr, "ttc: daemon transport: %v\n", err)
@@ -154,41 +155,55 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 }
 
 // prepareCheckpointArchiveIO keeps checkpoint and restore operands on the
-// client host. The daemon always streams the archive as standard output/input,
-// which is essential when a login-node client routes work to a compute node
-// with an unrelated filesystem namespace.
-func prepareCheckpointArchiveIO(args []string, stdin io.Reader, stdout io.Writer) ([]string, io.Reader, io.Writer, func() error, error) {
+// client host: the daemon never opens a client's path, which is essential when
+// a login-node client routes work to a compute node with an unrelated
+// filesystem namespace. A regular file is opened here and passed to the
+// daemon, which writes or reads it in place, and streams it on to a node it
+// routes the command to; anything else is streamed as standard output/input.
+func prepareCheckpointArchiveIO(args []string, stdin io.Reader, stdout io.Writer) ([]string, io.Reader, io.Writer, *os.File, func() error, error) {
 	result := append([]string(nil), args...)
 	closeArchive := func() error { return nil }
 	if len(result) == 0 {
-		return result, stdin, stdout, closeArchive, nil
+		return result, stdin, stdout, nil, closeArchive, nil
 	}
 	switch result[0] {
 	case "checkpoint":
 		if len(result) < 3 || result[len(result)-1] == "-" {
-			return result, stdin, stdout, closeArchive, nil
+			return result, stdin, stdout, nil, closeArchive, nil
 		}
 		path := result[len(result)-1]
 		file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 		if err != nil {
-			return nil, stdin, stdout, closeArchive, fmt.Errorf("opening checkpoint output: %w", err)
+			return nil, stdin, stdout, nil, closeArchive, fmt.Errorf("opening checkpoint output: %w", err)
 		}
 		result[len(result)-1] = "-"
-		return result, stdin, file, file.Close, nil
+		if regularFile(file) {
+			return result, stdin, stdout, file, file.Close, nil
+		}
+		return result, stdin, file, nil, file.Close, nil
 	case "restore":
 		if len(result) < 2 || result[len(result)-1] == "-" {
-			return result, stdin, stdout, closeArchive, nil
+			return result, stdin, stdout, nil, closeArchive, nil
 		}
 		path := result[len(result)-1]
 		file, err := os.Open(path)
 		if err != nil {
-			return nil, stdin, stdout, closeArchive, fmt.Errorf("opening checkpoint input: %w", err)
+			return nil, stdin, stdout, nil, closeArchive, fmt.Errorf("opening checkpoint input: %w", err)
 		}
 		result[len(result)-1] = "-"
-		return result, file, stdout, file.Close, nil
+		if regularFile(file) {
+			return result, stdin, stdout, file, file.Close, nil
+		}
+		return result, file, stdout, nil, file.Close, nil
 	default:
-		return result, stdin, stdout, closeArchive, nil
+		return result, stdin, stdout, nil, closeArchive, nil
 	}
+}
+
+// regularFile reports whether file is a regular file.
+func regularFile(file *os.File) bool {
+	info, err := file.Stat()
+	return err == nil && info.Mode().IsRegular()
 }
 
 // prepareImageArchiveIO implements Docker's client-local -i/-o semantics.
@@ -790,10 +805,12 @@ func printHelpTopic(topic []string, stdout io.Writer) {
 	fmt.Fprintf(stdout, "Usage: ttc %s [OPTIONS]\n", key)
 }
 
-func runCommand(socket string, args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+// runCommand runs a command on the daemon at socket, passing it archive, a
+// checkpoint's or a restore's, if not nil.
+func runCommand(socket string, args []string, stdin io.Reader, stdout, stderr io.Writer, archive *os.File) (int, error) {
 	terminal, width := terminalWriterInfo(stderr)
 	req := request{Version: daemonAPIVersion, ClientBuildID: version.Version(), Action: "command", Args: args,
-		Stdin: commandUsesStdin(args), TerminalControl: protocol.CommandUsesTerminalControl(args), ClientTERM: os.Getenv("TERM"), StderrTerminal: terminal, StderrWidth: width}
+		Stdin: commandUsesStdin(args) && archive == nil, ArchiveFile: archive != nil, TerminalControl: protocol.CommandUsesTerminalControl(args), ClientTERM: os.Getenv("TERM"), StderrTerminal: terminal, StderrWidth: width}
 	if commandCanRetry(args) && !req.Stdin {
 		id, err := newRequestID()
 		if err != nil {
@@ -816,7 +833,7 @@ func runCommand(socket string, args []string, stdin io.Reader, stdout, stderr io
 		if req.RequestID != "" {
 			out, errOut = &bufferedOut, &bufferedErr
 		}
-		status, err := exchange(conn, req, stdin, out, errOut)
+		status, err := exchange(conn, req, stdin, out, errOut, archive)
 		conn.Close()
 		if err != nil {
 			lastErr = err
@@ -840,7 +857,7 @@ func runDaemon(opts options, args []string, stdout, stderr io.Writer) int {
 	case "start":
 		if conn, err := net.DialTimeout("unix", opts.socket, 150*time.Millisecond); err == nil {
 			_ = conn.SetDeadline(time.Now().Add(time.Second))
-			status, exchangeErr := exchange(conn, request{Version: daemonAPIVersion, ClientBuildID: version.Version(), Action: "ping"}, strings.NewReader(""), io.Discard, stderr)
+			status, exchangeErr := exchange(conn, request{Version: daemonAPIVersion, ClientBuildID: version.Version(), Action: "ping"}, strings.NewReader(""), io.Discard, stderr, nil)
 			conn.Close()
 			if exchangeErr != nil {
 				fmt.Fprintf(stderr, "ttc: checking running daemon: %v\n", exchangeErr)
@@ -912,7 +929,7 @@ func exchangeControlCapture(socket string, req request) (int, []byte, []byte, er
 	}
 	defer conn.Close()
 	var stdout, stderr bytes.Buffer
-	status, err := exchange(conn, req, strings.NewReader(""), &stdout, &stderr)
+	status, err := exchange(conn, req, strings.NewReader(""), &stdout, &stderr, nil)
 	return status, stdout.Bytes(), stderr.Bytes(), err
 }
 
@@ -941,7 +958,7 @@ func exchangeControl(socket string, req request, stdout, stderr io.Writer) int {
 		return 1
 	}
 	defer conn.Close()
-	status, err := exchange(conn, req, strings.NewReader(""), stdout, stderr)
+	status, err := exchange(conn, req, strings.NewReader(""), stdout, stderr, nil)
 	if err != nil {
 		fmt.Fprintf(stderr, "ttc: %v\n", err)
 		return 1
@@ -996,7 +1013,7 @@ func startDaemon(socket string, args []string, stdout, stderr io.Writer) error {
 		}
 		defer conn.Close()
 		_ = conn.SetDeadline(time.Now().Add(250 * time.Millisecond))
-		status, err := exchange(conn, request{Version: daemonAPIVersion, ClientBuildID: version.Version(), Action: "ping"}, strings.NewReader(""), io.Discard, io.Discard)
+		status, err := exchange(conn, request{Version: daemonAPIVersion, ClientBuildID: version.Version(), Action: "ping"}, strings.NewReader(""), io.Discard, io.Discard, nil)
 		return err == nil && status == 0
 	}
 	deadline := time.Now().Add(daemonStartTimeout)
@@ -1055,13 +1072,27 @@ func connect(socket string) (net.Conn, error) {
 	return conn, nil
 }
 
-func exchange(conn net.Conn, req request, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+// exchange sends req on conn, with archive, if not nil, passed with its
+// header, and relays the daemon's frames until its status.
+func exchange(conn net.Conn, req request, stdin io.Reader, stdout, stderr io.Writer, archive *os.File) (int, error) {
 	header, err := json.Marshal(req)
 	if err != nil {
 		return 1, err
 	}
 	header = append(header, '\n')
 	var writeMu sync.Mutex
+	if archive != nil {
+		unixConn, ok := conn.(*net.UnixConn)
+		if !ok {
+			return 1, fmt.Errorf("cannot pass a file over %T", conn)
+		}
+		// The file goes with the header's first bytes.
+		n, _, err := unixConn.WriteMsgUnix(header, syscall.UnixRights(int(archive.Fd())), nil)
+		if err != nil {
+			return 1, err
+		}
+		header = header[n:]
+	}
 	if err := writeBytes(conn, header); err != nil {
 		return 1, err
 	}

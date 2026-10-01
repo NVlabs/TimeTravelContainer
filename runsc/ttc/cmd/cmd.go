@@ -6347,6 +6347,10 @@ type runtimeBackend struct {
 	clientCanceled        <-chan struct{}
 	// clientGone is closed once the client's connection breaks.
 	clientGone <-chan struct{}
+	// archiveFile, if not nil, is the archive the client passed with its
+	// request, a regular file: a checkpoint is written into it, and a
+	// restore reads it, where either would stream it, as "-".
+	archiveFile *os.File
 	// lockLifecycle serializes background lifecycle completion with foreground
 	// commands and periodic repository maintenance. Long-running transfer and
 	// peer polling stay outside this lock; only the terminal mutation that

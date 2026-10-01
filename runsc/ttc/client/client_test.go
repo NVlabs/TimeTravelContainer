@@ -263,7 +263,7 @@ func TestDetachedTTYRequestKeepsTerminalControlStreamOpen(t *testing.T) {
 		var writeMu sync.Mutex
 		serverErr <- writeFrame(conn, &writeMu, daemonFrameStatus, status[:])
 	}()
-	status, err := runCommand(socket, []string{"exec", "-td", "--session", "build", "demo@main", "sh"}, strings.NewReader(""), io.Discard, io.Discard)
+	status, err := runCommand(socket, []string{"exec", "-td", "--session", "build", "demo@main", "sh"}, strings.NewReader(""), io.Discard, io.Discard, nil)
 	if err != nil || status != 0 {
 		t.Fatalf("runCommand status=%d err=%v", status, err)
 	}
@@ -342,15 +342,21 @@ func TestPrepareImageArchiveIOUsesClientFiles(t *testing.T) {
 	}
 }
 
-func TestPrepareCheckpointArchiveIOUsesClientFiles(t *testing.T) {
+// A checkpoint's or a restore's regular file is opened by the client and
+// passed to the daemon.
+func TestPrepareCheckpointArchiveIOPassesRegularFiles(t *testing.T) {
 	dir := t.TempDir()
 	outputPath := filepath.Join(dir, "output.ttc")
-	args, input, output, closeArchive, err := prepareCheckpointArchiveIO(
-		[]string{"checkpoint", "demo@main", outputPath}, strings.NewReader("stdin"), io.Discard)
+	stdin := strings.NewReader("stdin")
+	args, input, output, archive, closeArchive, err := prepareCheckpointArchiveIO(
+		[]string{"checkpoint", "demo@main", outputPath}, stdin, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := io.WriteString(output, "checkpoint-output"); err != nil {
+	if archive == nil || input != stdin || output != io.Discard {
+		t.Fatalf("checkpoint archive=%v input=%v output=%v, want the file passed", archive, input, output)
+	}
+	if _, err := io.WriteString(archive, "checkpoint-output"); err != nil {
 		t.Fatal(err)
 	}
 	if err := closeArchive(); err != nil {
@@ -360,7 +366,7 @@ func TestPrepareCheckpointArchiveIOUsesClientFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(args, " "); got != "checkpoint demo@main -" || string(data) != "checkpoint-output" || input == nil {
+	if got := strings.Join(args, " "); got != "checkpoint demo@main -" || string(data) != "checkpoint-output" {
 		t.Fatalf("checkpoint args=%q data=%q", args, data)
 	}
 
@@ -368,20 +374,52 @@ func TestPrepareCheckpointArchiveIOUsesClientFiles(t *testing.T) {
 	if err := os.WriteFile(inputPath, []byte("checkpoint-input"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	args, input, output, closeArchive, err = prepareCheckpointArchiveIO(
-		[]string{"restore", "--node", "node-b", "--name", "copy", inputPath}, strings.NewReader("wrong"), io.Discard)
+	args, input, output, archive, closeArchive, err = prepareCheckpointArchiveIO(
+		[]string{"restore", "--node", "node-b", "--name", "copy", inputPath}, stdin, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, err = io.ReadAll(input)
+	if archive == nil || input != stdin || output != io.Discard {
+		t.Fatalf("restore archive=%v input=%v output=%v, want the file passed", archive, input, output)
+	}
+	data, err = io.ReadAll(archive)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := closeArchive(); err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(args, " "); got != "restore --node node-b --name copy -" || string(data) != "checkpoint-input" || output != io.Discard || !commandUsesStdin(args) {
-		t.Fatalf("restore args=%q data=%q stdin=%t", args, data, commandUsesStdin(args))
+	if got := strings.Join(args, " "); got != "restore --node node-b --name copy -" || string(data) != "checkpoint-input" {
+		t.Fatalf("restore args=%q data=%q", args, data)
+	}
+}
+
+// A checkpoint's or a restore's file that is not a regular file is streamed.
+func TestPrepareCheckpointArchiveIOStreamsOtherFiles(t *testing.T) {
+	args, input, output, archive, closeArchive, err := prepareCheckpointArchiveIO(
+		[]string{"checkpoint", "demo@main", os.DevNull}, strings.NewReader("stdin"), io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file, ok := output.(*os.File); !ok || file.Name() != os.DevNull || archive != nil || input == nil {
+		t.Fatalf("checkpoint output=%v archive=%v, want %s streamed", output, archive, os.DevNull)
+	}
+	if err := closeArchive(); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(args, " "); got != "checkpoint demo@main -" {
+		t.Fatalf("checkpoint args=%q", args)
+	}
+	args, input, output, archive, closeArchive, err = prepareCheckpointArchiveIO(
+		[]string{"restore", os.DevNull}, strings.NewReader("wrong"), io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file, ok := input.(*os.File); !ok || file.Name() != os.DevNull || archive != nil || output != io.Discard || !commandUsesStdin(args) {
+		t.Fatalf("restore input=%v archive=%v stdin=%t, want %s streamed", input, archive, commandUsesStdin(args), os.DevNull)
+	}
+	if err := closeArchive(); err != nil {
+		t.Fatal(err)
 	}
 }
 

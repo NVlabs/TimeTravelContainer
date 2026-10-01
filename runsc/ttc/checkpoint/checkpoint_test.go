@@ -248,6 +248,67 @@ func TestArchiveReadAndDiscarded(t *testing.T) {
 	}
 }
 
+// An archive written into its caller's file stays there once finished, and
+// Unpack reads it wherever the file's offset is; one that is not finished is
+// emptied by Abort.
+func TestWriteArchiveIntoACallersFile(t *testing.T) {
+	staging := t.TempDir()
+	if err := WriteManifest(staging, testManifest()); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Create(filepath.Join(t.TempDir(), "client.ttc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	unfinished := WriteArchive(file)
+	if err := unfinished.Stream("state/memory.stream", 0600, func(w *os.File) error {
+		_, err := w.Write([]byte("partial"))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	unfinished.Abort()
+	info, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("an unfinished archive left %d bytes in its caller's file", info.Size())
+	}
+	archive := WriteArchive(file)
+	memory := bytes.Repeat([]byte("page"), 3000)
+	if err := archive.Stream("state/memory.stream", 0600, func(w *os.File) error {
+		_, err := w.Write(memory)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := archive.Finish(staging); err != nil {
+		t.Fatal(err)
+	}
+	if err := archive.Publish(filepath.Join(t.TempDir(), "elsewhere.ttc")); err == nil {
+		t.Fatal("an archive in its caller's file was published")
+	}
+	archive.Abort()
+	if _, err := file.Seek(0, io.SeekEnd); err != nil {
+		t.Fatal(err)
+	}
+	extracted := filepath.Join(t.TempDir(), "extracted")
+	sections, err := Unpack(file, extracted, "state/memory.stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadManifest(extracted); err != nil {
+		t.Fatal(err)
+	}
+	section := sections["state/memory.stream"]
+	got := make([]byte, section.Size)
+	if _, err := file.ReadAt(got, section.Offset); err != nil || !bytes.Equal(got, memory) {
+		t.Fatalf("the section at %d holds %d bytes (%v), not the member's %d", section.Offset, len(got), err, len(memory))
+	}
+}
+
 // A streamed member's header records a size beyond 8 GiB in its one block.
 func TestStreamedHeaderRecordsLargeSizes(t *testing.T) {
 	const size = 10 << 30
