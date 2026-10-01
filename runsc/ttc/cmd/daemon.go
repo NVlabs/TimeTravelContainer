@@ -353,8 +353,9 @@ type daemonServer struct {
 	familyLocks   map[string]chan struct{}
 	mutationCount atomic.Uint64
 
-	eventMu  sync.Mutex
-	eventSeq uint64
+	eventMu    sync.Mutex
+	eventSeq   uint64
+	eventSyncs eventLogSyncer
 
 	stdinMu     sync.Mutex
 	stdinLeases map[string]*daemonStdinLease

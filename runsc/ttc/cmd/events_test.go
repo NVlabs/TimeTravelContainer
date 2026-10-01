@@ -188,6 +188,40 @@ func TestDaemonEventLogRotationIsBounded(t *testing.T) {
 	}
 }
 
+func TestEventLogSyncerSyncsEveryLogAndStops(t *testing.T) {
+	dir := t.TempDir()
+	written := filepath.Join(dir, "events.jsonl")
+	if err := os.WriteFile(written, []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var syncer eventLogSyncer
+	// A log that is gone by the time it is synced is skipped.
+	for _, path := range []string{written, filepath.Join(dir, "gone.jsonl"), written} {
+		syncer.syncSoon(path)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		syncer.mu.Lock()
+		idle := !syncer.running && len(syncer.pending) == 0
+		syncer.mu.Unlock()
+		if idle {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the syncer did not finish")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// It starts again for the next write.
+	syncer.syncSoon(written)
+	syncer.mu.Lock()
+	running := syncer.running
+	syncer.mu.Unlock()
+	if !running {
+		t.Error("the syncer did not start again")
+	}
+}
+
 func TestDaemonEventsReadRetainedGenerationsOldestFirst(t *testing.T) {
 	root := t.TempDir()
 	path := daemonEventsPath(root)
