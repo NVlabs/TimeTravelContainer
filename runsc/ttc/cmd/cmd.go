@@ -6348,8 +6348,9 @@ type runtimeBackend struct {
 	// clientGone is closed once the client's connection breaks.
 	clientGone <-chan struct{}
 	// archiveFile, if not nil, is the archive the client passed with its
-	// request, a regular file: a checkpoint is written into it, and a
-	// restore reads it, where either would stream it, as "-".
+	// request, a regular file: a checkpoint or an image save is written into
+	// it, and a restore or an image load reads it, where each would stream
+	// it.
 	archiveFile *os.File
 	// lockLifecycle serializes background lifecycle completion with foreground
 	// commands and periodic repository maintenance. Long-running transfer and
@@ -11694,7 +11695,16 @@ func (b *runtimeBackend) pull(reference, platform string, progress bool) (ttcima
 	return info, nil
 }
 
+// loadImages loads the images of archive, or else of the file the client
+// passed, or of its standard input.
 func (b *runtimeBackend) loadImages(archive io.Reader, platform string) ([]ttcimages.Info, error) {
+	if archive == nil && b.archiveFile != nil {
+		info, err := b.archiveFile.Stat()
+		if err != nil {
+			return nil, err
+		}
+		archive = io.NewSectionReader(b.archiveFile, 0, info.Size())
+	}
 	if archive == nil {
 		archive = b.stdin
 	}
@@ -11743,7 +11753,12 @@ func (b *runtimeBackend) loadImages(archive io.Reader, platform string) ([]ttcim
 	return infos, nil
 }
 
+// saveImages writes the images to archive, or to the file the client passed
+// in place of its stream.
 func (b *runtimeBackend) saveImages(archive io.Writer, identifiers []string, platform string) error {
+	if b.archiveFile != nil {
+		archive = io.NewOffsetWriter(b.archiveFile, 0)
+	}
 	// Exporting takes time in proportion to the images.
 	return b.withoutLifecycleLock(b.imageOperation(), longOperation{state: "saving"}, func() error {
 		return ttcimages.Save(context.Background(), ttcimages.SaveOptions{

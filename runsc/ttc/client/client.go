@@ -122,16 +122,19 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if args[0] == "daemon" {
 		return runDaemon(opts, args[1:], stdout, stderr)
 	}
-	args, stdin, stdout, closeArchive, err := prepareImageArchiveIO(args, stdin, stdout)
+	args, stdin, stdout, archive, closeArchive, err := prepareImageArchiveIO(args, stdin, stdout)
 	if err != nil {
 		fmt.Fprintf(stderr, "ttc: %v\n", err)
 		return 2
 	}
-	args, stdin, stdout, archive, closeCheckpoint, err := prepareCheckpointArchiveIO(args, stdin, stdout)
+	args, stdin, stdout, checkpoint, closeCheckpoint, err := prepareCheckpointArchiveIO(args, stdin, stdout)
 	if err != nil {
 		_ = closeArchive()
 		fmt.Fprintf(stderr, "ttc: %v\n", err)
 		return 2
+	}
+	if archive == nil {
+		archive = checkpoint
 	}
 	args = normalizeEnvironmentImports(args)
 	args, err = normalizeHostPaths(args)
@@ -207,10 +210,11 @@ func regularFile(file *os.File) bool {
 }
 
 // prepareImageArchiveIO implements Docker's client-local -i/-o semantics.
-// The daemon always consumes or produces a stream; it must never interpret a
-// CLI path in its own mount namespace, especially through a control-only
-// gateway whose filesystem differs from the user's login node.
-func prepareImageArchiveIO(args []string, stdin io.Reader, stdout io.Writer) ([]string, io.Reader, io.Writer, func() error, error) {
+// The daemon must never interpret a CLI path in its own mount namespace,
+// especially through a control-only gateway whose filesystem differs from
+// the user's login node: a regular file is opened here and passed to it, as
+// prepareCheckpointArchiveIO passes one, and anything else is streamed.
+func prepareImageArchiveIO(args []string, stdin io.Reader, stdout io.Writer) ([]string, io.Reader, io.Writer, *os.File, func() error, error) {
 	result := append([]string(nil), args...)
 	command, start := result[0], 1
 	if command == "image" && len(result) > 1 {
@@ -224,7 +228,7 @@ func prepareImageArchiveIO(args []string, stdin io.Reader, stdout io.Writer) ([]
 	case "save":
 		short, long = "-o", "--output"
 	default:
-		return result, stdin, stdout, closeArchive, nil
+		return result, stdin, stdout, nil, closeArchive, nil
 	}
 	option := -1
 	value := ""
@@ -234,7 +238,7 @@ func prepareImageArchiveIO(args []string, stdin io.Reader, stdout io.Writer) ([]
 		switch {
 		case arg == short || arg == long:
 			if i+1 >= len(result) {
-				return nil, stdin, stdout, closeArchive, fmt.Errorf("%s requires a path", arg)
+				return nil, stdin, stdout, nil, closeArchive, fmt.Errorf("%s requires a path", arg)
 			}
 			option, value, consume = i, result[i+1], 2
 		case strings.HasPrefix(arg, short+"="):
@@ -247,27 +251,33 @@ func prepareImageArchiveIO(args []string, stdin io.Reader, stdout io.Writer) ([]
 		}
 	}
 	if option < 0 {
-		return result, stdin, stdout, closeArchive, nil
+		return result, stdin, stdout, nil, closeArchive, nil
 	}
 	result = append(result[:option], result[option+consume:]...)
 	if value == "" {
-		return nil, stdin, stdout, closeArchive, fmt.Errorf("%s requires a path", long)
+		return nil, stdin, stdout, nil, closeArchive, fmt.Errorf("%s requires a path", long)
 	}
 	if value == "-" {
-		return result, stdin, stdout, closeArchive, nil
+		return result, stdin, stdout, nil, closeArchive, nil
 	}
 	if command == "load" {
 		file, err := os.Open(value)
 		if err != nil {
-			return nil, stdin, stdout, closeArchive, fmt.Errorf("opening image archive: %w", err)
+			return nil, stdin, stdout, nil, closeArchive, fmt.Errorf("opening image archive: %w", err)
 		}
-		return result, file, stdout, file.Close, nil
+		if regularFile(file) {
+			return result, stdin, stdout, file, file.Close, nil
+		}
+		return result, file, stdout, nil, file.Close, nil
 	}
 	file, err := os.OpenFile(value, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
-		return nil, stdin, stdout, closeArchive, fmt.Errorf("opening image archive output: %w", err)
+		return nil, stdin, stdout, nil, closeArchive, fmt.Errorf("opening image archive output: %w", err)
 	}
-	return result, stdin, file, file.Close, nil
+	if regularFile(file) {
+		return result, stdin, stdout, file, file.Close, nil
+	}
+	return result, stdin, file, nil, file.Close, nil
 }
 
 func parseGlobal(args []string, stdout io.Writer) (options, []string, bool, error) {
@@ -806,7 +816,7 @@ func printHelpTopic(topic []string, stdout io.Writer) {
 }
 
 // runCommand runs a command on the daemon at socket, passing it archive, a
-// checkpoint's or a restore's, if not nil.
+// checkpoint's or a restore's, or an image load's or save's, if not nil.
 func runCommand(socket string, args []string, stdin io.Reader, stdout, stderr io.Writer, archive *os.File) (int, error) {
 	terminal, width := terminalWriterInfo(stderr)
 	req := request{Version: daemonAPIVersion, ClientBuildID: version.Version(), Action: "command", Args: args,

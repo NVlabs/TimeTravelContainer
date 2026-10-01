@@ -179,8 +179,8 @@ type daemonRequest struct {
 	Args           []string `json:"args,omitempty"`
 	Stdin          bool     `json:"stdin,omitempty"`
 	// ArchiveFile says the client passed, with the header, the regular file
-	// a checkpoint is written into or a restore reads, which it would
-	// otherwise stream as its operand "-".
+	// a checkpoint or an image save is written into, or a restore or an
+	// image load reads, which it would otherwise stream.
 	ArchiveFile bool `json:"archive_file,omitempty"`
 	// TerminalControl keeps the daemon stream full-duplex for terminal-size
 	// requests even when guest stdin is detached. This is distinct from Stdin:
@@ -5765,9 +5765,28 @@ func readDaemonRequestHeader(conn net.Conn) (*bufio.Reader, string, []*os.File, 
 	return reader, header, files, err
 }
 
+// daemonArchiveFileCommand reports whether a command takes an archive file in
+// place of its stream, and whether it reads the archive: a restore and an
+// image load read theirs, and a checkpoint and an image save write theirs.
+func daemonArchiveFileCommand(args []string) (takes, reads bool) {
+	if len(args) > 1 && args[0] == "image" {
+		args = args[1:]
+	}
+	if len(args) == 0 {
+		return false, false
+	}
+	switch args[0] {
+	case "restore", "load":
+		return true, true
+	case "checkpoint", "save":
+		return true, false
+	}
+	return false, false
+}
+
 // daemonRequestArchiveFile returns the archive file a request passed: one
-// regular file, for a checkpoint or a restore that says it passes one, and
-// none otherwise.
+// regular file, for a command that takes one and says it passes it, and none
+// otherwise.
 func daemonRequestArchiveFile(request daemonRequest, files []*os.File) (*os.File, error) {
 	if !request.ArchiveFile {
 		if len(files) != 0 {
@@ -5775,8 +5794,8 @@ func daemonRequestArchiveFile(request daemonRequest, files []*os.File) (*os.File
 		}
 		return nil, nil
 	}
-	if request.Action != "command" || len(request.Args) == 0 || (request.Args[0] != "checkpoint" && request.Args[0] != "restore") {
-		return nil, errors.New("only a checkpoint or a restore passes an archive file")
+	if takes, _ := daemonArchiveFileCommand(request.Args); request.Action != "command" || !takes {
+		return nil, errors.New("only a checkpoint, a restore, an image load or an image save passes an archive file")
 	}
 	if len(files) != 1 {
 		return nil, fmt.Errorf("the request passed %d files, not its archive", len(files))
@@ -5792,15 +5811,15 @@ func daemonRequestArchiveFile(request daemonRequest, files []*os.File) (*os.File
 }
 
 // proxyDaemonArchiveFile runs on peer a request that passed its archive file,
-// streaming the archive, which a peer cannot be passed: a restore's is read
-// from the file as the command's input, and a checkpoint's written to it from
-// the command's output, and emptied again if the checkpoint fails. The client
-// hears the rest of what the peer says.
+// streaming the archive, which a peer cannot be passed: a restore's or a
+// load's is read from the file as the command's input, and a checkpoint's or
+// a save's written to it from the command's output, a checkpoint's emptied
+// again if it fails. The client hears the rest of what the peer says.
 func proxyDaemonArchiveFile(peer *cluster.Client, request daemonRequest, archive *os.File, conn net.Conn, writeMu *sync.Mutex) error {
 	request.ArchiveFile = false
 	var stdin io.Reader = strings.NewReader("")
 	var stdout io.Writer = io.NewOffsetWriter(archive, 0)
-	if request.Args[0] == "restore" {
+	if _, reads := daemonArchiveFileCommand(request.Args); reads {
 		info, err := archive.Stat()
 		if err != nil {
 			return err

@@ -299,35 +299,44 @@ func TestNormalizeClientRelativePaths(t *testing.T) {
 	}
 }
 
-func TestPrepareImageArchiveIOUsesClientFiles(t *testing.T) {
+// An image load's or save's regular file is opened by the client and passed
+// to the daemon.
+func TestPrepareImageArchiveIOPassesRegularFiles(t *testing.T) {
 	dir := t.TempDir()
 	inputPath := filepath.Join(dir, "input.tar")
 	if err := os.WriteFile(inputPath, []byte("archive-input"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	args, input, output, closeArchive, err := prepareImageArchiveIO(
-		[]string{"image", "load", "--platform", "linux/amd64", "-i", inputPath}, strings.NewReader("wrong"), io.Discard)
+	stdin := strings.NewReader("wrong")
+	args, input, output, archive, closeArchive, err := prepareImageArchiveIO(
+		[]string{"image", "load", "--platform", "linux/amd64", "-i", inputPath}, stdin, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, err := io.ReadAll(input)
+	if archive == nil || input != stdin || output != io.Discard {
+		t.Fatalf("load archive=%v input=%v output=%v, want the file passed", archive, input, output)
+	}
+	data, err := io.ReadAll(archive)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := closeArchive(); err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(args, " "); got != "image load --platform linux/amd64" || string(data) != "archive-input" || output != io.Discard || !commandUsesStdin(args) {
-		t.Fatalf("load args=%q data=%q stdin=%t", args, data, commandUsesStdin(args))
+	if got := strings.Join(args, " "); got != "image load --platform linux/amd64" || string(data) != "archive-input" {
+		t.Fatalf("load args=%q data=%q", args, data)
 	}
 
 	outputPath := filepath.Join(dir, "output.tar")
-	args, input, output, closeArchive, err = prepareImageArchiveIO(
-		[]string{"save", "--output=" + outputPath, "busybox:1.36"}, strings.NewReader("stdin"), io.Discard)
+	args, input, output, archive, closeArchive, err = prepareImageArchiveIO(
+		[]string{"save", "--output=" + outputPath, "busybox:1.36"}, stdin, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := io.WriteString(output, "archive-output"); err != nil {
+	if archive == nil || input != stdin || output != io.Discard {
+		t.Fatalf("save archive=%v input=%v output=%v, want the file passed", archive, input, output)
+	}
+	if _, err := io.WriteString(archive, "archive-output"); err != nil {
 		t.Fatal(err)
 	}
 	if err := closeArchive(); err != nil {
@@ -337,8 +346,37 @@ func TestPrepareImageArchiveIOUsesClientFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(args, " "); got != "save busybox:1.36" || string(data) != "archive-output" || input == nil {
+	if got := strings.Join(args, " "); got != "save busybox:1.36" || string(data) != "archive-output" {
 		t.Fatalf("save args=%q data=%q", args, data)
+	}
+}
+
+// An image load's or save's file that is not a regular file is streamed.
+func TestPrepareImageArchiveIOStreamsOtherFiles(t *testing.T) {
+	args, input, output, archive, closeArchive, err := prepareImageArchiveIO(
+		[]string{"load", "-i", os.DevNull}, strings.NewReader("wrong"), io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file, ok := input.(*os.File); !ok || file.Name() != os.DevNull || archive != nil || output != io.Discard || !commandUsesStdin(args) {
+		t.Fatalf("load input=%v archive=%v stdin=%t, want %s streamed", input, archive, commandUsesStdin(args), os.DevNull)
+	}
+	if err := closeArchive(); err != nil {
+		t.Fatal(err)
+	}
+	args, input, output, archive, closeArchive, err = prepareImageArchiveIO(
+		[]string{"save", "-o", os.DevNull, "busybox:1.36"}, strings.NewReader("stdin"), io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file, ok := output.(*os.File); !ok || file.Name() != os.DevNull || archive != nil || input == nil {
+		t.Fatalf("save output=%v archive=%v, want %s streamed", output, archive, os.DevNull)
+	}
+	if err := closeArchive(); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(args, " "); got != "save busybox:1.36" {
+		t.Fatalf("save args=%q", args)
 	}
 }
 
