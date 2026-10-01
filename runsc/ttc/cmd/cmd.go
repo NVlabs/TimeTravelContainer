@@ -8457,7 +8457,7 @@ func (b *runtimeBackend) exec(request execRequest) (retStatus int, retErr error)
 		if request.interactive && !request.detach {
 			input = b.stdin
 		}
-		status = embeddedExec(b.runtimeControlArgs(), args, request.detach, input, b.stdout, b.stderr)
+		status = embeddedExec(b.runtimeControlArgs(), args, request.detach, input, b.stdout, b.stderr, nil)
 	} else {
 		command := runscCommand(b.runsc, append(append(b.runtimeControlArgs(), "exec"), args...)...)
 		if !request.detach && (request.interactive || request.terminal) {

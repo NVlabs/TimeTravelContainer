@@ -256,20 +256,21 @@ func embeddedRuntimeCommand(root string, args []string) ([]byte, bool, error) {
 }
 
 // embeddedExec runs, in ttcd's process, the runsc exec that runtimeArgs, the
-// runtime's flags, and execArgs, the exec's, describe: an exec on an internal
-// console, whose input, if stdin is not nil, is read from stdin and whose
-// output is written to stdout and stderr, or discarded if they are nil; a
-// detached exec takes none. Starting a copy of ttcd to run it costs more than
-// the rest of the exec. It returns the status runsc exec would exit with,
-// having written to stderr what it would.
-func embeddedExec(runtimeArgs, execArgs []string, detach bool, stdin io.Reader, stdout, stderr io.Writer) int {
+// runtime's flags, and execArgs, the exec's, describe: one whose input, if
+// stdin is not nil, is read from stdin, and whose output is written to stdout
+// and stderr, or discarded if they are nil, whether through its internal
+// console or as its own stdio; a detached exec takes none. execFile is the
+// executable execArgs' --exec-fd names, if any. Starting a copy of ttcd to
+// run it costs more than the rest of the exec. It returns the status runsc
+// exec would exit with, having written to stderr what it would.
+func embeddedExec(runtimeArgs, execArgs []string, detach bool, stdin io.Reader, stdout, stderr io.Writer, execFile *os.File) int {
 	if stdout == nil {
 		stdout = io.Discard
 	}
 	if stderr == nil {
 		stderr = io.Discard
 	}
-	status, err := runEmbeddedExec(runtimeArgs, execArgs, detach, stdin, stdout, stderr)
+	status, err := runEmbeddedExec(runtimeArgs, execArgs, detach, stdin, stdout, stderr, execFile)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		// What runsc exits with when a command fails.
@@ -281,7 +282,7 @@ func embeddedExec(runtimeArgs, execArgs []string, detach bool, stdin io.Reader, 
 	return status.ExitStatus()
 }
 
-func runEmbeddedExec(runtimeArgs, execArgs []string, detach bool, stdin io.Reader, stdout, stderr io.Writer) (unix.WaitStatus, error) {
+func runEmbeddedExec(runtimeArgs, execArgs []string, detach bool, stdin io.Reader, stdout, stderr io.Writer, execFile *os.File) (unix.WaitStatus, error) {
 	// The flags are the whole configuration: no spec TTC makes carries
 	// annotations that change it.
 	flags := flag.NewFlagSet("runsc", flag.ContinueOnError)
@@ -295,10 +296,11 @@ func runEmbeddedExec(runtimeArgs, execArgs []string, detach bool, stdin io.Reade
 		return 0, err
 	}
 	if detach {
-		return runsccmd.ExecInProcess(conf, execArgs, nil, nil, nil)
+		return runsccmd.ExecInProcess(conf, execArgs, nil, nil, nil, execFile)
 	}
-	// The Sentry copies the console's input and output through pipes, as it
-	// did to runsc exec's own; ttcd copies them from and to the client.
+	// The input and output go through pipes, as they did through runsc
+	// exec's own, which the Sentry copies from and to the console or gives
+	// the process; ttcd copies them from and to the client.
 	var input *os.File
 	if stdin != nil {
 		reader, writer, err := os.Pipe()
@@ -339,5 +341,5 @@ func runEmbeddedExec(runtimeArgs, execArgs []string, detach bool, stdin io.Reade
 			copied <- struct{}{}
 		}()
 	}
-	return runsccmd.ExecInProcess(conf, execArgs, input, outputs[0], outputs[1])
+	return runsccmd.ExecInProcess(conf, execArgs, input, outputs[0], outputs[1], execFile)
 }

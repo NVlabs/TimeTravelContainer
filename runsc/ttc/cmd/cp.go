@@ -450,19 +450,25 @@ func (b *runtimeBackend) runLiveCopyHelper(resolved selector, helperArgs []strin
 		return err
 	}
 	defer helper.Close()
-	args := append(b.runtimeControlArgs(),
-		"exec", "--branch", resolved.branch,
+	args := []string{
+		"--branch", resolved.branch,
 		"--user", "0:0",
 		"--cap", "CAP_CHOWN", "--cap", "CAP_DAC_OVERRIDE",
 		"--cap", "CAP_FOWNER", "--cap", "CAP_MKNOD",
 		"--exec-fd", "3",
-	)
+	}
 	if paused {
 		args = append(args, "--paused-management", "--exec-id", execID)
 	}
 	args = append(args, resolved.container, "ttc", copyHelperArg)
 	args = append(args, helperArgs...)
-	command := runscCommand(b.runsc, args...)
+	if embeddedRuntime(b.runsc) {
+		if status := embeddedExec(b.runtimeControlArgs(), args, false, input, output, b.stderr, helper); status != 0 {
+			return fmt.Errorf("container copy helper exited with status %d", status)
+		}
+		return nil
+	}
+	command := runscCommand(b.runsc, append(append(b.runtimeControlArgs(), "exec"), args...)...)
 	command.ExtraFiles = []*os.File{helper}
 	command.Stdout = output
 	command.Stderr = b.stderr

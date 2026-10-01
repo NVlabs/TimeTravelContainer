@@ -96,9 +96,10 @@ type Exec struct {
 	// init process was intentionally released during dehydration.
 	allowStoppedSandbox bool
 
-	// stdin, stdout and stderr are what an internal console's input is read
-	// from and its output written to: this process's own, unless another
-	// program runs the exec in its process (see ExecInProcess).
+	// stdin, stdout and stderr are the exec's stdio, or what its internal
+	// console's input is read from and its output written to: this
+	// process's own, unless another program runs the exec in its process
+	// (see ExecInProcess).
 	stdin, stdout, stderr *os.File
 }
 
@@ -236,14 +237,17 @@ func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 }
 
 // ExecInProcess runs, in the calling process, the exec `runsc exec args...`
-// would run, which must be on an internal console (--internal-console): its
-// input, if it takes any, is read from stdin and its output written to stdout
-// and stderr, in place of runsc's own. A detached exec, which must be a
-// managed session (--exec-id), takes none of them. conf is the configuration
-// runsc would run with, with the container's annotations applied. It returns
-// the process's wait status, zero for a detached exec, or why it could not be
-// run, which runsc exec would print before exiting with 128.
-func ExecInProcess(conf *config.Config, args []string, stdin, stdout, stderr *os.File) (unix.WaitStatus, error) {
+// would run, with stdin, stdout and stderr in place of runsc's own: on an
+// internal console (--internal-console), its input, if it takes any, is read
+// from stdin and its output written to stdout and stderr; otherwise they are
+// the process's stdio, a nil stdin standing for /dev/null. execFile is the
+// executable --exec-fd names, if args name one. A detached exec, which must be
+// a managed session (--exec-id) on an internal console, takes no stdio. conf
+// is the configuration runsc would run with, with the container's annotations
+// applied. It returns the process's wait status, zero for a detached exec, or
+// why it could not be run, which runsc exec would print before exiting with
+// 128.
+func ExecInProcess(conf *config.Config, args []string, stdin, stdout, stderr, execFile *os.File) (unix.WaitStatus, error) {
 	ex := &Exec{stdin: stdin, stdout: stdout, stderr: stderr}
 	f := flag.NewFlagSet(ex.Name(), flag.ContinueOnError)
 	f.SetOutput(io.Discard)
@@ -253,12 +257,14 @@ func ExecInProcess(conf *config.Config, args []string, stdin, stdout, stderr *os
 		return 0, err
 	}
 	switch {
-	case ex.internalConsole == "":
-		return 0, errors.New("an exec run in another process must be on an internal console")
-	case ex.pidFile != "":
-		return 0, errors.New("an exec run in another process has no pid file")
-	case ex.detach && ex.execID == "":
-		return 0, errors.New("a detached exec run in another process must be a managed session")
+	case ex.pidFile != "" || ex.internalPidFile != "":
+		return 0, errors.New("an exec run in another process has no pid files")
+	case ex.consoleSocket != "" || len(ex.passFDs) != 0:
+		return 0, errors.New("an exec run in another process takes no console socket or passed descriptors")
+	case (ex.execFD >= 0) != (execFile != nil):
+		return 0, errors.New("an exec run in another process is given the file --exec-fd names, and only it")
+	case ex.detach && (ex.execID == "" || ex.internalConsole == ""):
+		return 0, errors.New("a detached exec run in another process must be a managed session on an internal console")
 	case !ex.detach && (stdout == nil || stderr == nil || (ex.internalConsoleStdin && stdin == nil)):
 		return 0, errors.New("an exec run in another process needs its input and output")
 	}
@@ -266,7 +272,23 @@ func ExecInProcess(conf *config.Config, args []string, stdin, stdout, stderr *os
 	if err != nil {
 		return 0, err
 	}
-	e.FilePayload = control.NewFilePayload(nil, nil)
+	// A host terminal's exec forwards this process's signals to the process.
+	if e.StdioIsPty && e.InternalConsoleID == "" {
+		return 0, errors.New("an exec run in another process cannot have a host terminal")
+	}
+	var fdMap map[int]*os.File
+	if e.InternalConsoleID == "" && !ex.detach {
+		if stdin == nil {
+			devNull, err := os.Open(os.DevNull)
+			if err != nil {
+				return 0, err
+			}
+			defer devNull.Close()
+			stdin = devNull
+		}
+		fdMap = map[int]*os.File{0: stdin, 1: stdout, 2: stderr}
+	}
+	e.FilePayload = control.NewFilePayload(fdMap, execFile)
 	if ex.detach {
 		return 0, ex.startManagedDetached(conf, c, e)
 	}
@@ -717,10 +739,20 @@ func (ex *Exec) argsFromCLI(p *specs.Process, argv []string, enableRaw bool) (*c
 		KGID:             kgid,
 		ExtraKGIDs:       extraKGIDs,
 		Capabilities:     caps,
-		StdioIsPty:       ex.consoleSocket != "" || console.StdioIsPty(),
+		StdioIsPty:       ex.consoleSocket != "" || ex.stdioIsPty(),
 		NoNewPrivileges:  p.NoNewPrivileges,
 		SupportTTYs:      true,
 	}, nil
+}
+
+// stdioIsPty reports whether the exec's stdio are all terminals.
+func (ex *Exec) stdioIsPty() bool {
+	for _, file := range []*os.File{ex.stdin, ex.stdout, ex.stderr} {
+		if file == nil || !term.IsTerminal(int(file.Fd())) {
+			return false
+		}
+	}
+	return true
 }
 
 func (ex *Exec) argsFromProcessFile(specProc *specs.Process, enableRaw bool) (*control.ExecArgs, error) {
