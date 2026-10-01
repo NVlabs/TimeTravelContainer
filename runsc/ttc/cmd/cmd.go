@@ -8383,7 +8383,7 @@ func (b *runtimeBackend) exec(request execRequest) (retStatus int, retErr error)
 			return 1, err
 		}
 	}
-	args := append(b.runtimeControlArgs(), "exec", "--ttc-allow-stopped-sandbox", "--branch", request.target.branch)
+	args := []string{"--ttc-allow-stopped-sandbox", "--branch", request.target.branch}
 	consoleID := ""
 	execID := request.execID
 	if execID == "" {
@@ -8433,17 +8433,6 @@ func (b *runtimeBackend) exec(request execRequest) (retStatus int, retErr error)
 	if request.processPath == "" {
 		args = append(args, request.args...)
 	}
-	command := runscCommand(b.runsc, args...)
-	var closeCommandStdin func()
-	if !request.detach && (request.interactive || request.terminal) {
-		closeCommandStdin, err = setCommandStdin(command, b.stdin)
-		if err != nil {
-			return 1, err
-		}
-		defer closeCommandStdin()
-	}
-	command.Stdout = b.stdout
-	command.Stderr = b.stderr
 	if request.terminal && request.interactive && !request.detach {
 		restore, err := makeRawTerminal(b.stdin)
 		if err != nil {
@@ -8458,31 +8447,57 @@ func (b *runtimeBackend) exec(request execRequest) (retStatus int, retErr error)
 		}
 	}
 	started := time.Now()
-	if err := command.Start(); err != nil {
-		return 1, fmt.Errorf("starting runsc exec: %w", err)
-	}
-	if request.terminal && !request.detach {
-		stopResize := b.watchConsoleResize(request.target, consoleID)
-		defer stopResize()
-	}
-	if err := command.Wait(); err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			if diagnostic := b.runtimeDiagnosticSince(request.target.container, started); diagnostic != "" && b.stderr != nil {
-				fmt.Fprintf(b.stderr, "ttc: sandbox diagnostic: %s\n", diagnostic)
-			}
-			// runsc exec fails with 128 when the runtime dies under it, as
-			// its cgroup's out-of-memory killer may kill it. The process was
-			// killed with the runtime: report it as docker exec reports one
-			// killed with its container, and record the loss.
-			if exitErr.ExitCode() == 128 {
-				if _, lost := b.lostRuntimeWaitStatus(request.target); lost {
-					return 128 + int(unix.SIGKILL), nil
-				}
-			}
-			return exitErr.ExitCode(), nil
+	status := 0
+	if embeddedRuntime(b.runsc) {
+		if request.terminal && !request.detach {
+			stopResize := b.watchConsoleResize(request.target, consoleID)
+			defer stopResize()
 		}
-		return 1, fmt.Errorf("executing runsc: %w", err)
+		var input io.Reader
+		if request.interactive && !request.detach {
+			input = b.stdin
+		}
+		status = embeddedExec(b.runtimeControlArgs(), args, request.detach, input, b.stdout, b.stderr)
+	} else {
+		command := runscCommand(b.runsc, append(append(b.runtimeControlArgs(), "exec"), args...)...)
+		if !request.detach && (request.interactive || request.terminal) {
+			closeCommandStdin, err := setCommandStdin(command, b.stdin)
+			if err != nil {
+				return 1, err
+			}
+			defer closeCommandStdin()
+		}
+		command.Stdout = b.stdout
+		command.Stderr = b.stderr
+		if err := command.Start(); err != nil {
+			return 1, fmt.Errorf("starting runsc exec: %w", err)
+		}
+		if request.terminal && !request.detach {
+			stopResize := b.watchConsoleResize(request.target, consoleID)
+			defer stopResize()
+		}
+		if err := command.Wait(); err != nil {
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) {
+				return 1, fmt.Errorf("executing runsc: %w", err)
+			}
+			status = exitErr.ExitCode()
+		}
+	}
+	if status != 0 {
+		if diagnostic := b.runtimeDiagnosticSince(request.target.container, started); diagnostic != "" && b.stderr != nil {
+			fmt.Fprintf(b.stderr, "ttc: sandbox diagnostic: %s\n", diagnostic)
+		}
+		// runsc exec fails with 128 when the runtime dies under it, as its
+		// cgroup's out-of-memory killer may kill it. The process was killed
+		// with the runtime: report it as docker exec reports one killed with
+		// its container, and record the loss.
+		if status == 128 {
+			if _, lost := b.lostRuntimeWaitStatus(request.target); lost {
+				return 128 + int(unix.SIGKILL), nil
+			}
+		}
+		return status, nil
 	}
 	if request.detach {
 		session, err := b.execSession(request.target, request.execID)

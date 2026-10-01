@@ -20,7 +20,9 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -93,6 +95,11 @@ type Exec struct {
 	// allowStoppedSandbox permits TTC to address a rehydrated family whose OCI
 	// init process was intentionally released during dehydration.
 	allowStoppedSandbox bool
+
+	// stdin, stdout and stderr are what an internal console's input is read
+	// from and its output written to: this process's own, unless another
+	// program runs the exec in its process (see ExecInProcess).
+	stdin, stdout, stderr *os.File
 }
 
 // Name implements subcommands.Command.Name.
@@ -164,50 +171,11 @@ func (ex *Exec) FetchSpec(conf *config.Config, f *flag.FlagSet) (string, *specs.
 func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	conf := args[0].(*config.Config)
 	waitStatus := args[1].(*unix.WaitStatus)
+	ex.stdin, ex.stdout, ex.stderr = os.Stdin, os.Stdout, os.Stderr
 
-	c, err := ex.loadContainer(conf, f, container.LoadOpts{SkipCheck: ex.allowStoppedSandbox})
+	c, e, err := ex.prepare(conf, f)
 	if err != nil {
-		util.Fatalf("loading container failed: %v", err)
-	}
-
-	e, err := ex.parseArgs(f, c.Spec.Process, conf.EnableRaw)
-	if err != nil {
-		util.Fatalf("parsing process spec: %v", err)
-	}
-	e.BranchID = ex.branch
-	e.ExecID = ex.execID
-	e.RetainExecSession = ex.retainExecSession
-	e.PausedManagement = ex.pausedManagement
-	e.AllowStoppedContainer = ex.allowStoppedSandbox
-	if ex.pausedManagement && ex.execFD < 0 {
-		util.Fatalf("--paused-management requires --exec-fd")
-	}
-	if ex.pausedManagement && ex.detach {
-		util.Fatalf("--paused-management cannot be detached")
-	}
-	if ex.internalConsole != "" {
-		if ex.consoleSocket != "" {
-			util.Fatalf("--internal-console and --console-socket cannot be combined")
-		}
-		if len(ex.passFDs) != 0 || ex.execFD >= 0 {
-			util.Fatalf("--internal-console cannot be combined with --pass-fd or --exec-fd")
-		}
-		e.InternalConsoleID = ex.internalConsole
-		e.StdioIsPty = ex.internalConsoleTerminal
-		if ex.internalConsoleRows < 0 || ex.internalConsoleRows > 1<<16-1 || ex.internalConsoleCols < 0 || ex.internalConsoleCols > 1<<16-1 {
-			util.Fatalf("--internal-console-rows and --internal-console-cols must fit in uint16")
-		}
-		if (ex.internalConsoleRows == 0) != (ex.internalConsoleCols == 0) {
-			util.Fatalf("--internal-console-rows and --internal-console-cols must be specified together")
-		}
-		e.ConsoleRows = uint16(ex.internalConsoleRows)
-		e.ConsoleCols = uint16(ex.internalConsoleCols)
-	}
-	if ex.pausedManagement && ex.execID == "" {
-		util.Fatalf("--paused-management requires --exec-id")
-	}
-	if ex.branch != boot.DefaultBranchID && e.StdioIsPty && e.InternalConsoleID == "" {
-		util.Fatalf("branch exec with a host PTY is unsupported; use --internal-console")
+		util.Fatalf("%v", err)
 	}
 
 	log.Debugf("Exec arguments: %+v", e)
@@ -267,27 +235,132 @@ func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	return ex.exec(conf, c, e, waitStatus)
 }
 
+// ExecInProcess runs, in the calling process, the exec `runsc exec args...`
+// would run, which must be on an internal console (--internal-console): its
+// input, if it takes any, is read from stdin and its output written to stdout
+// and stderr, in place of runsc's own. A detached exec, which must be a
+// managed session (--exec-id), takes none of them. conf is the configuration
+// runsc would run with, with the container's annotations applied. It returns
+// the process's wait status, zero for a detached exec, or why it could not be
+// run, which runsc exec would print before exiting with 128.
+func ExecInProcess(conf *config.Config, args []string, stdin, stdout, stderr *os.File) (unix.WaitStatus, error) {
+	ex := &Exec{stdin: stdin, stdout: stdout, stderr: stderr}
+	f := flag.NewFlagSet(ex.Name(), flag.ContinueOnError)
+	f.SetOutput(io.Discard)
+	f.Usage = func() {}
+	ex.SetFlags(f)
+	if err := f.Parse(args); err != nil {
+		return 0, err
+	}
+	switch {
+	case ex.internalConsole == "":
+		return 0, errors.New("an exec run in another process must be on an internal console")
+	case ex.pidFile != "":
+		return 0, errors.New("an exec run in another process has no pid file")
+	case ex.detach && ex.execID == "":
+		return 0, errors.New("a detached exec run in another process must be a managed session")
+	case !ex.detach && (stdout == nil || stderr == nil || (ex.internalConsoleStdin && stdin == nil)):
+		return 0, errors.New("an exec run in another process needs its input and output")
+	}
+	c, e, err := ex.prepare(conf, f)
+	if err != nil {
+		return 0, err
+	}
+	e.FilePayload = control.NewFilePayload(nil, nil)
+	if ex.detach {
+		return 0, ex.startManagedDetached(conf, c, e)
+	}
+	return ex.run(conf, c, e)
+}
+
+// prepare loads the container and builds, from the command's flags, the
+// arguments of the process to execute in it.
+func (ex *Exec) prepare(conf *config.Config, f *flag.FlagSet) (*container.Container, *control.ExecArgs, error) {
+	c, err := ex.loadContainer(conf, f, container.LoadOpts{SkipCheck: ex.allowStoppedSandbox})
+	if err != nil {
+		return nil, nil, fmt.Errorf("loading container failed: %v", err)
+	}
+
+	e, err := ex.parseArgs(f, c.Spec.Process, conf.EnableRaw)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parsing process spec: %v", err)
+	}
+	e.BranchID = ex.branch
+	e.ExecID = ex.execID
+	e.RetainExecSession = ex.retainExecSession
+	e.PausedManagement = ex.pausedManagement
+	e.AllowStoppedContainer = ex.allowStoppedSandbox
+	if ex.pausedManagement && ex.execFD < 0 {
+		return nil, nil, errors.New("--paused-management requires --exec-fd")
+	}
+	if ex.pausedManagement && ex.detach {
+		return nil, nil, errors.New("--paused-management cannot be detached")
+	}
+	if ex.internalConsole != "" {
+		if ex.consoleSocket != "" {
+			return nil, nil, errors.New("--internal-console and --console-socket cannot be combined")
+		}
+		if len(ex.passFDs) != 0 || ex.execFD >= 0 {
+			return nil, nil, errors.New("--internal-console cannot be combined with --pass-fd or --exec-fd")
+		}
+		e.InternalConsoleID = ex.internalConsole
+		e.StdioIsPty = ex.internalConsoleTerminal
+		if ex.internalConsoleRows < 0 || ex.internalConsoleRows > 1<<16-1 || ex.internalConsoleCols < 0 || ex.internalConsoleCols > 1<<16-1 {
+			return nil, nil, errors.New("--internal-console-rows and --internal-console-cols must fit in uint16")
+		}
+		if (ex.internalConsoleRows == 0) != (ex.internalConsoleCols == 0) {
+			return nil, nil, errors.New("--internal-console-rows and --internal-console-cols must be specified together")
+		}
+		e.ConsoleRows = uint16(ex.internalConsoleRows)
+		e.ConsoleCols = uint16(ex.internalConsoleCols)
+	}
+	if ex.pausedManagement && ex.execID == "" {
+		return nil, nil, errors.New("--paused-management requires --exec-id")
+	}
+	if ex.branch != boot.DefaultBranchID && e.StdioIsPty && e.InternalConsoleID == "" {
+		return nil, nil, errors.New("branch exec with a host PTY is unsupported; use --internal-console")
+	}
+	return c, e, nil
+}
+
 // execManagedDetached creates a managed Sentry-owned session without leaving a
 // host shim attached to its console. TTC starts the sole persistent drainer.
 func (ex *Exec) execManagedDetached(conf *config.Config, c *container.Container, e *control.ExecArgs, waitStatus *unix.WaitStatus) subcommands.ExitStatus {
-	pid, err := c.Execute(conf, e)
-	if err != nil {
-		return util.Errorf("executing managed detached process: %v", err)
-	}
-	if ex.internalPidFile != "" {
-		if err := WritePidFile(ex.internalPidFile, int(pid)); err != nil {
-			return util.Errorf("writing internal pid file: %v", err)
-		}
+	if err := ex.startManagedDetached(conf, c, e); err != nil {
+		return util.Errorf("%v", err)
 	}
 	*waitStatus = 0
 	return subcommands.ExitSuccess
 }
 
+func (ex *Exec) startManagedDetached(conf *config.Config, c *container.Container, e *control.ExecArgs) error {
+	pid, err := c.Execute(conf, e)
+	if err != nil {
+		return fmt.Errorf("executing managed detached process: %v", err)
+	}
+	if ex.internalPidFile != "" {
+		if err := WritePidFile(ex.internalPidFile, int(pid)); err != nil {
+			return fmt.Errorf("writing internal pid file: %v", err)
+		}
+	}
+	return nil
+}
+
 func (ex *Exec) exec(conf *config.Config, c *container.Container, e *control.ExecArgs, waitStatus *unix.WaitStatus) subcommands.ExitStatus {
+	ws, err := ex.run(conf, c, e)
+	if err != nil {
+		return util.Errorf("%v", err)
+	}
+	*waitStatus = ws
+	return subcommands.ExitSuccess
+}
+
+// run starts the process and waits for it to exit.
+func (ex *Exec) run(conf *config.Config, c *container.Container, e *control.ExecArgs) (unix.WaitStatus, error) {
 	// Start the new process and get its pid.
 	pid, err := c.Execute(conf, e)
 	if err != nil {
-		return util.Errorf("executing processes for container: %v", err)
+		return 0, fmt.Errorf("executing processes for container: %v", err)
 	}
 
 	var consoleOutput <-chan error
@@ -301,7 +374,7 @@ func (ex *Exec) exec(conf *config.Config, c *container.Container, e *control.Exe
 			if removeErr := c.Sandbox.RemoveConsole(&boot.ConsoleRemoveArgs{BranchID: branchID, ConsoleID: e.InternalConsoleID}); removeErr != nil {
 				log.Warningf("removing internal exec console after attach failure: %v", removeErr)
 			}
-			return util.Errorf("attaching internal exec console: %v", err)
+			return 0, fmt.Errorf("attaching internal exec console: %v", err)
 		}
 		consoleOutput = output
 		defer cleanup()
@@ -317,7 +390,7 @@ func (ex *Exec) exec(conf *config.Config, c *container.Container, e *control.Exe
 	// Write the sandbox-internal pid if required.
 	if ex.internalPidFile != "" {
 		if err := WritePidFile(ex.internalPidFile, int(pid)); err != nil {
-			return util.Errorf("writing internal pid file: %v", err)
+			return 0, fmt.Errorf("writing internal pid file: %v", err)
 		}
 	}
 
@@ -326,7 +399,7 @@ func (ex *Exec) exec(conf *config.Config, c *container.Container, e *control.Exe
 	// `runsc exec -d` returns.
 	if ex.pidFile != "" {
 		if err := WritePidFile(ex.pidFile, os.Getpid()); err != nil {
-			return util.Errorf("writing pid file: %v", err)
+			return 0, fmt.Errorf("writing pid file: %v", err)
 		}
 	}
 
@@ -349,15 +422,14 @@ func (ex *Exec) exec(conf *config.Config, c *container.Container, e *control.Exe
 		ws, err = c.WaitBranchPID(e.BranchID, pid)
 	}
 	if err != nil {
-		return util.Errorf("waiting on pid %d: %v", pid, err)
+		return 0, fmt.Errorf("waiting on pid %d: %v", pid, err)
 	}
 	if consoleOutput != nil {
 		if err := <-consoleOutput; err != nil {
-			return util.Errorf("reading internal exec console: %v", err)
+			return 0, fmt.Errorf("reading internal exec console: %v", err)
 		}
 	}
-	*waitStatus = ws
-	return subcommands.ExitSuccess
+	return ws, nil
 }
 
 func (ex *Exec) startInternalConsole(c *container.Container, e *control.ExecArgs) (<-chan error, func(), error) {
@@ -366,8 +438,11 @@ func (ex *Exec) startInternalConsole(c *container.Container, e *control.ExecArgs
 		branchID = boot.DefaultBranchID
 	}
 	target := &boot.ConsoleResizeArgs{BranchID: branchID, ConsoleID: e.InternalConsoleID, Rows: e.ConsoleRows, Cols: e.ConsoleCols}
-	stdinFD := int(os.Stdin.Fd())
-	stdinIsTerminal := e.StdioIsPty && term.IsTerminal(stdinFD)
+	stdinFD, stdinIsTerminal := -1, false
+	if ex.stdin != nil {
+		stdinFD = int(ex.stdin.Fd())
+		stdinIsTerminal = e.StdioIsPty && term.IsTerminal(stdinFD)
+	}
 	if stdinIsTerminal {
 		cols, rows, err := term.GetSize(stdinFD)
 		if err != nil {
@@ -415,11 +490,11 @@ func (ex *Exec) startInternalConsole(c *container.Container, e *control.ExecArgs
 
 	if ex.internalConsoleStdin {
 		// The Sentry reads stdin itself, blocking.
-		err := unix.SetNonblock(int(os.Stdin.Fd()), false)
+		err := unix.SetNonblock(stdinFD, false)
 		if err == nil {
 			err = c.Sandbox.ConsoleInput(&boot.ConsoleInputArgs{
 				BranchID: branchID, ConsoleID: e.InternalConsoleID,
-				FilePayload: urpc.FilePayload{Files: []*os.File{os.Stdin}},
+				FilePayload: urpc.FilePayload{Files: []*os.File{ex.stdin}},
 			})
 		}
 		if err != nil {
@@ -463,16 +538,16 @@ func (ex *Exec) startInternalConsole(c *container.Container, e *control.ExecArgs
 }
 
 // pumpInternalConsoleOutput has the Sentry write the console's stdout and
-// stderr to this process's, blocking, until both end.
+// stderr to the exec's, blocking, until both end.
 func (ex *Exec) pumpInternalConsoleOutput(c *container.Container, branchID, consoleID string) error {
-	for _, file := range []*os.File{os.Stdout, os.Stderr} {
+	for _, file := range []*os.File{ex.stdout, ex.stderr} {
 		if err := unix.SetNonblock(int(file.Fd()), false); err != nil {
 			return err
 		}
 	}
 	return c.Sandbox.ConsoleOutput(&boot.ConsoleOutputArgs{
 		BranchID: branchID, ConsoleID: consoleID,
-		FilePayload: urpc.FilePayload{Files: []*os.File{os.Stdout, os.Stderr}},
+		FilePayload: urpc.FilePayload{Files: []*os.File{ex.stdout, ex.stderr}},
 	})
 }
 
@@ -601,7 +676,7 @@ func (ex *Exec) argsFromCLI(p *specs.Process, argv []string, enableRaw bool) (*c
 	for _, s := range ex.extraKGIDs {
 		kgid, err := strconv.Atoi(s)
 		if err != nil {
-			util.Fatalf("parsing GID: %s, %v", s, err)
+			return nil, fmt.Errorf("parsing GID: %s, %v", s, err)
 		}
 		extraKGIDs = append(extraKGIDs, auth.KGID(kgid))
 	}

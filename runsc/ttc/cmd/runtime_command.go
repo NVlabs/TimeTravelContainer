@@ -7,6 +7,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -14,9 +16,13 @@ import (
 	"time"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/runsc/boot"
+	runsccmd "gvisor.dev/gvisor/runsc/cmd"
+	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
+	"gvisor.dev/gvisor/runsc/flag"
 )
 
 // runscCommand invokes TTC's OCI runtime. Production installations embed that
@@ -247,4 +253,91 @@ func embeddedRuntimeCommand(root string, args []string) ([]byte, bool, error) {
 		return nil, true, fmt.Errorf("encoding %v: %v", args, err)
 	}
 	return encoded, true, nil
+}
+
+// embeddedExec runs, in ttcd's process, the runsc exec that runtimeArgs, the
+// runtime's flags, and execArgs, the exec's, describe: an exec on an internal
+// console, whose input, if stdin is not nil, is read from stdin and whose
+// output is written to stdout and stderr, or discarded if they are nil; a
+// detached exec takes none. Starting a copy of ttcd to run it costs more than
+// the rest of the exec. It returns the status runsc exec would exit with,
+// having written to stderr what it would.
+func embeddedExec(runtimeArgs, execArgs []string, detach bool, stdin io.Reader, stdout, stderr io.Writer) int {
+	if stdout == nil {
+		stdout = io.Discard
+	}
+	if stderr == nil {
+		stderr = io.Discard
+	}
+	status, err := runEmbeddedExec(runtimeArgs, execArgs, detach, stdin, stdout, stderr)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		// What runsc exits with when a command fails.
+		return 128
+	}
+	if status.Signaled() {
+		return 128 + int(status.Signal())
+	}
+	return status.ExitStatus()
+}
+
+func runEmbeddedExec(runtimeArgs, execArgs []string, detach bool, stdin io.Reader, stdout, stderr io.Writer) (unix.WaitStatus, error) {
+	// The flags are the whole configuration: no spec TTC makes carries
+	// annotations that change it.
+	flags := flag.NewFlagSet("runsc", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	config.RegisterFlags(flags)
+	if err := flags.Parse(runtimeArgs); err != nil {
+		return 0, err
+	}
+	conf, err := config.NewFromFlags(flags)
+	if err != nil {
+		return 0, err
+	}
+	if detach {
+		return runsccmd.ExecInProcess(conf, execArgs, nil, nil, nil)
+	}
+	// The Sentry copies the console's input and output through pipes, as it
+	// did to runsc exec's own; ttcd copies them from and to the client.
+	var input *os.File
+	if stdin != nil {
+		reader, writer, err := os.Pipe()
+		if err != nil {
+			return 0, err
+		}
+		// Closing the writer once the exec ends also ends the copy.
+		defer reader.Close()
+		defer writer.Close()
+		go func() {
+			_, _ = io.Copy(writer, stdin)
+			_ = writer.Close()
+		}()
+		input = reader
+	}
+	var outputs []*os.File
+	copied := make(chan struct{}, 2)
+	defer func() {
+		for _, output := range outputs {
+			_ = output.Close()
+		}
+		for range outputs {
+			<-copied
+		}
+	}()
+	for _, w := range []io.Writer{stdout, stderr} {
+		reader, writer, err := os.Pipe()
+		if err != nil {
+			return 0, err
+		}
+		outputs = append(outputs, writer)
+		go func() {
+			// A read takes what the pipe holds, 64 KiB; the wrapper keeps
+			// io.CopyBuffer from reading 32 KiB at a time through
+			// File.WriteTo.
+			_, _ = io.CopyBuffer(w, struct{ io.Reader }{reader}, make([]byte, 64<<10))
+			_ = reader.Close()
+			copied <- struct{}{}
+		}()
+	}
+	return runsccmd.ExecInProcess(conf, execArgs, input, outputs[0], outputs[1])
 }
