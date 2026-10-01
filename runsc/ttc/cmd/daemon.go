@@ -1635,7 +1635,7 @@ func (r *daemonTargetRuntime) Activate(_ context.Context, tx *cluster.Transactio
 		if session.State != "running" {
 			continue
 		}
-		if _, err := r.backend.ensureExecConsoleDrain(selector{container: info.ID, branch: branch.ID}, session.ID, session.ConsoleID, false); err != nil {
+		if _, err := r.backend.ensureExecConsoleDrain(selector{container: info.ID, branch: branch.ID}, session, false); err != nil {
 			return fmt.Errorf("starting distributed target exec console %q: %w", session.ID, err)
 		}
 	}
@@ -8065,7 +8065,7 @@ func (s *daemonServer) reconcile(backend *runtimeBackend) {
 			}
 			for _, session := range sessions {
 				if session.State == "running" {
-					_, _ = backend.ensureExecConsoleDrain(target, session.ID, session.ConsoleID, false)
+					_, _ = backend.ensureExecConsoleDrain(target, session, false)
 				}
 			}
 		}

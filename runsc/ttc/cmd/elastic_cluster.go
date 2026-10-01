@@ -3679,11 +3679,13 @@ func (b *runtimeBackend) restoreMigrationBranchSidecars(target selector, info tt
 	if _, err := b.ensureConsoleDrain(target, false); err != nil {
 		result = errors.Join(result, fmt.Errorf("restoring init console: %w", err))
 	}
-	for _, session := range sessions {
+	// The sessions may have ended since they were listed.
+	current := b.refreshExecSessions(target, sessions)
+	for index, session := range sessions {
 		if session.State != "running" {
 			continue
 		}
-		if _, err := b.ensureExecConsoleDrain(target, session.ID, session.ConsoleID, false); err != nil {
+		if _, err := b.ensureExecConsoleDrain(target, current[index], false); err != nil {
 			result = errors.Join(result, fmt.Errorf("restoring exec console %q: %w", session.ID, err))
 		}
 	}
