@@ -4862,69 +4862,111 @@ func runStop(args []string, stdout, stderr io.Writer, backend backend) error {
 	if timeoutSet && timeout < -1 {
 		return errors.New("stop timeout must be -1 or greater")
 	}
-	for _, value := range fs.Args() {
+	// Every target is resolved first: the running branches of all are sent
+	// their stop signals before any is waited for, as docker stop's
+	// containers stop together. A branch named twice is stopped once. The
+	// targets named before one that cannot be stopped are stopped still.
+	var groups []stopGroup
+	named := make(map[selector]bool)
+	resolve := func(value string) (stopGroup, error) {
 		targets, err := branchOperationTargets(value, backend, true)
 		if err != nil {
-			return fmt.Errorf("invalid target %q: %w", value, err)
+			return stopGroup{}, fmt.Errorf("invalid target %q: %w", value, err)
 		}
 		if len(targets) == 0 {
-			return fmt.Errorf("container %q has no branches", value)
+			return stopGroup{}, fmt.Errorf("container %q has no branches", value)
 		}
 		info, err := backend.inspect(targets[0].selector.container)
 		if err != nil {
-			return fmt.Errorf("inspecting %s before stop: %w", value, err)
+			return stopGroup{}, fmt.Errorf("inspecting %s before stop: %w", value, err)
 		}
 		stopSignal, stopTimeout, err := stopPolicy(info)
 		if err != nil {
-			return err
+			return stopGroup{}, err
 		}
 		if timeoutSet {
 			stopTimeout = timeout
 		}
-		if err := stopBranchesLifecycle(targets, stopSignal, stopTimeout, backend); err != nil {
-			return err
+		group := stopGroup{signal: stopSignal, timeoutSeconds: stopTimeout, stopped: func() { fmt.Fprintln(stdout, value) }}
+		for _, target := range targets {
+			if !named[target.selector] {
+				named[target.selector] = true
+				group.targets = append(group.targets, target)
+			}
 		}
-		fmt.Fprintln(stdout, value)
+		return group, nil
 	}
-	return nil
+	var resolveErr error
+	for _, value := range fs.Args() {
+		group, err := resolve(value)
+		if err != nil {
+			resolveErr = err
+			break
+		}
+		groups = append(groups, group)
+	}
+	if err := stopGroupsLifecycle(groups, backend); err != nil {
+		return err
+	}
+	return resolveErr
 }
 
-// stopBranchesLifecycle stops a family's branches as stopBranchLifecycle
-// stops each, in order, with one grace period for all its running branches:
-// each is sent the stop signal before any branch is stopped, and is waited
-// for until the period, which begins once the last is signaled, ends.
-// Stopped one after another, each branch whose init ignores the signal, as
-// an init does that does not handle it, held the stop for a period of its
-// own.
-func stopBranchesLifecycle(targets []branchOperationTarget, stopSignal, timeoutSeconds int, backend backend) error {
+// stopGroup is the branches one target of a stop names, with its stop
+// policy, and what to do once they are stopped.
+type stopGroup struct {
+	targets        []branchOperationTarget
+	signal         int
+	timeoutSeconds int
+	stopped        func()
+}
+
+// stopGroupsLifecycle stops the branches of groups, in order, as
+// stopBranchLifecycle stops each, with one grace period for each group's
+// running branches: every running branch of every group is sent its stop
+// signal before any branch is stopped, and is waited for until its group's
+// period, which begins once the last is signaled, ends. Stopped one after
+// another, each branch whose init ignores the signal, as an init does that
+// does not handle it, held the stop for a period of its own.
+func stopGroupsLifecycle(groups []stopGroup, backend backend) error {
 	running := func(target branchOperationTarget) bool {
 		return target.state == "running" || target.state == "restarting"
 	}
-	// stops holds, by index, the running branches signaled, nil for one that
-	// needed nothing more.
-	stops := make(map[int]*runningStop)
+	// stops holds the running branches signaled, nil for one that needed
+	// nothing more.
+	stops := make(map[selector]*runningStop)
 	var err error
-	for index, target := range targets {
-		if !running(target) {
-			continue
-		}
-		var stop *runningStop
-		if stop, err = beginRunningStop(target, stopSignal, backend, true); err != nil {
-			break
-		}
-		stops[index] = stop
-	}
-	deadline := stopDeadline(timeoutSeconds)
-	for index, target := range targets {
-		// A branch signaled is stopped even after another failed.
-		if stop, signaled := stops[index]; signaled {
-			if stop != nil {
-				err = errors.Join(err, stop.finish(deadline, backend))
+signal:
+	for _, group := range groups {
+		for _, target := range group.targets {
+			if !running(target) {
+				continue
 			}
-			continue
+			var stop *runningStop
+			if stop, err = beginRunningStop(target, group.signal, backend, true); err != nil {
+				break signal
+			}
+			stops[target.selector] = stop
 		}
-		if err == nil && !running(target) {
-			err = stopBranchLifecycle(target, stopSignal, timeoutSeconds, backend, true)
+	}
+	deadlines := make([]time.Time, len(groups))
+	for index, group := range groups {
+		deadlines[index] = stopDeadline(group.timeoutSeconds)
+	}
+	for index, group := range groups {
+		for _, target := range group.targets {
+			// A branch signaled is stopped even after another failed.
+			if stop, signaled := stops[target.selector]; signaled {
+				if stop != nil {
+					err = errors.Join(err, stop.finish(deadlines[index], backend))
+				}
+				continue
+			}
+			if err == nil && !running(target) {
+				err = stopBranchLifecycle(target, group.signal, group.timeoutSeconds, backend, true)
+			}
+		}
+		if err == nil {
+			group.stopped()
 		}
 	}
 	return err
