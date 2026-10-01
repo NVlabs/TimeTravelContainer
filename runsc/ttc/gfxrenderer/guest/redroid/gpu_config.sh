@@ -13,3 +13,10 @@ chmod 666 /dev/dri/renderD128
 setprop ro.hardware.gralloc cros
 setprop ro.hardware.vulkan gfxstream
 setprop ro.hardware.egl angle
+
+# Video encoding, which screen mirroring such as scrcpy's uses: redroid turns
+# Codec2's software codecs off, since they allocate from a DMA-BUF heap,
+# which TTC has. Without an OMX service, which the image lacks, encoders
+# take their input surface in the client's process.
+setprop debug.stagefright.ccodec 4
+setprop debug.stagefright.c2inputsurface -1
