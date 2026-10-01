@@ -260,6 +260,95 @@ func filteredSentry(conn net.Conn, chunk Chunk, object ID) <-chan [slotBitmapByt
 
 // A filtered capture sends only the pages the graph lacks: all of them the
 // first time, and only the rewritten one when a later capture shares the rest.
+// A capture writes each object as the chunk's encoding, the pages read from
+// the snapshot: those that are not zero follow the chunk's header, in slot
+// order, as Encode makes it.
+func TestGraphCaptureWritesTheChunkEncoding(t *testing.T) {
+	file, err := os.CreateTemp("", "ttc-capture-memory-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(file.Name()); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	mf, err := pgalloc.NewMemoryFile(file, pgalloc.MemoryFileOpts{
+		DelayedEviction:         pgalloc.DelayedEvictionDisabled,
+		DisableIMAWorkAround:    true,
+		DisableMemoryAccounting: true,
+	})
+	if err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	defer mf.Destroy()
+	// A page, a zero page, two pages, and in another chunk one more.
+	contents := [][]byte{
+		bytes.Repeat([]byte{1}, hostarch.PageSize),
+		make([]byte, hostarch.PageSize),
+		bytes.Repeat([]byte{3}, hostarch.PageSize),
+		bytes.Repeat([]byte{4}, hostarch.PageSize),
+		bytes.Repeat([]byte{5}, hostarch.PageSize),
+	}
+	fr, err := mf.Allocate(uint64(len(contents))*hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.Anonymous, Mode: pgalloc.AllocateAndWritePopulate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mf.DecRef(fr)
+	for i, page := range contents {
+		if _, err := file.WriteAt(page, int64(fr.Start)+int64(i)*hostarch.PageSize); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snapshot, err := pgalloc.NewRemoteSnapshot([]pgalloc.RemoteSnapshotRegion{{ID: 1, File: mf, Range: fr}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	chunks := []pgalloc.LogicalChunkID{{Allocator: testAllocator(1), Sequence: 7}, {Allocator: testAllocator(1), Sequence: 8}}
+	slots := []uint8{0, 1, 2, 9, 3}
+	want := map[pgalloc.LogicalChunkID]*Chunk{}
+	var bindings []pgalloc.CapturedPageBinding
+	for i := range contents {
+		chunk := chunks[i/4]
+		version := pgalloc.PageVersionID{Allocator: testAllocator(2), Sequence: uint64(i + 1)}
+		page := pgalloc.LogicalPageID{Allocator: chunk.Allocator, Sequence: chunk.Sequence*PagesPerChunk + uint64(slots[i])}
+		bindings = append(bindings, pgalloc.CapturedPageBinding{Page: page, Chunk: chunk, Slot: slots[i], Version: version, StreamOffset: uint64(i) * hostarch.PageSize, References: 1})
+		if want[chunk] == nil {
+			want[chunk] = &Chunk{Logical: chunk}
+		}
+		encoded := Page{Slot: slots[i], Version: version, Data: contents[i]}
+		if i == 1 {
+			encoded = Page{Slot: slots[i], Version: version, Zero: true}
+		}
+		want[chunk].Pages = append(want[chunk].Pages, encoded)
+	}
+	var stream bytes.Buffer
+	if err := WriteGraphCapture(&stream, snapshot, bindings); err != nil {
+		t.Fatal(err)
+	}
+	groups, manifest, err := planGraphCapture(bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var expected bytes.Buffer
+	if err := writeGraphCaptureHeader(&expected, graphCaptureMagic, manifest, len(groups)); err != nil {
+		t.Fatal(err)
+	}
+	for _, group := range groups {
+		encoded, err := Encode(*want[group.logical])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := writeGraphCaptureObject(&expected, group.id, encoded); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !bytes.Equal(stream.Bytes(), expected.Bytes()) {
+		t.Fatalf("the capture wrote %d bytes that differ from the %d its chunks encode to", stream.Len(), expected.Len())
+	}
+}
+
 func TestFilteredGraphCaptureSendsOnlyWhatTheGraphLacks(t *testing.T) {
 	first := testChunk()
 	second := testChunk()
@@ -1368,4 +1457,19 @@ func BenchmarkPlanGraphCapture(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// writeGraphCaptureObject writes an object of a capture stream, its data
+// encoded whole.
+func writeGraphCaptureObject(w io.Writer, id ID, data []byte) error {
+	if len(data) == 0 || len(data) > maxGraphCaptureObjectBytes {
+		return fmt.Errorf("graph memory object %s has invalid size %d", id, len(data))
+	}
+	if err := writeGraphCaptureBytes(w, id[:]); err != nil {
+		return err
+	}
+	if err := writeGraphCaptureUint64(w, uint64(len(data))); err != nil {
+		return err
+	}
+	return writeGraphCaptureBytes(w, data)
 }

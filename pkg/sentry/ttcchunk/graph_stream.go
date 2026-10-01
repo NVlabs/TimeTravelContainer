@@ -46,8 +46,9 @@ func WriteGraphCapture(w io.Writer, snapshot *pgalloc.RemoteSnapshot, bindings [
 	if err := writeGraphCaptureHeader(w, graphCaptureMagic, manifest, len(groups)); err != nil {
 		return err
 	}
+	var buffer []byte
 	for index := range groups {
-		if err := writeGraphCaptureGroup(w, snapshot, bindings, &groups[index], nil); err != nil {
+		if err := writeGraphCaptureGroup(w, snapshot, bindings, &groups[index], nil, &buffer); err != nil {
 			return err
 		}
 	}
@@ -73,6 +74,7 @@ func WriteFilteredGraphCapture(stream io.ReadWriter, snapshot *pgalloc.RemoteSna
 	if _, err := io.ReadFull(stream, answer); err != nil {
 		return fmt.Errorf("reading which memory pages the daemon lacks: %w", err)
 	}
+	var buffer []byte
 	for index := range groups {
 		group := &groups[index]
 		var need [slotBitmapBytes]byte
@@ -85,7 +87,7 @@ func WriteFilteredGraphCapture(stream io.ReadWriter, snapshot *pgalloc.RemoteSna
 				return fmt.Errorf("the daemon asked for slot %d of memory object %s, which the capture does not hold", slot, group.id)
 			}
 		}
-		if err := writeGraphCaptureGroup(stream, snapshot, bindings, group, &need); err != nil {
+		if err := writeGraphCaptureGroup(stream, snapshot, bindings, group, &need, &buffer); err != nil {
 			return err
 		}
 	}
@@ -96,7 +98,7 @@ var zeroGraphCapturePage [hostarch.PageSize]byte
 
 // writeGraphCaptureGroup reads the pages of group, of the capture's bindings,
 // or only those in need if it is set, and writes them as one object.
-func writeGraphCaptureGroup(w io.Writer, snapshot *pgalloc.RemoteSnapshot, bindings []pgalloc.CapturedPageBinding, group *graphCaptureGroup, need *[slotBitmapBytes]byte) error {
+func writeGraphCaptureGroup(w io.Writer, snapshot *pgalloc.RemoteSnapshot, bindings []pgalloc.CapturedPageBinding, group *graphCaptureGroup, need *[slotBitmapBytes]byte, buffer *[]byte) error {
 	indexes := group.bindings
 	if need != nil {
 		indexes = make([]int32, 0, countBits(need))
@@ -106,7 +108,10 @@ func writeGraphCaptureGroup(w io.Writer, snapshot *pgalloc.RemoteSnapshot, bindi
 			}
 		}
 	}
-	buffer := make([]byte, len(indexes)*hostarch.PageSize)
+	if cap(*buffer) < len(indexes)*hostarch.PageSize {
+		*buffer = make([]byte, PagesPerChunk*hostarch.PageSize)
+	}
+	data := (*buffer)[:len(indexes)*hostarch.PageSize]
 	// Pages the capture stream holds one after another are read with one copy.
 	for begin := 0; begin < len(indexes); {
 		first := &bindings[indexes[begin]]
@@ -114,9 +119,9 @@ func writeGraphCaptureGroup(w io.Writer, snapshot *pgalloc.RemoteSnapshot, bindi
 		for end < len(indexes) && bindings[indexes[end]].StreamOffset == bindings[indexes[end-1]].StreamOffset+hostarch.PageSize {
 			end++
 		}
-		data := buffer[begin*hostarch.PageSize : end*hostarch.PageSize]
-		n, err := snapshot.CopyStreamAt(data, int64(first.StreamOffset))
-		if err != nil || n != len(data) {
+		pages := data[begin*hostarch.PageSize : end*hostarch.PageSize]
+		n, err := snapshot.CopyStreamAt(pages, int64(first.StreamOffset))
+		if err != nil || n != len(pages) {
 			if err == nil {
 				err = io.ErrUnexpectedEOF
 			}
@@ -125,22 +130,52 @@ func writeGraphCaptureGroup(w io.Writer, snapshot *pgalloc.RemoteSnapshot, bindi
 		begin = end
 	}
 	chunk := Chunk{Logical: group.logical, Pages: make([]Page, 0, len(indexes))}
+	payloadPages := 0
 	for position, index := range indexes {
 		binding := &bindings[index]
-		data := buffer[position*hostarch.PageSize : (position+1)*hostarch.PageSize : (position+1)*hostarch.PageSize]
-		page := Page{Slot: binding.Slot, Version: binding.Version}
-		if bytes.Equal(data, zeroGraphCapturePage[:]) {
-			page.Zero = true
+		page := data[position*hostarch.PageSize : (position+1)*hostarch.PageSize : (position+1)*hostarch.PageSize]
+		entry := Page{Slot: binding.Slot, Version: binding.Version}
+		if bytes.Equal(page, zeroGraphCapturePage[:]) {
+			entry.Zero = true
 		} else {
-			page.Data = data
+			entry.Data = page
+			payloadPages++
 		}
-		chunk.Pages = append(chunk.Pages, page)
+		chunk.Pages = append(chunk.Pages, entry)
 	}
-	encoded, err := Encode(chunk)
+	header, _, err := encodeHeader(chunk, 0)
 	if err != nil {
 		return err
 	}
-	return writeGraphCaptureObject(w, group.id, encoded)
+	length := len(header) + payloadPages*hostarch.PageSize
+	if length > maxGraphCaptureObjectBytes {
+		return fmt.Errorf("graph memory object %s has invalid size %d", group.id, length)
+	}
+	// The object is its identity, its length and its chunk's encoding: the
+	// chunk's header, then the data of its pages that are not zero, in slot
+	// order, as they are in data, written from there a run at a time.
+	prefix := make([]byte, 0, len(group.id)+8+len(header))
+	prefix = append(prefix, group.id[:]...)
+	prefix = binary.LittleEndian.AppendUint64(prefix, uint64(length))
+	prefix = append(prefix, header...)
+	if err := writeGraphCaptureBytes(w, prefix); err != nil {
+		return err
+	}
+	for begin := 0; begin < len(chunk.Pages); {
+		if chunk.Pages[begin].Zero {
+			begin++
+			continue
+		}
+		end := begin + 1
+		for end < len(chunk.Pages) && !chunk.Pages[end].Zero {
+			end++
+		}
+		if err := writeGraphCaptureBytes(w, data[begin*hostarch.PageSize:end*hostarch.PageSize]); err != nil {
+			return err
+		}
+		begin = end
+	}
+	return nil
 }
 
 func writeGraphCaptureHeader(w io.Writer, magic [16]byte, manifest Manifest, objectCount int) error {
@@ -164,19 +199,6 @@ func writeGraphCaptureHeader(w io.Writer, magic [16]byte, manifest Manifest, obj
 		return err
 	}
 	return nil
-}
-
-func writeGraphCaptureObject(w io.Writer, id ID, data []byte) error {
-	if len(data) == 0 || len(data) > maxGraphCaptureObjectBytes {
-		return fmt.Errorf("graph memory object %s has invalid size %d", id, len(data))
-	}
-	if err := writeGraphCaptureBytes(w, id[:]); err != nil {
-		return err
-	}
-	if err := writeGraphCaptureUint64(w, uint64(len(data))); err != nil {
-		return err
-	}
-	return writeGraphCaptureBytes(w, data)
 }
 
 // graphCaptureGroup is one object of a capture: the pages of one version of

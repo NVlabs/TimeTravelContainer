@@ -60,40 +60,59 @@ func hasBit(bitmap *[slotBitmapBytes]byte, slot uint8) bool {
 
 // Encode validates and encodes a chunk for an ephemeral capture stream.
 func Encode(chunk Chunk) ([]byte, error) {
+	encoded, payload, err := encodeHeader(chunk, payloadPagesOf(chunk))
+	if err != nil {
+		return nil, err
+	}
+	for _, data := range payload {
+		encoded = append(encoded, data...)
+	}
+	return encoded, nil
+}
+
+// payloadPagesOf returns how many of chunk's pages are not zero.
+func payloadPagesOf(chunk Chunk) int {
+	n := 0
+	for i := range chunk.Pages {
+		if !chunk.Pages[i].Zero {
+			n++
+		}
+	}
+	return n
+}
+
+// encodeHeader returns chunk's encoding but for its pages' data, in a slice
+// with room for payloadPages pages more, and the data of each page that is
+// not zero, in slot order, which follows it in the encoding.
+func encodeHeader(chunk Chunk, payloadPages int) ([]byte, [][]byte, error) {
 	if chunk.Logical.Allocator == (pgalloc.LogicalAllocatorID{}) {
-		return nil, errors.New("memory chunk has zero logical allocator ID")
+		return nil, nil, errors.New("memory chunk has zero logical allocator ID")
 	}
 	if len(chunk.Pages) == 0 || len(chunk.Pages) > PagesPerChunk {
-		return nil, fmt.Errorf("memory chunk has %d pages", len(chunk.Pages))
+		return nil, nil, fmt.Errorf("memory chunk has %d pages", len(chunk.Pages))
 	}
 	pages := make([]*Page, PagesPerChunk)
 	var valid, zero [32]byte
 	for i := range chunk.Pages {
 		page := &chunk.Pages[i]
 		if pages[page.Slot] != nil {
-			return nil, fmt.Errorf("memory chunk repeats slot %d", page.Slot)
+			return nil, nil, fmt.Errorf("memory chunk repeats slot %d", page.Slot)
 		}
 		if page.Version.Allocator == (pgalloc.LogicalAllocatorID{}) {
-			return nil, fmt.Errorf("memory chunk slot %d has zero version allocator ID", page.Slot)
+			return nil, nil, fmt.Errorf("memory chunk slot %d has zero version allocator ID", page.Slot)
 		}
 		if page.Zero {
 			if len(page.Data) != 0 {
-				return nil, fmt.Errorf("zero memory chunk slot %d has payload", page.Slot)
+				return nil, nil, fmt.Errorf("zero memory chunk slot %d has payload", page.Slot)
 			}
 			setBit(&zero, page.Slot)
 		} else if len(page.Data) != hostarch.PageSize {
-			return nil, fmt.Errorf("memory chunk slot %d has %d payload bytes, want %d", page.Slot, len(page.Data), hostarch.PageSize)
+			return nil, nil, fmt.Errorf("memory chunk slot %d has %d payload bytes, want %d", page.Slot, len(page.Data), hostarch.PageSize)
 		}
 		setBit(&valid, page.Slot)
 		pages[page.Slot] = page
 	}
 
-	payloadPages := len(chunk.Pages)
-	for _, page := range chunk.Pages {
-		if page.Zero {
-			payloadPages--
-		}
-	}
 	encoded := make([]byte, 0, headerBytes+len(chunk.Pages)*entryBytes+payloadPages*hostarch.PageSize)
 	encoded = append(encoded, formatMagic[:]...)
 	var number [8]byte
@@ -114,12 +133,13 @@ func Encode(chunk Chunk) ([]byte, error) {
 		binary.LittleEndian.PutUint64(number[:], page.Version.Sequence)
 		encoded = append(encoded, number[:]...)
 	}
+	payload := make([][]byte, 0, payloadPages)
 	for _, page := range pages {
 		if page != nil && !page.Zero {
-			encoded = append(encoded, page.Data...)
+			payload = append(payload, page.Data)
 		}
 	}
-	return encoded, nil
+	return encoded, payload, nil
 }
 
 // Decode validates capture-stream chunk data.
