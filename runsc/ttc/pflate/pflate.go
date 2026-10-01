@@ -41,29 +41,38 @@ type segment struct {
 	done  chan struct{}
 }
 
-// Writer compresses what is written to it into one DEFLATE stream.
+// Writer compresses what is written to it into one DEFLATE stream. Its
+// Close must be called.
 type Writer struct {
 	w     io.Writer
 	level int
 	// current is the segment being filled.
 	current []byte
 	// pending are the segments being compressed, or compressed and not yet
-	// written, in order: at most one for each processor.
-	pending []*segment
-	limit   int
+	// written, in order: at most one for each processor. A goroutine of the
+	// Writer's own writes each once it is compressed, so that writing the
+	// stream, which may digest it, goes on beside filling segments, which
+	// may digest what is written.
+	pending chan *segment
+	// written is closed once that goroutine has written every segment.
+	written chan struct{}
 	// compressors, inputs and outputs are kept for reuse: a compressor's
-	// state is hundreds of kilobytes. Only Write and Close use inputs and
-	// outputs. probeCompressors are at best speed, for probes, and
-	// storeCompressors store the segments that do not compress.
+	// state is hundreds of kilobytes. The writing goroutine returns a
+	// segment's input and output once written. probeCompressors are at best
+	// speed, for probes, and storeCompressors store the segments that do not
+	// compress.
 	compressors      sync.Pool
 	probeCompressors sync.Pool
 	storeCompressors sync.Pool
-	inputs           [][]byte
-	outputs          []*bytes.Buffer
-	// segments are the compressed lengths of the segments written.
+	inputs           chan []byte
+	outputs          chan *bytes.Buffer
+	closed           bool
+
+	mu sync.Mutex
+	// segments are the compressed lengths of the segments written, and err
+	// the first error compressing or writing them.
 	segments []int64
 	err      error
-	closed   bool
 }
 
 // NewWriter returns a Writer that compresses onto w at level, a flate
@@ -73,9 +82,22 @@ func NewWriter(w io.Writer, level int) (*Writer, error) {
 	if err != nil {
 		return nil, err
 	}
-	z := &Writer{w: w, level: level, limit: runtime.GOMAXPROCS(0)}
+	limit := runtime.GOMAXPROCS(0)
+	z := &Writer{
+		w: w, level: level,
+		pending: make(chan *segment, limit), written: make(chan struct{}),
+		inputs: make(chan []byte, limit+1), outputs: make(chan *bytes.Buffer, limit+1),
+	}
 	z.compressors.Put(compressor)
+	go z.writeSegments()
 	return z, nil
+}
+
+// error returns the first error compressing or writing the stream.
+func (z *Writer) error() error {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	return z.err
 }
 
 // Write implements io.Writer.
@@ -85,8 +107,8 @@ func (z *Writer) Write(p []byte) (int, error) {
 	}
 	written := 0
 	for len(p) != 0 {
-		if z.err != nil {
-			return written, z.err
+		if err := z.error(); err != nil {
+			return written, err
 		}
 		if z.current == nil {
 			z.current = z.input()
@@ -99,39 +121,36 @@ func (z *Writer) Write(p []byte) (int, error) {
 			z.compress(false)
 		}
 	}
-	return written, z.err
+	return written, z.error()
 }
 
 // input returns a segment's input buffer, empty.
 func (z *Writer) input() []byte {
-	if n := len(z.inputs); n != 0 {
-		input := z.inputs[n-1]
-		z.inputs = z.inputs[:n-1]
+	select {
+	case input := <-z.inputs:
 		return input[:0]
+	default:
+		return make([]byte, 0, segmentBytes)
 	}
-	return make([]byte, 0, segmentBytes)
 }
 
 // output returns a segment's output buffer, empty.
 func (z *Writer) output() *bytes.Buffer {
-	if n := len(z.outputs); n != 0 {
-		output := z.outputs[n-1]
-		z.outputs = z.outputs[:n-1]
+	select {
+	case output := <-z.outputs:
 		output.Reset()
 		return output
+	default:
+		return new(bytes.Buffer)
 	}
-	return new(bytes.Buffer)
 }
 
-// compress starts the compression of the current segment, first writing the
-// oldest pending one while as many as there are processors are pending.
+// compress starts the compression of the current segment, once fewer than one
+// for each processor are pending.
 func (z *Writer) compress(final bool) {
 	s := &segment{input: z.current, output: z.output(), final: final, done: make(chan struct{})}
 	z.current = nil
-	for len(z.pending) >= z.limit && z.err == nil {
-		z.writeOldest()
-	}
-	z.pending = append(z.pending, s)
+	z.pending <- s
 	go z.run(s)
 }
 
@@ -186,36 +205,45 @@ func (w *countingWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// writeOldest waits for the oldest pending segment and writes it.
-func (z *Writer) writeOldest() {
-	s := z.pending[0]
-	copy(z.pending, z.pending[1:])
-	z.pending = z.pending[:len(z.pending)-1]
-	<-s.done
-	defer func() {
-		if s.input != nil {
-			z.inputs = append(z.inputs, s.input)
+// writeSegments writes each pending segment, in order, once it is compressed,
+// until the Writer is closed, and returns its buffers. After an error it
+// writes no more.
+func (z *Writer) writeSegments() {
+	defer close(z.written)
+	for s := range z.pending {
+		<-s.done
+		if err := z.error(); err == nil {
+			err = s.err
+			if err == nil {
+				_, err = z.w.Write(s.output.Bytes())
+			}
+			z.mu.Lock()
+			if err != nil {
+				z.err = err
+			} else {
+				z.segments = append(z.segments, int64(s.output.Len()))
+			}
+			z.mu.Unlock()
 		}
-		z.outputs = append(z.outputs, s.output)
-	}()
-	if z.err != nil {
-		return
+		if s.input != nil {
+			select {
+			case z.inputs <- s.input:
+			default:
+			}
+		}
+		select {
+		case z.outputs <- s.output:
+		default:
+		}
 	}
-	if s.err != nil {
-		z.err = s.err
-		return
-	}
-	if _, err := z.w.Write(s.output.Bytes()); err != nil {
-		z.err = err
-		return
-	}
-	z.segments = append(z.segments, int64(s.output.Len()))
 }
 
 // Segments returns the compressed lengths of the segments written, in order:
 // once the Writer is closed, those of the whole stream, by which a Reader
 // decompresses them at once.
 func (z *Writer) Segments() []int64 {
+	z.mu.Lock()
+	defer z.mu.Unlock()
 	return z.segments
 }
 
@@ -223,17 +251,16 @@ func (z *Writer) Segments() []int64 {
 // underlying writer.
 func (z *Writer) Close() error {
 	if z.closed {
-		return z.err
+		return z.error()
 	}
 	z.closed = true
-	if z.err == nil {
+	if z.error() == nil {
 		// The last segment ends the stream, empty or not.
 		z.compress(true)
 	}
-	for len(z.pending) != 0 {
-		z.writeOldest()
-	}
-	return z.err
+	close(z.pending)
+	<-z.written
+	return z.error()
 }
 
 // GzipWriter compresses what is written to it into one gzip member, as
@@ -280,7 +307,7 @@ func (z *GzipWriter) Write(p []byte) (int, error) {
 // underlying writer.
 func (z *GzipWriter) Close() error {
 	if z.closed {
-		return z.flate.err
+		return z.flate.error()
 	}
 	z.closed = true
 	if err := z.flate.Close(); err != nil {
