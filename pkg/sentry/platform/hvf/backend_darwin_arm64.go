@@ -186,7 +186,7 @@ func (v *hvfVM) canonicalGPAForHost(host uintptr) (uint64, vmm.Stage2Access, boo
 			access vmm.Stage2Access
 		}{
 			{m.codeHost, monitorCodeGPA, monitorCodeCapacity, vmm.Stage2Read | vmm.Stage2Execute},
-			{m.controlHost, monitorControlGPA, vmm.HostSlabSize, vmm.Stage2Read | vmm.Stage2Write},
+			{m.controlHost, monitorControlGPA, monitorControlLength, vmm.Stage2Read | vmm.Stage2Write},
 			{m.statesHost, monitorStatesGPA, monitorStatesLength, vmm.Stage2Read | vmm.Stage2Write},
 		} {
 			if host >= region.host && uint64(host-region.host) < region.length {

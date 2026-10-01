@@ -2338,26 +2338,61 @@ func TestMonitorASIDsStayUniqueAcrossWrap(t *testing.T) {
 // answers by permanently growing the pool.
 func TestMonitorAddressSpaceTableFullReportsLimit(t *testing.T) {
 	_, engine := newRing0MonitorTestEngine(t)
+	// The platform's monitor grows the page-table pool, which holds each
+	// space's root, as the pool runs out.
+	create := func(id uint64) error {
+		return engine.monitor.Execute(context.Background(), monitorabi.Command{Opcode: monitorabi.OpcodeCreateAddressSpace, AddressSpaceID: id})
+	}
 	created := 0
 	for id := uint64(1); ; id++ {
-		status := runRing0InternalMonitorStatus(t, engine, monitorabi.Command{Opcode: monitorabi.OpcodeCreateAddressSpace, AddressSpaceID: id})
-		if status == monitorabi.StatusLimit {
+		err := create(id)
+		var statusErr *vmplatform.MonitorStatusError
+		if errors.As(err, &statusErr) && statusErr.Response.Status == monitorabi.StatusLimit {
 			break
 		}
-		if status != monitorabi.StatusOK {
-			t.Fatalf("creating address space %d: status %d", id, status)
+		if err != nil {
+			t.Fatalf("creating address space %d: %v", id, err)
 		}
 		created++
-		if created > 1<<12 {
+		if created > monitorMaxAddressSpaces {
 			t.Fatal("address-space table never filled")
 		}
 	}
 	// The Sentry mirror owns one slot.
-	if want := 319; created != want {
+	if want := monitorMaxAddressSpaces - 1; created != want {
 		t.Errorf("created %d application address spaces before the limit, want %d", created, want)
 	}
 	runRing0InternalMonitor(t, engine, monitorabi.Command{Opcode: monitorabi.OpcodeDestroyAddressSpace, AddressSpaceID: 1})
-	runRing0InternalMonitor(t, engine, monitorabi.Command{Opcode: monitorabi.OpcodeCreateAddressSpace, AddressSpaceID: 1 << 20})
+	if err := create(1 << 20); err != nil {
+		t.Fatalf("creating an address space in a freed slot: %v", err)
+	}
+}
+
+// TestMonitorFindsSpacesPastTheirHomeSlot creates two spaces whose IDs share
+// a home slot. The monitor places the second past it, and must find it there,
+// also once the first is gone.
+func TestMonitorFindsSpacesPastTheirHomeSlot(t *testing.T) {
+	_, engine := newRing0MonitorTestEngine(t)
+	const first = 904
+	const second = first + monitorMaxAddressSpaces
+	activate := func(id uint64) monitorabi.Status {
+		return runRing0InternalMonitorStatus(t, engine, monitorabi.Command{Opcode: monitorabi.OpcodeActivate, AddressSpaceID: id})
+	}
+	runRing0InternalMonitor(t, engine, monitorabi.Command{Opcode: monitorabi.OpcodeCreateAddressSpace, AddressSpaceID: first})
+	runRing0InternalMonitor(t, engine, monitorabi.Command{Opcode: monitorabi.OpcodeCreateAddressSpace, AddressSpaceID: second})
+	for _, id := range []uint64{first, second} {
+		if status := activate(id); status != monitorabi.StatusOK {
+			t.Fatalf("activating space %d: status %d", id, status)
+		}
+	}
+	runRing0InternalMonitor(t, engine, monitorabi.Command{Opcode: monitorabi.OpcodeDestroyAddressSpace, AddressSpaceID: first})
+	if status := activate(first); status != monitorabi.StatusNotFound {
+		t.Errorf("activating destroyed space %d: status %d, want %d", first, status, monitorabi.StatusNotFound)
+	}
+	if status := activate(second); status != monitorabi.StatusOK {
+		t.Errorf("activating space %d past its freed home slot: status %d", second, status)
+	}
+	runRing0InternalMonitor(t, engine, monitorabi.Command{Opcode: monitorabi.OpcodeDestroyAddressSpace, AddressSpaceID: second})
 }
 
 // TestInterruptApplicationStopsOnlyTargetRun runs two CPU-bound applications

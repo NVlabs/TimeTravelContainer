@@ -172,13 +172,15 @@ const (
 	monitorCodeGPA                = uint64(0x00010000)
 	monitorCodeCapacity           = uint64(0x00010000)
 	monitorControlGPA             = uint64(0x00020000)
-	monitorStatesGPA              = uint64(0x00024000)
+	monitorControlLength          = uint64(C.TTC_MONITOR_CONTROL_SIZE)
+	monitorStatesGPA              = monitorControlGPA + monitorControlLength
 	monitorMaxVCPUs               = 64
+	monitorMaxAddressSpaces       = C.TTC_MONITOR_MAX_ADDRESS_SPACES
 	monitorStatesLength           = uint64(monitorMaxVCPUs) * vmm.HostSlabSize
 	monitorPoolGPA                = uint64(0x00200000)
 	monitorCodeVA                 = uint64(0xffff000000000000)
 	monitorControlVA              = monitorCodeVA + monitorCodeCapacity
-	monitorStatesVA               = monitorControlVA + vmm.HostSlabSize
+	monitorStatesVA               = monitorControlVA + monitorControlLength
 	monitorPoolVA                 = monitorCodeVA + 0x00200000
 	monitorCommandMax             = 64 + 256*40
 	stateCommandLength            = 0x0010
@@ -306,7 +308,7 @@ func newMonitorMemory(vm *hvfVM) (*monitorMemory, error) {
 			m.releaseHost()
 		}
 	}()
-	if m.controlHost, err = alloc.Reserve(vmm.HostSlabSize); err != nil {
+	if m.controlHost, err = alloc.Reserve(monitorControlLength); err != nil {
 		return nil, err
 	}
 	if m.statesHost, err = alloc.Reserve(monitorStatesLength); err != nil {
@@ -320,7 +322,7 @@ func newMonitorMemory(vm *hvfVM) (*monitorMemory, error) {
 		length  uint64
 	}{
 		{m.codeHost, monitorCodeCapacity},
-		{m.controlHost, vmm.HostSlabSize},
+		{m.controlHost, monitorControlLength},
 		{m.statesHost, monitorStatesLength},
 		{m.poolHost, monitorPoolInitialLength},
 	} {
@@ -334,10 +336,10 @@ func newMonitorMemory(vm *hvfVM) (*monitorMemory, error) {
 		return nil, err
 	}
 	m.mapped = append(m.mapped, monitorStage2Mapping{monitorCodeGPA, monitorCodeCapacity})
-	if err := vm.mapStage2Locked(monitorControlGPA, m.controlHost, vmm.HostSlabSize, vmm.Stage2Read|vmm.Stage2Write); err != nil {
+	if err := vm.mapStage2Locked(monitorControlGPA, m.controlHost, monitorControlLength, vmm.Stage2Read|vmm.Stage2Write); err != nil {
 		return nil, err
 	}
-	m.mapped = append(m.mapped, monitorStage2Mapping{monitorControlGPA, vmm.HostSlabSize})
+	m.mapped = append(m.mapped, monitorStage2Mapping{monitorControlGPA, monitorControlLength})
 	if err := vm.mapStage2Locked(monitorStatesGPA, m.statesHost, monitorStatesLength, vmm.Stage2Read|vmm.Stage2Write); err != nil {
 		return nil, err
 	}
@@ -391,7 +393,7 @@ func (m *monitorMemory) releaseHost() {
 		m.statesHost = 0
 	}
 	if m.controlHost != 0 {
-		_ = alloc.Release(m.controlHost, vmm.HostSlabSize)
+		_ = alloc.Release(m.controlHost, monitorControlLength)
 		m.controlHost = 0
 	}
 	if m.codeHost != 0 {

@@ -133,7 +133,7 @@ void MONITOR_CODE ttc_monitor_bootstrap(struct ttc_monitor_control* ctl) {
     if (!boot_map_range(ctl, ctl->code_va, ctl->code_gpa,
                         ctl->code_length, code_flags) ||
         !boot_map_range(ctl, ctl->control_va, ctl->control_gpa,
-                        TTC_MONITOR_HOST_SLAB_SIZE, data_flags) ||
+                        TTC_MONITOR_CONTROL_SIZE, data_flags) ||
         !boot_map_range(ctl, ctl->states_va, ctl->states_gpa,
                         ctl->state_count * TTC_MONITOR_HOST_SLAB_SIZE,
                         data_flags)) {
@@ -242,18 +242,29 @@ static int MONITOR_CODE recycle_table(struct ttc_monitor_control* ctl,
   return recycle_page(ctl, table_gpa);
 }
 
+static MONITOR_INLINE struct ttc_monitor_address_space* space_slot(
+    struct ttc_monitor_control* ctl, uint64_t id, uint64_t probe) {
+  return &ctl->spaces[(id + probe) & (TTC_MONITOR_MAX_ADDRESS_SPACES - 1)];
+}
+
+// An address space lives in the first free slot from its home slot, its ID
+// modulo the table's size. The host issues IDs in increasing order, so spaces
+// rarely leave their home slots, and a lookup probes at most
+// space_probe_limit slots past it.
 static struct ttc_monitor_address_space* MONITOR_CODE find_space(
     struct ttc_monitor_control* ctl, uint64_t id) {
-  for (uint64_t i = 0; i < TTC_MONITOR_MAX_ADDRESS_SPACES; ++i) {
-    uint8_t active = *(volatile uint8_t*)&ctl->spaces[i].active;
+  uint64_t limit = *(volatile uint64_t*)&ctl->space_probe_limit;
+  for (uint64_t probe = 0; probe <= limit; ++probe) {
+    struct ttc_monitor_address_space* space = space_slot(ctl, id, probe);
+    uint8_t active = *(volatile uint8_t*)&space->active;
     if (active) {
       // Pair with create_space's release publication. Application entry runs
       // concurrently on other vCPUs and must not observe active before the
       // root, ASID, and ID are globally visible.
       __asm__ __volatile__("dmb ishld" ::: "memory");
     }
-    if (active && ctl->spaces[i].id == id) {
-      return &ctl->spaces[i];
+    if (active && space->id == id) {
+      return space;
     }
   }
   return 0;
@@ -472,8 +483,9 @@ static uint32_t MONITOR_CODE create_space(struct ttc_monitor_control* ctl,
       find_space(ctl, id) != 0) {
     return TTC_STATUS_CONFLICT;
   }
-  for (uint64_t i = 0; i < TTC_MONITOR_MAX_ADDRESS_SPACES; ++i) {
-    if (!ctl->spaces[i].active) {
+  for (uint64_t probe = 0; probe < TTC_MONITOR_MAX_ADDRESS_SPACES; ++probe) {
+    struct ttc_monitor_address_space* space = space_slot(ctl, id, probe);
+    if (!space->active) {
       uint64_t root = alloc_page(ctl);
       if (root == 0) {
         return TTC_STATUS_NO_MEMORY;
@@ -483,12 +495,17 @@ static uint32_t MONITOR_CODE create_space(struct ttc_monitor_control* ctl,
         (void)recycle_page(ctl, root);
         return TTC_STATUS_INTERNAL;
       }
-      ctl->spaces[i].id = id;
-      ctl->spaces[i].root_gpa = root;
-      ctl->spaces[i].asid = (uint16_t)asid;
-      ctl->spaces[i].flags = (uint32_t)flags;
+      space->id = id;
+      space->root_gpa = root;
+      space->asid = (uint16_t)asid;
+      space->flags = (uint32_t)flags;
+      // Lookups of this ID start only once the host has its response, which
+      // follows the publication below.
+      if (probe > ctl->space_probe_limit) {
+        ctl->space_probe_limit = probe;
+      }
       ttc_monitor_dsb_ishst();
-      *(volatile uint8_t*)&ctl->spaces[i].active = 1;
+      *(volatile uint8_t*)&space->active = 1;
       ttc_monitor_dsb_ish();
       return TTC_STATUS_OK;
     }
