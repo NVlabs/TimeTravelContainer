@@ -122,20 +122,79 @@ func EpollCtl(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintpt
 	}
 }
 
-func waitEpoll(t *kernel.Task, epfd int32, eventsAddr hostarch.Addr, maxEvents int, timeoutInNanos int64) (uintptr, *kernel.SyscallControl, error) {
+// waitEpoll implements the wait of epoll_wait(2) and epoll_pwait(2): it
+// waits forever if timeoutInNanos is negative. tempMask is whether the
+// caller set a temporary signal mask.
+//
+// Linux fails an interrupted wait with EINTR. So does the sentry if a signal
+// handler runs. Otherwise, as after its pause for a checkpoint or a live
+// fork, it restarts the wait, with the same deadline, rather than have the
+// application retry it: after a pause, every waiting thread would do so at
+// once. A timed wait with a temporary signal mask still fails with EINTR,
+// since its restart would have to set the mask again.
+func waitEpoll(t *kernel.Task, epfd int32, eventsAddr hostarch.Addr, maxEvents int, timeoutInNanos int64, tempMask bool) (uintptr, *kernel.SyscallControl, error) {
+	var deadline ktime.Time
+	if timeoutInNanos > 0 {
+		deadline = t.Kernel().MonotonicClock().Now().Add(time.Duration(timeoutInNanos) * time.Nanosecond)
+	}
+	n, err := epollWaitUntil(t, epfd, eventsAddr, maxEvents, timeoutInNanos, deadline)
+	if linuxerr.Equals(linuxerr.ErrInterrupted, err) {
+		switch {
+		case timeoutInNanos < 0:
+			err = linuxerr.ERESTARTNOHAND
+		case !tempMask:
+			t.SetSyscallRestartBlock(&epollWaitRestartBlock{
+				epfd:       epfd,
+				eventsAddr: eventsAddr,
+				maxEvents:  maxEvents,
+				deadline:   deadline,
+			})
+			err = linuxerr.ERESTART_RESTARTBLOCK
+		}
+	}
+	return n, nil, err
+}
+
+// epollWaitRestartBlock restarts a timed epoll wait via restart_syscall(2),
+// until its deadline.
+//
+// +stateify savable
+type epollWaitRestartBlock struct {
+	epfd       int32
+	eventsAddr hostarch.Addr
+	maxEvents  int
+	deadline   ktime.Time
+}
+
+// Restart implements kernel.SyscallRestartBlock.Restart.
+func (r *epollWaitRestartBlock) Restart(t *kernel.Task) (uintptr, error) {
+	// A deadline in the past times out at once.
+	remaining := max(r.deadline.Sub(t.Kernel().MonotonicClock().Now()).Nanoseconds(), 1)
+	n, err := epollWaitUntil(t, r.epfd, r.eventsAddr, r.maxEvents, remaining, r.deadline)
+	if linuxerr.Equals(linuxerr.ErrInterrupted, err) {
+		t.SetSyscallRestartBlock(r)
+		err = linuxerr.ERESTART_RESTARTBLOCK
+	}
+	return n, err
+}
+
+// epollWaitUntil reads epfd's ready events to eventsAddr. If there are none,
+// it returns at once if timeoutInNanos is 0, and otherwise waits for them:
+// forever if timeoutInNanos is negative, else until deadline.
+func epollWaitUntil(t *kernel.Task, epfd int32, eventsAddr hostarch.Addr, maxEvents int, timeoutInNanos int64, deadline ktime.Time) (uintptr, error) {
 	var _EP_MAX_EVENTS = math.MaxInt32 / sizeofEpollEvent // Linux: fs/eventpoll.c:EP_MAX_EVENTS
 	if maxEvents <= 0 || maxEvents > _EP_MAX_EVENTS {
-		return 0, nil, linuxerr.EINVAL
+		return 0, linuxerr.EINVAL
 	}
 
 	epfile := t.GetFile(epfd)
 	if epfile == nil {
-		return 0, nil, linuxerr.EBADF
+		return 0, linuxerr.EBADF
 	}
 	defer epfile.DecRef(t)
 	ep, ok := epfile.Impl().(*vfs.EpollInstance)
 	if !ok {
-		return 0, nil, linuxerr.EINVAL
+		return 0, linuxerr.EINVAL
 	}
 
 	// Record what this wait is actually for. The syscall number says only that
@@ -148,10 +207,8 @@ func waitEpoll(t *kernel.Task, epfd int32, eventsAddr hostarch.Addr, maxEvents i
 	// Allocate space for a few events on the stack for the common case in
 	// which we don't have too many events.
 	var (
-		eventsArr    [16]linux.EpollEvent
-		ch           chan struct{}
-		haveDeadline bool
-		deadline     ktime.Time
+		eventsArr [16]linux.EpollEvent
+		ch        chan struct{}
 	)
 	for {
 		events := ep.ReadEvents(eventsArr[:0], maxEvents)
@@ -159,12 +216,12 @@ func waitEpoll(t *kernel.Task, epfd int32, eventsAddr hostarch.Addr, maxEvents i
 			copiedBytes, err := linux.CopyEpollEventSliceOut(t, eventsAddr, events)
 			copiedEvents := copiedBytes / sizeofEpollEvent // rounded down
 			if copiedEvents != 0 {
-				return uintptr(copiedEvents), nil, nil
+				return uintptr(copiedEvents), nil
 			}
-			return 0, nil, err
+			return 0, err
 		}
 		if timeoutInNanos == 0 {
-			return 0, nil, nil
+			return 0, nil
 		}
 		// In the first iteration of this loop, register with the epoll
 		// instance for readability events, but then immediately continue the
@@ -175,21 +232,15 @@ func waitEpoll(t *kernel.Task, epfd int32, eventsAddr hostarch.Addr, maxEvents i
 			var w waiter.Entry
 			w, ch = waiter.NewChannelEntry(waiter.ReadableEvents)
 			if err := epfile.EventRegister(&w); err != nil {
-				return 0, nil, err
+				return 0, err
 			}
 			defer epfile.EventUnregister(&w)
 		} else {
-			// Set up the timer if a timeout was specified.
-			if timeoutInNanos > 0 && !haveDeadline {
-				timeoutDur := time.Duration(timeoutInNanos) * time.Nanosecond
-				deadline = t.Kernel().MonotonicClock().Now().Add(timeoutDur)
-				haveDeadline = true
-			}
-			if err := t.BlockWithDeadline(ch, haveDeadline, deadline); err != nil {
+			if err := t.BlockWithDeadline(ch, timeoutInNanos > 0, deadline); err != nil {
 				if linuxerr.Equals(linuxerr.ETIMEDOUT, err) {
 					err = nil
 				}
-				return 0, nil, err
+				return 0, err
 			}
 		}
 	}
@@ -203,7 +254,7 @@ func EpollWait(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintp
 	maxEvents := int(args[2].Int())
 	timeoutInNanos := int64(args[3].Int()) * 1000000
 
-	return waitEpoll(t, epfd, eventsAddr, maxEvents, timeoutInNanos)
+	return waitEpoll(t, epfd, eventsAddr, maxEvents, timeoutInNanos, false /* tempMask */)
 }
 
 // EpollPwait implements Linux syscall epoll_pwait(2).
@@ -215,7 +266,11 @@ func EpollPwait(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uint
 		return 0, nil, err
 	}
 
-	return EpollWait(t, sysno, args)
+	epfd := args[0].Int()
+	eventsAddr := args[1].Pointer()
+	maxEvents := int(args[2].Int())
+	timeoutInNanos := int64(args[3].Int()) * 1000000
+	return waitEpoll(t, epfd, eventsAddr, maxEvents, timeoutInNanos, maskAddr != 0)
 }
 
 // EpollPwait2 implements Linux syscall epoll_pwait(2).
@@ -241,5 +296,5 @@ func EpollPwait2(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uin
 		return 0, nil, err
 	}
 
-	return waitEpoll(t, epfd, eventsAddr, maxEvents, timeoutInNanos)
+	return waitEpoll(t, epfd, eventsAddr, maxEvents, timeoutInNanos, maskAddr != 0)
 }

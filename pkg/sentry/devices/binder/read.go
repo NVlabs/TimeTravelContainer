@@ -165,7 +165,11 @@ done:
 }
 
 // wait waits for th's work, or, if procWork, its proc's, as Linux's
-// binder_wait_for_work does.
+// binder_wait_for_work does. An interrupted wait fails with EINTR, as
+// Linux's, if a signal handler runs; otherwise, as after the sentry's pause
+// for a checkpoint or a live fork, the ioctl restarts where it stopped
+// (writeRead has written its progress back), as libbinder would retry it,
+// without resuming the application.
 //
 // Preconditions: the device's mutex is locked. It unlocks it while it
 // waits.
@@ -185,7 +189,7 @@ func (th *thread) wait(t *kernel.Task, procWork bool) error {
 		th.queue.EventUnregister(&e)
 		th.removeWaiting()
 		if err != nil {
-			return linuxerr.EINTR
+			return linuxerr.ERESTARTNOHAND
 		}
 	}
 	return nil

@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package linux
 
 import (
@@ -331,6 +334,13 @@ func RtSigtimedwait(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (
 
 	si, err := t.Sigtimedwait(mask, timeout)
 	if err != nil {
+		// An untimed wait that a signal handler does not interrupt, as the
+		// sentry's pause for a checkpoint or a live fork does, restarts
+		// rather than fail with EINTR, which each waiting thread, such as
+		// every ART runtime's signal catcher, would retry at once.
+		if timespec == 0 && linuxerr.Equals(linuxerr.ErrInterrupted, err) {
+			err = linuxerr.ERESTARTNOHAND
+		}
 		return 0, nil, err
 	}
 
