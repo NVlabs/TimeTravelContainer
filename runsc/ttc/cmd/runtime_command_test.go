@@ -35,6 +35,10 @@ func TestEmbeddedRuntimeCommandAnswersOnlyWhatItRuns(t *testing.T) {
 		{"timetravel", "--source", "main", "family", "fork"},
 		{"timetravel", "--source", "main", "family", "pause", "b1"},
 		{"timetravel", "--source", "main", "--filesystem-origins-fd=3", "family", "fork", "b1"},
+		{"timetravel", "--console", "c1", "--max-bytes", "10", "family", "console-read", "main"},
+		{"timetravel", "--console", "c1", "family", "console-read", "main"},
+		{"timetravel", "--console", "c1", "family", "console-write"},
+		{"timetravel", "--console", "c1", "--wait-timeout=soon", "family", "console-wait", "main"},
 		{"timetravel", "--signal", "15", "family", "pause", "main"},
 		{"timetravel", "--signal", "TERM", "family", "signal", "main"},
 		{"timetravel", "family", "signal", "main"},
@@ -57,6 +61,11 @@ func TestEmbeddedRuntimeCommandAnswersOnlyWhatItRuns(t *testing.T) {
 		{"timetravel", "--signal", "15", "--all", "missing", "signal", "main"},
 		{"timetravel", "--source", "main", "missing", "fork", "b1"},
 		{"timetravel", "--source", "main", "--paused", "--quarantine", "missing", "fork", "b1", "b2"},
+		{"timetravel", "--console", "c1", "--data-base64", "aGk=", "missing", "console-write", "main"},
+		{"timetravel", "--console", "c1", "--data-base64", "!!", "family", "console-write", "main"},
+		{"timetravel", "--console", "c1", "--wait-stdin", "--wait-timeout=1s", "missing", "console-wait", "main"},
+		{"timetravel", "--console", "c1", "missing", "console-close-stdin", "main"},
+		{"timetravel", "--console", "c1", "missing", "console-stat", "main"},
 	} {
 		if _, answered, err := embeddedRuntimeCommand(root, args); !answered || err == nil {
 			t.Errorf("embeddedRuntimeCommand(%q) of a missing sandbox: answered %t, err %v; want an error", args, answered, err)

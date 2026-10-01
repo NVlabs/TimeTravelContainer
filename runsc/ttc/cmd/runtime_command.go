@@ -4,13 +4,17 @@
 package cmd
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"time"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/container"
 )
@@ -75,13 +79,75 @@ var embeddedBranchActions = map[string]func(c *container.Container, branch strin
 // embeddedRuntimeCommand runs, in ttcd's own process, the runtime commands
 // ttcd runs most, each a read of runsc's state and at most one call to a
 // Sentry: listing the sandboxes in root, a sandbox's state, a family's
-// branches, a signal to a branch, the branch actions above, and a fork.
+// branches, a signal to a branch, the branch actions above, a fork, and the
+// calls on a branch's internal console that its attached clients make.
 // Starting a copy of ttcd to run one costs more than the call. It returns
 // what the command would print, and false for any other command, which must
 // be run as a command. Errors are flattened to their text, as a command's are.
 func embeddedRuntimeCommand(root string, args []string) ([]byte, bool, error) {
 	var output any
 	switch {
+	case len(args) >= 6 && args[0] == "timetravel" && args[1] == "--console":
+		// timetravel --console ID [--data-base64 DATA] [--wait-stdin]
+		// [--wait-timeout=DURATION] CONTAINER ACTION BRANCH
+		consoleID, rest := args[2], args[3:]
+		var data []byte
+		waitStdin, waitTimeout := false, time.Second
+		for len(rest) != 0 && strings.HasPrefix(rest[0], "--") {
+			switch {
+			case rest[0] == "--data-base64" && len(rest) > 1:
+				decoded, err := base64.StdEncoding.DecodeString(rest[1])
+				if err != nil {
+					return nil, true, fmt.Errorf("decoding --data-base64: %v", err)
+				}
+				data, rest = decoded, rest[2:]
+			case rest[0] == "--wait-stdin":
+				waitStdin, rest = true, rest[1:]
+			case strings.HasPrefix(rest[0], "--wait-timeout="):
+				timeout, err := time.ParseDuration(strings.TrimPrefix(rest[0], "--wait-timeout="))
+				if err != nil {
+					return nil, false, nil
+				}
+				waitTimeout, rest = timeout, rest[1:]
+			default:
+				return nil, false, nil
+			}
+		}
+		if len(rest) != 3 {
+			return nil, false, nil
+		}
+		action, branch := rest[1], rest[2]
+		var call func(*container.Container) (any, error)
+		switch action {
+		case "console-write":
+			call = func(c *container.Container) (any, error) {
+				return c.Sandbox.WriteConsole(&boot.ConsoleWriteArgs{BranchID: branch, ConsoleID: consoleID, Data: data})
+			}
+		case "console-wait":
+			call = func(c *container.Container) (any, error) {
+				return c.Sandbox.WaitConsole(&boot.ConsoleWaitArgs{
+					BranchID: branch, ConsoleID: consoleID,
+					Want: kernel.InternalConsoleReadiness{Stdin: waitStdin}, Timeout: waitTimeout,
+				})
+			}
+		case "console-close-stdin":
+			call = func(c *container.Container) (any, error) {
+				return nil, c.Sandbox.CloseConsoleStdin(&boot.ConsoleCloseStdinArgs{BranchID: branch, ConsoleID: consoleID})
+			}
+		case "console-stat":
+			call = func(c *container.Container) (any, error) {
+				return c.Sandbox.ObserveConsole(&boot.ConsoleObservationArgs{BranchID: branch, ConsoleID: consoleID})
+			}
+		default:
+			return nil, false, nil
+		}
+		c, err := container.Load(root, container.FullID{ContainerID: rest[0]}, container.LoadOpts{SkipCheck: true})
+		if err != nil {
+			return nil, true, fmt.Errorf("loading container: %v", err)
+		}
+		if output, err = call(c); err != nil {
+			return nil, true, fmt.Errorf("timetravel %s failed: %v", action, err)
+		}
 	case len(args) >= 5 && args[0] == "timetravel" && args[1] == "--source":
 		// timetravel --source BRANCH [--paused] [--quarantine] ID fork
 		// DESTINATION...
