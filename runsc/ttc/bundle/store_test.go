@@ -811,3 +811,14 @@ func TestRepositoryInventoryPassesOverAContainerRemovedSinceListing(t *testing.T
 		t.Fatal("inventory of a present container whose spec cannot be read succeeded")
 	}
 }
+
+func TestTTCNetworkInterface(t *testing.T) {
+	if got := (ContainerInfo{NetworkInterface: "eth1"}).TTCNetworkInterface(); got != "eth1" {
+		t.Errorf("TTCNetworkInterface()=%q, want eth1", got)
+	}
+	// Containers recorded before their interface's name was keep the name
+	// that they were created with.
+	if got := (ContainerInfo{}).TTCNetworkInterface(); got != LegacyNetworkInterface {
+		t.Errorf("TTCNetworkInterface() of a legacy record=%q, want %q", got, LegacyNetworkInterface)
+	}
+}

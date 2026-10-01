@@ -35,6 +35,7 @@ import (
 	"gvisor.dev/gvisor/pkg/ttcpack"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
+	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
 	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
 	"gvisor.dev/gvisor/runsc/ttc/images"
@@ -48,6 +49,12 @@ const (
 	hostMountRepositoryDir   = "host-mounts"
 	// DefaultLogDriver is the persistent logging policy used when none is specified.
 	DefaultLogDriver = "local"
+	// DefaultNetworkInterface is the guest's name for the ttc virtual NIC
+	// when none is specified: eth0, as Docker names a container's interface.
+	DefaultNetworkInterface = "eth0"
+	// LegacyNetworkInterface named the ttc virtual NIC of containers created
+	// before their records held its name.
+	LegacyNetworkInterface = "ttc0"
 )
 
 // removedContainerDir is outside the active container namespace so that a
@@ -521,6 +528,7 @@ type PrepareOptions struct {
 	NetworkNAT         bool
 	NetworkIP          string
 	NetworkMAC         string
+	NetworkInterface   string
 	PublishedPorts     []PortBinding
 	WaiveLiveFork      bool
 	LiveForkWaiver     string
@@ -813,6 +821,7 @@ type ContainerInfo struct {
 	NetworkNAT                   bool                             `json:"network_nat,omitempty"`
 	NetworkIP                    string                           `json:"network_ip,omitempty"`
 	NetworkMAC                   string                           `json:"network_mac,omitempty"`
+	NetworkInterface             string                           `json:"network_interface,omitempty"`
 	PublishedPorts               []PortBinding                    `json:"published_ports,omitempty"`
 	LogDriver                    string                           `json:"log_driver,omitempty"`
 	LogOptions                   map[string]string                `json:"log_options,omitempty"`
@@ -864,6 +873,15 @@ type ContainerInfo struct {
 	DistributedCatalogOnly bool `json:"distributed_catalog_only,omitempty"`
 	// GPUOptions are the family's GPU devices.
 	GPUOptions
+}
+
+// TTCNetworkInterface returns the guest's name for the container's ttc
+// virtual NIC.
+func (info ContainerInfo) TTCNetworkInterface() string {
+	if info.NetworkInterface != "" {
+		return info.NetworkInterface
+	}
+	return LegacyNetworkInterface
 }
 
 // IsDistributedPhysicalRuntime reports whether info is a node-local physical
@@ -1507,6 +1525,18 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if (opts.NetworkIP != "" || opts.NetworkMAC != "") && networkMode != "ttc" {
 		return Prepared{}, fmt.Errorf("custom IP and MAC addresses require network mode ttc")
 	}
+	if opts.NetworkInterface != "" {
+		if networkMode != "ttc" {
+			return Prepared{}, fmt.Errorf("a custom interface name requires network mode ttc")
+		}
+		if err := config.ValidateNetworkInterfaceName(opts.NetworkInterface); err != nil {
+			return Prepared{}, err
+		}
+	} else if networkMode == "ttc" {
+		// Record the name, so that the container keeps it whatever later
+		// releases default to.
+		opts.NetworkInterface = DefaultNetworkInterface
+	}
 	if len(opts.PublishedPorts) != 0 && networkMode != "ttc" {
 		return Prepared{}, fmt.Errorf("published ports require network mode ttc")
 	}
@@ -1682,6 +1712,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		NetworkNAT:          opts.NetworkNAT,
 		NetworkIP:           opts.NetworkIP,
 		NetworkMAC:          opts.NetworkMAC,
+		NetworkInterface:    opts.NetworkInterface,
 		PublishedPorts:      append([]PortBinding(nil), opts.PublishedPorts...),
 		GPUOptions:          opts.GPUOptions,
 		LogDriver:           logDriver,

@@ -163,6 +163,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool("ttc-network-quarantine", false, "start with the TTC runtime-owned external network edge disconnected")
 	ttcNetworkIP := flagSet.String("ttc-network-ip", "", "IPv4 address for the --network=ttc virtual NIC (default 10.0.2.15)")
 	ttcNetworkMAC := flagSet.String("ttc-network-mac", "", "MAC address for the --network=ttc virtual NIC")
+	flagSet.String("ttc-network-interface", "", "guest's name for the --network=ttc virtual NIC (default eth0)")
 	// Keep old low-level runsc arguments working for bundles and launchers
 	// produced before the TimeTravelContainer rename.
 	flagSet.BoolVar(ttcNetworkNAT, "ttos-network-nat", hostDefaultTTCNetworkNAT, "deprecated alias for --ttc-network-nat")

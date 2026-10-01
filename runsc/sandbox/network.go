@@ -80,6 +80,7 @@ func setupNetwork(conn *urpc.Client, pid int, conf *config.Config, disableIPv6 b
 			LoopbackLinks: []boot.LoopbackLink{link},
 			TimeTravel: &boot.TimeTravelNetworkConfig{
 				NAT: conf.TimeTravelNetworkNAT, GuestIP: guestIP, GuestMAC: guestMAC,
+				InterfaceName: conf.TimeTravelNetworkInterface,
 			},
 			IsRestore: isRestore,
 		}, nil); err != nil {

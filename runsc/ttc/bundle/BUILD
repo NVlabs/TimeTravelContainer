@@ -24,6 +24,7 @@ go_library(
         "//pkg/ttcpack",
         "//pkg/ttcsnapshot",
         "//pkg/ttcvolume",
+        "//runsc/config",
         "//runsc/specutils",
         "//runsc/ttc/console",
         "//runsc/ttc/images",

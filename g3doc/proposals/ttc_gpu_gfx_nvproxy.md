@@ -785,8 +785,9 @@ repository. `runsc/ttc/test/e2e_redroid.sh` checks that.
         add `CAP_NET_RAW`, alarm clocks for AlarmManager, `/proc/pressure`
         for lmkd, and real-time scheduling policies, recorded without effect,
         for Bluetooth;
-    *   for Android's network: TTC's interface named `eth0`, as Docker's is,
-        which Android's Ethernet service manages; `/sys/class/net`, where
+    *   for Android's network: TTC's interface named `eth0` by default, as
+        Docker's is (`--interface-name` names it otherwise), which Android's
+        Ethernet service manages; `/sys/class/net`, where
         netd lists interfaces; the per-interface settings of
         `/proc/sys/net/ipv{4,6}/{conf,neigh}`, which netd and IpClient
         write; `SIOCSIFADDR` and `SIOCSIFNETMASK`, with which IpClient sets

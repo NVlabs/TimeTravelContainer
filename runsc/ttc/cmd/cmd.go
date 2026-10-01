@@ -48,6 +48,7 @@ import (
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 
 	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/processutil"
@@ -1580,9 +1581,14 @@ func validateLiveForkCreationPolicy(networkMode string, waived bool) error {
 	return nil
 }
 
-func validateVirtualNICOptions(networkMode, ipValue, macValue string) error {
-	if (ipValue != "" || macValue != "") && networkMode != "ttc" {
-		return errors.New("--ip and --mac-address require --network=ttc")
+func validateVirtualNICOptions(networkMode, ipValue, macValue, interfaceName string) error {
+	if (ipValue != "" || macValue != "" || interfaceName != "") && networkMode != "ttc" {
+		return errors.New("--ip, --mac-address, and --interface-name require --network=ttc")
+	}
+	if interfaceName != "" {
+		if err := config.ValidateNetworkInterfaceName(interfaceName); err != nil {
+			return fmt.Errorf("--interface-name: %w", err)
+		}
 	}
 	if ipValue != "" {
 		ip, err := netip.ParseAddr(ipValue)
@@ -1788,6 +1794,7 @@ type runRequest struct {
 	networkNAT         bool
 	networkIP          string
 	networkMAC         string
+	networkInterface   string
 	publishedPorts     []ttcbundle.PortBinding
 	logDriver          string
 	extraHosts         []string
@@ -1867,7 +1874,7 @@ func flagWasSet(fs *flag.FlagSet, name string) bool {
 }
 
 func runContainer(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "dit", "--name", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--ip", "--mac-address", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--memory-swap", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt", "--gfx-fork", "--nvproxy-fork")
+	args = expandCombinedShortBools(args, "dit", "--name", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--ip", "--mac-address", "--interface-name", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--memory-swap", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt", "--gfx-fork", "--nvproxy-fork")
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -1903,6 +1910,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	networkNAT := fs.Bool("nat", false, "allow outbound host networking from a ttc virtual NIC")
 	networkIP := fs.String("ip", "", "IPv4 address for the ttc virtual NIC")
 	networkMAC := fs.String("mac-address", "", "MAC address for the ttc virtual NIC")
+	networkInterface := fs.String("interface-name", "", "guest's name for the ttc virtual NIC (default "+ttcbundle.DefaultNetworkInterface+")")
 	logDriverValue := fs.String("log-driver", ttcbundle.DefaultLogDriver, "logging driver: local, json-file, or none")
 	fs.StringVar(networkModeValue, "net", "none", "network mode: none, host, or ttc")
 	entrypoint := fs.String("entrypoint", "", "override the image entrypoint")
@@ -1983,7 +1991,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	if *networkNAT && networkMode != "ttc" {
 		return errors.New("--nat requires --network=ttc")
 	}
-	if err := validateVirtualNICOptions(networkMode, *networkIP, *networkMAC); err != nil {
+	if err := validateVirtualNICOptions(networkMode, *networkIP, *networkMAC, *networkInterface); err != nil {
 		return err
 	}
 	publishedPorts, err := parsePublishedPorts(publishedPortValues)
@@ -2096,6 +2104,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		networkNAT:         *networkNAT,
 		networkIP:          *networkIP,
 		networkMAC:         strings.ToLower(*networkMAC),
+		networkInterface:   *networkInterface,
 		publishedPorts:     publishedPorts,
 		logDriver:          logDriver,
 		extraHosts:         parsedExtraHosts,
@@ -2150,7 +2159,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 }
 
 func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "it", "--name", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--ip", "--mac-address", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--memory-swap", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt", "--gfx-fork", "--nvproxy-fork")
+	args = expandCombinedShortBools(args, "it", "--name", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--ip", "--mac-address", "--interface-name", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--memory-swap", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt", "--gfx-fork", "--nvproxy-fork")
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -2184,6 +2193,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	networkNAT := fs.Bool("nat", false, "allow outbound host networking from a ttc virtual NIC")
 	networkIP := fs.String("ip", "", "IPv4 address for the ttc virtual NIC")
 	networkMAC := fs.String("mac-address", "", "MAC address for the ttc virtual NIC")
+	networkInterface := fs.String("interface-name", "", "guest's name for the ttc virtual NIC (default "+ttcbundle.DefaultNetworkInterface+")")
 	logDriverValue := fs.String("log-driver", ttcbundle.DefaultLogDriver, "logging driver: local, json-file, or none")
 	fs.StringVar(networkModeValue, "net", "none", "network mode: none, host, or ttc")
 	entrypoint := fs.String("entrypoint", "", "override the image entrypoint")
@@ -2264,7 +2274,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	if *networkNAT && networkMode != "ttc" {
 		return errors.New("--nat requires --network=ttc")
 	}
-	if err := validateVirtualNICOptions(networkMode, *networkIP, *networkMAC); err != nil {
+	if err := validateVirtualNICOptions(networkMode, *networkIP, *networkMAC, *networkInterface); err != nil {
 		return err
 	}
 	publishedPorts, err := parsePublishedPorts(publishedPortValues)
@@ -2377,6 +2387,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		networkNAT:         *networkNAT,
 		networkIP:          *networkIP,
 		networkMAC:         strings.ToLower(*networkMAC),
+		networkInterface:   *networkInterface,
 		publishedPorts:     publishedPorts,
 		logDriver:          logDriver,
 		extraHosts:         parsedExtraHosts,
@@ -7728,6 +7739,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 		NetworkNAT:              request.networkNAT,
 		NetworkIP:               request.networkIP,
 		NetworkMAC:              request.networkMAC,
+		NetworkInterface:        request.networkInterface,
 		PublishedPorts:          persistedPorts,
 		WaiveLiveFork:           !request.liveForkEligible,
 		LiveForkWaiver:          request.liveForkWaiver,
@@ -7875,6 +7887,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 		NetworkNAT:         request.networkNAT,
 		NetworkIP:          request.networkIP,
 		NetworkMAC:         request.networkMAC,
+		NetworkInterface:   request.networkInterface,
 		PublishedPorts:     request.publishedPorts,
 		WaiveLiveFork:      !request.liveForkEligible,
 		LiveForkWaiver:     request.liveForkWaiver,
@@ -10864,10 +10877,10 @@ func (b *runtimeBackend) configuredRunscArgsForNetwork(networkMode string) []str
 }
 
 func (b *runtimeBackend) configuredRunscArgsForNetworkNAT(networkMode string, networkNAT bool) []string {
-	return b.configuredRunscArgsForNetworkConfig(networkMode, networkNAT, "", "")
+	return b.configuredRunscArgsForNetworkConfig(networkMode, networkNAT, "", "", "")
 }
 
-func (b *runtimeBackend) configuredRunscArgsForNetworkConfig(networkMode string, networkNAT bool, networkIP, networkMAC string) []string {
+func (b *runtimeBackend) configuredRunscArgsForNetworkConfig(networkMode string, networkNAT bool, networkIP, networkMAC, networkInterface string) []string {
 	runtimePlatform := b.runtimePlatform
 	if runtimePlatform == "" {
 		runtimePlatform = defaultRuntimePlatform
@@ -10907,6 +10920,9 @@ func (b *runtimeBackend) configuredRunscArgsForNetworkConfig(networkMode string,
 		}
 		if networkMAC != "" {
 			args = append(args, "--ttc-network-mac="+networkMAC)
+		}
+		if networkInterface != "" {
+			args = append(args, "--ttc-network-interface="+networkInterface)
 		}
 	}
 	return args
@@ -10964,7 +10980,7 @@ func (b *runtimeBackend) runtimeDiagnosticSince(containerID string, since time.T
 }
 
 func (b *runtimeBackend) configuredRunscArgsForBranch(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) ([]string, error) {
-	args := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
+	args := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC, info.TTCNetworkInterface())
 	if branch.Quarantined {
 		args = append(args, "--ttc-network-quarantine=true")
 	}
@@ -11470,7 +11486,7 @@ func (b *runtimeBackend) ensurePublishedPort(info ttcbundle.ContainerInfo, bindi
 	}
 	defer readyReader.Close()
 	endpoint := fmt.Sprintf("%s:%d:%d", binding.HostIP, binding.HostPort, binding.ContainerPort)
-	args := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
+	args := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC, info.TTCNetworkInterface())
 	args = append(args, "port-forward", "--ttc-allow-stopped-sandbox", "--branch="+binding.Branch(), "--ready-fd=4", info.ID, endpoint)
 	command := runscCommand(b.runsc, args...)
 	command.Stdout = errorFile
@@ -16409,7 +16425,7 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 		return fmt.Errorf("preparing dehydration restore bundle: %w", err)
 	}
 	defer cleanupBundle()
-	configured := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
+	configured := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC, info.TTCNetworkInterface())
 	configured, err = b.withRuntimeDiagnostics(configured, info.ID)
 	if err != nil {
 		return err
@@ -16882,7 +16898,7 @@ func dehydrationNetworkArgs(info ttcbundle.ContainerInfo) (*boot.CreateLinksAndR
 	case "none":
 		return args, nil
 	case "ttc":
-		cfg := &boot.TimeTravelNetworkConfig{NAT: info.NetworkNAT}
+		cfg := &boot.TimeTravelNetworkConfig{NAT: info.NetworkNAT, InterfaceName: info.TTCNetworkInterface()}
 		if info.NetworkIP != "" {
 			cfg.GuestIP = net.ParseIP(info.NetworkIP)
 			if cfg.GuestIP == nil {

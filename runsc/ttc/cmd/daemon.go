@@ -294,7 +294,7 @@ func placementOptionConsumesValue(command, arg string) bool {
 		return name == "name"
 	case "run", "create":
 		switch name {
-		case "name", "pull", "workdir", "w", "user", "u", "hostname", "h", "network", "net", "ip", "mac-address", "publish", "p", "add-host", "dns", "dns-search", "dns-option", "dns-opt", "entrypoint", "stop-signal", "stop-timeout", "pids-limit", "memory", "m", "memory-swap", "cpus", "cpu-shares", "cpu-period", "cpu-quota", "shm-size", "group-add", "cap-add", "cap-drop", "ulimit", "env", "e", "env-file", "label", "l", "label-file", "volume", "v", "mount", "tmpfs", "log-driver", "log-opt":
+		case "name", "pull", "workdir", "w", "user", "u", "hostname", "h", "network", "net", "ip", "mac-address", "interface-name", "publish", "p", "add-host", "dns", "dns-search", "dns-option", "dns-opt", "entrypoint", "stop-signal", "stop-timeout", "pids-limit", "memory", "m", "memory-swap", "cpus", "cpu-shares", "cpu-period", "cpu-quota", "shm-size", "group-add", "cap-add", "cap-drop", "ulimit", "env", "e", "env-file", "label", "l", "label-file", "volume", "v", "mount", "tmpfs", "log-driver", "log-opt":
 			return true
 		}
 	}
@@ -1272,7 +1272,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		restoreArgs.PrefetchBehindBytes = (windowPages / 2) * tx.Negotiated.PagingPolicy.PageSize
 		restoreArgs.PrefetchBytes = (windowPages - windowPages/2) * tx.Negotiated.PagingPolicy.PageSize
 	}
-	configured := r.backend.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
+	configured := r.backend.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC, info.TTCNetworkInterface())
 	configured, err = r.backend.withRuntimeDiagnostics(configured, info.ID)
 	if err != nil {
 		return err

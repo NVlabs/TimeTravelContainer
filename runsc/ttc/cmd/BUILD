@@ -68,6 +68,7 @@ go_library(
         "//pkg/ttcsnapshot",
         "//pkg/ttcvolume",
         "//runsc/boot",
+        "//runsc/config",
         "//runsc/container",
         "//runsc/flag",
         "//runsc/processutil",

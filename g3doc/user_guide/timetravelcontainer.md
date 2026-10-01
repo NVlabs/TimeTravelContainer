@@ -1039,28 +1039,31 @@ preserves internal connections and unread data independently in both branches.
 
 `ttc` adds a rootless, Sentry-managed IPv4 interface without TAP, veth, a host
 network namespace, CNI, or elevated network capabilities. It is `eth0`, as a
-Docker container's interface is:
+Docker container's interface is, unless `--interface-name` names it otherwise:
 
 ```text
 eth0       10.0.2.15/24           MAC 02:42:0a:00:02:0f
 gateway     10.0.2.2
 ```
 
-Set a stable guest-visible address and MAC at create/run time when a test needs
-a particular network identity:
+Set a stable guest-visible address, MAC, and interface name at create/run time
+when a test needs a particular network identity:
 
 ```shell
 ttc run -d --name appliance --network ttc --nat \
-  --ip 192.0.2.44 --mac-address 02:aa:bb:cc:dd:ee \
+  --ip 192.0.2.44 --mac-address 02:aa:bb:cc:dd:ee --interface-name net0 \
   alpine:3.20 sleep 600
 ```
 
-Both values are persistent container configuration and survive start, restart,
+These values are persistent container configuration and survive start, restart,
 and live fork. The address must be unicast IPv4; TTC uses a `/24` and reserves
 the `.2` address in that subnet for its gateway, in addition to the network and
-broadcast addresses. The MAC must be a unicast 48-bit address. `--ip` and
-`--mac-address` are valid only with `--network ttc`. If no custom value is
-given, the defaults above apply.
+broadcast addresses. The MAC must be a unicast 48-bit address. The interface
+name follows Linux's rules: 1 to 15 bytes, without `/`, `:`, or white space,
+and not `lo`. `--ip`, `--mac-address`, and `--interface-name` are valid only
+with `--network ttc`. If no custom value is given, the defaults above apply.
+Containers created before TTC recorded the interface's name keep `ttc0`, the
+name they were created with.
 
 The interface is useful by itself for a stable container-visible NIC. Add
 `--nat` to permit outbound IPv4 TCP and UDP through the Sentry's user-mode
