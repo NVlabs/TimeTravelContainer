@@ -75,13 +75,39 @@ var embeddedBranchActions = map[string]func(c *container.Container, branch strin
 // embeddedRuntimeCommand runs, in ttcd's own process, the runtime commands
 // ttcd runs most, each a read of runsc's state and at most one call to a
 // Sentry: listing the sandboxes in root, a sandbox's state, a family's
-// branches, a signal to a branch, and the branch actions above. Starting a
-// copy of ttcd to run one costs more than the call. It returns what the
-// command would print, and false for any other command, which must be run as
-// a command. Errors are flattened to their text, as a command's are.
+// branches, a signal to a branch, the branch actions above, and a fork.
+// Starting a copy of ttcd to run one costs more than the call. It returns
+// what the command would print, and false for any other command, which must
+// be run as a command. Errors are flattened to their text, as a command's are.
 func embeddedRuntimeCommand(root string, args []string) ([]byte, bool, error) {
 	var output any
 	switch {
+	case len(args) >= 5 && args[0] == "timetravel" && args[1] == "--source":
+		// timetravel --source BRANCH [--paused] [--quarantine] ID fork
+		// DESTINATION...
+		source, rest := args[2], args[3:]
+		var paused, quarantine bool
+		for len(rest) != 0 && (rest[0] == "--paused" || rest[0] == "--quarantine") {
+			paused = paused || rest[0] == "--paused"
+			quarantine = quarantine || rest[0] == "--quarantine"
+			rest = rest[1:]
+		}
+		if len(rest) < 3 || rest[1] != "fork" {
+			return nil, false, nil
+		}
+		c, err := container.Load(root, container.FullID{ContainerID: rest[0]}, container.LoadOpts{SkipCheck: true})
+		if err != nil {
+			return nil, true, fmt.Errorf("loading container: %v", err)
+		}
+		destinations := rest[2:]
+		if len(destinations) == 1 {
+			output, err = c.Sandbox.ForkBranch(&boot.ForkBranchArgs{Source: source, ID: destinations[0], Paused: paused, Quarantine: quarantine})
+		} else {
+			output, err = c.Sandbox.ForkBranches(&boot.ForkBranchesArgs{Source: source, IDs: destinations, Paused: paused, Quarantine: quarantine})
+		}
+		if err != nil {
+			return nil, true, fmt.Errorf("timetravel fork failed: %v", err)
+		}
 	case len(args) == 3 && args[0] == "list" && args[1] == "--format=json" && args[2] == "--sandbox":
 		ids, err := container.ListSandboxes(root)
 		if err != nil {

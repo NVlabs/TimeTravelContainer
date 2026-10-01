@@ -32,7 +32,9 @@ func TestEmbeddedRuntimeCommandAnswersOnlyWhatItRuns(t *testing.T) {
 		{"state"},
 		{"delete", "--force", "family"},
 		{"timetravel", "family", "fork", "b1"},
-		{"timetravel", "--source", "main", "family", "fork", "b1"},
+		{"timetravel", "--source", "main", "family", "fork"},
+		{"timetravel", "--source", "main", "family", "pause", "b1"},
+		{"timetravel", "--source", "main", "--filesystem-origins-fd=3", "family", "fork", "b1"},
 		{"timetravel", "--signal", "15", "family", "pause", "main"},
 		{"timetravel", "--signal", "TERM", "family", "signal", "main"},
 		{"timetravel", "family", "signal", "main"},
@@ -53,6 +55,8 @@ func TestEmbeddedRuntimeCommandAnswersOnlyWhatItRuns(t *testing.T) {
 		{"timetravel", "missing", "branches"},
 		{"timetravel", "missing", "pause", "main"},
 		{"timetravel", "--signal", "15", "--all", "missing", "signal", "main"},
+		{"timetravel", "--source", "main", "missing", "fork", "b1"},
+		{"timetravel", "--source", "main", "--paused", "--quarantine", "missing", "fork", "b1", "b2"},
 	} {
 		if _, answered, err := embeddedRuntimeCommand(root, args); !answered || err == nil {
 			t.Errorf("embeddedRuntimeCommand(%q) of a missing sandbox: answered %t, err %v; want an error", args, answered, err)
