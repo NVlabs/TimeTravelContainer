@@ -60,8 +60,10 @@ type Writer struct {
 	storeCompressors sync.Pool
 	inputs           [][]byte
 	outputs          []*bytes.Buffer
-	err              error
-	closed           bool
+	// segments are the compressed lengths of the segments written.
+	segments []int64
+	err      error
+	closed   bool
 }
 
 // NewWriter returns a Writer that compresses onto w at level, a flate
@@ -205,7 +207,16 @@ func (z *Writer) writeOldest() {
 	}
 	if _, err := z.w.Write(s.output.Bytes()); err != nil {
 		z.err = err
+		return
 	}
+	z.segments = append(z.segments, int64(s.output.Len()))
+}
+
+// Segments returns the compressed lengths of the segments written, in order:
+// once the Writer is closed, those of the whole stream, by which a Reader
+// decompresses them at once.
+func (z *Writer) Segments() []int64 {
+	return z.segments
 }
 
 // Close ends the stream and writes what remains of it. It does not close the

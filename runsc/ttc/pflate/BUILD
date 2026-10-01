@@ -10,7 +10,10 @@ package(
 
 go_library(
     name = "pflate",
-    srcs = ["pflate.go"],
+    srcs = [
+        "pflate.go",
+        "reader.go",
+    ],
     visibility = ["//runsc:__subpackages__"],
 )
 

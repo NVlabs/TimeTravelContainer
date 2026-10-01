@@ -300,6 +300,7 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest, output io.Writer)
 		return err
 	}
 	defer archive.Abort()
+	var memorySegments []int64
 	var manifestRepositories []ttccheckpoint.RepositorySnapshot
 	var hostMounts []ttccheckpoint.HostMountSnapshot
 	// Saving the branch's memory and exporting its files take time in
@@ -307,7 +308,10 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest, output io.Writer)
 	// which keeps its state, is left as it is.
 	if err := b.withoutLifecycleLock(info, longOperation{branch: target.branch, state: "checkpointing", hidden: hiddenBranch}, func() error {
 		var err error
-		manifestRepositories, hostMounts, err = b.saveCheckpointState(info, spec, request.compression, hiddenBranch, hiddenInfo.FilesystemBranch, stage, stateDir, archive)
+		if memorySegments, err = b.saveCheckpointDehydration(info, hiddenBranch, request.compression, stateDir, archive); err != nil {
+			return fmt.Errorf("saving checkpoint state: %w", err)
+		}
+		manifestRepositories, hostMounts, err = b.saveCheckpointState(spec, hiddenInfo.FilesystemBranch, stage)
 		return err
 	}); err != nil {
 		return err
@@ -334,6 +338,7 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest, output io.Writer)
 		Repositories:      manifestRepositories,
 		HostMounts:        hostMounts,
 		MemoryCompression: memoryCompression,
+		MemorySegments:    memorySegments,
 	}); err != nil {
 		return err
 	}
@@ -354,13 +359,9 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest, output io.Writer)
 	})
 }
 
-// saveCheckpointState saves a dehydration of the hidden checkpoint branch in
-// stateDir and archive, and its repositories and host mounts in stage.
-func (b *runtimeBackend) saveCheckpointState(info ttcbundle.ContainerInfo, spec *specs.Spec, compression, hiddenBranch, persistentBranch, stage, stateDir string, archive *ttccheckpoint.Archive) (manifestRepositories []ttccheckpoint.RepositorySnapshot, hostMounts []ttccheckpoint.HostMountSnapshot, retErr error) {
-	if err := b.saveCheckpointDehydration(info, hiddenBranch, compression, stateDir, archive); err != nil {
-		return nil, nil, fmt.Errorf("saving checkpoint state: %w", err)
-	}
-
+// saveCheckpointState saves the hidden checkpoint branch's repositories, of
+// its filesystem branch persistentBranch, and host mounts in stage.
+func (b *runtimeBackend) saveCheckpointState(spec *specs.Spec, persistentBranch, stage string) (manifestRepositories []ttccheckpoint.RepositorySnapshot, hostMounts []ttccheckpoint.HostMountSnapshot, retErr error) {
 	repositories, err := specutils.TTCVolumeRepositories(spec)
 	if err != nil {
 		return nil, nil, err
@@ -446,19 +447,21 @@ const (
 // the dehydration: its capture and its kernel state in stateDir, and a stream
 // of the pages it uses in archive, as state/memory.stream. The stream holds the
 // branch's own memory; saving its kernel as gVisor does wrote the whole memory
-// file it shares with its family.
-func (b *runtimeBackend) saveCheckpointDehydration(info ttcbundle.ContainerInfo, hiddenBranch, compression, stateDir string, archive *ttccheckpoint.Archive) error {
+// file it shares with its family. It returns the compressed lengths of a
+// compressed stream's segments.
+func (b *runtimeBackend) saveCheckpointDehydration(info ttcbundle.ContainerInfo, hiddenBranch, compression, stateDir string, archive *ttccheckpoint.Archive) ([]int64, error) {
 	if _, err := b.command("timetravel", info.ID, "dehydrate", hiddenBranch); err != nil {
-		return fmt.Errorf("capturing the branch: %w", err)
+		return nil, fmt.Errorf("capturing the branch: %w", err)
 	}
 	metadata, err := os.OpenFile(filepath.Join(stateDir, checkpointMetadataName), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer metadata.Close()
 	// Unfiltered, the capture's stream is one-way, so the archive can record
 	// it.
 	var output []byte
+	var segments []int64
 	if err := archive.Stream(checkpointMemoryMember, 0600, func(memory *os.File) error {
 		stream, finish := memory, func() error { return nil }
 		if compression != "none" {
@@ -472,6 +475,7 @@ func (b *runtimeBackend) saveCheckpointDehydration(info ttcbundle.ContainerInfo,
 				if err == nil {
 					_, err = io.Copy(compressor, reader)
 					err = errors.Join(err, compressor.Close())
+					segments = compressor.Segments()
 				}
 				// Drain what is left if compressing failed, so the Sentry's
 				// writes do not block.
@@ -488,18 +492,18 @@ func (b *runtimeBackend) saveCheckpointDehydration(info ttcbundle.ContainerInfo,
 		output, exportErr = b.commandWithFiles([]*os.File{stream, metadata}, "timetravel", "--dehydration-graph-stream-fd=3", "--dehydration-fd=4", info.ID, "dehydrate-export", hiddenBranch)
 		return errors.Join(exportErr, finish())
 	}); err != nil {
-		return fmt.Errorf("exporting the branch's memory: %w", err)
+		return nil, fmt.Errorf("exporting the branch's memory: %w", err)
 	}
 	var exported boot.BranchDehydrationExportInfo
 	if err := json.Unmarshal(output, &exported); err != nil {
-		return fmt.Errorf("decoding the branch's capture: %w", err)
+		return nil, fmt.Errorf("decoding the branch's capture: %w", err)
 	}
 	// The state directory is packed into the archive, which is what is kept.
 	data, err := json.Marshal(&exported.Capture)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return os.WriteFile(filepath.Join(stateDir, checkpointControlName), data, 0600)
+	return segments, os.WriteFile(filepath.Join(stateDir, checkpointControlName), data, 0600)
 }
 
 // recordedCapture replays a memory capture stream recorded to a file. The
@@ -514,11 +518,12 @@ func (recordedCapture) Write([]byte) (int, error) {
 
 // installCheckpointDehydration makes a checkpoint's dehydration the durable
 // dehydration of the restored family's main branch, as dehydrating main would
-// have left it: its pages, read from memory, compressed by compression, in the
-// snapshot graph, and its capture and kernel state, in stateDir, in main's
-// dehydration image. resume says whether main runs once rehydrated, or stays
-// paused as the checkpointed branch was.
-func (b *runtimeBackend) installCheckpointDehydration(info ttcbundle.ContainerInfo, stateDir string, memory io.Reader, compression string, resume bool) (retErr error) {
+// have left it: its pages, read from memory, compressed by compression in
+// segments of the given compressed lengths, if any, in the snapshot graph,
+// and its capture and kernel state, in stateDir, in main's dehydration image.
+// resume says whether main runs once rehydrated, or stays paused as the
+// checkpointed branch was.
+func (b *runtimeBackend) installCheckpointDehydration(info ttcbundle.ContainerInfo, stateDir string, memory *io.SectionReader, compression string, segments []int64, resume bool) (retErr error) {
 	main, err := persistentBranchInfo(info, defaultBranchID)
 	if err != nil {
 		return err
@@ -560,10 +565,16 @@ func (b *runtimeBackend) installCheckpointDehydration(info ttcbundle.ContainerIn
 			retErr = errors.Join(retErr, fmt.Errorf("discarding the checkpoint's snapshot origin: %w", graphErr))
 		}
 	}()
-	reader := memory
+	var reader io.Reader = memory
 	switch compression {
 	case "":
 	case "flate-best-speed":
+		if len(segments) != 0 {
+			reader = pflate.NewReader(memory, 0, segments)
+			break
+		}
+		// A checkpoint of an earlier build does not say where its segments
+		// are.
 		decompressor := flate.NewReader(memory)
 		defer decompressor.Close()
 		reader = decompressor
@@ -844,7 +855,7 @@ func (b *runtimeBackend) restoreCheckpoint(source, name string) (id string, retE
 	}
 	// Importing the memory takes time in proportion to it.
 	if err := b.withoutLifecycleLock(prepared.Container, longOperation{state: "restoring", shown: true}, func() error {
-		return b.installCheckpointDehydration(prepared.Container, filepath.Join(stage, "state"), io.NewSectionReader(archive, memory.Offset, memory.Size), manifest.MemoryCompression, !manifest.RestorePaused)
+		return b.installCheckpointDehydration(prepared.Container, filepath.Join(stage, "state"), io.NewSectionReader(archive, memory.Offset, memory.Size), manifest.MemoryCompression, manifest.MemorySegments, !manifest.RestorePaused)
 	}); err != nil {
 		return "", err
 	}

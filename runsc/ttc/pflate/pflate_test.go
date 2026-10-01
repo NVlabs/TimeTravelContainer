@@ -96,6 +96,70 @@ func TestWriterStoresWhatDoesNotCompress(t *testing.T) {
 	}
 }
 
+// What a Writer compresses, a Reader decompresses, given its segments, at
+// any size and level, at an offset, and however it is read.
+func TestReaderRoundTrips(t *testing.T) {
+	for _, size := range testSizes {
+		for _, random := range []bool{false, true} {
+			for _, level := range []int{flate.BestSpeed, flate.DefaultCompression} {
+				input := testInput(size, random)
+				compressed := bytes.NewBufferString("prefix")
+				z, err := NewWriter(compressed, level)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := z.Write(input); err != nil {
+					t.Fatal(err)
+				}
+				if err := z.Close(); err != nil {
+					t.Fatal(err)
+				}
+				r := NewReader(bytes.NewReader(compressed.Bytes()), int64(len("prefix")), z.Segments())
+				var output bytes.Buffer
+				buffer := make([]byte, 77777)
+				for {
+					n, err := r.Read(buffer)
+					output.Write(buffer[:n])
+					if err == io.EOF {
+						break
+					}
+					if err != nil {
+						t.Fatalf("size %d random %t level %d: %v", size, random, level, err)
+					}
+				}
+				if !bytes.Equal(output.Bytes(), input) {
+					t.Fatalf("size %d random %t level %d: read %d bytes that differ from the %d written", size, random, level, output.Len(), len(input))
+				}
+			}
+		}
+	}
+}
+
+// A Reader reports a stream that does not match its segments.
+func TestReaderRejectsWhatDoesNotMatch(t *testing.T) {
+	input := testInput(3*segmentBytes, false)
+	var compressed bytes.Buffer
+	z, err := NewWriter(&compressed, flate.BestSpeed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := z.Write(input); err != nil {
+		t.Fatal(err)
+	}
+	if err := z.Close(); err != nil {
+		t.Fatal(err)
+	}
+	segments := z.Segments()
+	shifted := append([]int64{segments[0] - 1, segments[1] + 1}, segments[2:]...)
+	truncated := append([]int64(nil), segments...)
+	truncated[len(truncated)-1] += 100
+	for name, lengths := range map[string][]int64{"shifted": shifted, "past the end": truncated, "empty": {0}} {
+		if _, err := io.ReadAll(NewReader(bytes.NewReader(compressed.Bytes()), 0, lengths)); err == nil {
+			t.Fatalf("%s segments read without an error", name)
+		}
+	}
+}
+
 // A GzipWriter writes one member, which a gzip reader decompresses and checks.
 func TestGzipWriterRoundTrips(t *testing.T) {
 	for _, size := range testSizes {

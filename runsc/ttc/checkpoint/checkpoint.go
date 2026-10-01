@@ -68,6 +68,10 @@ type Manifest struct {
 	// MemoryCompression is how the dehydration's page stream is compressed:
 	// "flate-best-speed", or empty for none.
 	MemoryCompression string `json:"memory_compression,omitempty"`
+	// MemorySegments are the compressed lengths of a compressed page
+	// stream's segments, which a restore decompresses at once; a checkpoint
+	// of an earlier build has none.
+	MemorySegments []int64 `json:"memory_segments,omitempty"`
 }
 
 // WriteManifest writes manifest into an unpacked checkpoint staging tree.
