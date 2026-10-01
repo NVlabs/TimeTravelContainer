@@ -2216,7 +2216,11 @@ func (s *Stack) Restore() {
 	if s.liveForkConfigRestored {
 		s.allowLiveTCPMigration = s.liveForkRestoreTCPMigration
 	}
+	tables := s.tables
 	s.mu.Unlock()
+	if tables != nil {
+		tables.restoreReaper()
+	}
 }
 
 // Resume resumes the stack after a save.

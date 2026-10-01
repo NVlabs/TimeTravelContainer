@@ -18,7 +18,6 @@
 package stack
 
 import (
-	"context"
 	"fmt"
 	"math/rand"
 	"reflect"
@@ -721,12 +720,15 @@ func (it *IPTables) resumeAfterLiveForkSave() {
 	}
 }
 
-// afterLoad is invoked by stateify.
-func (it *IPTables) afterLoad(context.Context) {
+// restoreReaper starts the connection reaper of restored tables that have
+// one. Stack.Restore, rather than afterLoad, starts it: the reaper's timer
+// reads the clock, which the sentry restores only after the state that holds
+// the tables has loaded, and which blocks readers until then.
+func (it *IPTables) restoreReaper() {
 	it.mu.RLock()
 	modified := it.modified
 	it.mu.RUnlock()
-	if modified {
+	if modified && it.reaper == nil {
 		it.startReaper(reaperDelay)
 	}
 }
