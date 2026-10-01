@@ -78,7 +78,11 @@ func ServeLauncher(fd int, renderer string, opts Options) error {
 			m.FDs = nil
 			withFlags := opts
 			withFlags.Snapshots = p.Flags&gfxproto.RendererFlagSnapshots != 0
-			err = launchRenderer(renderer, withFlags, fd)
+			mode := "serve"
+			if p.Flags&gfxproto.RendererFlagFamily != 0 {
+				mode = "serve-family"
+			}
+			err = launchRenderer(renderer, mode, withFlags, fd)
 		case gfxproto.MsgLaunchProbe:
 			var p gfxproto.LaunchProbe
 			if _, err = m.Decode(&p); err != nil {
@@ -103,12 +107,12 @@ func ServeLauncher(fd int, renderer string, opts Options) error {
 	}
 }
 
-// launchRenderer starts a renderer whose connection to its Sentry is fd,
-// which it takes, and the renderer gets as its fd 3.
-func launchRenderer(renderer string, opts Options, fd int) error {
+// launchRenderer starts a renderer in mode, "serve" or "serve-family",
+// whose connection is fd, which it takes, and the renderer gets as its fd 3.
+func launchRenderer(renderer, mode string, opts Options, fd int) error {
 	conn := os.NewFile(uintptr(fd), "gfx-renderer-connection")
 	defer conn.Close()
-	cmd := exec.Command(renderer, append([]string{"serve"}, opts.flags()...)...)
+	cmd := exec.Command(renderer, append([]string{mode}, opts.flags()...)...)
 	cmd.ExtraFiles = []*os.File{conn}
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr

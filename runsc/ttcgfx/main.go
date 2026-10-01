@@ -5,6 +5,10 @@
 // branch whose virtual GPU is in use:
 //
 //	ttc-gfx-renderer serve [flags]   renders for the Sentry connected to fd 3
+//	ttc-gfx-renderer serve-family [flags]
+//	                                 renders for the branches of a family,
+//	                                 whose connections the broker connected
+//	                                 to fd 3 gives it
 //	ttc-gfx-renderer probe [flags]   prints the renderer's capability sets
 //	ttc-gfx-renderer launch [flags]  starts renderers, with flags, for the
 //	                                 ttcd connected to fd 3
@@ -39,7 +43,7 @@ func main() {
 	flags.Parse(os.Args[2:])
 	mode := os.Args[1]
 	switch mode {
-	case "serve", "probe":
+	case "serve", "serve-family", "probe":
 		if mode == "serve" && opts.Snapshots {
 			// gfxstream takes and restores snapshots in a directory, which
 			// is the renderer's own.
@@ -75,6 +79,10 @@ func main() {
 			}
 			fatal(err)
 		}
+	case "serve-family":
+		if err := gfxrenderer.ServeFamily(connFD, opts); err != nil {
+			fatal(err)
+		}
 	case "probe":
 		capsets, err := gfxrenderer.Probe(opts)
 		if err != nil {
@@ -102,7 +110,7 @@ func fatal(err error) {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: ttc-gfx-renderer serve|probe [--backend BACKEND] [--library PATH] [--features FEATURES] [--snapshots] [--unconfined]")
+	fmt.Fprintln(os.Stderr, "usage: ttc-gfx-renderer serve|serve-family|probe [--backend BACKEND] [--library PATH] [--features FEATURES] [--snapshots] [--unconfined]")
 	fmt.Fprintln(os.Stderr, "       ttc-gfx-renderer launch [--backend BACKEND] [--library PATH] [--features FEATURES]")
 	os.Exit(2)
 }

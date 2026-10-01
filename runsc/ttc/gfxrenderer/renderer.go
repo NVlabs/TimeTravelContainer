@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -146,6 +147,47 @@ func Serve(fd int, opts Options) error {
 		if err != nil {
 			return err
 		}
+	}
+}
+
+// ServeFamily serves the branches of a family, a connection to each, which
+// its broker gives it on the control connection fd, which it takes, until
+// the broker disconnects and the connections close. Only the Venus backend
+// serves families.
+func ServeFamily(fd int, opts Options) error {
+	if opts.Backend != BackendVenus {
+		unix.Close(fd)
+		return fmt.Errorf("the %q backend serves no families", opts.Backend)
+	}
+	control, err := gfxproto.NewConn(fd)
+	if err != nil {
+		unix.Close(fd)
+		return err
+	}
+	defer control.Close()
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	for {
+		m, err := control.Recv()
+		if errors.Is(err, gfxproto.ErrClosed) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if m.Type != gfxproto.MsgServeConnection || len(m.FDs) != 1 {
+			m.CloseFDs()
+			return fmt.Errorf("unexpected %v with %d descriptors", m.Type, len(m.FDs))
+		}
+		conn := m.FDs[0]
+		m.FDs = nil
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := venus.Serve(conn); err != nil {
+				log.Printf("serving a branch: %v", err)
+			}
+		}()
 	}
 }
 

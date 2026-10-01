@@ -14,6 +14,11 @@ func Serve(fd int, opts Options) error {
 	return errNoCgo
 }
 
+// ServeFamily serves the branches of a family. Without cgo, it cannot.
+func ServeFamily(fd int, opts Options) error {
+	return errNoCgo
+}
+
 // Probe returns gfxstream's capability sets. Without cgo, it cannot.
 func Probe(opts Options) ([]Capset, error) {
 	return nil, errNoCgo

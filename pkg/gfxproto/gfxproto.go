@@ -71,6 +71,12 @@ const (
 	MsgLaunchProbe
 )
 
+// Messages from the renderers' broker to the renderer of a family, which
+// serves a connection to each of the family's branches.
+const (
+	MsgServeConnection MsgType = iota + 400
+)
+
 // String implements fmt.Stringer.String.
 func (t MsgType) String() string {
 	switch t {
@@ -114,6 +120,8 @@ func (t MsgType) String() string {
 		return "LaunchRenderer"
 	case MsgLaunchProbe:
 		return "LaunchProbe"
+	case MsgServeConnection:
+		return "ServeConnection"
 	default:
 		return fmt.Sprintf("MsgType(%d)", uint32(t))
 	}
@@ -280,12 +288,23 @@ type (
 	LaunchProbe struct {
 		Flags uint32
 	}
+
+	// ServeConnection gives the renderer of a family a connection to serve,
+	// the message's descriptor, a branch's. The renderer does not reply.
+	ServeConnection struct {
+		Reserved uint32
+	}
 )
 
 // RendererFlagSnapshots is a flag of StartRenderer and LaunchRenderer: the
 // renderer takes snapshots and restores them, which costs it memory from its
 // start, since it records how to rebuild its Vulkan objects.
 const RendererFlagSnapshots = 1 << 0
+
+// RendererFlagFamily is a flag of LaunchRenderer: the renderer serves the
+// branches of a family, and its descriptor is not a Sentry's connection but
+// the broker's, on which ServeConnection gives it connections to serve.
+const RendererFlagFamily = 1 << 1
 
 const (
 	// headerSize is the size of a message's header: its type, the length of
