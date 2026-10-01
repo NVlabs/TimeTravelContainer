@@ -163,10 +163,14 @@ redroid, an Android image for containers, runs in TTC with the GPU: its init
 is the container's, and `guest/redroid/gpu_config.sh`, which replaces the
 image's `/vendor/bin/gpu_config.sh`, has it use the image's minigbm
 (`ro.hardware.gralloc=cros`), the driver, and the image's ANGLE, OpenGL ES
-on Vulkan, for SurfaceFlinger and apps:
+on Vulkan, for SurfaceFlinger and apps; it also turns on Codec2's software
+video codecs, which encode the screen for screen mirroring. With
+`--gfx-fork=snapshot`, Android forks live, and its adb, on port 5555, can be
+published to the host:
 
 ```sh
-ttc create --name android --gfx --waive-live-fork --cap-add ALL --network ttc --nat \
+ttc create --name android --gfx --gfx-fork snapshot -p 127.0.0.1:5555:5555 \
+  --cap-add ALL --network ttc --nat \
   --entrypoint /init redroid/redroid:14.0.0_64only-latest \
   qemu=1 androidboot.hardware=redroid androidboot.use_memfd=true
 ttc cp out-android/lib64/hw/vulkan.gfxstream.so android@main:/vendor/lib64/hw/
@@ -175,7 +179,32 @@ ttc start android
 ttc exec android@main /system/bin/dumpsys SurfaceFlinger | grep GLES
 ```
 
+[scrcpy] shows and controls Android from the host, over adb; neither runs in
+TTC. Android renders on the GPU, and its software encoder compresses the
+screen to H.264, on the CPU:
+
+```sh
+adb connect 127.0.0.1:5555
+scrcpy -s 127.0.0.1:5555 --no-audio
+```
+
+A fork's child is another Android, with the same apps in the same state,
+whose adb a port of its own publishes:
+
+```sh
+ttc fork android@main child
+ttc port publish android@child 127.0.0.1:5556:5555
+adb connect 127.0.0.1:5556
+scrcpy -s 127.0.0.1:5556 --no-audio
+```
+
+Both branches answer only after a while, tens of seconds, after a fork:
+every thread of both restarts its system call at once, and the vCPUs admit
+them in turn.
+
 `runsc/ttc/test/e2e_redroid.sh` boots it so, checks that SurfaceFlinger and
-apps render with ANGLE on the GPU, and installs and runs an APK.
+apps render with ANGLE on the GPU, that the screen records to video, and
+that both branches of a live fork run on, and installs and runs an APK.
 
 [gfxstream]: https://github.com/google/gfxstream
+[scrcpy]: https://github.com/Genymobile/scrcpy

@@ -764,13 +764,15 @@ compatible nodes.
 
 redroid's arm64 images could then run on macOS too.
 
-*Status (2026-10-01): redroid runs on macOS, ahead of Phase B, and renders
-on the virtual GPU.* redroid 14's arm64 image
-(`redroid/redroid:14.0.0_64only-latest`) boots with its own init as the
-container's in about 40 s; SurfaceFlinger and apps render with ANGLE on
-gfxstream's Vulkan driver; Android's network comes up and validates; and
-apps from F-Droid install and run, F-Droid itself downloading its
-repository. `runsc/ttc/test/e2e_redroid.sh` checks that.
+*Status (2026-10-01): redroid runs on macOS, ahead of Phase B, renders on
+the virtual GPU, shows on the host through scrcpy, and forks live.* redroid
+14's arm64 image (`redroid/redroid:14.0.0_64only-latest`) boots with its own
+init as the container's in about 40 s; SurfaceFlinger and apps render with
+ANGLE on gfxstream's Vulkan driver; Android's network comes up and
+validates; apps from F-Droid install and run, F-Droid itself downloading its
+repository; scrcpy, on the host, shows and controls Android over adb; and a
+live fork's branches both run on. `runsc/ttc/test/e2e_redroid.sh` checks
+that.
 
 *   **Sentry:** what Android's init and daemons required:
     *   binder, and binderfs for `binder`, `hwbinder`, and `vndbinder`;
@@ -795,6 +797,9 @@ repository. `runsc/ttc/test/e2e_redroid.sh` checks that.
         the address. Policy routing remains unsupported: netd fails to add
         rules and per-network routes, but the Sentry routes every socket by
         its main table, which is right for one interface;
+    *   the DMA-BUF system heap, `/dev/dma_heap/system`, from which Codec2's
+        software video codecs allocate: Android encodes its screen for
+        scrcpy with them, on the CPU, while it renders on the GPU;
     *   fixes: arm64 signal frames laid out as Linux lays them out, which ART's
         unwinder reads; `setsid(2)` deadlocked with children in an orphaned
         process group; `SOCK_SEQPACKET` peer credentials; and container roots
@@ -805,8 +810,24 @@ repository. `runsc/ttc/test/e2e_redroid.sh` checks that.
     selects it, redroid's minigbm, and ANGLE. SurfaceFlinger crashed while
     MoltenVK's four identical queue families showed; gfxstream patch `0009`
     hides the duplicates.
-*   **Not done:** display (scrcpy or VNC), forks of Android (it runs with
-    `--waive-live-fork`), and the device-lost experiment.
+*   **Display:** scrcpy runs on the host, not in TTC, against adb, which
+    `-p 127.0.0.1:5555:5555` publishes (a child's, `ttc port publish`).
+    redroid's image turns Codec2's software codecs off, and has no OMX
+    service; `gpu_config.sh` turns them on, and has encoders take their
+    input surface in the client's process.
+*   **Forks:** with `--gfx-fork=snapshot`, Android forks live. The child
+    restores the renderer's snapshot, and both branches run on, with the same
+    processes and apps in the same state, a network each, and their own
+    screens. Live forks needed, as the family's eligibility allows: tmpfs
+    mappings on devtmpfs clonable (Android maps `/dev/__properties__`); the
+    iptables reaper started by `Stack.Restore`, since its start while the
+    state loaded deadlocked on the clock; binder transaction memory per
+    branch, which the branches had shared; and restored connection tracking
+    that reinstalls what it does not save, its TCP state handlers and random
+    source. After a fork, every thread of both branches restarts its system
+    call at once, and the HVF engine admits them to vCPUs in turn: the
+    branches answer after about half a minute.
+*   **Not done:** VNC, and the device-lost experiment.
 *   **Found in the image:** its simulated Bluetooth HAL aborts on any
     kernel ("Invalid address"): it links two different
     `bluetooth::hci::Address` classes, and tests the parsed address's
