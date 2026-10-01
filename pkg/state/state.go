@@ -204,6 +204,9 @@ func (s Sink) SaveValue(slot int, obj any) {
 
 // Context returns the context object provided at save time.
 func (s Sink) Context() context.Context {
+	if s.internal.cr != nil {
+		return s.internal.cr.cs.saveCtx
+	}
 	return s.internal.es.ctx
 }
 
@@ -275,6 +278,9 @@ func (s Source) AfterLoad(fn func()) {
 
 // Context returns the context object provided at load time.
 func (s Source) Context() context.Context {
+	if s.internal.cl != nil {
+		return s.internal.cl.cs.loadCtx
+	}
 	return s.internal.ds.ctx
 }
 

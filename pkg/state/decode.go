@@ -358,10 +358,17 @@ type objectDecoder struct {
 
 	// encoded is the encoded object state.
 	encoded *wire.Struct
+
+	// cl, if not nil, loads the struct for Clone instead.
+	cl *cloneLoader
 }
 
 // load is helper for the public methods on Source.
 func (od *objectDecoder) load(slot int, objPtr reflect.Value, wait bool, fn func()) {
+	if od.cl != nil {
+		od.cl.load(slot, objPtr.Elem(), wait, fn)
+		return
+	}
 	// Note that we have reconciled the type and may remap the fields here
 	// to match what's expected by the decoder. The "slot" parameter here
 	// is in terms of the local type, where the fields in the encoded
@@ -377,6 +384,10 @@ func (od *objectDecoder) load(slot int, objPtr reflect.Value, wait bool, fn func
 
 // aterLoad implements Source.AfterLoad.
 func (od *objectDecoder) afterLoad(fn func()) {
+	if od.cl != nil {
+		od.cl.afterLoad(fn)
+		return
+	}
 	// Queue the local callback; this will execute when all of the above
 	// data dependencies have been cleared.
 	od.ods.addCallback(userCallback(fn))

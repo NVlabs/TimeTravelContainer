@@ -22,7 +22,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"sort"
 	"sync"
 	"time"
@@ -1487,34 +1486,11 @@ func (k *Kernel) captureFileDescriptionMemory(capture *pgalloc.MemoryRangeCaptur
 	return nil
 }
 
-// streamLiveForkState connects state.Save directly to state.Load. The pipe
-// bounds temporary memory use and ensures that no checkpoint file is created.
+// streamLiveForkState makes child a copy of parent's state, in memory: the
+// child is in the same process, so that its state need not be encoded.
 func streamLiveForkState(saveCtx, loadCtx context.Context, parent, child *Kernel) error {
-	reader, writer := io.Pipe()
-	saveErrCh := make(chan error, 1)
-	go func() {
-		bufferedWriter := bufio.NewWriterSize(writer, 64<<10)
-		_, err := parent.saveStateGraph(saveCtx, bufferedWriter)
-		if err == nil {
-			err = bufferedWriter.Flush()
-		}
-		writer.CloseWithError(err)
-		saveErrCh <- err
-	}()
-
-	bufferedReader := bufio.NewReaderSize(reader, 64<<10)
-	_, loadErr := state.Load(loadCtx, bufferedReader, child)
-	if loadErr != nil {
-		reader.CloseWithError(loadErr)
-	} else {
-		reader.Close()
-	}
-	saveErr := <-saveErrCh
-	if loadErr != nil {
-		return fmt.Errorf("loading live-fork metadata: %w", loadErr)
-	}
-	if saveErr != nil {
-		return fmt.Errorf("saving live-fork metadata: %w", saveErr)
+	if err := parent.cloneStateGraph(saveCtx, loadCtx, child); err != nil {
+		return fmt.Errorf("cloning live-fork metadata: %w", err)
 	}
 	return nil
 }

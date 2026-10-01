@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package tests tests the state packages.
 package tests
 
@@ -76,6 +79,20 @@ func runTestCases(t *testing.T, shouldFail bool, prefix string, objects []any) {
 			saveBuffer := &bytes.Buffer{}
 			saveObjectPtr := reflect.New(reflect.TypeOf(root))
 			saveObjectPtr.Elem().Set(reflect.ValueOf(root))
+
+			// A clone is what a save and a load make. Clone may take
+			// objects that the encoder refuses, so that a case that
+			// should fail may clone.
+			cloneObjectPtr := reflect.New(reflect.TypeOf(root))
+			cloneErr := state.Clone(context.Background(), context.Background(), saveObjectPtr.Interface(), cloneObjectPtr.Interface(), state.SaveOptions{})
+			if !shouldFail {
+				if cloneErr != nil {
+					t.Fatalf("Clone failed unexpectedly: %v", cloneErr)
+				}
+				if cloned := cloneObjectPtr.Elem().Interface(); !checkEqual(root, cloned) {
+					t.Fatalf("Clone differs:\n\toriginal: %#v\n\tclone:    %#v\n", root, cloned)
+				}
+			}
 			saveStats, err := state.Save(context.Background(), saveBuffer, saveObjectPtr.Interface())
 			if err != nil {
 				if shouldFail {

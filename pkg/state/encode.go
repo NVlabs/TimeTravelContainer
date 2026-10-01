@@ -51,6 +51,9 @@ type objectEncodeState struct {
 	// references may be updated directly and automatically.
 	refs []*wire.Ref
 
+	// clone is the object's copy, for Clone.
+	clone *cloneObject
+
 	deferredEntry
 }
 
@@ -482,10 +485,17 @@ type objectEncoder struct {
 
 	// encoded is the encoded struct.
 	encoded *wire.Struct
+
+	// cr, if not nil, records the struct for Clone instead.
+	cr *cloneRecorder
 }
 
 // save is called by the public methods on Sink.
 func (oe *objectEncoder) save(slot int, obj reflect.Value) {
+	if oe.cr != nil {
+		oe.cr.save(slot, obj)
+		return
+	}
 	fieldValue := oe.encoded.Field(slot)
 	oe.es.encodeObject(obj, encodeDefault, fieldValue)
 }
