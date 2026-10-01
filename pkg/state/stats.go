@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package state
 
 import (
@@ -33,6 +36,10 @@ type statEntry struct {
 //
 // All exported receivers accept nil.
 type Stats struct {
+	// off is set when no time is taken, as it reads the clock twice an
+	// object; the stats are then empty.
+	off bool
+
 	// byType contains a breakdown of time spent by type.
 	//
 	// This is indexed *directly* by typeID, including zero.
@@ -54,12 +61,18 @@ type Stats struct {
 
 // init initializes statistics.
 func (s *Stats) init() {
+	if s.off {
+		return
+	}
 	s.last = time.Now()
 	s.stack = append(s.stack, 0)
 }
 
 // fini finalizes statistics.
 func (s *Stats) fini(resolve func(id typeID) string) {
+	if s.off {
+		return
+	}
 	s.done()
 
 	// Resolve all type names.
@@ -83,6 +96,9 @@ func (s *Stats) sample(id typeID) {
 
 // start starts a sample.
 func (s *Stats) start(id typeID) {
+	if s.off {
+		return
+	}
 	last := s.stack[len(s.stack)-1]
 	s.sample(last)
 	s.stack = append(s.stack, id)
@@ -90,6 +106,9 @@ func (s *Stats) start(id typeID) {
 
 // done finishes the current sample.
 func (s *Stats) done() {
+	if s.off {
+		return
+	}
 	last := s.stack[len(s.stack)-1]
 	s.sample(last)
 	s.byType[last].count++

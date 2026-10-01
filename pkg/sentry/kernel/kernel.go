@@ -899,7 +899,7 @@ func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCl
 
 		// Save the kernel state.
 		kernelStart := time.Now()
-		stats, err := k.saveStateGraph(ctx, stateFile)
+		stats, err := k.saveStateGraph(ctx, stateFile, true)
 		if err != nil {
 			return err
 		}

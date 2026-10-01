@@ -275,7 +275,7 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 		}
 		var kernelMetadata bytes.Buffer
 		buffered := bufio.NewWriterSize(&kernelMetadata, 64<<10)
-		if _, err := k.saveStateGraph(saveCtx, buffered); err != nil {
+		if _, err := k.saveStateGraph(saveCtx, buffered, false); err != nil {
 			return fmt.Errorf("saving distributed Kernel metadata: %w", err)
 		}
 		if err := buffered.Flush(); err != nil {
@@ -457,7 +457,7 @@ func LoadDistributedFork(ctx context.Context, p platform.Platform, targetMF *pga
 		loadValues[vfs.CtxRestoreFilesystemFDMap] = opts.RestoreFilesystemFDMap
 	}
 	loadCtx := context.WithValues(child.SupervisorContext(), loadValues)
-	if _, err := state.Load(loadCtx, bufio.NewReaderSize(bytes.NewReader(kernelMetadata), 64<<10), child); err != nil {
+	if _, err := state.LoadWithOptions(loadCtx, bufio.NewReaderSize(bytes.NewReader(kernelMetadata), 64<<10), child, state.LoadOptions{NoStats: true}); err != nil {
 		return nil, fmt.Errorf("loading distributed Kernel metadata: %w", err)
 	}
 	if opts.OverrideQuarantine {
@@ -568,7 +568,7 @@ func loadRelocatedDistributedFork(p platform.Platform, targetMF *pgalloc.MemoryF
 		loadValues[vfs.CtxRestoreFilesystemFDMap] = opts.RestoreFilesystemFDMap
 	}
 	loadCtx := context.WithValues(child.SupervisorContext(), loadValues)
-	if _, err := state.Load(loadCtx, bufio.NewReaderSize(bytes.NewReader(kernelMetadata), 64<<10), child); err != nil {
+	if _, err := state.LoadWithOptions(loadCtx, bufio.NewReaderSize(bytes.NewReader(kernelMetadata), 64<<10), child, state.LoadOptions{NoStats: true}); err != nil {
 		references.Abort()
 		return nil, fmt.Errorf("loading relocated distributed Kernel metadata: %w", err)
 	}

@@ -509,7 +509,7 @@ func (k *Kernel) CaptureDehydration(ctx context.Context, opts DehydrationCapture
 		}
 		var metadata bytes.Buffer
 		buffered := bufio.NewWriterSize(&metadata, 64<<10)
-		if _, err := k.saveStateGraph(saveCtx, buffered); err != nil {
+		if _, err := k.saveStateGraph(saveCtx, buffered, false); err != nil {
 			return fmt.Errorf("saving dehydrated Kernel metadata: %w", err)
 		}
 		if err := buffered.Flush(); err != nil {
@@ -591,7 +591,7 @@ func LoadDehydration(ctx context.Context, p platform.Platform, image *Dehydratio
 		}
 		metadata = durable.KernelMetadata
 	}
-	if _, err := state.Load(loadCtx, bufio.NewReaderSize(bytes.NewReader(metadata), 64<<10), child); err != nil {
+	if _, err := state.LoadWithOptions(loadCtx, bufio.NewReaderSize(bytes.NewReader(metadata), 64<<10), child, state.LoadOptions{NoStats: true}); err != nil {
 		return nil, fmt.Errorf("loading dehydrated Kernel metadata: %w", err)
 	}
 	ownersTransferred = true
@@ -785,7 +785,7 @@ func loadSparseDurableDehydration(ctx context.Context, p platform.Platform, imag
 		loadValues[vfs.CtxRestoreFilesystemFDMap] = opts.RestoreFilesystemFDMap
 	}
 	loadCtx := context.WithValues(child.SupervisorContext(), loadValues)
-	if _, err := state.Load(loadCtx, bufio.NewReaderSize(bytes.NewReader(image.KernelMetadata), 64<<10), child); err != nil {
+	if _, err := state.LoadWithOptions(loadCtx, bufio.NewReaderSize(bytes.NewReader(image.KernelMetadata), 64<<10), child, state.LoadOptions{NoStats: true}); err != nil {
 		referenceTransaction.Abort()
 		return nil, fmt.Errorf("loading sparse dehydrated Kernel metadata: %w", err)
 	}

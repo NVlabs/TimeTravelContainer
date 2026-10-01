@@ -750,7 +750,7 @@ func (k *Kernel) captureLiveForkMetadata(fsResources vfs.LiveForkFilesystemResou
 		k.mf.MarkSavable()
 
 		buffered := bufio.NewWriterSize(&metadata, 64<<10)
-		if _, err := k.saveStateGraph(saveCtx, buffered); err != nil {
+		if _, err := k.saveStateGraph(saveCtx, buffered, false); err != nil {
 			return fmt.Errorf("saving live-fork metadata: %w", err)
 		}
 		if err := buffered.Flush(); err != nil {
@@ -807,7 +807,7 @@ func (k *Kernel) loadCapturedLiveForkChild(
 		mm.CtxLiveForkPMASnapshots:         pmaSnapshots,
 	})
 	metadataStarted := time.Now()
-	if _, err := state.Load(loadCtx, bufio.NewReaderSize(bytes.NewReader(metadata), 64<<10), child); err != nil {
+	if _, err := state.LoadWithOptions(loadCtx, bufio.NewReaderSize(bytes.NewReader(metadata), 64<<10), child, state.LoadOptions{NoStats: true}); err != nil {
 		return nil, fmt.Errorf("loading live-fork metadata: %w", err)
 	}
 	childLoaded = true
@@ -1487,7 +1487,7 @@ func streamLiveForkState(saveCtx, loadCtx context.Context, parent, child *Kernel
 	saveErrCh := make(chan error, 1)
 	go func() {
 		bufferedWriter := bufio.NewWriterSize(writer, 64<<10)
-		_, err := parent.saveStateGraph(saveCtx, bufferedWriter)
+		_, err := parent.saveStateGraph(saveCtx, bufferedWriter, false)
 		if err == nil {
 			err = bufferedWriter.Flush()
 		}
@@ -1496,7 +1496,7 @@ func streamLiveForkState(saveCtx, loadCtx context.Context, parent, child *Kernel
 	}()
 
 	bufferedReader := bufio.NewReaderSize(reader, 64<<10)
-	_, loadErr := state.Load(loadCtx, bufferedReader, child)
+	_, loadErr := state.LoadWithOptions(loadCtx, bufferedReader, child, state.LoadOptions{NoStats: true})
 	if loadErr != nil {
 		reader.CloseWithError(loadErr)
 	} else {

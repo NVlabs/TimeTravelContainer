@@ -36,14 +36,18 @@ func (ts *TaskSet) afterLoad(_ context.Context) {
 // Filter branch-owned registry entries and reject any future path that reaches
 // a peer Kernel instead of silently combining both branches in one image.
 //
+// It takes Stats, timing each object, only if stats is set: a checkpoint logs
+// them, and the forks, dehydrations and migrations that save a Kernel do not.
+//
 // Preconditions: k.extMu must be locked.
-func (k *Kernel) saveStateGraph(ctx context.Context, w io.Writer) (state.Stats, error) {
+func (k *Kernel) saveStateGraph(ctx context.Context, w io.Writer, stats bool) (state.Stats, error) {
 	k.filteringBranchDanglingEndpoints = true
 	defer func() {
 		k.filteringBranchDanglingEndpoints = false
 	}()
 	return state.SaveWithOptions(ctx, w, k, state.SaveOptions{
 		RejectMultipleRootObjects: true,
+		NoStats:                   !stats,
 	})
 }
 

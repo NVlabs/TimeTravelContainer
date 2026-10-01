@@ -98,6 +98,9 @@ type SaveOptions struct {
 	// sentry Kernel: accidentally reaching a peer root must fail instead of
 	// silently folding both object graphs into one image.
 	RejectMultipleRootObjects bool
+
+	// NoStats takes no Stats, which read the clock twice an object saved.
+	NoStats bool
 }
 
 // Save saves the given object state.
@@ -120,6 +123,7 @@ func SaveWithOptions(ctx context.Context, w io.Writer, rootPtr any, opts SaveOpt
 		rootType:                  root.Type(),
 		rejectMultipleRootObjects: opts.RejectMultipleRootObjects,
 	}
+	es.stats.off = opts.NoStats
 
 	// Perform the encoding.
 	err := safely(func() {
@@ -130,6 +134,17 @@ func SaveWithOptions(ctx context.Context, w io.Writer, rootPtr any, opts SaveOpt
 
 // Load loads a checkpoint.
 func Load(ctx context.Context, r io.Reader, rootPtr any) (Stats, error) {
+	return LoadWithOptions(ctx, r, rootPtr, LoadOptions{})
+}
+
+// LoadOptions is what LoadWithOptions takes.
+type LoadOptions struct {
+	// NoStats takes no Stats, which read the clock twice an object loaded.
+	NoStats bool
+}
+
+// LoadWithOptions loads a checkpoint as Load does, as opts says.
+func LoadWithOptions(ctx context.Context, r io.Reader, rootPtr any, opts LoadOptions) (Stats, error) {
 	// Create the decoding state.
 	ds := decodeState{
 		ctx:      ctx,
@@ -137,6 +152,7 @@ func Load(ctx context.Context, r io.Reader, rootPtr any) (Stats, error) {
 		types:    makeTypeDecodeDatabase(),
 		deferred: make(map[objectID]wire.Object),
 	}
+	ds.stats.off = opts.NoStats
 
 	// Attempt our decode.
 	err := safely(func() {
