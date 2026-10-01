@@ -36,6 +36,7 @@ go_library(
         "//pkg/sentry/platform",
         "//pkg/sentry/platform/vmplatform/monitorabi",
         "//pkg/sentry/platform/vmplatform/vmm",
+        "@com_github_google_btree//:go_default_library",
     ],
 )
 

@@ -179,7 +179,7 @@ func TestMapHostMemoryInPlace(t *testing.T) {
 		hostMemories: make(map[memmap.HostMemoryFile]hostRange),
 	}
 	p.monitor = NewMonitor(p.engine, monitorPoolExpander(vm))
-	as := &addressSpace{id: 1, platform: p, mappings: make(map[hostarch.Addr]addressMapping)}
+	as := indexed(&addressSpace{id: 1, platform: p, mappings: make(map[hostarch.Addr]addressMapping)})
 	p.spaces[as.id] = as
 	ram.SetRevoker(p)
 

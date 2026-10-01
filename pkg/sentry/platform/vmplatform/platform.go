@@ -10,6 +10,7 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/google/btree"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
@@ -268,7 +269,7 @@ func (p *Platform) NewAddressSpace() (sentryplatform.AddressSpace, error) {
 		log.Warningf("vmplatform: creating address space: %v", err)
 		return nil, linuxerr.ENOMEM
 	}
-	as := &addressSpace{platform: p, id: id, mappings: make(map[hostarch.Addr]addressMapping)}
+	as := &addressSpace{platform: p, id: id, mappings: make(map[hostarch.Addr]addressMapping), mapped: newMappedSet()}
 	p.mu.Lock()
 	p.spaces[id] = as
 	p.mu.Unlock()
@@ -590,10 +591,33 @@ type addressSpace struct {
 	platform *Platform
 	id       uint64
 
-	mu              sync.Mutex
-	mappings        map[hostarch.Addr]addressMapping
+	mu       sync.Mutex
+	mappings map[hostarch.Addr]addressMapping
+	// mapped holds the keys of mappings in order: unmapping a range, as each
+	// of a process's mappings does before a live fork, must not scan every
+	// page that the address space maps.
+	mapped          *btree.BTreeG[hostarch.Addr]
 	released        bool
 	stickyWriteback error
+}
+
+func newMappedSet() *btree.BTreeG[hostarch.Addr] {
+	return btree.NewG(32, func(a, b hostarch.Addr) bool { return a < b })
+}
+
+// mappedIn returns the VAs in [addr, end) that as maps, in order.
+//
+// Preconditions: as.mu is locked.
+func (as *addressSpace) mappedIn(addr, end hostarch.Addr) []hostarch.Addr {
+	var vas []hostarch.Addr
+	if as.mapped == nil { // Released.
+		return nil
+	}
+	as.mapped.AscendRange(addr, end, func(va hostarch.Addr) bool {
+		vas = append(vas, va)
+		return true
+	})
+	return vas
 }
 
 // +checklocksignore: lockEpoch conditionally returns with epochMu read-locked.
@@ -749,6 +773,7 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, file memmap.File, fr memmap.
 			}
 			staged := stagedPageAt(stagedPages, i)
 			as.mappings[va] = addressMapping{frame: frames[i].ID, access: at, staged: staged}
+			as.mapped.ReplaceOrInsert(va)
 			if staged != nil {
 				stagedPages[i] = nil
 			}
@@ -806,13 +831,7 @@ func (as *addressSpace) Unmap(addr hostarch.Addr, length uint64) {
 	if end < addr {
 		end = ^hostarch.Addr(0)
 	}
-	vas := make([]hostarch.Addr, 0)
-	for va := range as.mappings {
-		if va >= addr && va < end {
-			vas = append(vas, va)
-		}
-	}
-	sort.Slice(vas, func(i, j int) bool { return vas[i] < vas[j] })
+	vas := as.mappedIn(addr, end)
 	for start := 0; start < len(vas); start += monitorabi.MaxOperations {
 		batch := vas[start:min(start+monitorabi.MaxOperations, len(vas))]
 		operations := make([]monitorabi.Operation, 0, len(batch))
@@ -845,6 +864,7 @@ func (as *addressSpace) Unmap(addr hostarch.Addr, length uint64) {
 				as.stickyWriteback = errors.Join(as.stickyWriteback, err)
 			}
 			delete(as.mappings, va)
+			as.mapped.Delete(va)
 		}
 	}
 }
@@ -879,6 +899,7 @@ func (as *addressSpace) Release() {
 		}
 	}
 	as.mappings = nil
+	as.mapped = nil
 	as.released = true
 	as.mu.Unlock()
 	as.platform.mu.Lock()
@@ -903,8 +924,8 @@ func (as *addressSpace) SyncRange(_ context.Context, addr hostarch.Addr, length 
 	if end < addr {
 		end = ^hostarch.Addr(0)
 	}
-	for va, mapping := range as.mappings {
-		if va >= addr && va < end && mapping.staged != nil {
+	for _, va := range as.mappedIn(addr, end) {
+		if mapping := as.mappings[va]; mapping.staged != nil {
 			pages = append(pages, mapping.staged)
 		}
 	}
@@ -975,6 +996,7 @@ func (p *Platform) RevokeFrames(_ stdcontext.Context, refs map[pgalloc.FrameID][
 					as.stickyWriteback = errors.Join(as.stickyWriteback, err)
 				}
 				delete(as.mappings, hostarch.Addr(va))
+				as.mapped.Delete(hostarch.Addr(va))
 			}
 		}
 		as.mu.Unlock()
