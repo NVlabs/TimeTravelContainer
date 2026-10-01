@@ -150,15 +150,42 @@ func connectFamilyRenderer(opts *BrokerOptions, family *gfxproto.Conn) (int, *gf
 		err = family.Send(gfxproto.MsgServeConnection, 0, &gfxproto.ServeConnection{}, nil, fds[1])
 		unix.Close(fds[1])
 		if err == nil {
+			err = recvServing(family)
+		}
+		if err == nil {
 			return fds[0], family, nil
 		}
-		// The renderer exited: start another.
+		// The renderer exited, as it does once it serves no branch: start
+		// another.
 		unix.Close(fds[0])
 		family.Close()
 		family = nil
-		log.Printf("the family's GPU renderer is gone (%v); starting another", err)
+		if !errors.Is(err, gfxproto.ErrClosed) {
+			log.Printf("the family's GPU renderer is gone (%v); starting another", err)
+		}
 	}
 	return -1, nil, errors.New("the family's GPU renderer exits")
+}
+
+// recvServing receives the reply of the renderer of a family that serves the
+// connection that the broker gave it.
+func recvServing(family *gfxproto.Conn) error {
+	m, err := family.Recv()
+	if err != nil {
+		return err
+	}
+	m.CloseFDs()
+	if m.Type != gfxproto.MsgReply {
+		return fmt.Errorf("unexpected %v", m.Type)
+	}
+	var reply gfxproto.Reply
+	if _, err := m.Decode(&reply); err != nil {
+		return err
+	}
+	if reply.Errno != 0 {
+		return unix.Errno(reply.Errno)
+	}
+	return nil
 }
 
 // startFamilyRenderer starts a renderer for a family, and returns its

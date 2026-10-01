@@ -42,6 +42,11 @@ func helperMain() {
 	case "serve":
 		conn := os.NewFile(3, "connection")
 		fmt.Fprint(conn, strings.Join(args, " "))
+	case "serve-family":
+		if err := ServeFamily(3, Options{Backend: BackendVenus}); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	case "probe":
 		if len(args) == 3 && args[2] == "fail" {
 			fmt.Fprintln(os.Stderr, "no GPU here")

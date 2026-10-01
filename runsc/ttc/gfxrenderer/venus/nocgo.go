@@ -23,3 +23,9 @@ func Serve(fd int) error {
 func Probe() ([]byte, error) {
 	return nil, errNoCgo
 }
+
+// PendingClones returns the number of clones that forks' children have yet
+// to adopt. Without cgo, there are none.
+func PendingClones() int {
+	return 0
+}

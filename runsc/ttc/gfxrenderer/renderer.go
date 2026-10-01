@@ -151,9 +151,11 @@ func Serve(fd int, opts Options) error {
 }
 
 // ServeFamily serves the branches of a family, a connection to each, which
-// its broker gives it on the control connection fd, which it takes, until
-// the broker disconnects and the connections close. Only the Venus backend
-// serves families.
+// its broker gives it on the control connection fd, which it takes. It
+// returns once it serves no connection and keeps nothing for a fork's
+// children, as a branch's renderer exits once its branch no longer uses the
+// GPU, or once the broker disconnects and the connections close. Only the
+// Venus backend serves families.
 func ServeFamily(fd int, opts Options) error {
 	if opts.Backend != BackendVenus {
 		unix.Close(fd)
@@ -164,12 +166,13 @@ func ServeFamily(fd int, opts Options) error {
 		unix.Close(fd)
 		return err
 	}
-	defer control.Close()
+	f := &familyServer{control: control}
+	defer f.close()
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	for {
 		m, err := control.Recv()
-		if errors.Is(err, gfxproto.ErrClosed) {
+		if errors.Is(err, gfxproto.ErrClosed) || f.closed() {
 			return nil
 		}
 		if err != nil {
@@ -181,13 +184,72 @@ func ServeFamily(fd int, opts Options) error {
 		}
 		conn := m.FDs[0]
 		m.FDs = nil
+		if !f.accept() {
+			// The renderer exits: the broker starts another.
+			unix.Close(conn)
+			return nil
+		}
+		if err := control.Send(gfxproto.MsgReply, m.Seq, &gfxproto.Reply{}, nil); err != nil {
+			unix.Close(conn)
+			f.done()
+			return err
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer f.done()
 			if err := venus.Serve(conn); err != nil {
 				log.Printf("serving a branch: %v", err)
 			}
 		}()
+	}
+}
+
+// familyServer counts the connections that the renderer of a family serves,
+// and closes its control connection once it serves none and keeps nothing
+// for a fork's children.
+type familyServer struct {
+	control *gfxproto.Conn
+
+	mu      sync.Mutex
+	serving int
+	closing bool
+}
+
+// accept counts a connection to serve, unless the renderer is exiting.
+func (f *familyServer) accept() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closing {
+		return false
+	}
+	f.serving++
+	return true
+}
+
+// done uncounts a connection that the renderer served.
+func (f *familyServer) done() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.serving--
+	if f.serving == 0 && venus.PendingClones() == 0 && !f.closing {
+		f.closing = true
+		f.control.Close()
+	}
+}
+
+func (f *familyServer) closed() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closing
+}
+
+func (f *familyServer) close() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.closing {
+		f.closing = true
+		f.control.Close()
 	}
 }
 

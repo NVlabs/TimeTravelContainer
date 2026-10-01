@@ -410,6 +410,14 @@ var clones = struct {
 	m  map[string]*pendingClone
 }{m: make(map[string]*pendingClone)}
 
+// PendingClones returns the number of clones that forks' children have yet
+// to adopt, which keep the renderer of a family from exiting.
+func PendingClones() int {
+	clones.mu.Lock()
+	defer clones.mu.Unlock()
+	return len(clones.m)
+}
+
 // pendingClone is a clone that forks' children adopt. The last takes it;
 // the others clone it again.
 type pendingClone struct {

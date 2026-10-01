@@ -305,7 +305,10 @@ type (
 	}
 
 	// ServeConnection gives the renderer of a family a connection to serve,
-	// the message's descriptor, a branch's. The renderer does not reply.
+	// the message's descriptor, a branch's. The renderer replies once it
+	// serves the connection. A renderer that exits, which it does once it
+	// serves no connection and keeps nothing for a fork, closes the control
+	// connection instead, and the broker starts another.
 	ServeConnection struct {
 		Reserved uint32
 	}
