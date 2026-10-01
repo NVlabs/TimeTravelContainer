@@ -6,7 +6,7 @@ package images
 
 import (
 	"bytes"
-	"compress/gzip"
+	"compress/flate"
 	"context"
 	"encoding/json"
 	"errors"
@@ -29,6 +29,7 @@ import (
 	"github.com/containerd/platforms"
 	distref "github.com/distribution/reference"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"gvisor.dev/gvisor/runsc/ttc/pflate"
 )
 
 var (
@@ -828,47 +829,57 @@ func Commit(ctx context.Context, opts CommitOptions) (Info, error) {
 		}
 	}
 
-	temporary, err := os.CreateTemp(store.root, ".commit-layer-")
-	if err != nil {
-		return Info{}, err
-	}
-	temporaryName := temporary.Name()
-	defer os.Remove(temporaryName)
 	algorithm := base.Target.Digest.Algorithm()
 	if !algorithm.Available() {
-		temporary.Close()
 		return Info{}, fmt.Errorf("base image uses unavailable digest algorithm %q", algorithm)
 	}
+	// The layer is compressed into the content store as it is exported, on
+	// every processor: compressed on one into a file, which was then read
+	// back into the store, a layer of 1 GiB took 30 s.
+	ref := fmt.Sprintf("ttc-commit-layer-%d-%d", os.Getpid(), time.Now().UnixNano())
+	writer, err := content.OpenWriter(ctx, store.content, content.WithRef(ref))
+	if err != nil {
+		return Info{}, fmt.Errorf("storing committed layer: %w", err)
+	}
+	stored := false
+	defer func() {
+		_ = writer.Close()
+		if !stored {
+			_ = store.content.Abort(ctx, ref)
+		}
+	}()
+	// The store digests what it is written; a layer is digested apart only
+	// by another algorithm.
 	blobDigester := algorithm.Digester()
+	storeDigests := writer.Digest().Algorithm() == algorithm
+	var blobHash io.Writer = io.Discard
+	if !storeDigests {
+		blobHash = blobDigester.Hash()
+	}
 	diffDigester := algorithm.Digester()
 	// OCI identifies the stored gzip blob separately from the uncompressed tar
 	// stream recorded in config.RootFS.DiffIDs.
-	compressor := gzip.NewWriter(io.MultiWriter(temporary, blobDigester.Hash()))
+	compressor, err := pflate.NewGzipWriter(io.MultiWriter(writer, blobHash), flate.DefaultCompression)
+	if err != nil {
+		return Info{}, err
+	}
 	_, copyErr := io.Copy(compressor, io.TeeReader(opts.Layer, diffDigester.Hash()))
 	closeErr := compressor.Close()
 	if err := errors.Join(copyErr, closeErr); err != nil {
-		temporary.Close()
 		return Info{}, fmt.Errorf("compressing committed layer: %w", err)
 	}
-	layerSize, err := temporary.Seek(0, io.SeekCurrent)
+	status, err := writer.Status()
 	if err != nil {
-		temporary.Close()
-		return Info{}, err
-	}
-	if _, err := temporary.Seek(0, io.SeekStart); err != nil {
-		temporary.Close()
-		return Info{}, err
-	}
-	layer := ocispec.Descriptor{
-		MediaType: ocispec.MediaTypeImageLayerGzip, Digest: blobDigester.Digest(), Size: layerSize,
-	}
-	if err := content.WriteBlob(ctx, store.content, "ttc-commit-layer-"+layer.Digest.Encoded(), temporary, layer); err != nil {
-		temporary.Close()
 		return Info{}, fmt.Errorf("storing committed layer: %w", err)
 	}
-	if err := temporary.Close(); err != nil {
-		return Info{}, err
+	layer := ocispec.Descriptor{MediaType: ocispec.MediaTypeImageLayerGzip, Digest: writer.Digest(), Size: status.Offset}
+	if !storeDigests {
+		layer.Digest = blobDigester.Digest()
 	}
+	if err := writer.Commit(ctx, layer.Size, layer.Digest); err != nil && !errdefs.IsAlreadyExists(err) {
+		return Info{}, fmt.Errorf("storing committed layer: %w", err)
+	}
+	stored = true
 
 	now := time.Now().UTC()
 	config.Created = &now

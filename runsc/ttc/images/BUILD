@@ -20,6 +20,7 @@ go_library(
     visibility = ["//runsc/ttc:__subpackages__"],
     deps = [
         "//runsc/ttc/ownership",
+        "//runsc/ttc/pflate",
         "@com_github_containerd_containerd_v2//core/content",
         "@com_github_containerd_errdefs//:go_default_library",
         "@com_github_containerd_containerd_v2//core/images",

@@ -23,6 +23,7 @@ import (
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	ttccheckpoint "gvisor.dev/gvisor/runsc/ttc/checkpoint"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
+	"gvisor.dev/gvisor/runsc/ttc/pflate"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
@@ -455,7 +456,7 @@ func (b *runtimeBackend) saveCheckpointDehydration(info ttcbundle.ContainerInfo,
 		}
 		compressed := make(chan error, 1)
 		go func() {
-			compressor, err := flate.NewWriter(memory, flate.BestSpeed)
+			compressor, err := pflate.NewWriter(memory, flate.BestSpeed)
 			if err == nil {
 				_, err = io.Copy(compressor, reader)
 				err = errors.Join(err, compressor.Close())

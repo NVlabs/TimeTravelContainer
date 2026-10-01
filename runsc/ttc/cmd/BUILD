@@ -78,6 +78,7 @@ go_library(
         "//runsc/ttc/console",
         "//runsc/ttc/copyhelper",
         "//runsc/ttc/images",
+        "//runsc/ttc/pflate",
 		"//runsc/ttc/protocol",
 		"//runsc/ttc/storage",
         "//runsc/version",
