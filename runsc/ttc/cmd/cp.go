@@ -15,6 +15,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -33,14 +34,27 @@ const (
 )
 
 // guestCopyHelper contains a Linux executable used for copy operations inside
-// a container. Native Linux builds leave this empty and execute the TTC binary
-// itself; non-Linux hosts register a guest-ISA helper during process startup.
-var guestCopyHelper []byte
+// a container: the small helper ttcd embeds for its host's ISA, or, if it has
+// none, empty, for copies to execute the TTC binary itself. stagedCopyHelper
+// is it staged as a file, once, of which each copy is given a duplicate.
+var (
+	guestCopyHelper  []byte
+	stagedCopyHelper struct {
+		mu   sync.Mutex
+		file *os.File
+	}
+)
 
 // SetGuestCopyHelper registers the Linux executable used by container copy
 // operations. It must be called before Run or RunDaemon starts serving work.
 func SetGuestCopyHelper(binary []byte) {
+	stagedCopyHelper.mu.Lock()
+	defer stagedCopyHelper.mu.Unlock()
 	guestCopyHelper = binary
+	if stagedCopyHelper.file != nil {
+		_ = stagedCopyHelper.file.Close()
+		stagedCopyHelper.file = nil
+	}
 }
 
 type copyCommandOptions struct {
@@ -362,33 +376,25 @@ func offlineCopyState(state string) bool {
 	}
 }
 
+// openCopyHelper returns the copy helper's executable, opened read-only, for
+// the caller to close. The Sentry reads it at offsets, so the duplicates of
+// the staged helper the copies run share it.
 func (b *runtimeBackend) openCopyHelper() (*os.File, error) {
+	stagedCopyHelper.mu.Lock()
+	defer stagedCopyHelper.mu.Unlock()
 	if len(guestCopyHelper) != 0 {
-		staging, err := os.CreateTemp("", "ttc-linux-copy-helper-")
+		if stagedCopyHelper.file == nil {
+			staged, err := stageCopyHelper()
+			if err != nil {
+				return nil, err
+			}
+			stagedCopyHelper.file = staged
+		}
+		fd, err := unix.FcntlInt(stagedCopyHelper.file.Fd(), unix.F_DUPFD_CLOEXEC, 0)
 		if err != nil {
-			return nil, fmt.Errorf("creating TTC Linux copy helper: %w", err)
+			return nil, fmt.Errorf("duplicating TTC Linux copy helper: %w", err)
 		}
-		name := staging.Name()
-		if _, err := staging.Write(guestCopyHelper); err != nil {
-			staging.Close()
-			_ = os.Remove(name)
-			return nil, fmt.Errorf("writing TTC Linux copy helper: %w", err)
-		}
-		if err := staging.Close(); err != nil {
-			_ = os.Remove(name)
-			return nil, fmt.Errorf("closing staged TTC Linux copy helper: %w", err)
-		}
-		// Executable host FDs are required to be O_RDONLY. Reopen the staged
-		// bytes accordingly before unlinking the path.
-		helper, err := os.Open(name)
-		if err != nil {
-			_ = os.Remove(name)
-			return nil, fmt.Errorf("opening TTC Linux copy helper read-only: %w", err)
-		}
-		// The open descriptor remains usable after unlink on Darwin, while no
-		// guest-helper artifact is left behind after a host process crash.
-		_ = os.Remove(name)
-		return helper, nil
+		return os.NewFile(uintptr(fd), stagedCopyHelper.file.Name()), nil
 	}
 	// The copy helper is built into ttcd. Donating the daemon executable keeps
 	// the client binary out of the Sentry and out of the wire protocol.
@@ -397,6 +403,36 @@ func (b *runtimeBackend) openCopyHelper() (*os.File, error) {
 	if err != nil {
 		return nil, fmt.Errorf("opening TTC copy helper %q: %w", executable, err)
 	}
+	return helper, nil
+}
+
+// stageCopyHelper writes guestCopyHelper to a file, and returns it, opened
+// read-only and unlinked.
+func stageCopyHelper() (*os.File, error) {
+	staging, err := os.CreateTemp("", "ttc-linux-copy-helper-")
+	if err != nil {
+		return nil, fmt.Errorf("creating TTC Linux copy helper: %w", err)
+	}
+	name := staging.Name()
+	if _, err := staging.Write(guestCopyHelper); err != nil {
+		staging.Close()
+		_ = os.Remove(name)
+		return nil, fmt.Errorf("writing TTC Linux copy helper: %w", err)
+	}
+	if err := staging.Close(); err != nil {
+		_ = os.Remove(name)
+		return nil, fmt.Errorf("closing staged TTC Linux copy helper: %w", err)
+	}
+	// Executable host FDs are required to be O_RDONLY. Reopen the staged
+	// bytes accordingly before unlinking the path.
+	helper, err := os.Open(name)
+	if err != nil {
+		_ = os.Remove(name)
+		return nil, fmt.Errorf("opening TTC Linux copy helper read-only: %w", err)
+	}
+	// The open descriptor remains usable after unlink, while no guest-helper
+	// artifact is left behind after a host process crash.
+	_ = os.Remove(name)
 	return helper, nil
 }
 

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+//go:build darwin || linux
+
 package copyguest
 
 import _ "embed"
@@ -11,5 +13,5 @@ import _ "embed"
 //go:embed cmd/copy_helper_linux_arm64
 var linuxARM64 []byte
 
-// Binary returns the copy helper matching the native macOS guest ISA.
+// Binary returns the copy helper for the guest's ISA, the host's.
 func Binary() []byte { return linuxARM64 }

@@ -239,23 +239,43 @@ func TestOfflineCopySpecRejectsLegacyWritableRoot(t *testing.T) {
 
 func TestOpenEmbeddedGuestCopyHelper(t *testing.T) {
 	previous := guestCopyHelper
-	t.Cleanup(func() { guestCopyHelper = previous })
+	t.Cleanup(func() { SetGuestCopyHelper(previous) })
 	want := []byte("guest-elf-fixture")
+	SetGuestCopyHelper(want)
+	// Every copy gets a descriptor of its own for the one staged file.
+	for i := 0; i < 2; i++ {
+		helper, err := (&runtimeBackend{}).openCopyHelper()
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := io.ReadAll(io.NewSectionReader(helper, 0, int64(len(want))+1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("embedded helper = %q, want %q", got, want)
+		}
+		if _, err := os.Stat(helper.Name()); !os.IsNotExist(err) {
+			t.Fatalf("embedded helper path remains after open: %v", err)
+		}
+		if err := helper.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Another helper replaces the staged one.
+	want = []byte("another-guest-elf-fixture")
 	SetGuestCopyHelper(want)
 	helper, err := (&runtimeBackend{}).openCopyHelper()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer helper.Close()
-	got, err := io.ReadAll(helper)
+	got, err := io.ReadAll(io.NewSectionReader(helper, 0, int64(len(want))+1))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(got, want) {
-		t.Fatalf("embedded helper = %q, want %q", got, want)
-	}
-	if _, err := os.Stat(helper.Name()); !os.IsNotExist(err) {
-		t.Fatalf("embedded helper path remains after open: %v", err)
+		t.Fatalf("replaced embedded helper = %q, want %q", got, want)
 	}
 }
 
