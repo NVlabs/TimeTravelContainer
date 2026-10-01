@@ -295,7 +295,13 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		// branch-local cloned filesystem graph. This must precede VFS.PrepareSave
 		// for the same reason as in Kernel.SaveTo.
 		mappingInvalidationStarted := time.Now()
-		if err := k.invalidateUnsavableMappings(ctx); err != nil {
+		invalidateCtx := ctx
+		if opts.RemoteMemoryFile == nil {
+			// The child shares the MemoryFile, and with it the pages of
+			// files that cannot change, which their mappings keep.
+			invalidateCtx = context.WithValue(ctx, memmap.CtxLiveForkInProcess, true)
+		}
+		if err := k.invalidateUnsavableMappings(invalidateCtx); err != nil {
 			return fmt.Errorf("invalidating unsavable mappings for live fork: %w", err)
 		}
 		if opts.Metrics != nil {

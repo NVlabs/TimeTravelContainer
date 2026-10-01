@@ -98,11 +98,31 @@ type Mappable interface {
 	Translate(ctx context.Context, required, optional MappableRange, at hostarch.AccessType) ([]Translation, error)
 
 	// InvalidateUnsavable requests that the Mappable invalidate Translations
-	// that cannot be preserved across save/restore.
+	// that cannot be preserved across save/restore. For a live fork whose
+	// child is in the same process (see IsLiveForkInProcess), Translations
+	// to the MemoryFile that both share may be preserved, if the child's
+	// copy of the Mappable references what they map.
 	//
 	// Invariant: InvalidateUnsavable never races with concurrent calls to any
 	// other Mappable methods.
 	InvalidateUnsavable(ctx context.Context) error
+}
+
+// contextID is this package's type for context.Context.Value keys.
+type contextID int
+
+const (
+	// CtxLiveForkInProcess is a Context.Value key for whether
+	// Mappable.InvalidateUnsavable prepares a live fork whose child is in the
+	// same process, and shares its MemoryFile.
+	CtxLiveForkInProcess contextID = iota
+)
+
+// IsLiveForkInProcess reports whether ctx's Mappable.InvalidateUnsavable
+// prepares a live fork whose child shares the process's MemoryFile.
+func IsLiveForkInProcess(ctx context.Context) bool {
+	v, _ := ctx.Value(CtxLiveForkInProcess).(bool)
+	return v
 }
 
 // Translations are returned by Mappable.Translate.
