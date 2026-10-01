@@ -437,14 +437,15 @@ func stageCopyHelper() (*os.File, error) {
 }
 
 func (b *runtimeBackend) runLiveCopyHelper(resolved selector, helperArgs []string, input io.Reader, output io.Writer, paused bool) error {
-	execID := ""
-	if paused {
-		requestID, err := newDaemonRequestID()
-		if err != nil {
-			return fmt.Errorf("allocating paused copy session ID: %w", err)
-		}
-		execID = "ttc-cp-" + requestID
+	// The helper is a session of its own, whose wait finds it however soon
+	// it exits. A branch's process is waited for by its PID otherwise, and
+	// one with no parent is reaped as it exits: a helper done before its
+	// wait began was gone, and the copy failed.
+	requestID, err := newDaemonRequestID()
+	if err != nil {
+		return fmt.Errorf("allocating copy session ID: %w", err)
 	}
+	execID := "ttc-cp-" + requestID
 	helper, err := b.openCopyHelper()
 	if err != nil {
 		return err
@@ -456,9 +457,10 @@ func (b *runtimeBackend) runLiveCopyHelper(resolved selector, helperArgs []strin
 		"--cap", "CAP_CHOWN", "--cap", "CAP_DAC_OVERRIDE",
 		"--cap", "CAP_FOWNER", "--cap", "CAP_MKNOD",
 		"--exec-fd", "3",
+		"--exec-id", execID,
 	}
 	if paused {
-		args = append(args, "--paused-management", "--exec-id", execID)
+		args = append(args, "--paused-management")
 	}
 	args = append(args, resolved.container, "ttc", copyHelperArg)
 	args = append(args, helperArgs...)
