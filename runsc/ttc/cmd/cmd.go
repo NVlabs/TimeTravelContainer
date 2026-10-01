@@ -29,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"text/tabwriter"
 	"text/template"
@@ -4880,74 +4881,166 @@ func runStop(args []string, stdout, stderr io.Writer, backend backend) error {
 		if timeoutSet {
 			stopTimeout = timeout
 		}
-		for _, target := range targets {
-			if err := stopBranchLifecycle(target, stopSignal, stopTimeout, backend, true); err != nil {
-				return err
-			}
+		if err := stopBranchesLifecycle(targets, stopSignal, stopTimeout, backend); err != nil {
+			return err
 		}
 		fmt.Fprintln(stdout, value)
 	}
 	return nil
 }
 
-func stopBranchLifecycle(target branchOperationTarget, stopSignal, timeoutSeconds int, backend backend, publish bool) error {
-	queueExit := func() error {
-		if !publish {
-			return nil
+// stopBranchesLifecycle stops a family's branches as stopBranchLifecycle
+// stops each, in order, with one grace period for all its running branches:
+// each is sent the stop signal before any branch is stopped, and is waited
+// for until the period, which begins once the last is signaled, ends.
+// Stopped one after another, each branch whose init ignores the signal, as
+// an init does that does not handle it, held the stop for a period of its
+// own.
+func stopBranchesLifecycle(targets []branchOperationTarget, stopSignal, timeoutSeconds int, backend backend) error {
+	running := func(target branchOperationTarget) bool {
+		return target.state == "running" || target.state == "restarting"
+	}
+	// stops holds, by index, the running branches signaled, nil for one that
+	// needed nothing more.
+	stops := make(map[int]*runningStop)
+	var err error
+	for index, target := range targets {
+		if !running(target) {
+			continue
 		}
-		if publisher, ok := backend.(interface{ queueBranchPublication(selector, string) error }); ok {
-			if err := publisher.queueBranchPublication(target.selector, "stop"); err != nil {
-				return fmt.Errorf("queueing durable filesystem publication for %s: %w", target.selector, err)
+		var stop *runningStop
+		if stop, err = beginRunningStop(target, stopSignal, backend, true); err != nil {
+			break
+		}
+		stops[index] = stop
+	}
+	deadline := stopDeadline(timeoutSeconds)
+	for index, target := range targets {
+		// A branch signaled is stopped even after another failed.
+		if stop, signaled := stops[index]; signaled {
+			if stop != nil {
+				err = errors.Join(err, stop.finish(deadline, backend))
 			}
+			continue
 		}
+		if err == nil && !running(target) {
+			err = stopBranchLifecycle(target, stopSignal, timeoutSeconds, backend, true)
+		}
+	}
+	return err
+}
+
+// stopDeadline is when a grace period of timeoutSeconds that begins now
+// ends: never, for -1.
+func stopDeadline(timeoutSeconds int) time.Time {
+	if timeoutSeconds == -1 {
+		return time.Time{}
+	}
+	return time.Now().Add(time.Duration(timeoutSeconds) * time.Second)
+}
+
+// queueStopPublication queues the durable publication of a stopped branch's
+// filesystem, if publish.
+func queueStopPublication(target branchOperationTarget, backend backend, publish bool) error {
+	if !publish {
 		return nil
 	}
-	switch target.state {
-	case "running", "restarting":
-		finishExplicitStop := func(bool) {}
-		if coordinator, ok := backend.(interface {
-			beginExplicitInitStop(selector) (func(bool), error)
-		}); ok {
-			var err error
-			finishExplicitStop, err = coordinator.beginExplicitInitStop(target.selector)
-			if err != nil {
-				return fmt.Errorf("coordinating explicit stop of %s: %w", target.selector, err)
-			}
+	if publisher, ok := backend.(interface{ queueBranchPublication(selector, string) error }); ok {
+		if err := publisher.queueBranchPublication(target.selector, "stop"); err != nil {
+			return fmt.Errorf("queueing durable filesystem publication for %s: %w", target.selector, err)
 		}
-		initTerminated := false
-		defer func() { finishExplicitStop(initTerminated) }()
-		if err := backend.prepareStop(target.selector); err != nil {
-			refreshed, refreshErr := branchOperationTargets(target.selector.String(), backend, false)
-			if refreshErr == nil && len(refreshed) == 1 && refreshed[0].state == "exited" {
-				initTerminated = true
-				if discardErr := backend.discard(target.selector); discardErr == nil {
-					return queueExit()
-				}
-			}
-			return fmt.Errorf("preparing %s for independent stop: %w", target.selector, err)
+	}
+	return nil
+}
+
+// runningStop is a running branch being stopped, sent its stop signal.
+type runningStop struct {
+	target  branchOperationTarget
+	publish bool
+	// exited is whether the branch had exited when it was signaled.
+	exited             bool
+	finishExplicitStop func(initTerminated bool)
+}
+
+// beginRunningStop prepares the running branch target to stop and sends it
+// stopSignal. It returns nil if target needs nothing more: it had exited
+// already, and was released.
+func beginRunningStop(target branchOperationTarget, stopSignal int, backend backend, publish bool) (*runningStop, error) {
+	stop := &runningStop{target: target, publish: publish, finishExplicitStop: func(bool) {}}
+	if coordinator, ok := backend.(interface {
+		beginExplicitInitStop(selector) (func(bool), error)
+	}); ok {
+		finish, err := coordinator.beginExplicitInitStop(target.selector)
+		if err != nil {
+			return nil, fmt.Errorf("coordinating explicit stop of %s: %w", target.selector, err)
 		}
-		// The grace period lasts as long as the stop policy allows, and
-		// other commands go on meanwhile; a kill of this branch too.
+		stop.finishExplicitStop = finish
+	}
+	if err := backend.prepareStop(target.selector); err != nil {
+		refreshed, refreshErr := branchOperationTargets(target.selector.String(), backend, false)
+		if refreshErr == nil && len(refreshed) == 1 && refreshed[0].state == "exited" {
+			stop.finishExplicitStop(true)
+			if discardErr := backend.discard(target.selector); discardErr == nil {
+				return nil, queueStopPublication(target, backend, publish)
+			}
+			return nil, fmt.Errorf("preparing %s for independent stop: %w", target.selector, err)
+		}
+		stop.finishExplicitStop(false)
+		return nil, fmt.Errorf("preparing %s for independent stop: %w", target.selector, err)
+	}
+	exited, err := signalStop(target.selector, stopSignal, backend)
+	if err != nil {
+		stop.finishExplicitStop(false)
+		return nil, err
+	}
+	stop.exited = exited
+	return stop, nil
+}
+
+// finish waits for the branch to exit, killing it at deadline if it is not
+// zero, and releases it.
+func (stop *runningStop) finish(deadline time.Time, backend backend) error {
+	target := stop.target
+	initTerminated := false
+	defer func() { stop.finishExplicitStop(initTerminated) }()
+	// The grace period lasts as long as the stop policy allows, and other
+	// commands go on meanwhile; a kill of this branch too.
+	if !stop.exited {
 		if err := withoutLifecycleLock(backend, target.selector, longOperation{branch: target.selector.branch, state: "stopping"}, func() error {
-			return stopBranch(target.selector, stopSignal, timeoutSeconds, backend)
+			return awaitStop(target.selector, deadline, backend)
 		}); err != nil {
-			// The final physical branch on an elastic node tears down its control
-			// socket as the init exits. If reconciliation confirms the requested
-			// terminal state, treat the lost wait reply as a committed stop.
+			// The final physical branch on an elastic node tears down its
+			// control socket as the init exits. If reconciliation confirms the
+			// requested terminal state, treat the lost wait reply as a
+			// committed stop.
 			refreshed, refreshErr := branchOperationTargets(target.selector.String(), backend, false)
 			if refreshErr == nil && len(refreshed) == 1 && refreshed[0].state == "exited" {
 				initTerminated = true
 				if discardErr := backend.discard(target.selector); discardErr == nil {
-					return queueExit()
+					return queueStopPublication(target, backend, stop.publish)
 				}
 			}
 			return err
 		}
-		initTerminated = true
-		if err := backend.discard(target.selector); err != nil {
-			return fmt.Errorf("releasing stopped execution state for %s: %w", target.selector, err)
+	}
+	initTerminated = true
+	if err := backend.discard(target.selector); err != nil {
+		return fmt.Errorf("releasing stopped execution state for %s: %w", target.selector, err)
+	}
+	return queueStopPublication(target, backend, stop.publish)
+}
+
+func stopBranchLifecycle(target branchOperationTarget, stopSignal, timeoutSeconds int, backend backend, publish bool) error {
+	queueExit := func() error {
+		return queueStopPublication(target, backend, publish)
+	}
+	switch target.state {
+	case "running", "restarting":
+		stop, err := beginRunningStop(target, stopSignal, backend, publish)
+		if err != nil || stop == nil {
+			return err
 		}
-		return queueExit()
+		return stop.finish(stopDeadline(timeoutSeconds), backend)
 	case "paused":
 		if err := backend.preparePausedStop(target.selector); err != nil {
 			return fmt.Errorf("persisting paused filesystem state for %s: %w", target.selector, err)
@@ -5238,27 +5331,35 @@ func stopPolicy(info InspectInfo) (int, int, error) {
 	return signal, timeout, nil
 }
 
-func stopBranch(target selector, stopSignal, timeoutSeconds int, backend backend) error {
-	const signalKill = 9
+// signalStop sends target stopSignal. It reports whether target had exited
+// already.
+func signalStop(target selector, stopSignal int, backend backend) (bool, error) {
 	if err := backend.signal(target, stopSignal, false); err != nil {
 		if _, waitErr := backend.wait(target); waitErr == nil {
-			return nil
+			return true, nil
 		}
-		return fmt.Errorf("stopping %s with signal %d: %w", target, stopSignal, err)
+		return false, fmt.Errorf("stopping %s with signal %d: %w", target, stopSignal, err)
 	}
+	return false, nil
+}
+
+// awaitStop waits for target, sent its stop signal, to exit, and kills it at
+// deadline, unless that is zero.
+func awaitStop(target selector, deadline time.Time, backend backend) error {
+	const signalKill = 9
 	waited := make(chan waitResult, 1)
 	go func() {
 		status, err := backend.wait(target)
 		waited <- waitResult{status: status, err: err}
 	}()
-	if timeoutSeconds == -1 {
+	if deadline.IsZero() {
 		result := <-waited
 		if result.err != nil {
 			return fmt.Errorf("waiting for %s: %w", target, result.err)
 		}
 		return nil
 	}
-	timer := time.NewTimer(time.Duration(timeoutSeconds) * time.Second)
+	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
 	select {
 	case result := <-waited:
@@ -6178,12 +6279,9 @@ type consoleSidecarOwner interface {
 // true once the old init is known to have terminated, or false when the stop
 // was abandoned while it could still exit naturally later.
 func (b *runtimeBackend) beginExplicitInitStop(target selector) (func(bool), error) {
-	if b.explicitInitStop {
-		return nil, errors.New("explicit init stop is already active")
-	}
 	if b.consoleSidecars == nil {
-		b.explicitInitStop = true
-		return func(bool) { b.explicitInitStop = false }, nil
+		atomic.AddInt32(&b.explicitInitStops, 1)
+		return func(bool) { atomic.AddInt32(&b.explicitInitStops, -1) }, nil
 	}
 	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
@@ -6194,9 +6292,9 @@ func (b *runtimeBackend) beginExplicitInitStop(target selector) (func(bool), err
 		return nil, err
 	}
 	finishConsole := b.consoleSidecars.SuppressConsoleExitOnce(paths.Lock)
-	b.explicitInitStop = true
+	atomic.AddInt32(&b.explicitInitStops, 1)
 	return func(commit bool) {
-		b.explicitInitStop = false
+		atomic.AddInt32(&b.explicitInitStops, -1)
 		finishConsole(commit)
 	}, nil
 }
@@ -6362,11 +6460,13 @@ type runtimeBackend struct {
 	// completion paths use it to avoid recursively acquiring the non-reentrant
 	// family lifecycle lock.
 	lifecycleLockHeld bool
-	// explicitInitStop distinguishes the internal wait performed by stop and
-	// restart from a user-facing `ttc wait`. The foreground lifecycle operation
-	// owns discard/publication ordering and must not recursively invoke the
-	// spontaneous-exit finalizer from its wait path.
-	explicitInitStop bool
+	// explicitInitStops counts the explicit stops in progress, which
+	// distinguish the internal waits performed by stop and restart from a
+	// user-facing `ttc wait`. The foreground lifecycle operation owns
+	// discard/publication ordering and must not recursively invoke the
+	// spontaneous-exit finalizer from its wait path. A family's stop stops
+	// its branches together, and their waits read it as they go.
+	explicitInitStops int32
 	// lifecycleReady releases the daemon lifecycle lock after an attached
 	// run/start has finished creating its runtime but before it waits for the
 	// guest. Detached commands release the lock when the command returns.
@@ -17736,7 +17836,7 @@ func (b *runtimeBackend) wait(target selector) (uint32, error) {
 // installations by the follower and this synchronous path are equivalent.
 func (b *runtimeBackend) completeWaitedInitExit(target selector, status uint32) error {
 	b.recordWaitState(target, status)
-	if b.explicitInitStop {
+	if atomic.LoadInt32(&b.explicitInitStops) != 0 {
 		return nil
 	}
 	// Standalone start already consumes the durable exited state directly and
