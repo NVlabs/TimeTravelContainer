@@ -95,6 +95,18 @@ func registerExternalMemory() {
 		if pd == nil {
 			return
 		}
+		if pd.emulateModifiers {
+			info := (*vn.VkPhysicalDeviceImageFormatInfo2)(a.PImageFormatInfo)
+			if info.Tiling == imageTilingDrmFormatModifier {
+				p := findStruct(info.PNext, vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT)
+				if p == nil || (*vn.VkPhysicalDeviceImageDrmFormatModifierInfoEXT)(p).DrmFormatModifier != drmFormatModLinear {
+					a.Ret = vn.VK_ERROR_FORMAT_NOT_SUPPORTED
+					return
+				}
+				removeStructs(unsafe.Pointer(info), vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT)
+				info.Tiling = imageTilingLinear
+			}
+		}
 		var handleType uint32
 		if pd.emulateDmaBuf {
 			info := unsafe.Pointer(a.PImageFormatInfo)
@@ -163,7 +175,14 @@ func registerExternalMemory() {
 		if dev == nil {
 			return
 		}
-		external := stripExternal(dev, *(*unsafe.Pointer)(unsafe.Add(a.PInfo, 16)), vn.VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO)
+		createInfo := *(*unsafe.Pointer)(unsafe.Add(a.PInfo, 16))
+		external := stripExternal(dev, createInfo, vn.VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO)
+		if createInfo != nil {
+			if _, ok := linearizeImageInfo(dev.pd, (*vn.VkImageCreateInfo)(createInfo)); !ok {
+				s.fail("%s: an image of no modifier that the renderer has", cmd.Name)
+				return
+			}
+		}
 		if s.call(cmd, args) && external {
 			restrictToHostVisible(dev, &(*vn.VkMemoryRequirements2)(a.PMemoryRequirements).MemoryRequirements.MemoryTypeBits)
 		}

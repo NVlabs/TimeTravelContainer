@@ -71,6 +71,9 @@ type physicalDevice struct {
 	hostNullDescriptor     bool
 	emulateProvokingVertex bool
 	emulateDmaBuf          bool
+	// emulateModifiers is whether the renderer offers DRM format modifiers
+	// and foreign queue families: see modifier_unsafe.go.
+	emulateModifiers bool
 	// hostVisibleTypes are the host-visible memory types.
 	hostVisibleTypes uint32
 	// familyCount is the number of queue families that guests see.

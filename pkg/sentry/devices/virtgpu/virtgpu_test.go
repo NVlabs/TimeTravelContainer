@@ -1012,7 +1012,8 @@ func TestBlobs(t *testing.T) {
 		cmd   []byte
 	}{
 		{"cross-device", linux.VIRTGPU_BLOB_MEM_HOST3D, linux.VIRTGPU_BLOB_FLAG_USE_CROSS_DEVICE, 1, size, nil},
-		{"unknown flags", linux.VIRTGPU_BLOB_MEM_HOST3D, 8, 1, size, nil},
+		{"unknown flags", linux.VIRTGPU_BLOB_MEM_HOST3D, 16, 1, size, nil},
+		{"a guest handle of the host's memory", linux.VIRTGPU_BLOB_MEM_HOST3D, linux.VIRTGPU_BLOB_FLAG_CREATE_GUEST_HANDLE, 1, size, nil},
 		{"unknown memory", 4, 0, 1, size, nil},
 		{"a guest blob with an ID", linux.VIRTGPU_BLOB_MEM_GUEST, 0, 1, size, nil},
 		{"a guest blob with a command", linux.VIRTGPU_BLOB_MEM_GUEST, 0, 0, size, []byte("abcd")},
@@ -1024,6 +1025,28 @@ func TestBlobs(t *testing.T) {
 			t.Errorf("creating %s: %v, want EINVAL", test.name, err)
 		}
 	}
+}
+
+// TestGuestHandleBlobs checks that the device takes blobs of the guest's
+// memory with host handles, of IDs, as Android's minigbm, built against
+// ChromeOS's headers, asks for them.
+func TestGuestHandleBlobs(t *testing.T) {
+	e := newTestEnv(t, ForkIneligible)
+	file := e.open()
+	if err := e.contextInit(file, 3, 1, "minigbm"); err != nil {
+		t.Fatal(err)
+	}
+	r := e.fakes.last(t)
+	r.takeCalls()
+	const size = 4 * hostarch.PageSize
+	flags := uint32(linux.VIRTGPU_BLOB_FLAG_USE_SHAREABLE | linux.VIRTGPU_BLOB_FLAG_CREATE_GUEST_HANDLE)
+	_, resID, err := e.createBlob(file, linux.VIRTGPU_BLOB_MEM_GUEST, flags, 3, size, nil)
+	if err != nil {
+		t.Fatalf("RESOURCE_CREATE_BLOB: %v", err)
+	}
+	wantCalls(t, r,
+		fmt.Sprintf("CreateBlob 1 %d mem 1 flags %d id 3 size %d", resID, flags, size),
+		fmt.Sprintf("AttachResource 1 %d", resID))
 }
 
 func TestClassicResources(t *testing.T) {

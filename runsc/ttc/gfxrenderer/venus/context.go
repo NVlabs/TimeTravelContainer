@@ -139,6 +139,10 @@ type Context struct {
 	// stream executes what the Sentry submits.
 	stream *stream
 
+	// crossDomain is the state of a cross-domain context, which executes
+	// cross-domain commands rather than Venus's (see crossdomain_unsafe.go).
+	crossDomain *crossDomain
+
 	ringMu sync.Mutex
 	rings  map[uint64]*ring
 	// monitor marks monitored rings alive.
@@ -326,6 +330,9 @@ func (c *Context) detach(id uint32) {
 func (c *Context) submit(buf []byte) error {
 	if c.fatal.Load() {
 		return fmt.Errorf("the context failed")
+	}
+	if c.crossDomain != nil {
+		return c.crossDomain.submit(c, buf)
 	}
 	if !c.stream.execute(buf) {
 		return fmt.Errorf("executing a command stream failed")

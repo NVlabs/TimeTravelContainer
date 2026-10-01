@@ -54,6 +54,7 @@ func (s *stream) initQuirks(pd *physicalDevice, hostExtensions map[string]bool) 
 		pd.extensions = append(pd.extensions, e)
 	}
 	pd.initExternalMemory(hostExtensions)
+	pd.initModifiers(hostExtensions)
 	// Trailing families that duplicate an earlier one.
 	pd.familyCount = uint32(len(pd.queueFamilies))
 	for pd.familyCount > 1 {
@@ -143,6 +144,10 @@ func deviceQuirks(pd *physicalDevice, info *vn.VkDeviceCreateInfo, names []unsaf
 		for _, name := range emulatedExtensions {
 			emulated[name] = true
 		}
+	}
+	if pd.emulateModifiers {
+		emulated[extImageDrmFormatModifier] = true
+		emulated[extQueueFamilyForeign] = true
 	}
 	kept := names[:0]
 	for _, name := range names {

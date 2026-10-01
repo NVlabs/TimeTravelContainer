@@ -228,12 +228,21 @@ func (s *stream) createExternable(cmd *vn.Command, args unsafe.Pointer, typ int3
 	}
 	external := stripExternal(dev, info, stype)
 	var img *imageInfo
+	var layouts []vn.VkSubresourceLayout
 	if typ == vn.VK_OBJECT_TYPE_IMAGE {
+		var ok bool
+		if layouts, ok = linearizeImageInfo(dev.pd, (*vn.VkImageCreateInfo)(info)); !ok {
+			(*vn.Args_vkCreateImage)(args).Ret = vn.VK_ERROR_FORMAT_NOT_SUPPORTED
+			return
+		}
 		img = newImageInfo((*vn.VkImageCreateInfo)(info))
 	}
 	if o := s.createObject(cmd, args, typ, out); o != nil {
 		o.external = external
 		o.image = img
+		if layouts != nil {
+			s.checkLinearLayout(dev, o.handle, img.format, layouts)
+		}
 	}
 }
 

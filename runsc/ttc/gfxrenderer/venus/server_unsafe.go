@@ -140,13 +140,17 @@ func (s *server) handle(m *gfxproto.Message) error {
 		errno := uint32(0)
 		s.mu.Lock()
 		switch {
-		case p.CapsetID != CapsetVenus:
+		case p.CapsetID != CapsetVenus && p.CapsetID != CapsetCrossDomain:
 			log.Printf("venus: context %d of capability set %d", p.CtxID, p.CapsetID)
 			errno = uint32(unix.EINVAL)
 		case s.contexts[p.CtxID] != nil:
 			errno = uint32(unix.EEXIST)
 		default:
-			s.contexts[p.CtxID] = newContext(s, p.CtxID, string(name))
+			c := newContext(s, p.CtxID, string(name))
+			if p.CapsetID == CapsetCrossDomain {
+				c.crossDomain = newCrossDomain()
+			}
+			s.contexts[p.CtxID] = c
 		}
 		s.mu.Unlock()
 		return s.reply(m, gfxproto.Reply{Errno: errno})
@@ -353,8 +357,31 @@ func (s *server) addResource(ctxID uint32, r *resource) {
 }
 
 // createBlob creates a blob resource: shared memory that the guest asks for
-// with ID 0, as rings and reply streams, or a VkDeviceMemory's.
+// with ID 0, as rings and reply streams, or of the guest's memory, a
+// VkDeviceMemory's, or an image's that a cross-domain context allocated.
 func (s *server) createBlob(p *gfxproto.CreateBlob) error {
+	c := s.context(p.CtxID)
+	if c != nil && c.crossDomain != nil && p.BlobID != 0 {
+		// An image that the context allocated, as the host's memory or,
+		// for minigbm built against ChromeOS's headers, the guest's with a
+		// host handle, which are alike here.
+		mem, err := c.crossDomain.newBlob(uint32(p.BlobID), p.Size)
+		if err != nil {
+			return err
+		}
+		s.addResource(p.CtxID, &resource{id: p.ResID, size: p.Size, mapInfo: mapCacheCached, mem: mem})
+		return nil
+	}
+	if p.Mem == blobMemGuest {
+		// The renderer's shared memory is the guest's memory, which the
+		// Sentry maps as it maps the host's.
+		mem, err := newSharedMemory(p.Size)
+		if err != nil {
+			return err
+		}
+		s.addResource(p.CtxID, &resource{id: p.ResID, size: p.Size, mapInfo: mapCacheCached, mem: mem})
+		return nil
+	}
 	if p.Mem != blobMemHost3D {
 		return fmt.Errorf("blob memory %d", p.Mem)
 	}
@@ -369,7 +396,6 @@ func (s *server) createBlob(p *gfxproto.CreateBlob) error {
 		s.addResource(p.CtxID, &resource{id: p.ResID, size: p.Size, mapInfo: mapCacheCached, mem: mem})
 		return nil
 	}
-	c := s.context(p.CtxID)
 	if c == nil {
 		return fmt.Errorf("no context %d", p.CtxID)
 	}

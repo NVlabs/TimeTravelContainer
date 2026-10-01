@@ -123,6 +123,9 @@ func cloneContexts(contexts map[uint32]*Context, resources map[uint32]*resource)
 		c := contexts[id]
 		cc := newContext(nil, id, c.name)
 		st.contexts[id] = cc
+		if c.crossDomain != nil {
+			cc.crossDomain = c.crossDomain.clone()
+		}
 		cl.cloneDevices(c, cc)
 	}
 

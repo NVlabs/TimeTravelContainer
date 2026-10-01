@@ -14,6 +14,15 @@ var errNoCgo = errors.New("the renderer was built without cgo, which it needs to
 // CapsetVenus is the ID of Venus's capability set.
 const CapsetVenus = 4
 
+// CapsetCrossDomain is the ID of the cross-domain capability set.
+const CapsetCrossDomain = 5
+
+// CrossDomainCapset returns the cross-domain capability set. Without cgo,
+// there is none.
+func CrossDomainCapset() []byte {
+	return nil
+}
+
 // Serve renders for the Sentry connected to fd. Without cgo, it cannot.
 func Serve(fd int) error {
 	return errNoCgo

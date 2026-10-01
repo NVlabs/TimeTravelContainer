@@ -51,7 +51,12 @@ func Probe(opts Options) ([]Capset, error) {
 		if err != nil {
 			return nil, err
 		}
-		return []Capset{{ID: venus.CapsetVenus, Data: data}}, nil
+		return []Capset{
+			{ID: venus.CapsetVenus, Data: data},
+			// minigbm, Android's gralloc, allocates buffers with
+			// cross-domain contexts.
+			{ID: venus.CapsetCrossDomain, Data: venus.CrossDomainCapset()},
+		}, nil
 	}
 	r, w, err := os.Pipe()
 	if err != nil {

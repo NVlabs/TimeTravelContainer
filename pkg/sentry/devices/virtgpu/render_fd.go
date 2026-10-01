@@ -713,18 +713,25 @@ func (fd *renderFD) resourceCreateBlob(t *kernel.Task, cmd uint32, addr hostarch
 	if err := copyInArg(t, cmd, kernelRW, addr, &rc); err != nil {
 		return err
 	}
-	// See drivers/gpu/drm/virtio/virtgpu_ioctl.c:verify_blob().
-	const knownFlags = linux.VIRTGPU_BLOB_FLAG_USE_MAPPABLE | linux.VIRTGPU_BLOB_FLAG_USE_SHAREABLE | linux.VIRTGPU_BLOB_FLAG_USE_CROSS_DEVICE
+	// See drivers/gpu/drm/virtio/virtgpu_ioctl.c:verify_blob(). Guests built
+	// against ChromeOS's headers, such as Android's minigbm, take upstream's
+	// VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME, which the device offers, for
+	// ChromeOS's VIRTGPU_PARAM_CREATE_GUEST_HANDLE, and ask for blobs of
+	// their memory with host handles, which the renderer's memory, that the
+	// guest maps as its own, is.
+	const knownFlags = linux.VIRTGPU_BLOB_FLAG_USE_MAPPABLE | linux.VIRTGPU_BLOB_FLAG_USE_SHAREABLE |
+		linux.VIRTGPU_BLOB_FLAG_USE_CROSS_DEVICE | linux.VIRTGPU_BLOB_FLAG_CREATE_GUEST_HANDLE
 	if rc.BlobFlags&^knownFlags != 0 || rc.BlobFlags&linux.VIRTGPU_BLOB_FLAG_USE_CROSS_DEVICE != 0 {
 		return linuxerr.EINVAL
 	}
 	switch rc.BlobMem {
 	case linux.VIRTGPU_BLOB_MEM_GUEST:
-		if rc.BlobID != 0 || rc.CmdSize != 0 {
+		// A blob of the guest's memory has an ID only for its host handle.
+		if (rc.BlobID != 0 && rc.BlobFlags&linux.VIRTGPU_BLOB_FLAG_CREATE_GUEST_HANDLE == 0) || rc.CmdSize != 0 {
 			return linuxerr.EINVAL
 		}
 	case linux.VIRTGPU_BLOB_MEM_HOST3D, linux.VIRTGPU_BLOB_MEM_HOST3D_GUEST:
-		if rc.CmdSize%4 != 0 {
+		if rc.CmdSize%4 != 0 || rc.BlobFlags&linux.VIRTGPU_BLOB_FLAG_CREATE_GUEST_HANDLE != 0 {
 			return linuxerr.EINVAL
 		}
 	default:
