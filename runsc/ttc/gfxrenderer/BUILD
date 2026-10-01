@@ -31,6 +31,7 @@ go_library(
     ],
     deps = [
         "//pkg/gfxproto",
+        "//runsc/ttc/gfxrenderer/venus",
         "//runsc/ttc/seatbelt",
         "@org_golang_x_sys//unix:go_default_library",
     ],

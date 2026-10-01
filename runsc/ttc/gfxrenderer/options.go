@@ -15,8 +15,21 @@ import (
 	"runtime"
 )
 
+// Backends of the renderer.
+const (
+	// BackendGfxstream renders with gfxstream, for guests with gfxstream's
+	// Vulkan driver.
+	BackendGfxstream = "gfxstream"
+	// BackendVenus renders with TTC's Venus renderer, for guests with
+	// Mesa's Venus Vulkan driver.
+	BackendVenus = "venus"
+)
+
 // Options configures a renderer.
 type Options struct {
+	// Backend is BackendGfxstream, the default, or BackendVenus.
+	Backend string
+
 	// Library is the path of gfxstream's host library. If it is empty, the
 	// renderer looks beside its executable, then where the dynamic linker
 	// looks.
@@ -45,6 +58,9 @@ const snapshotFeatures = "VulkanSnapshots:enabled,VulkanBatchedDescriptorSetUpda
 // flags returns the renderer's flags for the options.
 func (o *Options) flags() []string {
 	var flags []string
+	if o.Backend != "" {
+		flags = append(flags, "--backend", o.Backend)
+	}
 	if o.Library != "" {
 		flags = append(flags, "--library", o.Library)
 	}

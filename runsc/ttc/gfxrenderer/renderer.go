@@ -19,6 +19,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/gfxproto"
+	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/venus"
 )
 
 // start loads and starts gfxstream, which writes the fences it signals to
@@ -42,8 +43,15 @@ func start(opts Options, fenceFD int) (*gfxstream, error) {
 // maxCapsetID is the largest capability set ID that Probe asks about.
 const maxCapsetID = 8
 
-// Probe starts gfxstream, and returns its capability sets.
+// Probe starts the renderer's backend, and returns its capability sets.
 func Probe(opts Options) ([]Capset, error) {
+	if opts.Backend == BackendVenus {
+		data, err := venus.Probe()
+		if err != nil {
+			return nil, err
+		}
+		return []Capset{{ID: venus.CapsetVenus, Data: data}}, nil
+	}
 	r, w, err := os.Pipe()
 	if err != nil {
 		return nil, err
@@ -89,6 +97,9 @@ type server struct {
 // Serve renders for the Sentry connected to the Unix stream socket fd, which
 // it takes, until the Sentry disconnects.
 func Serve(fd int, opts Options) error {
+	if opts.Backend == BackendVenus {
+		return venus.Serve(fd)
+	}
 	conn, err := gfxproto.NewConn(fd)
 	if err != nil {
 		unix.Close(fd)

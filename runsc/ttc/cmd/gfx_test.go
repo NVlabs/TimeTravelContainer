@@ -13,11 +13,23 @@ import (
 	"testing"
 
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
+	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer"
 )
 
 func TestGFXGuestEdits(t *testing.T) {
+	for _, backend := range []string{gfxrenderer.BackendGfxstream, gfxrenderer.BackendVenus} {
+		t.Run(backend, func(t *testing.T) {
+			testGFXGuestEdits(t, backend)
+		})
+	}
+}
+
+func testGFXGuestEdits(t *testing.T, backend string) {
+	t.Setenv("TTC_GFX_BACKEND", backend)
+	d := gfxGuestDrivers[backend]
+	driverPath := filepath.Join(gfxGuestDriverDir, d.name)
 	driverDir := t.TempDir()
-	driver := filepath.Join(driverDir, gfxGuestDriverName)
+	driver := filepath.Join(driverDir, d.name)
 	if err := os.WriteFile(driver, []byte("driver"), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -35,14 +47,14 @@ func TestGFXGuestEdits(t *testing.T) {
 		if err != nil {
 			t.Fatalf("guestEdits: %v", err)
 		}
-		if !slices.Equal(env, gfxGuestEnv) {
-			t.Errorf("env = %q, want %q", env, gfxGuestEnv)
+		if !slices.Equal(env, d.env) {
+			t.Errorf("env = %q, want %q", env, d.env)
 		}
 		sources := make(map[string]string)
 		for _, m := range mounts {
 			sources[m.Destination] = m.Source
 		}
-		if len(sources) != 3 || sources[gfxGuestDriverPath] != driver {
+		if len(sources) != 3 || sources[driverPath] != driver {
 			t.Fatalf("mounts = %+v, want the driver, its manifest, and the OpenGL configuration", mounts)
 		}
 		var manifest struct {
@@ -50,18 +62,18 @@ func TestGFXGuestEdits(t *testing.T) {
 				LibraryPath string `json:"library_path"`
 			}
 		}
-		content, err := os.ReadFile(sources[gfxGuestManifestPath])
+		content, err := os.ReadFile(sources[d.manifest])
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := json.Unmarshal(content, &manifest); err != nil || manifest.ICD.LibraryPath != gfxGuestDriverPath {
+		if err := json.Unmarshal(content, &manifest); err != nil || manifest.ICD.LibraryPath != driverPath {
 			t.Errorf("manifest %s: %v, library %q", content, err, manifest.ICD.LibraryPath)
 		}
 		content, err = os.ReadFile(sources[gfxGuestDriconfPath])
 		if err != nil || !bytes.Equal(content, []byte(gfxGuestDriconf)) {
 			t.Errorf("OpenGL configuration %q, %v", content, err)
 		}
-		for _, source := range []string{sources[gfxGuestManifestPath], sources[gfxGuestDriconfPath]} {
+		for _, source := range []string{sources[d.manifest], sources[gfxGuestDriconfPath]} {
 			if info, err := os.Stat(source); err != nil || info.Mode().Perm() != 0444 {
 				t.Errorf("stat %s: %v, %v; want mode 0444", source, info, err)
 			}
@@ -80,7 +92,7 @@ func TestGFXGuestEdits(t *testing.T) {
 
 func TestGFXGuestEditsWithoutZink(t *testing.T) {
 	driverDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(driverDir, gfxGuestDriverName), []byte("driver"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(driverDir, gfxGuestDrivers[gfxBackend()].name), []byte("driver"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("TTC_GFX_GUEST_DRIVER", driverDir)

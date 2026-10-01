@@ -31,6 +31,7 @@ func main() {
 	}
 	flags := flag.NewFlagSet(os.Args[1], flag.ExitOnError)
 	var opts gfxrenderer.Options
+	flags.StringVar(&opts.Backend, "backend", "", "the renderer's backend: gfxstream (the default) or venus")
 	flags.StringVar(&opts.Library, "library", "", "path of gfxstream's host library")
 	flags.StringVar(&opts.Features, "features", "", "gfxstream renderer features")
 	flags.BoolVar(&opts.Snapshots, "snapshots", false, "take snapshots and restore them")
@@ -101,7 +102,7 @@ func fatal(err error) {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: ttc-gfx-renderer serve|probe [--library PATH] [--features FEATURES] [--snapshots] [--unconfined]")
-	fmt.Fprintln(os.Stderr, "       ttc-gfx-renderer launch [--library PATH] [--features FEATURES]")
+	fmt.Fprintln(os.Stderr, "usage: ttc-gfx-renderer serve|probe [--backend BACKEND] [--library PATH] [--features FEATURES] [--snapshots] [--unconfined]")
+	fmt.Fprintln(os.Stderr, "       ttc-gfx-renderer launch [--backend BACKEND] [--library PATH] [--features FEATURES]")
 	os.Exit(2)
 }
