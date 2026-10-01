@@ -7362,7 +7362,7 @@ func TestParseDistributedFamilyMutation(t *testing.T) {
 		t.Fatalf("distributed branch removal prefix=%v, want [rm -f]", mutation.branchPrefix())
 	}
 	first := distributedChildRequestID("parent", 2, []string{"stop", "demo@main"})
-	if _, err := daemonMutationPath(t.TempDir(), first); err != nil {
+	if err := validateDaemonRequestID(first); err != nil {
 		t.Fatalf("child request ID %q is not a valid daemon mutation ID: %v", first, err)
 	}
 	if second := distributedChildRequestID("parent", 2, []string{"stop", "demo@main"}); first != second {

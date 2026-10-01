@@ -165,6 +165,13 @@ func readHostBootID() (string, error) {
 	return strings.TrimSpace(string(data)), nil
 }
 
+// syncFileData makes what was written to file durable, and its size, but not
+// its other metadata: a write over blocks the file has already, synced so,
+// commits nothing of the filesystem's own.
+func syncFileData(file *os.File) error {
+	return unix.Fdatasync(int(file.Fd()))
+}
+
 // growPipe lets pipe hold 1 MiB rather than 64 KiB, so that its writer and
 // reader take turns a sixteenth as often. A pipe that cannot grow, past the
 // host's pipe-max-size, works as it is.

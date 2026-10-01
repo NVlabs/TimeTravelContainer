@@ -44,6 +44,7 @@ go_library(
         "image_prune.go",
         "lifecycle_recovery.go",
         "long_operations.go",
+        "mutation_journal.go",
 		"port_ingress.go",
         "runtime_command.go",
         "runtime_loss.go",

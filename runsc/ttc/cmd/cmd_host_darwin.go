@@ -200,6 +200,12 @@ func readHostBootID() (string, error) {
 	return unix.Sysctl("kern.bootsessionuuid")
 }
 
+// syncFileData makes what was written to file durable. Darwin's full sync,
+// which File.Sync is, is the one that reaches the disk.
+func syncFileData(file *os.File) error {
+	return file.Sync()
+}
+
 // growPipe does nothing: a Darwin pipe's buffer is not set.
 func growPipe(*os.File) {}
 
