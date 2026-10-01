@@ -284,14 +284,15 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest, output io.Writer)
 		return err
 	}
 	// The branch's memory streams into the archive as it is captured; the
-	// rest of the checkpoint is staged, and packed after it.
-	destination := request.destination
-	stream := destination == "-"
-	if stream {
-		destination = stage + ".ttc"
-		defer os.Remove(destination)
+	// rest of the checkpoint is staged, and packed after it. An archive
+	// streamed to the client is its to keep: the daemon's copy is not made
+	// durable.
+	stream := request.destination == "-"
+	archiveDir := filepath.Dir(stage)
+	if !stream {
+		archiveDir = filepath.Dir(request.destination)
 	}
-	archive, err := ttccheckpoint.CreateArchive(destination)
+	archive, err := ttccheckpoint.CreateArchive(archiveDir)
 	if err != nil {
 		return err
 	}
@@ -339,14 +340,10 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest, output io.Writer)
 			return err
 		}
 		if stream {
-			archive, err := os.Open(destination)
-			if err != nil {
-				return err
-			}
-			_, copyErr := io.Copy(output, archive)
-			return errors.Join(copyErr, archive.Close())
+			_, err := io.Copy(output, archive.Contents())
+			return err
 		}
-		return nil
+		return archive.Publish(request.destination)
 	})
 }
 

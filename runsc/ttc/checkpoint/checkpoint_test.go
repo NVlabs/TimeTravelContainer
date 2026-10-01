@@ -6,6 +6,7 @@ package checkpoint
 import (
 	"archive/tar"
 	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -98,7 +99,7 @@ func TestArchiveStreamsAMemberFirst(t *testing.T) {
 		t.Fatal(err)
 	}
 	destination := filepath.Join(t.TempDir(), "snapshot.ttc")
-	archive, err := CreateArchive(destination)
+	archive, err := CreateArchive(filepath.Dir(destination))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,6 +123,16 @@ func TestArchiveStreamsAMemberFirst(t *testing.T) {
 	}
 	if err := archive.Finish(staging); err != nil {
 		t.Fatal(err)
+	}
+	contents, err := io.ReadAll(archive.Contents())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := archive.Publish(destination); err != nil {
+		t.Fatal(err)
+	}
+	if published, err := os.ReadFile(destination); err != nil || !bytes.Equal(published, contents) {
+		t.Fatalf("the published archive differs from its contents (%v)", err)
 	}
 	file, err := os.Open(destination)
 	if err != nil {
@@ -168,7 +179,7 @@ func TestUnpackLeavesAMemberInTheArchive(t *testing.T) {
 		t.Fatal(err)
 	}
 	streamed := filepath.Join(t.TempDir(), "streamed.ttc")
-	archive, err := CreateArchive(streamed)
+	archive, err := CreateArchive(filepath.Dir(streamed))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,6 +191,9 @@ func TestUnpackLeavesAMemberInTheArchive(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := archive.Finish(staging); err != nil {
+		t.Fatal(err)
+	}
+	if err := archive.Publish(streamed); err != nil {
 		t.Fatal(err)
 	}
 	for _, source := range []string{packed, streamed} {
@@ -207,6 +221,30 @@ func TestUnpackLeavesAMemberInTheArchive(t *testing.T) {
 		if _, err := file.ReadAt(got, section.Offset); err != nil || !bytes.Equal(got, memory) {
 			t.Fatalf("%s: the section at %d holds %d bytes (%v), not the member's %d", source, section.Offset, len(got), err, len(memory))
 		}
+	}
+}
+
+// An archive read rather than published is removed, unsynced, by Abort.
+func TestArchiveReadAndDiscarded(t *testing.T) {
+	staging := t.TempDir()
+	if err := WriteManifest(staging, testManifest()); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	archive, err := CreateArchive(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := archive.Finish(staging); err != nil {
+		t.Fatal(err)
+	}
+	header, err := tar.NewReader(archive.Contents()).Next()
+	if err != nil || header.Name != "manifest.json" {
+		t.Fatalf("the archive begins with %+v (%v), want the manifest", header, err)
+	}
+	archive.Abort()
+	if entries, err := os.ReadDir(dir); err != nil || len(entries) != 0 {
+		t.Fatalf("the discarded archive's directory holds %v (%v)", entries, err)
 	}
 }
 

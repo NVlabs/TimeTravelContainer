@@ -153,12 +153,15 @@ func ReadManifest(root string) (Manifest, error) {
 // Pack atomically publishes a staging tree containing regular files,
 // directories, and symbolic links as one tar file.
 func Pack(root, destination string) error {
-	archive, err := CreateArchive(destination)
+	archive, err := CreateArchive(filepath.Dir(destination))
 	if err != nil {
 		return err
 	}
 	defer archive.Abort()
-	return archive.Finish(root)
+	if err := archive.Finish(root); err != nil {
+		return err
+	}
+	return archive.Publish(destination)
 }
 
 // blockSize is the size of a tar block.
@@ -166,28 +169,25 @@ const blockSize = 512
 
 // Archive is a checkpoint archive being written: first the members whose
 // content is streamed, each as it is made, then, by Finish, the other entries
-// of a staging tree, as Pack writes them.
+// of a staging tree, as Pack writes them. Once finished, it is published, or
+// read and discarded.
 type Archive struct {
-	destination string
-	temp        *os.File
-	// end is where the next member begins.
+	temp *os.File
+	// end is where the next member begins, and once the archive is
+	// finished, its size.
 	end       int64
 	streamed  map[string]struct{}
 	published bool
 }
 
-// CreateArchive begins an archive that Finish publishes at destination.
-func CreateArchive(destination string) (*Archive, error) {
-	if _, err := os.Lstat(destination); err == nil {
-		return nil, fmt.Errorf("checkpoint destination %q already exists", destination)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
-	temp, err := os.CreateTemp(filepath.Dir(destination), ".ttc-checkpoint-*")
+// CreateArchive begins an archive in dir, which Publish can make a file of
+// dir.
+func CreateArchive(dir string) (*Archive, error) {
+	temp, err := os.CreateTemp(dir, ".ttc-checkpoint-*")
 	if err != nil {
 		return nil, err
 	}
-	return &Archive{destination: destination, temp: temp, streamed: make(map[string]struct{})}, nil
+	return &Archive{temp: temp, streamed: make(map[string]struct{})}, nil
 }
 
 // Stream writes name, a regular file of mode, whose content write writes to
@@ -245,7 +245,7 @@ func streamedHeader(name string, mode fs.FileMode, size int64) ([]byte, error) {
 	return header.Bytes(), nil
 }
 
-// Abort removes the archive, unless Finish published it.
+// Abort removes the archive, unless it was published.
 func (a *Archive) Abort() {
 	if a.published {
 		return
@@ -255,13 +255,12 @@ func (a *Archive) Abort() {
 }
 
 // Finish writes the entries of the staging tree at root that were not
-// streamed, as Pack does, and publishes the archive.
+// streamed, as Pack does, and ends the archive.
 func (a *Archive) Finish(root string) error {
 	if _, err := a.temp.Seek(a.end, io.SeekStart); err != nil {
 		return err
 	}
-	temp, tempName, destination := a.temp, a.temp.Name(), a.destination
-	writer := tar.NewWriter(temp)
+	writer := tar.NewWriter(a.temp)
 	type packReadResult struct {
 		data []byte
 		err  error
@@ -413,16 +412,37 @@ func (a *Archive) Finish(root string) error {
 	if err := writer.Close(); err != nil {
 		return err
 	}
-	if err := temp.Sync(); err != nil {
+	end, err := a.temp.Seek(0, io.SeekCurrent)
+	if err != nil {
 		return err
 	}
-	if err := temp.Close(); err != nil {
+	a.end = end
+	return nil
+}
+
+// Contents returns the finished archive, to be read from its start.
+func (a *Archive) Contents() io.Reader {
+	return io.NewSectionReader(a.temp, 0, a.end)
+}
+
+// Publish makes the finished archive destination, durably, unless destination
+// exists.
+func (a *Archive) Publish(destination string) error {
+	if _, err := os.Lstat(destination); err == nil {
+		return fmt.Errorf("checkpoint destination %q already exists", destination)
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if err := os.Link(tempName, destination); err != nil {
+	if err := a.temp.Sync(); err != nil {
+		return err
+	}
+	if err := a.temp.Close(); err != nil {
+		return err
+	}
+	if err := os.Link(a.temp.Name(), destination); err != nil {
 		return fmt.Errorf("publishing checkpoint: %w", err)
 	}
-	if err := os.Remove(tempName); err != nil {
+	if err := os.Remove(a.temp.Name()); err != nil {
 		_ = os.Remove(destination)
 		return err
 	}
