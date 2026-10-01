@@ -13,13 +13,19 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/pipefs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/pipe"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
-const maxInternalConsoleIO = 1 << 20
+// maxInternalConsoleIO is the most a control call reads or writes at once,
+// and what each of the console's pipes holds.
+const maxInternalConsoleIO = pipe.MaximumPipeSize
+
+// internalConsoleReadStart is the buffer a console read starts with.
+const internalConsoleReadStart = 64 << 10
 
 // InternalConsoleStream identifies an output stream of an internal console.
 type InternalConsoleStream uint8
@@ -321,6 +327,13 @@ func (k *Kernel) NewInternalConsoleFDTable(ctx context.Context, id string) (*FDT
 	pairs := make([]pipePair, 0, 3)
 	for range 3 {
 		reader, writer, err := pipefs.NewConnectedPipeFDs(ctx, k.PipeMount(), 0)
+		if err == nil {
+			_, err = reader.Impl().(*pipe.VFSPipeFD).SetPipeSize(maxInternalConsoleIO)
+			if err != nil {
+				reader.DecRef(ctx)
+				writer.DecRef(ctx)
+			}
+		}
 		if err != nil {
 			for _, pair := range pairs {
 				pair.reader.DecRef(ctx)
@@ -473,8 +486,20 @@ func (k *Kernel) ReadInternalConsole(ctx context.Context, id string, stream Inte
 	default:
 		return nil, false, false, fmt.Errorf("invalid internal console stream %d", stream)
 	}
-	buf := make([]byte, maxBytes)
+	// Most reads find little: one that fills a buffer of a few pages reads
+	// on, into one of what it may return.
+	buf := make([]byte, min(maxBytes, internalConsoleReadStart))
 	n, err := file.Read(ctx, usermem.BytesIOSequence(buf), vfs.ReadOptions{})
+	if err == nil && n == int64(len(buf)) && len(buf) < maxBytes {
+		more := make([]byte, maxBytes)
+		copy(more, buf)
+		// What the second read finds, if anything, goes with the first's;
+		// an end it finds, the next read finds again.
+		if m, moreErr := file.Read(ctx, usermem.BytesIOSequence(more[n:]), vfs.ReadOptions{}); moreErr == nil {
+			n += m
+		}
+		buf = more
+	}
 	if linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
 		return nil, false, true, nil
 	}

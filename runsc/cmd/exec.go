@@ -20,9 +20,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -37,8 +35,8 @@ import (
 	"golang.org/x/term"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/control"
-	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/cmd/sandboxsetup"
 	"gvisor.dev/gvisor/runsc/cmd/util"
@@ -416,7 +414,24 @@ func (ex *Exec) startInternalConsole(c *container.Container, e *control.ExecArgs
 	}
 
 	if ex.internalConsoleStdin {
-		go ex.pumpInternalConsoleInput(c, branchID, e.InternalConsoleID)
+		// The Sentry reads stdin itself, blocking.
+		err := unix.SetNonblock(int(os.Stdin.Fd()), false)
+		if err == nil {
+			err = c.Sandbox.ConsoleInput(&boot.ConsoleInputArgs{
+				BranchID: branchID, ConsoleID: e.InternalConsoleID,
+				FilePayload: urpc.FilePayload{Files: []*os.File{os.Stdin}},
+			})
+		}
+		if err != nil {
+			if restore != nil {
+				_ = restore()
+			}
+			if stdinIsTerminal {
+				signal.Stop(resizeSignals)
+				close(resizeDone)
+			}
+			return nil, nil, err
+		}
 	} else if err := c.Sandbox.CloseConsoleStdin(&boot.ConsoleCloseStdinArgs{BranchID: branchID, ConsoleID: e.InternalConsoleID}); err != nil {
 		if restore != nil {
 			_ = restore()
@@ -447,89 +462,18 @@ func (ex *Exec) startInternalConsole(c *container.Container, e *control.ExecArgs
 	return output, cleanup, nil
 }
 
-func (ex *Exec) pumpInternalConsoleInput(c *container.Container, branchID, consoleID string) {
-	buf := make([]byte, 32*1024)
-	for {
-		n, readErr := os.Stdin.Read(buf)
-		for written := 0; written < n; {
-			result, err := c.Sandbox.WriteConsole(&boot.ConsoleWriteArgs{
-				BranchID: branchID, ConsoleID: consoleID, Data: buf[written:n],
-			})
-			if err != nil {
-				return
-			}
-			written += result.N
-			if result.WouldBlock || result.N == 0 {
-				if _, err := c.Sandbox.WaitConsole(&boot.ConsoleWaitArgs{
-					BranchID: branchID, ConsoleID: consoleID,
-					Want: kernel.InternalConsoleReadiness{Stdin: true}, Timeout: time.Second,
-				}); err != nil {
-					return
-				}
-			}
-		}
-		if readErr != nil {
-			if !errors.Is(readErr, io.EOF) {
-				log.Warningf("reading internal exec console stdin: %v", readErr)
-			}
-			_ = c.Sandbox.CloseConsoleStdin(&boot.ConsoleCloseStdinArgs{BranchID: branchID, ConsoleID: consoleID})
-			return
-		}
-	}
-}
-
+// pumpInternalConsoleOutput has the Sentry write the console's stdout and
+// stderr to this process's, blocking, until both end.
 func (ex *Exec) pumpInternalConsoleOutput(c *container.Container, branchID, consoleID string) error {
-	type outputStream struct {
-		stream kernel.InternalConsoleStream
-		file   *os.File
-		eof    bool
-	}
-	streams := []outputStream{
-		{stream: kernel.InternalConsoleStdout, file: os.Stdout},
-		{stream: kernel.InternalConsoleStderr, file: os.Stderr},
-	}
-	for {
-		progress := false
-		allEOF := true
-		for i := range streams {
-			stream := &streams[i]
-			if stream.eof {
-				continue
-			}
-			allEOF = false
-			result, err := c.Sandbox.ReadConsole(&boot.ConsoleReadArgs{
-				BranchID: branchID, ConsoleID: consoleID, Stream: stream.stream, MaxBytes: 65536,
-			})
-			if err != nil {
-				return err
-			}
-			if len(result.Data) != 0 {
-				if _, err := stream.file.Write(result.Data); err != nil {
-					return err
-				}
-				progress = true
-			}
-			stream.eof = result.EOF
-			if result.EOF {
-				progress = true
-			}
-		}
-		if allEOF {
-			return nil
-		}
-		if !progress {
-			if _, err := c.Sandbox.WaitConsole(&boot.ConsoleWaitArgs{
-				BranchID: branchID, ConsoleID: consoleID,
-				Want: kernel.InternalConsoleReadiness{
-					Stdout: !streams[0].eof,
-					Stderr: !streams[1].eof,
-				},
-				Timeout: time.Second,
-			}); err != nil {
-				return err
-			}
+	for _, file := range []*os.File{os.Stdout, os.Stderr} {
+		if err := unix.SetNonblock(int(file.Fd()), false); err != nil {
+			return err
 		}
 	}
+	return c.Sandbox.ConsoleOutput(&boot.ConsoleOutputArgs{
+		BranchID: branchID, ConsoleID: consoleID,
+		FilePayload: urpc.FilePayload{Files: []*os.File{os.Stdout, os.Stderr}},
+	})
 }
 
 func (ex *Exec) execChildAndWait(waitStatus *unix.WaitStatus) subcommands.ExitStatus {

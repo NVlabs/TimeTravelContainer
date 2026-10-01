@@ -2574,6 +2574,25 @@ func (s *Sandbox) PushConsole(args *boot.ConsolePushArgs) error {
 	return nil
 }
 
+// ConsoleOutput has the Sentry copy a branch-local internal console's stdout
+// and stderr to the two files args passes, which it writes blocking, until
+// both end, and returns then.
+func (s *Sandbox) ConsoleOutput(args *boot.ConsoleOutputArgs) error {
+	if err := s.call(boot.ContMgrConsoleOutput, args, nil); err != nil {
+		return fmt.Errorf("copying output of internal console %q in branch %q: %w", args.ConsoleID, args.BranchID, err)
+	}
+	return nil
+}
+
+// ConsoleInput has the Sentry copy the file args passes, which it reads
+// blocking, into a branch-local internal console's stdin until it ends.
+func (s *Sandbox) ConsoleInput(args *boot.ConsoleInputArgs) error {
+	if err := s.call(boot.ContMgrConsoleInput, args, nil); err != nil {
+		return fmt.Errorf("streaming input to internal console %q in branch %q: %w", args.ConsoleID, args.BranchID, err)
+	}
+	return nil
+}
+
 // ReadConsole performs one nonblocking branch-local internal-console read.
 func (s *Sandbox) ReadConsole(args *boot.ConsoleReadArgs) (boot.ConsoleReadResult, error) {
 	var result boot.ConsoleReadResult

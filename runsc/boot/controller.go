@@ -261,6 +261,14 @@ const (
 	// ContMgrConsoleCloseStdin closes branch-local internal console input.
 	ContMgrConsoleCloseStdin = "containerManager.ConsoleCloseStdin"
 
+	// ContMgrConsoleInput has the Sentry copy a file into branch-local
+	// internal console input.
+	ContMgrConsoleInput = "containerManager.ConsoleInput"
+
+	// ContMgrConsoleOutput has the Sentry copy branch-local internal console
+	// output to files.
+	ContMgrConsoleOutput = "containerManager.ConsoleOutput"
+
 	// ContMgrConsoleResize changes a branch-local PTY console's window size.
 	ContMgrConsoleResize = "containerManager.ConsoleResize"
 
@@ -1645,6 +1653,43 @@ func (cm *containerManager) ConsolePush(args *ConsolePushArgs, _ *struct{}) erro
 		return err
 	}
 	return nil
+}
+
+// ConsoleInput has the Sentry copy the one file given into a branch-local
+// internal console's input: see PullConsoleInput.
+func (cm *containerManager) ConsoleInput(args *ConsoleInputArgs, _ *struct{}) error {
+	syscallsEnd()
+	if len(args.FilePayload.Files) != 1 {
+		return fmt.Errorf("console input received %d files, want its input", len(args.FilePayload.Files))
+	}
+	// urpc closes the files it received when this returns: the copy reads a
+	// copy, which the caller made blocking.
+	input, err := args.FilePayload.ReleaseFD(0)
+	if err != nil {
+		return fmt.Errorf("taking console input: %w", err)
+	}
+	if err := cm.l.family.PullConsoleInput(args.BranchID, args.ConsoleID, input); err != nil {
+		_ = input.Close()
+		return err
+	}
+	return nil
+}
+
+// ConsoleOutput has the Sentry copy a branch-local internal console's stdout
+// and stderr to the two files given until both end, and returns then: see
+// CopyConsoleOutput.
+func (cm *containerManager) ConsoleOutput(args *ConsoleOutputArgs, _ *struct{}) error {
+	syscallsEnd()
+	if len(args.FilePayload.Files) != 2 {
+		return fmt.Errorf("console output received %d files, want stdout and stderr", len(args.FilePayload.Files))
+	}
+	// The copy's writes, to files the caller made blocking, need not end:
+	// they are a goroutine's of their own.
+	copied := make(chan error, 1)
+	go func() {
+		copied <- cm.l.family.CopyConsoleOutput(args.BranchID, args.ConsoleID, args.FilePayload.Files[0], args.FilePayload.Files[1])
+	}()
+	return <-copied
 }
 
 // ConsoleRead reads output from a branch-local internal console.

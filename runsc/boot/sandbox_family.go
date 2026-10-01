@@ -495,6 +495,22 @@ type ConsoleWaitResult struct {
 	TimedOut bool
 }
 
+// ConsoleOutputArgs selects a branch-local internal console whose stdout and
+// stderr the Sentry copies to the two files given: see CopyConsoleOutput.
+type ConsoleOutputArgs struct {
+	urpc.FilePayload
+	BranchID  string
+	ConsoleID string
+}
+
+// ConsoleInputArgs selects a branch-local internal console whose stdin the
+// Sentry copies the one file given to: see PullConsoleInput.
+type ConsoleInputArgs struct {
+	urpc.FilePayload
+	BranchID  string
+	ConsoleID string
+}
+
 // ConsoleWriteArgs writes to a branch-local internal console's stdin.
 type ConsoleWriteArgs struct {
 	BranchID  string
@@ -3929,6 +3945,92 @@ func (f *SandboxFamily) ConsoleWrite(args *ConsoleWriteArgs, out *ConsoleWriteRe
 		return err
 	}
 	*out = ConsoleWriteResult{N: n, WouldBlock: wouldBlock}
+	return nil
+}
+
+// PullConsoleInput copies input into a branch-local internal console's stdin,
+// as writes and waits of the console's control would, until input ends, when
+// it closes the console's stdin, or the console or its branch does. A read of
+// input holds nothing of the branch, which may go meanwhile: the copy then
+// ends at its next write.
+func (f *SandboxFamily) PullConsoleInput(id, consoleID string, input io.ReadCloser) error {
+	var observation kernel.InternalConsoleObservation
+	if err := f.ConsoleObservation(&ConsoleObservationArgs{BranchID: id, ConsoleID: consoleID}, &observation); err != nil {
+		return err
+	}
+	go func() {
+		defer input.Close()
+		buffer := make([]byte, consoleIOChunk)
+		for {
+			n, readErr := input.Read(buffer)
+			for written := 0; written < n; {
+				var result ConsoleWriteResult
+				if err := f.ConsoleWrite(&ConsoleWriteArgs{BranchID: id, ConsoleID: consoleID, Data: buffer[written:n]}, &result); err != nil {
+					return
+				}
+				written += result.N
+				if result.WouldBlock || result.N == 0 {
+					var waited ConsoleWaitResult
+					if err := f.ConsoleWait(&ConsoleWaitArgs{BranchID: id, ConsoleID: consoleID, Want: kernel.InternalConsoleReadiness{Stdin: true}, Timeout: time.Second}, &waited); err != nil {
+						return
+					}
+				}
+			}
+			if readErr != nil {
+				_ = f.ConsoleCloseStdin(&ConsoleCloseStdinArgs{BranchID: id, ConsoleID: consoleID})
+				return
+			}
+		}
+	}()
+	return nil
+}
+
+// consoleIOChunk is the most PullConsoleInput and CopyConsoleOutput move at
+// once, as much as a console's pipe holds.
+const consoleIOChunk = 1 << 20
+
+// CopyConsoleOutput copies a branch-local internal console's stdout and stderr
+// to the given writers, as reads and waits of the console's control would,
+// until both end, or the console or its branch does. A write holds nothing of
+// the branch.
+func (f *SandboxFamily) CopyConsoleOutput(id, consoleID string, stdout, stderr io.Writer) error {
+	streams := [...]struct {
+		stream kernel.InternalConsoleStream
+		output io.Writer
+		eof    bool
+	}{
+		{stream: kernel.InternalConsoleStdout, output: stdout},
+		{stream: kernel.InternalConsoleStderr, output: stderr},
+	}
+	for !streams[0].eof || !streams[1].eof {
+		progress := false
+		for i := range streams {
+			stream := &streams[i]
+			if stream.eof {
+				continue
+			}
+			var result ConsoleReadResult
+			if err := f.ConsoleRead(&ConsoleReadArgs{BranchID: id, ConsoleID: consoleID, Stream: stream.stream, MaxBytes: consoleIOChunk}, &result); err != nil {
+				return err
+			}
+			if len(result.Data) != 0 {
+				if _, err := stream.output.Write(result.Data); err != nil {
+					return err
+				}
+				progress = true
+			}
+			if result.EOF {
+				stream.eof = true
+				progress = true
+			}
+		}
+		if !progress {
+			var waited ConsoleWaitResult
+			if err := f.ConsoleWait(&ConsoleWaitArgs{BranchID: id, ConsoleID: consoleID, Want: kernel.InternalConsoleReadiness{Stdout: !streams[0].eof, Stderr: !streams[1].eof}, Timeout: time.Second}, &waited); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
