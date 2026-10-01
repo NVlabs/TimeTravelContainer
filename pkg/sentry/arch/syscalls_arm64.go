@@ -90,3 +90,9 @@ func (c *Context64) RestartSyscallWithRestartBlock() {
 	c.Regs.Regs[0] = uint64(c.OrigR0)
 	c.Regs.Regs[8] = uint64(restartSyscallNr)
 }
+
+// ReenterRestartedSyscall implements Context.ReenterRestartedSyscall. SVC
+// changes no general register; doSyscall saves R0 in OrigR0.
+func (c *Context64) ReenterRestartedSyscall() {
+	c.Regs.Pc += SyscallWidth
+}
