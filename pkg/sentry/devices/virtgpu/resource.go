@@ -190,9 +190,10 @@ func (r *resource) configureMMap(opts *memmap.MMapOpts, offset uint64) error {
 	if !ok || uint64(end) > r.size {
 		return linuxerr.EINVAL
 	}
-	// Linux maps the renderer's memory only whole: see
-	// drivers/gpu/drm/virtio/virtgpu_vram.c:virtio_gpu_vram_mmap().
-	if r.host3D() && (offset != 0 || opts.Length != r.size) {
+	// Linux maps the renderer's memory only whole, in pages: see
+	// drivers/gpu/drm/virtio/virtgpu_vram.c:virtio_gpu_vram_mmap(). The
+	// length is the caller's, which mmap rounds up later.
+	if r.host3D() && (offset != 0 || uint64(hostarch.Addr(opts.Length).MustRoundUp()) != r.size) {
 		return linuxerr.EINVAL
 	}
 	d := r.dev

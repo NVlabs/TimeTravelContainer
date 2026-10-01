@@ -416,6 +416,9 @@ func (fd *renderFD) contextInit(t *kernel.Task, cmd uint32, addr hostarch.Addr) 
 		haveNumRings bool
 		name         string
 		haveName     bool
+		// havePollRings is whether the parameters had a mask of rings to
+		// poll.
+		havePollRings bool
 	)
 	for _, p := range params {
 		switch p.Param {
@@ -438,9 +441,14 @@ func (fd *renderFD) contextInit(t *kernel.Task, cmd uint32, addr hostarch.Addr) 
 				return err
 			}
 			haveName = true
+		case linux.VIRTGPU_CONTEXT_PARAM_POLL_RINGS_MASK:
+			// The device delivers no fence events through the file, which
+			// a mask of no rings asks for, as Mesa's Venus driver's does.
+			if havePollRings || p.Value != 0 {
+				return linuxerr.EINVAL
+			}
+			havePollRings = true
 		default:
-			// Including VIRTGPU_CONTEXT_PARAM_POLL_RINGS_MASK: the device
-			// does not deliver fence events through the file.
 			return linuxerr.EINVAL
 		}
 	}

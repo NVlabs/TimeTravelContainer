@@ -822,6 +822,7 @@ func TestContextInit(t *testing.T) {
 		{"two capability sets", []linux.DRMVirtgpuContextSetParam{{Param: linux.VIRTGPU_CONTEXT_PARAM_CAPSET_ID, Value: 3}, {Param: linux.VIRTGPU_CONTEXT_PARAM_CAPSET_ID, Value: 3}}},
 		{"too many rings", []linux.DRMVirtgpuContextSetParam{{Param: linux.VIRTGPU_CONTEXT_PARAM_NUM_RINGS, Value: 65}}},
 		{"a poll rings mask", []linux.DRMVirtgpuContextSetParam{{Param: linux.VIRTGPU_CONTEXT_PARAM_POLL_RINGS_MASK, Value: 1}}},
+		{"two poll rings masks", []linux.DRMVirtgpuContextSetParam{{Param: linux.VIRTGPU_CONTEXT_PARAM_POLL_RINGS_MASK}, {Param: linux.VIRTGPU_CONTEXT_PARAM_POLL_RINGS_MASK}}},
 		{"an unknown parameter", []linux.DRMVirtgpuContextSetParam{{Param: 99, Value: 1}}},
 		{"five parameters", make([]linux.DRMVirtgpuContextSetParam, 5)},
 	} {
@@ -829,6 +830,17 @@ func TestContextInit(t *testing.T) {
 		wantErr(t, test.name, e.contextInitParams(other, test.params), linuxerr.EINVAL)
 	}
 	wantCalls(t, r)
+
+	// Mesa's Venus driver asks for no fence events: a mask of no rings.
+	venus := e.open()
+	if err := e.contextInitParams(venus, []linux.DRMVirtgpuContextSetParam{
+		{Param: linux.VIRTGPU_CONTEXT_PARAM_CAPSET_ID, Value: linux.VIRTGPU_DRM_CAPSET_GFXSTREAM_VULKAN},
+		{Param: linux.VIRTGPU_CONTEXT_PARAM_NUM_RINGS, Value: 64},
+		{Param: linux.VIRTGPU_CONTEXT_PARAM_POLL_RINGS_MASK, Value: 0},
+	}); err != nil {
+		t.Errorf("CONTEXT_INIT with a mask of no rings to poll: %v", err)
+	}
+	r.takeCalls()
 
 	// A file without CONTEXT_INIT gets a default context when it needs one,
 	// named after its task.
@@ -938,6 +950,21 @@ func TestBlobs(t *testing.T) {
 	if !mem.released {
 		t.Error("the resource's memory was not released")
 	}
+
+	// A blob's size need not be whole pages, nor the length that maps it,
+	// as Mesa's Venus driver's ring buffers are not.
+	const oddSize = 3*hostarch.PageSize + 100
+	handle, _ = e.mustCreateBlob(file, linux.VIRTGPU_BLOB_FLAG_USE_MAPPABLE, oddSize)
+	m = linux.DRMVirtgpuMap{Handle: handle}
+	if err := e.ioctl(file, virtgpuIOWR(linux.DRM_VIRTGPU_MAP, m.SizeBytes()), &m); err != nil {
+		t.Fatalf("MAP: %v", err)
+	}
+	if addr, err := e.mmap(file, m.Offset, oddSize); err != nil {
+		t.Errorf("mapping a blob of %d bytes: %v", oddSize, err)
+	} else {
+		e.munmap(addr, oddSize)
+	}
+	r.takeCalls()
 
 	// A blob that is not mappable is not.
 	handle, _ = e.mustCreateBlob(file, linux.VIRTGPU_BLOB_FLAG_USE_SHAREABLE, size)
