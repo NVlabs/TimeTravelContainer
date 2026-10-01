@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package tests
 
 import (
@@ -130,5 +133,27 @@ func TestSliceContainers(t *testing.T) {
 		slicePtrContainer{v: &nilSlice},
 		slicePtrContainer{v: &emptySlice},
 		slicePtrContainer{v: &fullSlice},
+	})
+}
+
+// namedByte is a byte type of another name, whose arrays the encoder writes
+// element by element.
+type namedByte uint8
+
+// TestByteArrays round-trips arrays and slices of bytes, which the encoder
+// writes as strings, including one large enough that element-by-element
+// encoding would show.
+func TestByteArrays(t *testing.T) {
+	large := make([]byte, 1<<20)
+	for i := range large {
+		large[i] = byte(i * 7)
+	}
+	runTestCases(t, false, "", []any{
+		large,
+		large[1 : len(large)-1],
+		[3]byte{1, 2, 3},
+		[2][2]byte{{1, 2}, {3, 4}},
+		[]namedByte{1, 2, 3},
+		[2]namedByte{4, 5},
 	})
 }

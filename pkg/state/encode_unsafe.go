@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package state
 
 import (
@@ -29,4 +32,13 @@ func arrayFromSlice(obj reflect.Value) reflect.Value {
 	return reflect.NewAt(
 		reflect.ArrayOf(obj.Cap(), obj.Type().Elem()),
 		unsafe.Pointer(obj.Pointer()))
+}
+
+// byteType is the type of the elements of arrays of bytes.
+var byteType = reflect.TypeOf(byte(0))
+
+// byteArrayBytes returns the bytes of obj, a non-empty array of bytes whose
+// elements are addressable, without copying them.
+func byteArrayBytes(obj reflect.Value) []byte {
+	return unsafe.Slice((*byte)(unsafe.Pointer(obj.Index(0).UnsafeAddr())), obj.Len())
 }

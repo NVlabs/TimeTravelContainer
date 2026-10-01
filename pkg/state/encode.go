@@ -553,6 +553,15 @@ func (es *encodeState) encodeStruct(obj reflect.Value, dest *wire.Object) {
 // encodeArray encodes an array.
 func (es *encodeState) encodeArray(obj reflect.Value, dest *wire.Object) {
 	l := obj.Len()
+	// Encode an array of bytes, such as the backing array of a []byte, as a
+	// string: element by element, each byte would cost a wire.Object, and
+	// reflection, which for a GPU's snapshot of hundreds of megabytes takes
+	// seconds and gigabytes.
+	if obj.Type().Elem() == byteType && l > 0 && obj.Index(0).CanAddr() {
+		s := wire.String(byteArrayBytes(obj)) // Copies.
+		*dest = &s
+		return
+	}
 	a := &wire.Array{
 		Contents: make([]wire.Object, l),
 	}

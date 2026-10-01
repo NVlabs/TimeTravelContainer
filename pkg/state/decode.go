@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package state
 
 import (
@@ -444,6 +447,24 @@ func (ds *decodeState) decodeArray(ods *objectDecodeState, obj reflect.Value, en
 	}
 }
 
+// decodeByteArray decodes s, which encodeState.encodeArray encoded, into obj,
+// an array of bytes.
+func (ds *decodeState) decodeByteArray(obj reflect.Value, s string) {
+	if obj.Type().Elem() != byteType || len(s) != obj.Len() {
+		Failf("mismatching byte array: %d bytes for %v", len(s), obj.Type())
+	}
+	if len(s) == 0 {
+		return
+	}
+	if obj.Index(0).CanAddr() {
+		copy(byteArrayBytes(obj), s)
+		return
+	}
+	for i := 0; i < len(s); i++ {
+		obj.Index(i).SetUint(uint64(s[i]))
+	}
+}
+
 // findType finds the type for the given wire.TypeSpecs.
 func (ds *decodeState) findType(t wire.TypeSpec) reflect.Type {
 	switch x := t.(type) {
@@ -570,6 +591,11 @@ func (ds *decodeState) decodeObject(ods *objectDecodeState, obj reflect.Value, e
 			Failf("complex number truncated from %v to %v", complex128(*x), obj.Complex())
 		}
 	case *wire.String:
+		if obj.Kind() == reflect.Array {
+			// An array of bytes; see encodeState.encodeArray.
+			ds.decodeByteArray(obj, string(*x))
+			break
+		}
 		obj.SetString(string(*x))
 	case *wire.Slice:
 		// See *wire.Ref above; same applies.
