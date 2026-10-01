@@ -679,6 +679,14 @@ func (rf *regularFile) truncateNoTimeUpdateLocked(newSize uint64) error {
 	return nil
 }
 
+// ValidateLiveForkMapping implements memmap.LiveForkMappingValidator. A tmpfs
+// file's contents are the Sentry's memory, which a live fork clones with the
+// filesystem, whatever the mount that shows the file: devtmpfs is a tmpfs,
+// and Android, for one, maps its system properties from /dev/__properties__.
+func (rf *regularFile) ValidateLiveForkMapping() error {
+	return nil
+}
+
 // AddMapping implements memmap.Mappable.AddMapping.
 func (rf *regularFile) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) error {
 	rf.mapsMu.Lock()
