@@ -16339,6 +16339,30 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	if peer {
 		return b.rehydrateColdPeer(target, info, branch, capture, imageDir, metadata, relays)
 	}
+	// The memory image is read while the sandbox is made.
+	type graphRestoreOpening struct {
+		restore *graphMemoryRestore
+		err     error
+	}
+	graphRestoreOpened := make(chan graphRestoreOpening, 1)
+	go func() {
+		restore, err := b.openGraphMemoryRestore(capture)
+		graphRestoreOpened <- graphRestoreOpening{restore: restore, err: err}
+	}()
+	var graphRestore *graphMemoryRestore
+	graphRestoreTaken := false
+	takeGraphRestore := func() error {
+		graphRestoreTaken = true
+		opened := <-graphRestoreOpened
+		graphRestore = opened.restore
+		return opened.err
+	}
+	defer func() {
+		if !graphRestoreTaken {
+			_ = takeGraphRestore()
+		}
+		graphRestore.close()
+	}()
 	bundleDir, cleanupBundle, err := b.containerStore().PrepareDehydrationRestoreBundle(info.ID, capture.FilesystemBranch)
 	if err != nil {
 		return fmt.Errorf("preparing dehydration restore bundle: %w", err)
@@ -16378,11 +16402,9 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	if err != nil {
 		return err
 	}
-	graphRestore, err := b.openGraphMemoryRestore(capture)
-	if err != nil {
+	if err := takeGraphRestore(); err != nil {
 		return err
 	}
-	defer graphRestore.close()
 	if graphRestore.remote != nil {
 		restoreArgs.GraphRemote = true
 		restoreArgs.GraphRemoteToken = graphRestore.token
