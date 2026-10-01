@@ -26,9 +26,9 @@ const segmentBytes = 1 << 20
 
 // probeBytes is how much of a segment is compressed first, at best speed, to
 // find whether it compresses: flate spends most of its time looking for
-// matches in data that does not, and best speed looks least. A segment
-// whose probe does not shrink is compressed at best speed, as small as a
-// slower level makes it.
+// matches in data that does not. A segment whose probe does not shrink by a
+// thirty-second is stored, as flate stores data that does not compress at
+// all, six times as fast as best speed compresses it.
 const probeBytes = 64 << 10
 
 // segment is the compression of one segment of the input.
@@ -53,14 +53,15 @@ type Writer struct {
 	limit   int
 	// compressors, inputs and outputs are kept for reuse: a compressor's
 	// state is hundreds of kilobytes. Only Write and Close use inputs and
-	// outputs. fastCompressors are at best speed, for probes and the
-	// segments that do not compress.
-	compressors     sync.Pool
-	fastCompressors sync.Pool
-	inputs          [][]byte
-	outputs         []*bytes.Buffer
-	err             error
-	closed          bool
+	// outputs. probeCompressors are at best speed, for probes, and
+	// storeCompressors store the segments that do not compress.
+	compressors      sync.Pool
+	probeCompressors sync.Pool
+	storeCompressors sync.Pool
+	inputs           [][]byte
+	outputs          []*bytes.Buffer
+	err              error
+	closed           bool
 }
 
 // NewWriter returns a Writer that compresses onto w at level, a flate
@@ -136,8 +137,8 @@ func (z *Writer) compress(final bool) {
 func (z *Writer) run(s *segment) {
 	defer close(s.done)
 	pool, level := &z.compressors, z.level
-	if (z.level == flate.DefaultCompression || z.level > flate.BestSpeed) && !z.compresses(s.input[:min(len(s.input), probeBytes)]) {
-		pool, level = &z.fastCompressors, flate.BestSpeed
+	if z.level != flate.NoCompression && z.level != flate.HuffmanOnly && !z.compresses(s.input[:min(len(s.input), probeBytes)]) {
+		pool, level = &z.storeCompressors, flate.NoCompression
 	}
 	compressor, _ := pool.Get().(*flate.Writer)
 	if compressor == nil {
@@ -161,14 +162,14 @@ func (z *Writer) run(s *segment) {
 
 // compresses reports whether flate at best speed makes probe smaller.
 func (z *Writer) compresses(probe []byte) bool {
-	compressor, _ := z.fastCompressors.Get().(*flate.Writer)
+	compressor, _ := z.probeCompressors.Get().(*flate.Writer)
 	var size countingWriter
 	if compressor == nil {
 		compressor, _ = flate.NewWriter(&size, flate.BestSpeed)
 	} else {
 		compressor.Reset(&size)
 	}
-	defer z.fastCompressors.Put(compressor)
+	defer z.probeCompressors.Put(compressor)
 	if _, err := compressor.Write(probe); err != nil || compressor.Flush() != nil {
 		return true
 	}

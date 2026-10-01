@@ -66,6 +66,36 @@ func TestWriterRoundTrips(t *testing.T) {
 	}
 }
 
+// Data that does not compress is stored as best speed stores it.
+func TestWriterStoresWhatDoesNotCompress(t *testing.T) {
+	input := testInput(4*segmentBytes, true)
+	var single bytes.Buffer
+	compressor, err := flate.NewWriter(&single, flate.BestSpeed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := compressor.Write(input); err != nil {
+		t.Fatal(err)
+	}
+	if err := compressor.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var parallel bytes.Buffer
+	z, err := NewWriter(&parallel, flate.BestSpeed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := z.Write(input); err != nil {
+		t.Fatal(err)
+	}
+	if err := z.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if parallel.Len() > single.Len()+single.Len()/1000 {
+		t.Fatalf("%d random bytes compress into %d, where best speed makes %d", len(input), parallel.Len(), single.Len())
+	}
+}
+
 // A GzipWriter writes one member, which a gzip reader decompresses and checks.
 func TestGzipWriterRoundTrips(t *testing.T) {
 	for _, size := range testSizes {
