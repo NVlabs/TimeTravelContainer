@@ -312,6 +312,10 @@ type Repository struct {
 	graph    *ttcsnapshot.Store
 	data     *ttcsnapshot.LocalDataStore
 
+	// unsynced is set while createAt makes the repository: its metadata
+	// syncs nothing, and createAt makes all of it durable at once.
+	unsynced bool
+
 	// Ordinary Linux namespace mutations are not durable until fsync(2),
 	// sync(2), or filesystem teardown. Track journal and pointer files that
 	// still need their contents made durable.
@@ -1265,7 +1269,11 @@ func (m *Manager) createAt(path, name, id string, workingOrigin ttcsnapshot.Snap
 		}
 	}
 	info := VolumeInfo{ID: id, Name: name, CreatedAt: time.Now().UTC(), NextInode: rootInode + 1, Clustered: workingOrigin != 0}
-	repo, err := m.openPath(path, info)
+	// The repository is made without a sync, and made durable at once
+	// before the format marker commits it: its files and directories synced
+	// one after another took sixteen syncs, 40 ms of a run on a disk whose
+	// sync takes 2.5 ms, and together they take about two.
+	repo, err := m.openNewPath(path, info)
 	if err != nil {
 		_ = os.RemoveAll(path)
 		return nil, err
@@ -1276,7 +1284,7 @@ func (m *Manager) createAt(path, name, id string, workingOrigin ttcsnapshot.Snap
 			repo.Close()
 		}
 	}()
-	if err := writeJSONAtomic(filepath.Join(path, "staging"), filepath.Join(path, "volume.json"), info); err != nil {
+	if err := writeJSONUnsynced(filepath.Join(path, "staging"), filepath.Join(path, "volume.json"), info); err != nil {
 		_ = os.RemoveAll(path)
 		return nil, err
 	}
@@ -1305,16 +1313,59 @@ func (m *Manager) createAt(path, name, id string, workingOrigin ttcsnapshot.Snap
 		_ = os.RemoveAll(path)
 		return nil, err
 	}
-	if err := atomicWriteFile(filepath.Join(path, "staging"), filepath.Join(path, "format"), []byte(strconv.Itoa(formatVersion)+"\n"), 0600); err != nil {
+	if err := repo.SyncMetadata(); err != nil {
 		_ = os.RemoveAll(path)
 		return nil, err
 	}
-	if err := repo.SyncMetadata(); err != nil {
+	if err := syncTree(path); err != nil {
+		_ = os.RemoveAll(path)
+		return nil, fmt.Errorf("syncing new volume repository: %w", err)
+	}
+	repo.graph.Synced()
+	repo.unsynced = false
+	if err := atomicWriteFile(filepath.Join(path, "staging"), filepath.Join(path, "format"), []byte(strconv.Itoa(formatVersion)+"\n"), 0600); err != nil {
 		_ = os.RemoveAll(path)
 		return nil, err
 	}
 	keepRepo = true
 	return repo, nil
+}
+
+// syncTree syncs every file and directory under root, many at once.
+func syncTree(root string) error {
+	var paths []string
+	if err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.Type().IsRegular() || entry.IsDir() {
+			paths = append(paths, path)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	errs := make([]error, len(paths))
+	slots := make(chan struct{}, 32)
+	var wg sync.WaitGroup
+	for index, path := range paths {
+		wg.Add(1)
+		slots <- struct{}{}
+		go func() {
+			defer func() {
+				<-slots
+				wg.Done()
+			}()
+			file, err := os.Open(path)
+			if err != nil {
+				errs[index] = err
+				return
+			}
+			errs[index] = errors.Join(file.Sync(), file.Close())
+		}()
+	}
+	wg.Wait()
+	return errors.Join(errs...)
 }
 
 // OpenPrivate opens a repository created by CreatePrivate.
@@ -1467,11 +1518,25 @@ func (m *Manager) RemovePrivate(path string) error {
 }
 
 func (m *Manager) openPath(path string, info VolumeInfo) (*Repository, error) {
+	return m.openPathCreating(path, info, false)
+}
+
+// openNewPath opens the repository createAt is making at path, whose graph it
+// makes, both syncing nothing until createAt has made them durable.
+func (m *Manager) openNewPath(path string, info VolumeInfo) (*Repository, error) {
+	return m.openPathCreating(path, info, true)
+}
+
+func (m *Manager) openPathCreating(path string, info VolumeInfo, creating bool) (*Repository, error) {
 	dir, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	graph, err := ttcsnapshot.OpenExternallyCoordinated(filepath.Join(path, "graph"))
+	openGraph := ttcsnapshot.OpenExternallyCoordinated
+	if creating {
+		openGraph = ttcsnapshot.CreateExternallyCoordinated
+	}
+	graph, err := openGraph(filepath.Join(path, "graph"))
 	if err != nil {
 		dir.Close()
 		return nil, fmt.Errorf("opening repository snapshot graph: %w", err)
@@ -1482,7 +1547,7 @@ func (m *Manager) openPath(path string, info VolumeInfo) (*Repository, error) {
 		dir.Close()
 		return nil, fmt.Errorf("opening repository data store: %w", err)
 	}
-	return &Repository{path: path, dir: dir, copyMode: m.capability.Mode, info: info, graph: graph, data: data}, nil
+	return &Repository{path: path, dir: dir, copyMode: m.capability.Mode, info: info, graph: graph, data: data, unsynced: creating}, nil
 }
 
 // ReadRepositoryInfo returns what Info returns of the repository at path,
@@ -3463,18 +3528,25 @@ func (r *Repository) syncMetadataLocked() error {
 	// A guest durability boundary first persists every new or modified payload
 	// and the complete directory path that publishes it. Only then may the
 	// graph WAL making those immutable IDs reachable become durable.
-	if err := r.data.SyncObjects(dataIDs); err != nil {
-		return fmt.Errorf("syncing repository data objects: %w", err)
-	}
-	if err := r.data.SyncNewNames(); err != nil {
-		return fmt.Errorf("syncing repository data object names: %w", err)
+	// A repository being made syncs nothing: createAt makes it durable at
+	// once.
+	syncing := !r.unsynced
+	if syncing {
+		if err := r.data.SyncObjects(dataIDs); err != nil {
+			return fmt.Errorf("syncing repository data objects: %w", err)
+		}
+		if err := r.data.SyncNewNames(); err != nil {
+			return fmt.Errorf("syncing repository data object names: %w", err)
+		}
 	}
 	sort.Strings(dirtyBranches)
 	// Persist directory entries only after the files they name. The graph WAL
 	// is the final reachability barrier, so every immutable object must already
 	// be openable if that WAL survives a crash.
-	if _, err := r.syncNamesLocked(); err != nil {
-		return err
+	if syncing {
+		if _, err := r.syncNamesLocked(); err != nil {
+			return err
+		}
 	}
 	// The graph journal names the immutable metadata and data objects made
 	// durable above. Persist it before publishing branch pointer files.
@@ -3537,14 +3609,16 @@ func (r *Repository) syncMetadataLocked() error {
 	}
 	r.dirtyMu.Unlock()
 	sort.Strings(branchDirty)
-	if err := r.syncRepositoryFiles(branchDirty); err != nil {
-		return err
-	}
-	if err := r.syncDirectory("branches"); err != nil {
-		return err
-	}
-	if err := r.dir.Sync(); err != nil {
-		return err
+	if syncing {
+		if err := r.syncRepositoryFiles(branchDirty); err != nil {
+			return err
+		}
+		if err := r.syncDirectory("branches"); err != nil {
+			return err
+		}
+		if err := r.dir.Sync(); err != nil {
+			return err
+		}
 	}
 	r.dirtyMu.Lock()
 	for name := range r.dirtyFiles {
@@ -4420,6 +4494,30 @@ func writeJSONAtomic(stagingDir, path string, value any) error {
 	}
 	data = append(data, '\n')
 	return atomicWriteFile(stagingDir, path, data, 0600)
+}
+
+// writeJSONUnsynced writes value to path as writeJSONAtomic does, without
+// syncing it, for a repository createAt makes durable at once.
+func writeJSONUnsynced(stagingDir, path string, value any) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	file, err := os.CreateTemp(stagingDir, "publish-")
+	if err != nil {
+		return err
+	}
+	staging := file.Name()
+	if err := errors.Join(file.Chmod(0600), writeAll(file, data), file.Close()); err != nil {
+		_ = os.Remove(staging)
+		return err
+	}
+	if err := os.Rename(staging, path); err != nil {
+		_ = os.Remove(staging)
+		return err
+	}
+	return nil
 }
 
 func atomicWriteFile(stagingDir, path string, data []byte, mode fs.FileMode) error {

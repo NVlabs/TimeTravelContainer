@@ -305,6 +305,11 @@ type journalReference struct {
 
 // Store owns one authoritative logical snapshot graph.
 type Store struct {
+	// unsynced is set while a store being made is not yet durable: until
+	// Synced, it syncs none of what it writes. See
+	// CreateExternallyCoordinated.
+	unsynced atomic.Bool
+
 	mu         sync.RWMutex
 	dir        string
 	dirFD      *os.File
@@ -406,7 +411,7 @@ var graphTemporarySequence atomic.Uint64
 
 // Open opens or creates a snapshot graph store at dir.
 func Open(dir string) (*Store, error) {
-	return open(dir, false)
+	return open(dir, false, false)
 }
 
 // OpenExternallyCoordinated opens a graph whose writers are serialized by an
@@ -414,7 +419,29 @@ func Open(dir string) (*Store, error) {
 // graph.lock. This is intentionally a narrow integration API for repository
 // implementations; ordinary graph owners should use Open.
 func OpenExternallyCoordinated(dir string) (*Store, error) {
-	return open(dir, true)
+	return open(dir, true, false)
+}
+
+// CreateExternallyCoordinated makes a graph in dir, a directory just made,
+// and opens it as OpenExternallyCoordinated does, but syncs nothing it
+// writes until Synced. Its caller makes it durable before anything names it,
+// with the rest of what it is part of: syncs that come together, the
+// filesystem commits together, and one after another, each on its own.
+func CreateExternallyCoordinated(dir string) (*Store, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) != 0 {
+		return nil, fmt.Errorf("creating TTC snapshot graph: %q is not empty", dir)
+	}
+	return open(dir, true, true)
+}
+
+// Synced has the store sync what it writes from now on: its caller has made
+// it durable.
+func (s *Store) Synced() {
+	s.unsynced.Store(false)
 }
 
 func decodeHead(data []byte) (graphHead, error) {
@@ -490,7 +517,7 @@ func preflightGraphDirectory(dir string) (bool, error) {
 	return true, nil
 }
 
-func open(dir string, externallyCoordinated bool) (*Store, error) {
+func open(dir string, externallyCoordinated, unsynced bool) (*Store, error) {
 	if dir == "" {
 		return nil, errors.New("TTC snapshot graph directory is empty")
 	}
@@ -531,6 +558,7 @@ func open(dir string, externallyCoordinated bool) (*Store, error) {
 		deferredResolvers: make(map[string]deferredResolver), deferredObjects: make(map[deferredKey]ObjectID),
 		deferredLoads: make(map[deferredKey]*deferredLoad), memoryTableSeed: maphash.MakeSeed(),
 	}
+	store.unsynced.Store(unsynced)
 	if externallyCoordinated {
 		if err := hostthread.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
 			store.Close()
@@ -908,8 +936,10 @@ func (s *Store) writeFileAtomically(destination, prefix string, data []byte) err
 	if _, err := temporary.Write(data); err != nil {
 		return err
 	}
-	if err := temporary.Sync(); err != nil {
-		return err
+	if !s.unsynced.Load() {
+		if err := temporary.Sync(); err != nil {
+			return err
+		}
 	}
 	if err := temporary.Close(); err != nil {
 		return err
@@ -924,6 +954,9 @@ func (s *Store) writeFileAtomically(destination, prefix string, data []byte) err
 func (s *Store) syncDirectory() error {
 	if s.dirFD == nil {
 		return errors.New("TTC snapshot graph is closed")
+	}
+	if s.unsynced.Load() {
+		return nil
 	}
 	return s.dirFD.Sync()
 }
@@ -1582,8 +1615,10 @@ func (s *Store) replayJournal(repairTail bool) error {
 		if _, err := s.journal.WriteAt([]byte(journalHeader), 0); err != nil {
 			return err
 		}
-		if err := s.journal.Sync(); err != nil {
-			return err
+		if !s.unsynced.Load() {
+			if err := s.journal.Sync(); err != nil {
+				return err
+			}
 		}
 	}
 	journal, err := s.readJournalAt(0)
@@ -1787,6 +1822,11 @@ func (s *Store) applyIncrementalJournalRecord(record journalRecord) error {
 
 func (s *Store) truncateJournal(offset int64) error {
 	if err := s.journal.Truncate(offset); err != nil {
+		return err
+	}
+	if s.unsynced.Load() {
+		s.journalEnd = offset
+		_, err := s.journal.Seek(0, io.SeekEnd)
 		return err
 	}
 	if err := s.journal.Sync(); err != nil {
@@ -2474,6 +2514,9 @@ func (s *Store) Sync() error {
 	}
 	if s.journal == nil {
 		return errors.New("TTC snapshot graph is closed")
+	}
+	if s.unsynced.Load() {
+		return nil
 	}
 	if err := s.journal.Sync(); err != nil {
 		s.poisoned = err
