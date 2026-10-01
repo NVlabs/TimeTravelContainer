@@ -6,6 +6,7 @@ package checkpoint
 
 import (
 	"archive/tar"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -151,24 +152,114 @@ func ReadManifest(root string) (Manifest, error) {
 // Pack atomically publishes a staging tree containing regular files,
 // directories, and symbolic links as one tar file.
 func Pack(root, destination string) error {
-	if _, err := os.Lstat(destination); err == nil {
-		return fmt.Errorf("checkpoint destination %q already exists", destination)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	parent := filepath.Dir(destination)
-	temp, err := os.CreateTemp(parent, ".ttc-checkpoint-*")
+	archive, err := CreateArchive(destination)
 	if err != nil {
 		return err
 	}
-	tempName := temp.Name()
-	keep := false
-	defer func() {
-		_ = temp.Close()
-		if !keep {
-			_ = os.Remove(tempName)
-		}
-	}()
+	defer archive.Abort()
+	return archive.Finish(root)
+}
+
+// blockSize is the size of a tar block.
+const blockSize = 512
+
+// Archive is a checkpoint archive being written: first the members whose
+// content is streamed, each as it is made, then, by Finish, the other entries
+// of a staging tree, as Pack writes them.
+type Archive struct {
+	destination string
+	temp        *os.File
+	// end is where the next member begins.
+	end       int64
+	streamed  map[string]struct{}
+	published bool
+}
+
+// CreateArchive begins an archive that Finish publishes at destination.
+func CreateArchive(destination string) (*Archive, error) {
+	if _, err := os.Lstat(destination); err == nil {
+		return nil, fmt.Errorf("checkpoint destination %q already exists", destination)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	temp, err := os.CreateTemp(filepath.Dir(destination), ".ttc-checkpoint-*")
+	if err != nil {
+		return nil, err
+	}
+	return &Archive{destination: destination, temp: temp, streamed: make(map[string]struct{})}, nil
+}
+
+// Stream writes name, a regular file of mode, whose content write writes to
+// the archive's file from the file's offset on, by itself or by another
+// process it hands the file to. The member's header, which records its size,
+// is written once its content is: the content is neither staged nor copied.
+func (a *Archive) Stream(name string, mode fs.FileMode, write func(*os.File) error) error {
+	if !validArchivePath(filepath.FromSlash(name)) {
+		return fmt.Errorf("invalid checkpoint archive path %q", name)
+	}
+	if _, ok := a.streamed[name]; ok {
+		return fmt.Errorf("duplicate checkpoint archive path %q", name)
+	}
+	start := a.end + blockSize
+	if _, err := a.temp.Seek(start, io.SeekStart); err != nil {
+		return err
+	}
+	if err := write(a.temp); err != nil {
+		return err
+	}
+	end, err := a.temp.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+	size := end - start
+	header, err := streamedHeader(name, mode, size)
+	if err != nil {
+		return err
+	}
+	if _, err := a.temp.WriteAt(header, a.end); err != nil {
+		return err
+	}
+	padding := (blockSize - size%blockSize) % blockSize
+	if _, err := a.temp.WriteAt(make([]byte, padding), end); err != nil {
+		return err
+	}
+	a.end = end + padding
+	a.streamed[name] = struct{}{}
+	return nil
+}
+
+// streamedHeader returns the one block of the header of a streamed member: the
+// GNU format records a size of any length in it.
+func streamedHeader(name string, mode fs.FileMode, size int64) ([]byte, error) {
+	var header bytes.Buffer
+	if err := tar.NewWriter(&header).WriteHeader(&tar.Header{
+		Typeflag: tar.TypeReg, Name: name, Mode: int64(mode.Perm()), Size: size,
+		ModTime: time.Unix(time.Now().Unix(), 0), Format: tar.FormatGNU,
+	}); err != nil {
+		return nil, err
+	}
+	if header.Len() != blockSize {
+		return nil, fmt.Errorf("checkpoint archive header of %q has %d bytes", name, header.Len())
+	}
+	return header.Bytes(), nil
+}
+
+// Abort removes the archive, unless Finish published it.
+func (a *Archive) Abort() {
+	if a.published {
+		return
+	}
+	_ = a.temp.Close()
+	_ = os.Remove(a.temp.Name())
+}
+
+// Finish writes the entries of the staging tree at root that were not
+// streamed, as Pack does, and publishes the archive.
+func (a *Archive) Finish(root string) error {
+	if _, err := a.temp.Seek(a.end, io.SeekStart); err != nil {
+		return err
+	}
+	temp, tempName, destination := a.temp, a.temp.Name(), a.destination
 	writer := tar.NewWriter(temp)
 	type packReadResult struct {
 		data []byte
@@ -194,6 +285,9 @@ func Pack(root, destination string) error {
 		}
 		if !validArchivePath(relative) {
 			return fmt.Errorf("invalid checkpoint staging path %q", relative)
+		}
+		if _, ok := a.streamed[filepath.ToSlash(relative)]; ok {
+			return fmt.Errorf("checkpoint staging path %q was streamed", relative)
 		}
 		info, err := entry.Info()
 		if err != nil {
@@ -331,7 +425,7 @@ func Pack(root, destination string) error {
 		_ = os.Remove(destination)
 		return err
 	}
-	keep = true
+	a.published = true
 	return nil
 }
 

@@ -5,6 +5,7 @@ package checkpoint
 
 import (
 	"archive/tar"
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -70,6 +71,79 @@ func TestPackUnpack(t *testing.T) {
 	}
 	if err := Pack(staging, archive); err == nil {
 		t.Fatal("Pack overwrote an existing checkpoint")
+	}
+}
+
+// A member streamed into an archive comes first, its size recorded once it is
+// written, and the staging tree's entries follow it: Unpack extracts both.
+func TestArchiveStreamsAMemberFirst(t *testing.T) {
+	staging := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(staging, "state"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(staging, "state", "metadata.state"), []byte("metadata"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteManifest(staging, testManifest()); err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(t.TempDir(), "snapshot.ttc")
+	archive, err := CreateArchive(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer archive.Abort()
+	// Not a whole number of blocks, and written in pieces.
+	memory := bytes.Repeat([]byte("page"), 3000)
+	if err := archive.Stream("state/memory.stream", 0600, func(w *os.File) error {
+		for rest := memory; len(rest) != 0; {
+			n := min(len(rest), 1000)
+			if _, err := w.Write(rest[:n]); err != nil {
+				return err
+			}
+			rest = rest[n:]
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := archive.Stream("state/memory.stream", 0600, func(*os.File) error { return nil }); err == nil {
+		t.Fatal("a member was streamed twice")
+	}
+	if err := archive.Finish(staging); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := tar.NewReader(file).Next()
+	file.Close()
+	if err != nil || first.Name != "state/memory.stream" || first.Size != int64(len(memory)) {
+		t.Fatalf("the archive begins with %+v (%v), want the streamed member", first, err)
+	}
+	extracted := filepath.Join(t.TempDir(), "extracted")
+	if err := Unpack(destination, extracted); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string][]byte{"state/memory.stream": memory, "state/metadata.state": []byte("metadata")} {
+		got, err := os.ReadFile(filepath.Join(extracted, name))
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("%s holds %d bytes (%v), want %d", name, len(got), err, len(want))
+		}
+	}
+}
+
+// A streamed member's header records a size beyond 8 GiB in its one block.
+func TestStreamedHeaderRecordsLargeSizes(t *testing.T) {
+	const size = 10 << 30
+	header, err := streamedHeader("state/memory.stream", 0600, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := tar.NewReader(bytes.NewReader(header)).Next()
+	if err != nil || parsed.Name != "state/memory.stream" || parsed.Size != size {
+		t.Fatalf("the header reads as %+v (%v), want a member of %d bytes", parsed, err, int64(size))
 	}
 }
 

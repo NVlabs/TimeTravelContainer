@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"time"
@@ -283,6 +284,19 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest, output io.Writer)
 	if err := os.Mkdir(stateDir, 0700); err != nil {
 		return err
 	}
+	// The branch's memory streams into the archive as it is captured; the
+	// rest of the checkpoint is staged, and packed after it.
+	destination := request.destination
+	stream := destination == "-"
+	if stream {
+		destination = stage + ".ttc"
+		defer os.Remove(destination)
+	}
+	archive, err := ttccheckpoint.CreateArchive(destination)
+	if err != nil {
+		return err
+	}
+	defer archive.Abort()
 	var manifestRepositories []ttccheckpoint.RepositorySnapshot
 	var hostMounts []ttccheckpoint.HostMountSnapshot
 	// Saving the branch's memory and exporting its files take time in
@@ -290,7 +304,7 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest, output io.Writer)
 	// which keeps its state, is left as it is.
 	if err := b.withoutLifecycleLock(info, longOperation{branch: target.branch, state: "checkpointing", hidden: hiddenBranch}, func() error {
 		var err error
-		manifestRepositories, hostMounts, err = b.saveCheckpointState(info, spec, request.compression, hiddenBranch, hiddenInfo.FilesystemBranch, stage, stateDir)
+		manifestRepositories, hostMounts, err = b.saveCheckpointState(info, spec, request.compression, hiddenBranch, hiddenInfo.FilesystemBranch, stage, stateDir, archive)
 		return err
 	}); err != nil {
 		return err
@@ -322,13 +336,7 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest, output io.Writer)
 	}
 	// Packing, like saving, takes time in proportion to the checkpoint.
 	return b.withoutLifecycleLock(info, longOperation{branch: target.branch, state: "checkpointing"}, func() error {
-		destination := request.destination
-		stream := destination == "-"
-		if stream {
-			destination = stage + ".ttc"
-			defer os.Remove(destination)
-		}
-		if err := ttccheckpoint.Pack(stage, destination); err != nil {
+		if err := archive.Finish(stage); err != nil {
 			return err
 		}
 		if stream {
@@ -344,9 +352,9 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest, output io.Writer)
 }
 
 // saveCheckpointState saves a dehydration of the hidden checkpoint branch in
-// stateDir, and its repositories and host mounts in stage.
-func (b *runtimeBackend) saveCheckpointState(info ttcbundle.ContainerInfo, spec *specs.Spec, compression, hiddenBranch, persistentBranch, stage, stateDir string) (manifestRepositories []ttccheckpoint.RepositorySnapshot, hostMounts []ttccheckpoint.HostMountSnapshot, retErr error) {
-	if err := b.saveCheckpointDehydration(info, hiddenBranch, compression, stateDir); err != nil {
+// stateDir and archive, and its repositories and host mounts in stage.
+func (b *runtimeBackend) saveCheckpointState(info ttcbundle.ContainerInfo, spec *specs.Spec, compression, hiddenBranch, persistentBranch, stage, stateDir string, archive *ttccheckpoint.Archive) (manifestRepositories []ttccheckpoint.RepositorySnapshot, hostMounts []ttccheckpoint.HostMountSnapshot, retErr error) {
+	if err := b.saveCheckpointDehydration(info, hiddenBranch, compression, stateDir, archive); err != nil {
 		return nil, nil, fmt.Errorf("saving checkpoint state: %w", err)
 	}
 
@@ -430,10 +438,11 @@ const (
 )
 
 // saveCheckpointDehydration dehydrates the hidden checkpoint branch and saves
-// the dehydration in stateDir: its capture, its kernel state, and a stream of
-// the pages it uses. The stream holds the branch's own memory; saving its
-// kernel as gVisor does wrote the whole memory file it shares with its family.
-func (b *runtimeBackend) saveCheckpointDehydration(info ttcbundle.ContainerInfo, hiddenBranch, compression, stateDir string) error {
+// the dehydration: its capture and its kernel state in stateDir, and a stream
+// of the pages it uses in archive, as state/memory.stream. The stream holds the
+// branch's own memory; saving its kernel as gVisor does wrote the whole memory
+// file it shares with its family.
+func (b *runtimeBackend) saveCheckpointDehydration(info ttcbundle.ContainerInfo, hiddenBranch, compression, stateDir string, archive *ttccheckpoint.Archive) error {
 	if _, err := b.command("timetravel", info.ID, "dehydrate", hiddenBranch); err != nil {
 		return fmt.Errorf("capturing the branch: %w", err)
 	}
@@ -442,38 +451,38 @@ func (b *runtimeBackend) saveCheckpointDehydration(info ttcbundle.ContainerInfo,
 		return err
 	}
 	defer metadata.Close()
-	memory, err := os.OpenFile(filepath.Join(stateDir, checkpointMemoryName), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-	if err != nil {
-		return err
-	}
-	defer memory.Close()
-	// Unfiltered, the capture's stream is one-way, so a file can record it.
-	stream, finish := memory, func() error { return nil }
-	if compression != "none" {
-		reader, writer, err := os.Pipe()
-		if err != nil {
-			return err
-		}
-		compressed := make(chan error, 1)
-		go func() {
-			compressor, err := pflate.NewWriter(memory, flate.BestSpeed)
-			if err == nil {
-				_, err = io.Copy(compressor, reader)
-				err = errors.Join(err, compressor.Close())
+	// Unfiltered, the capture's stream is one-way, so the archive can record
+	// it.
+	var output []byte
+	if err := archive.Stream(path.Join(filepath.Base(stateDir), checkpointMemoryName), 0600, func(memory *os.File) error {
+		stream, finish := memory, func() error { return nil }
+		if compression != "none" {
+			reader, writer, err := os.Pipe()
+			if err != nil {
+				return err
 			}
-			// Drain what is left if compressing failed, so the Sentry's
-			// writes do not block.
-			_, _ = io.Copy(io.Discard, reader)
-			compressed <- errors.Join(err, reader.Close())
-		}()
-		stream = writer
-		finish = func() error {
-			_ = writer.Close()
-			return <-compressed
+			compressed := make(chan error, 1)
+			go func() {
+				compressor, err := pflate.NewWriter(memory, flate.BestSpeed)
+				if err == nil {
+					_, err = io.Copy(compressor, reader)
+					err = errors.Join(err, compressor.Close())
+				}
+				// Drain what is left if compressing failed, so the Sentry's
+				// writes do not block.
+				_, _ = io.Copy(io.Discard, reader)
+				compressed <- errors.Join(err, reader.Close())
+			}()
+			stream = writer
+			finish = func() error {
+				_ = writer.Close()
+				return <-compressed
+			}
 		}
-	}
-	output, exportErr := b.commandWithFiles([]*os.File{stream, metadata}, "timetravel", "--dehydration-graph-stream-fd=3", "--dehydration-fd=4", info.ID, "dehydrate-export", hiddenBranch)
-	if err := errors.Join(exportErr, finish()); err != nil {
+		var exportErr error
+		output, exportErr = b.commandWithFiles([]*os.File{stream, metadata}, "timetravel", "--dehydration-graph-stream-fd=3", "--dehydration-fd=4", info.ID, "dehydrate-export", hiddenBranch)
+		return errors.Join(exportErr, finish())
+	}); err != nil {
 		return fmt.Errorf("exporting the branch's memory: %w", err)
 	}
 	var exported boot.BranchDehydrationExportInfo
