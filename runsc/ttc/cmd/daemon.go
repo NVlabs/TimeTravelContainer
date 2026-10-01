@@ -7877,7 +7877,7 @@ func writeDaemonBufferedResult(conn net.Conn, writeMu *sync.Mutex, stdout, stder
 // stands for every family.
 func commandReconciledFamilies(args []string, b *runtimeBackend) []string {
 	switch name := daemonCommandName(args); {
-	case familyScopedCommands[name], name == "migrate", name == "run":
+	case familyScopedCommands[name], name == "migrate", name == "run", name == "create":
 		return b.resolvedFamilies.list()
 	default:
 		return nil

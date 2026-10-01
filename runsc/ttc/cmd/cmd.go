@@ -7950,6 +7950,9 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 	if err := b.registerCreatedContainerPlacement(prepared.Container); err != nil {
 		return "", errors.Join(err, store.RemoveContainer(prepared.Container.ID))
 	}
+	// The family is made, not resolved by name: recorded, it is the one the
+	// reconciliation after the command looks at, as after a run.
+	b.resolvedFamilies.resolved(prepared.Container.Name, prepared.Container)
 	return prepared.Container.ID, nil
 }
 
