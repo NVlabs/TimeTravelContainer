@@ -6,8 +6,10 @@
 # Manual end-to-end coverage for Android in TTC: redroid (an Android image
 # for containers) boots, as its container's init, with the virtual GPU
 # (--gfx); SurfaceFlinger composes with ANGLE on gfxstream's Vulkan driver;
-# Android's network comes up and validates; apps render on the GPU; and,
-# given one, an APK installs and runs.
+# Android's network comes up and validates; apps render on the GPU; the
+# screen records to video, as screen mirroring such as scrcpy's needs; given
+# one, an APK installs and runs; and a live fork of Android, whose GPU state
+# the child restores, runs on in both branches.
 #
 # It needs what runsc/ttc/test/e2e_gfx.sh needs (TTC, TTCD,
 # TTC_GFX_RENDERER, TTC_GFXSTREAM_LIBRARY, TTC_GFX_GUEST_DRIVER), and:
@@ -97,14 +99,19 @@ if [ "$TTC_UNSAFE_NO_HOST_ISOLATION" = 1 ]; then
 fi
 ttc "$@"
 
-# adb runs a command in Android, as its shell would.
+# adb runs a command in Android, as its shell would; adb_in, in a branch.
 adb() {
   ttc exec "$NAME@main" "$@"
+}
+adb_in() {
+  branch=$1
+  shift
+  ttc exec "$NAME@$branch" "$@"
 }
 
 # Android's init is the container's. Before it starts, the container gets
 # the Android driver, and redroid's graphics configuration for the GPU.
-ttc create --name "$NAME" --gfx --waive-live-fork --cap-add ALL --network ttc --nat \
+ttc create --name "$NAME" --gfx --gfx-fork snapshot --cap-add ALL --network ttc --nat \
   --entrypoint /init "$REDROID_IMAGE" \
   qemu=1 androidboot.hardware=redroid androidboot.use_memfd=true >/dev/null
 ttc cp "$ANDROID_GFX_DRIVER" "$NAME@main:/vendor/lib64/hw/vulkan.gfxstream.so" >/dev/null
@@ -136,19 +143,20 @@ until adb /system/bin/dumpsys connectivity 2>/dev/null | grep -q '&VALIDATED&'; 
 done
 echo "ttc redroid e2e: the network is validated"
 
-# launch PACKAGE starts the package's launcher activity, and checks that it
-# renders with ANGLE on gfxstream's driver.
+# launch PACKAGE [BRANCH] starts the package's launcher activity, and checks
+# that it renders with ANGLE on gfxstream's driver.
 launch() {
-  component=$(adb /system/bin/cmd package resolve-activity --brief \
+  branch=${2:-main}
+  component=$(adb_in "$branch" /system/bin/cmd package resolve-activity --brief \
     -c android.intent.category.LAUNCHER "$1" | tail -1)
   case "$component" in
     */*) ;;
     *) fail "$1 has no launcher activity: $component" ;;
   esac
-  adb /system/bin/am start -W -n "$component" >/dev/null || fail "starting $component"
+  adb_in "$branch" /system/bin/am start -W -n "$component" >/dev/null || fail "starting $component"
   sleep 5
-  pid=$(adb /system/bin/pidof -s "$1") || fail "$1 is not running"
-  maps=$(adb /system/bin/cat "/proc/$pid/maps")
+  pid=$(adb_in "$branch" /system/bin/pidof -s "$1") || fail "$1 is not running"
+  maps=$(adb_in "$branch" /system/bin/cat "/proc/$pid/maps")
   case "$maps" in
     *libGLESv2_angle.so*) ;;
     *) fail "$1 does not render with ANGLE" ;;
@@ -157,15 +165,25 @@ launch() {
     *vulkan.gfxstream.so*) ;;
     *) fail "$1 does not use gfxstream's Vulkan driver" ;;
   esac
-  adb /system/bin/screencap -p "/data/local/tmp/$1.png" || fail "screencap"
-  ttc cp "$NAME@main:/data/local/tmp/$1.png" "$OUT_DIR/$1.png" >/dev/null
+  adb_in "$branch" /system/bin/screencap -p "/data/local/tmp/$1.png" || fail "screencap"
+  ttc cp "$NAME@$branch:/data/local/tmp/$1.png" "$OUT_DIR/$branch-$1.png" >/dev/null
   # A blank screen compresses to a few kilobytes.
-  size=$(wc -c <"$OUT_DIR/$1.png")
+  size=$(wc -c <"$OUT_DIR/$branch-$1.png")
   [ "$size" -gt 20000 ] || fail "$1's screen is blank ($size bytes)"
-  echo "ttc redroid e2e: $1 renders on the GPU"
+  echo "ttc redroid e2e: $1 renders on the GPU in $branch"
 }
 
 launch com.android.settings
+
+# The screen records to video: Codec2's software encoder, whose buffers come
+# from the Sentry's DMA-BUF heap, takes frames from an input surface, as
+# screen mirroring such as scrcpy's does.
+adb /system/bin/screenrecord --time-limit 3 /data/local/tmp/screen.mp4 >/dev/null 2>&1 ||
+  fail "screenrecord failed"
+ttc cp "$NAME@main:/data/local/tmp/screen.mp4" "$OUT_DIR/screen.mp4" >/dev/null
+size=$(($(wc -c <"$OUT_DIR/screen.mp4")))
+[ "$size" -gt 10000 ] || fail "the screen recording is empty ($size bytes)"
+echo "ttc redroid e2e: the screen records to video ($size bytes)"
 
 if [ -n "$APK" ]; then
   ttc cp "$APK" "$NAME@main:/data/local/tmp/app.apk" >/dev/null
@@ -178,5 +196,25 @@ if [ -n "$APK" ]; then
   [ -n "$package" ] || fail "no installed package"
   launch "$package"
 fi
+
+# A live fork: the child restores the GPU's state, and both branches run on,
+# without restarting Android's framework.
+system_server=$(adb /system/bin/pidof system_server) || fail "system_server is not running"
+ttc fork "$NAME@main" child >/dev/null || fail "forking Android"
+# Every thread of both branches restarts its interrupted system call at once,
+# which takes the branches a while.
+deadline=$(($(date +%s) + 180))
+until adb_in child /system/bin/true >/dev/null 2>&1 && adb /system/bin/true >/dev/null 2>&1; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "the branches do not answer after the fork"
+  sleep 5
+done
+for branch in main child; do
+  [ "$(adb_in "$branch" /system/bin/pidof system_server)" = "$system_server" ] ||
+    fail "Android's framework restarted in $branch after the fork"
+  adb_in "$branch" /system/bin/dumpsys SurfaceFlinger 2>&1 | grep -q '^GLES:.*ANGLE' ||
+    fail "SurfaceFlinger composes without the GPU in $branch after the fork"
+done
+launch com.android.settings child
+echo "ttc redroid e2e: Android runs on in both branches of a live fork"
 
 echo "ttc redroid e2e: ok"
