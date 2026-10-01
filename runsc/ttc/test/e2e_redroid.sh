@@ -202,7 +202,7 @@ fi
 system_server=$(adb /system/bin/pidof system_server) || fail "system_server is not running"
 ttc fork "$NAME@main" child >/dev/null || fail "forking Android"
 # Every thread of both branches restarts its interrupted system call at once,
-# which takes the branches a while.
+# which takes the branches a few seconds.
 deadline=$(($(date +%s) + 180))
 until adb_in child /system/bin/true >/dev/null 2>&1 && adb /system/bin/true >/dev/null 2>&1; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "the branches do not answer after the fork"

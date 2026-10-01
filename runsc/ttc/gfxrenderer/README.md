@@ -198,9 +198,7 @@ adb connect 127.0.0.1:5556
 scrcpy -s 127.0.0.1:5556 --no-audio
 ```
 
-Both branches answer only after a while, tens of seconds, after a fork:
-every thread of both restarts its system call at once, and the vCPUs admit
-them in turn.
+Both branches answer again within about ten seconds of a fork.
 
 `runsc/ttc/test/e2e_redroid.sh` boots it so, checks that SurfaceFlinger and
 apps render with ANGLE on the GPU, that the screen records to video, and

@@ -825,8 +825,11 @@ that.
     branch, which the branches had shared; and restored connection tracking
     that reinstalls what it does not save, its TCP state handlers and random
     source. After a fork, every thread of both branches restarts its system
-    call at once, and the HVF engine admits them to vCPUs in turn: the
-    branches answer after about half a minute.
+    call at once; the Sentry restarts them itself, rather than through the
+    application, which would need a vCPU each, so the branches answer within
+    about ten seconds. The HVF monitor's table of address spaces, one per
+    process, holds 4096, and a family of six Androids forks; with 320, a
+    fifth Android could not fork.
 *   **Not done:** VNC, and the device-lost experiment.
 *   **Found in the image:** its simulated Bluetooth HAL aborts on any
     kernel ("Invalid address"): it links two different
