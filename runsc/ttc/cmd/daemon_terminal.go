@@ -39,13 +39,15 @@ func newDaemonStdinQueue(writer *io.PipeWriter, ack func(int) error) *daemonStdi
 	return queue
 }
 
+// enqueue queues data, which the queue takes: a frame's payload, read into a
+// buffer of its own.
 func (queue *daemonStdinQueue) enqueue(data []byte) bool {
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
 	if queue.closed || len(data) > daemonStdinWindowBytes-queue.bytes {
 		return false
 	}
-	queue.chunks = append(queue.chunks, append([]byte(nil), data...))
+	queue.chunks = append(queue.chunks, data)
 	queue.bytes += len(data)
 	select {
 	case queue.notify <- struct{}{}:

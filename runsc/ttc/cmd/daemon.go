@@ -8255,6 +8255,8 @@ func (s *daemonServer) reconcile(backend *runtimeBackend) {
 	}
 }
 
+// writeDaemonFrame writes a frame, its header and payload in one write where
+// writer takes several buffers at once.
 func writeDaemonFrame(writer io.Writer, mu *sync.Mutex, typ byte, payload []byte) error {
 	if len(payload) > daemonMaxFrame {
 		return fmt.Errorf("daemon frame is too large: %d", len(payload))
@@ -8263,10 +8265,9 @@ func writeDaemonFrame(writer io.Writer, mu *sync.Mutex, typ byte, payload []byte
 	binary.BigEndian.PutUint32(header[1:], uint32(len(payload)))
 	mu.Lock()
 	defer mu.Unlock()
-	if err := writeDaemonBytes(writer, header[:]); err != nil {
-		return err
-	}
-	return writeDaemonBytes(writer, payload)
+	buffers := net.Buffers{header[:], payload}
+	_, err := buffers.WriteTo(writer)
+	return err
 }
 
 func writeDaemonBytes(writer io.Writer, data []byte) error {
@@ -8541,7 +8542,7 @@ func exchangeDaemon(conn net.Conn, request daemonRequest, stdin io.Reader, stdou
 	defer stdinFlow.close()
 	if request.Stdin {
 		go func() {
-			buffer := make([]byte, 32<<10)
+			buffer := make([]byte, 256<<10)
 			for {
 				n, readErr := stdin.Read(buffer)
 				if n != 0 {
