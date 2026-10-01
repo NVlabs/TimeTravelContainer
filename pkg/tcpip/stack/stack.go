@@ -2219,7 +2219,7 @@ func (s *Stack) Restore() {
 	tables := s.tables
 	s.mu.Unlock()
 	if tables != nil {
-		tables.restoreReaper()
+		tables.restore(s.insecureRNG)
 	}
 }
 

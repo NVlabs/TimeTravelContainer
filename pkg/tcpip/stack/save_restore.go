@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package stack
 
 import (
@@ -49,6 +52,7 @@ func (s *Stack) beforeSave() {
 
 // afterLoad is invoked by stateify.
 func (s *Stack) afterLoad(context.Context) {
-	s.insecureRNG = rand.New(rand.NewSource(time.Now().UnixNano()))
+	// The stack's users share its source, so it is locked, as New's is.
+	s.insecureRNG = rand.New(&lockedRandomSource{src: rand.NewSource(time.Now().UnixNano())})
 	s.secureRNG = cryptorand.RNGFrom(cryptorand.Reader)
 }
