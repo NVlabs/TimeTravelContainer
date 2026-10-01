@@ -824,12 +824,24 @@ that.
     state loaded deadlocked on the clock; binder transaction memory per
     branch, which the branches had shared; and restored connection tracking
     that reinstalls what it does not save, its TCP state handlers and random
-    source. After a fork, every thread of both branches restarts its system
-    call at once; the Sentry restarts them itself, rather than through the
-    application, which would need a vCPU each, so the branches answer within
-    about ten seconds. The HVF monitor's table of address spaces, one per
-    process, holds 4096, and a family of six Androids forks; with 320, a
-    fifth Android could not fork.
+    source. The HVF monitor's table of address spaces, one per process,
+    holds 4096, and a family of six Androids forks; with 320, a fifth
+    Android could not fork.
+*   **Fork time:** the first fork of a booted Android pauses it for about
+    5 s, and both branches answer within a second after. That took: the
+    Sentry restarting the system calls that the pause interrupts, rather
+    than the application, whose threads would each need a vCPU, also for
+    the waits that Linux fails with `EINTR` (`epoll_pwait`, binder, untimed
+    `rt_sigtimedwait`) unless a handler runs; an ordered index of each
+    address space's pages, which unmapping a range had scanned whole; and
+    byte arrays saved as strings rather than element by element, which for
+    the renderer's snapshot, about 190 MB, took seconds and gigabytes.
+    Before, a fork paused Android for 13 s, and the branches answered 9 s
+    after. What remains: the snapshot still passes through the saved state
+    (1.6 s), which an in-process fork could share; the source drops its
+    gofer-backed mappings and page cache (1.4 s, and refaults after), which
+    only state files require; and preparing copy-on-write sends a monitor
+    transaction per mapping (0.6 s), which batching would amortize.
 *   **Not done:** VNC, and the device-lost experiment.
 *   **Found in the image:** its simulated Bluetooth HAL aborts on any
     kernel ("Invalid address"): it links two different
