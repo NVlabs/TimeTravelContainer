@@ -469,11 +469,13 @@ func (b *runtimeBackend) saveCheckpointDehydration(info ttcbundle.ContainerInfo,
 			if err != nil {
 				return err
 			}
+			growPipe(writer)
 			compressed := make(chan error, 1)
 			go func() {
 				compressor, err := pflate.NewWriter(memory, flate.BestSpeed)
 				if err == nil {
-					_, err = io.Copy(compressor, reader)
+					// As much at once as the pipe holds.
+					_, err = io.CopyBuffer(compressor, reader, make([]byte, 1<<20))
 					err = errors.Join(err, compressor.Close())
 					segments = compressor.Segments()
 				}

@@ -165,6 +165,13 @@ func readHostBootID() (string, error) {
 	return strings.TrimSpace(string(data)), nil
 }
 
+// growPipe lets pipe hold 1 MiB rather than 64 KiB, so that its writer and
+// reader take turns a sixteenth as often. A pipe that cannot grow, past the
+// host's pipe-max-size, works as it is.
+func growPipe(pipe *os.File) {
+	_, _ = unix.FcntlInt(pipe.Fd(), unix.F_SETPIPE_SZ, 1<<20)
+}
+
 func checkDaemonPeer(conn net.Conn) error {
 	unixConn, ok := conn.(*net.UnixConn)
 	if !ok {

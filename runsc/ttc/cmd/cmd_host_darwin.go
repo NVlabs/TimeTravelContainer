@@ -200,6 +200,9 @@ func readHostBootID() (string, error) {
 	return unix.Sysctl("kern.bootsessionuuid")
 }
 
+// growPipe does nothing: a Darwin pipe's buffer is not set.
+func growPipe(*os.File) {}
+
 func checkDaemonPeer(conn net.Conn) error {
 	unixConn, ok := conn.(*net.UnixConn)
 	if !ok {
