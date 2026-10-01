@@ -75,6 +75,7 @@ go_library(
         "//pkg/sentry/arch:registers_go_proto",
         "//pkg/sentry/checkpoint",
         "//pkg/sentry/control",
+        "//pkg/sentry/devices/dmaheap",
         "//pkg/sentry/devices/memdev",
         "//pkg/sentry/devices/nvproxy",
         "//pkg/sentry/devices/virtgpu",
