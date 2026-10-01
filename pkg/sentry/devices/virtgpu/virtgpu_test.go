@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -60,6 +61,9 @@ type fakeRenderer struct {
 	restored map[uint32][]byte
 	// failRestore makes restores fail.
 	failRestore bool
+	// referenceSnapshots makes snapshots references, as the Venus
+	// renderer's are.
+	referenceSnapshots bool
 }
 
 // fakeRenderers starts fakeRenderers.
@@ -72,6 +76,8 @@ type fakeRenderers struct {
 	rejectCapset0 bool
 	// failRestore makes new renderers fail to restore snapshots.
 	failRestore bool
+	// referenceSnapshots makes new renderers' snapshots references.
+	referenceSnapshots bool
 }
 
 func (f *fakeRenderers) newRenderer(events RendererEvents) (Renderer, error) {
@@ -84,6 +90,8 @@ func (f *fakeRenderers) newRenderer(events RendererEvents) (Renderer, error) {
 		memory:      make(map[uint32]*fakeMemory),
 		rejectCtx:   f.rejectCapset0,
 		failRestore: f.failRestore,
+
+		referenceSnapshots: f.referenceSnapshots,
 	}
 	f.renderers = append(f.renderers, r)
 	return r, nil
@@ -185,10 +193,16 @@ func (r *fakeRenderer) MapResource(resID uint32) (ResourceMemory, error) {
 type fakeSnapshot struct {
 	Sizes  map[uint32]uint64
 	Memory map[uint32][]byte
+	// Reference tells reference snapshots apart, as the tokens that refer
+	// to what the renderer keeps are.
+	Reference uint64 `json:",omitempty"`
 }
 
+// fakeReferences numbers fake reference snapshots.
+var fakeReferences atomic.Uint64
+
 // Snapshot implements Renderer.Snapshot.
-func (r *fakeRenderer) Snapshot() ([]byte, error) {
+func (r *fakeRenderer) Snapshot() (Snapshot, error) {
 	r.record("Snapshot")
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -199,16 +213,29 @@ func (r *fakeRenderer) Snapshot() ([]byte, error) {
 		}
 		data, err := mem.copyOut()
 		if err != nil {
-			return nil, err
+			return Snapshot{}, err
 		}
 		snapshot.Memory[id] = data
 	}
-	return json.Marshal(&snapshot)
+	if r.referenceSnapshots {
+		snapshot.Reference = fakeReferences.Add(1)
+	}
+	data, err := json.Marshal(&snapshot)
+	return Snapshot{Data: data, Reference: r.referenceSnapshots}, err
+}
+
+// ForgetSnapshot implements Renderer.ForgetSnapshot.
+func (r *fakeRenderer) ForgetSnapshot(snapshot []byte) {
+	r.record("ForgetSnapshot")
 }
 
 // Restore implements Renderer.Restore.
-func (r *fakeRenderer) Restore(data []byte, sizes map[uint32]uint64) error {
-	r.record("Restore %v", slices.Sorted(maps.Keys(sizes)))
+func (r *fakeRenderer) Restore(data []byte, sizes map[uint32]uint64, last bool) error {
+	if last {
+		r.record("Restore %v", slices.Sorted(maps.Keys(sizes)))
+	} else {
+		r.record("Restore %v, not the last", slices.Sorted(maps.Keys(sizes)))
+	}
 	var snapshot fakeSnapshot
 	if err := json.Unmarshal(data, &snapshot); err != nil {
 		return err
@@ -1499,13 +1526,25 @@ func TestSaveAndLoad(t *testing.T) {
 // loadDevice saves d and loads a copy of it, as a fork does.
 func loadDevice(t *testing.T, d *device, newRenderer NewRendererFunc) *device {
 	t.Helper()
+	return loadSavedDevice(t, saveDevice(t, d), newRenderer)
+}
+
+// saveDevice saves d, as a fork does.
+func saveDevice(t *testing.T, d *device) []byte {
+	t.Helper()
 	var buf bytes.Buffer
-	ctx := context.Background()
-	if _, err := state.Save(ctx, &buf, d); err != nil {
+	if _, err := state.Save(context.Background(), &buf, d); err != nil {
 		t.Fatalf("state.Save: %v", err)
 	}
+	return buf.Bytes()
+}
+
+// loadSavedDevice loads a copy of a device that saveDevice saved.
+func loadSavedDevice(t *testing.T, saved []byte, newRenderer NewRendererFunc) *device {
+	t.Helper()
 	child := &device{}
-	if _, err := state.Load(context.WithValue(ctx, CtxNewRenderer, newRenderer), &buf, child); err != nil {
+	ctx := context.WithValue(context.Background(), CtxNewRenderer, newRenderer)
+	if _, err := state.Load(ctx, bytes.NewReader(saved), child); err != nil {
 		t.Fatalf("state.Load: %v", err)
 	}
 	return child
@@ -1655,6 +1694,158 @@ func TestSnapshotFork(t *testing.T) {
 	if got := string(readTranslation(t, r, 0, 15)); got != "before the fork" {
 		t.Errorf("the source's blob holds %q", got)
 	}
+}
+
+// TestReferenceSnapshotFork forks a device whose renderer's snapshots are
+// references, as the Venus renderer's are: the child restores the snapshot
+// as soon as the source's save ends, as the last of its holders.
+func TestReferenceSnapshotFork(t *testing.T) {
+	e := newTestEnv(t, ForkSnapshot)
+	e.fakes.referenceSnapshots = true
+	file := e.open()
+	if err := e.contextInit(file, linux.VIRTGPU_DRM_CAPSET_GFXSTREAM_VULKAN, 1, "snap"); err != nil {
+		t.Fatal(err)
+	}
+	fd := file.Impl().(*renderFD)
+	source := e.fakes.last(t)
+	source.takeCalls()
+	child := forkWithSnapshot(t, e, fd.dev)
+	<-child.restoredEagerly
+	wantCalls(t, source, "Snapshot")
+	restored := e.fakes.last(t)
+	if restored == source {
+		t.Fatal("the child did not restore the snapshot")
+	}
+	wantCalls(t, restored, "Restore []")
+	if child.snapshot != nil || child.renderer != restored {
+		t.Errorf("the child kept its snapshot, or has no renderer")
+	}
+}
+
+// TestReferenceSnapshotFanOut checks that of the children that load one
+// save, each but the last restores the snapshot as one of several, and the
+// last as the last.
+func TestReferenceSnapshotFanOut(t *testing.T) {
+	e := newTestEnv(t, ForkSnapshot)
+	e.fakes.referenceSnapshots = true
+	file := e.open()
+	if err := e.contextInit(file, 3, 1, "snap"); err != nil {
+		t.Fatal(err)
+	}
+	d := file.Impl().(*renderFD).dev
+	if err := d.PrepareSave(context.Background()); err != nil {
+		t.Fatalf("PrepareSave: %v", err)
+	}
+	one := loadDevice(t, d, e.fakes.newRenderer)
+	two := loadDevice(t, d, e.fakes.newRenderer)
+	d.BeforeResume(context.Background())
+	<-one.restoredEagerly
+	<-two.restoredEagerly
+	var restores []string
+	e.fakes.mu.Lock()
+	for _, r := range e.fakes.renderers[1:] {
+		restores = append(restores, r.takeCalls()...)
+	}
+	e.fakes.mu.Unlock()
+	slices.Sort(restores)
+	if want := []string{"Restore []", "Restore [], not the last"}; !slices.Equal(restores, want) {
+		t.Errorf("the children's restores are %q, want %q", restores, want)
+	}
+}
+
+// TestReferenceSnapshotBatchSiblings checks that the source of a save whose
+// loads follow it, as a live fork's batch siblings load what the save of
+// their primary sibling captured, holds its reference snapshot until the
+// loads end.
+func TestReferenceSnapshotBatchSiblings(t *testing.T) {
+	e := newTestEnv(t, ForkSnapshot)
+	e.fakes.referenceSnapshots = true
+	file := e.open()
+	if err := e.contextInit(file, 3, 1, "snap"); err != nil {
+		t.Fatal(err)
+	}
+	d := file.Impl().(*renderFD).dev
+	source := e.fakes.last(t)
+	source.takeCalls()
+	loads := &vfs.LiveForkLoads{}
+	ctx := context.WithValue(context.Background(), vfs.CtxLiveForkLoads, loads)
+	if err := d.PrepareSave(ctx); err != nil {
+		t.Fatalf("PrepareSave: %v", err)
+	}
+	saved := saveDevice(t, d)
+	d.BeforeResume(ctx)
+	one := loadSavedDevice(t, saved, e.fakes.newRenderer)
+	two := loadSavedDevice(t, saved, e.fakes.newRenderer)
+	loads.Done()
+	<-one.restoredEagerly
+	<-two.restoredEagerly
+	wantCalls(t, source, "Snapshot")
+	var restores []string
+	e.fakes.mu.Lock()
+	for _, r := range e.fakes.renderers[1:] {
+		restores = append(restores, r.takeCalls()...)
+	}
+	e.fakes.mu.Unlock()
+	slices.Sort(restores)
+	if want := []string{"Restore []", "Restore [], not the last"}; !slices.Equal(restores, want) {
+		t.Errorf("the siblings' restores are %q, want %q", restores, want)
+	}
+}
+
+// TestReferenceSnapshotSaveBeforeRestore checks that a loaded device that
+// has yet to restore its reference snapshot restores it before a save takes
+// a snapshot of its own, which a load of the save restores.
+func TestReferenceSnapshotSaveBeforeRestore(t *testing.T) {
+	e := newTestEnv(t, ForkSnapshot)
+	e.fakes.referenceSnapshots = true
+	file := e.open()
+	if err := e.contextInit(file, 3, 1, "snap"); err != nil {
+		t.Fatal(err)
+	}
+	d := file.Impl().(*renderFD).dev
+	source := e.fakes.last(t)
+	source.takeCalls()
+	if err := d.PrepareSave(context.Background()); err != nil {
+		t.Fatalf("PrepareSave: %v", err)
+	}
+	// The source holds its snapshot until its save ends, which keeps the
+	// child from restoring it eagerly.
+	child := loadDevice(t, d, e.fakes.newRenderer)
+	if err := child.PrepareSave(context.Background()); err != nil {
+		t.Fatalf("PrepareSave of the child: %v", err)
+	}
+	restored := e.fakes.last(t)
+	if restored == source {
+		t.Fatal("the child's save did not restore the child's snapshot")
+	}
+	grandchild := loadDevice(t, child, e.fakes.newRenderer)
+	child.BeforeResume(context.Background())
+	d.BeforeResume(context.Background())
+	<-child.restoredEagerly
+	<-grandchild.restoredEagerly
+	wantCalls(t, source, "Snapshot", "ForgetSnapshot")
+	wantCalls(t, restored, "Restore [], not the last", "Snapshot")
+	wantCalls(t, e.fakes.last(t), "Restore []")
+}
+
+// TestReferenceSnapshotWithoutChildren checks that a save that loads no
+// device, such as a checkpoint, tells the renderer to forget its reference
+// snapshot.
+func TestReferenceSnapshotWithoutChildren(t *testing.T) {
+	e := newTestEnv(t, ForkSnapshot)
+	e.fakes.referenceSnapshots = true
+	file := e.open()
+	if err := e.contextInit(file, 3, 1, "snap"); err != nil {
+		t.Fatal(err)
+	}
+	d := file.Impl().(*renderFD).dev
+	source := e.fakes.last(t)
+	source.takeCalls()
+	if err := d.PrepareSave(context.Background()); err != nil {
+		t.Fatalf("PrepareSave: %v", err)
+	}
+	d.BeforeResume(context.Background())
+	wantCalls(t, source, "Snapshot", "ForgetSnapshot")
 }
 
 // TestSnapshotForkWaitsForFences checks that a save waits for the renderer's

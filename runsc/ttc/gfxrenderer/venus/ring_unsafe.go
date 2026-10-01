@@ -54,9 +54,16 @@ type ring struct {
 	// base is the head at the start of cmd.
 	base uint32
 
-	mu             sync.Mutex
-	cond           *sync.Cond
-	started        bool
+	// execMu is held while the ring executes commands, which a fork's
+	// clone keeps it from doing.
+	execMu sync.Mutex
+
+	mu      sync.Mutex
+	cond    *sync.Cond
+	started bool
+	// launched is whether the ring's goroutine started: a fork's clone
+	// has rings that start only once a child adopts it.
+	launched       bool
 	pendingNotify  bool
 	virtqueueSeqno uint64
 	done           chan struct{}
@@ -168,7 +175,15 @@ func (c *Context) createRing(s *stream, id uint64, info *vn.VkRingCreateInfoMESA
 	c.ringMu.Lock()
 	c.rings[id] = rg
 	c.ringMu.Unlock()
+	rg.start()
+}
+
+// start starts the ring's goroutine.
+func (rg *ring) start() {
+	rg.mu.Lock()
 	rg.started = true
+	rg.launched = true
+	rg.mu.Unlock()
 	go rg.run()
 }
 
@@ -239,10 +254,13 @@ func (rg *ring) run() {
 				failed = true
 				break
 			}
+			rg.execMu.Lock()
 			rg.base = rg.cur
 			cmd := rg.cmd[:size]
 			rg.read(cmd)
-			if !rg.stream.execute(cmd) {
+			ok := rg.stream.execute(cmd)
+			rg.execMu.Unlock()
+			if !ok {
 				failed = true
 				break
 			}
@@ -296,10 +314,17 @@ func (rg *ring) notify() {
 func (rg *ring) stop() {
 	rg.mu.Lock()
 	rg.started = false
+	launched := rg.launched
 	rg.cond.Broadcast()
 	rg.mu.Unlock()
-	<-rg.done
+	if launched {
+		<-rg.done
+	}
 	if !rg.stopped.Swap(true) {
+		if !launched {
+			// What the ring's goroutine releases as it ends.
+			rg.stream.release()
+		}
 		rg.res.mem.decRef()
 	}
 	// Wake the context if it waits for the ring.

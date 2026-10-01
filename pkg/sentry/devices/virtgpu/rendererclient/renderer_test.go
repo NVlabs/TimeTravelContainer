@@ -265,7 +265,7 @@ func TestRealSnapshot(t *testing.T) {
 		t.Fatalf("NewRenderer: %v", err)
 	}
 	defer child.Close()
-	if err := child.Restore(snapshot, map[uint32]uint64{1: ringSize}); err != nil {
+	if err := child.Restore(snapshot.Data, map[uint32]uint64{1: ringSize}, true); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
 	childMem, err := child.MapResource(1)

@@ -7,13 +7,16 @@ package venus
 
 import (
 	"sort"
+	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/venus/vk"
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/venus/vn"
 )
 
-// device is a context's VkDevice.
+// device is a context's VkDevice. A fork's child shares its parent's
+// VkDevice, and with it the objects that the two share.
 type device struct {
 	obj    *object
 	pd     *physicalDevice
@@ -26,6 +29,36 @@ type device struct {
 	// objects are the device's objects, which it destroys with it. The
 	// context's mu guards it.
 	objects map[uint64]*object
+	// host is what the contexts that share the VkDevice share.
+	host *hostDevice
+}
+
+// hostDevice is what the contexts that share a VkDevice share.
+type hostDevice struct {
+	// refs counts the devices of contexts that share the VkDevice.
+	refs atomic.Int32
+	// queues are the VkDevice's queues, in the order of the devices'.
+	queues []*hostQueue
+}
+
+// hostQueue is a VkQueue, which contexts that share its device share.
+type hostQueue struct {
+	// mu serializes the use of the queue, which Vulkan requires.
+	mu sync.Mutex
+}
+
+// lockQueues locks every queue of the VkDevice, which vkDeviceWaitIdle
+// requires.
+func (h *hostDevice) lockQueues() {
+	for _, q := range h.queues {
+		q.mu.Lock()
+	}
+}
+
+func (h *hostDevice) unlockQueues() {
+	for _, q := range h.queues {
+		q.mu.Unlock()
+	}
 }
 
 func registerDevice() {
@@ -101,14 +134,17 @@ func createDevice(s *stream, cmd *vn.Command, args unsafe.Pointer) {
 	if a.Ret != vn.VK_SUCCESS {
 		return
 	}
-	dev := &device{pd: pd, handle: h, objects: make(map[uint64]*object)}
+	dev := &device{pd: pd, handle: h, objects: make(map[uint64]*object), host: &hostDevice{}}
+	dev.host.refs.Store(1)
 	dev.table = vk.DeviceTable(pd.inst.pdTable, vk.Handle(h), pd.apiVersion, exts)
 	if pd.extMetal && pd.extMetalObjects {
 		dev.metal = vk.MetalDevice(pd.inst.pdTable, vk.Handle(h))
 	}
 	for _, qi := range queueInfos {
 		for i := uint32(0); i < qi.QueueCount; i++ {
-			dev.queues = append(dev.queues, s.newQueue(dev, qi.Flags, qi.QueueFamilyIndex, i))
+			hq := &hostQueue{}
+			dev.host.queues = append(dev.host.queues, hq)
+			dev.queues = append(dev.queues, s.newQueue(dev, hq, qi.Flags, qi.QueueFamilyIndex, i))
 		}
 	}
 	dev.obj = &object{typ: vn.VK_OBJECT_TYPE_DEVICE, id: id, handle: h, dev: dev}
@@ -173,7 +209,9 @@ func (s *stream) destroyDevice(dev *device) {
 	// Nothing may use what the device destroys.
 	wait := newArgs[vn.Args_vkDeviceWaitIdle](s)
 	wait.Device = dev.handle
+	dev.host.lockQueues()
 	vk.Call(vn.VK_COMMAND_TYPE_vkDeviceWaitIdle_EXT, dev.table, unsafe.Pointer(wait))
+	dev.host.unlockQueues()
 
 	c.mu.Lock()
 	objs := make([]*object, 0, len(dev.objects))
@@ -188,7 +226,9 @@ func (s *stream) destroyDevice(dev *device) {
 		return destroyOrder(objs[i].typ) < destroyOrder(objs[j].typ)
 	})
 	for _, o := range objs {
-		s.destroyHostObject(dev, o)
+		if o.releaseHost() {
+			s.destroyHostObject(dev, o)
+		}
 		if o.children != nil {
 			c.removeChildren(o)
 		}
@@ -215,10 +255,14 @@ func (s *stream) destroyDevice(dev *device) {
 	c.removeObject(dev.obj)
 }
 
-// destroyHostDevice destroys a device's VkDevice and its table.
+// destroyHostDevice releases a context's device: the device's fences, and
+// the VkDevice and its table once no context shares them.
 func (s *stream) destroyHostDevice(dev *device) {
 	for _, q := range dev.queues {
 		q.releaseFences(s)
+	}
+	if dev.host.refs.Add(-1) != 0 {
+		return
 	}
 	a := newArgs[vn.Args_vkDestroyDevice](s)
 	a.Device = dev.handle

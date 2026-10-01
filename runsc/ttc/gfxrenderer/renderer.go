@@ -364,6 +364,9 @@ func (s *server) handle(m *gfxproto.Message) error {
 		}
 		s.restoring = append(s.restoring, data...)
 
+	case gfxproto.MsgForgetSnapshot:
+		// gfxstream keeps nothing for its snapshots.
+
 	case gfxproto.MsgRestore:
 		var p gfxproto.Restore
 		if _, err := m.Decode(&p); err != nil {

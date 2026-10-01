@@ -30,9 +30,10 @@ type queue struct {
 	// ringIdx is the ring whose timeline the queue's fences are on.
 	ringIdx uint32
 
-	// mu serializes the use of the queue, which Vulkan requires.
-	mu sync.Mutex
-	// pool holds the arguments of the renderer's own submissions, under mu.
+	// host is what the contexts that share the VkQueue share: its mutex.
+	host *hostQueue
+	// pool holds the arguments of the renderer's own submissions, under
+	// host.mu.
 	pool vn.Pool
 
 	syncMu   sync.Mutex
@@ -55,8 +56,8 @@ type queueSync struct {
 }
 
 // newQueue gets a queue of dev, and starts its goroutine.
-func (s *stream) newQueue(dev *device, flags, family, index uint32) *queue {
-	q := &queue{dev: dev, flags: flags, family: family, index: index, done: make(chan struct{})}
+func (s *stream) newQueue(dev *device, host *hostQueue, flags, family, index uint32) *queue {
+	q := &queue{dev: dev, host: host, flags: flags, family: family, index: index, done: make(chan struct{})}
 	q.syncCond = sync.NewCond(&q.syncMu)
 	out := alloc[vn.Handle](s, 1)
 	if flags != 0 {
@@ -88,8 +89,8 @@ func (s *stream) newQueue(dev *device, flags, family, index uint32) *queue {
 // submitSync submits a fence of the Sentry's, which the queue signals once
 // what was submitted to it is done.
 func (q *queue) submitSync(c *Context, ring uint32, fenceID uint64) error {
-	q.mu.Lock()
-	defer q.mu.Unlock()
+	q.host.mu.Lock()
+	defer q.host.mu.Unlock()
 	defer q.pool.Reset()
 	t := q.dev.table
 	fence := q.takeFence()

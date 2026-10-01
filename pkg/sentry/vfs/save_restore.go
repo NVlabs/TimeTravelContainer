@@ -308,6 +308,47 @@ type DeviceSaveRestoreExtension interface {
 	BeforeResume(ctx context.Context)
 }
 
+// LiveForkLoads is the loads of a save that happen after the save ends: the
+// batch siblings of a live fork load the metadata that the save of their
+// primary sibling captured. What a device keeps for the kernels that load its
+// state outlives such a save until the loads end.
+type LiveForkLoads struct {
+	mu    gsync.Mutex
+	done  bool
+	after []func()
+}
+
+// AfterLoads calls f once the loads end, or now if they did.
+func (l *LiveForkLoads) AfterLoads(f func()) {
+	l.mu.Lock()
+	if !l.done {
+		l.after = append(l.after, f)
+		l.mu.Unlock()
+		return
+	}
+	l.mu.Unlock()
+	f()
+}
+
+// Done ends the loads, which succeeded or failed.
+func (l *LiveForkLoads) Done() {
+	l.mu.Lock()
+	after := l.after
+	l.after = nil
+	l.done = true
+	l.mu.Unlock()
+	for _, f := range after {
+		f()
+	}
+}
+
+// LiveForkLoadsFromContext returns the loads that follow the save of ctx,
+// or nil if the save's loads, if any, end before the save does.
+func LiveForkLoadsFromContext(ctx goContext.Context) *LiveForkLoads {
+	loads, _ := ctx.Value(CtxLiveForkLoads).(*LiveForkLoads)
+	return loads
+}
+
 // saveRestoreDevices returns the registered devices that implement
 // DeviceSaveRestoreExtension, in the order of their device numbers.
 func (vfs *VirtualFilesystem) saveRestoreDevices() []DeviceSaveRestoreExtension {

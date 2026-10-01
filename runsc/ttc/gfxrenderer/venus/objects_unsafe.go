@@ -170,8 +170,10 @@ func registerObjects() {
 	handle(vn.VK_COMMAND_TYPE_vkAllocateCommandBuffers_EXT, func(s *stream, cmd *vn.Command, args unsafe.Pointer) {
 		a := (*vn.Args_vkAllocateCommandBuffers)(args)
 		info := (*vn.VkCommandBufferAllocateInfo)(a.PAllocateInfo)
+		level := info.Level
 		s.allocateFromPool(cmd, args, vn.VK_OBJECT_TYPE_COMMAND_POOL, uint64(info.CommandPool),
-			vn.VK_OBJECT_TYPE_COMMAND_BUFFER, a.PCommandBuffers, uint64(info.CommandBufferCount))
+			vn.VK_OBJECT_TYPE_COMMAND_BUFFER, a.PCommandBuffers, uint64(info.CommandBufferCount),
+			func(i int, o *object) { o.level = level })
 	})
 	handle(vn.VK_COMMAND_TYPE_vkFreeCommandBuffers_EXT, func(s *stream, cmd *vn.Command, args unsafe.Pointer) {
 		a := (*vn.Args_vkFreeCommandBuffers)(args)
@@ -180,8 +182,16 @@ func registerObjects() {
 	handle(vn.VK_COMMAND_TYPE_vkAllocateDescriptorSets_EXT, func(s *stream, cmd *vn.Command, args unsafe.Pointer) {
 		a := (*vn.Args_vkAllocateDescriptorSets)(args)
 		info := (*vn.VkDescriptorSetAllocateInfo)(a.PAllocateInfo)
+		// The sets' layouts and variable counts, before their handles are
+		// replaced.
+		sets := newDescriptorSetStates(s.ctx, info)
 		s.allocateFromPool(cmd, args, vn.VK_OBJECT_TYPE_DESCRIPTOR_POOL, uint64(info.DescriptorPool),
-			vn.VK_OBJECT_TYPE_DESCRIPTOR_SET, a.PDescriptorSets, uint64(info.DescriptorSetCount))
+			vn.VK_OBJECT_TYPE_DESCRIPTOR_SET, a.PDescriptorSets, uint64(info.DescriptorSetCount),
+			func(i int, o *object) {
+				if i < len(sets) {
+					o.set = sets[i]
+				}
+			})
 	})
 	handle(vn.VK_COMMAND_TYPE_vkFreeDescriptorSets_EXT, func(s *stream, cmd *vn.Command, args unsafe.Pointer) {
 		a := (*vn.Args_vkFreeDescriptorSets)(args)
@@ -217,8 +227,13 @@ func (s *stream) createExternable(cmd *vn.Command, args unsafe.Pointer, typ int3
 		return
 	}
 	external := stripExternal(dev, info, stype)
+	var img *imageInfo
+	if typ == vn.VK_OBJECT_TYPE_IMAGE {
+		img = newImageInfo((*vn.VkImageCreateInfo)(info))
+	}
 	if o := s.createObject(cmd, args, typ, out); o != nil {
 		o.external = external
+		o.image = img
 	}
 }
 
@@ -253,6 +268,7 @@ func (s *stream) createObject(cmd *vn.Command, args unsafe.Pointer, typ int32, o
 		return nil
 	}
 	o := &object{typ: typ, id: id, handle: h, dev: dev}
+	s.journalCreation(o)
 	if !s.ctx.addObject(o) {
 		return nil
 	}
@@ -271,7 +287,9 @@ func (s *stream) destroyObject(cmd *vn.Command, args unsafe.Pointer, typ int32, 
 		s.fail("%s: no object %d", cmd.Name, id)
 		return nil
 	}
-	if !s.call(cmd, args) {
+	// A fork's child may share the object's host handle, which the last
+	// context to destroy it destroys.
+	if o.releaseHost() && !s.call(cmd, args) {
 		return nil
 	}
 	if o.children != nil {
@@ -287,7 +305,7 @@ func (s *stream) destroyObject(cmd *vn.Command, args unsafe.Pointer, typ int32, 
 
 // allocateFromPool executes a command that allocates count objects of type
 // typ, whose IDs out holds, from pool poolID of type poolType.
-func (s *stream) allocateFromPool(cmd *vn.Command, args unsafe.Pointer, poolType int32, poolID uint64, typ int32, out unsafe.Pointer, count uint64) {
+func (s *stream) allocateFromPool(cmd *vn.Command, args unsafe.Pointer, poolType int32, poolID uint64, typ int32, out unsafe.Pointer, count uint64, after func(i int, o *object)) {
 	dev := s.commandDevice(cmd, args)
 	if dev == nil {
 		return
@@ -318,6 +336,10 @@ func (s *stream) allocateFromPool(cmd *vn.Command, args unsafe.Pointer, poolType
 	for i, id := range ids {
 		o := &object{typ: typ, id: id, handle: vn.Handle(slots[i]), dev: dev, pool: pool}
 		slots[i] = id
+		o.seq = journalSeq.Add(1)
+		if after != nil {
+			after(i, o)
+		}
 		if !s.ctx.addObject(o) {
 			return
 		}
@@ -387,7 +409,9 @@ func (s *stream) createPipelines(cmd *vn.Command, args unsafe.Pointer, out unsaf
 			continue
 		}
 		slots[i] = id
-		if !s.ctx.addObject(&object{typ: vn.VK_OBJECT_TYPE_PIPELINE, id: id, handle: h, dev: dev}) {
+		o := &object{typ: vn.VK_OBJECT_TYPE_PIPELINE, id: id, handle: h, dev: dev}
+		s.journalCreation(o)
+		if !s.ctx.addObject(o) {
 			return
 		}
 	}

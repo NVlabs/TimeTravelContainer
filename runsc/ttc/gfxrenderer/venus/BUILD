@@ -11,12 +11,14 @@ package(
 go_library(
     name = "venus",
     srcs = [
+        "clone_unsafe.go",
         "context.go",
         "device_unsafe.go",
         "dispatch_unsafe.go",
         "dmabuf_unsafe.go",
         "hostcopy_unsafe.go",
         "instance_unsafe.go",
+        "journal_unsafe.go",
         "memory_unsafe.go",
         "nocgo.go",
         "objects_unsafe.go",

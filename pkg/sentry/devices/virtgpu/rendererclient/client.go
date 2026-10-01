@@ -345,18 +345,23 @@ const maxSnapshotSize = 16 << 30
 // Snapshot implements virtgpu.Renderer.Snapshot. The renderer sends the
 // snapshot through a pipe, whose read end its reply carries: the Sentry
 // neither creates nor maps memory for it.
-func (c *Client) Snapshot() ([]byte, error) {
+func (c *Client) Snapshot() (virtgpu.Snapshot, error) {
+	data, flags, err := c.snapshot()
+	return virtgpu.Snapshot{Data: data, Reference: flags&gfxproto.SnapshotFlagReference != 0}, err
+}
+
+func (c *Client) snapshot() ([]byte, uint32, error) {
 	m, reply, err := c.call(gfxproto.MsgSnapshot, &gfxproto.Snapshot{}, nil)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if len(m.FDs) != 1 {
 		m.CloseFDs()
-		return nil, fmt.Errorf("the snapshot came with %d file descriptors", len(m.FDs))
+		return nil, 0, fmt.Errorf("the snapshot came with %d file descriptors", len(m.FDs))
 	}
 	defer m.CloseFDs()
 	if reply.Size > maxSnapshotSize {
-		return nil, fmt.Errorf("the snapshot is %d bytes, more than %d", reply.Size, maxSnapshotSize)
+		return nil, 0, fmt.Errorf("the snapshot is %d bytes, more than %d", reply.Size, maxSnapshotSize)
 	}
 	// The pipe blocks: read it without the runtime's poller.
 	snapshot := make([]byte, reply.Size)
@@ -366,14 +371,19 @@ func (c *Client) Snapshot() ([]byte, error) {
 			continue
 		}
 		if err != nil {
-			return nil, fmt.Errorf("reading the snapshot: %w", err)
+			return nil, 0, fmt.Errorf("reading the snapshot: %w", err)
 		}
 		if n == 0 {
-			return nil, fmt.Errorf("the snapshot ended after %d of %d bytes", done, len(snapshot))
+			return nil, 0, fmt.Errorf("the snapshot ended after %d of %d bytes", done, len(snapshot))
 		}
 		done += n
 	}
-	return snapshot, nil
+	return snapshot, reply.Flags, nil
+}
+
+// ForgetSnapshot implements virtgpu.Renderer.ForgetSnapshot.
+func (c *Client) ForgetSnapshot(snapshot []byte) {
+	c.send(gfxproto.MsgForgetSnapshot, &gfxproto.ForgetSnapshot{}, snapshot)
 }
 
 // restoreChunkSize is the size of the parts in which Restore sends a
@@ -382,7 +392,7 @@ const restoreChunkSize = 16 << 20
 
 // Restore implements virtgpu.Renderer.Restore. The snapshot goes inline, in
 // parts that fit in messages.
-func (c *Client) Restore(snapshot []byte, sizes map[uint32]uint64) error {
+func (c *Client) Restore(snapshot []byte, sizes map[uint32]uint64, last bool) error {
 	for rest := snapshot; len(rest) != 0; {
 		chunk := rest[:min(len(rest), restoreChunkSize)]
 		rest = rest[len(chunk):]
@@ -390,7 +400,11 @@ func (c *Client) Restore(snapshot []byte, sizes map[uint32]uint64) error {
 			return err
 		}
 	}
-	if _, _, err := c.call(gfxproto.MsgRestore, &gfxproto.Restore{Size: uint64(len(snapshot))}, nil); err != nil {
+	var flags uint32
+	if last {
+		flags |= gfxproto.RestoreFlagLast
+	}
+	if _, _, err := c.call(gfxproto.MsgRestore, &gfxproto.Restore{Size: uint64(len(snapshot)), Flags: flags}, nil); err != nil {
 		return err
 	}
 	c.mu.Lock()

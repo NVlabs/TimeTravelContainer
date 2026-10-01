@@ -623,8 +623,12 @@ func (k *Kernel) LiveForkMany(ctx context.Context, opts []LiveForkOptions, sourc
 		cleanup()
 		return nil, err
 	}
-	serialized, pmaSnapshots, err := primary.captureLiveForkMetadata(fsResources)
+	// The siblings load what the capture saved once the capture ends: what
+	// the primary's devices keep for them lasts until the loads end.
+	loads := &vfs.LiveForkLoads{}
+	serialized, pmaSnapshots, err := primary.captureLiveForkMetadata(fsResources, loads)
 	if err != nil {
+		loads.Done()
 		cleanup()
 		return nil, fmt.Errorf("capturing primary live-fork child: %w", err)
 	}
@@ -633,6 +637,7 @@ func (k *Kernel) LiveForkMany(ctx context.Context, opts []LiveForkOptions, sourc
 	}
 	if sourceReady != nil {
 		if err := sourceReady(); err != nil {
+			loads.Done()
 			cleanup()
 			return nil, fmt.Errorf("making live-fork source ready: %w", err)
 		}
@@ -661,6 +666,7 @@ func (k *Kernel) LiveForkMany(ctx context.Context, opts []LiveForkOptions, sourc
 		}()
 	}
 	wg.Wait()
+	loads.Done()
 	for i := 1; i < len(errs); i++ {
 		if errs[i] != nil {
 			cleanup()
@@ -706,8 +712,8 @@ func forkPreparedFilesystemBranches(resources vfs.LiveForkFilesystemResources, p
 // captureLiveForkMetadata prepares paused child k as an additional live-fork
 // source and serializes its metadata in memory. Persistent filesystem branches
 // were created before this pass, so it only establishes CoW for in-memory
-// filesystem data.
-func (k *Kernel) captureLiveForkMetadata(fsResources vfs.LiveForkFilesystemResources) ([]byte, mm.LiveForkPMASnapshots, error) {
+// filesystem data. The siblings that load the metadata end loads.
+func (k *Kernel) captureLiveForkMetadata(fsResources vfs.LiveForkFilesystemResources, loads *vfs.LiveForkLoads) ([]byte, mm.LiveForkPMASnapshots, error) {
 	if !k.IsPaused() {
 		return nil, nil, fmt.Errorf("capturing live-fork metadata requires a paused kernel")
 	}
@@ -735,6 +741,7 @@ func (k *Kernel) captureLiveForkMetadata(fsResources vfs.LiveForkFilesystemResou
 			pgalloc.CtxLiveForkSource:          true,
 			vfs.CtxLiveForkFilesystemResources: fsResources,
 			vfs.CtxLiveForkBranchesPrepared:    true,
+			vfs.CtxLiveForkLoads:               loads,
 		})
 		if err := k.vfs.PrepareSave(saveCtx); err != nil {
 			return fmt.Errorf("preparing primary VFS for sibling capture: %w", err)

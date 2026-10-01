@@ -38,6 +38,21 @@ type object struct {
 	// external is whether a buffer or image was created for external
 	// memory that the renderer emulates (see dmabuf.go).
 	external bool
+
+	// shared, if not nil, counts the contexts whose objects share the
+	// object's host handle: a fork's child shares its parent's immutable
+	// objects, such as pipelines. The last one destroys it.
+	shared *atomic.Int32
+
+	// What a fork's child needs to rebuild the object: see
+	// journal_unsafe.go.
+	journalState
+}
+
+// releaseHost drops the object's reference on its host handle, and reports
+// whether it was the last, which destroys the handle.
+func (o *object) releaseHost() bool {
+	return o.shared == nil || o.shared.Add(-1) == 0
 }
 
 // resource is a resource of a server: memory that the Sentry maps into the
@@ -50,6 +65,12 @@ type resource struct {
 	mapInfo uint32
 	// mem is the resource's memory.
 	mem *sharedMemory
+	// fromCtx and fromMemory are, for a resource that exported a context's
+	// memory, the context and the memory's ID, and seq is the export's in
+	// journalSeq.
+	fromCtx    *Context
+	fromMemory uint64
+	seq        uint64
 }
 
 // sharedMemory is shared memory that the renderer maps, and that the Sentry
@@ -144,6 +165,12 @@ func newContext(srv *server, id uint32, name string) *Context {
 	c.waitRing.cond = sync.NewCond(&c.waitRing.mu)
 	c.stream = newStream(c, nil)
 	return c
+}
+
+// lib returns the Vulkan library, which every server of the process
+// shares.
+func (c *Context) lib() *vk.Library {
+	return library
 }
 
 // logf logs a message about the context.

@@ -50,6 +50,7 @@ func init() {
 	registerQuirks()
 	registerExternalMemory()
 	registerHostCopy()
+	registerJournal()
 	refuse(
 		vn.VK_COMMAND_TYPE_vkEnumerateInstanceLayerProperties_EXT,
 		vn.VK_COMMAND_TYPE_vkEnumerateDeviceLayerProperties_EXT,
@@ -84,5 +85,7 @@ func init() {
 
 // passThrough executes a command as it is, once its handles are replaced.
 func passThrough(s *stream, cmd *vn.Command, args unsafe.Pointer) {
-	s.call(cmd, args)
+	if o, ok := s.callObject(cmd, args); ok && o != nil && o.typ == vn.VK_OBJECT_TYPE_COMMAND_BUFFER {
+		s.journalCommandBuffer(o, cmd)
+	}
 }

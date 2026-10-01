@@ -6,10 +6,13 @@
 package venus
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
 	"sync"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -27,7 +30,7 @@ const (
 	blobFlagCrossDevice = 4
 )
 
-// server renders for one Sentry.
+// server renders for one branch of a Sentry's family.
 type server struct {
 	conn *gfxproto.Conn
 	lib  *vk.Library
@@ -35,6 +38,9 @@ type server struct {
 	mu        sync.Mutex
 	contexts  map[uint32]*Context
 	resources map[uint32]*resource
+
+	// restoring is the snapshot that MsgRestoreData sent, for MsgRestore.
+	restoring []byte
 }
 
 // Serve renders for the Sentry connected to the Unix stream socket fd, which
@@ -280,12 +286,50 @@ func (s *server) handle(m *gfxproto.Message) error {
 		}
 
 	case gfxproto.MsgSnapshot:
-		return s.reply(m, gfxproto.Reply{Errno: uint32(unix.ENOTSUP)})
+		token, err := s.snapshot()
+		if err != nil {
+			log.Printf("venus: taking a snapshot for a fork: %v", err)
+			return s.reply(m, gfxproto.Reply{Errno: uint32(unix.EIO)})
+		}
+		fd, err := pipeOf(token)
+		if err != nil {
+			return s.reply(m, gfxproto.Reply{Errno: uint32(unix.EIO)})
+		}
+		err = s.reply(m, gfxproto.Reply{Size: uint64(len(token)), Flags: gfxproto.SnapshotFlagReference}, fd)
+		unix.Close(fd)
+		return err
 
 	case gfxproto.MsgRestoreData:
+		var p gfxproto.RestoreData
+		data, err := m.Decode(&p)
+		if err != nil {
+			return err
+		}
+		if len(s.restoring)+len(data) > maxTokenSize {
+			return fmt.Errorf("a snapshot of more than %d bytes", maxTokenSize)
+		}
+		s.restoring = append(s.restoring, data...)
 
 	case gfxproto.MsgRestore:
-		return s.reply(m, gfxproto.Reply{Errno: uint32(unix.ENOTSUP)})
+		var p gfxproto.Restore
+		if _, err := m.Decode(&p); err != nil {
+			return err
+		}
+		token := s.restoring
+		s.restoring = nil
+		if err := s.restore(token, p.Flags&gfxproto.RestoreFlagLast != 0); err != nil {
+			log.Printf("venus: restoring a snapshot: %v", err)
+			return s.reply(m, gfxproto.Reply{Errno: uint32(unix.EINVAL)})
+		}
+		return s.reply(m, gfxproto.Reply{})
+
+	case gfxproto.MsgForgetSnapshot:
+		var p gfxproto.ForgetSnapshot
+		token, err := m.Decode(&p)
+		if err != nil {
+			return err
+		}
+		forgetClone(string(token))
 
 	default:
 		return fmt.Errorf("unexpected %v", m.Type)
@@ -333,7 +377,7 @@ func (s *server) createBlob(p *gfxproto.CreateBlob) error {
 	if err != nil {
 		return err
 	}
-	s.addResource(p.CtxID, &resource{id: p.ResID, size: p.Size, mapInfo: mapInfo, mem: mem})
+	s.addResource(p.CtxID, &resource{id: p.ResID, size: p.Size, mapInfo: mapInfo, mem: mem, fromCtx: c, fromMemory: p.BlobID, seq: journalSeq.Add(1)})
 	return nil
 }
 
@@ -351,4 +395,120 @@ func (s *server) release() {
 	for _, r := range resources {
 		r.mem.decRef()
 	}
+}
+
+// Snapshots of the Venus renderer, for forks, are references to clones that
+// the renderer of the family keeps: a token.
+const (
+	tokenPrefix  = "TTC-VENUS-CLONE:"
+	maxTokenSize = 64
+)
+
+// clones are the clones that forks' children have yet to adopt, by token.
+var clones = struct {
+	mu sync.Mutex
+	m  map[string]*pendingClone
+}{m: make(map[string]*pendingClone)}
+
+// pendingClone is a clone that forks' children adopt. The last takes it;
+// the others clone it again.
+type pendingClone struct {
+	mu sync.Mutex
+	st *cloneState
+}
+
+// snapshot clones the server's contexts and resources, which the Sentry
+// quiesced, for a fork's children, and returns its token.
+func (s *server) snapshot() ([]byte, error) {
+	s.mu.Lock()
+	contexts := make(map[uint32]*Context, len(s.contexts))
+	for id, c := range s.contexts {
+		contexts[id] = c
+	}
+	resources := make(map[uint32]*resource, len(s.resources))
+	for id, r := range s.resources {
+		resources[id] = r
+	}
+	s.mu.Unlock()
+	resume, err := quiesce(contexts)
+	if err != nil {
+		return nil, err
+	}
+	defer resume()
+	start := time.Now()
+	st, err := cloneContexts(contexts, resources)
+	if err != nil {
+		return nil, err
+	}
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		st.release()
+		return nil, err
+	}
+	token := tokenPrefix + hex.EncodeToString(id[:])
+	clones.mu.Lock()
+	clones.m[token] = &pendingClone{st: st}
+	clones.mu.Unlock()
+	log.Printf("venus: cloned %d contexts and %d resources for a fork in %v", len(st.contexts), len(st.resources), time.Since(start))
+	return []byte(token), nil
+}
+
+// restore gives the server, which has no contexts or resources, the clone
+// of token: the clone itself if last, or another clone of it.
+func (s *server) restore(token []byte, last bool) error {
+	s.mu.Lock()
+	empty := len(s.contexts) == 0 && len(s.resources) == 0
+	s.mu.Unlock()
+	if !empty {
+		return fmt.Errorf("the renderer has contexts or resources")
+	}
+	clones.mu.Lock()
+	pc := clones.m[string(token)]
+	if pc != nil && last {
+		delete(clones.m, string(token))
+	}
+	clones.mu.Unlock()
+	if pc == nil {
+		return fmt.Errorf("no clone %q", token)
+	}
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	st := pc.st
+	if !last {
+		var err error
+		if st, err = cloneContexts(pc.st.contexts, pc.st.resources); err != nil {
+			return err
+		}
+	}
+	s.adopt(st)
+	return nil
+}
+
+// forgetClone drops the clone of token, which no child will adopt.
+func forgetClone(token string) {
+	clones.mu.Lock()
+	pc := clones.m[token]
+	delete(clones.m, token)
+	clones.mu.Unlock()
+	if pc != nil {
+		pc.mu.Lock()
+		pc.st.release()
+		pc.mu.Unlock()
+	}
+}
+
+// pipeOf returns the read end of a pipe that holds data.
+func pipeOf(data []byte) (int, error) {
+	var fds [2]int
+	if err := unix.Pipe(fds[:]); err != nil {
+		return -1, err
+	}
+	// A token fits in the pipe's buffer.
+	_, err := unix.Write(fds[1], data)
+	unix.Close(fds[1])
+	if err != nil {
+		unix.Close(fds[0])
+		return -1, err
+	}
+	return fds[0], nil
 }

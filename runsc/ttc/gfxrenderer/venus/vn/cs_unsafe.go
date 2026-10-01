@@ -153,6 +153,17 @@ func (d *Decoder) Restore(s DecoderState) {
 	d.pool.restoreMark(s.mark)
 }
 
+// Bytes returns bytes start to end of the decoder's stream, which stay
+// valid until the stream changes.
+func (d *Decoder) Bytes(start, end int) []byte {
+	return d.buf[start:end]
+}
+
+// ClearFatal clears the decoder's failure.
+func (d *Decoder) ClearFatal() {
+	d.fatal = false
+}
+
 // SetStream makes the decoder decode buf, from its start, keeping its
 // fatal state.
 func (d *Decoder) SetStream(buf []byte) {
@@ -182,6 +193,11 @@ func (e *Encoder) Seek(pos uint64) bool {
 	}
 	e.off = int(pos)
 	return true
+}
+
+// Stream returns the encoder's stream.
+func (e *Encoder) Stream() []byte {
+	return e.buf
 }
 
 // HasStream reports whether the encoder has a stream.

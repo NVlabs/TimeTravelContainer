@@ -206,6 +206,12 @@ type device struct {
 	// snapshotTaken is whether the save's preparation took snapshot, which
 	// the source drops once the save is done.
 	snapshotTaken bool `state:"nosave"`
+	// snapshotReference is whether snapshot is a reference to what the
+	// renderer of the Sentry's family keeps for it (see Snapshot).
+	snapshotReference bool
+	// restoredEagerly, if not nil, is closed once a loaded device restored
+	// a reference snapshot, for tests.
+	restoredEagerly chan struct{} `state:"nosave"`
 
 	// mu protects the fields below, and the state of the device's contexts,
 	// resources, and fences that their comments say it protects.
@@ -256,6 +262,12 @@ func (d *device) afterLoad(ctx goContext.Context) {
 		// and resources of generation gen. No fence was pending when the
 		// snapshot was taken.
 		d.lost = false
+		if d.snapshotReference {
+			// What the snapshot refers to is the renderer's to keep until
+			// the device restores it: restore it now.
+			d.restoredEagerly = make(chan struct{})
+			go d.restoreEagerly(holdSnapshot(d.snapshot))
+		}
 		return
 	}
 	d.gen++

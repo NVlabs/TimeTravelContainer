@@ -7,6 +7,7 @@ package venus
 
 import (
 	"runtime"
+	"sync/atomic"
 	"unsafe"
 
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/venus/vk"
@@ -38,6 +39,9 @@ type instance struct {
 	pdTable vk.Table
 	// apiVersion is the version that the instance was created for.
 	apiVersion uint32
+	// refs counts the contexts whose instances share the VkInstance: a
+	// fork's child shares its parent's.
+	refs *atomic.Int32
 	// handles are the host's physical devices, and physicalDevices the
 	// guest's objects of them, once it enumerated them.
 	enumerated      bool
@@ -251,7 +255,7 @@ func (s *stream) instanceVersion() (uint32, int32) {
 	a := newArgs[vn.Args_vkEnumerateInstanceVersion](s)
 	version := alloc[uint32](s, 1)
 	a.PApiVersion = unsafe.Pointer(version)
-	vk.Call(vn.VK_COMMAND_TYPE_vkEnumerateInstanceVersion_EXT, s.ctx.srv.lib.Global(), unsafe.Pointer(a))
+	vk.Call(vn.VK_COMMAND_TYPE_vkEnumerateInstanceVersion_EXT, s.ctx.lib().Global(), unsafe.Pointer(a))
 	return *version, a.Ret
 }
 
@@ -260,7 +264,7 @@ func (s *stream) hasInstanceExtension(name string) bool {
 	a := newArgs[vn.Args_vkEnumerateInstanceExtensionProperties](s)
 	count := alloc[uint32](s, 1)
 	a.PPropertyCount = unsafe.Pointer(count)
-	global := s.ctx.srv.lib.Global()
+	global := s.ctx.lib().Global()
 	vk.Call(vn.VK_COMMAND_TYPE_vkEnumerateInstanceExtensionProperties_EXT, global, unsafe.Pointer(a))
 	if a.Ret != vn.VK_SUCCESS || *count == 0 {
 		return false
@@ -343,8 +347,9 @@ func createInstance(s *stream, cmd *vn.Command, args unsafe.Pointer) {
 	if a.Ret != vn.VK_SUCCESS {
 		return
 	}
-	inst := &instance{handle: h, apiVersion: app.ApiVersion}
-	inst.table, inst.pdTable = c.srv.lib.InstanceTables(vk.Handle(h))
+	inst := &instance{handle: h, apiVersion: app.ApiVersion, refs: new(atomic.Int32)}
+	inst.refs.Store(1)
+	inst.table, inst.pdTable = c.lib().InstanceTables(vk.Handle(h))
 	inst.obj = &object{typ: vn.VK_OBJECT_TYPE_INSTANCE, id: id, handle: h, inst: inst}
 	if !c.addObject(inst.obj) {
 		s.destroyHostInstance(inst)
@@ -367,8 +372,12 @@ func goCString(p unsafe.Pointer) string {
 	return string(unsafe.Slice((*byte)(p), n))
 }
 
-// destroyHostInstance destroys an instance's VkInstance and its tables.
+// destroyHostInstance destroys an instance's VkInstance and its tables,
+// once no context shares them.
 func (s *stream) destroyHostInstance(inst *instance) {
+	if inst.refs.Add(-1) != 0 {
+		return
+	}
 	a := newArgs[vn.Args_vkDestroyInstance](s)
 	a.Instance = inst.handle
 	vk.Call(vn.VK_COMMAND_TYPE_vkDestroyInstance_EXT, inst.table, unsafe.Pointer(a))

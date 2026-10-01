@@ -48,6 +48,7 @@ const (
 	MsgSnapshot
 	MsgRestoreData
 	MsgRestore
+	MsgForgetSnapshot
 )
 
 // Messages from the renderer to the Sentry.
@@ -108,6 +109,8 @@ func (t MsgType) String() string {
 		return "RestoreData"
 	case MsgRestore:
 		return "Restore"
+	case MsgForgetSnapshot:
+		return "ForgetSnapshot"
 	case MsgHello:
 		return "Hello"
 	case MsgReply:
@@ -231,11 +234,13 @@ type (
 	}
 
 	// Reply answers a request, whose sequence number it has. Errno is 0 or
-	// the request's error.
+	// the request's error. Flags are a Snapshot's, SnapshotFlag*.
 	Reply struct {
-		Errno   uint32
-		MapInfo uint32
-		Size    uint64
+		Errno    uint32
+		MapInfo  uint32
+		Size     uint64
+		Flags    uint32
+		Reserved uint32
 	}
 
 	// FenceSignaled reports a signaled fence, which signals every fence
@@ -277,9 +282,19 @@ type (
 	// Restore restores a renderer, which has no contexts or resources, from
 	// the snapshot of Size bytes that RestoreData sent. The renderer replies.
 	// The snapshot comes inline, so that the Sentry, whose system calls
-	// Linux restricts, creates no descriptors for it.
+	// Linux restricts, creates no descriptors for it. Flags are
+	// RestoreFlag*.
 	Restore struct {
-		Size uint64
+		Size     uint64
+		Flags    uint32
+		Reserved uint32
+	}
+
+	// ForgetSnapshot tells the renderer that no renderer will restore the
+	// snapshot that is its trailer, so that a renderer that keeps what it
+	// needs to restore snapshots may drop it. The renderer does not reply.
+	ForgetSnapshot struct {
+		Reserved uint32
 	}
 
 	// LaunchProbe asks the launcher for the capability sets of a renderer
@@ -300,6 +315,18 @@ type (
 // renderer takes snapshots and restores them, which costs it memory from its
 // start, since it records how to rebuild its Vulkan objects.
 const RendererFlagSnapshots = 1 << 0
+
+// SnapshotFlagReference is a flag of a Snapshot's reply: the snapshot is a
+// reference to what the renderer, which serves the family of the Sentry's
+// branches, keeps for it. A fork's children restore it promptly, and the
+// renderer keeps it until the last restores it with RestoreFlagLast, or
+// ForgetSnapshot tells it that none will.
+const SnapshotFlagReference = 1 << 0
+
+// RestoreFlagLast is a flag of Restore: no other renderer restores the
+// snapshot, so that a renderer that kept what the snapshot needs may take
+// it rather than copy it.
+const RestoreFlagLast = 1 << 0
 
 // RendererFlagFamily is a flag of LaunchRenderer: the renderer serves the
 // branches of a family, and its descriptor is not a Sentry's connection but

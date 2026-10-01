@@ -61,15 +61,32 @@ type Renderer interface {
 	// Snapshot returns a snapshot of the renderer's state: its contexts and
 	// resources, and what they hold. The Sentry calls it with no fence
 	// pending, and the guest stopped.
-	Snapshot() ([]byte, error)
+	Snapshot() (Snapshot, error)
 
 	// Restore gives a new renderer the state of a snapshot. sizes are the
 	// sizes of the snapshot's resources, which the Sentry maps as it maps
-	// those that it creates.
-	Restore(snapshot []byte, sizes map[uint32]uint64) error
+	// those that it creates. last is whether no other device will restore
+	// the snapshot.
+	Restore(snapshot []byte, sizes map[uint32]uint64, last bool) error
+
+	// ForgetSnapshot tells the renderer that no device will restore a
+	// snapshot that is a reference.
+	ForgetSnapshot(snapshot []byte)
 
 	// Close releases the Renderer. It reports nothing afterward.
 	Close()
+}
+
+// Snapshot is a snapshot of a renderer's state.
+type Snapshot struct {
+	// Data is the snapshot.
+	Data []byte
+
+	// Reference is whether the snapshot is a reference to what the
+	// renderer of the Sentry's family keeps for it, rather than the state
+	// itself. A fork's children restore it promptly: the renderer keeps it
+	// until they do, or until it learns that none will.
+	Reference bool
 }
 
 // RendererEvents receives what a Renderer reports.

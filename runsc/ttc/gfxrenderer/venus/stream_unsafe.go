@@ -6,6 +6,7 @@
 package venus
 
 import (
+	"encoding/binary"
 	"sync"
 	"unsafe"
 
@@ -41,6 +42,13 @@ type stream struct {
 	nestedMu sync.Mutex
 	nested   *resource
 	inNested bool
+
+	// cmdStart and cmdEnd bound the command being executed in the
+	// decoder's stream, which journals keep (see journal_unsafe.go).
+	cmdStart, cmdEnd int
+	// replaying is whether the stream replays journals into a fork's
+	// child, whose failures fail only what they replay.
+	replaying bool
 }
 
 func newStream(c *Context, rg *ring) *stream {
@@ -102,6 +110,7 @@ func (s *stream) dispatch() {
 		s.ctx.logf("decoding %s failed", cmd.Name)
 		return
 	}
+	s.cmdStart, s.cmdEnd = off, s.dec.Offset()
 	h(s, cmd, args)
 	if s.dec.Fatal() || s.ctx.fatal.Load() {
 		s.ctx.logf("%s failed", cmd.Name)
@@ -121,8 +130,18 @@ func (s *stream) dispatch() {
 // fail fails the context, for what its guest did.
 func (s *stream) fail(format string, args ...any) {
 	s.ctx.logf(format, args...)
-	s.ctx.setFatal()
+	if !s.replaying {
+		s.ctx.setFatal()
+	}
 	s.dec.SetFatal()
+}
+
+// commandBytes returns a copy of the command being executed, as it was
+// encoded, without asking for a reply.
+func (s *stream) commandBytes() []byte {
+	b := append([]byte(nil), s.dec.Bytes(s.cmdStart, s.cmdEnd)...)
+	binary.LittleEndian.PutUint32(b[4:], 0)
+	return b
 }
 
 // encodeReply encodes a command's reply in the reply stream.
@@ -220,10 +239,17 @@ func (s *stream) executeResource(r *resource, offset, size uint64) bool {
 // call calls the command with its arguments, whose handles it replaces,
 // through the table of the object that its first argument is.
 func (s *stream) call(cmd *vn.Command, args unsafe.Pointer) bool {
-	t, q, ok := s.table(cmd, args)
+	_, ok := s.callObject(cmd, args)
+	return ok
+}
+
+// callObject calls the command as call does, and returns the object that
+// its first argument is, of a command of a device or its children.
+func (s *stream) callObject(cmd *vn.Command, args unsafe.Pointer) (*object, bool) {
+	t, o, q, ok := s.table(cmd, args)
 	if !ok {
 		s.fail("%s: no table", cmd.Name)
-		return false
+		return nil, false
 	}
 	cmd.ReplaceHandles(s.r, args)
 	var called bool
@@ -231,9 +257,9 @@ func (s *stream) call(cmd *vn.Command, args unsafe.Pointer) bool {
 		// Vulkan requires that the use of a queue be externally
 		// synchronized, and the context's stream and rings may use one at
 		// once.
-		q.mu.Lock()
+		q.host.mu.Lock()
 		called = vk.Call(cmd.Type, t, args)
-		q.mu.Unlock()
+		q.host.mu.Unlock()
 	} else {
 		called = vk.Call(cmd.Type, t, args)
 	}
@@ -242,29 +268,30 @@ func (s *stream) call(cmd *vn.Command, args unsafe.Pointer) bool {
 		// enable, or that the host lacks.
 		s.fail("%s: the host's Vulkan has no such command", cmd.Name)
 	}
-	return called
+	return o, called
 }
 
-// table returns the table through which to call a command, and the queue
-// that the command uses, if any.
-func (s *stream) table(cmd *vn.Command, args unsafe.Pointer) (vk.Table, *queue, bool) {
+// table returns the table through which to call a command, the object of a
+// device command's first argument, and the queue that the command uses, if
+// any.
+func (s *stream) table(cmd *vn.Command, args unsafe.Pointer) (vk.Table, *object, *queue, bool) {
 	switch cmd.Level() {
 	case vn.LevelGlobal:
-		return s.ctx.srv.lib.Global(), nil, true
+		return s.ctx.lib().Global(), nil, nil, true
 	case vn.LevelInstance:
 		if o := s.ctx.lookupType(firstID(args), vn.VK_OBJECT_TYPE_INSTANCE); o != nil {
-			return o.inst.table, nil, true
+			return o.inst.table, nil, nil, true
 		}
 	case vn.LevelPhysicalDevice:
 		if o := s.ctx.lookupType(firstID(args), vn.VK_OBJECT_TYPE_PHYSICAL_DEVICE); o != nil {
-			return o.pd.inst.pdTable, nil, true
+			return o.pd.inst.pdTable, nil, nil, true
 		}
 	case vn.LevelDevice:
 		if o := s.ctx.lookup(firstID(args)); o != nil && o.dev != nil {
-			return o.dev.table, o.queue, true
+			return o.dev.table, o, o.queue, true
 		}
 	}
-	return vk.Table{}, nil, false
+	return vk.Table{}, nil, nil, false
 }
 
 // firstID returns the object ID of a command's first argument.

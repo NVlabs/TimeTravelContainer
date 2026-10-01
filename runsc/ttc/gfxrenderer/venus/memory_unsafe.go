@@ -34,6 +34,8 @@ type memory struct {
 	metalBuffer unsafe.Pointer
 	// exported is whether a resource has the memory.
 	exported bool
+	// imported is whether the memory imports a resource's.
+	imported bool
 }
 
 // release releases what the memory holds, once Vulkan freed it.
@@ -124,6 +126,7 @@ func allocateMemory(s *stream, cmd *vn.Command, args unsafe.Pointer) {
 		}
 		setNext(prev, unsafe.Pointer(imp))
 		mem.metalBuffer = imp.handle
+		mem.imported = true
 		info.AllocationSize = uint64(len(shm.data))
 	} else if mem.propertyFlags&vkMemoryPropertyHostVisible != 0 && dev.metal != nil {
 		var err error

@@ -81,6 +81,10 @@ const (
 	// CtxLiveForkPreparationMetrics carries an optional accumulator for
 	// persistent filesystem seal costs.
 	CtxLiveForkPreparationMetrics
+
+	// CtxLiveForkLoads is a Context.Value key for the *LiveForkLoads of a
+	// save whose state kernels load after the save ends.
+	CtxLiveForkLoads
 )
 
 // LiveForkPreparationMetrics breaks persistent filesystem preparation into
