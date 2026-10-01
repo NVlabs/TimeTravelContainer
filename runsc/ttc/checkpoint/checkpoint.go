@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -429,17 +430,19 @@ func (a *Archive) Finish(root string) error {
 	return nil
 }
 
-// Unpack extracts a TTC checkpoint into an empty destination. It accepts safe
-// symbolic links and rejects hard links, special files, duplicate paths, and
-// traversal.
-func Unpack(source, destination string) error {
-	file, err := os.Open(source)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
+// Section is where a regular file Unpack left in its archive is: its content
+// is the archive's Size bytes from Offset.
+type Section struct {
+	Offset, Size int64
+}
+
+// Unpack extracts the TTC checkpoint archive into an empty destination, but
+// for the regular files named in leave, which it leaves in the archive, and
+// returns the sections of. It accepts safe symbolic links and rejects hard
+// links, special files, duplicate paths, and traversal.
+func Unpack(archive *os.File, destination string, leave ...string) (map[string]Section, error) {
 	if err := os.Mkdir(destination, 0700); err != nil {
-		return err
+		return nil, err
 	}
 	keep := false
 	defer func() {
@@ -447,7 +450,8 @@ func Unpack(source, destination string) error {
 			_ = os.RemoveAll(destination)
 		}
 	}()
-	reader := tar.NewReader(file)
+	reader := tar.NewReader(archive)
+	sections := make(map[string]Section, len(leave))
 	seen := make(map[string]struct{})
 	type archivedSymlink struct {
 		name   string
@@ -460,32 +464,42 @@ func Unpack(source, destination string) error {
 			break
 		}
 		if err != nil {
-			return err
+			return nil, err
 		}
 		name := filepath.FromSlash(header.Name)
 		if !validArchivePath(name) {
-			return fmt.Errorf("invalid checkpoint archive path %q", header.Name)
+			return nil, fmt.Errorf("invalid checkpoint archive path %q", header.Name)
 		}
 		if _, ok := seen[name]; ok {
-			return fmt.Errorf("duplicate checkpoint archive path %q", header.Name)
+			return nil, fmt.Errorf("duplicate checkpoint archive path %q", header.Name)
 		}
 		seen[name] = struct{}{}
 		path := filepath.Join(destination, name)
 		switch header.Typeflag {
 		case tar.TypeDir:
 			if err := ensureArchiveParents(destination, name); err != nil {
-				return err
+				return nil, err
 			}
 			mode := fs.FileMode(header.Mode).Perm()
 			if mode == 0 {
 				mode = 0700
 			}
 			if err := os.Mkdir(path, mode); err != nil && !errors.Is(err, os.ErrExist) {
-				return err
+				return nil, err
 			}
 		case tar.TypeReg, tar.TypeRegA:
+			if slices.Contains(leave, header.Name) {
+				// tar reads no further than a header: the member's content
+				// begins where the archive is read to.
+				offset, err := archive.Seek(0, io.SeekCurrent)
+				if err != nil {
+					return nil, err
+				}
+				sections[header.Name] = Section{Offset: offset, Size: header.Size}
+				continue
+			}
 			if err := ensureArchiveParents(destination, name); err != nil {
-				return err
+				return nil, err
 			}
 			mode := fs.FileMode(header.Mode).Perm()
 			if mode == 0 {
@@ -493,23 +507,23 @@ func Unpack(source, destination string) error {
 			}
 			output, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			_, copyErr := io.CopyN(output, reader, header.Size)
 			closeErr := output.Close()
 			if copyErr != nil {
-				return copyErr
+				return nil, copyErr
 			}
 			if closeErr != nil {
-				return closeErr
+				return nil, closeErr
 			}
 		case tar.TypeSymlink:
 			if header.Linkname == "" {
-				return fmt.Errorf("checkpoint archive symlink %q has an empty target", header.Name)
+				return nil, fmt.Errorf("checkpoint archive symlink %q has an empty target", header.Name)
 			}
 			symlinks = append(symlinks, archivedSymlink{name: name, target: header.Linkname})
 		default:
-			return fmt.Errorf("unsupported checkpoint archive entry %q type %d", header.Name, header.Typeflag)
+			return nil, fmt.Errorf("unsupported checkpoint archive entry %q type %d", header.Name, header.Typeflag)
 		}
 	}
 	sort.Slice(symlinks, func(i, j int) bool { return symlinks[i].name < symlinks[j].name })
@@ -517,21 +531,21 @@ func Unpack(source, destination string) error {
 		prefix := link.name + string(filepath.Separator)
 		for name := range seen {
 			if strings.HasPrefix(name, prefix) {
-				return fmt.Errorf("checkpoint archive path %q is beneath symlink %q", name, link.name)
+				return nil, fmt.Errorf("checkpoint archive path %q is beneath symlink %q", name, link.name)
 			}
 		}
 		if err := ensureArchiveParents(destination, link.name); err != nil {
-			return err
+			return nil, err
 		}
 		if err := os.Symlink(link.target, filepath.Join(destination, link.name)); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if _, err := ReadManifest(destination); err != nil {
-		return err
+		return nil, err
 	}
 	keep = true
-	return nil
+	return sections, nil
 }
 
 func ensureArchiveParents(root, name string) error {

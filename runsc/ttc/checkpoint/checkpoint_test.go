@@ -26,6 +26,16 @@ func testManifest() Manifest {
 	}
 }
 
+// unpack unpacks the archive at source as Unpack does.
+func unpack(source, destination string, leave ...string) (map[string]Section, error) {
+	archive, err := os.Open(source)
+	if err != nil {
+		return nil, err
+	}
+	defer archive.Close()
+	return Unpack(archive, destination, leave...)
+}
+
 func TestPackUnpack(t *testing.T) {
 	staging := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(staging, "state"), 0700); err != nil {
@@ -45,7 +55,7 @@ func TestPackUnpack(t *testing.T) {
 		t.Fatal(err)
 	}
 	extracted := filepath.Join(t.TempDir(), "extracted")
-	if err := Unpack(archive, extracted); err != nil {
+	if _, err := unpack(archive, extracted); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(filepath.Join(extracted, "state", "checkpoint.img"))
@@ -123,13 +133,79 @@ func TestArchiveStreamsAMemberFirst(t *testing.T) {
 		t.Fatalf("the archive begins with %+v (%v), want the streamed member", first, err)
 	}
 	extracted := filepath.Join(t.TempDir(), "extracted")
-	if err := Unpack(destination, extracted); err != nil {
+	if _, err := unpack(destination, extracted); err != nil {
 		t.Fatal(err)
 	}
 	for name, want := range map[string][]byte{"state/memory.stream": memory, "state/metadata.state": []byte("metadata")} {
 		got, err := os.ReadFile(filepath.Join(extracted, name))
 		if err != nil || !bytes.Equal(got, want) {
 			t.Fatalf("%s holds %d bytes (%v), want %d", name, len(got), err, len(want))
+		}
+	}
+}
+
+// Unpack leaves a member it is asked to in the archive, wherever it is, and
+// says where its content is.
+func TestUnpackLeavesAMemberInTheArchive(t *testing.T) {
+	memory := bytes.Repeat([]byte("page"), 3000)
+	staging := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(staging, "state"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteManifest(staging, testManifest()); err != nil {
+		t.Fatal(err)
+	}
+	// Packed after the manifest, as a staged file.
+	if err := os.WriteFile(filepath.Join(staging, "state", "memory.stream"), memory, 0600); err != nil {
+		t.Fatal(err)
+	}
+	packed := filepath.Join(t.TempDir(), "packed.ttc")
+	if err := Pack(staging, packed); err != nil {
+		t.Fatal(err)
+	}
+	// Streamed first.
+	if err := os.Remove(filepath.Join(staging, "state", "memory.stream")); err != nil {
+		t.Fatal(err)
+	}
+	streamed := filepath.Join(t.TempDir(), "streamed.ttc")
+	archive, err := CreateArchive(streamed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer archive.Abort()
+	if err := archive.Stream("state/memory.stream", 0600, func(w *os.File) error {
+		_, err := w.Write(memory)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := archive.Finish(staging); err != nil {
+		t.Fatal(err)
+	}
+	for _, source := range []string{packed, streamed} {
+		file, err := os.Open(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		extracted := filepath.Join(t.TempDir(), "extracted")
+		sections, err := Unpack(file, extracted, "state/memory.stream")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Lstat(filepath.Join(extracted, "state", "memory.stream")); !os.IsNotExist(err) {
+			t.Fatalf("%s: the member left in the archive was extracted (%v)", source, err)
+		}
+		if _, err := ReadManifest(extracted); err != nil {
+			t.Fatalf("%s: %v", source, err)
+		}
+		section, ok := sections["state/memory.stream"]
+		if !ok {
+			t.Fatalf("%s: Unpack returned %v, without the member", source, sections)
+		}
+		got := make([]byte, section.Size)
+		if _, err := file.ReadAt(got, section.Offset); err != nil || !bytes.Equal(got, memory) {
+			t.Fatalf("%s: the section at %d holds %d bytes (%v), not the member's %d", source, section.Offset, len(got), err, len(memory))
 		}
 	}
 }
@@ -181,7 +257,7 @@ func TestUnpackRejectsFileBeneathSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	destination := filepath.Join(t.TempDir(), "out")
-	if err := Unpack(archivePath, destination); err == nil {
+	if _, err := unpack(archivePath, destination); err == nil {
 		t.Fatal("Unpack accepted a file beneath a symlink")
 	}
 	if _, err := os.Stat(filepath.Join(filepath.Dir(destination), "escape", "file")); !os.IsNotExist(err) {
@@ -209,7 +285,7 @@ func TestUnpackRejectsTraversal(t *testing.T) {
 		t.Fatal(err)
 	}
 	destination := filepath.Join(t.TempDir(), "out")
-	if err := Unpack(archivePath, destination); err == nil {
+	if _, err := unpack(archivePath, destination); err == nil {
 		t.Fatal("Unpack accepted traversal")
 	}
 	if _, err := os.Stat(filepath.Join(filepath.Dir(destination), "escape")); !os.IsNotExist(err) {

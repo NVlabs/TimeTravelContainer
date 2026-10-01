@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path"
 	"path/filepath"
 	"strconv"
 	"time"
@@ -430,11 +429,13 @@ func (b *runtimeBackend) releaseRestoredMemory(id string) error {
 	return result
 }
 
-// The files of a checkpoint's dehydration, in its state directory.
+// The files of a checkpoint's dehydration, in its state directory, and the
+// member of the archive its memory is.
 const (
 	checkpointControlName  = "control.json"
 	checkpointMetadataName = "metadata.state"
 	checkpointMemoryName   = "memory.stream"
+	checkpointMemoryMember = "state/" + checkpointMemoryName
 )
 
 // saveCheckpointDehydration dehydrates the hidden checkpoint branch and saves
@@ -454,7 +455,7 @@ func (b *runtimeBackend) saveCheckpointDehydration(info ttcbundle.ContainerInfo,
 	// Unfiltered, the capture's stream is one-way, so the archive can record
 	// it.
 	var output []byte
-	if err := archive.Stream(path.Join(filepath.Base(stateDir), checkpointMemoryName), 0600, func(memory *os.File) error {
+	if err := archive.Stream(checkpointMemoryMember, 0600, func(memory *os.File) error {
 		stream, finish := memory, func() error { return nil }
 		if compression != "none" {
 			reader, writer, err := os.Pipe()
@@ -509,10 +510,11 @@ func (recordedCapture) Write([]byte) (int, error) {
 
 // installCheckpointDehydration makes a checkpoint's dehydration the durable
 // dehydration of the restored family's main branch, as dehydrating main would
-// have left it: its pages in the snapshot graph, and its capture and kernel
-// state in main's dehydration image. resume says whether main runs once
-// rehydrated, or stays paused as the checkpointed branch was.
-func (b *runtimeBackend) installCheckpointDehydration(info ttcbundle.ContainerInfo, stateDir, compression string, resume bool) (retErr error) {
+// have left it: its pages, read from memory, compressed by compression, in the
+// snapshot graph, and its capture and kernel state, in stateDir, in main's
+// dehydration image. resume says whether main runs once rehydrated, or stays
+// paused as the checkpointed branch was.
+func (b *runtimeBackend) installCheckpointDehydration(info ttcbundle.ContainerInfo, stateDir string, memory io.Reader, compression string, resume bool) (retErr error) {
 	main, err := persistentBranchInfo(info, defaultBranchID)
 	if err != nil {
 		return err
@@ -554,12 +556,7 @@ func (b *runtimeBackend) installCheckpointDehydration(info ttcbundle.ContainerIn
 			retErr = errors.Join(retErr, fmt.Errorf("discarding the checkpoint's snapshot origin: %w", graphErr))
 		}
 	}()
-	memory, err := os.Open(filepath.Join(stateDir, checkpointMemoryName))
-	if err != nil {
-		return fmt.Errorf("opening the checkpoint's memory: %w", err)
-	}
-	defer memory.Close()
-	var reader io.Reader = memory
+	reader := memory
 	switch compression {
 	case "":
 	case "flate-best-speed":
@@ -731,25 +728,45 @@ func (b *runtimeBackend) restoreCheckpoint(source, name string) (id string, retE
 	}
 	defer os.RemoveAll(stageBase)
 	stage := filepath.Join(stageBase, "checkpoint")
+	// The memory, most of a checkpoint, is not unpacked, but imported from
+	// the archive.
+	var archive *os.File
+	defer func() {
+		if archive != nil {
+			_ = archive.Close()
+		}
+	}()
+	var memory ttccheckpoint.Section
 	// Receiving and unpacking the archive take time in proportion to it,
 	// before there is a family to protect: other commands go on meanwhile,
 	// and one that names the family to be is refused.
 	if err := b.withoutLifecycleLock(ttcbundle.ContainerInfo{ID: "restore:" + stageBase, Name: name}, longOperation{state: "restoring", shown: true}, func() error {
+		var err error
 		if source == "-" {
 			if b.stdin == nil {
 				return errors.New("checkpoint restore from '-' requires standard input")
 			}
-			source = filepath.Join(stageBase, "input.ttc")
-			archive, err := os.OpenFile(source, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-			if err != nil {
+			if archive, err = os.OpenFile(filepath.Join(stageBase, "input.ttc"), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600); err != nil {
 				return err
 			}
-			_, copyErr := io.Copy(archive, b.stdin)
-			if err := errors.Join(copyErr, archive.Close()); err != nil {
+			if _, err := io.Copy(archive, b.stdin); err != nil {
 				return fmt.Errorf("receiving checkpoint archive: %w", err)
 			}
+			if _, err := archive.Seek(0, io.SeekStart); err != nil {
+				return err
+			}
+		} else if archive, err = os.Open(source); err != nil {
+			return err
 		}
-		return ttccheckpoint.Unpack(source, stage)
+		sections, err := ttccheckpoint.Unpack(archive, stage, checkpointMemoryMember)
+		if err != nil {
+			return err
+		}
+		var ok bool
+		if memory, ok = sections[checkpointMemoryMember]; !ok {
+			return fmt.Errorf("checkpoint archive holds no %s", checkpointMemoryMember)
+		}
+		return nil
 	}); err != nil {
 		return "", err
 	}
@@ -821,7 +838,7 @@ func (b *runtimeBackend) restoreCheckpoint(source, name string) (id string, retE
 	}
 	// Importing the memory takes time in proportion to it.
 	if err := b.withoutLifecycleLock(prepared.Container, longOperation{state: "restoring", shown: true}, func() error {
-		return b.installCheckpointDehydration(prepared.Container, filepath.Join(stage, "state"), manifest.MemoryCompression, !manifest.RestorePaused)
+		return b.installCheckpointDehydration(prepared.Container, filepath.Join(stage, "state"), io.NewSectionReader(archive, memory.Offset, memory.Size), manifest.MemoryCompression, !manifest.RestorePaused)
 	}); err != nil {
 		return "", err
 	}
