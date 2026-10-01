@@ -106,13 +106,24 @@ func (p *proc) accessBuffer(ctx context.Context, b *buffer, off uint64, data []b
 	if off+uint64(len(data)) > b.size || off+uint64(len(data)) < off {
 		return linuxerr.EFAULT
 	}
-	start := p.fr.Start + b.offset + off
+	p.mapMu.Lock()
+	fr, err := p.memoryLocked(ctx)
+	mf := p.mf
+	p.mapMu.Unlock()
+	if err != nil {
+		return err
+	}
+	return copyMemory(mf, fr.Start+b.offset+off, data, write)
+}
+
+// copyMemory copies data to mf at start, or with write false, from it.
+func copyMemory(mf *pgalloc.MemoryFile, start uint64, data []byte, write bool) error {
 	fr := memmap.FileRange{Start: start, End: start + uint64(len(data))}
 	at := hostarch.Read
 	if write {
 		at = hostarch.Write
 	}
-	ims, lease, err := memmap.MapInternalWithLease(pgalloc.MemoryFileFromContext(ctx), fr, at)
+	ims, lease, err := memmap.MapInternalWithLease(mf, fr, at)
 	if err != nil {
 		return err
 	}

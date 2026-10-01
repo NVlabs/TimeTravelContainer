@@ -14,6 +14,7 @@ go_library(
         "read.go",
         "refs.go",
         "release.go",
+        "save_restore.go",
         "write.go",
     ],
     visibility = ["//pkg/sentry:internal"],
@@ -42,5 +43,10 @@ go_test(
     size = "small",
     srcs = ["binder_test.go"],
     library = ":binder",
-    deps = ["//pkg/sentry/kernel"],
+    deps = [
+        "//pkg/hostarch",
+        "//pkg/sentry/contexttest",
+        "//pkg/sentry/kernel",
+        "//pkg/sentry/memmap",
+    ],
 )

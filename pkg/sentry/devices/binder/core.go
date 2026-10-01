@@ -24,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/waiter"
@@ -195,8 +196,11 @@ type proc struct {
 	base uint64
 	// size is the mapping's size.
 	size uint64
-	// fr is the mapping's memory.
-	fr memmap.FileRange
+	// fr is the mapping's memory, and mf its MemoryFile. They are not saved:
+	// each branch of a live fork writes its own transactions, so a restored
+	// proc allocates new memory on first use (see memoryLocked).
+	fr memmap.FileRange    `state:"nosave"`
+	mf *pgalloc.MemoryFile `state:"nosave"`
 	// mappings tracks the proc's mappings of its buffer.
 	mappings memmap.MappingSet
 	// buffers are the allocated buffers, by offset in the mapping.
@@ -363,4 +367,7 @@ type buffer struct {
 	async      bool
 	// userFree is whether the proc may free the buffer.
 	userFree bool
+	// contents is the buffer's data while the proc's state is saved, until
+	// the restored proc allocates its memory.
+	contents []byte
 }

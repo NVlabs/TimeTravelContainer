@@ -4,9 +4,13 @@
 package binder
 
 import (
+	"bytes"
 	"testing"
 
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 )
 
 // The UAPI's numbers, from a Linux build's include/uapi/linux/android/binder.h.
@@ -123,5 +127,46 @@ func TestRefs(t *testing.T) {
 	}
 	if err := r.dec(true); err == nil {
 		t.Errorf("dec of a dead ref succeeded")
+	}
+}
+
+// TestRestoredProcMemory checks that a restored proc writes its buffers'
+// saved data into memory of its own, rather than into the saved proc's: the
+// two branches of a live fork each write their own transactions.
+func TestRestoredProcMemory(t *testing.T) {
+	ctx := contexttest.Context(t)
+	p := &proc{dev: &Device{}}
+	if err := p.allocMapping(ctx, 2*hostarch.PageSize); err != nil {
+		t.Fatalf("allocMapping: %v", err)
+	}
+	defer p.freeMapping(ctx)
+	p.mapped = true
+	b, err := p.allocBuffer(64, false)
+	if err != nil {
+		t.Fatalf("allocBuffer: %v", err)
+	}
+	data := []byte("a transaction in flight at the save")
+	if err := p.writeBuffer(ctx, b, 0, data); err != nil {
+		t.Fatalf("writeBuffer: %v", err)
+	}
+
+	p.beforeSave()
+	// Model the restored proc: its memory is not saved.
+	source, sourceMF := p.fr, p.mf
+	defer sourceMF.DecRef(source)
+	p.fr, p.mf = memmap.FileRange{}, nil
+
+	got := make([]byte, len(data))
+	if err := p.readBuffer(ctx, b, 0, got); err != nil {
+		t.Fatalf("readBuffer: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Errorf("restored buffer holds %q, want %q", got, data)
+	}
+	if p.fr.Length() == 0 || p.fr.Overlaps(source) {
+		t.Errorf("restored proc's memory %v, want memory of its own, apart from %v", p.fr, source)
+	}
+	if b.contents != nil {
+		t.Errorf("restored buffer keeps its saved data")
 	}
 }

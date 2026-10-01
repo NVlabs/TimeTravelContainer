@@ -429,7 +429,7 @@ func (p *proc) allocMapping(ctx context.Context, length uint64) error {
 	if err != nil {
 		return err
 	}
-	p.fr = fr
+	p.fr, p.mf = fr, mf
 	p.size = size
 	p.freeAsyncSpace = size / 2
 	return nil
@@ -442,8 +442,8 @@ func (p *proc) freeMapping(ctx context.Context) {
 	if p.fr.Length() == 0 {
 		return
 	}
-	pgalloc.MemoryFileFromContext(ctx).DecRef(p.fr)
-	p.fr = memmap.FileRange{}
+	p.mf.DecRef(p.fr)
+	p.fr, p.mf = memmap.FileRange{}, nil
 }
 
 // AddMapping implements memmap.Mappable.AddMapping.
@@ -493,8 +493,12 @@ func (p *proc) Translate(ctx context.Context, required, optional memmap.Mappable
 		return nil, &memmap.BusError{Err: linuxerr.EFAULT}
 	}
 	p.mapMu.Lock()
-	size, fr := p.size, p.fr
+	fr, err := p.memoryLocked(ctx)
+	size, mf := p.size, p.mf
 	p.mapMu.Unlock()
+	if err != nil {
+		return nil, err
+	}
 	if required.End > size || fr.Length() == 0 {
 		return nil, &memmap.BusError{Err: linuxerr.EFAULT}
 	}
@@ -504,14 +508,20 @@ func (p *proc) Translate(ctx context.Context, required, optional memmap.Mappable
 	}
 	return []memmap.Translation{{
 		Source: source,
-		File:   pgalloc.MemoryFileFromContext(ctx),
+		File:   mf,
 		Offset: fr.Start + source.Start,
 		Perms:  hostarch.Read,
 	}}, nil
 }
 
-// InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.
+// InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable. The
+// proc's memory is not saved, so translations to it must not be: the child
+// of a live fork would read the source's buffer, which only the source
+// writes to.
 func (p *proc) InvalidateUnsavable(ctx context.Context) error {
+	p.mapMu.Lock()
+	defer p.mapMu.Unlock()
+	p.mappings.InvalidateAll(memmap.InvalidateOpts{InvalidatePrivate: true})
 	return nil
 }
 
