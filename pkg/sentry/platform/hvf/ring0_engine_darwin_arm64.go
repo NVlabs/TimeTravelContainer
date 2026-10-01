@@ -1878,17 +1878,28 @@ retry:
 		admissible = admissible && waiterIndex < e.freeApplicationIDsLocked()
 	}
 	if !admissible {
+		// A handoff admits at most as many waiters as there are vCPUs. The
+		// waiters behind those wait their turn: they neither retire parked
+		// vCPUs nor preempt incumbents, which would serve nobody, and they
+		// poll seldom. After a live fork, every thread of every branch
+		// restarts its interrupted system call at once; when each of
+		// thousands of waiters preempted incumbents and polled cpuMu, the
+		// tasks admitted lost their vCPUs again at once, and the family made
+		// almost no progress for minutes.
+		inWindow := waiterIndex < len(e.cpuIDs)
 		// Parked vCPUs hold IDs that no residency uses: ask their owner
 		// threads to retire as many as the waiters up to this one need,
 		// beyond the free IDs and the retirements already asked for.
-		needed := waiterIndex + 1 - e.freeApplicationIDsLocked() - e.parkedRetirements
-		requested := 0
-		if needed > 0 {
-			requested = e.requestParkedRetirementsLocked(needed)
+		needed, requested := 0, 0
+		if inWindow {
+			needed = waiterIndex + 1 - e.freeApplicationIDsLocked() - e.parkedRetirements
+			if needed > 0 {
+				requested = e.requestParkedRetirementsLocked(needed)
+			}
 		}
 		// A thread takes a while to retire its vCPU if it is in a system call
 		// that ends, such as a gofer request. Then preempt an incumbent too.
-		kick := needed > requested || time.Since(waitStarted) >= 10*time.Millisecond
+		kick := inWindow && (needed > requested || time.Since(waitStarted) >= 10*time.Millisecond)
 		e.cpuMu.Unlock()
 		if requested != 0 {
 			ring0WakeIdleThreads()
@@ -1919,8 +1930,11 @@ retry:
 		// kick. Polling every waiter at a short interval instead saturates
 		// cpuMu, which incumbents also need to hand off their vCPUs.
 		pollInterval := 10 * time.Millisecond
-		if waiterIndex == 0 {
+		switch {
+		case waiterIndex == 0:
 			pollInterval = time.Millisecond
+		case !inWindow:
+			pollInterval = 50 * time.Millisecond
 		}
 		if pollTimer == nil {
 			pollTimer = time.NewTimer(pollInterval)
