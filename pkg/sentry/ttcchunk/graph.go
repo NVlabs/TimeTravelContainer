@@ -146,9 +146,14 @@ type importedMapping struct {
 	slot     uint8
 }
 
-// graphTablesPerTransaction bounds the tables one transaction maps: 128 MiB
-// of memory.
+// graphTablesPerTransaction bounds the tables one transaction maps, 128 MiB
+// of memory, unless they write less journal than graphTransactionJournalBytes,
+// as tables the graph shares do.
 const graphTablesPerTransaction = 128
+
+// graphTransactionJournalBytes is about what a transaction of
+// graphTablesPerTransaction new tables writes.
+const graphTransactionJournalBytes = 2 << 20
 
 // heldPinComponent names the pins under which a capture holds the pages it
 // shares with other origins until its trees refer to them:
@@ -370,15 +375,26 @@ func importCapture(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, o
 		if err := data.SyncObjects(installed); err != nil {
 			return fmt.Errorf("syncing graph memory chunks: %w", err)
 		}
-		for begin := 0; begin < len(tables); begin += graphTablesPerTransaction {
-			end := min(begin+graphTablesPerTransaction, len(tables))
+		batch := graphTablesPerTransaction
+		for begin := 0; begin < len(tables); {
+			end := min(begin+batch, len(tables))
 			var chunks []ttcsnapshot.ObjectID
 			for _, table := range newChunks[begin:end] {
 				chunks = append(chunks, table...)
 			}
+			before := graph.JournalBytes()
 			if err := graph.CommitMemoryTablesReusing(origin, tables[begin:end], chunks, reuse); err != nil {
 				return fmt.Errorf("committing graph memory tables: %w", err)
 			}
+			// Tables the graph shares write little: as many go in the next
+			// transaction as write what new tables of 128 MiB of memory do. A
+			// checkpoint meanwhile leaves the journal shorter.
+			batch = graphTablesPerTransaction
+			if written := graph.JournalBytes() - before; written > 0 {
+				perTable := max(written/int64(end-begin), 1)
+				batch = int(min(max(graphTransactionJournalBytes/perTable, graphTablesPerTransaction), int64(len(tables))))
+			}
+			begin = end
 			if err := checkpointGraphImportIfNeeded(graph, graphImportCheckpointBytes); err != nil {
 				return err
 			}
