@@ -82,6 +82,7 @@ go_library(
         "ancestry_mutex.go",
         "dentry_list.go",
         "device_file.go",
+        "disk_mapping.go",
         "disk_volume.go",
         "directory.go",
         "filesystem.go",

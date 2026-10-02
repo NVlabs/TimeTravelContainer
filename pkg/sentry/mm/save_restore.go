@@ -134,11 +134,19 @@ func (mm *MemoryManager) afterLoad(ctx goContext.Context) {
 	if pgalloc.LiveForkCloneNeedsPageRefs(ctx) {
 		memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
 		for pseg := mm.pmas.FirstSegment(); pseg.Ok(); pseg = pseg.NextSegment() {
-			mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile)
-			if !ok {
+			switch f := pseg.ValuePtr().file.(type) {
+			case *pgalloc.MemoryFile:
+				pgalloc.AcquireRestoreRef(ctx, f, pseg.fileRange(), memCgID)
+			case memmap.LiveForkSharedFile:
+				// The parent's translation of pages that cannot change,
+				// which the child shares.
+				if !f.LiveForkShared() {
+					panic(fmt.Sprintf("restored PMA %v maps mutable pages of %T", pseg.Range(), f))
+				}
+				f.IncRef(pseg.fileRange(), memCgID)
+			default:
 				panic(fmt.Sprintf("restored PMA has unsupported file %T", pseg.ValuePtr().file))
 			}
-			pgalloc.AcquireRestoreRef(ctx, mf, pseg.fileRange(), memCgID)
 		}
 	}
 	mm.haveASIO = mm.p.SupportsAddressSpaceIO()

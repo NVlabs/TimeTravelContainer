@@ -1301,3 +1301,67 @@ func BenchmarkLiveForkWriteFault(b *testing.B) {
 		})
 	}
 }
+
+// liveForkTestFile is a File whose pages the test says are immutable, or not.
+type liveForkTestFile struct {
+	memmap.DefaultMemoryType
+	memmap.NoBufferedIOFallback
+	shared bool
+	refs   uint64
+}
+
+func (f *liveForkTestFile) IncRef(fr memmap.FileRange, memCgID uint32) {
+	f.refs += fr.Length() / hostarch.PageSize
+}
+
+func (f *liveForkTestFile) DecRef(fr memmap.FileRange) {
+	f.refs -= fr.Length() / hostarch.PageSize
+}
+
+func (f *liveForkTestFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (safemem.BlockSeq, error) {
+	return safemem.BlockSeq{}, linuxerr.EFAULT
+}
+
+func (f *liveForkTestFile) DataFD(fr memmap.FileRange) (int, error) {
+	return -1, linuxerr.EINVAL
+}
+
+func (f *liveForkTestFile) FD() int {
+	return -1
+}
+
+func (f *liveForkTestFile) LiveForkShared() bool {
+	return f.shared
+}
+
+// TestLiveForkChildSharesImmutableFilePMAs checks that a live fork's child
+// takes its parent's translations of a file's immutable pages, with
+// references of its own, and refuses translations of mutable ones.
+func TestLiveForkChildSharesImmutableFilePMAs(t *testing.T) {
+	ctx := contexttest.Context(t)
+	for _, shared := range []bool{true, false} {
+		file := &liveForkTestFile{shared: shared}
+		child := &MemoryManager{}
+		ar := hostarch.AddrRange{Start: 0x10000, End: 0x10000 + 2*hostarch.PageSize}
+		child.pmas.Insert(child.pmas.FirstGap(), ar, pma{
+			file:           file,
+			translatePerms: hostarch.ReadExecute,
+			effectivePerms: hostarch.Read,
+			maxPerms:       hostarch.AnyAccess,
+		})
+		loadCtx := context.WithValue(ctx, pgalloc.CtxLiveForkClone, true)
+		panicked := func() (panicked bool) {
+			defer func() {
+				panicked = recover() != nil
+			}()
+			child.afterLoad(loadCtx)
+			return false
+		}()
+		if shared && (panicked || file.refs != 2) {
+			t.Errorf("the child of a translation of immutable pages: panicked %t, took %d page references, want 2", panicked, file.refs)
+		}
+		if !shared && !panicked {
+			t.Errorf("the child took a translation of mutable pages")
+		}
+	}
+}

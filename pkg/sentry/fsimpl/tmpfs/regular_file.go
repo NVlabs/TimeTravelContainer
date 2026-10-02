@@ -24,7 +24,6 @@ import (
 	"math"
 	"os"
 
-	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
@@ -69,7 +68,8 @@ type regularFile struct {
 	// mappings from many VMAs. We count pages rather than bytes to slightly
 	// mitigate this.
 	//
-	// Protected by mapsMu.
+	// Protected by mapsMu. For a file of a TTC volume, it is also protected
+	// by diskMapMu, so that Translate may read it.
 	writableMappingPages uint64
 
 	// dataMu protects the fields below.
@@ -91,10 +91,25 @@ type regularFile struct {
 	// Protected by dataMu.
 	seals uint32
 
-	// diskMmap maps the current persistent volume object. It is rebuilt after
-	// restore and replaced whenever branch-generation CoW selects a new object.
-	diskMmap   fsutil.MmapCachedFile `state:"nosave"`
-	diskObject string                `state:"nosave"`
+	// diskMapMu protects diskMap and diskObject. Translate locks it, below
+	// the locks of the MemoryManager that calls it. Changes of the object
+	// that the file's translations map lock it below mapsMu, and invalidate
+	// translations once they unlock it.
+	diskMapMu sync.Mutex `state:"nosave"`
+	// diskMap maps the file's volume object, diskObject, for its
+	// translations: the branch's private object, or a sealed object, which
+	// files of every branch share (see diskMapping). A file whose mappings
+	// may write it maps the branch's private object, and its translations
+	// map no other object: a writable mapping first makes the file's
+	// translations of a sealed object fault again, and a fork does so to a
+	// file with writable mappings. Translations of other files map the
+	// sealed object that a fork made of their branch's private object, as
+	// the child's do, until a write copies it.
+	diskMap    *diskMapping `state:"nosave"`
+	diskObject string       `state:"nosave"`
+	// diskIOStale is set when Translate copied the file's object, so that the
+	// I/O cache must open it anew.
+	diskIOStale atomicbitops.Bool `state:"nosave"`
 
 	// diskIOFile caches the host object used by read(2)/write(2). Without this
 	// cache, every 64 KiB operation reopens the branch, traverses the immutable
@@ -149,9 +164,6 @@ func (fs *filesystem) newRegularFile(kuid auth.KUID, kgid auth.KGID, mode linux.
 		memoryUsageKind: fs.usage,
 		seals:           linux.F_SEAL_SEAL,
 	}
-	if fs.diskVolume != nil {
-		file.diskMmap.SetFD(-1)
-	}
 	err := file.inode.init(file, fs, kuid, kgid, linux.S_IFREG|mode, parentDir)
 	if err != nil {
 		return nil, err
@@ -198,20 +210,19 @@ func (rf *regularFile) afterLoad(ctx goContext.Context) {
 		panic(fmt.Sprintf("relocating tmpfs file CoW metadata: %v", err))
 	}
 	if rf.inode.fs.diskVolume != nil {
-		rf.diskMmap.SetFD(-1)
+		rf.diskMap = nil
 		rf.diskObject = ""
 		rf.diskIOFile = nil
 		rf.diskIOObject = ""
 		rf.diskIOWritable = false
-		// diskMmap is not serialized because its host FD and cached host
-		// mappings are runtime-local. Rebuild the mapping references that it
-		// would have acquired through AddMapping before the checkpoint. VMAs
-		// themselves are restored directly from state, so AddMapping is not
-		// called again during restore; without this reconstruction, tearing
-		// down a restored VMA underflows diskMmap's reference counts.
+		// VMAs are restored from state, without AddMapping: count their
+		// writable mappings as it would have.
+		rf.writableMappingPages = 0
 		for seg := rf.mappings.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
 			for mapping := range seg.Value() {
-				rf.diskMmap.AddMapping(mapping.AddrRange, seg.Start())
+				if mapping.Writable {
+					rf.writableMappingPages += uint64(mapping.AddrRange.Length() / hostarch.PageSize)
+				}
 			}
 		}
 		if !rf.mappings.IsEmpty() {
@@ -227,86 +238,160 @@ func (rf *regularFile) afterLoad(ctx goContext.Context) {
 	}
 }
 
-// prepareLiveFork invalidates file-backed translations and marks every present
-// page as shared with the impending child branch. Private PMAs must be
-// preserved: they contain application-owned modifications, such as dynamic
-// linker relocations, that are no longer represented by the tmpfs file.
-func (rf *regularFile) prepareLiveFork() {
+// prepareLiveFork prepares the file for a live fork, which seals its branch's
+// objects, and reports whether the file keeps translations of its object,
+// which a later fork that leaves the process must invalidate.
+//
+// A file of a TTC volume whose mappings cannot write it keeps its
+// translations, if share is set, as the fork's child takes them: what they
+// map, the fork seals. Otherwise the file's translations fault again after
+// the fork, to map the object that it has then.
+//
+// A file of the Sentry's memory makes its translations fault again, and
+// marks every present page as shared with the child, which a write copies.
+// Private PMAs must be preserved: they contain application-owned
+// modifications, such as dynamic linker relocations, that are no longer
+// represented by the tmpfs file.
+func (rf *regularFile) prepareLiveFork(share bool) bool {
 	rf.mapsMu.Lock()
+	defer rf.mapsMu.Unlock()
 	if rf.inode.fs.diskVolume != nil {
+		// Its descriptor may be writable: a write after the fork copies the
+		// sealed object first.
 		rf.diskIOMu.Lock()
 		rf.invalidateDiskIOLocked()
+		rf.diskIOMu.Unlock()
+		rf.diskMapMu.Lock()
+		if share && rf.writableMappingPages == 0 {
+			if m := rf.diskMap; m != nil && !m.shared.Load() {
+				rf.diskMap = shareDiskMapping(rf.inode.fs.diskVolume.Repository, rf.diskObject, m)
+			}
+			rf.diskMapMu.Unlock()
+			// A fork's child maps what its parent's translations do, without
+			// a mapping of its own.
+			return rf.diskMap != nil || !rf.mappings.IsEmpty()
+		}
+		// A mapping of the branch's object would write the sealed object, or
+		// its translations could not leave the Sentry's process. The mapping
+		// is closed once nothing maps its pages.
+		rf.releaseDiskMapLocked()
+		rf.diskMapMu.Unlock()
+		rf.mappings.InvalidateAll(memmap.InvalidateOpts{})
+		return false
 	}
 	rf.mappings.InvalidateAll(memmap.InvalidateOpts{})
-	if rf.inode.fs.diskVolume != nil {
-		// Close the old object before BeginFork advances the repository
-		// generation. Keeping only diskObject="" would leave the old mmap FD
-		// open until the next fault, allowing GC to unlink an object that is
-		// still pinned by this runtime cache. The restored child starts without
-		// a runtime-local mmap FD via afterLoad.
-		rf.diskMmap.ResetFD()
-		rf.setDiskMmapObjectLocked("")
-		rf.diskIOMu.Unlock()
-		rf.mapsMu.Unlock()
-		return
-	}
 	rf.dataMu.Lock()
 	rf.cow.RemoveAll()
 	for seg := rf.data.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
 		rf.cow.Insert(rf.cow.FindGap(seg.Start()), seg.Range(), seg.Value())
 	}
 	rf.dataMu.Unlock()
-	rf.mapsMu.Unlock()
+	return false
 }
 
-// ensureDiskMmapLocked opens a branch-private object and installs it as the
-// backing for future translations.
+// diskTranslationLocked returns the mapping of the file's volume object that
+// a translation maps, for writing if write is set, and the translation's
+// permissions.
 //
-// Preconditions: rf.mapsMu is locked. No application translation backed by
-// diskMmap may remain valid when diskObject is empty.
-func (rf *regularFile) ensureDiskMmapLocked() error {
-	if rf.diskObject != "" && rf.diskMmap.FD() >= 0 {
-		// AddMapping is not called again when an existing VMA refaults after
-		// prepareLiveFork invalidated its PMAs. Keep the file in the next
-		// lifecycle fence's invalidation set even on this fast path.
+// Preconditions: rf.diskMapMu is locked.
+func (rf *regularFile) diskTranslationLocked(write bool) (*diskMapping, hostarch.AccessType, error) {
+	if write || rf.writableMappingPages != 0 {
+		// The branch's private object, which no other translation of the
+		// file maps another object than (see diskMap).
+		if rf.diskMap == nil || rf.diskMap.shared.Load() {
+			if err := rf.privatizeDiskMapLocked(); err != nil {
+				return nil, hostarch.NoAccess, err
+			}
+		}
 		rf.inode.fs.markDiskForkFile(rf)
-		return nil
+		return rf.diskMap, hostarch.AnyAccess, nil
 	}
+	if rf.diskMap == nil {
+		if err := rf.openDiskMapLocked(); err != nil {
+			return nil, hostarch.NoAccess, err
+		}
+	}
+	rf.inode.fs.markDiskForkFile(rf)
+	if rf.diskMap.shared.Load() {
+		return rf.diskMap, hostarch.ReadExecute, nil
+	}
+	return rf.diskMap, hostarch.AnyAccess, nil
+}
+
+// openDiskMapLocked maps the file's object for reading: the sealed object
+// that every branch shares, or else the branch's private object.
+//
+// Preconditions: rf.diskMapMu is locked. rf.diskMap is nil.
+func (rf *regularFile) openDiskMapLocked() error {
 	volume := rf.inode.fs.diskVolume
-	rf.diskIOMu.Lock()
-	defer rf.diskIOMu.Unlock()
-	file, meta, _, err := volume.Repository.OpenDataFileWithCoW(volume.Branch, rf.inode.ino, true, func() {
-		// prepareLiveFork invalidated all application translations before the
-		// branch generation changed. Close both remaining host object caches
-		// while repository GC is excluded by the mutation lock.
-		rf.invalidateDiskIOLocked()
-		rf.diskMmap.ResetFD()
-		rf.setDiskMmapObjectLocked("")
-	})
+	file, meta, sealed, err := volume.Repository.OpenSealedDataFile(volume.Branch, rf.inode.ino)
 	if err != nil {
 		return diskVolumeError("open mmap backing", err)
 	}
-	defer file.Close()
-	if rf.diskObject == meta.Object && rf.diskMmap.FD() >= 0 {
-		rf.inode.fs.markDiskForkFile(rf)
-		return nil
+	if !sealed {
+		file.Close()
+		return rf.privatizeDiskMapLocked()
 	}
-	newFD, err := unix.Dup(int(file.Fd()))
+	m, err := acquireSharedDiskMapping(volume.Repository, meta.Object, file)
 	if err != nil {
 		return err
 	}
-	if err := rf.diskMmap.ReplaceFD(newFD); err != nil {
-		unix.Close(newFD)
+	rf.diskMap = m
+	rf.setDiskMmapObjectLocked(meta.Object)
+	return nil
+}
+
+// privatizeDiskMapLocked maps the branch's private object of the file, which
+// it copies from the file's sealed object first if need be.
+//
+// Preconditions: rf.diskMapMu is locked.
+func (rf *regularFile) privatizeDiskMapLocked() error {
+	volume := rf.inode.fs.diskVolume
+	file, meta, cloned, err := volume.Repository.OpenDataFileWithCoW(volume.Branch, rf.inode.ino, true, nil)
+	if err != nil {
+		return diskVolumeError("open mmap backing", err)
+	}
+	if cloned {
+		// The I/O cache, which Translate cannot lock, may hold the sealed
+		// object.
+		rf.diskIOStale.Store(true)
+	}
+	m, err := newDiskMapping(file)
+	if err != nil {
 		return err
 	}
+	rf.releaseDiskMapLocked()
+	rf.diskMap = m
 	rf.setDiskMmapObjectLocked(meta.Object)
-	// An existing VMA can reach Translate after a fork without another
-	// AddMapping call. Record the newly installed host-backed translation so
-	// the next fork, checkpoint, or dehydration invalidates it before PMA
-	// serialization. Otherwise an idle-then-refaulted branch can retain an
-	// fsutil.MmapCachedFile PMA that the memory graph cannot serialize.
-	rf.inode.fs.markDiskForkFile(rf)
 	return nil
+}
+
+// releaseDiskMapLocked releases the file's mapping of its object, which is
+// closed once nothing maps its pages.
+//
+// Preconditions: rf.diskMapMu is locked.
+func (rf *regularFile) releaseDiskMapLocked() {
+	if rf.diskMap != nil {
+		rf.diskMap.release()
+		rf.diskMap = nil
+	}
+	rf.setDiskMmapObjectLocked("")
+}
+
+// releaseDiskMap is releaseDiskMapLocked.
+func (rf *regularFile) releaseDiskMap() {
+	rf.diskMapMu.Lock()
+	rf.releaseDiskMapLocked()
+	rf.diskMapMu.Unlock()
+}
+
+// resetDiskMapLocked makes the file's translations fault again, to map the
+// object that the file has then, once a write copied the object.
+//
+// Preconditions: rf.mapsMu is locked. rf.diskMapMu is not.
+func (rf *regularFile) resetDiskMapLocked(opts memmap.InvalidateOpts) {
+	rf.releaseDiskMap()
+	rf.mappings.InvalidateAll(opts)
 }
 
 // openDiskIOLocked returns a cached data object. A read-only descriptor is
@@ -316,6 +401,9 @@ func (rf *regularFile) ensureDiskMmapLocked() error {
 // Preconditions: rf.diskIOMu is locked. If writable is true, rf.mapsMu must
 // precede diskIOMu and remain locked until onCoW returns.
 func (rf *regularFile) openDiskIOLocked(writable bool, onCoW func()) (*os.File, bool, error) {
+	if rf.diskIOStale.Swap(false) {
+		rf.invalidateDiskIOLocked()
+	}
 	if rf.diskIOFile != nil && (!writable || rf.diskIOWritable) {
 		return rf.diskIOFile, false, nil
 	}
@@ -359,16 +447,6 @@ func (rf *regularFile) ensureDiskData() error {
 	size := int64(rf.size.Load())
 	return diskVolumeError("materialize file", rf.inode.fs.diskVolume.Repository.EnsureDataRange(
 		rf.inode.fs.diskVolume.Branch, rf.inode.ino, 0, size))
-}
-
-// resetDiskMmapLocked revokes application translations and drops the mmap
-// cache's host reference to an object that repository CoW made unreachable.
-//
-// Preconditions: rf.mapsMu is locked.
-func (rf *regularFile) resetDiskMmapLocked() {
-	rf.mappings.InvalidateAll(memmap.InvalidateOpts{})
-	rf.diskMmap.ResetFD()
-	rf.setDiskMmapObjectLocked("")
 }
 
 // markDiskMetadataDirty defers repository metadata publication. The flag is
@@ -614,9 +692,6 @@ func (rf *regularFile) truncateNoTimeUpdateLocked(newSize uint64) error {
 		cloned, err := rf.inode.fs.diskVolume.Repository.TruncateWithCoW(
 			rf.inode.fs.diskVolume.Branch, rf.inode.ino, int64(newSize), func() {
 				rf.invalidateDiskIOLocked()
-				rf.mappings.InvalidateAll(memmap.InvalidateOpts{InvalidatePrivate: true})
-				rf.diskMmap.ResetFD()
-				rf.setDiskMmapObjectLocked("")
 			})
 		rf.diskIOMu.Unlock()
 		if err != nil {
@@ -625,7 +700,11 @@ func (rf *regularFile) truncateNoTimeUpdateLocked(newSize uint64) error {
 		}
 		rf.size.Store(newSize)
 		rf.inode.fs.adjustDiskBytes(oldSize, newSize)
-		if !cloned && newSize < oldSize {
+		if cloned {
+			// The file's translations map the object that it had.
+			rf.resetDiskMapLocked(memmap.InvalidateOpts{})
+		}
+		if newSize < oldSize {
 			rf.mappings.Invalidate(memmap.MappableRange{offsetPageEnd(int64(newSize)), offsetPageEnd(int64(oldSize))}, memmap.InvalidateOpts{InvalidatePrivate: true})
 		}
 		rf.mapsMu.Unlock()
@@ -692,9 +771,29 @@ func (rf *regularFile) AddMapping(ctx context.Context, ms memmap.MappingSpace, a
 	rf.mapsMu.Lock()
 	defer rf.mapsMu.Unlock()
 	if rf.inode.fs.diskVolume != nil {
-		rf.diskMmap.AddMapping(ar, offset)
 		rf.mappings.AddMapping(ms, ar, offset, writable)
 		rf.inode.fs.markDiskForkFile(rf)
+		if !writable {
+			return nil
+		}
+		rf.diskMapMu.Lock()
+		pagesBefore := rf.writableMappingPages
+		rf.writableMappingPages += uint64(ar.Length() / hostarch.PageSize)
+		if rf.writableMappingPages < pagesBefore {
+			panic(fmt.Sprintf("Overflow while mapping potentially writable pages pointing to a tmpfs file. Before %v, after %v", pagesBefore, rf.writableMappingPages))
+		}
+		// The file's translations may map its sealed object, which a write
+		// copies first, if it has no mapping of the branch's object (a fork's
+		// child takes its parent's translations): the mapping writes the
+		// copy, which they must map.
+		reset := pagesBefore == 0 && (rf.diskMap == nil || rf.diskMap.shared.Load())
+		if reset {
+			rf.releaseDiskMapLocked()
+		}
+		rf.diskMapMu.Unlock()
+		if reset {
+			rf.mappings.InvalidateAll(memmap.InvalidateOpts{})
+		}
 		return nil
 	}
 	rf.dataMu.RLock()
@@ -727,7 +826,15 @@ func (rf *regularFile) RemoveMapping(ctx context.Context, ms memmap.MappingSpace
 
 	rf.mappings.RemoveMapping(ms, ar, offset, writable)
 	if rf.inode.fs.diskVolume != nil {
-		rf.diskMmap.RemoveMapping(ar, offset)
+		if writable {
+			rf.diskMapMu.Lock()
+			pagesBefore := rf.writableMappingPages
+			rf.writableMappingPages -= uint64(ar.Length() / hostarch.PageSize)
+			if rf.writableMappingPages > pagesBefore {
+				panic(fmt.Sprintf("Underflow while unmapping potentially writable pages pointing to a tmpfs file. Before %v, after %v", pagesBefore, rf.writableMappingPages))
+			}
+			rf.diskMapMu.Unlock()
+		}
 		return
 	}
 
@@ -754,14 +861,6 @@ func (rf *regularFile) Translate(ctx context.Context, required, optional memmap.
 		if err := rf.ensureDiskData(); err != nil {
 			return nil, &memmap.BusError{err}
 		}
-		rf.mapsMu.Lock()
-		defer rf.mapsMu.Unlock()
-		// Privatize on the first mapping fault after a fork, including a read
-		// fault. This preserves coherent MAP_SHARED views without invalidating
-		// another MappingSpace from inside an MM fault lock.
-		if err := rf.ensureDiskMmapLocked(); err != nil {
-			return nil, &memmap.BusError{err}
-		}
 		pgend := offsetPageEnd(int64(rf.size.Load()))
 		if required.Start >= pgend {
 			return nil, &memmap.BusError{io.EOF}
@@ -772,11 +871,20 @@ func (rf *regularFile) Translate(ctx context.Context, required, optional memmap.
 		if required.End > pgend {
 			required.End = pgend
 		}
+		// Translate cannot invalidate translations, under the
+		// MemoryManager's locks: it takes no lock that a change of the
+		// file's object holds while it does (see diskMap).
+		rf.diskMapMu.Lock()
+		defer rf.diskMapMu.Unlock()
+		m, perms, err := rf.diskTranslationLocked(at.Write)
+		if err != nil {
+			return nil, &memmap.BusError{err}
+		}
 		return []memmap.Translation{{
 			Source: optional,
-			File:   &rf.diskMmap,
+			File:   m,
 			Offset: optional.Start,
-			Perms:  hostarch.AnyAccess,
+			Perms:  perms,
 		}}, nil
 	}
 	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
@@ -976,12 +1084,15 @@ func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint
 		oldSize := f.size.Load()
 		f.mapsMu.Lock()
 		f.diskIOMu.Lock()
-		_, err := f.inode.fs.diskVolume.Repository.AllocateWithCoW(
+		cloned, err := f.inode.fs.diskVolume.Repository.AllocateWithCoW(
 			f.inode.fs.diskVolume.Branch, f.inode.ino, int64(offset), int64(length), func() {
 				f.invalidateDiskIOLocked()
-				f.resetDiskMmapLocked()
 			})
 		f.diskIOMu.Unlock()
+		if err == nil && cloned {
+			// The file's translations map the object that it had.
+			f.resetDiskMapLocked(memmap.InvalidateOpts{})
+		}
 		f.mapsMu.Unlock()
 		if err != nil {
 			return diskVolumeError("allocate file range", err)
@@ -1223,14 +1334,16 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 			return 0, offset, err
 		}
 		oldSize := f.size.Load()
-		// Object transitions always take mapsMu before diskIOMu. The CoW
-		// callback runs while repository GC is excluded, so it can revoke the
-		// old mmap backing before that object becomes collectible.
+		// Object transitions always take mapsMu before diskIOMu. Mappings of
+		// the object that a CoW leaves remain open until nothing maps their
+		// pages: the object's bytes remain until then, and what maps them
+		// faults again before this write returns.
 		f.mapsMu.Lock()
 		f.diskIOMu.Lock()
-		file, _, err := f.openDiskIOLocked(true, func() {
-			f.resetDiskMmapLocked()
-		})
+		file, cloned, err := f.openDiskIOLocked(true, nil)
+		if err == nil && cloned {
+			f.resetDiskMapLocked(memmap.InvalidateOpts{})
+		}
 		f.mapsMu.Unlock()
 		if err != nil {
 			f.diskIOMu.Unlock()

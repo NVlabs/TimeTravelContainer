@@ -3022,6 +3022,36 @@ func (r *Repository) OpenDataFileWithCoW(branchID string, ino uint64, writable b
 	return file, inode, cloned, nil
 }
 
+// OpenSealedDataFile opens, read-only, the host data object selected by
+// branchID and ino, and reports whether it is sealed: whether the branch
+// shares it with a snapshot, and so with every branch forked since, so that
+// its bytes never change, as a write first copies them into an object of the
+// branch's working generation.
+func (r *Repository) OpenSealedDataFile(branchID string, ino uint64) (*os.File, Inode, bool, error) {
+	r.viewMu.RLock()
+	defer r.viewMu.RUnlock()
+	branch, err := r.readBranch(branchID)
+	if err != nil {
+		return nil, Inode{}, false, err
+	}
+	state, err := r.metadataForBranch(branch)
+	if err != nil {
+		return nil, Inode{}, false, err
+	}
+	inode, err := r.metadataInode(state, ino)
+	if err != nil {
+		return nil, Inode{}, false, err
+	}
+	if inode.Type != "regular" {
+		return nil, Inode{}, false, syscall.EINVAL
+	}
+	file, err := r.openObject(inode.Object, os.O_RDONLY)
+	if err != nil {
+		return nil, Inode{}, false, err
+	}
+	return file, inode, inode.DataGeneration != branch.WorkingSnapshot, nil
+}
+
 // SyncData makes the selected data object durable.
 func (r *Repository) SyncData(branchID string, ino uint64, dataOnly bool) error {
 	// A remotely restored application may synchronize an inherited file before

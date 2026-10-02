@@ -24,6 +24,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
@@ -115,8 +116,25 @@ func (fs *filesystem) PrepareSave(ctx context.Context) error {
 			fs.diskForkFiles = nil
 		}
 		fs.liveForkMu.Unlock()
+		// A fork whose children are in this process shares the pages of the
+		// objects that it seals with them.
+		share := memmap.IsLiveForkInProcess(ctx)
+		var kept []*regularFile
 		for _, file := range files {
-			file.prepareLiveFork()
+			if file.prepareLiveFork(share) {
+				kept = append(kept, file)
+			}
+		}
+		if fs.diskVolume != nil && len(kept) != 0 {
+			// The next fork that leaves the process must invalidate them.
+			fs.liveForkMu.Lock()
+			if fs.diskForkFiles == nil {
+				fs.diskForkFiles = make(map[*regularFile]struct{}, len(kept))
+			}
+			for _, file := range kept {
+				fs.diskForkFiles[file] = struct{}{}
+			}
+			fs.liveForkMu.Unlock()
 		}
 		filesDone := time.Now()
 		if fs.diskVolume != nil && vfs.LiveForkBranchesPreparedFromContext(ctx) {

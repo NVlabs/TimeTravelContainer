@@ -124,7 +124,7 @@ func TestPrepareLiveForkPreservesPrivatePMAs(t *testing.T) {
 	}
 	defer rf.RemoveMapping(ctx, ms, ar, 0, true)
 
-	rf.prepareLiveFork()
+	rf.prepareLiveFork(true /* share */)
 	if !ms.invalidated {
 		t.Fatal("prepareLiveFork did not invalidate file-backed translations")
 	}
@@ -133,7 +133,7 @@ func TestPrepareLiveForkPreservesPrivatePMAs(t *testing.T) {
 	}
 }
 
-func TestDiskVolumeAfterLoadRebuildsMmapReferences(t *testing.T) {
+func TestDiskVolumeAfterLoadCountsWritableMappings(t *testing.T) {
 	fs := &filesystem{diskVolume: &diskVolumeState{}}
 	rf := &regularFile{inode: inode{fs: fs}}
 	firstMS := &recordingMappingSpace{}
@@ -150,15 +150,19 @@ func TestDiskVolumeAfterLoadRebuildsMmapReferences(t *testing.T) {
 	// State restore reconstructs MappingSet directly instead of invoking
 	// regularFile.AddMapping. Model that here, including overlapping mappings
 	// of the same file range.
-	rf.mappings.AddMapping(firstMS, firstAR, 0, false)
+	rf.mappings.AddMapping(firstMS, firstAR, 0, true)
 	rf.mappings.AddMapping(secondMS, secondAR, hostarch.PageSize, false)
 	rf.afterLoad(contexttest.Context(t))
+	if got, want := rf.writableMappingPages, uint64(4); got != want {
+		t.Fatalf("restored file counts %d writable pages, want %d", got, want)
+	}
 
-	// Each removal must have a matching diskMmap reference. Before the restore
-	// reconstruction in afterLoad, the first removal panicked with a reference
-	// count underflow.
-	rf.RemoveMapping(contexttest.Context(t), firstMS, firstAR, 0, false)
+	// Removals must not underflow the count.
+	rf.RemoveMapping(contexttest.Context(t), firstMS, firstAR, 0, true)
 	rf.RemoveMapping(contexttest.Context(t), secondMS, secondAR, hostarch.PageSize, false)
+	if rf.writableMappingPages != 0 {
+		t.Fatalf("file counts %d writable pages after removals", rf.writableMappingPages)
+	}
 }
 
 func TestLiveForkPWriteFromSameMemoryManagerDoesNotReenterActiveLock(t *testing.T) {
@@ -182,7 +186,7 @@ func TestLiveForkPWriteFromSameMemoryManagerDoesNotReenterActiveLock(t *testing.
 		t.Fatalf("AddMapping: %v", err)
 	}
 	defer rf.RemoveMapping(ctx, ms, ar, 0, true)
-	rf.prepareLiveFork()
+	rf.prepareLiveFork(true /* share */)
 	ms.invalidated = false
 
 	src := usermem.IOSequence{
@@ -221,7 +225,7 @@ func TestLiveForkCopyOnWriteSkipsAdjacentRange(t *testing.T) {
 		t.Fatalf("initial PWrite: n=%d err=%v", n, err)
 	}
 	rf := fd.Impl().(*regularFileFD).inode().impl.(*regularFile)
-	rf.prepareLiveFork()
+	rf.prepareLiveFork(true /* share */)
 
 	// Leave a CoW range that ends exactly where the requested translation
 	// starts. FileRangeSet.LowerBoundSegment may return that preceding segment,
@@ -249,7 +253,7 @@ func TestLiveForkCopyOnWriteRemovesFinalRange(t *testing.T) {
 		t.Fatalf("initial PWrite: n=%d err=%v", n, err)
 	}
 	rf := fd.Impl().(*regularFileFD).inode().impl.(*regularFile)
-	rf.prepareLiveFork()
+	rf.prepareLiveFork(true /* share */)
 
 	rf.dataMu.Lock()
 	err = rf.copyOnWriteLocked(ctx, memmap.MappableRange{Start: 0, End: hostarch.PageSize})
@@ -561,5 +565,29 @@ func TestTruncate(t *testing.T) {
 	}
 	if got := statAfterTruncateUp.Ctime.ToNsec(); got <= statAfterTruncateDown.Ctime.ToNsec() {
 		t.Errorf("fd.Stat got Ctime %v, want > %v", got, stat.Ctime)
+	}
+}
+
+func TestDiskVolumeLiveForkKeepsInheritedTranslationsTracked(t *testing.T) {
+	ctx := contexttest.Context(t)
+	fs := &filesystem{diskVolume: &diskVolumeState{}}
+	rf := &regularFile{inode: inode{fs: fs}}
+	ms := &recordingMappingSpace{}
+	ar := hostarch.AddrRange{Start: 0x10000, End: 0x10000 + hostarch.PageSize}
+	// A fork's child has its parent's mappings, and translations, without
+	// a mapping of the file's object of its own.
+	rf.mappings.AddMapping(ms, ar, 0, false)
+	rf.afterLoad(ctx)
+	if !rf.prepareLiveFork(true /* share */) {
+		t.Fatal("an in-process fork stopped tracking the child's inherited translations")
+	}
+	if ms.invalidated {
+		t.Fatal("an in-process fork invalidated translations of a sealed object")
+	}
+	if rf.prepareLiveFork(false /* share */) {
+		t.Fatal("a fork that leaves the process kept the file's translations")
+	}
+	if !ms.invalidated {
+		t.Fatal("a fork that leaves the process did not invalidate the inherited translations")
 	}
 }

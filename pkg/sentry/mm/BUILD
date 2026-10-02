@@ -194,6 +194,7 @@ go_test(
         "//pkg/sentry/limits",
         "//pkg/sentry/memmap",
         "//pkg/sentry/pgalloc",
+        "//pkg/safemem",
         "//pkg/sentry/platform",
         "//pkg/usermem",
     ],

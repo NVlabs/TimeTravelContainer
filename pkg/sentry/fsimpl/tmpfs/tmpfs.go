@@ -1082,7 +1082,7 @@ func (i *inode) decRef(ctx context.Context) {
 			if i.fs.diskVolume != nil {
 				impl.invalidateDiskIO()
 				i.fs.adjustDiskBytes(impl.size.Load(), 0)
-				impl.diskMmap.MappableRelease()
+				impl.releaseDiskMap()
 				break
 			}
 			// Release memory used by regFile to store data. Since regFile is

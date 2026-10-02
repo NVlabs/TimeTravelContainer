@@ -113,13 +113,14 @@ type contextID int
 
 const (
 	// CtxLiveForkInProcess is a Context.Value key for whether
-	// Mappable.InvalidateUnsavable prepares a live fork whose child is in the
-	// same process, and shares its MemoryFile.
+	// Mappable.InvalidateUnsavable, or a filesystem's preparation for a save,
+	// prepares a live fork whose child is in the same process, and shares
+	// its MemoryFile.
 	CtxLiveForkInProcess contextID = iota
 )
 
-// IsLiveForkInProcess reports whether ctx's Mappable.InvalidateUnsavable
-// prepares a live fork whose child shares the process's MemoryFile.
+// IsLiveForkInProcess reports whether ctx prepares a live fork whose child
+// shares the process's MemoryFile.
 func IsLiveForkInProcess(ctx context.Context) bool {
 	v, _ := ctx.Value(CtxLiveForkInProcess).(bool)
 	return v
@@ -647,6 +648,16 @@ func MapInternalForPMA(file File, fr FileRange, at hostarch.AccessType) (safemem
 		return file.MapInternalForPMA(fr, at)
 	}
 	return file.MapInternal(fr, at)
+}
+
+// LiveForkSharedFile is implemented by Files whose pages may be immutable,
+// which a live fork's child, in its parent's process, may then map as its
+// parent does, rather than fault on them again.
+type LiveForkSharedFile interface {
+	File
+
+	// LiveForkShared reports whether the File's pages are immutable.
+	LiveForkShared() bool
 }
 
 // HostMemoryFile is implemented by Files whose contents are memory that the
