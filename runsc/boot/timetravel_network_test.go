@@ -48,6 +48,21 @@ func newTimeTravelNetworkTestStackWithState(t *testing.T, cfg TimeTravelNetworkC
 	return s
 }
 
+func TestTimeTravelNetworkInterfaceName(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		want string
+	}{
+		{"", "eth0"},
+		{"ttc0", "ttc0"},
+	} {
+		s := newTimeTravelNetworkTestStackWithConfig(t, TimeTravelNetworkConfig{InterfaceName: tc.name})
+		if nic, ok := s.Interfaces()[int32(timeTravelNICID)]; !ok || nic.Name != tc.want {
+			t.Errorf("InterfaceName %q: NIC %+v, want one named %q", tc.name, nic, tc.want)
+		}
+	}
+}
+
 func TestTimeTravelNetworkCanStartQuarantinedAndReconnect(t *testing.T) {
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
@@ -216,7 +231,7 @@ func TestTimeTravelNetworkRuntimeLinkReplacementPreservesListener(t *testing.T) 
 	defer listener.Close()
 	port := uint16(listener.Addr().(*net.TCPAddr).Port)
 
-	// Distributed restore replaces the runtime-only side of ttc0 after the
+	// Distributed restore replaces the runtime-only side of the NIC after the
 	// guest's complete netstack, including this listener, has been decoded.
 	s.Pause()
 	if err := configureTimeTravelNetwork(s, TimeTravelNetworkConfig{NAT: true}, false, false); err != nil {

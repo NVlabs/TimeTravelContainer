@@ -9,6 +9,7 @@ go_library(
     name = "sandbox",
     force_add_state_pkg = True,
     srcs = [
+        "gfx.go",
         "network.go",
         "network_darwin.go",
         "network_unsafe.go",

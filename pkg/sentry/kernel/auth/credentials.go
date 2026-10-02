@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package auth
 
 import (
@@ -54,7 +57,12 @@ type Credentials struct {
 
 	// KeepCaps is the flag for PR_SET_KEEPCAPS which allow capabilities to be
 	// maintained after a switch from root user to non-root user via setuid().
+	// It is securebits' SECBIT_KEEP_CAPS.
 	KeepCaps bool
+
+	// SecureBits are the securebits flags, linux.SECBIT_*, but for
+	// SECBIT_KEEP_CAPS, which KeepCaps holds.
+	SecureBits uint32
 
 	// The user namespace associated with the owner of the credentials.
 	UserNamespace *UserNamespace

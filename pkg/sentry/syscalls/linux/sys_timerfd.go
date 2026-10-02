@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package linux
 
 import (
@@ -42,12 +45,15 @@ func TimerfdCreate(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (u
 
 	var clock ktime.Clock
 	switch clockID {
-	case linux.CLOCK_REALTIME:
+	case linux.CLOCK_REALTIME, linux.CLOCK_REALTIME_ALARM:
 		clock = t.Kernel().RealtimeClock()
-	case linux.CLOCK_MONOTONIC, linux.CLOCK_BOOTTIME:
+	case linux.CLOCK_MONOTONIC, linux.CLOCK_BOOTTIME, linux.CLOCK_BOOTTIME_ALARM:
 		clock = t.Kernel().MonotonicClock()
 	default:
 		return 0, nil, linuxerr.EINVAL
+	}
+	if err := checkAlarmClock(t, clockID); err != nil {
+		return 0, nil, err
 	}
 	vfsObj := t.Kernel().VFS()
 	file, err := timerfd.New(t, vfsObj, clock, fileFlags)

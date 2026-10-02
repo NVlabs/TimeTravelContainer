@@ -169,6 +169,7 @@ func (app *runApp) execute(t *Task) taskRunState {
 	// mask, restore it. (Note that restoring the saved signal mask may unblock
 	// a pending signal, causing another interruption, but that signal should
 	// not interact with the interrupted syscall.)
+	restarting := false
 	if t.haveSyscallReturn {
 		if err := t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch()); err != nil {
 			t.Warningf("Unable to pull a full state: %v", err)
@@ -184,6 +185,7 @@ func (app *runApp) execute(t *Task) taskRunState {
 				t.Debugf("Restarting syscall %d: not interrupted by handled signal", t.Arch().SyscallNo())
 				t.Arch().RestartSyscall()
 			}
+			restarting = true
 		}
 		t.haveSyscallReturn = false
 	}
@@ -196,6 +198,7 @@ func (app *runApp) execute(t *Task) taskRunState {
 	}
 
 	// Apply restartable sequences.
+	restartIP := t.Arch().IP()
 	if t.rseqPreempted {
 		t.rseqPreempted = false
 		if t.rseqAddr != 0 || t.oldRSeqCPUAddr != 0 {
@@ -216,6 +219,18 @@ func (app *runApp) execute(t *Task) taskRunState {
 			}
 		}
 		t.rseqInterrupt()
+	}
+
+	// The application would only execute the syscall instruction again:
+	// restart the syscall here instead, unless a tracer may watch the
+	// instruction or a restartable sequence moved the task away from it.
+	// After a pause, such as a checkpoint's or a live fork's, every task
+	// that was blocked in a syscall restarts it at once; on platforms whose
+	// application contexts are scarce, such as HVF's vCPUs, each would
+	// otherwise wait its turn for one only to block again.
+	if restarting && t.Arch().IP() == restartIP && !t.hasTracer() {
+		t.Arch().ReenterRestartedSyscall()
+		return t.doSyscall()
 	}
 
 	// Check if we need to enable single-stepping. Tracers expect that the

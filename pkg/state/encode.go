@@ -51,6 +51,9 @@ type objectEncodeState struct {
 	// references may be updated directly and automatically.
 	refs []*wire.Ref
 
+	// clone is the object's copy, for Clone.
+	clone *cloneObject
+
 	deferredEntry
 }
 
@@ -482,10 +485,17 @@ type objectEncoder struct {
 
 	// encoded is the encoded struct.
 	encoded *wire.Struct
+
+	// cr, if not nil, records the struct for Clone instead.
+	cr *cloneRecorder
 }
 
 // save is called by the public methods on Sink.
 func (oe *objectEncoder) save(slot int, obj reflect.Value) {
+	if oe.cr != nil {
+		oe.cr.save(slot, obj)
+		return
+	}
 	fieldValue := oe.encoded.Field(slot)
 	oe.es.encodeObject(obj, encodeDefault, fieldValue)
 }
@@ -553,6 +563,15 @@ func (es *encodeState) encodeStruct(obj reflect.Value, dest *wire.Object) {
 // encodeArray encodes an array.
 func (es *encodeState) encodeArray(obj reflect.Value, dest *wire.Object) {
 	l := obj.Len()
+	// Encode an array of bytes, such as the backing array of a []byte, as a
+	// string: element by element, each byte would cost a wire.Object, and
+	// reflection, which for a GPU's snapshot of hundreds of megabytes takes
+	// seconds and gigabytes.
+	if obj.Type().Elem() == byteType && l > 0 && obj.Index(0).CanAddr() {
+		s := wire.String(byteArrayBytes(obj)) // Copies.
+		*dest = &s
+		return
+	}
 	a := &wire.Array{
 		Contents: make([]wire.Object, l),
 	}

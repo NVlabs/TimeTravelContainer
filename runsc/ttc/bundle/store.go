@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -34,6 +35,7 @@ import (
 	"gvisor.dev/gvisor/pkg/ttcpack"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
+	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
 	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
 	"gvisor.dev/gvisor/runsc/ttc/images"
@@ -47,6 +49,12 @@ const (
 	hostMountRepositoryDir   = "host-mounts"
 	// DefaultLogDriver is the persistent logging policy used when none is specified.
 	DefaultLogDriver = "local"
+	// DefaultNetworkInterface is the guest's name for the ttc virtual NIC
+	// when none is specified: eth0, as Docker names a container's interface.
+	DefaultNetworkInterface = "eth0"
+	// LegacyNetworkInterface named the ttc virtual NIC of containers created
+	// before their records held its name.
+	LegacyNetworkInterface = "ttc0"
 )
 
 // removedContainerDir is outside the active container namespace so that a
@@ -520,10 +528,21 @@ type PrepareOptions struct {
 	NetworkNAT         bool
 	NetworkIP          string
 	NetworkMAC         string
+	NetworkInterface   string
 	PublishedPorts     []PortBinding
 	WaiveLiveFork      bool
 	LiveForkWaiver     string
 	Progress           images.ProgressFunc
+	// GPUOptions are the family's GPU devices.
+	GPUOptions
+	// DeviceMounts are read-only mounts of the guest's side of the family's
+	// devices, which the daemon provides: user-space drivers, and the files
+	// that make the guest's libraries find them.
+	DeviceMounts []HostMount
+	// DeviceEnv are the environment variables, NAME=VALUE, that make the
+	// guest's libraries use the family's devices. A container gets those that
+	// its image and options leave unset.
+	DeviceEnv []string
 	// VolumeCopyMode is the copy policy already verified by ttcd at startup.
 	// Empty permits Store-only callers to probe either supported mode.
 	VolumeCopyMode ttcvolume.CopyMode
@@ -671,20 +690,27 @@ type BranchInfo struct {
 	// containing a process-free branch's kernel/process metadata. They are
 	// present only while a branch is dehydrated; live branches have already
 	// consumed this auxiliary snapshot root.
-	ControlRoot               string    `json:"control_root,omitempty"`
-	ControlRootObject         string    `json:"control_root_object,omitempty"`
-	ForkTotalNS               int64     `json:"fork_total_ns,omitempty"`
-	SourceDowntimeNS          int64     `json:"source_downtime_ns,omitempty"`
-	KernelForkNS              int64     `json:"kernel_fork_ns,omitempty"`
-	ForkValidationNS          int64     `json:"fork_validation_ns,omitempty"`
-	ForkSharedMemoryNS        int64     `json:"fork_shared_memory_ns,omitempty"`
-	ForkMappingInvalidationNS int64     `json:"fork_mapping_invalidation_ns,omitempty"`
-	ForkVFSPreparationNS      int64     `json:"fork_vfs_preparation_ns,omitempty"`
-	ForkMemoryPreparationNS   int64     `json:"fork_memory_preparation_ns,omitempty"`
-	ForkMetadataStreamNS      int64     `json:"fork_metadata_stream_ns,omitempty"`
-	ForkMetadataBytes         int64     `json:"fork_metadata_bytes,omitempty"`
-	ForkChildRestoreNS        int64     `json:"fork_child_restore_ns,omitempty"`
-	CreatedAt                 time.Time `json:"created_at"`
+	ControlRoot                 string    `json:"control_root,omitempty"`
+	ControlRootObject           string    `json:"control_root_object,omitempty"`
+	ForkTotalNS                 int64     `json:"fork_total_ns,omitempty"`
+	SourceDowntimeNS            int64     `json:"source_downtime_ns,omitempty"`
+	KernelForkNS                int64     `json:"kernel_fork_ns,omitempty"`
+	ForkValidationNS            int64     `json:"fork_validation_ns,omitempty"`
+	ForkSharedMemoryNS          int64     `json:"fork_shared_memory_ns,omitempty"`
+	ForkMappingInvalidationNS   int64     `json:"fork_mapping_invalidation_ns,omitempty"`
+	ForkVFSPreparationNS        int64     `json:"fork_vfs_preparation_ns,omitempty"`
+	ForkDevicePreparationNS     int64     `json:"fork_device_preparation_ns,omitempty"`
+	ForkFSMetadataFlushNS       int64     `json:"fork_fs_metadata_flush_ns,omitempty"`
+	ForkFSRuntimeInvalidationNS int64     `json:"fork_fs_runtime_invalidation_ns,omitempty"`
+	ForkFSBranchSealNS          int64     `json:"fork_fs_branch_seal_ns,omitempty"`
+	ForkFSNamespacePruneNS      int64     `json:"fork_fs_namespace_prune_ns,omitempty"`
+	ForkMemoryPreparationNS     int64     `json:"fork_memory_preparation_ns,omitempty"`
+	ForkMetadataStreamNS        int64     `json:"fork_metadata_stream_ns,omitempty"`
+	ForkMetadataBytes           int64     `json:"fork_metadata_bytes,omitempty"`
+	ForkMetadataRecordNS        int64     `json:"fork_metadata_record_ns,omitempty"`
+	ForkMetadataObjects         int64     `json:"fork_metadata_objects,omitempty"`
+	ForkChildRestoreNS          int64     `json:"fork_child_restore_ns,omitempty"`
+	CreatedAt                   time.Time `json:"created_at"`
 }
 
 // RuntimeMemoryBacking retains an immutable process-memory graph while a live
@@ -802,6 +828,7 @@ type ContainerInfo struct {
 	NetworkNAT                   bool                             `json:"network_nat,omitempty"`
 	NetworkIP                    string                           `json:"network_ip,omitempty"`
 	NetworkMAC                   string                           `json:"network_mac,omitempty"`
+	NetworkInterface             string                           `json:"network_interface,omitempty"`
 	PublishedPorts               []PortBinding                    `json:"published_ports,omitempty"`
 	LogDriver                    string                           `json:"log_driver,omitempty"`
 	LogOptions                   map[string]string                `json:"log_options,omitempty"`
@@ -851,6 +878,17 @@ type ContainerInfo struct {
 	// still exist in the authority. Such a record intentionally has no local branches;
 	// user-visible branch inventory is synthesized from placement authority.
 	DistributedCatalogOnly bool `json:"distributed_catalog_only,omitempty"`
+	// GPUOptions are the family's GPU devices.
+	GPUOptions
+}
+
+// TTCNetworkInterface returns the guest's name for the container's ttc
+// virtual NIC.
+func (info ContainerInfo) TTCNetworkInterface() string {
+	if info.NetworkInterface != "" {
+		return info.NetworkInterface
+	}
+	return LegacyNetworkInterface
 }
 
 // IsDistributedPhysicalRuntime reports whether info is a node-local physical
@@ -1018,12 +1056,18 @@ func ensureNetworkMountpoints(rootfs string) error {
 	if err != nil {
 		return fmt.Errorf("loading rootfs ownership for network mountpoints: %w", err)
 	}
-	etc := filepath.Join(rootfs, "etc")
+	// Android's images link /etc to /system/etc: the container's mounts on
+	// /etc follow the link, and so do their mountpoints.
+	etcPath, err := resolveInRootfs(rootfs, "etc")
+	if err != nil {
+		return fmt.Errorf("resolving rootfs /etc: %w", err)
+	}
+	etc := filepath.Join(rootfs, etcPath)
 	if info, err := os.Lstat(etc); os.IsNotExist(err) {
 		if err := os.Mkdir(etc, 0755); err != nil {
 			return fmt.Errorf("creating rootfs /etc mountpoint directory: %w", err)
 		}
-		manifest.Entries["etc"] = ownership.Owner{}
+		manifest.Entries[filepath.ToSlash(etcPath)] = ownership.Owner{}
 	} else if err != nil {
 		return fmt.Errorf("checking rootfs /etc mountpoint directory: %w", err)
 	} else if !info.IsDir() {
@@ -1037,7 +1081,7 @@ func ensureNetworkMountpoints(rootfs string) error {
 		case err != nil:
 			return fmt.Errorf("checking rootfs /etc/%s mountpoint: %w", base, err)
 		case info.Mode().IsRegular():
-			manifest.Entries[filepath.ToSlash(filepath.Join("etc", base))] = ownership.Owner{}
+			manifest.Entries[filepath.ToSlash(filepath.Join(etcPath, base))] = ownership.Owner{}
 			continue
 		case info.Mode()&os.ModeSymlink != 0:
 			if err := os.Remove(name); err != nil {
@@ -1049,12 +1093,67 @@ func ensureNetworkMountpoints(rootfs string) error {
 		if err := os.WriteFile(name, nil, 0644); err != nil {
 			return fmt.Errorf("creating rootfs /etc/%s mountpoint: %w", base, err)
 		}
-		manifest.Entries[filepath.ToSlash(filepath.Join("etc", base))] = ownership.Owner{}
+		manifest.Entries[filepath.ToSlash(filepath.Join(etcPath, base))] = ownership.Owner{}
 	}
 	if err := ownership.Write(manifestName, manifest); err != nil {
 		return fmt.Errorf("updating rootfs ownership for network mountpoints: %w", err)
 	}
 	return nil
+}
+
+// resolveInRootfs returns the path, relative to rootfs, that the container
+// reaches by name, a path relative to its root: it follows the symbolic
+// links on the way, as the container would, without leaving rootfs. The
+// components after the first that does not exist are taken as they are.
+func resolveInRootfs(rootfs, name string) (string, error) {
+	const maxLinks = 40
+	links := 0
+	missing := false
+	var resolved []string
+	pending := strings.Split(filepath.ToSlash(name), "/")
+	for len(pending) != 0 {
+		component := pending[0]
+		pending = pending[1:]
+		switch component {
+		case "", ".":
+			continue
+		case "..":
+			if len(resolved) != 0 {
+				resolved = resolved[:len(resolved)-1]
+			}
+			continue
+		}
+		if missing {
+			resolved = append(resolved, component)
+			continue
+		}
+		host := filepath.Join(append([]string{rootfs}, append(resolved, component)...)...)
+		info, err := os.Lstat(host)
+		if os.IsNotExist(err) {
+			missing = true
+			resolved = append(resolved, component)
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			resolved = append(resolved, component)
+			continue
+		}
+		if links++; links > maxLinks {
+			return "", fmt.Errorf("%q: %w", name, syscall.ELOOP)
+		}
+		target, err := os.Readlink(host)
+		if err != nil {
+			return "", err
+		}
+		if strings.HasPrefix(target, "/") {
+			resolved = nil
+		}
+		pending = append(strings.Split(target, "/"), pending...)
+	}
+	return filepath.Join(resolved...), nil
 }
 
 // rehomeInternalMounts gives a distributed target its own copies of TTC's
@@ -1433,6 +1532,18 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if (opts.NetworkIP != "" || opts.NetworkMAC != "") && networkMode != "ttc" {
 		return Prepared{}, fmt.Errorf("custom IP and MAC addresses require network mode ttc")
 	}
+	if opts.NetworkInterface != "" {
+		if networkMode != "ttc" {
+			return Prepared{}, fmt.Errorf("a custom interface name requires network mode ttc")
+		}
+		if err := config.ValidateNetworkInterfaceName(opts.NetworkInterface); err != nil {
+			return Prepared{}, err
+		}
+	} else if networkMode == "ttc" {
+		// Record the name, so that the container keeps it whatever later
+		// releases default to.
+		opts.NetworkInterface = DefaultNetworkInterface
+	}
 	if len(opts.PublishedPorts) != 0 && networkMode != "ttc" {
 		return Prepared{}, fmt.Errorf("published ports require network mode ttc")
 	}
@@ -1445,6 +1556,9 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	}
 	if !liveForkEligible && opts.LiveForkWaiver == "" {
 		return Prepared{}, fmt.Errorf("ineligible container requires an explicit live fork waiver")
+	}
+	if err := ValidateGPUOptions(opts.GPUOptions, liveForkEligible, runtime.GOOS); err != nil {
+		return Prepared{}, err
 	}
 	opts.SpecOptions.WaiveLiveFork = opts.WaiveLiveFork
 	opts.ExtraHosts, err = ParseExtraHosts(opts.ExtraHosts)
@@ -1550,6 +1664,11 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		return Prepared{}, err
 	}
 	opts.HostMounts = append(opts.HostMounts, internalMounts...)
+	for _, mount := range opts.DeviceMounts {
+		mount.Readonly = true
+		mount.Internal = true
+		opts.HostMounts = append(opts.HostMounts, mount)
+	}
 	opts.SpecOptions.RootFS = rootfs
 	if hasHardResourceLimits(opts.SpecOptions) {
 		opts.SpecOptions.CgroupsPath = filepath.Join("ttc", id)
@@ -1558,6 +1677,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if err != nil {
 		return Prepared{}, err
 	}
+	spec.Process.Env = addDefaultEnv(spec.Process.Env, opts.DeviceEnv)
 	if s.CPUFeatures != "" {
 		if spec.Annotations == nil {
 			spec.Annotations = make(map[string]string)
@@ -1599,7 +1719,9 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		NetworkNAT:          opts.NetworkNAT,
 		NetworkIP:           opts.NetworkIP,
 		NetworkMAC:          opts.NetworkMAC,
+		NetworkInterface:    opts.NetworkInterface,
 		PublishedPorts:      append([]PortBinding(nil), opts.PublishedPorts...),
+		GPUOptions:          opts.GPUOptions,
 		LogDriver:           logDriver,
 		LogOptions:          cloneStringMap(opts.LogOptions),
 		LogAttributes:       logAttributes,
@@ -3333,6 +3455,9 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 	}
 	if !info.LiveForkEligible && info.LiveForkWaiver == "" {
 		return ContainerInfo{}, fmt.Errorf("container %q is not live-fork eligible but has no waiver", key)
+	}
+	if err := checkGPURecord(info.GPUOptions, info.LiveForkEligible); err != nil {
+		return ContainerInfo{}, fmt.Errorf("container %q has invalid GPU options: %w", key, err)
 	}
 	if len(info.PublishedPorts) != 0 && networkMode != "ttc" {
 		return ContainerInfo{}, fmt.Errorf("container %q publishes ports with network mode %q", key, networkMode)

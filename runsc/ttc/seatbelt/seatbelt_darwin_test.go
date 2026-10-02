@@ -48,6 +48,44 @@ func TestHelperProcess(t *testing.T) {
 		fmt.Fprintf(os.Stderr, format+"\n", args...)
 		os.Exit(1)
 	}
+	if os.Getenv(helperProfileEnv) == "renderer" {
+		// The file is admitted by its path through a symbolic link, and by
+		// its own, as the renderer admits its executable.
+		linked := filepath.Join(dir, "link", "readable")
+		readable := filepath.Join(dir, "real", "readable")
+		profile, err := RendererProfile([]string{linked, readable})
+		if err != nil {
+			fail("RendererProfile: %v", err)
+		}
+		if err := Apply(profile); err != nil {
+			fail("Apply(RendererProfile): %v", err)
+		}
+		if data, err := os.ReadFile(linked); err != nil || string(data) != "readable" {
+			fail("reading a file the profile admits: %q, %v", data, err)
+		}
+		// Resolving the path reads the link: CoreFoundation does, for the
+		// executable's.
+		if resolved, err := filepath.EvalSymlinks(linked); err != nil || resolved != readable {
+			fail("resolving the path of a file the profile admits: %q, %v", resolved, err)
+		}
+		if _, err := os.ReadFile(filepath.Join(dir, "secret")); !errors.Is(err, syscall.EPERM) {
+			fail("reading a file the profile does not admit: %v, want EPERM", err)
+		}
+		if _, err := os.ReadDir(filepath.Join(dir, "real")); err == nil {
+			fail("listed the directory of a file the profile admits")
+		}
+		if err := os.WriteFile(filepath.Join(dir, "written"), []byte("x"), 0600); err == nil {
+			fail("wrote a file, which the profile denies")
+		}
+		if conn, err := net.Dial("tcp", address); err == nil {
+			conn.Close()
+			fail("connected to %s, which the profile denies", address)
+		}
+		if err := exec.Command("/usr/bin/true").Run(); err == nil {
+			fail("started a process, which the profile denies")
+		}
+		os.Exit(0)
+	}
 	if os.Getenv(helperProfileEnv) == "daemon" {
 		// A daemon started by a confined one confines itself again.
 		for i := 0; i < 2; i++ {
@@ -163,5 +201,57 @@ func TestDaemonProfile(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
 			t.Errorf("file the confined process was to write: %v", err)
 		}
+	}
+}
+
+func TestRendererProfile(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+	// Resolve the directory, as the renderer resolves its files: macOS's
+	// temporary directories are under a symbolic link, /var.
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "real"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("real", filepath.Join(dir, "link")); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"real/readable", "secret"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(filepath.Base(name)), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	child := exec.Command(os.Args[0], "-test.run=^TestHelperProcess$")
+	child.Env = append(os.Environ(), helperProfileEnv+"=renderer", helperDirEnv+"="+dir, helperAddressEnv+"="+listener.Addr().String())
+	if output, err := child.CombinedOutput(); err != nil {
+		t.Fatalf("process confined to RendererProfile: %v\n%s", err, output)
+	}
+}
+
+func TestRendererProfileQuotes(t *testing.T) {
+	profile, err := RendererProfile([]string{`/a "b" \c`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `(literal "/a \"b\" \\c")`; !strings.Contains(profile, want) {
+		t.Errorf("profile has no %s:\n%s", want, profile)
+	}
+	if _, err := RendererProfile([]string{"/a\nb"}); err == nil {
+		t.Error("a path with a newline was accepted")
 	}
 }

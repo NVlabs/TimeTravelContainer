@@ -70,3 +70,10 @@ func (c *Context64) RestartSyscallWithRestartBlock() {
 	c.Regs.Rip -= SyscallWidth
 	c.Regs.Rax = uint64(restartSyscallNr)
 }
+
+// ReenterRestartedSyscall implements Context.ReenterRestartedSyscall. The
+// syscall instruction leaves RCX and R11 as its first execution did.
+func (c *Context64) ReenterRestartedSyscall() {
+	c.Regs.Rip += SyscallWidth
+	c.Regs.Orig_rax = c.Regs.Rax
+}

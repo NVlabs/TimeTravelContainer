@@ -180,6 +180,18 @@ func (s *Stack) sendDeleteEvent(ctx context.Context, id tcpip.NICID, nicInfo *st
 	s.eventSubscriber.OnInterfaceDeleteEvent(ctx, int32(id), makeInterfaceInfo(nicInfo))
 }
 
+// sendAddrEvent tells subscribers that an interface gained an address, or
+// with added false, lost one. Netlink listeners such as Android's IpClient
+// learn the interface's addresses from these events alone.
+func (s *Stack) sendAddrEvent(idx int32, addr inet.InterfaceAddr, added bool) {
+	if s.eventSubscriber == nil {
+		return
+	}
+	// Delivery queues messages on the listeners' sockets, which needs no
+	// task.
+	s.eventSubscriber.OnInterfaceAddrEvent(context.Background(), idx, addr, added)
+}
+
 // Destroy implements inet.Stack.Destroy.
 func (s *Stack) Destroy() {
 	if s.liveForkNetwork != nil && s.liveForkNetwork.Close != nil {
@@ -831,6 +843,7 @@ func (s *Stack) AddInterfaceAddr(idx int32, addr inet.InterfaceAddr) error {
 	if err := s.Stack.AddProtocolAddress(nicID, protocolAddress, stack.AddressProperties{}); err != nil {
 		return syserr.TranslateNetstackError(err).ToError()
 	}
+	s.sendAddrEvent(idx, addr, true /* added */)
 
 	// Add route for local network if it doesn't exist already.
 	localRoute := tcpip.Route{
@@ -863,6 +876,7 @@ func (s *Stack) RemoveInterfaceAddr(idx int32, addr inet.InterfaceAddr) error {
 	if err := s.Stack.RemoveAddress(nicID, protocolAddress.AddressWithPrefix.Address); err != nil {
 		return syserr.TranslateNetstackError(err).ToError()
 	}
+	s.sendAddrEvent(idx, addr, false /* added */)
 
 	// Remove the corresponding local network route if it exists.
 	localRoute := tcpip.Route{

@@ -24,6 +24,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -48,6 +49,7 @@ import (
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 
 	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/processutil"
@@ -1496,14 +1498,81 @@ func parseNetworkMode(value string) (string, error) {
 	}
 }
 
-func liveForkWaiverReason(waived bool, networkMode string) string {
+func liveForkWaiverReason(waived bool, networkMode string, gpu ttcbundle.GPUOptions) string {
 	if !waived {
 		return ""
 	}
 	if networkMode == "host" {
 		return "explicit waiver for host networking"
 	}
+	if gpu.GFX && gpu.GFXFork == "" {
+		return "explicit waiver for the virtual GPU"
+	}
 	return "explicitly waived during container creation"
+}
+
+// gpuFlags are the GPU options of ttc run and ttc create.
+type gpuFlags struct {
+	gfx         *bool
+	gfxFork     *string
+	nvproxy     nvproxyFlag
+	nvproxyFork *string
+}
+
+func addGPUFlags(fs *flag.FlagSet) *gpuFlags {
+	f := &gpuFlags{}
+	f.gfx = fs.Bool("gfx", false, "give the container a virtual GPU, /dev/dri/renderD128")
+	f.gfxFork = fs.String("gfx-fork", "", "what a live fork does with the virtual GPU while it is in use: device-lost or snapshot; without it, a --gfx family must waive live forks")
+	fs.Var(&f.nvproxy, "nvproxy", "give the container the host's NVIDIA GPUs; --nvproxy=CAPS limits the driver capabilities")
+	f.nvproxyFork = fs.String("nvproxy-fork", "", "what a live fork does with NVIDIA GPUs while they are in use: device-lost or snapshot")
+	return f
+}
+
+func (f *gpuFlags) options() ttcbundle.GPUOptions {
+	return ttcbundle.GPUOptions{
+		GFX:         *f.gfx,
+		GFXFork:     *f.gfxFork,
+		NVProxy:     f.nvproxy.enabled,
+		NVProxyCaps: f.nvproxy.caps,
+		NVProxyFork: *f.nvproxyFork,
+	}
+}
+
+// nvproxyFlag is --nvproxy[=CAPS].
+type nvproxyFlag struct {
+	enabled bool
+	caps    string
+}
+
+// String implements flag.Value.String.
+func (f *nvproxyFlag) String() string {
+	if f == nil || !f.enabled {
+		return "false"
+	}
+	if f.caps != "" {
+		return f.caps
+	}
+	return "true"
+}
+
+// Set implements flag.Value.Set.
+func (f *nvproxyFlag) Set(value string) error {
+	switch value {
+	case "true":
+		f.enabled, f.caps = true, ""
+	case "false":
+		f.enabled, f.caps = false, ""
+	case "":
+		return errors.New("--nvproxy= needs driver capabilities, such as compute,utility")
+	default:
+		f.enabled, f.caps = true, value
+	}
+	return nil
+}
+
+// IsBoolFlag implements flag's boolFlag, so that --nvproxy takes no value.
+func (f *nvproxyFlag) IsBoolFlag() bool {
+	return true
 }
 
 func validateLiveForkCreationPolicy(networkMode string, waived bool) error {
@@ -1513,9 +1582,14 @@ func validateLiveForkCreationPolicy(networkMode string, waived bool) error {
 	return nil
 }
 
-func validateVirtualNICOptions(networkMode, ipValue, macValue string) error {
-	if (ipValue != "" || macValue != "") && networkMode != "ttc" {
-		return errors.New("--ip and --mac-address require --network=ttc")
+func validateVirtualNICOptions(networkMode, ipValue, macValue, interfaceName string) error {
+	if (ipValue != "" || macValue != "" || interfaceName != "") && networkMode != "ttc" {
+		return errors.New("--ip, --mac-address, and --interface-name require --network=ttc")
+	}
+	if interfaceName != "" {
+		if err := config.ValidateNetworkInterfaceName(interfaceName); err != nil {
+			return fmt.Errorf("--interface-name: %w", err)
+		}
 	}
 	if ipValue != "" {
 		ip, err := netip.ParseAddr(ipValue)
@@ -1717,9 +1791,11 @@ type runRequest struct {
 	networkMode        string
 	liveForkEligible   bool
 	liveForkWaiver     string
+	gpu                ttcbundle.GPUOptions
 	networkNAT         bool
 	networkIP          string
 	networkMAC         string
+	networkInterface   string
 	publishedPorts     []ttcbundle.PortBinding
 	logDriver          string
 	extraHosts         []string
@@ -1799,7 +1875,7 @@ func flagWasSet(fs *flag.FlagSet, name string) bool {
 }
 
 func runContainer(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "dit", "--name", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--ip", "--mac-address", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--memory-swap", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
+	args = expandCombinedShortBools(args, "dit", "--name", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--ip", "--mac-address", "--interface-name", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--memory-swap", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt", "--gfx-fork", "--nvproxy-fork")
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -1831,9 +1907,11 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	fs.StringVar(hostname, "h", "", "container hostname")
 	networkModeValue := fs.String("network", "none", "network mode: none, host, or ttc")
 	waiveLiveFork := fs.Bool("waive-live-fork", false, "explicitly create a family that is not eligible for live fork")
+	gpu := addGPUFlags(fs)
 	networkNAT := fs.Bool("nat", false, "allow outbound host networking from a ttc virtual NIC")
 	networkIP := fs.String("ip", "", "IPv4 address for the ttc virtual NIC")
 	networkMAC := fs.String("mac-address", "", "MAC address for the ttc virtual NIC")
+	networkInterface := fs.String("interface-name", "", "guest's name for the ttc virtual NIC (default "+ttcbundle.DefaultNetworkInterface+")")
 	logDriverValue := fs.String("log-driver", ttcbundle.DefaultLogDriver, "logging driver: local, json-file, or none")
 	fs.StringVar(networkModeValue, "net", "none", "network mode: none, host, or ttc")
 	entrypoint := fs.String("entrypoint", "", "override the image entrypoint")
@@ -1907,10 +1985,14 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	if err := validateLiveForkCreationPolicy(networkMode, *waiveLiveFork); err != nil {
 		return err
 	}
+	gpuOptions := gpu.options()
+	if err := ttcbundle.ValidateGPUOptions(gpuOptions, !*waiveLiveFork, runtime.GOOS); err != nil {
+		return err
+	}
 	if *networkNAT && networkMode != "ttc" {
 		return errors.New("--nat requires --network=ttc")
 	}
-	if err := validateVirtualNICOptions(networkMode, *networkIP, *networkMAC); err != nil {
+	if err := validateVirtualNICOptions(networkMode, *networkIP, *networkMAC, *networkInterface); err != nil {
 		return err
 	}
 	publishedPorts, err := parsePublishedPorts(publishedPortValues)
@@ -2018,10 +2100,12 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		hostname:           *hostname,
 		networkMode:        networkMode,
 		liveForkEligible:   !*waiveLiveFork,
-		liveForkWaiver:     liveForkWaiverReason(*waiveLiveFork, networkMode),
+		liveForkWaiver:     liveForkWaiverReason(*waiveLiveFork, networkMode, gpuOptions),
+		gpu:                gpuOptions,
 		networkNAT:         *networkNAT,
 		networkIP:          *networkIP,
 		networkMAC:         strings.ToLower(*networkMAC),
+		networkInterface:   *networkInterface,
 		publishedPorts:     publishedPorts,
 		logDriver:          logDriver,
 		extraHosts:         parsedExtraHosts,
@@ -2076,7 +2160,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 }
 
 func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "it", "--name", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--ip", "--mac-address", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--memory-swap", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
+	args = expandCombinedShortBools(args, "it", "--name", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--ip", "--mac-address", "--interface-name", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--memory-swap", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt", "--gfx-fork", "--nvproxy-fork")
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -2106,9 +2190,11 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs.StringVar(hostname, "h", "", "container hostname")
 	networkModeValue := fs.String("network", "none", "network mode: none, host, or ttc")
 	waiveLiveFork := fs.Bool("waive-live-fork", false, "explicitly create a family that is not eligible for live fork")
+	gpu := addGPUFlags(fs)
 	networkNAT := fs.Bool("nat", false, "allow outbound host networking from a ttc virtual NIC")
 	networkIP := fs.String("ip", "", "IPv4 address for the ttc virtual NIC")
 	networkMAC := fs.String("mac-address", "", "MAC address for the ttc virtual NIC")
+	networkInterface := fs.String("interface-name", "", "guest's name for the ttc virtual NIC (default "+ttcbundle.DefaultNetworkInterface+")")
 	logDriverValue := fs.String("log-driver", ttcbundle.DefaultLogDriver, "logging driver: local, json-file, or none")
 	fs.StringVar(networkModeValue, "net", "none", "network mode: none, host, or ttc")
 	entrypoint := fs.String("entrypoint", "", "override the image entrypoint")
@@ -2182,10 +2268,14 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	if err := validateLiveForkCreationPolicy(networkMode, *waiveLiveFork); err != nil {
 		return err
 	}
+	gpuOptions := gpu.options()
+	if err := ttcbundle.ValidateGPUOptions(gpuOptions, !*waiveLiveFork, runtime.GOOS); err != nil {
+		return err
+	}
 	if *networkNAT && networkMode != "ttc" {
 		return errors.New("--nat requires --network=ttc")
 	}
-	if err := validateVirtualNICOptions(networkMode, *networkIP, *networkMAC); err != nil {
+	if err := validateVirtualNICOptions(networkMode, *networkIP, *networkMAC, *networkInterface); err != nil {
 		return err
 	}
 	publishedPorts, err := parsePublishedPorts(publishedPortValues)
@@ -2293,10 +2383,12 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		hostname:           *hostname,
 		networkMode:        networkMode,
 		liveForkEligible:   !*waiveLiveFork,
-		liveForkWaiver:     liveForkWaiverReason(*waiveLiveFork, networkMode),
+		liveForkWaiver:     liveForkWaiverReason(*waiveLiveFork, networkMode, gpuOptions),
+		gpu:                gpuOptions,
 		networkNAT:         *networkNAT,
 		networkIP:          *networkIP,
 		networkMAC:         strings.ToLower(*networkMAC),
+		networkInterface:   *networkInterface,
 		publishedPorts:     publishedPorts,
 		logDriver:          logDriver,
 		extraHosts:         parsedExtraHosts,
@@ -5657,40 +5749,47 @@ func (s selector) String() string {
 
 // Branch is stable branch metadata returned by ttc ls --json.
 type Branch struct {
-	ID                        string    `json:"id"`
-	Quarantined               bool      `json:"quarantined,omitempty"`
-	NodeID                    string    `json:"node_id,omitempty"`
-	ParentID                  string    `json:"parent,omitempty"`
-	State                     string    `json:"state"`
-	ExitStatus                *int      `json:"exit_status,omitempty"`
-	StorageState              string    `json:"storage_state"`
-	PublicationID             string    `json:"publication_id,omitempty"`
-	StorageError              string    `json:"storage_error,omitempty"`
-	StorageManifest           string    `json:"storage_manifest,omitempty"`
-	StorageRetryAt            time.Time `json:"storage_retry_at,omitempty"`
-	SnapshotID                uint64    `json:"snapshot_id,omitempty"`
-	MemoryRoots               []string  `json:"memory_roots,omitempty"`
-	MemoryRootObjects         []string  `json:"memory_root_objects,omitempty"`
-	ControlRoot               string    `json:"control_root,omitempty"`
-	ControlRootObject         string    `json:"control_root_object,omitempty"`
-	SourceNode                string    `json:"source_node,omitempty"`
-	DependentMemoryBytes      uint64    `json:"dependent_memory_bytes,omitempty"`
-	DependentFilesystemBytes  uint64    `json:"dependent_filesystem_bytes,omitempty"`
-	ForkTotalNS               int64     `json:"fork_total_ns,omitempty"`
-	SourceDowntimeNS          int64     `json:"source_downtime_ns,omitempty"`
-	KernelForkNS              int64     `json:"kernel_fork_ns,omitempty"`
-	ForkValidationNS          int64     `json:"fork_validation_ns,omitempty"`
-	ForkSharedMemoryNS        int64     `json:"fork_shared_memory_ns,omitempty"`
-	ForkMappingInvalidationNS int64     `json:"fork_mapping_invalidation_ns,omitempty"`
-	ForkVFSPreparationNS      int64     `json:"fork_vfs_preparation_ns,omitempty"`
-	ForkMemoryPreparationNS   int64     `json:"fork_memory_preparation_ns,omitempty"`
-	ForkMetadataStreamNS      int64     `json:"fork_metadata_stream_ns,omitempty"`
-	ForkMetadataBytes         int64     `json:"fork_metadata_bytes,omitempty"`
-	ForkChildRestoreNS        int64     `json:"fork_child_restore_ns,omitempty"`
-	CreatedAt                 time.Time `json:"created_at"`
-	InitPID                   int32     `json:"init_pid,omitempty"`
-	InitState                 string    `json:"init_state,omitempty"`
-	MemorySharing             string    `json:"memory_sharing,omitempty"`
+	ID                          string    `json:"id"`
+	Quarantined                 bool      `json:"quarantined,omitempty"`
+	NodeID                      string    `json:"node_id,omitempty"`
+	ParentID                    string    `json:"parent,omitempty"`
+	State                       string    `json:"state"`
+	ExitStatus                  *int      `json:"exit_status,omitempty"`
+	StorageState                string    `json:"storage_state"`
+	PublicationID               string    `json:"publication_id,omitempty"`
+	StorageError                string    `json:"storage_error,omitempty"`
+	StorageManifest             string    `json:"storage_manifest,omitempty"`
+	StorageRetryAt              time.Time `json:"storage_retry_at,omitempty"`
+	SnapshotID                  uint64    `json:"snapshot_id,omitempty"`
+	MemoryRoots                 []string  `json:"memory_roots,omitempty"`
+	MemoryRootObjects           []string  `json:"memory_root_objects,omitempty"`
+	ControlRoot                 string    `json:"control_root,omitempty"`
+	ControlRootObject           string    `json:"control_root_object,omitempty"`
+	SourceNode                  string    `json:"source_node,omitempty"`
+	DependentMemoryBytes        uint64    `json:"dependent_memory_bytes,omitempty"`
+	DependentFilesystemBytes    uint64    `json:"dependent_filesystem_bytes,omitempty"`
+	ForkTotalNS                 int64     `json:"fork_total_ns,omitempty"`
+	SourceDowntimeNS            int64     `json:"source_downtime_ns,omitempty"`
+	KernelForkNS                int64     `json:"kernel_fork_ns,omitempty"`
+	ForkValidationNS            int64     `json:"fork_validation_ns,omitempty"`
+	ForkSharedMemoryNS          int64     `json:"fork_shared_memory_ns,omitempty"`
+	ForkMappingInvalidationNS   int64     `json:"fork_mapping_invalidation_ns,omitempty"`
+	ForkVFSPreparationNS        int64     `json:"fork_vfs_preparation_ns,omitempty"`
+	ForkDevicePreparationNS     int64     `json:"fork_device_preparation_ns,omitempty"`
+	ForkFSMetadataFlushNS       int64     `json:"fork_fs_metadata_flush_ns,omitempty"`
+	ForkFSRuntimeInvalidationNS int64     `json:"fork_fs_runtime_invalidation_ns,omitempty"`
+	ForkFSBranchSealNS          int64     `json:"fork_fs_branch_seal_ns,omitempty"`
+	ForkFSNamespacePruneNS      int64     `json:"fork_fs_namespace_prune_ns,omitempty"`
+	ForkMemoryPreparationNS     int64     `json:"fork_memory_preparation_ns,omitempty"`
+	ForkMetadataStreamNS        int64     `json:"fork_metadata_stream_ns,omitempty"`
+	ForkMetadataBytes           int64     `json:"fork_metadata_bytes,omitempty"`
+	ForkMetadataRecordNS        int64     `json:"fork_metadata_record_ns,omitempty"`
+	ForkMetadataObjects         int64     `json:"fork_metadata_objects,omitempty"`
+	ForkChildRestoreNS          int64     `json:"fork_child_restore_ns,omitempty"`
+	CreatedAt                   time.Time `json:"created_at"`
+	InitPID                     int32     `json:"init_pid,omitempty"`
+	InitState                   string    `json:"init_state,omitempty"`
+	MemorySharing               string    `json:"memory_sharing,omitempty"`
 }
 
 // Family is stable family metadata returned by ttc ls --json.
@@ -6482,6 +6581,7 @@ type runtimeBackend struct {
 	consoleSidecars       consoleSidecarOwner
 	distributedSource     *distributedSourceRuntime
 	portIngress           *portIngressManager
+	gfx                   *gfxService
 	nodeID                string
 	cancelClient          func()
 	clientCanceled        <-chan struct{}
@@ -7734,6 +7834,10 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 	if err != nil {
 		return containerRunResult{}, err
 	}
+	deviceMounts, deviceEnv, err := b.gfx.guestEdits(request.gpu)
+	if err != nil {
+		return containerRunResult{}, err
+	}
 	filesystemOrigins, finishFilesystemOrigins := b.newFilesystemOriginScope()
 	persistedPorts := request.publishedPorts
 	if b.portIngress.Clustered() {
@@ -7789,9 +7893,13 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 		NetworkNAT:              request.networkNAT,
 		NetworkIP:               request.networkIP,
 		NetworkMAC:              request.networkMAC,
+		NetworkInterface:        request.networkInterface,
 		PublishedPorts:          persistedPorts,
 		WaiveLiveFork:           !request.liveForkEligible,
 		LiveForkWaiver:          request.liveForkWaiver,
+		GPUOptions:              request.gpu,
+		DeviceMounts:            deviceMounts,
+		DeviceEnv:               deviceEnv,
 		Progress:                b.imageProgress(),
 		VolumeCopyMode:          b.volumeCopyMode,
 		NodeID:                  b.nodeID,
@@ -7879,6 +7987,10 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	deviceMounts, deviceEnv, err := b.gfx.guestEdits(request.gpu)
+	if err != nil {
+		return "", err
+	}
 	filesystemOrigins, finishFilesystemOrigins := b.newFilesystemOriginScope()
 	createdNodeID := b.nodeID
 	prepared, err := store.Prepare(context.Background(), ttcbundle.PrepareOptions{
@@ -7929,9 +8041,13 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 		NetworkNAT:         request.networkNAT,
 		NetworkIP:          request.networkIP,
 		NetworkMAC:         request.networkMAC,
+		NetworkInterface:   request.networkInterface,
 		PublishedPorts:     request.publishedPorts,
 		WaiveLiveFork:      !request.liveForkEligible,
 		LiveForkWaiver:     request.liveForkWaiver,
+		GPUOptions:         request.gpu,
+		DeviceMounts:       deviceMounts,
+		DeviceEnv:          deviceEnv,
 		Progress:           b.imageProgress(),
 		VolumeCopyMode:     b.volumeCopyMode,
 		// A created branch owns mutable local filesystem state even though it has
@@ -8177,7 +8293,10 @@ func (b *runtimeBackend) startFreshBranchBesidePeers(info ttcbundle.ContainerInf
 		return fmt.Errorf("creating branch bootstrap runtime ID: %w", err)
 	}
 	runtimeID := "ttc-bootstrap-" + hex.EncodeToString(random)
-	configured := b.configuredRunscArgsForBranch(info, branch)
+	configured, err := b.configuredRunscArgsForBranch(info, branch)
+	if err != nil {
+		return err
+	}
 	configured, err = b.withRuntimeDiagnostics(configured, info.ID)
 	if err != nil {
 		return err
@@ -10967,10 +11086,10 @@ func (b *runtimeBackend) configuredRunscArgsForNetwork(networkMode string) []str
 }
 
 func (b *runtimeBackend) configuredRunscArgsForNetworkNAT(networkMode string, networkNAT bool) []string {
-	return b.configuredRunscArgsForNetworkConfig(networkMode, networkNAT, "", "")
+	return b.configuredRunscArgsForNetworkConfig(networkMode, networkNAT, "", "", "")
 }
 
-func (b *runtimeBackend) configuredRunscArgsForNetworkConfig(networkMode string, networkNAT bool, networkIP, networkMAC string) []string {
+func (b *runtimeBackend) configuredRunscArgsForNetworkConfig(networkMode string, networkNAT bool, networkIP, networkMAC, networkInterface string) []string {
 	runtimePlatform := b.runtimePlatform
 	if runtimePlatform == "" {
 		runtimePlatform = defaultRuntimePlatform
@@ -11010,6 +11129,9 @@ func (b *runtimeBackend) configuredRunscArgsForNetworkConfig(networkMode string,
 		}
 		if networkMAC != "" {
 			args = append(args, "--ttc-network-mac="+networkMAC)
+		}
+		if networkInterface != "" {
+			args = append(args, "--ttc-network-interface="+networkInterface)
 		}
 	}
 	return args
@@ -11066,12 +11188,39 @@ func (b *runtimeBackend) runtimeDiagnosticSince(containerID string, since time.T
 	return ""
 }
 
-func (b *runtimeBackend) configuredRunscArgsForBranch(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) []string {
-	args := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
+func (b *runtimeBackend) configuredRunscArgsForBranch(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) ([]string, error) {
+	args := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC, info.TTCNetworkInterface())
 	if branch.Quarantined {
 		args = append(args, "--ttc-network-quarantine=true")
 	}
-	return args
+	if rawSocketsRequested(info.CapAdd, info.CapDrop) {
+		args = append(args, "--net-raw=true")
+	}
+	gfxArgs, err := b.gfx.runscArgs(info.GPUOptions)
+	if err != nil {
+		return nil, err
+	}
+	return append(args, gfxArgs...), nil
+}
+
+// rawSocketsRequested returns whether a container's capability options ask
+// for CAP_NET_RAW explicitly. runsc drops CAP_NET_RAW, which Docker's
+// defaults include, unless raw sockets are on: TTC turns them on for
+// containers that add the capability, by name or with ALL, as Android's
+// netd, which requires it, needs.
+func rawSocketsRequested(capAdd, capDrop []string) bool {
+	added := false
+	for _, c := range capAdd {
+		if c == "ALL" || c == "NET_RAW" {
+			added = true
+		}
+	}
+	for _, c := range capDrop {
+		if c == "ALL" || c == "NET_RAW" {
+			return false
+		}
+	}
+	return added
 }
 
 func (b *runtimeBackend) runConfiguredCommand(args ...string) (int, error) {
@@ -11295,6 +11444,11 @@ func preflightHostResourceLimits(bundleDir string) error {
 	if len(required) == 0 {
 		return nil
 	}
+	if runtime.GOOS == "darwin" {
+		// Without this, runsc starts the sandbox without the limits, and only
+		// their verification, which reads Linux's /proc, fails.
+		return fmt.Errorf("hard %s limits require host cgroups, which macOS does not have; omit --memory and CPU limit options", strings.Join(required, " and "))
+	}
 	return preflightCgroupV2Delegation("/proc/self/cgroup", "/sys/fs/cgroup", required)
 }
 
@@ -11409,7 +11563,10 @@ func (b *runtimeBackend) launch(info ttcbundle.ContainerInfo, target selector, b
 	if err := preflightHostResourceLimits(bundleDir); err != nil {
 		return 1, false, err
 	}
-	configuredArgs := b.configuredRunscArgsForBranch(info, branch)
+	configuredArgs, err := b.configuredRunscArgsForBranch(info, branch)
+	if err != nil {
+		return 1, false, err
+	}
 	configuredArgs, err = b.withRuntimeDiagnostics(configuredArgs, info.ID)
 	if err != nil {
 		return 1, false, err
@@ -11538,7 +11695,7 @@ func (b *runtimeBackend) ensurePublishedPort(info ttcbundle.ContainerInfo, bindi
 	}
 	defer readyReader.Close()
 	endpoint := fmt.Sprintf("%s:%d:%d", binding.HostIP, binding.HostPort, binding.ContainerPort)
-	args := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
+	args := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC, info.TTCNetworkInterface())
 	args = append(args, "port-forward", "--ttc-allow-stopped-sandbox", "--branch="+binding.Branch(), "--ready-fd=4", info.ID, endpoint)
 	command := runscCommand(b.runsc, args...)
 	command.Stdout = errorFile
@@ -12806,15 +12963,22 @@ type runscBranchInfo struct {
 	ForkMetrics      struct {
 		SourceDowntime time.Duration `json:"SourceDowntime"`
 		Kernel         struct {
-			Validation              time.Duration `json:"Validation"`
-			SharedMemoryPreparation time.Duration `json:"SharedMemoryPreparation"`
-			MappingInvalidation     time.Duration `json:"MappingInvalidation"`
-			VFSPreparation          time.Duration `json:"VFSPreparation"`
-			MemoryPreparation       time.Duration `json:"MemoryPreparation"`
-			MetadataStream          time.Duration `json:"MetadataStream"`
-			MetadataBytes           int64         `json:"MetadataBytes"`
-			ChildRestore            time.Duration `json:"ChildRestore"`
-			Total                   time.Duration `json:"Total"`
+			Validation                    time.Duration `json:"Validation"`
+			SharedMemoryPreparation       time.Duration `json:"SharedMemoryPreparation"`
+			MappingInvalidation           time.Duration `json:"MappingInvalidation"`
+			VFSPreparation                time.Duration `json:"VFSPreparation"`
+			DevicePreparation             time.Duration `json:"DevicePreparation"`
+			FilesystemMetadataFlush       time.Duration `json:"FilesystemMetadataFlush"`
+			FilesystemRuntimeInvalidation time.Duration `json:"FilesystemRuntimeInvalidation"`
+			FilesystemBranchSeal          time.Duration `json:"FilesystemBranchSeal"`
+			FilesystemNamespacePrune      time.Duration `json:"FilesystemNamespacePrune"`
+			MemoryPreparation             time.Duration `json:"MemoryPreparation"`
+			MetadataStream                time.Duration `json:"MetadataStream"`
+			MetadataBytes                 int64         `json:"MetadataBytes"`
+			MetadataRecord                time.Duration `json:"MetadataRecord"`
+			MetadataObjects               int64         `json:"MetadataObjects"`
+			ChildRestore                  time.Duration `json:"ChildRestore"`
+			Total                         time.Duration `json:"Total"`
 		} `json:"Kernel"`
 		Total time.Duration `json:"Total"`
 	} `json:"ForkMetrics"`
@@ -12844,6 +13008,12 @@ func persistentBranchView(info ttcbundle.BranchInfo) Branch {
 		ForkMappingInvalidationNS: info.ForkMappingInvalidationNS, ForkVFSPreparationNS: info.ForkVFSPreparationNS,
 		ForkMemoryPreparationNS: info.ForkMemoryPreparationNS, ForkMetadataStreamNS: info.ForkMetadataStreamNS,
 		ForkMetadataBytes: info.ForkMetadataBytes, ForkChildRestoreNS: info.ForkChildRestoreNS,
+		ForkMetadataRecordNS: info.ForkMetadataRecordNS, ForkMetadataObjects: info.ForkMetadataObjects,
+		ForkDevicePreparationNS:     info.ForkDevicePreparationNS,
+		ForkFSMetadataFlushNS:       info.ForkFSMetadataFlushNS,
+		ForkFSRuntimeInvalidationNS: info.ForkFSRuntimeInvalidationNS,
+		ForkFSBranchSealNS:          info.ForkFSBranchSealNS,
+		ForkFSNamespacePruneNS:      info.ForkFSNamespacePruneNS,
 	}
 }
 
@@ -13025,25 +13195,32 @@ func memorySharingMode(shared bool) string {
 
 func branchView(info runscBranchInfo) Branch {
 	return Branch{
-		ID:                        info.ID,
-		ParentID:                  info.ParentID,
-		Quarantined:               info.Quarantined,
-		State:                     normalizeLifecycleState(info.State),
-		CreatedAt:                 info.CreatedAt,
-		InitPID:                   info.InitPID,
-		InitState:                 info.InitState,
-		MemorySharing:             memorySharingMode(info.SharesMemory),
-		ForkTotalNS:               info.ForkMetrics.Total.Nanoseconds(),
-		SourceDowntimeNS:          info.ForkMetrics.SourceDowntime.Nanoseconds(),
-		KernelForkNS:              info.ForkMetrics.Kernel.Total.Nanoseconds(),
-		ForkValidationNS:          info.ForkMetrics.Kernel.Validation.Nanoseconds(),
-		ForkSharedMemoryNS:        info.ForkMetrics.Kernel.SharedMemoryPreparation.Nanoseconds(),
-		ForkMappingInvalidationNS: info.ForkMetrics.Kernel.MappingInvalidation.Nanoseconds(),
-		ForkVFSPreparationNS:      info.ForkMetrics.Kernel.VFSPreparation.Nanoseconds(),
-		ForkMemoryPreparationNS:   info.ForkMetrics.Kernel.MemoryPreparation.Nanoseconds(),
-		ForkMetadataStreamNS:      info.ForkMetrics.Kernel.MetadataStream.Nanoseconds(),
-		ForkMetadataBytes:         info.ForkMetrics.Kernel.MetadataBytes,
-		ForkChildRestoreNS:        info.ForkMetrics.Kernel.ChildRestore.Nanoseconds(),
+		ID:                          info.ID,
+		ParentID:                    info.ParentID,
+		Quarantined:                 info.Quarantined,
+		State:                       normalizeLifecycleState(info.State),
+		CreatedAt:                   info.CreatedAt,
+		InitPID:                     info.InitPID,
+		InitState:                   info.InitState,
+		MemorySharing:               memorySharingMode(info.SharesMemory),
+		ForkTotalNS:                 info.ForkMetrics.Total.Nanoseconds(),
+		SourceDowntimeNS:            info.ForkMetrics.SourceDowntime.Nanoseconds(),
+		KernelForkNS:                info.ForkMetrics.Kernel.Total.Nanoseconds(),
+		ForkValidationNS:            info.ForkMetrics.Kernel.Validation.Nanoseconds(),
+		ForkSharedMemoryNS:          info.ForkMetrics.Kernel.SharedMemoryPreparation.Nanoseconds(),
+		ForkMappingInvalidationNS:   info.ForkMetrics.Kernel.MappingInvalidation.Nanoseconds(),
+		ForkVFSPreparationNS:        info.ForkMetrics.Kernel.VFSPreparation.Nanoseconds(),
+		ForkDevicePreparationNS:     info.ForkMetrics.Kernel.DevicePreparation.Nanoseconds(),
+		ForkFSMetadataFlushNS:       info.ForkMetrics.Kernel.FilesystemMetadataFlush.Nanoseconds(),
+		ForkFSRuntimeInvalidationNS: info.ForkMetrics.Kernel.FilesystemRuntimeInvalidation.Nanoseconds(),
+		ForkFSBranchSealNS:          info.ForkMetrics.Kernel.FilesystemBranchSeal.Nanoseconds(),
+		ForkFSNamespacePruneNS:      info.ForkMetrics.Kernel.FilesystemNamespacePrune.Nanoseconds(),
+		ForkMemoryPreparationNS:     info.ForkMetrics.Kernel.MemoryPreparation.Nanoseconds(),
+		ForkMetadataStreamNS:        info.ForkMetrics.Kernel.MetadataStream.Nanoseconds(),
+		ForkMetadataBytes:           info.ForkMetrics.Kernel.MetadataBytes,
+		ForkMetadataRecordNS:        info.ForkMetrics.Kernel.MetadataRecord.Nanoseconds(),
+		ForkMetadataObjects:         info.ForkMetrics.Kernel.MetadataObjects,
+		ForkChildRestoreNS:          info.ForkMetrics.Kernel.ChildRestore.Nanoseconds(),
 	}
 }
 
@@ -13199,6 +13376,12 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 				ForkMappingInvalidationNS: branch.ForkMappingInvalidationNS, ForkVFSPreparationNS: branch.ForkVFSPreparationNS,
 				ForkMemoryPreparationNS: branch.ForkMemoryPreparationNS, ForkMetadataStreamNS: branch.ForkMetadataStreamNS,
 				ForkMetadataBytes: branch.ForkMetadataBytes, ForkChildRestoreNS: branch.ForkChildRestoreNS,
+				ForkMetadataRecordNS: branch.ForkMetadataRecordNS, ForkMetadataObjects: branch.ForkMetadataObjects,
+				ForkDevicePreparationNS:     branch.ForkDevicePreparationNS,
+				ForkFSMetadataFlushNS:       branch.ForkFSMetadataFlushNS,
+				ForkFSRuntimeInvalidationNS: branch.ForkFSRuntimeInvalidationNS,
+				ForkFSBranchSealNS:          branch.ForkFSBranchSealNS,
+				ForkFSNamespacePruneNS:      branch.ForkFSNamespacePruneNS,
 			}
 			if referenceOperations[i] != "" {
 				if referenceTransaction != "" {
@@ -16555,7 +16738,7 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 		return fmt.Errorf("preparing dehydration restore bundle: %w", err)
 	}
 	defer cleanupBundle()
-	configured := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
+	configured := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC, info.TTCNetworkInterface())
 	configured, err = b.withRuntimeDiagnostics(configured, info.ID)
 	if err != nil {
 		return err
@@ -17026,7 +17209,7 @@ func dehydrationNetworkArgs(info ttcbundle.ContainerInfo) (*boot.CreateLinksAndR
 	case "none":
 		return args, nil
 	case "ttc":
-		cfg := &boot.TimeTravelNetworkConfig{NAT: info.NetworkNAT}
+		cfg := &boot.TimeTravelNetworkConfig{NAT: info.NetworkNAT, InterfaceName: info.TTCNetworkInterface()}
 		if info.NetworkIP != "" {
 			cfg.GuestIP = net.ParseIP(info.NetworkIP)
 			if cfg.GuestIP == nil {

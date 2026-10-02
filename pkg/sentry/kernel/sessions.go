@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package kernel
 
 import (
@@ -317,18 +320,20 @@ func (tg *ThreadGroup) createSession() (SessionID, error) {
 
 	// Leave the current group, and assign the new one.
 	if tg.processGroup != nil {
+		// If a process group is an orphan, decRefWithParent will lock
+		// the signal mutex of each thread group in it. However, tg's
+		// signal mutex is locked at this point. We change tg's process
+		// group before calling decRefWithParent, for tg's children as
+		// for tg, to avoid locking tg's signal mutex twice: tg's
+		// children are usually in tg's process group.
+		oldPG := tg.processGroup
 		oldParentPG := tg.parentPG()
+		tg.processGroup = pg
+		// tg's children's parent leaves oldPG for pg.
 		tg.forEachChildThreadGroupLocked(func(childTG *ThreadGroup) {
 			childTG.processGroup.incRefWithParent(pg)
-			childTG.processGroup.decRefWithParent(oldParentPG)
+			childTG.processGroup.decRefWithParent(oldPG)
 		})
-		// If tg.processGroup is an orphan, decRefWithParent will lock
-		// the signal mutex of each thread group in tg.processGroup.
-		// However, tg's signal mutex may already be locked at this
-		// point. We change tg's process group before calling
-		// decRefWithParent to avoid locking tg's signal mutex twice.
-		oldPG := tg.processGroup
-		tg.processGroup = pg
 		oldPG.decRefWithParent(oldParentPG)
 	} else {
 		// The current process group may be nil only in the case of an
@@ -406,11 +411,12 @@ func (tg *ThreadGroup) CreateProcessGroup() error {
 		pg.ancestors++
 	}
 
-	// Assign the new process group; adjust children.
+	// Assign the new process group; adjust children, whose parent leaves
+	// its process group for the new one.
 	oldParentPG := tg.parentPG()
 	tg.forEachChildThreadGroupLocked(func(childTG *ThreadGroup) {
 		childTG.processGroup.incRefWithParent(&pg)
-		childTG.processGroup.decRefWithParent(oldParentPG)
+		childTG.processGroup.decRefWithParent(tg.processGroup)
 	})
 	tg.processGroup.decRefWithParent(oldParentPG)
 	tg.processGroup = &pg

@@ -1071,6 +1071,15 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		}
 		donations.DonateAndClose("ttc-volume-fds", dir)
 	}
+	if conf.GFX {
+		// The Sentry asks the renderers' broker for GPU renderers over this
+		// connection, since it starts no processes of its own.
+		broker, err := dialGFXBroker(conf.GFXBroker)
+		if err != nil {
+			return err
+		}
+		donations.DonateAndClose("ttc-gfx-fd", broker)
+	}
 	finalMountPaths, err := specutils.MountTarOnExitPaths(args.Spec)
 	if err != nil {
 		return err

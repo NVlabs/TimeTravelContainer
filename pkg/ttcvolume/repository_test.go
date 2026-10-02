@@ -187,6 +187,100 @@ func TestConcurrentMetadataReadsStayOnLiveGraphGeneration(t *testing.T) {
 	}
 }
 
+// A batch of more updates than a journal transaction holds, as a file
+// system's flush of every inode it changed before a live fork, is published.
+func TestUpdateMetadataBatchLargerThanTransaction(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("large-batch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	// 1200 inodes with 8 KiB of extended attributes are some 10 MB.
+	const files = 1200
+	value := strings.Repeat("x", 8<<10)
+	updates := make([]Inode, 0, files)
+	for i := 0; i < files; i++ {
+		ino, err := repository.CreateRegular(MainBranch, RootInode, fmt.Sprintf("file-%04d", i), 0644, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inode, err := repository.Inode(MainBranch, ino)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inode.Xattrs = map[string]string{"user.value": value}
+		inode.MtimeNsec = int64(i + 1)
+		updates = append(updates, inode)
+	}
+	if err := repository.UpdateMetadataBatch(MainBranch, updates); err != nil {
+		t.Fatalf("UpdateMetadataBatch: %v", err)
+	}
+	if err := repository.SyncMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	for _, updated := range []Inode{updates[0], updates[files/2], updates[files-1]} {
+		inode, err := repository.Inode(MainBranch, updated.Number)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if inode.MtimeNsec != updated.MtimeNsec || inode.Xattrs["user.value"] != value {
+			t.Errorf("inode %d: mtime %d, %d bytes of xattr; want mtime %d, %d bytes",
+				updated.Number, inode.MtimeNsec, len(inode.Xattrs["user.value"]), updated.MtimeNsec, len(value))
+		}
+	}
+}
+
+func TestOpenSealedDataFile(t *testing.T) {
+	manager := openTestManager(t)
+	repo, err := manager.Create("state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	ino, err := repo.CreateRegular("main", rootInode, "value", 0644, 1000, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, repo, "main", ino, "base", 0)
+	sealed := func(branch string) (string, bool) {
+		t.Helper()
+		file, inode, sealed, err := repo.OpenSealedDataFile(branch, ino)
+		if err != nil {
+			t.Fatalf("OpenSealedDataFile(%q): %v", branch, err)
+		}
+		defer file.Close()
+		buf := make([]byte, 4)
+		if _, err := file.ReadAt(buf, 0); err != nil {
+			t.Fatalf("reading %q's object: %v", branch, err)
+		}
+		if _, err := file.WriteAt([]byte("x"), 0); err == nil {
+			t.Fatalf("%q's object opened writable", branch)
+		}
+		return inode.Object + ":" + string(buf), sealed
+	}
+	if _, ok := sealed("main"); ok {
+		t.Fatal("a branch's own object is sealed before a fork")
+	}
+	before, _ := sealed("main")
+	if err := repo.Fork("main", "child"); err != nil {
+		t.Fatal(err)
+	}
+	for _, branch := range []string{"main", "child"} {
+		got, ok := sealed(branch)
+		if !ok || got != before {
+			t.Fatalf("%q after the fork opens %q, sealed %t; want the sealed %q", branch, got, ok, before)
+		}
+	}
+	write(t, repo, "main", ino, "PA", 0)
+	if got, ok := sealed("main"); ok || got == before {
+		t.Fatalf("main after its write opens %q, sealed %t; want its own copy", got, ok)
+	}
+	if got, ok := sealed("child"); !ok || got != before {
+		t.Fatalf("child after main's write opens %q, sealed %t; want the sealed %q", got, ok, before)
+	}
+}
+
 func TestForkWritesDivergeAcrossGenerations(t *testing.T) {
 	manager := openTestManager(t)
 	repo, err := manager.Create("state")

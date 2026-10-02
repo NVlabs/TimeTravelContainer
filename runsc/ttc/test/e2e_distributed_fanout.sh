@@ -110,15 +110,17 @@ node_branch_count() {
 		'[.[] | select(.name == $name) | .branches[] | select(.node_id == $node)] | length'
 }
 
-# The cluster keeps its Raft log in its shared root, as the authority of its
-# latest epoch, and no node keeps one in its local root.
+# The cluster keeps its authority's log in its shared root, as the snapshot
+# and log segments of its latest epoch, and no node keeps one in its local
+# root.
 authority_log_retained() {
 	authority=$SHARED/cluster/authority
 	latest=$(ls "$authority/epochs" | sort | tail -n 1)
 	test -n "$latest"
 	test -f "$authority/$latest/prepared"
-	test -f "$authority/$latest/raft/raft.db"
-	test -z "$(find "$LOCAL_BASE"/local-? -path '*/cluster/raft/raft.db' -print -quit)"
+	test -f "$authority/$latest/snapshot"
+	test -n "$(find "$authority/$latest" -name 'log-*' -print -quit)"
+	test -z "$(find "$LOCAL_BASE"/local-? -path '*/cluster/authority/*' -print -quit)"
 }
 
 mkdir -p "$ROOT" "$SHARED"
@@ -236,7 +238,8 @@ client a node stop node-a --stop-all >/dev/null
 wait "$PID_A"
 PID_A=
 
-# Cleanly stopping the whole cluster must retain its Raft log to restart from.
+# Cleanly stopping the whole cluster must retain its authority's log to
+# restart from.
 # Restart a node, which takes the authority; startup also exercises a fresh
 # shared-reference-ledger reconstruction.
 authority_log_retained

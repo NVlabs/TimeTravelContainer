@@ -37,6 +37,11 @@ func classifyPortableResources(conf *config.Config, containerSpecs map[string]*s
 		if conf.RDMAProxy {
 			reasons = append(reasons, "RDMA proxy device is enabled")
 		}
+		if conf.GFX {
+			// Its capability sets are those of this host's renderer, and no
+			// restore yet checks another host's renderer against them.
+			reasons = append(reasons, "virtual GPU is enabled")
+		}
 	}
 	if len(containerSpecs) == 0 {
 		reasons = append(reasons, "container specifications are unavailable")

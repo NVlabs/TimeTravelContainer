@@ -98,11 +98,32 @@ type Mappable interface {
 	Translate(ctx context.Context, required, optional MappableRange, at hostarch.AccessType) ([]Translation, error)
 
 	// InvalidateUnsavable requests that the Mappable invalidate Translations
-	// that cannot be preserved across save/restore.
+	// that cannot be preserved across save/restore. For a live fork whose
+	// child is in the same process (see IsLiveForkInProcess), Translations
+	// to the MemoryFile that both share may be preserved, if the child's
+	// copy of the Mappable references what they map.
 	//
 	// Invariant: InvalidateUnsavable never races with concurrent calls to any
 	// other Mappable methods.
 	InvalidateUnsavable(ctx context.Context) error
+}
+
+// contextID is this package's type for context.Context.Value keys.
+type contextID int
+
+const (
+	// CtxLiveForkInProcess is a Context.Value key for whether
+	// Mappable.InvalidateUnsavable, or a filesystem's preparation for a save,
+	// prepares a live fork whose child is in the same process, and shares
+	// its MemoryFile.
+	CtxLiveForkInProcess contextID = iota
+)
+
+// IsLiveForkInProcess reports whether ctx prepares a live fork whose child
+// shares the process's MemoryFile.
+func IsLiveForkInProcess(ctx context.Context) bool {
+	v, _ := ctx.Value(CtxLiveForkInProcess).(bool)
+	return v
 }
 
 // Translations are returned by Mappable.Translate.
@@ -627,6 +648,34 @@ func MapInternalForPMA(file File, fr FileRange, at hostarch.AccessType) (safemem
 		return file.MapInternalForPMA(fr, at)
 	}
 	return file.MapInternal(fr, at)
+}
+
+// LiveForkSharedFile is implemented by Files whose pages may be immutable,
+// which a live fork's child, in its parent's process, may then map as its
+// parent does, rather than fault on them again.
+type LiveForkSharedFile interface {
+	File
+
+	// LiveForkShared reports whether the File's pages are immutable.
+	LiveForkShared() bool
+}
+
+// HostMemoryFile is implemented by Files whose contents are memory that the
+// Sentry shares with another host process, such as a GPU renderer, which must
+// see the application's writes at once, as the application must see its. A
+// platform that copies Files that it cannot map into applications must map
+// such a File's memory instead.
+type HostMemoryFile interface {
+	File
+
+	// HostAddress returns the address of fr in the Sentry's mapping of the
+	// memory. The mapping is stable while any page of the File is referenced.
+	HostAddress(fr FileRange) (uintptr, error)
+
+	// OnRelease arranges for f to be called once, before the Sentry unmaps
+	// the memory, after nothing references the File's pages. A platform that
+	// maps the memory into guests itself unmaps it there then.
+	OnRelease(f func())
 }
 
 // MemoryFileRange identifies one range whose ownership is serialized as part

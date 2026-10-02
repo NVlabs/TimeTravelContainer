@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package linux
 
 import (
@@ -121,10 +124,13 @@ func getClock(t *kernel.Task, clockID int32) (ktime.Clock, error) {
 	}
 
 	switch clockID {
-	case linux.CLOCK_REALTIME, linux.CLOCK_REALTIME_COARSE:
+	case linux.CLOCK_REALTIME, linux.CLOCK_REALTIME_COARSE, linux.CLOCK_REALTIME_ALARM:
+		// Alarm clocks are CLOCK_REALTIME and CLOCK_BOOTTIME, whose
+		// timers would also wake the system from suspend, which gVisor
+		// lacks.
 		return t.Kernel().RealtimeClock(), nil
 	case linux.CLOCK_MONOTONIC, linux.CLOCK_MONOTONIC_COARSE,
-		linux.CLOCK_MONOTONIC_RAW, linux.CLOCK_BOOTTIME:
+		linux.CLOCK_MONOTONIC_RAW, linux.CLOCK_BOOTTIME, linux.CLOCK_BOOTTIME_ALARM:
 		// CLOCK_MONOTONIC approximates CLOCK_MONOTONIC_RAW.
 		// CLOCK_BOOTTIME is internally mapped to CLOCK_MONOTONIC, as:
 		//	- CLOCK_BOOTTIME should behave as CLOCK_MONOTONIC while also
@@ -140,6 +146,21 @@ func getClock(t *kernel.Task, clockID int32) (ktime.Clock, error) {
 	default:
 		return nil, linuxerr.EINVAL
 	}
+}
+
+// isAlarmClock returns whether clockID is an alarm clock, whose timers,
+// and sleeps, need CAP_WAKE_ALARM.
+func isAlarmClock(clockID int32) bool {
+	return clockID == linux.CLOCK_REALTIME_ALARM || clockID == linux.CLOCK_BOOTTIME_ALARM
+}
+
+// checkAlarmClock checks that t may set timers of clockID, as Linux's
+// alarmtimer does.
+func checkAlarmClock(t *kernel.Task, clockID int32) error {
+	if isAlarmClock(clockID) && !t.HasRootCapability(linux.CAP_WAKE_ALARM) {
+		return linuxerr.EPERM
+	}
+	return nil
 }
 
 // ClockGettime implements linux syscall clock_gettime(2).
@@ -218,8 +239,17 @@ func ClockNanosleep(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (
 		if clockID != linux.CLOCK_REALTIME &&
 			clockID != linux.CLOCK_MONOTONIC &&
 			clockID != linux.CLOCK_BOOTTIME &&
-			clockID != linux.CLOCK_PROCESS_CPUTIME_ID {
+			clockID != linux.CLOCK_PROCESS_CPUTIME_ID &&
+			!isAlarmClock(clockID) {
 			return 0, nil, linuxerr.EINVAL
+		}
+	}
+	if isAlarmClock(clockID) {
+		if flags&^linux.TIMER_ABSTIME != 0 {
+			return 0, nil, linuxerr.EINVAL
+		}
+		if err := checkAlarmClock(t, clockID); err != nil {
+			return 0, nil, err
 		}
 	}
 

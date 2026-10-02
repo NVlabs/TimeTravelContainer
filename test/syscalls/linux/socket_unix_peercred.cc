@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 #include "test/syscalls/linux/socket_unix_peercred.h"
 
 #include <errno.h>
@@ -108,12 +111,15 @@ TEST_P(UnixSocketPeerCredTest, PeerCredAfterListen) {
 }
 
 TEST_P(UnixSocketPeerCredTest, AfterConnectClientPeerCred) {
-  if (GetParam().type != SOCK_STREAM) {
-    GTEST_SKIP() << "Test requires SOCK_STREAM";
+  // Connected sockets exchange credentials: SOCK_STREAM's and
+  // SOCK_SEQPACKET's.
+  const int type = GetParam().type & ~(SOCK_NONBLOCK | SOCK_CLOEXEC);
+  if (type == SOCK_DGRAM) {
+    GTEST_SKIP() << "Test requires a connection-oriented socket";
   }
   auto addr = ASSERT_NO_ERRNO_AND_VALUE(UniqueUnixAddr(true, AF_UNIX));
   auto server_socket =
-      ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_UNIX, SOCK_STREAM, 0));
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_UNIX, type, 0));
   ASSERT_THAT(bind(server_socket.get(), AsSockAddr(&addr), sizeof(addr)),
               SyscallSucceeds());
   ASSERT_THAT(listen(server_socket.get(), 5), SyscallSucceeds());
@@ -122,7 +128,7 @@ TEST_P(UnixSocketPeerCredTest, AfterConnectClientPeerCred) {
   gid_t server_gid = getgid();
   uid_t server_uid = getuid();
   const auto client = [&] {
-    auto client_socket = Socket(AF_UNIX, SOCK_STREAM, 0);
+    auto client_socket = Socket(AF_UNIX, type, 0);
     TEST_PCHECK_MSG(client_socket.ok(), "client socket failed");
     TEST_PCHECK_MSG(connect(client_socket.ValueOrDie().get(), AsSockAddr(&addr),
                             sizeof(addr)) == 0,
@@ -140,8 +146,11 @@ TEST_P(UnixSocketPeerCredTest, AfterConnectClientPeerCred) {
 }
 
 TEST_P(UnixSocketPeerCredTest, AfterConnectServerPeerCred) {
-  if (GetParam().type != SOCK_STREAM) {
-    GTEST_SKIP() << "Test requires SOCK_STREAM";
+  // Connected sockets exchange credentials: SOCK_STREAM's and
+  // SOCK_SEQPACKET's.
+  const int type = GetParam().type & ~(SOCK_NONBLOCK | SOCK_CLOEXEC);
+  if (type == SOCK_DGRAM) {
+    GTEST_SKIP() << "Test requires a connection-oriented socket";
   }
   // Create a pipe.
   int pipe_fd[2];
@@ -149,14 +158,14 @@ TEST_P(UnixSocketPeerCredTest, AfterConnectServerPeerCred) {
   // Create a server socket.
   auto addr = ASSERT_NO_ERRNO_AND_VALUE(UniqueUnixAddr(true, AF_UNIX));
   auto server_socket =
-      ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_UNIX, SOCK_STREAM, 0));
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_UNIX, type, 0));
   ASSERT_THAT(bind(server_socket.get(), AsSockAddr(&addr), sizeof(addr)),
               SyscallSucceeds());
   ASSERT_THAT(listen(server_socket.get(), 5), SyscallSucceeds());
 
   const auto client = [&] {
     TEST_PCHECK_MSG(close(pipe_fd[1]) == 0, "close failed");
-    auto client_socket = Socket(AF_UNIX, SOCK_STREAM, 0);
+    auto client_socket = Socket(AF_UNIX, type, 0);
     auto client_soc = client_socket.ValueOrDie().get();
     TEST_PCHECK_MSG(client_socket.ok(), "client socket failed");
     TEST_PCHECK_MSG(connect(client_soc, AsSockAddr(&addr), sizeof(addr)) == 0,

@@ -21,10 +21,12 @@ go_library(
     srcs = [
         "dir_refs.go",
         "kcov.go",
+        "net.go",
         "pci.go",
         "rdma.go",
         "save_restore.go",
         "sys.go",
+        "virtgpu.go",
     ],
     visibility = ["//pkg/sentry:internal"],
     deps = [

@@ -301,7 +301,7 @@ func placementOptionConsumesValue(command, arg string) bool {
 		return name == "name"
 	case "run", "create":
 		switch name {
-		case "name", "pull", "workdir", "w", "user", "u", "hostname", "h", "network", "net", "ip", "mac-address", "publish", "p", "add-host", "dns", "dns-search", "dns-option", "dns-opt", "entrypoint", "stop-signal", "stop-timeout", "pids-limit", "memory", "m", "memory-swap", "cpus", "cpu-shares", "cpu-period", "cpu-quota", "shm-size", "group-add", "cap-add", "cap-drop", "ulimit", "env", "e", "env-file", "label", "l", "label-file", "volume", "v", "mount", "tmpfs", "log-driver", "log-opt":
+		case "name", "pull", "workdir", "w", "user", "u", "hostname", "h", "network", "net", "ip", "mac-address", "interface-name", "publish", "p", "add-host", "dns", "dns-search", "dns-option", "dns-opt", "entrypoint", "stop-signal", "stop-timeout", "pids-limit", "memory", "m", "memory-swap", "cpus", "cpu-shares", "cpu-period", "cpu-quota", "shm-size", "group-add", "cap-add", "cap-drop", "ulimit", "env", "e", "env-file", "label", "l", "label-file", "volume", "v", "mount", "tmpfs", "log-driver", "log-opt":
 			return true
 		}
 	}
@@ -385,6 +385,8 @@ type daemonServer struct {
 	consoleClientMu      sync.Mutex
 	consoleClients       map[string]map[*daemonConsoleClient]struct{}
 	closingConsoleClient map[string]int
+	// gfx starts GPU renderers for sandboxes of --gfx families.
+	gfx *gfxService
 }
 
 // retireBeforeReply completes clustered identity retirement before a
@@ -1278,7 +1280,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		restoreArgs.PrefetchBehindBytes = (windowPages / 2) * tx.Negotiated.PagingPolicy.PageSize
 		restoreArgs.PrefetchBytes = (windowPages - windowPages/2) * tx.Negotiated.PagingPolicy.PageSize
 	}
-	configured := r.backend.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
+	configured := r.backend.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC, info.TTCNetworkInterface())
 	configured, err = r.backend.withRuntimeDiagnostics(configured, info.ID)
 	if err != nil {
 		return err
@@ -2790,6 +2792,7 @@ func (s *daemonServer) configureVolumeBackend(backend *runtimeBackend) {
 	backend.snapshotShared = s.snapshotShared
 	backend.sharedReferences = s.sharedReferences
 	backend.portIngress = s.portIngress
+	backend.gfx = s.gfx
 	backend.lockLifecycle = func() func() { return s.lockDataRoot(backend.dataRoot) }
 	backend.operations = &s.operations
 }
@@ -3910,6 +3913,10 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	} else if name != "" {
 		fmt.Fprintf(stderr, "ttcd: warning: %s %q is on a network filesystem (%s); its sockets, locks, and process state may not work there\n", rootVariable, layout.root, name)
 	}
+	// GPU renderers need the GPU, which the daemon's isolation bars its
+	// children from: settle how they start first.
+	gfx := startGFXHost(unsafeNoHostIsolation, stderr)
+	defer gfx.Close()
 	// Isolate the daemon before it touches its roots.
 	if err := enterDaemonHostIsolation(unsafeNoHostIsolation); err != nil {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
@@ -4078,7 +4085,7 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	if clusterRuntime != nil {
 		cpuProfile = clusterRuntime.cpuProfile
 	}
-	if err := serveDaemonWithCluster(socket, runtimePlatform, cpuProfile, unsafeNoHostIsolation, kernelCompatibility, daemonDataRoot, roots.local, daemonRoot, daemonRunsc, manager.Capability(), clusterRuntime, stdout, stderr); err != nil {
+	if err := serveDaemonWithCluster(socket, runtimePlatform, cpuProfile, unsafeNoHostIsolation, kernelCompatibility, daemonDataRoot, roots.local, daemonRoot, daemonRunsc, manager.Capability(), clusterRuntime, gfx, stdout, stderr); err != nil {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
 		if errors.Is(err, errLeaseSelfFenced) {
 			fmt.Fprintln(stderr, "ttcd: restarting to wait for the cluster; this node's sandboxes stay stopped until it answers")
@@ -6154,10 +6161,10 @@ func serveDaemon(socket, runtimePlatform string, unsafeNoHostIsolation bool, ker
 	if err != nil {
 		return err
 	}
-	return serveDaemonWithCluster(socket, runtimePlatform, profile, unsafeNoHostIsolation, kernelCompatibility, dataRoot, dataRoot, root, runsc, volumeCapability, nil, stdout, stderr)
+	return serveDaemonWithCluster(socket, runtimePlatform, profile, unsafeNoHostIsolation, kernelCompatibility, dataRoot, dataRoot, root, runsc, volumeCapability, nil, gfxHost{unconfined: unsafeNoHostIsolation}, stdout, stderr)
 }
 
-func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPUProfile, unsafeNoHostIsolation bool, kernelCompatibility hostKernelCompatibility, dataRoot, localRoot, root, runsc string, volumeCapability ttcvolume.Capability, clusterRuntime *daemonClusterRuntime, stdout, stderr io.Writer) (err error) {
+func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPUProfile, unsafeNoHostIsolation bool, kernelCompatibility hostKernelCompatibility, dataRoot, localRoot, root, runsc string, volumeCapability ttcvolume.Capability, clusterRuntime *daemonClusterRuntime, gfx gfxHost, stdout, stderr io.Writer) (err error) {
 	snapshotGraph, err := ttcsnapshot.Open(filepath.Join(localRoot, "catalog", "snapshot-graph"))
 	if err != nil {
 		return fmt.Errorf("opening TTC snapshot graph: %w", err)
@@ -6243,6 +6250,12 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 	}
 	server.portIngress = newPortIngressManager(server)
 	defer server.portIngress.Close()
+	run := daemonRunDir()
+	if run == "" {
+		run = filepath.Dir(socket)
+	}
+	server.gfx = newGFXService(run, filepath.Join(localRoot, "gfx"), gfx, stderr)
+	defer server.gfx.Close()
 	if err := compactDaemonMutations(server.mutationRoot(), daemonMutationRetention); err != nil && stderr != nil {
 		fmt.Fprintf(stderr, "ttcd: warning: compacting daemon mutation history: %v\n", err)
 	}

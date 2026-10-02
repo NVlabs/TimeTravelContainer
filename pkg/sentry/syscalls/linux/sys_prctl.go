@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package linux
 
 import (
@@ -81,6 +84,9 @@ func Prctl(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 		return 0, nil, nil
 
 	case linux.PR_SET_KEEPCAPS:
+		if t.Credentials().SecureBits&linux.SECBIT_KEEP_CAPS_LOCKED != 0 {
+			return 0, nil, linuxerr.EPERM
+		}
 		val := args[1].Int()
 		// prctl(2): arg2 must be either 0 (permitted capabilities are cleared)
 		// or 1 (permitted capabilities are kept).
@@ -96,12 +102,7 @@ func Prctl(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 		return 0, nil, nil
 
 	case linux.PR_GET_SECUREBITS:
-		var securebits uintptr
-		creds := t.Credentials()
-		if creds.KeepCaps {
-			securebits |= linux.SECBIT_KEEP_CAPS
-		}
-		return securebits, nil, nil
+		return uintptr(t.Securebits()), nil, nil
 
 	case linux.PR_SET_SECUREBITS:
 		val := args[1].Uint64()
@@ -271,6 +272,9 @@ func Prctl(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 			cp := linux.Capability(args[2].Uint64())
 			if !cp.Ok() {
 				return 0, nil, linuxerr.EINVAL
+			}
+			if t.Credentials().SecureBits&linux.SECBIT_NO_CAP_AMBIENT_RAISE != 0 {
+				return 0, nil, linuxerr.EPERM
 			}
 			if err := t.RaiseAmbientCapability(cp); err != nil {
 				return 0, nil, err

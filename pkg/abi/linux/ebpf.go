@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package linux
 
 import (
@@ -210,6 +213,10 @@ type BPFAttr interface {
 func (a *BPFAttrProgLoad) implementsBPFAttr()   {}
 func (a *BPFAttrProgQuery) implementsBPFAttr()  {}
 func (a *BPFAttrProgAttach) implementsBPFAttr() {}
+func (a *BPFAttrMapCreate) implementsBPFAttr()  {}
+func (a *BPFAttrMapElem) implementsBPFAttr()    {}
+func (a *BPFAttrObj) implementsBPFAttr()        {}
+func (a *BPFAttrObjGetInfo) implementsBPFAttr() {}
 
 // BPFAttrProgLoad contains parameters for a BPF_PROG_LOAD command.
 //
@@ -288,7 +295,231 @@ type BPFAttrProgAttach struct {
 // the sub-command attribute structures.
 //
 // BPF_ATTR_SIZE is immutable.
-var BPF_ATTR_SIZE = max((*BPFAttrProgLoad)(nil).SizeBytes(), (*BPFAttrProgQuery)(nil).SizeBytes(), (*BPFAttrProgAttach)(nil).SizeBytes())
+var BPF_ATTR_SIZE = max((*BPFAttrProgLoad)(nil).SizeBytes(), (*BPFAttrProgQuery)(nil).SizeBytes(), (*BPFAttrProgAttach)(nil).SizeBytes(),
+	(*BPFAttrMapCreate)(nil).SizeBytes(), (*BPFAttrMapElem)(nil).SizeBytes(), (*BPFAttrObj)(nil).SizeBytes(), (*BPFAttrObjGetInfo)(nil).SizeBytes())
+
+// BPFAttrMapCreate contains parameters for a BPF_MAP_CREATE command.
+//
+// +marshal
+type BPFAttrMapCreate struct {
+	_ structs.HostLayout
+
+	MapType               uint32
+	KeySize               uint32
+	ValueSize             uint32
+	MaxEntries            uint32
+	MapFlags              uint32
+	InnerMapFD            uint32
+	NumaNode              uint32
+	MapName               [BPF_OBJ_NAME_LEN]byte
+	MapIfindex            uint32
+	BTFFD                 uint32
+	BTFKeyTypeID          uint32
+	BTFValueTypeID        uint32
+	BTFVmlinuxValueTypeID uint32
+	MapExtra              uint64
+	ValueTypeBTFObjFD     int32
+	MapTokenFD            int32
+}
+
+// BPFAttrMapElem contains parameters for the BPF_MAP_*_ELEM commands, and
+// BPF_MAP_FREEZE.
+//
+// +marshal
+type BPFAttrMapElem struct {
+	_ structs.HostLayout
+
+	MapFD uint32
+	_     uint32 // padding
+	Key   uint64
+	Value uint64 // union of either value or next_key
+	Flags uint64
+}
+
+// BPFAttrObj contains parameters for the BPF_OBJ_PIN and BPF_OBJ_GET
+// commands.
+//
+// +marshal
+type BPFAttrObj struct {
+	_ structs.HostLayout
+
+	Pathname  uint64
+	BPFFD     uint32
+	FileFlags uint32
+	PathFD    int32
+	// Pad is the struct's padding, which is past its last field, and so,
+	// as the rest of the union past it, must be zero.
+	Pad uint32
+}
+
+// BPFAttrObjGetInfo contains parameters for a BPF_OBJ_GET_INFO_BY_FD
+// command.
+//
+// +marshal
+type BPFAttrObjGetInfo struct {
+	_ structs.HostLayout
+
+	BPFFD   uint32
+	InfoLen uint32
+	Info    uint64
+}
+
+// BPFMapInfo is struct bpf_map_info, which BPF_OBJ_GET_INFO_BY_FD returns
+// for maps.
+//
+// +marshal
+type BPFMapInfo struct {
+	_ structs.HostLayout
+
+	Type                  uint32
+	ID                    uint32
+	KeySize               uint32
+	ValueSize             uint32
+	MaxEntries            uint32
+	MapFlags              uint32
+	Name                  [BPF_OBJ_NAME_LEN]byte
+	Ifindex               uint32
+	BTFVmlinuxValueTypeID uint32
+	NetnsDev              uint64
+	NetnsIno              uint64
+	BTFID                 uint32
+	BTFKeyTypeID          uint32
+	BTFValueTypeID        uint32
+	BTFVmlinuxID          uint32
+	MapExtra              uint64
+}
+
+// BPF_TAG_SIZE is the size of a program's tag.
+const BPF_TAG_SIZE = 8
+
+// BPFProgInfo is struct bpf_prog_info, which BPF_OBJ_GET_INFO_BY_FD returns
+// for programs.
+//
+// +marshal
+type BPFProgInfo struct {
+	_ structs.HostLayout
+
+	Type                 uint32
+	ID                   uint32
+	Tag                  [BPF_TAG_SIZE]byte
+	JitedProgLen         uint32
+	XlatedProgLen        uint32
+	JitedProgInsns       uint64
+	XlatedProgInsns      uint64
+	LoadTime             uint64
+	CreatedByUID         uint32
+	NrMapIDs             uint32
+	MapIDs               uint64
+	Name                 [BPF_OBJ_NAME_LEN]byte
+	Ifindex              uint32
+	GPLCompatible        uint32 // bit 0; the rest are padding
+	NetnsDev             uint64
+	NetnsIno             uint64
+	NrJitedKsyms         uint32
+	NrJitedFuncLens      uint32
+	JitedKsyms           uint64
+	JitedFuncLens        uint64
+	BTFID                uint32
+	FuncInfoRecSize      uint32
+	FuncInfo             uint64
+	NrFuncInfo           uint32
+	NrLineInfo           uint32
+	LineInfo             uint64
+	JitedLineInfo        uint64
+	NrJitedLineInfo      uint32
+	LineInfoRecSize      uint32
+	JitedLineInfoRecSize uint32
+	NrProgTags           uint32
+	ProgTags             uint64
+	RunTimeNs            uint64
+	RunCnt               uint64
+	RecursionMisses      uint64
+	VerifiedInsns        uint32
+	AttachBTFObjID       uint32
+	AttachBTFID          uint32
+	_                    uint32 // padding
+}
+
+// BPFMapType is enum bpf_map_type, the type of an eBPF map.
+type BPFMapType uint32
+
+// Types of eBPF maps.
+const (
+	BPF_MAP_TYPE_UNSPEC BPFMapType = iota
+	BPF_MAP_TYPE_HASH
+	BPF_MAP_TYPE_ARRAY
+	BPF_MAP_TYPE_PROG_ARRAY
+	BPF_MAP_TYPE_PERF_EVENT_ARRAY
+	BPF_MAP_TYPE_PERCPU_HASH
+	BPF_MAP_TYPE_PERCPU_ARRAY
+	BPF_MAP_TYPE_STACK_TRACE
+	BPF_MAP_TYPE_CGROUP_ARRAY
+	BPF_MAP_TYPE_LRU_HASH
+	BPF_MAP_TYPE_LRU_PERCPU_HASH
+	BPF_MAP_TYPE_LPM_TRIE
+	BPF_MAP_TYPE_ARRAY_OF_MAPS
+	BPF_MAP_TYPE_HASH_OF_MAPS
+	BPF_MAP_TYPE_DEVMAP
+	BPF_MAP_TYPE_SOCKMAP
+	BPF_MAP_TYPE_CPUMAP
+	BPF_MAP_TYPE_XSKMAP
+	BPF_MAP_TYPE_SOCKHASH
+	BPF_MAP_TYPE_CGROUP_STORAGE
+	BPF_MAP_TYPE_REUSEPORT_SOCKARRAY
+	BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE
+	BPF_MAP_TYPE_QUEUE
+	BPF_MAP_TYPE_STACK
+	BPF_MAP_TYPE_SK_STORAGE
+	BPF_MAP_TYPE_DEVMAP_HASH
+	BPF_MAP_TYPE_STRUCT_OPS
+	BPF_MAP_TYPE_RINGBUF
+	BPF_MAP_TYPE_INODE_STORAGE
+	BPF_MAP_TYPE_TASK_STORAGE
+	BPF_MAP_TYPE_BLOOM_FILTER
+	BPF_MAP_TYPE_USER_RINGBUF
+	BPF_MAP_TYPE_CGRP_STORAGE
+	BPF_MAP_TYPE_ARENA
+)
+
+// Flags of BPF_MAP_CREATE, and of BPF_OBJ_GET.
+const (
+	BPF_F_NO_PREALLOC      = 1 << 0
+	BPF_F_NO_COMMON_LRU    = 1 << 1
+	BPF_F_NUMA_NODE        = 1 << 2
+	BPF_F_RDONLY           = 1 << 3
+	BPF_F_WRONLY           = 1 << 4
+	BPF_F_STACK_BUILD_ID   = 1 << 5
+	BPF_F_ZERO_SEED        = 1 << 6
+	BPF_F_RDONLY_PROG      = 1 << 7
+	BPF_F_WRONLY_PROG      = 1 << 8
+	BPF_F_CLONE            = 1 << 9
+	BPF_F_MMAPABLE         = 1 << 10
+	BPF_F_PRESERVE_ELEMS   = 1 << 11
+	BPF_F_INNER_MAP        = 1 << 12
+	BPF_F_PATH_FD          = 1 << 14
+	BPF_F_VTYPE_BTF_OBJ_FD = 1 << 15
+	BPF_F_TOKEN_FD         = 1 << 16
+)
+
+// Flags of BPF_MAP_UPDATE_ELEM.
+const (
+	BPF_ANY     = 0
+	BPF_NOEXIST = 1
+	BPF_EXIST   = 2
+	BPF_F_LOCK  = 4
+)
+
+// BPF_PSEUDO_MAP_FD and BPF_PSEUDO_MAP_VALUE are values of the source
+// register of a BPF_LD_IMM64 instruction whose immediate is a map's file
+// descriptor.
+const (
+	BPF_PSEUDO_MAP_FD    = 1
+	BPF_PSEUDO_MAP_VALUE = 2
+)
+
+// BPF_MAXINSNS is the most instructions that a program of an unprivileged
+// user may have.
+const BPF_MAXINSNS = 4096
 
 // eBPF-related flags
 const (

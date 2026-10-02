@@ -18,10 +18,13 @@
 package vfs
 
 import (
+	"cmp"
 	goContext "context"
 	"fmt"
+	"slices"
 	"sort"
 	"sync/atomic"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/refs"
@@ -266,11 +269,26 @@ func (vfs *VirtualFilesystem) PrepareSave(ctx context.Context) error {
 			}
 		}
 	}
+	// Devices prepare last: what they prepare, such as a GPU's snapshot, is
+	// wasted if a filesystem fails.
+	devices := vfs.saveRestoreDevices()
+	started := time.Now()
+	for i, dev := range devices {
+		if err := dev.PrepareSave(ctx); err != nil {
+			for _, prepared := range devices[:i] {
+				prepared.BeforeResume(ctx)
+			}
+			return err
+		}
+	}
+	if metrics := LiveForkPreparationMetricsFromContext(ctx); metrics != nil {
+		metrics.Devices += time.Since(started)
+	}
 	return nil
 }
 
 // BeforeResume is called before the kernel is resumed after save and allows
-// filesystems to clean up S/R state.
+// filesystems and devices to clean up S/R state.
 func (vfs *VirtualFilesystem) BeforeResume(ctx context.Context) {
 	for _, fs := range vfs.GetFilesystems() {
 		if ext, ok := fs.impl.(FilesystemImplSaveRestoreExtension); ok {
@@ -278,6 +296,83 @@ func (vfs *VirtualFilesystem) BeforeResume(ctx context.Context) {
 		}
 		fs.DecRef(ctx)
 	}
+	for _, dev := range vfs.saveRestoreDevices() {
+		dev.BeforeResume(ctx)
+	}
+}
+
+// DeviceSaveRestoreExtension is a Device with state outside the sandbox that
+// it prepares for a save, of a checkpoint or a live fork.
+type DeviceSaveRestoreExtension interface {
+	Device
+
+	// PrepareSave prepares the device for a save. An error fails the save.
+	PrepareSave(ctx context.Context) error
+
+	// BeforeResume undoes PrepareSave, once the save is done.
+	BeforeResume(ctx context.Context)
+}
+
+// LiveForkLoads is the loads of a save that happen after the save ends: the
+// batch siblings of a live fork load the metadata that the save of their
+// primary sibling captured. What a device keeps for the kernels that load its
+// state outlives such a save until the loads end.
+type LiveForkLoads struct {
+	mu    gsync.Mutex
+	done  bool
+	after []func()
+}
+
+// AfterLoads calls f once the loads end, or now if they did.
+func (l *LiveForkLoads) AfterLoads(f func()) {
+	l.mu.Lock()
+	if !l.done {
+		l.after = append(l.after, f)
+		l.mu.Unlock()
+		return
+	}
+	l.mu.Unlock()
+	f()
+}
+
+// Done ends the loads, which succeeded or failed.
+func (l *LiveForkLoads) Done() {
+	l.mu.Lock()
+	after := l.after
+	l.after = nil
+	l.done = true
+	l.mu.Unlock()
+	for _, f := range after {
+		f()
+	}
+}
+
+// LiveForkLoadsFromContext returns the loads that follow the save of ctx,
+// or nil if the save's loads, if any, end before the save does.
+func LiveForkLoadsFromContext(ctx goContext.Context) *LiveForkLoads {
+	loads, _ := ctx.Value(CtxLiveForkLoads).(*LiveForkLoads)
+	return loads
+}
+
+// saveRestoreDevices returns the registered devices that implement
+// DeviceSaveRestoreExtension, in the order of their device numbers.
+func (vfs *VirtualFilesystem) saveRestoreDevices() []DeviceSaveRestoreExtension {
+	vfs.devicesMu.RLock()
+	defer vfs.devicesMu.RUnlock()
+	tuples := make([]devTuple, 0, len(vfs.devices))
+	for tup, rd := range vfs.devices {
+		if _, ok := rd.dev.(DeviceSaveRestoreExtension); ok {
+			tuples = append(tuples, tup)
+		}
+	}
+	slices.SortFunc(tuples, func(a, b devTuple) int {
+		return cmp.Or(cmp.Compare(a.kind, b.kind), cmp.Compare(a.major, b.major), cmp.Compare(a.minor, b.minor))
+	})
+	devices := make([]DeviceSaveRestoreExtension, 0, len(tuples))
+	for _, tup := range tuples {
+		devices = append(devices, vfs.devices[tup].dev.(DeviceSaveRestoreExtension))
+	}
+	return devices
 }
 
 // CompleteRestore completes restoration from checkpoint for all filesystems

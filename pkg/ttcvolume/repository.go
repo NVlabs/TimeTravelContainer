@@ -1861,6 +1861,24 @@ func (r *Repository) HostPath() string {
 	return r.path
 }
 
+// Capacity describes the host filesystem that stores a repository.
+type Capacity struct {
+	TotalBytes     uint64
+	FreeBytes      uint64
+	AvailableBytes uint64
+	TotalFiles     uint64
+	FreeFiles      uint64
+}
+
+// Capacity returns the capacity of the host filesystem that stores the
+// repository.
+func (r *Repository) Capacity() (Capacity, error) {
+	if r == nil || r.dir == nil {
+		return Capacity{}, errors.New("repository is closed")
+	}
+	return hostCapacity(r.dir)
+}
+
 func (r *Repository) withLock(fn func() error) (result error) {
 	r.viewMu.Lock()
 	defer r.viewMu.Unlock()
@@ -2959,9 +2977,13 @@ func (r *Repository) UpdateMetadata(branchID string, updated Inode) error {
 	return r.updateMetadata(branchID, updated, false)
 }
 
-// UpdateMetadataBatch publishes coalesced metadata changes in one journal
-// transaction. Identity, type, link count, data object, generation, and
-// regular-file size remain repository-owned.
+// UpdateMetadataBatch publishes coalesced metadata changes. Identity, type,
+// link count, data object, generation, and regular-file size remain
+// repository-owned. The updates are independent, and are published in
+// bounded journal transactions: a file system's flush of every inode it
+// changed, as before a live fork, can exceed one transaction's size. A
+// failed batch may leave some updates published; publishing them again is
+// harmless.
 func (r *Repository) UpdateMetadataBatch(branchID string, updates []Inode) error {
 	if len(updates) == 0 {
 		return nil
@@ -2989,7 +3011,14 @@ func (r *Repository) UpdateMetadataBatch(branchID string, updates []Inode) error
 			mergeMutableMetadata(&current, updated)
 			ops = append(ops, metadataOp{Kind: metadataSetInode, Inode: &current})
 		}
-		return r.commitMetadata(&branch, state, ops)
+		for len(ops) != 0 {
+			n := min(len(ops), metadataBatchOperations)
+			if err := r.commitMetadata(&branch, state, ops[:n]); err != nil {
+				return err
+			}
+			ops = ops[n:]
+		}
+		return nil
 	})
 }
 
@@ -3306,6 +3335,36 @@ func (r *Repository) OpenDataFileWithCoW(branchID string, ino uint64, writable b
 		return nil, Inode{}, false, err
 	}
 	return file, inode, cloned, nil
+}
+
+// OpenSealedDataFile opens, read-only, the host data object selected by
+// branchID and ino, and reports whether it is sealed: whether the branch
+// shares it with a snapshot, and so with every branch forked since, so that
+// its bytes never change, as a write first copies them into an object of the
+// branch's working generation.
+func (r *Repository) OpenSealedDataFile(branchID string, ino uint64) (*os.File, Inode, bool, error) {
+	r.viewMu.RLock()
+	defer r.viewMu.RUnlock()
+	branch, err := r.readBranch(branchID)
+	if err != nil {
+		return nil, Inode{}, false, err
+	}
+	state, err := r.metadataForBranch(branch)
+	if err != nil {
+		return nil, Inode{}, false, err
+	}
+	inode, err := r.metadataInode(state, ino)
+	if err != nil {
+		return nil, Inode{}, false, err
+	}
+	if inode.Type != "regular" {
+		return nil, Inode{}, false, syscall.EINVAL
+	}
+	file, err := r.openObject(inode.Object, os.O_RDONLY)
+	if err != nil {
+		return nil, Inode{}, false, err
+	}
+	return file, inode, inode.DataGeneration != branch.WorkingSnapshot, nil
 }
 
 // SyncData makes the selected data object durable.

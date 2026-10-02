@@ -391,10 +391,13 @@ func (e *connectionedEndpoint) BidirectionalConnect(ctx context.Context, ce Conn
 			writeQueue: writeQueue,
 		}
 		readQueue.IncRef()
+		// Each end's SO_PEERCRED is the other's, for SOCK_SEQPACKET as for
+		// SOCK_STREAM (Linux's unix_stream_connect() connects both). Android's
+		// logd authorizes readers of its SOCK_SEQPACKET socket so.
+		if err := e.swapPeerCredsLocked(ctx, ce, ne); err != nil {
+			return err
+		}
 		if e.stype == linux.SOCK_STREAM {
-			if err := e.swapPeerCredsLocked(ctx, ce, ne); err != nil {
-				return err
-			}
 			returnConnect(&streamQueueReceiver{queueReceiver: queueReceiver{readQueue: readQueue}}, connected)
 		} else {
 			returnConnect(&queueReceiver{readQueue: readQueue}, connected)

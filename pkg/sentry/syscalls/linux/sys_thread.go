@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package linux
 
 import (
@@ -581,7 +584,7 @@ func canSetTaskNice(tSrc *kernel.Task, tDst *kernel.Task) bool {
 		srcCreds.HasCapabilityIn(linux.CAP_SYS_NICE, dstCreds.UserNamespace)
 }
 
-const supportedSchedFlags = 0
+const supportedSchedFlags = linux.SCHED_FLAG_RESET_ON_FORK
 
 // SchedSetattr implements linux syscall sched_setattr(2).
 func SchedSetattr(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
@@ -607,36 +610,12 @@ func SchedSetattr(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (ui
 		return 0, nil, err
 	}
 
-	var task *kernel.Task
-	if tid == 0 {
-		task = t
-	} else {
-		task = t.PIDNamespace().TaskWithID(tid)
-		if task == nil {
-			return 0, nil, linuxerr.ESRCH
-		}
-
-		// See kernel/sched/syscalls.c:user_check_sched_setscheduler().
-		if !canSetTaskNice(t, task) {
-			return 0, nil, linuxerr.EPERM
-		}
-
-		// Note that we do not enforce CAP_SYS_NICE for increasing one's *own* nice priority.
-		// This matches Setpriority(), and doesn't matter since niceness has no effect.
+	task, err := schedTask(t, tid)
+	if err != nil {
+		return 0, nil, err
 	}
 
 	if schedAttr.SchedFlags&^supportedSchedFlags != 0 {
-		return 0, nil, linuxerr.EINVAL
-	}
-
-	policy := uint(schedAttr.SchedPolicy)
-	if !isSchedulerSupported(policy) {
-		return 0, nil, linuxerr.EINVAL
-	}
-
-	if schedAttr.SchedPriority != 0 {
-		// SchedPriority only used for rt scheduling policies, which we don't support.
-		// If we ever add it, SchedPriority should be checked against RLIMIT_RTPRIO.
 		return 0, nil, linuxerr.EINVAL
 	}
 
@@ -651,7 +630,20 @@ func SchedSetattr(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (ui
 		return 0, nil, linuxerr.EINVAL
 	}
 
-	task.SetScheduler(policy)
+	// Note that we do not enforce CAP_SYS_NICE for increasing one's *own* nice
+	// priority. This matches Setpriority(), and doesn't matter since niceness
+	// has no effect.
+	policy := uint(schedAttr.SchedPolicy)
+	if schedAttr.SchedPriority > maxRTPriority {
+		return 0, nil, linuxerr.EINVAL
+	}
+	if err := setSchedPolicy(t, task, kernel.SchedPolicy{
+		Policy:      policy,
+		Priority:    int32(schedAttr.SchedPriority),
+		ResetOnFork: schedAttr.SchedFlags&linux.SCHED_FLAG_RESET_ON_FORK != 0,
+	}); err != nil {
+		return 0, nil, err
+	}
 
 	// Niceness is only set for SCHED_NORMAL and SCHED_BATCH
 	if policy == linux.SCHED_NORMAL || policy == linux.SCHED_BATCH {
@@ -721,21 +713,23 @@ func SchedGetattr(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (ui
 	}
 
 	// Lookup the target process
-	var task *kernel.Task
-	if tid == 0 {
-		task = t
-	} else {
-		task = t.PIDNamespace().TaskWithID(tid)
-		if task == nil {
-			return 0, nil, linuxerr.ESRCH
-		}
+	task, err := schedTask(t, tid)
+	if err != nil {
+		return 0, nil, err
 	}
 
-	policy := uint32(task.GetScheduler())
-
+	// See kernel/sched/syscalls.c:get_params().
+	p := task.SchedPolicy()
 	ret := linux.SchedAttr{
-		SchedPolicy: policy,
-		SchedNice:   int32(task.Niceness()),
+		SchedPolicy: uint32(p.Policy),
+	}
+	if p.ResetOnFork {
+		ret.SchedFlags |= linux.SCHED_FLAG_RESET_ON_FORK
+	}
+	if p.IsRealTime() {
+		ret.SchedPriority = uint32(p.Priority)
+	} else {
+		ret.SchedNice = int32(task.Niceness())
 	}
 
 	if err := copyOutSchedAttr(t, schedAttrAddr, schedAttrSize, &ret); err != nil {

@@ -62,6 +62,7 @@ import (
 	"unsafe"
 
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/platform/hvf/ring0asm"
 	"gvisor.dev/gvisor/pkg/sentry/platform/vmplatform/vmm"
 )
 
@@ -185,7 +186,7 @@ func (v *hvfVM) canonicalGPAForHost(host uintptr) (uint64, vmm.Stage2Access, boo
 			access vmm.Stage2Access
 		}{
 			{m.codeHost, monitorCodeGPA, monitorCodeCapacity, vmm.Stage2Read | vmm.Stage2Execute},
-			{m.controlHost, monitorControlGPA, vmm.HostSlabSize, vmm.Stage2Read | vmm.Stage2Write},
+			{m.controlHost, monitorControlGPA, monitorControlLength, vmm.Stage2Read | vmm.Stage2Write},
 			{m.statesHost, monitorStatesGPA, monitorStatesLength, vmm.Stage2Read | vmm.Stage2Write},
 		} {
 			if host >= region.host && uint64(host-region.host) < region.length {
@@ -239,6 +240,15 @@ func (v *hvfVM) MapStage2(gpa uint64, hostAddress uintptr, length uint64, access
 		v.stage2ByHost[host] = slabGPA
 	}
 	return nil
+}
+
+// MapSharedStage2 implements vmm.SharedStage2Mapper. Mapping commits the
+// memory's pages, which a Sentry continuation at EL1 cannot touch: EL1 mirrors
+// only memory that the Sentry owns, or that stage 2 already maps. So the
+// continuation returns to host EL0 first.
+func (v *hvfVM) MapSharedStage2(gpa uint64, hostAddress uintptr, length uint64, access vmm.Stage2Access) error {
+	ring0asm.EnsureHost()
+	return v.MapStage2(gpa, hostAddress, length, access)
 }
 
 // mapStage2Locked maps monitor-private or GuestRAM memory. The caller owns

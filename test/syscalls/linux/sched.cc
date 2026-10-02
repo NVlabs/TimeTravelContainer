@@ -12,10 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 #include <errno.h>
 #include <linux/sched.h>
+#include <sched.h>
 #include <stdint.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <cstring>
@@ -24,7 +30,9 @@
 #include "gtest/gtest.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "test/util/capability_util.h"
 #include "test/util/cleanup.h"
+#include "test/util/multiprocess_util.h"
 #include "test/util/posix_error.h"
 #include "test/util/test_util.h"
 
@@ -129,6 +137,75 @@ TEST(SchedSetschedulerTest, BasicSetGet) {
   int policy = sched_getscheduler(0);
   EXPECT_THAT(policy, SyscallSucceeds());
   EXPECT_EQ(policy, SCHED_BATCH);
+}
+
+TEST(SchedSetschedulerTest, RealTime) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_NICE)));
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(schedulerCleanup());
+
+  struct sched_param param = {.sched_priority = 1};
+  ASSERT_THAT(sched_setscheduler(0, SCHED_FIFO, &param), SyscallSucceeds());
+  EXPECT_THAT(sched_getscheduler(0), SyscallSucceedsWithValue(SCHED_FIFO));
+
+  param.sched_priority = 7;
+  ASSERT_THAT(sched_setparam(0, &param), SyscallSucceeds());
+  param = {};
+  ASSERT_THAT(sched_getparam(0, &param), SyscallSucceeds());
+  EXPECT_EQ(param.sched_priority, 7);
+
+  struct sched_attr attr = {};
+  ASSERT_THAT(sched_getattr(0, &attr, sizeof(attr), 0), SyscallSucceeds());
+  EXPECT_EQ(attr.sched_policy, SCHED_FIFO);
+  EXPECT_EQ(attr.sched_priority, 7);
+}
+
+TEST(SchedSetschedulerTest, RealTimePriorities) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_NICE)));
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(schedulerCleanup());
+
+  // Real-time policies have priorities 1 to 99, others only 0.
+  struct sched_param param = {.sched_priority = 0};
+  EXPECT_THAT(sched_setscheduler(0, SCHED_RR, &param),
+              SyscallFailsWithErrno(EINVAL));
+  param.sched_priority = 100;
+  EXPECT_THAT(sched_setscheduler(0, SCHED_RR, &param),
+              SyscallFailsWithErrno(EINVAL));
+  param.sched_priority = 1;
+  EXPECT_THAT(sched_setscheduler(0, SCHED_OTHER, &param),
+              SyscallFailsWithErrno(EINVAL));
+}
+
+TEST(SchedSetschedulerTest, ResetOnFork) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_NICE)));
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(schedulerCleanup());
+
+  struct sched_param param = {.sched_priority = 1};
+  ASSERT_THAT(sched_setscheduler(0, SCHED_RR | SCHED_RESET_ON_FORK, &param),
+              SyscallSucceeds());
+  EXPECT_THAT(sched_getscheduler(0),
+              SyscallSucceedsWithValue(SCHED_RR | SCHED_RESET_ON_FORK));
+
+  // Children revert to SCHED_OTHER.
+  const auto child = [] {
+    struct sched_param p = {.sched_priority = -1};
+    TEST_PCHECK(sched_getscheduler(0) == SCHED_OTHER);
+    TEST_PCHECK(sched_getparam(0, &p) == 0);
+    TEST_CHECK(p.sched_priority == 0);
+  };
+  EXPECT_THAT(InForkedProcess(child), IsPosixErrorOkAndHolds(0));
+}
+
+TEST(SchedSetschedulerTest, RealTimeWithoutPrivilege) {
+  // Without CAP_SYS_NICE, a zero RLIMIT_RTPRIO denies real-time policies.
+  const auto child = [] {
+    struct rlimit rl = {.rlim_cur = 0, .rlim_max = 0};
+    TEST_PCHECK(setrlimit(RLIMIT_RTPRIO, &rl) == 0);
+    TEST_CHECK(SetCapability(CAP_SYS_NICE, false).ok());
+    struct sched_param p = {.sched_priority = 1};
+    TEST_CHECK(sched_setscheduler(0, SCHED_FIFO, &p) == -1);
+    TEST_PCHECK(errno == EPERM);
+  };
+  EXPECT_THAT(InForkedProcess(child), IsPosixErrorOkAndHolds(0));
 }
 
 TEST(SchedAttrTest, InvalidPIDReturnsEINVAL) {

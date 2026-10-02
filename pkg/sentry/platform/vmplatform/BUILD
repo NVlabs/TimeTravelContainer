@@ -14,6 +14,7 @@ go_library(
 		"application_context.go",
         "doc.go",
         "engine.go",
+        "external.go",
         "guest_ram.go",
         "monitor.go",
         "platform.go",
@@ -35,6 +36,7 @@ go_library(
         "//pkg/sentry/platform",
         "//pkg/sentry/platform/vmplatform/monitorabi",
         "//pkg/sentry/platform/vmplatform/vmm",
+        "@com_github_google_btree//:go_default_library",
     ],
 )
 
@@ -44,6 +46,7 @@ go_test(
     srcs = [
 		"application_context_test.go",
         "engine_test.go",
+        "external_test.go",
         "guest_ram_test.go",
         "platform_test.go",
         "staging_test.go",

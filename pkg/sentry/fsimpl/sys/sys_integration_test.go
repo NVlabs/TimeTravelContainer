@@ -12,12 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package sys_test
 
 import (
 	"fmt"
 	"os"
 	"path"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -132,9 +136,12 @@ func TestCgroupMountpointExists(t *testing.T) {
 	defer s.Destroy()
 	pop := s.PathOpAtRoot("/fs")
 	s.AssertAllDirentTypes(s.ListDirents(pop), map[string]testutil.DirentType{
+		"bpf":    linux.DT_DIR,
 		"cgroup": linux.DT_DIR,
 	})
 	pop = s.PathOpAtRoot("/fs/cgroup")
+	s.AssertAllDirentTypes(s.ListDirents(pop), map[string]testutil.DirentType{ /*empty*/ })
+	pop = s.PathOpAtRoot("/fs/bpf")
 	s.AssertAllDirentTypes(s.ListDirents(pop), map[string]testutil.DirentType{ /*empty*/ })
 }
 
@@ -493,6 +500,74 @@ func TestRDMASysfs(t *testing.T) {
 		}
 		if got != want {
 			t.Errorf("%q contains %q, want %q", p, got, want)
+		}
+	}
+}
+
+// TestVirtualGPUSysfs reads what libdrm's drmGetDevices2() reads to find the
+// virtual GPU's render node, through the links it follows.
+func TestVirtualGPUSysfs(t *testing.T) {
+	s := newTestSystemWithInternalData(t, &sys.InternalData{VirtualGPU: true})
+	defer s.Destroy()
+
+	const node = "/dev/char/226:128"
+	for p, want := range map[string]string{
+		node + "/dev":                         "226:128\n",
+		node + "/uevent":                      "MAJOR=226\nMINOR=128\nDEVNAME=dri/renderD128\nDEVTYPE=drm_minor\n",
+		node + "/device/vendor":               "0x1af4\n",
+		node + "/device/device":               "0x0010\n",
+		node + "/device/../vendor":            "0x1af4\n",
+		node + "/device/../device":            "0x1050\n",
+		node + "/device/../subsystem_vendor":  "0x1af4\n",
+		node + "/device/../subsystem_device":  "0x1100\n",
+		node + "/device/../revision":          "0x01\n",
+		node + "/device/drm/renderD128/dev":   "226:128\n",
+		"/class/drm/renderD128/dev":           "226:128\n",
+		"/bus/pci/devices/00ff:00:00.0/class": "0x038000\n",
+		"/bus/virtio/devices/virtio0/device":  "0x0010\n",
+		"/devices/pci00ff:00/00ff:00:00.0/virtio0/drm/renderD128/device/vendor": "0x1af4\n",
+	} {
+		got, err := readTestFile(s, p)
+		if err != nil {
+			t.Fatalf("reading %q: %v", p, err)
+		}
+		if got != want {
+			t.Errorf("%q contains %q, want %q", p, got, want)
+		}
+	}
+	uevent, err := readTestFile(s, node+"/device/../uevent")
+	if err != nil {
+		t.Fatalf("reading the PCI device's uevent: %v", err)
+	}
+	if !strings.Contains(uevent, "\nPCI_SLOT_NAME=00ff:00:00.0\n") {
+		t.Errorf("the PCI device's uevent has no slot name: %q", uevent)
+	}
+
+	// libdrm finds the bus from the name of each subsystem link's target.
+	for p, want := range map[string]string{
+		node + "/device/subsystem":        "../../../../bus/virtio",
+		node + "/device/../subsystem":     "../../../bus/pci",
+		"/class/drm/renderD128/subsystem": "../../../../../../class/drm",
+	} {
+		got, err := s.VFS.ReadlinkAt(s.Ctx, s.Creds, s.PathOpAtRoot(p))
+		if err != nil {
+			t.Fatalf("readlink(%q): %v", p, err)
+		}
+		if got != want {
+			t.Errorf("readlink(%q) = %q, want %q", p, got, want)
+		}
+	}
+	for _, p := range []string{"/bus/pci", "/bus/virtio", "/class/drm"} {
+		s.GetDentryOrDie(s.PathOpAtRoot(p)).DecRef(s.Ctx)
+	}
+}
+
+func TestNoVirtualGPUSysfs(t *testing.T) {
+	s := newTestSystem(t, "" /*pciTestDir*/)
+	defer s.Destroy()
+	for _, p := range []string{"/dev/char/226:128", "/class/drm", "/bus/virtio"} {
+		if _, err := readTestFile(s, p+"/dev"); err == nil {
+			t.Errorf("%q exists without the virtual GPU", p)
 		}
 	}
 }

@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package stack
 
 import (
@@ -471,5 +474,39 @@ func TestIPTablesJumpLoop(t *testing.T) {
 	pkt := v6PacketBuffer()
 	if iptables.CheckInput(pkt, "") {
 		t.Errorf("CheckInput with jump loop expected to drop packet, but got accept")
+	}
+}
+
+// TestRestore checks that restoring a stack gives its tables' connections a
+// random source, and starts the connection reaper of tables that have one,
+// and no second one. Decoding tables cannot start it: the reaper's timer
+// reads the clock, which the sentry restores only after the state that holds
+// the tables has loaded.
+func TestRestore(t *testing.T) {
+	clock := faketime.NewManualClock()
+	s := New(Options{Clock: clock})
+	defer s.Close()
+	iptables := s.IPTables()
+	iptables.ForceReplaceTable(FilterID, iptables.GetTable(FilterID, false /* ipv6 */), false /* ipv6 */)
+
+	// Model the tables as decoded: their reaper and their connections'
+	// random source are not saved.
+	if !iptables.reaper.Stop() {
+		t.Fatal("failed to stop reaper")
+	}
+	iptables.reaper = nil
+	iptables.connections.rng = nil
+
+	s.Restore()
+	reaper := iptables.reaper
+	if reaper == nil {
+		t.Fatal("Restore did not start the reaper of modified tables")
+	}
+	if iptables.connections.rng == nil {
+		t.Error("Restore did not give the connections a random source")
+	}
+	s.Restore()
+	if iptables.reaper != reaper {
+		t.Error("a second Restore started a second reaper")
 	}
 }

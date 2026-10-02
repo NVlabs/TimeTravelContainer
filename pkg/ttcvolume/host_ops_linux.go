@@ -31,3 +31,22 @@ func allocateFile(file *os.File, offset, length int64) error {
 func directoryFDPath(dir *os.File) (string, error) {
 	return fmt.Sprintf("/proc/self/fd/%d", dir.Fd()), nil
 }
+
+func hostCapacity(dir *os.File) (Capacity, error) {
+	var st unix.Statfs_t
+	if err := unix.Fstatfs(int(dir.Fd()), &st); err != nil {
+		return Capacity{}, err
+	}
+	// Linux counts blocks in fragments.
+	size := uint64(st.Frsize)
+	if size == 0 {
+		size = uint64(st.Bsize)
+	}
+	return Capacity{
+		TotalBytes:     st.Blocks * size,
+		FreeBytes:      st.Bfree * size,
+		AvailableBytes: st.Bavail * size,
+		TotalFiles:     st.Files,
+		FreeFiles:      st.Ffree,
+	}, nil
+}

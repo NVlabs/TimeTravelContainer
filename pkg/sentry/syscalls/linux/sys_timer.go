@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package linux
 
 import (
@@ -107,6 +110,9 @@ func TimerCreate(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uin
 
 	c, err := getClock(t, clockID)
 	if err != nil {
+		return 0, nil, err
+	}
+	if err := checkAlarmClock(t, clockID); err != nil {
 		return 0, nil, err
 	}
 

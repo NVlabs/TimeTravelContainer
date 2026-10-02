@@ -215,6 +215,7 @@ go_test(
         "dentry_state_test.go",
         "file_description_impl_util_test.go",
         "mount_test.go",
+        "permissions_test.go",
         "posix_acl_test.go",
     ],
     library = ":vfs",

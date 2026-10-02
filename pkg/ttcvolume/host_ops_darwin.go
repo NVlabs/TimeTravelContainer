@@ -76,3 +76,18 @@ func directoryFDPath(dir *os.File) (string, error) {
 	}
 	return unix.ByteSliceToString(path[:]), nil
 }
+
+func hostCapacity(dir *os.File) (Capacity, error) {
+	var st unix.Statfs_t
+	if err := unix.Fstatfs(int(dir.Fd()), &st); err != nil {
+		return Capacity{}, err
+	}
+	size := uint64(st.Bsize)
+	return Capacity{
+		TotalBytes:     st.Blocks * size,
+		FreeBytes:      st.Bfree * size,
+		AvailableBytes: st.Bavail * size,
+		TotalFiles:     st.Files,
+		FreeFiles:      st.Ffree,
+	}, nil
+}

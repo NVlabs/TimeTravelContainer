@@ -31,8 +31,12 @@
 #define TTC_MONITOR_VERSION 1
 #define TTC_MONITOR_PAGE_SIZE UINT64_C(4096)
 #define TTC_MONITOR_HOST_SLAB_SIZE UINT64_C(16384)
+// The control block's host slabs.
+#define TTC_MONITOR_CONTROL_SIZE (8 * TTC_MONITOR_HOST_SLAB_SIZE)
 #define TTC_MONITOR_MAX_OPERATIONS 256
-#define TTC_MONITOR_MAX_ADDRESS_SPACES 320
+// Every process of a family has an address space, and an Android has about
+// 70 processes. A power of two: an address space's ID picks its home slot.
+#define TTC_MONITOR_MAX_ADDRESS_SPACES 4096
 #define TTC_MONITOR_MAX_POOL_REGIONS 64
 
 // Ring0 bridge calls. Application exits use a distinct call so the host can
@@ -225,14 +229,21 @@ struct ttc_monitor_control {
   // Head of an intrusive GPA free list. Freed page-table pages store the next
   // GPA in their first word and are zeroed before reuse.
   uint64_t free_page_gpa;
-  uint64_t reserved[4];
+  // space_probe_limit is the farthest past its home slot, its ID modulo the
+  // table's size, that an address space has been placed. Lookups, which every
+  // application entry makes, probe no farther.
+  uint64_t space_probe_limit;
+  uint64_t reserved[3];
   struct ttc_monitor_pool_region pool[TTC_MONITOR_MAX_POOL_REGIONS];
   struct ttc_monitor_address_space spaces[TTC_MONITOR_MAX_ADDRESS_SPACES];
   struct ttc_monitor_mutation mutations[TTC_MONITOR_MAX_OPERATIONS];
 };
 
-_Static_assert(sizeof(struct ttc_monitor_control) <= TTC_MONITOR_HOST_SLAB_SIZE,
-               "monitor control must fit in one host slab");
+_Static_assert(sizeof(struct ttc_monitor_control) <= TTC_MONITOR_CONTROL_SIZE,
+               "monitor control must fit in its host slabs");
+_Static_assert((TTC_MONITOR_MAX_ADDRESS_SPACES &
+                (TTC_MONITOR_MAX_ADDRESS_SPACES - 1)) == 0,
+               "the address-space table's size must be a power of two");
 
 #endif  // !__ASSEMBLER__
 

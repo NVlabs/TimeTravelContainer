@@ -49,7 +49,7 @@ Containers default
 to isolated `--network none`; Docker-style `--network/--net host` persists
 hostinet configuration across start/restart and is rejected by live-fork
 validation as an external resource. Rootless `--network ttc` adds a
-Sentry-managed `ttc0` virtual NIC, optional persistent `--ip` and
+Sentry-managed `eth0` virtual NIC, optional persistent `--ip` and
 `--mac-address`, optional IPv4 TCP/UDP user-mode NAT with
 `--nat`, and persistent IPv4 TCP publication with `-p`/`--publish`. Live fork
 keeps the source proxy and connections, gives the child a fresh proxy realm,

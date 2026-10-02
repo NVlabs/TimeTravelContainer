@@ -15,8 +15,10 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -25,16 +27,16 @@ func TestMaterializationDoesNotLockUnrelatedFile(t *testing.T) {
 	fs := &filesystem{diskVolume: &diskVolumeState{}}
 	target := &regularFile{}
 	target.inode.fs = fs
-	target.diskMmap.SetFD(-1)
-	target.mapsMu.Lock()
+	target.diskMapMu.Lock()
 	target.setDiskMmapObjectLocked("target-object")
-	target.mapsMu.Unlock()
+	target.diskMapMu.Unlock()
 
 	unrelated := &regularFile{}
 	unrelated.inode.fs = fs
-	unrelated.diskMmap.SetFD(-1)
 	unrelated.mapsMu.Lock()
+	unrelated.diskMapMu.Lock()
 	unrelated.setDiskMmapObjectLocked("unrelated-object")
+	unrelated.diskMapMu.Unlock()
 	// Model an unrelated write that holds mapsMu while waiting for the remote
 	// client. Materializing target-object must not wait for this file.
 	done := make(chan struct{})
@@ -136,11 +138,10 @@ func TestDiskVolumeMmapCoWClosesStaleIOObject(t *testing.T) {
 	file.inode.mode.Store(uint32(linux.S_IFREG | 0644))
 	file.inode.nlink.Store(1)
 	file.size.Store(uint64(len(contents)))
-	file.diskMmap.SetFD(-1)
 	fs.liveForkFiles[file] = struct{}{}
 	defer func() {
 		file.invalidateDiskIO()
-		file.diskMmap.MappableRelease()
+		file.releaseDiskMap()
 	}()
 
 	// Model an ELF-header or ordinary read after the fork. This caches the
@@ -158,11 +159,13 @@ func TestDiskVolumeMmapCoWClosesStaleIOObject(t *testing.T) {
 	}
 	file.diskIOMu.Unlock()
 
-	file.mapsMu.Lock()
-	err = file.ensureDiskMmapLocked()
-	file.mapsMu.Unlock()
+	// A write fault of a writable mapping copies the sealed object. Translate
+	// cannot lock the I/O cache, which it marks stale instead.
+	file.diskMapMu.Lock()
+	_, _, err = file.diskTranslationLocked(true)
+	file.diskMapMu.Unlock()
 	if err != nil {
-		t.Fatalf("ensureDiskMmapLocked: %v", err)
+		t.Fatalf("diskTranslationLocked: %v", err)
 	}
 	after, err := repository.Inode(ttcvolume.MainBranch, ino)
 	if err != nil {
@@ -171,14 +174,8 @@ func TestDiskVolumeMmapCoWClosesStaleIOObject(t *testing.T) {
 	if after.Object == before.Object {
 		t.Fatalf("mmap fault did not privatize shared object %q", before.Object)
 	}
-	file.diskIOMu.Lock()
-	if file.diskIOFile != nil || file.diskIOObject != "" {
-		file.diskIOMu.Unlock()
-		t.Fatalf("mmap CoW retained stale I/O cache: file=%v object=%q", file.diskIOFile, file.diskIOObject)
-	}
-	file.diskIOMu.Unlock()
-	if _, err := unix.FcntlInt(uintptr(oldFD), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
-		t.Fatalf("pre-CoW cached FD %d remains open: %v", oldFD, err)
+	if !file.diskIOStale.Load() {
+		t.Fatal("mmap CoW did not mark the I/O cache stale")
 	}
 
 	if err := repository.RemoveBranch("child"); err != nil {
@@ -197,6 +194,10 @@ func TestDiskVolumeMmapCoWClosesStaleIOObject(t *testing.T) {
 	if err != nil {
 		file.diskIOMu.Unlock()
 		t.Fatalf("opening current read cache: %v", err)
+	}
+	if current == cached || cached.Fd() != ^uintptr(0) {
+		file.diskIOMu.Unlock()
+		t.Fatalf("the I/O cache kept the pre-CoW object's FD %d", oldFD)
 	}
 	buf := make([]byte, len(contents))
 	n, readErr := current.ReadAt(buf, 0)
@@ -295,27 +296,32 @@ func TestPrepareLiveForkClosesDiskMmapObject(t *testing.T) {
 	file.inode.impl = file
 	file.inode.ino = ino
 	file.size.Store(4)
-	file.diskMmap.SetFD(-1)
 	ctx := contexttest.Context(t)
 	ms := &recordingMappingSpace{}
 	ar := hostarch.AddrRange{Start: 0x10000, End: 0x10000 + hostarch.PageSize}
 	if err := file.AddMapping(ctx, ms, ar, 0, false); err != nil {
 		t.Fatalf("AddMapping: %v", err)
 	}
-	file.mapsMu.Lock()
-	err = file.ensureDiskMmapLocked()
-	oldFD := file.diskMmap.FD()
-	file.mapsMu.Unlock()
+	file.diskMapMu.Lock()
+	m, _, err := file.diskTranslationLocked(false)
+	oldFD := -1
+	if err == nil {
+		oldFD = m.FD()
+	}
+	file.diskMapMu.Unlock()
 	if err != nil {
-		t.Fatalf("ensureDiskMmapLocked: %v", err)
+		t.Fatalf("diskTranslationLocked: %v", err)
 	}
 	if oldFD < 0 {
 		t.Fatal("mmap cache did not install a host FD")
 	}
 
-	file.prepareLiveFork()
-	if got := file.diskMmap.FD(); got != -1 {
-		t.Fatalf("prepareLiveFork retained mmap FD %d", got)
+	// A fork that leaves the process.
+	if file.prepareLiveFork(false /* share */) {
+		t.Fatal("prepareLiveFork kept the file's mapping")
+	}
+	if file.diskMap != nil {
+		t.Fatal("prepareLiveFork retained the mmap object")
 	}
 	if _, err := unix.FcntlInt(uintptr(oldFD), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
 		t.Fatalf("prepareLiveFork left old mmap FD %d open: %v", oldFD, err)
@@ -332,14 +338,14 @@ func TestPrepareLiveForkClosesDiskMmapObject(t *testing.T) {
 	if err := repository.Fork(ttcvolume.MainBranch, "child"); err != nil {
 		t.Fatalf("Fork: %v", err)
 	}
-	file.mapsMu.Lock()
-	err = file.ensureDiskMmapLocked()
-	file.mapsMu.Unlock()
+	file.diskMapMu.Lock()
+	m, perms, err := file.diskTranslationLocked(false)
+	file.diskMapMu.Unlock()
 	if err != nil {
 		t.Fatalf("reinstalling mmap object after fork: %v", err)
 	}
-	if got := file.diskMmap.FD(); got < 0 {
-		t.Fatal("mmap cache did not install a new FD after fork")
+	if m.FD() < 0 || !m.LiveForkShared() || perms != hostarch.ReadExecute {
+		t.Fatalf("mmap cache after fork: FD %d, shared %t, perms %v; want the sealed object's, read-only", m.FD(), m.LiveForkShared(), perms)
 	}
 	fs.liveForkMu.Lock()
 	_, trackedAfterRefault := fs.diskForkFiles[file]
@@ -348,7 +354,7 @@ func TestPrepareLiveForkClosesDiskMmapObject(t *testing.T) {
 		t.Fatal("post-fork mmap refault was not tracked for the next lifecycle fence")
 	}
 	file.RemoveMapping(ctx, ms, ar, 0, false)
-	file.diskMmap.MappableRelease()
+	file.releaseDiskMap()
 }
 
 func TestDiskVolumeWriteMetadataIsCoalesced(t *testing.T) {
@@ -461,7 +467,6 @@ func TestDiskVolumeReapedOrphanLeavesNoSaveCache(t *testing.T) {
 	file.inode.mode.Store(uint32(linux.S_IFREG | 0600))
 	file.inode.nlink.Store(0)
 	file.inode.refs.InitRefs()
-	file.diskMmap.SetFD(-1)
 	fs.diskInodes[ino] = &file.inode
 	fs.liveForkFiles[file] = struct{}{}
 	fs.markDiskFileDirty(file)
@@ -510,7 +515,6 @@ func TestDiskVolumeFlushSkipsAnInodeReapedAfterItWasTaken(t *testing.T) {
 		file.inode.mode.Store(uint32(linux.S_IFREG | 0600))
 		file.inode.nlink.Store(1)
 		file.inode.refs.InitRefs()
-		file.diskMmap.SetFD(-1)
 		fs.diskInodes[ino] = &file.inode
 		fs.liveForkFiles[file] = struct{}{}
 		return file
@@ -611,6 +615,272 @@ func TestDiskNamespaceSaveAcceptsRegularFileRoot(t *testing.T) {
 		t.Fatalf("regular-file root unexpectedly created saved namespace: %+v", fs.diskSaveChildren)
 	}
 	fs.restoreDiskNamespaceAfterSave()
+}
+
+func TestDiskVolumeStatFSReportsTheHostFilesystem(t *testing.T) {
+	manager, err := ttcvolume.OpenManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenManager: %v", err)
+	}
+	repository, err := manager.Create("statfs-test")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer repository.Close()
+	capacity, err := repository.Capacity()
+	if err != nil {
+		t.Fatalf("Capacity: %v", err)
+	}
+	if capacity.TotalBytes == 0 || capacity.AvailableBytes > capacity.TotalBytes {
+		t.Fatalf("Capacity() = %+v, want a nonzero total no smaller than what is available", capacity)
+	}
+
+	fs := &filesystem{
+		maxSizeInPages: getDefaultSizeLimit(true) / hostarch.PageSize,
+		diskVolume:     &diskVolumeState{Repository: repository, Branch: ttcvolume.MainBranch},
+	}
+	st := fs.statFS()
+	if want := capacity.TotalBytes / hostarch.PageSize; st.Blocks != want {
+		t.Errorf("Blocks = %d, want the host's %d", st.Blocks, want)
+	}
+	if st.BlocksAvailable == 0 || st.BlocksAvailable > st.Blocks || st.BlocksFree > st.Blocks {
+		t.Errorf("statFS() = %+v, want free and available blocks within the host's", st)
+	}
+
+	// A size limit is the volume's size.
+	fs.maxSizeInPages = 256
+	if st := fs.statFS(); st.Blocks != 256 || st.BlocksAvailable != 256 {
+		t.Errorf("with a limit of 256 pages, statFS() = %+v", st)
+	}
+}
+
+// newTestDiskRepository returns a repository with a file of contents, and the
+// file's inode.
+func newTestDiskRepository(t *testing.T, name, contents string) (*ttcvolume.Repository, uint64) {
+	t.Helper()
+	manager, err := ttcvolume.OpenManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenManager: %v", err)
+	}
+	repository, err := manager.Create(name)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() { repository.Close() })
+	ino, err := repository.CreateRegular(ttcvolume.MainBranch, ttcvolume.RootInode, "mapped", 0644, 0, 0)
+	if err != nil {
+		t.Fatalf("CreateRegular: %v", err)
+	}
+	if _, _, err := repository.WriteAt(ttcvolume.MainBranch, ino, []byte(contents), 0); err != nil {
+		t.Fatalf("WriteAt: %v", err)
+	}
+	return repository, ino
+}
+
+// newTestDiskFile returns the file ino, of size bytes, of a branch of
+// repository, as a filesystem of the branch has it.
+func newTestDiskFile(repository *ttcvolume.Repository, branch string, ino uint64, size int) *regularFile {
+	fs := &filesystem{
+		diskVolume:    &diskVolumeState{Repository: repository, Branch: branch},
+		liveForkFiles: make(map[*regularFile]struct{}),
+	}
+	file := &regularFile{}
+	file.inode.fs = fs
+	file.inode.impl = file
+	file.inode.ino = ino
+	file.inode.mode.Store(uint32(linux.S_IFREG | 0644))
+	file.inode.nlink.Store(1)
+	file.size.Store(uint64(size))
+	fs.liveForkFiles[file] = struct{}{}
+	return file
+}
+
+// translatePage returns the translation of file's first page for at.
+func translatePage(t *testing.T, file *regularFile, at hostarch.AccessType) memmap.Translation {
+	t.Helper()
+	page := memmap.MappableRange{Start: 0, End: hostarch.PageSize}
+	ts, err := file.Translate(contexttest.Context(t), page, page, at)
+	if err != nil || len(ts) != 1 {
+		t.Fatalf("Translate(%v): %v, %v", at, ts, err)
+	}
+	return ts[0]
+}
+
+// readPage returns n bytes that translation t maps.
+func readPage(t *testing.T, tr memmap.Translation, n int) string {
+	t.Helper()
+	bs, err := tr.File.MapInternal(tr.FileRange(), hostarch.Read)
+	if err != nil {
+		t.Fatalf("MapInternal: %v", err)
+	}
+	buf := make([]byte, n)
+	if _, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buf)), bs); err != nil {
+		t.Fatalf("reading a translation: %v", err)
+	}
+	return string(buf)
+}
+
+func TestLiveForkSharesSealedDiskMappings(t *testing.T) {
+	const contents = "sealed contents"
+	repository, ino := newTestDiskRepository(t, "shared-mapping-test", contents)
+	parent := newTestDiskFile(repository, ttcvolume.MainBranch, ino, len(contents))
+	ctx := contexttest.Context(t)
+	ms := &recordingMappingSpace{}
+	ar := hostarch.AddrRange{Start: 0x10000, End: 0x10000 + hostarch.PageSize}
+	if err := parent.AddMapping(ctx, ms, ar, 0, false); err != nil {
+		t.Fatalf("AddMapping: %v", err)
+	}
+	before := translatePage(t, parent, hostarch.Read)
+	if before.File.(memmap.LiveForkSharedFile).LiveForkShared() {
+		t.Fatal("a mapping of the branch's private object is shared")
+	}
+
+	// An in-process fork keeps the translations of a file that nothing maps
+	// writable: what they map, the fork seals.
+	if !parent.prepareLiveFork(true /* share */) {
+		t.Fatal("prepareLiveFork did not keep the file's mapping")
+	}
+	if ms.invalidated {
+		t.Fatal("prepareLiveFork invalidated translations of the sealed object")
+	}
+	if !before.File.(memmap.LiveForkSharedFile).LiveForkShared() {
+		t.Fatal("the fork's child cannot share the parent's translations")
+	}
+	if err := repository.Fork(ttcvolume.MainBranch, "child"); err != nil {
+		t.Fatalf("Fork: %v", err)
+	}
+	object, err := repository.Inode(ttcvolume.MainBranch, ino)
+	if err != nil {
+		t.Fatalf("Inode: %v", err)
+	}
+
+	// Both branches map the sealed object with the parent's mapping, which
+	// neither copies.
+	child := newTestDiskFile(repository, "child", ino, len(contents))
+	for _, file := range []*regularFile{parent, child} {
+		tr := translatePage(t, file, hostarch.Read)
+		if tr.File != before.File || tr.Perms != hostarch.ReadExecute {
+			t.Fatalf("a branch maps %p, %v, want the shared mapping %p, read-only", tr.File, tr.Perms, before.File)
+		}
+		if got := readPage(t, tr, len(contents)); got != contents {
+			t.Fatalf("the shared mapping reads %q, want %q", got, contents)
+		}
+	}
+	after, err := repository.Inode(ttcvolume.MainBranch, ino)
+	if err != nil {
+		t.Fatalf("Inode: %v", err)
+	}
+	if after.Object != object.Object {
+		t.Fatalf("reading copied the sealed object %q to %q", object.Object, after.Object)
+	}
+
+	parent.RemoveMapping(ctx, ms, ar, 0, false)
+	parent.releaseDiskMap()
+	child.releaseDiskMap()
+	diskMappings.mu.Lock()
+	_, ok := diskMappings.m[diskMappingKey{repository, object.Object}]
+	diskMappings.mu.Unlock()
+	if ok {
+		t.Fatal("the shared mapping outlives the files that used it")
+	}
+}
+
+func TestDiskVolumeWritableMappingAfterForkCopies(t *testing.T) {
+	const contents = "sealed contents"
+	repository, ino := newTestDiskRepository(t, "writable-mapping-test", contents)
+	parent := newTestDiskFile(repository, ttcvolume.MainBranch, ino, len(contents))
+	ctx := contexttest.Context(t)
+	ms := &recordingMappingSpace{}
+	ar := hostarch.AddrRange{Start: 0x10000, End: 0x10000 + hostarch.PageSize}
+	if err := parent.AddMapping(ctx, ms, ar, 0, false); err != nil {
+		t.Fatalf("AddMapping: %v", err)
+	}
+	sealed := translatePage(t, parent, hostarch.Read)
+	parent.prepareLiveFork(true /* share */)
+	if err := repository.Fork(ttcvolume.MainBranch, "child"); err != nil {
+		t.Fatalf("Fork: %v", err)
+	}
+	child := newTestDiskFile(repository, "child", ino, len(contents))
+	if tr := translatePage(t, child, hostarch.Read); tr.File != sealed.File {
+		t.Fatal("the child does not share the sealed object's mapping")
+	}
+
+	// A writable mapping makes the parent's translations of the sealed
+	// object fault again, to map the copy that its writes make.
+	wms := &recordingMappingSpace{}
+	war := hostarch.AddrRange{Start: 0x20000, End: 0x20000 + hostarch.PageSize}
+	if err := parent.AddMapping(ctx, wms, war, 0, true); err != nil {
+		t.Fatalf("AddMapping(writable): %v", err)
+	}
+	if !ms.invalidated {
+		t.Fatal("translations of the sealed object survive a writable mapping")
+	}
+	for _, at := range []hostarch.AccessType{hostarch.Read, hostarch.ReadWrite} {
+		tr := translatePage(t, parent, at)
+		if tr.File == sealed.File || tr.Perms != hostarch.AnyAccess {
+			t.Fatalf("a %v translation of a file with writable mappings maps %p, %v; want the branch's object, writable", at, tr.File, tr.Perms)
+		}
+	}
+	tr := translatePage(t, parent, hostarch.ReadWrite)
+	bs, err := tr.File.MapInternal(tr.FileRange(), hostarch.Write)
+	if err != nil {
+		t.Fatalf("MapInternal(write): %v", err)
+	}
+	const written = "PARENT"
+	if _, err := safemem.CopySeq(bs, safemem.BlockSeqOf(safemem.BlockFromSafeSlice([]byte(written)))); err != nil {
+		t.Fatalf("writing: %v", err)
+	}
+	if got := readPage(t, translatePage(t, parent, hostarch.Read), len(written)); got != written {
+		t.Fatalf("the parent reads %q, want what it wrote, %q", got, written)
+	}
+	if got := readPage(t, translatePage(t, child, hostarch.Read), len(contents)); got != contents {
+		t.Fatalf("the child reads %q, want the sealed object's %q", got, contents)
+	}
+	parentInode, err := repository.Inode(ttcvolume.MainBranch, ino)
+	if err != nil {
+		t.Fatalf("Inode: %v", err)
+	}
+	childInode, err := repository.Inode("child", ino)
+	if err != nil {
+		t.Fatalf("Inode(child): %v", err)
+	}
+	if parentInode.Object == childInode.Object {
+		t.Fatal("the parent's writable mapping did not copy the sealed object")
+	}
+
+	parent.RemoveMapping(ctx, ms, ar, 0, false)
+	parent.RemoveMapping(ctx, wms, war, 0, true)
+	parent.releaseDiskMap()
+	child.releaseDiskMap()
+}
+
+func TestDiskVolumeTranslateDoesNotLockMapsMu(t *testing.T) {
+	const contents = "contents"
+	repository, ino := newTestDiskRepository(t, "translate-lock-test", contents)
+	file := newTestDiskFile(repository, ttcvolume.MainBranch, ino, len(contents))
+	defer file.releaseDiskMap()
+
+	// A change of the file's object holds mapsMu while it invalidates
+	// translations, which waits for every MemoryManager that maps the file,
+	// and so for their faults, which Translate serves.
+	file.mapsMu.Lock()
+	done := make(chan error, 1)
+	go func() {
+		page := memmap.MappableRange{Start: 0, End: hostarch.PageSize}
+		_, err := file.Translate(contexttest.Context(t), page, page, hostarch.Read)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		file.mapsMu.Unlock()
+		if err != nil {
+			t.Fatalf("Translate: %v", err)
+		}
+	case <-time.After(time.Second):
+		file.mapsMu.Unlock()
+		<-done
+		t.Fatal("Translate waited for mapsMu")
+	}
 }
 
 // A directory this filesystem made holds every child it has on its volume:

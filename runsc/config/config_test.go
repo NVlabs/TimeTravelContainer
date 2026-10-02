@@ -111,6 +111,40 @@ func TestLegacyTimeTravelOSNetworkFlags(t *testing.T) {
 	}
 }
 
+func TestTimeTravelNetworkInterface(t *testing.T) {
+	for _, tc := range []struct {
+		network string
+		name    string
+		ok      bool
+	}{
+		{"ttc", "eth1", true},
+		{"ttc", "ttc0", true},
+		{"none", "eth1", false},
+		{"ttc", "lo", false},
+		{"ttc", "..", false},
+		{"ttc", "a/b", false},
+		{"ttc", "a:b", false},
+		{"ttc", "eth 1", false},
+		{"ttc", "0123456789abcdef", false},
+	} {
+		testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
+		RegisterFlags(testFlags)
+		if err := testFlags.Set("network", tc.network); err != nil {
+			t.Fatal(err)
+		}
+		if err := testFlags.Set("ttc-network-interface", tc.name); err != nil {
+			t.Fatal(err)
+		}
+		c, err := NewFromFlags(testFlags)
+		if (err == nil) != tc.ok {
+			t.Errorf("--network=%s --ttc-network-interface=%q: err=%v, want success %t", tc.network, tc.name, err, tc.ok)
+		}
+		if err == nil && c.TimeTravelNetworkInterface != tc.name {
+			t.Errorf("TimeTravelNetworkInterface=%q, want %q", c.TimeTravelNetworkInterface, tc.name)
+		}
+	}
+}
+
 func TestToFlagsFromFlags(t *testing.T) {
 	testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
 	RegisterFlags(testFlags)

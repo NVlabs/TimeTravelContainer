@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -1838,7 +1839,7 @@ func TestRunAndCreateParseTimeTravelNetworking(t *testing.T) {
 		t.Run(command, func(t *testing.T) {
 			backend := &fakeBackend{containerID: "demo"}
 			var stdout, stderr bytes.Buffer
-			args := []string{command, "--network=ttc", "--nat", "--ip", "192.0.2.44", "--mac-address", "02:aa:bb:cc:dd:ee", "-p", "8080:80", "--publish", "127.0.0.1:8443:443/tcp", "busybox"}
+			args := []string{command, "--network=ttc", "--nat", "--ip", "192.0.2.44", "--mac-address", "02:aa:bb:cc:dd:ee", "--interface-name", "eth1", "-p", "8080:80", "--publish", "127.0.0.1:8443:443/tcp", "busybox"}
 			if status := runCommand(args, &stdout, &stderr, backend); status != 0 {
 				t.Fatalf("status=%d, stderr=%q", status, stderr.String())
 			}
@@ -1847,6 +1848,9 @@ func TestRunAndCreateParseTimeTravelNetworking(t *testing.T) {
 			}
 			if backend.runRequest.networkIP != "192.0.2.44" || backend.runRequest.networkMAC != "02:aa:bb:cc:dd:ee" {
 				t.Errorf("virtual NIC=(%q, %q), want custom IP and MAC", backend.runRequest.networkIP, backend.runRequest.networkMAC)
+			}
+			if got := backend.runRequest.networkInterface; got != "eth1" {
+				t.Errorf("virtual NIC name=%q, want eth1", got)
 			}
 			if !reflect.DeepEqual(backend.runRequest.publishedPorts, wantPorts) {
 				t.Errorf("published ports=%+v, want %+v", backend.runRequest.publishedPorts, wantPorts)
@@ -1920,6 +1924,10 @@ func TestTimeTravelNetworkingRejectsInvalidCombinations(t *testing.T) {
 		{"run", "--ip", "192.0.2.44", "busybox"},
 		{"create", "--network=ttc", "--ip", "192.0.2.2", "busybox"},
 		{"create", "--network=ttc", "--mac-address", "01:00:5e:00:00:01", "busybox"},
+		{"run", "--interface-name", "eth1", "busybox"},
+		{"create", "--network=ttc", "--interface-name", "lo", "busybox"},
+		{"create", "--network=ttc", "--interface-name", "eth/1", "busybox"},
+		{"create", "--network=ttc", "--interface-name", "0123456789abcdef", "busybox"},
 		{"run", "-p", "8080:80", "busybox"},
 		{"create", "--network=ttc", "-p", "8080:80/udp", "busybox"},
 		{"create", "--network=ttc", "-p", "not-a-port", "busybox"},
@@ -4114,6 +4122,38 @@ func TestPreflightCgroupV2Delegation(t *testing.T) {
 	}
 }
 
+func TestPreflightHostResourceLimitsRefusesHardLimitsOnMacOS(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS only: Linux preflight depends on the host's cgroups")
+	}
+	limit := int64(1 << 30)
+	spec := specs.Spec{Linux: &specs.Linux{
+		CgroupsPath: "ttc/test",
+		Resources:   &specs.LinuxResources{Memory: &specs.LinuxMemory{Limit: &limit}},
+	}}
+	data, err := json.Marshal(&spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bundle, "config.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := preflightHostResourceLimits(bundle); err == nil || !strings.Contains(err.Error(), "macOS") {
+		t.Fatalf("preflight of a hard memory limit on macOS: %v, want a refusal that names macOS", err)
+	}
+	spec.Linux.Resources = &specs.LinuxResources{}
+	if data, err = json.Marshal(&spec); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundle, "config.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := preflightHostResourceLimits(bundle); err != nil {
+		t.Fatalf("preflight without hard limits on macOS: %v", err)
+	}
+}
+
 func TestClientDoesNotAcceptStorageOrDirectOptions(t *testing.T) {
 	for _, option := range []string{"--root=/runtime", "--runsc=/ttcd", "--data-root=/data", "--direct"} {
 		if _, _, _, err := parseGlobalOptions([]string{option, "ps"}, io.Discard); err == nil {
@@ -4150,8 +4190,8 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgsForNetworkNAT("ttc", true); !reflect.DeepEqual(got, wantTTCNAT) {
 		t.Errorf("TTC NAT runsc args=%q, want %q", got, wantTTCNAT)
 	}
-	wantCustomNIC := append(append([]string(nil), wantTTCNAT...), "--ttc-network-ip=192.0.2.44", "--ttc-network-mac=02:aa:bb:cc:dd:ee")
-	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgsForNetworkConfig("ttc", true, "192.0.2.44", "02:aa:bb:cc:dd:ee"); !reflect.DeepEqual(got, wantCustomNIC) {
+	wantCustomNIC := append(append([]string(nil), wantTTCNAT...), "--ttc-network-ip=192.0.2.44", "--ttc-network-mac=02:aa:bb:cc:dd:ee", "--ttc-network-interface=eth1")
+	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgsForNetworkConfig("ttc", true, "192.0.2.44", "02:aa:bb:cc:dd:ee", "eth1"); !reflect.DeepEqual(got, wantCustomNIC) {
 		t.Errorf("TTC custom NIC runsc args=%q, want %q", got, wantCustomNIC)
 	}
 	wantUnsafe := append([]string{
@@ -4247,6 +4287,17 @@ func TestDehydrationNetworkArgs(t *testing.T) {
 	}
 	if got := ttc.TimeTravel.GuestMAC.String(); got != "02:aa:bb:cc:dd:ee" {
 		t.Fatalf("restored MAC=%q", got)
+	}
+	// Records from before the interface's name was recorded keep ttc0.
+	if got := ttc.TimeTravel.InterfaceName; got != "ttc0" {
+		t.Fatalf("restored interface of a legacy record=%q, want ttc0", got)
+	}
+	named, err := dehydrationNetworkArgs(ttcbundle.ContainerInfo{NetworkMode: "ttc", NetworkInterface: "eth1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := named.TimeTravel.InterfaceName; got != "eth1" {
+		t.Fatalf("restored interface=%q, want eth1", got)
 	}
 	if _, err := dehydrationNetworkArgs(ttcbundle.ContainerInfo{NetworkMode: "host"}); err == nil {
 		t.Fatal("host network unexpectedly accepted for process-free restore")

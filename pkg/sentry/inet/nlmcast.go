@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package inet
 
 import (
@@ -20,8 +23,10 @@ import (
 )
 
 const (
-	routeProtocol       = linux.NETLINK_ROUTE
-	routeLinkMcastGroup = linux.RTNLGRP_LINK
+	routeProtocol           = linux.NETLINK_ROUTE
+	routeLinkMcastGroup     = linux.RTNLGRP_LINK
+	routeIPv4AddrMcastGroup = linux.RTNLGRP_IPV4_IFADDR
+	routeIPv6AddrMcastGroup = linux.RTNLGRP_IPV6_IFADDR
 )
 
 // InterfaceEventSubscriber allows clients to subscribe to events published by an inet.Stack.
@@ -34,6 +39,10 @@ type InterfaceEventSubscriber interface {
 
 	// OnInterfaceDeleteEvent is called by InterfaceEventPublishers when an interface delete event takes place.
 	OnInterfaceDeleteEvent(ctx context.Context, idx int32, i Interface)
+
+	// OnInterfaceAddrEvent is called by InterfaceEventPublishers when an
+	// interface gains an address, or with added false, loses one.
+	OnInterfaceAddrEvent(ctx context.Context, idx int32, addr InterfaceAddr, added bool)
 }
 
 // InterfaceEventPublisher is the interface event publishing aspect of an inet.Stack.
@@ -58,6 +67,11 @@ type NetlinkSocket interface {
 	// HandleInterfaceDeleteEvent is called on NetlinkSockets that are members of the RTNLGRP_LINK
 	// multicast group when an interface is deleted.
 	HandleInterfaceDeleteEvent(context.Context, int32, Interface)
+
+	// HandleInterfaceAddrEvent is called on NetlinkSockets that are members
+	// of the RTNLGRP_IPV4_IFADDR or RTNLGRP_IPV6_IFADDR multicast group, as
+	// the address's family is, when an interface gains or loses an address.
+	HandleInterfaceAddrEvent(ctx context.Context, idx int32, addr InterfaceAddr, added bool)
 }
 
 // McastTable holds multicast group membership information for netlink netlinkSocket.
@@ -133,6 +147,20 @@ func (m *McastTable) OnInterfaceDeleteEvent(ctx context.Context, idx int32, i In
 	// Relay the event to RTNLGRP_LINK subscribers.
 	m.ForEachMcastSock(routeProtocol, routeLinkMcastGroup, func(s NetlinkSocket) {
 		s.HandleInterfaceDeleteEvent(ctx, idx, i)
+	})
+}
+
+// OnInterfaceAddrEvent implements InterfaceEventSubscriber.OnInterfaceAddrEvent.
+func (m *McastTable) OnInterfaceAddrEvent(ctx context.Context, idx int32, addr InterfaceAddr, added bool) {
+	// Relay the event to the subscribers of the address's family, as Linux's
+	// net/ipv4/devinet.c:rtmsg_ifa() and net/ipv6/addrconf.c:inet6_ifa_notify()
+	// do.
+	group := routeIPv4AddrMcastGroup
+	if addr.Family == linux.AF_INET6 {
+		group = routeIPv6AddrMcastGroup
+	}
+	m.ForEachMcastSock(routeProtocol, group, func(s NetlinkSocket) {
+		s.HandleInterfaceAddrEvent(ctx, idx, addr, added)
 	})
 }
 

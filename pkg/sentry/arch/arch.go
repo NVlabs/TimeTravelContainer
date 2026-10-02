@@ -120,6 +120,12 @@ type contextInterface interface {
 	// syscall with a custom function when execution resumes.
 	RestartSyscallWithRestartBlock()
 
+	// ReenterRestartedSyscall, after RestartSyscall or
+	// RestartSyscallWithRestartBlock, leaves the registers as the
+	// application's execution of the syscall instruction would, so that the
+	// sentry can restart the syscall without resuming the application.
+	ReenterRestartedSyscall()
+
 	// IP returns the current instruction pointer.
 	IP() uintptr
 

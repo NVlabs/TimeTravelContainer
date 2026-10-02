@@ -31,9 +31,11 @@ import (
 )
 
 const (
-	timeTravelNICID   = tcpip.NICID(2)
-	timeTravelNICName = "ttc0"
-	timeTravelMTU     = uint32(65535)
+	timeTravelNICID = tcpip.NICID(2)
+	// defaultTimeTravelNICName names the guest's NIC when its configuration
+	// does not, as Docker names a container's interface.
+	defaultTimeTravelNICName = "eth0"
+	timeTravelMTU            = uint32(65535)
 )
 
 var (
@@ -48,6 +50,16 @@ type TimeTravelNetworkConfig struct {
 	NAT      bool
 	GuestIP  net.IP
 	GuestMAC net.HardwareAddr
+	// InterfaceName is the guest's name for the NIC. Empty names it eth0.
+	InterfaceName string
+}
+
+// interfaceName returns the guest's name for the NIC.
+func (c TimeTravelNetworkConfig) interfaceName() string {
+	if c.InterfaceName != "" {
+		return c.InterfaceName
+	}
+	return defaultTimeTravelNICName
 }
 
 func (c TimeTravelNetworkConfig) addresses() (tcpip.Address, tcpip.Address, tcpip.LinkAddress, tcpip.LinkAddress) {
@@ -389,7 +401,7 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 		replacedRuntimeLink = true
 	} else {
 		if err := dst.Stack.CreateNICWithOptions(timeTravelNICID, ethernet.New(guestEP), stack.NICOptions{
-			Name:               timeTravelNICName,
+			Name:               cfg.interfaceName(),
 			DeliverLinkPackets: true,
 		}); err != nil {
 			return fmt.Errorf("creating TTC guest NIC: %v", err)
@@ -506,7 +518,7 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 	}
 	dst.SetLiveForkQuarantine(quarantine)
 	dst.SetLiveForkNetworkHooks(hooks)
-	log.Infof("Configured TTC virtual NIC %s at %s/24, MAC %s (NAT=%t)", timeTravelNICName, guestAddress, net.HardwareAddr(guestMAC), cfg.NAT)
+	log.Infof("Configured TTC virtual NIC %s at %s/24, MAC %s (NAT=%t)", cfg.interfaceName(), guestAddress, net.HardwareAddr(guestMAC), cfg.NAT)
 	return nil
 }
 

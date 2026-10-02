@@ -603,7 +603,7 @@ func (b *runtimeBackend) openGuestPortStream(ctx context.Context, target selecto
 		listener.Close()
 		os.Remove(path)
 	}()
-	args := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
+	args := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC, info.TTCNetworkInterface())
 	args = append(args, "port-forward", "--ttc-allow-stopped-sandbox", "--branch="+resolved.branch, "--stream="+path, info.ID, strconv.Itoa(int(port)))
 	command := runscCommand(b.runsc, args...)
 	var diagnostic bytes.Buffer

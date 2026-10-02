@@ -20,6 +20,7 @@ go_library(
         "clone.go",
         "context.go",
         "dev.go",
+        "drm.go",
         "ebpf.go",
         "elf.go",
         "epoll.go",
@@ -64,6 +65,7 @@ go_library(
         "personality.go",
         "pidfd.go",
         "poll.go",
+        "reboot.go",
         "prctl.go",
         "ptrace.go",
         "ptrace_amd64.go",
@@ -108,7 +110,10 @@ go_test(
     name = "linux_test",
     size = "small",
     srcs = [
+        "capability_test.go",
+        "drm_test.go",
         "netfilter_test.go",
     ],
     library = ":linux",
+    deps = ["//pkg/marshal"],
 )

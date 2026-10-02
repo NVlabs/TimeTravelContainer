@@ -64,8 +64,14 @@ const (
 	// maxBufferSize is the largest size a send buffer can grow to.
 	maxSendBufferSize = 4 << 20 // 4MB
 
-	// supportedGroups is the set of multicast groups that are supported.
-	supportedGroups = 1 << (linux.RTNLGRP_LINK - 1)
+	// routeGroups is the set of NETLINK_ROUTE's multicast groups. Sockets
+	// may join any of them, as on Linux, though the sentry only announces
+	// changes of links, RTNLGRP_LINK's: the other groups carry nothing.
+	routeGroups = 1<<linux.RTNLGRP_MAX - 1
+
+	// privilegedRouteGroups are the groups that need CAP_NET_ADMIN, as
+	// Linux's rtnetlink_bind has.
+	privilegedRouteGroups = 1<<(linux.RTNLGRP_IPV4_MROUTE_R-1) | 1<<(linux.RTNLGRP_IPV6_MROUTE_R-1)
 )
 
 var errNoFilter = syserr.New("no filter attached", errno.ENOENT)
@@ -134,6 +140,19 @@ type Socket struct {
 	// this is just bookkeeping for tracking add/remove.
 	// +checklocks:mu
 	filter bool
+
+	// flags holds the socket's boolean SOL_NETLINK options, by option,
+	// which the sentry keeps, but which need not change its behavior:
+	// NETLINK_NO_ENOBUFS and NETLINK_BROADCAST_ERROR govern errors of
+	// overruns and broadcasts that it never reports, it always acks errors
+	// with the header of the failed message alone, as NETLINK_CAP_ACK has
+	// it, extended acks may lack their attributes, and it checks dump
+	// requests as strictly with NETLINK_GET_STRICT_CHK as without.
+	flags atomicbitops.Uint32
+
+	// timestamp is SO_TIMESTAMP: whether received messages come with the
+	// time of their receipt.
+	timestamp atomicbitops.Bool
 }
 
 var _ socket.Socket = (*Socket)(nil)
@@ -359,12 +378,24 @@ func (s *Socket) checkMcastSupport() *syserr.Error {
 	return nil
 }
 
-// preconditions: the netlink multicast table is locked.
-func (s *Socket) joinGroups(groups uint64) *syserr.Error {
-	if groups&supportedGroups != groups {
-		return syserr.ErrNotSupported
+// checkGroupsPermission checks that ctx may join groups.
+func (s *Socket) checkGroupsPermission(ctx context.Context, groups uint64) *syserr.Error {
+	if groups&privilegedRouteGroups != 0 && !s.netns.HasCapability(ctx, linux.CAP_NET_ADMIN) {
+		return syserr.ErrNotPermitted
 	}
+	return nil
+}
+
+// joinGroups makes s a member of groups, and of no others, as bind does.
+//
+// preconditions: the netlink multicast table is locked.
+func (s *Socket) joinGroups(ctx context.Context, groups uint64) *syserr.Error {
 	if err := s.checkMcastSupport(); err != nil {
+		return err
+	}
+	// Linux ignores the groups that the protocol lacks.
+	groups &= routeGroups
+	if err := s.checkGroupsPermission(ctx, groups); err != nil {
 		return err
 	}
 
@@ -379,15 +410,18 @@ func (s *Socket) joinGroups(groups uint64) *syserr.Error {
 }
 
 // preconditions: the netlink multicast table is locked.
-func (s *Socket) joinGroup(group uint32) *syserr.Error {
+func (s *Socket) joinGroup(ctx context.Context, group uint32) *syserr.Error {
 	if group == 0 || group > 64 {
 		return syserr.ErrInvalidArgument
 	}
 	groups := uint64(1) << (group - 1)
-	if groups&supportedGroups != groups {
-		return syserr.ErrNotSupported
-	}
 	if err := s.checkMcastSupport(); err != nil {
+		return err
+	}
+	if groups&routeGroups == 0 {
+		return syserr.ErrInvalidArgument
+	}
+	if err := s.checkGroupsPermission(ctx, groups); err != nil {
 		return err
 	}
 
@@ -405,11 +439,11 @@ func (s *Socket) leaveGroup(group uint32) *syserr.Error {
 		return syserr.ErrInvalidArgument
 	}
 	groups := uint64(1) << (group - 1)
-	if groups&supportedGroups != groups {
-		return syserr.ErrNotSupported
-	}
 	if err := s.checkMcastSupport(); err != nil {
 		return err
+	}
+	if groups&routeGroups == 0 {
+		return syserr.ErrInvalidArgument
 	}
 
 	s.groups.Store(s.groups.Load() &^ groups)
@@ -455,6 +489,19 @@ func (s *Socket) HandleInterfaceDeleteEvent(ctx context.Context, idx int32, i in
 	s.SendResponse(ctx, ms)
 }
 
+// HandleInterfaceAddrEvent implements inet.NetlinkSocket.HandleInterfaceAddrEvent.
+func (s *Socket) HandleInterfaceAddrEvent(ctx context.Context, idx int32, addr inet.InterfaceAddr, added bool) {
+	routeProtocol, ok := s.protocol.(RouteProtocol)
+	if !ok {
+		panic(fmt.Sprintf("Non-ROUTE netlink socket (protocol %d) cannot handle address events", s.Protocol()))
+	}
+
+	// Multicast messages from the kernel leave hdr->nlmsg_pid at 0.
+	ms := nlmsg.NewMessageSet(0 /*portID*/, 0 /*seq*/)
+	routeProtocol.AddAddrMessage(ms, idx, addr, added)
+	s.SendResponse(ctx, ms)
+}
+
 // Bind implements socket.Socket.Bind.
 func (s *Socket) Bind(t *kernel.Task, sockaddr []byte) *syserr.Error {
 	a, err := ExtractSockAddr(sockaddr)
@@ -462,10 +509,16 @@ func (s *Socket) Bind(t *kernel.Task, sockaddr []byte) *syserr.Error {
 		return err
 	}
 
-	if a.Groups != 0 {
+	if a.Groups != 0 && s.Protocol() == linux.NETLINK_KOBJECT_UEVENT {
+		// Linux keeps of a bind's groups those of the protocol, which has
+		// one for uevents, and anyone may receive them. The sentry has no
+		// hotplug, so the group carries nothing: its members, such as
+		// Android's ueventd, see no uevent, as on a machine that has none.
+		s.groups.Store(uint64(a.Groups) & 1)
+	} else if a.Groups != 0 {
 		var err *syserr.Error
 		s.netns.NetlinkMcastTable().WithTableLocked(func() {
-			err = s.joinGroups(uint64(a.Groups))
+			err = s.joinGroups(t, uint64(a.Groups))
 		})
 		if err != nil {
 			return err
@@ -540,6 +593,13 @@ func (s *Socket) GetSockOpt(t *kernel.Task, level int, name int, outPtr hostarch
 			// We don't have limit on receiving size.
 			return primitive.AllocateInt32(math.MaxInt32), nil
 
+		case linux.SO_TIMESTAMP:
+			var v int32
+			if s.timestamp.Load() {
+				v = 1
+			}
+			return primitive.AllocateInt32(v), nil
+
 		case linux.SO_PASSCRED:
 			var passcred primitive.Int32
 			if s.Passcred() {
@@ -564,8 +624,14 @@ func (s *Socket) GetSockOpt(t *kernel.Task, level int, name int, outPtr hostarch
 			linux.NETLINK_CAP_ACK,
 			linux.NETLINK_DUMP_STRICT_CHK,
 			linux.NETLINK_EXT_ACK,
-			linux.NETLINK_NO_ENOBUFS,
-			linux.NETLINK_PKTINFO:
+			linux.NETLINK_NO_ENOBUFS:
+			var v int32
+			if s.flags.Load()&(1<<name) != 0 {
+				v = 1
+			}
+			return primitive.AllocateInt32(v), nil
+
+		case linux.NETLINK_PKTINFO:
 
 			// Not supported.
 		}
@@ -600,6 +666,24 @@ func (s *Socket) SetSockOpt(t *kernel.Task, level int, name int, opt []byte) *sy
 			}
 			// We don't have limit on receiving size. So just accept anything as
 			// valid for compatibility.
+			return nil
+
+		case linux.SO_RCVBUFFORCE:
+			if len(opt) < sizeOfInt32 {
+				return syserr.ErrInvalidArgument
+			}
+			// As SO_RCVBUF, but past the system's limit, which
+			// CAP_NET_ADMIN may exceed.
+			if !t.HasRootCapability(linux.CAP_NET_ADMIN) {
+				return syserr.ErrNotPermitted
+			}
+			return nil
+
+		case linux.SO_TIMESTAMP:
+			if len(opt) < sizeOfInt32 {
+				return syserr.ErrInvalidArgument
+			}
+			s.timestamp.Store(hostarch.ByteOrder.Uint32(opt) != 0)
 			return nil
 
 		case linux.SO_PASSCRED:
@@ -678,7 +762,7 @@ func (s *Socket) SetSockOpt(t *kernel.Task, level int, name int, opt []byte) *sy
 			group := hostarch.ByteOrder.Uint32(opt)
 			var err *syserr.Error
 			s.netns.NetlinkMcastTable().WithTableLocked(func() {
-				err = s.joinGroup(group)
+				err = s.joinGroup(t, group)
 			})
 			return err
 
@@ -697,8 +781,24 @@ func (s *Socket) SetSockOpt(t *kernel.Task, level int, name int, opt []byte) *sy
 			linux.NETLINK_CAP_ACK,
 			linux.NETLINK_DUMP_STRICT_CHK,
 			linux.NETLINK_EXT_ACK,
-			linux.NETLINK_LISTEN_ALL_NSID,
-			linux.NETLINK_NO_ENOBUFS,
+			linux.NETLINK_NO_ENOBUFS:
+			// As Linux's netlink_setsockopt, a short value is 0.
+			var v uint32
+			if len(opt) >= sizeOfInt32 {
+				v = hostarch.ByteOrder.Uint32(opt)
+			}
+			for {
+				old := s.flags.Load()
+				flags := old &^ (1 << name)
+				if v != 0 {
+					flags |= 1 << name
+				}
+				if s.flags.CompareAndSwap(old, flags) {
+					return nil
+				}
+			}
+
+		case linux.NETLINK_LISTEN_ALL_NSID,
 			linux.NETLINK_PKTINFO:
 
 			// Not supported.
@@ -735,6 +835,17 @@ func (s *Socket) GetPeerName(t *kernel.Task) (linux.SockAddr, uint32, *syserr.Er
 // GetPeerCreds implements socket.Socket.GetPeerCreds.
 func (s *Socket) GetPeerCreds(t *kernel.Task) (marshal.Marshallable, *syserr.Error) {
 	return nil, syserr.ErrNotSupported
+}
+
+// controlMessages returns the control messages of a message that r read:
+// with SO_TIMESTAMP, its time of receipt, which is now.
+func (s *Socket) controlMessages(t *kernel.Task, r *unix.EndpointReader) socket.ControlMessages {
+	cms := socket.ControlMessages{Unix: r.Control}
+	if s.timestamp.Load() {
+		cms.IP.HasTimestamp = true
+		cms.IP.Timestamp = time.Unix(0, t.Kernel().RealtimeClock().Now().Nanoseconds())
+	}
+	return cms
 }
 
 // RecvMsg implements socket.Socket.RecvMsg.
@@ -782,7 +893,7 @@ func (s *Socket) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags int, have
 		if srcPort, err := strconv.ParseUint(r.From.Addr, 10, 32); err == nil {
 			from.PortID = uint32(srcPort)
 		}
-		return int(n), mflags, from, fromLen, socket.ControlMessages{Unix: r.Control}, syserr.FromError(err)
+		return int(n), mflags, from, fromLen, s.controlMessages(t, &r), syserr.FromError(err)
 	}
 
 	// We'll have to block. Register for notification and keep trying to
@@ -805,7 +916,7 @@ func (s *Socket) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags int, have
 			if srcPort, err := strconv.ParseUint(r.From.Addr, 10, 32); err == nil {
 				from.PortID = uint32(srcPort)
 			}
-			return int(n), mflags, from, fromLen, socket.ControlMessages{Unix: r.Control}, syserr.FromError(err)
+			return int(n), mflags, from, fromLen, s.controlMessages(t, &r), syserr.FromError(err)
 		}
 
 		if err := t.BlockWithDeadline(ch, haveDeadline, deadline); err != nil {

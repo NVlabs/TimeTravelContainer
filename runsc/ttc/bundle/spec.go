@@ -1091,6 +1091,18 @@ func mergeEnv(imageEnv, overrides []string) ([]string, error) {
 	return result, nil
 }
 
+// addDefaultEnv returns env with the assignments, NAME=VALUE, of defaults
+// whose names env does not assign.
+func addDefaultEnv(env, defaults []string) []string {
+	for _, assignment := range defaults {
+		name, _, _ := strings.Cut(assignment, "=")
+		if !envHasKey(env, name) {
+			env = append(env, assignment)
+		}
+	}
+	return env
+}
+
 func envHasKey(env []string, key string) bool {
 	prefix := key + "="
 	for _, assignment := range env {

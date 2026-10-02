@@ -146,7 +146,7 @@ func updateDiskCacheIndexLocked(index *map[string]map[*regularFile]struct{}, fil
 }
 
 // setDiskMmapObjectLocked updates the mmap cache identity and its exact
-// materialization index. rf.mapsMu must be held.
+// materialization index. rf.diskMapMu must be held.
 func (rf *regularFile) setDiskMmapObjectLocked(object string) {
 	fs := rf.inode.fs
 	if fs != nil && fs.diskVolume != nil {
@@ -206,6 +206,9 @@ func (fs *filesystem) finishDiskFileMetadata(file *regularFile, generation uint6
 }
 
 func (fs *filesystem) invalidateMaterializedObject(object string) {
+	if fs.diskVolume != nil && fs.diskVolume.Repository != nil {
+		forgetSharedDiskMapping(fs.diskVolume.Repository, object)
+	}
 	fs.liveForkMu.Lock()
 	selected := make(map[*regularFile]struct{})
 	for file := range fs.diskMmapObjectFiles[object] {
@@ -225,14 +228,18 @@ func (fs *filesystem) invalidateMaterializedObject(object string) {
 		if file.diskIOObject == object {
 			file.invalidateDiskIOLocked()
 		}
-		if file.diskObject == object {
+		file.diskIOMu.Unlock()
+		file.diskMapMu.Lock()
+		mapped := file.diskObject == object
+		if mapped {
+			file.releaseDiskMapLocked()
+		}
+		file.diskMapMu.Unlock()
+		if mapped {
 			// Preserve already-private application pages while forcing clean
 			// translations to fault against the newly installed backing inode.
 			file.mappings.InvalidateAll(memmap.InvalidateOpts{})
-			file.diskMmap.ResetFD()
-			file.setDiskMmapObjectLocked("")
 		}
-		file.diskIOMu.Unlock()
 		file.mapsMu.Unlock()
 	}
 }

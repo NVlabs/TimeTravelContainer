@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package state
 
 import (
@@ -355,10 +358,17 @@ type objectDecoder struct {
 
 	// encoded is the encoded object state.
 	encoded *wire.Struct
+
+	// cl, if not nil, loads the struct for Clone instead.
+	cl *cloneLoader
 }
 
 // load is helper for the public methods on Source.
 func (od *objectDecoder) load(slot int, objPtr reflect.Value, wait bool, fn func()) {
+	if od.cl != nil {
+		od.cl.load(slot, objPtr.Elem(), wait, fn)
+		return
+	}
 	// Note that we have reconciled the type and may remap the fields here
 	// to match what's expected by the decoder. The "slot" parameter here
 	// is in terms of the local type, where the fields in the encoded
@@ -374,6 +384,10 @@ func (od *objectDecoder) load(slot int, objPtr reflect.Value, wait bool, fn func
 
 // aterLoad implements Source.AfterLoad.
 func (od *objectDecoder) afterLoad(fn func()) {
+	if od.cl != nil {
+		od.cl.afterLoad(fn)
+		return
+	}
 	// Queue the local callback; this will execute when all of the above
 	// data dependencies have been cleared.
 	od.ods.addCallback(userCallback(fn))
@@ -441,6 +455,24 @@ func (ds *decodeState) decodeArray(ods *objectDecodeState, obj reflect.Value, en
 	for i := 0; i < len(encoded.Contents); i++ {
 		ds.decodeObject(ods, obj.Index(i), encoded.Contents[i])
 		ds.waitObject(ods, encoded.Contents[i], nil)
+	}
+}
+
+// decodeByteArray decodes s, which encodeState.encodeArray encoded, into obj,
+// an array of bytes.
+func (ds *decodeState) decodeByteArray(obj reflect.Value, s string) {
+	if obj.Type().Elem() != byteType || len(s) != obj.Len() {
+		Failf("mismatching byte array: %d bytes for %v", len(s), obj.Type())
+	}
+	if len(s) == 0 {
+		return
+	}
+	if obj.Index(0).CanAddr() {
+		copy(byteArrayBytes(obj), s)
+		return
+	}
+	for i := 0; i < len(s); i++ {
+		obj.Index(i).SetUint(uint64(s[i]))
 	}
 }
 
@@ -570,6 +602,11 @@ func (ds *decodeState) decodeObject(ods *objectDecodeState, obj reflect.Value, e
 			Failf("complex number truncated from %v to %v", complex128(*x), obj.Complex())
 		}
 	case *wire.String:
+		if obj.Kind() == reflect.Array {
+			// An array of bytes; see encodeState.encodeArray.
+			ds.decodeByteArray(obj, string(*x))
+			break
+		}
 		obj.SetString(string(*x))
 	case *wire.Slice:
 		// See *wire.Ref above; same applies.

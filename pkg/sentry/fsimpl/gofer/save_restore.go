@@ -311,10 +311,20 @@ func (fs *filesystem) afterLoad(ctx goContext.Context) {
 }
 
 // afterLoad is invoked by stateify.
-func (i *inode) afterLoad(goContext.Context) {
+func (i *inode) afterLoad(ctx goContext.Context) {
 	i.readFD = atomicbitops.FromInt32(-1)
 	i.writeFD = atomicbitops.FromInt32(-1)
 	i.mmapFD = atomicbitops.FromInt32(-1)
+	if pgalloc.LiveForkCloneNeedsPageRefs(ctx) {
+		// A live fork's source keeps the cache of a file that cannot change
+		// (see dentry.InvalidateUnsavable), which its child shares: take the
+		// child's references on its pages.
+		mf := pgalloc.MemoryFileFromContext(ctx)
+		memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
+		for seg := i.cache.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+			pgalloc.AcquireRestoreRef(ctx, mf, seg.FileRange(), memCgID)
+		}
+	}
 }
 
 // afterLoad is invoked by stateify.

@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package tcpconntrack implements a TCP connection tracking object. It allows
 // users with access to a segment stream to figure out when a connection is
 // established, reset, and closed (and in the last case, who closed first).
@@ -62,10 +65,12 @@ type TCB struct {
 	original stream
 
 	// State handlers. hdr is not guaranteed to contain bytes beyond the TCP
-	// header itself, i.e. it may not contain the payload.
-	// TODO(b/341946753): Restore them when netstack is savable.
+	// header itself, i.e. it may not contain the payload. synSent records
+	// whether they are SYN-SENT's, or all other states', so that a restored
+	// TCB reinstalls them (see afterLoad).
 	handlerReply    func(tcb *TCB, hdr header.TCP, dataLen int) Result `state:"nosave"`
 	handlerOriginal func(tcb *TCB, hdr header.TCP, dataLen int) Result `state:"nosave"`
+	synSent         bool
 
 	// firstFin holds a pointer to the first stream to send a FIN.
 	firstFin *stream
@@ -76,8 +81,7 @@ type TCB struct {
 
 // Init initializes the state of the TCB according to the initial SYN.
 func (t *TCB) Init(initialSyn header.TCP, dataLen int) Result {
-	t.handlerReply = synSentStateReply
-	t.handlerOriginal = synSentStateOriginal
+	t.setHandlers(true /* synSent */)
 
 	iss := seqnum.Value(initialSyn.SequenceNumber())
 	t.original.una = iss
@@ -96,6 +100,18 @@ func (t *TCB) Init(initialSyn header.TCP, dataLen int) Result {
 	t.reply.end = seqnum.Value(initialSyn.WindowSize())
 	t.state = ResultConnecting
 	return t.state
+}
+
+// setHandlers installs SYN-SENT's state handlers, or all other states'.
+func (t *TCB) setHandlers(synSent bool) {
+	t.synSent = synSent
+	if synSent {
+		t.handlerReply = synSentStateReply
+		t.handlerOriginal = synSentStateOriginal
+	} else {
+		t.handlerReply = allOtherReply
+		t.handlerOriginal = allOtherOriginal
+	}
 }
 
 // UpdateStateReply updates the state of the TCB based on the supplied reply
@@ -232,8 +248,7 @@ func synSentStateReply(t *TCB, tcp header.TCP, dataLen int) Result {
 	}
 
 	// Update handlers so that new calls will be handled by new state.
-	t.handlerReply = allOtherReply
-	t.handlerOriginal = allOtherOriginal
+	t.setHandlers(false /* synSent */)
 
 	return ResultAlive
 }

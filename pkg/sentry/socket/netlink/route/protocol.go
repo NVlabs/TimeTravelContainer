@@ -12,15 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package route provides a NETLINK_ROUTE socket protocol.
 package route
 
 import (
 	"bytes"
+	"net"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -311,25 +316,58 @@ func (p *Protocol) dumpAddrs(ctx context.Context, s *netlink.Socket, msg *nlmsg.
 	ifAddrs := stack.InterfaceAddrs()
 	for _, id := range stack.InterfaceIDs() {
 		for _, a := range ifAddrs[id] {
-			m := ms.AddMessage(linux.NetlinkMessageHeader{
-				Type: linux.RTM_NEWADDR,
-			})
-
-			m.Put(&linux.InterfaceAddrMessage{
-				Family:    a.Family,
-				PrefixLen: a.PrefixLen,
-				Index:     uint32(id),
-			})
-
-			addr := primitive.ByteSlice([]byte(a.Addr))
-			m.PutAttr(linux.IFA_LOCAL, &addr)
-			m.PutAttr(linux.IFA_ADDRESS, &addr)
-
-			// TODO(gvisor.dev/issue/578): There are many more attributes.
+			p.AddAddrMessage(ms, id, a, true /* added */)
 		}
 	}
 
 	return nil
+}
+
+// AddAddrMessage implements netlink.RouteProtocol.AddAddrMessage.
+func (p *Protocol) AddAddrMessage(ms *nlmsg.MessageSet, idx int32, a inet.InterfaceAddr, added bool) {
+	typ := uint16(linux.RTM_NEWADDR)
+	if !added {
+		typ = linux.RTM_DELADDR
+	}
+	m := ms.AddMessage(linux.NetlinkMessageHeader{
+		Type: typ,
+	})
+
+	// Addresses are configured, not learned, so they are permanent. See
+	// net/ipv4/devinet.c:inet_fill_ifaddr() and
+	// net/ipv6/addrconf.c:inet6_fill_ifaddr().
+	const flags = linux.IFA_F_PERMANENT
+	m.Put(&linux.InterfaceAddrMessage{
+		Family:    a.Family,
+		PrefixLen: a.PrefixLen,
+		Flags:     flags,
+		Scope:     addrScope(a.Addr),
+		Index:     uint32(idx),
+	})
+
+	addr := primitive.ByteSlice([]byte(a.Addr))
+	m.PutAttr(linux.IFA_LOCAL, &addr)
+	m.PutAttr(linux.IFA_ADDRESS, &addr)
+	cacheInfo := make([]byte, linux.InterfaceAddrCacheInfoSize)
+	hostarch.ByteOrder.PutUint32(cacheInfo[0:], linux.InfinityLifeTime) // ifa_prefered
+	hostarch.ByteOrder.PutUint32(cacheInfo[4:], linux.InfinityLifeTime) // ifa_valid
+	m.PutAttr(linux.IFA_CACHEINFO, primitive.AsByteSlice(cacheInfo))
+	// Linux always sends IFA_FLAGS, and Android's netlink parsers require it.
+	m.PutAttr(linux.IFA_FLAGS, primitive.AllocateUint32(flags))
+
+	// TODO(gvisor.dev/issue/578): There are many more attributes.
+}
+
+// addrScope returns the scope of an address: the host's for loopback
+// addresses, the link's for link-local ones, and the universe for others.
+func addrScope(addr []byte) uint8 {
+	switch ip := net.IP(addr); {
+	case ip.IsLoopback():
+		return linux.RT_SCOPE_HOST
+	case ip.IsLinkLocalUnicast():
+		return linux.RT_SCOPE_LINK
+	}
+	return linux.RT_SCOPE_UNIVERSE
 }
 
 // commonPrefixLen reports the length of the longest IP address prefix.

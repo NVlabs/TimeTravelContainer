@@ -12,9 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package linux
 
 import (
+	"bytes"
+
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -24,9 +29,6 @@ const (
 	_SYSLOG_ACTION_READ_ALL    = 3
 	_SYSLOG_ACTION_SIZE_BUFFER = 10
 )
-
-// logBufLen is the default syslog buffer size on Linux.
-const logBufLen = 1 << 17
 
 // Syslog implements part of Linux syscall syslog.
 //
@@ -42,19 +44,26 @@ func Syslog(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr,
 		if size < 0 {
 			return 0, nil, linuxerr.EINVAL
 		}
-		if size > logBufLen {
-			size = logBufLen
+		if size > kernel.SyslogMaxBytes {
+			size = kernel.SyslogMaxBytes
 		}
 
 		log := t.Kernel().Syslog().Log()
 		if len(log) > size {
-			log = log[:size]
+			// As Linux's syslog_print_all, return the newest records
+			// that fit.
+			log = log[len(log)-size:]
+			if i := bytes.IndexByte(log, '\n'); i >= 0 {
+				log = log[i+1:]
+			} else {
+				log = nil
+			}
 		}
 
 		n, err := t.CopyOutBytes(buf, log)
 		return uintptr(n), nil, err
 	case _SYSLOG_ACTION_SIZE_BUFFER:
-		return logBufLen, nil, nil
+		return kernel.SyslogMaxBytes, nil, nil
 	default:
 		return 0, nil, linuxerr.ENOSYS
 	}

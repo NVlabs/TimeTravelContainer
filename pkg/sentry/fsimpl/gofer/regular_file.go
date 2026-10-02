@@ -871,11 +871,20 @@ func boundedFillRange(required, optional memmap.MappableRange, maxReadahead uint
 
 // InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.
 func (d *dentry) InvalidateUnsavable(ctx context.Context) error {
+	d.inode.mapsMu.Lock()
+	defer d.inode.mapsMu.Unlock()
+	if memmap.IsLiveForkInProcess(ctx) && d.inode.sharesCacheWithLiveForks() {
+		// The file's pages, cached in the MemoryFile that the live fork's
+		// child shares, are the child's too: the file cannot change, since
+		// its connection is read-only, and the child takes references on
+		// them (see inode.afterLoad). Both branches keep their translations,
+		// and neither reads the file again.
+		return nil
+	}
+
 	// Whether we have a host fd (and consequently what memmap.File is
 	// mapped) can change across save/restore, so invalidate all translations
 	// unconditionally.
-	d.inode.mapsMu.Lock()
-	defer d.inode.mapsMu.Unlock()
 	d.inode.mappings.InvalidateAll(memmap.InvalidateOpts{})
 
 	// Write the cache's contents back to the remote file so that if we have a
@@ -897,6 +906,25 @@ func (d *dentry) InvalidateUnsavable(ctx context.Context) error {
 	d.inode.dirty.RemoveAllAndAccount()
 
 	return nil
+}
+
+// sharesCacheWithLiveForks reports whether the file's translations are all
+// to pages that its cache holds in the MemoryFile, and will always hold what
+// they do: the file's connection is read-only, its cache is clean, and no
+// translation is to a host file descriptor.
+//
+// Preconditions: i.mapsMu is locked.
+func (i *inode) sharesCacheWithLiveForks() bool {
+	fs := i.fs
+	if !fs.iopts.ReadOnly || fs.opts.directfs.enabled || !fs.mayCachePagesInMemoryFile() {
+		return false
+	}
+	if !fs.opts.forcePageCache && i.mmapFD.RacyLoad() >= 0 {
+		return false
+	}
+	i.dataMu.Lock()
+	defer i.dataMu.Unlock()
+	return i.dirty.IsEmpty()
 }
 
 // Evict implements pgalloc.EvictableMemoryUser.Evict.

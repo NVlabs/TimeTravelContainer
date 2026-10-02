@@ -141,6 +141,10 @@ type Config struct {
 	// virtual NIC. An empty value selects the runtime default.
 	TimeTravelNetworkMAC string `flag:"ttc-network-mac"`
 
+	// TimeTravelNetworkInterface is the guest's name for the TTC in-process
+	// virtual NIC. Empty names it eth0.
+	TimeTravelNetworkInterface string `flag:"ttc-network-interface"`
+
 	// GoferNetworkNamespace controls the network namespace used by gofer
 	// processes. The default is the shared empty "null" network namespace.
 	GoferNetworkNamespace GoferNetworkNamespace `flag:"gofer-network-namespace"`
@@ -397,6 +401,23 @@ type Config struct {
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`
 
+	// GFX enables the virtual GPU, /dev/dri/renderD128, whose renderers the
+	// sandbox's launcher starts (see pkg/sentry/devices/virtgpu).
+	GFX bool `flag:"gfx"`
+
+	// GFXFork is what a fork does with the virtual GPU while it is in use:
+	// "ineligible" refuses the fork, "device-lost" loses the GPU's state in
+	// the child, and "snapshot" forks it.
+	GFXFork string `flag:"gfx-fork"`
+
+	// GFXCapsets are the capability sets of the virtual GPU's renderer, as the
+	// base64 of the JSON that ttc-gfx-renderer's probe prints.
+	GFXCapsets string `flag:"gfx-capsets"`
+
+	// GFXBroker is the socket of the GPU renderers' broker, which runsc
+	// connects the Sentry to.
+	GFXBroker string `flag:"gfx-broker"`
+
 	// UnsafeNoHostIsolation runs the Sentry and gofer as the invoking user
 	// without placing either process in host namespaces or chroots. The Sentry
 	// still implements the guest's namespaces and credentials, but this option
@@ -558,6 +579,14 @@ func (c *Config) Validate() error {
 		mac, err := net.ParseMAC(c.TimeTravelNetworkMAC)
 		if err != nil || len(mac) != 6 || mac[0]&1 != 0 {
 			return fmt.Errorf("ttc-network-mac must be a unicast 48-bit MAC address, got %q", c.TimeTravelNetworkMAC)
+		}
+	}
+	if c.TimeTravelNetworkInterface != "" {
+		if c.Network != NetworkTimeTravel {
+			return fmt.Errorf("ttc-network-interface is only supported with ttc networking")
+		}
+		if err := ValidateNetworkInterfaceName(c.TimeTravelNetworkInterface); err != nil {
+			return fmt.Errorf("ttc-network-interface: %w", err)
 		}
 	}
 	if c.TBFBurst > maxQDiscTBFBurst {
@@ -1548,6 +1577,25 @@ func (xd *XDP) Set(input string) error {
 		xd.IfaceName = parts[1]
 	default:
 		return fmt.Errorf("invalid --xdp value: %q", input)
+	}
+	return nil
+}
+
+// ValidateNetworkInterfaceName checks that name may name a network interface
+// other than loopback, as Linux's net/core/dev.c:dev_valid_name() allows: 1
+// to 15 bytes, neither "." nor "..", without '/', ':', or white space. It also
+// refuses control characters.
+func ValidateNetworkInterfaceName(name string) error {
+	if name == "" || len(name) > 15 {
+		return fmt.Errorf("an interface name has 1 to 15 bytes, got %q", name)
+	}
+	if name == "." || name == ".." || name == "lo" {
+		return fmt.Errorf("%q cannot name an interface", name)
+	}
+	for _, c := range []byte(name) {
+		if c == '/' || c == ':' || c <= ' ' || c == 0x7f {
+			return fmt.Errorf("an interface name cannot contain %q, got %q", c, name)
+		}
 	}
 	return nil
 }

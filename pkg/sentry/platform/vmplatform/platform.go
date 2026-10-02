@@ -10,6 +10,7 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/google/btree"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
@@ -69,6 +70,17 @@ type Platform struct {
 	transitionDone chan struct{}
 	epochErr       error
 	closed         bool
+
+	// hostMemoryMu protects hostMemories, the parts of each
+	// memmap.HostMemoryFile that guests may map, which the platform maps in
+	// place until the file is released.
+	hostMemoryMu sync.Mutex
+	hostMemories map[memmap.HostMemoryFile]hostRange
+}
+
+// hostRange is a range of host addresses.
+type hostRange struct {
+	start, end uintptr
 }
 
 // New constructs the common VM platform.
@@ -135,6 +147,8 @@ func New(config Config) (*Platform, error) {
 		newEngine: engineFactory,
 		vcpus:     config.VCPUs,
 		spaces:    make(map[uint64]*addressSpace),
+
+		hostMemories: make(map[memmap.HostMemoryFile]hostRange),
 	}
 	ram.SetRevoker(p)
 	ram.SetRelocator(p)
@@ -255,7 +269,7 @@ func (p *Platform) NewAddressSpace() (sentryplatform.AddressSpace, error) {
 		log.Warningf("vmplatform: creating address space: %v", err)
 		return nil, linuxerr.ENOMEM
 	}
-	as := &addressSpace{platform: p, id: id, mappings: make(map[hostarch.Addr]addressMapping)}
+	as := &addressSpace{platform: p, id: id, mappings: make(map[hostarch.Addr]addressMapping), mapped: newMappedSet()}
 	p.mu.Lock()
 	p.spaces[id] = as
 	p.mu.Unlock()
@@ -577,10 +591,40 @@ type addressSpace struct {
 	platform *Platform
 	id       uint64
 
-	mu              sync.Mutex
-	mappings        map[hostarch.Addr]addressMapping
+	mu       sync.Mutex
+	mappings map[hostarch.Addr]addressMapping
+	// mapped holds the keys of mappings in order: unmapping a range, as each
+	// of a process's mappings does before a live fork, must not scan every
+	// page that the address space maps.
+	mapped          *btree.BTreeG[hostarch.Addr]
 	released        bool
 	stickyWriteback error
+
+	// forking is whether a fork establishes copy-on-write, between PreFork
+	// and PostFork, and deferred the pages that Unmap unmaps meanwhile,
+	// which PostFork unmaps in as few monitor transactions as they need,
+	// rather than one or more for each of a process's writable mappings.
+	forking  bool
+	deferred []hostarch.Addr
+}
+
+func newMappedSet() *btree.BTreeG[hostarch.Addr] {
+	return btree.NewG(32, func(a, b hostarch.Addr) bool { return a < b })
+}
+
+// mappedIn returns the VAs in [addr, end) that as maps, in order.
+//
+// Preconditions: as.mu is locked.
+func (as *addressSpace) mappedIn(addr, end hostarch.Addr) []hostarch.Addr {
+	var vas []hostarch.Addr
+	if as.mapped == nil { // Released.
+		return nil
+	}
+	as.mapped.AscendRange(addr, end, func(va hostarch.Addr) bool {
+		vas = append(vas, va)
+		return true
+	})
+	return vas
 }
 
 // +checklocksignore: lockEpoch conditionally returns with epochMu read-locked.
@@ -597,6 +641,10 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, file memmap.File, fr memmap.
 		var err error
 		if resolver, ok := file.(frameResolver); ok {
 			frames, frameLease, err = resolver.AcquireBackingFrames(fr, at)
+			stagedPages = nil
+		} else if hostMemory, ok := file.(memmap.HostMemoryFile); ok {
+			frames, err = as.platform.hostMemoryFrames(hostMemory, fr, at)
+			frameLease = nil
 			stagedPages = nil
 		} else {
 			frames, stagedPages, err = as.platform.staging.resolve(file, fr, at)
@@ -732,6 +780,7 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, file memmap.File, fr memmap.
 			}
 			staged := stagedPageAt(stagedPages, i)
 			as.mappings[va] = addressMapping{frame: frames[i].ID, access: at, staged: staged}
+			as.mapped.ReplaceOrInsert(va)
 			if staged != nil {
 				stagedPages[i] = nil
 			}
@@ -789,13 +838,18 @@ func (as *addressSpace) Unmap(addr hostarch.Addr, length uint64) {
 	if end < addr {
 		end = ^hostarch.Addr(0)
 	}
-	vas := make([]hostarch.Addr, 0)
-	for va := range as.mappings {
-		if va >= addr && va < end {
-			vas = append(vas, va)
-		}
+	vas := as.mappedIn(addr, end)
+	if as.forking {
+		as.deferred = append(as.deferred, vas...)
+		return
 	}
-	sort.Slice(vas, func(i, j int) bool { return vas[i] < vas[j] })
+	as.unmapLocked(vas)
+}
+
+// unmapLocked unmaps the pages at vas, which as maps, in order.
+//
+// Preconditions: as.mu is locked, and as.platform.epochMu read-locked.
+func (as *addressSpace) unmapLocked(vas []hostarch.Addr) {
 	for start := 0; start < len(vas); start += monitorabi.MaxOperations {
 		batch := vas[start:min(start+monitorabi.MaxOperations, len(vas))]
 		operations := make([]monitorabi.Operation, 0, len(batch))
@@ -828,6 +882,7 @@ func (as *addressSpace) Unmap(addr hostarch.Addr, length uint64) {
 				as.stickyWriteback = errors.Join(as.stickyWriteback, err)
 			}
 			delete(as.mappings, va)
+			as.mapped.Delete(va)
 		}
 	}
 }
@@ -862,6 +917,7 @@ func (as *addressSpace) Release() {
 		}
 	}
 	as.mappings = nil
+	as.mapped = nil
 	as.released = true
 	as.mu.Unlock()
 	as.platform.mu.Lock()
@@ -869,13 +925,58 @@ func (as *addressSpace) Release() {
 	as.platform.mu.Unlock()
 }
 
-// PreFork and PostFork intentionally do not hold as.mu. MemoryManager fork
-// establishes CoW by calling AddressSpace.Unmap between these hooks, and
-// Unmap must acquire as.mu to issue and record the monitor transaction. Each
-// address-space mutation is already serialized by as.mu, while the calling MM
-// excludes task-driven mapping changes for the duration of the fork.
-func (*addressSpace) PreFork()  {}
-func (*addressSpace) PostFork() {}
+// PreFork and PostFork intentionally do not hold as.mu between them.
+// MemoryManager fork establishes CoW by calling AddressSpace.Unmap between
+// these hooks, and Unmap must acquire as.mu. Each address-space mutation is
+// already serialized by as.mu, while the calling MM excludes task-driven
+// mapping changes for the duration of the fork. Unmap defers its unmaps to
+// PostFork, which unmaps them at once, before the fork returns: a page that
+// another thread mapped meanwhile is unmapped too, which only costs a fault.
+func (as *addressSpace) PreFork() {
+	as.mu.Lock()
+	as.forking = true
+	as.mu.Unlock()
+}
+
+// PostFork implements sentryplatform.AddressSpace.PostFork.
+//
+// +checklocksignore: lockEpoch conditionally returns with epochMu read-locked.
+func (as *addressSpace) PostFork() {
+	as.mu.Lock()
+	as.forking = false
+	vas := as.deferred
+	as.deferred = nil
+	as.mu.Unlock()
+	if len(vas) == 0 {
+		return
+	}
+	if err := as.platform.lockEpoch(stdcontext.Background()); err != nil {
+		as.mu.Lock()
+		as.stickyWriteback = errors.Join(as.stickyWriteback, err)
+		as.mu.Unlock()
+		return
+	}
+	defer as.platform.epochMu.RUnlock()
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	if as.released {
+		return
+	}
+	// Ranges of separate Unmaps may overlap or come out of order; pages
+	// that another thread unmapped or remapped meanwhile are as they are
+	// now.
+	sort.Slice(vas, func(i, j int) bool { return vas[i] < vas[j] })
+	kept := vas[:0]
+	for i, va := range vas {
+		if i > 0 && va == vas[i-1] {
+			continue
+		}
+		if _, ok := as.mappings[va]; ok {
+			kept = append(kept, va)
+		}
+	}
+	as.unmapLocked(kept)
+}
 
 // SyncRange implements sentryplatform.AddressSpaceCoherence.
 func (as *addressSpace) SyncRange(_ context.Context, addr hostarch.Addr, length uint64) error {
@@ -886,8 +987,8 @@ func (as *addressSpace) SyncRange(_ context.Context, addr hostarch.Addr, length 
 	if end < addr {
 		end = ^hostarch.Addr(0)
 	}
-	for va, mapping := range as.mappings {
-		if va >= addr && va < end && mapping.staged != nil {
+	for _, va := range as.mappedIn(addr, end) {
+		if mapping := as.mappings[va]; mapping.staged != nil {
 			pages = append(pages, mapping.staged)
 		}
 	}
@@ -958,6 +1059,7 @@ func (p *Platform) RevokeFrames(_ stdcontext.Context, refs map[pgalloc.FrameID][
 					as.stickyWriteback = errors.Join(as.stickyWriteback, err)
 				}
 				delete(as.mappings, hostarch.Addr(va))
+				as.mapped.Delete(hostarch.Addr(va))
 			}
 		}
 		as.mu.Unlock()

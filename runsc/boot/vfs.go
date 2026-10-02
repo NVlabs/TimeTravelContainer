@@ -42,6 +42,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/rdma"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
+	"gvisor.dev/gvisor/pkg/sentry/devices/dmaheap"
 	"gvisor.dev/gvisor/pkg/sentry/devices/memdev"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
@@ -50,6 +51,8 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/devices/tpuproxy/vfio"
 	"gvisor.dev/gvisor/pkg/sentry/devices/ttydev"
 	"gvisor.dev/gvisor/pkg/sentry/devices/tundev"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/binderfs"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/bpffs"
 	cgroup2fs "gvisor.dev/gvisor/pkg/sentry/fsimpl/cgroup2fs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/cgroupfs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/dev"
@@ -132,12 +135,25 @@ func registerFilesystems(k *kernel.Kernel, info *containerInfo, rdmaSnapshot *rd
 		AllowUserMount: true,
 		AllowUserList:  true,
 	})
-	if info.conf.MountCgroupV2 {
-		vfsObj.MustRegisterFilesystemType(cgroup2fs.Name, &cgroup2fs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
-			AllowUserMount: true,
-			AllowUserList:  true,
-		})
-	}
+	// The cgroup v2 hierarchy is mountable beside the v1 hierarchies too, as
+	// in Linux's hybrid setups, where the v1 hierarchies hold the controllers
+	// they mount: Android's init groups processes in it. It takes effect only
+	// once mounted.
+	vfsObj.MustRegisterFilesystemType(cgroup2fs.Name, &cgroup2fs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
+		AllowUserMount: true,
+		AllowUserList:  true,
+	})
+	// Android's init mounts binderfs, and allocates its binder devices.
+	vfsObj.MustRegisterFilesystemType(binderfs.Name, &binderfs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
+		AllowUserMount: true,
+		AllowUserList:  true,
+	})
+	// Android's init mounts the bpf filesystem, where its bpfloader pins
+	// eBPF maps and programs.
+	vfsObj.MustRegisterFilesystemType(bpffs.Name, &bpffs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
+		AllowUserMount: true,
+		AllowUserList:  true,
+	})
 	vfsObj.MustRegisterFilesystemType(devpts.Name, &devpts.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
 		AllowUserList:  true,
 		AllowUserMount: true,
@@ -195,8 +211,15 @@ func registerFilesystems(k *kernel.Kernel, info *containerInfo, rdmaSnapshot *rd
 	if err := fuse.Register(vfsObj); err != nil {
 		return fmt.Errorf("registering fusedev: %w", err)
 	}
+	if err := dmaheap.Register(vfsObj); err != nil {
+		return fmt.Errorf("registering the DMA-BUF system heap: %w", err)
+	}
 
 	if err := nvproxyRegisterDevices(info, vfsObj, k.NvidiaDriverVersion); err != nil {
+		return err
+	}
+
+	if err := gfxRegisterDevices(info, vfsObj); err != nil {
 		return err
 	}
 
@@ -1127,6 +1150,7 @@ func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo,
 		sysData := &sys.InternalData{
 			EnableTPUProxyPaths: specutils.TPUProxyEnabled(spec, conf),
 			RDMASysfs:           rdmaSysfs,
+			VirtualGPU:          conf.GFX,
 		}
 		if len(productName) > 0 {
 			sysData.ProductName = productName

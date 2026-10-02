@@ -163,6 +163,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool("ttc-network-quarantine", false, "start with the TTC runtime-owned external network edge disconnected")
 	ttcNetworkIP := flagSet.String("ttc-network-ip", "", "IPv4 address for the --network=ttc virtual NIC (default 10.0.2.15)")
 	ttcNetworkMAC := flagSet.String("ttc-network-mac", "", "MAC address for the --network=ttc virtual NIC")
+	flagSet.String("ttc-network-interface", "", "guest's name for the --network=ttc virtual NIC (default eth0)")
 	// Keep old low-level runsc arguments working for bundles and launchers
 	// produced before the TimeTravelContainer rename.
 	flagSet.BoolVar(ttcNetworkNAT, "ttos-network-nat", hostDefaultTTCNetworkNAT, "deprecated alias for --ttc-network-nat")
@@ -198,6 +199,10 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.String("nvproxy-allowed-driver-capabilities", "utility,compute", "Comma separated list of NVIDIA driver capabilities that are allowed to be requested by the container. If 'all' is specified here, it is resolved to all driver capabilities supported in nvproxy. If 'all' is requested by the container, it is resolved to this list.")
 	flagSet.Bool("rdmaproxy", false, "WIP: enable RDMA support for containers with /dev/infiniband/uverbs* devices.")
 	flagSet.Bool("tpuproxy", false, "LEGACY: enable support for TPU devices. TPU support gets automatically enabled if TPU devices are present in the OCI spec.")
+	flagSet.Bool("gfx", false, "enable the virtual GPU, /dev/dri/renderD128, whose renderers the sandbox's launcher starts.")
+	flagSet.String("gfx-fork", "ineligible", `what a fork does with the virtual GPU while it is in use: "ineligible", "device-lost", or "snapshot".`)
+	flagSet.String("gfx-capsets", "", "the capability sets of the virtual GPU's renderer, as the base64 of the JSON that ttc-gfx-renderer's probe prints.")
+	flagSet.String("gfx-broker", "", "the socket of the GPU renderers' broker, which runsc connects the Sentry to.")
 	flagSet.Bool("unsafe-no-host-isolation", hostDefaultUnsafeNoHostIsolation, "UNSAFE: run Sentry and gofer as the current user without host namespaces or chroots; intended only for trusted TimeTravelContainer workloads")
 
 	// Test flags, not to be used outside tests, ever.

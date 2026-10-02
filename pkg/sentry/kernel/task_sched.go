@@ -478,10 +478,15 @@ func (t *Task) Niceness() int {
 	return t.niceness
 }
 
-// Priority returns t's priority.
+// Priority returns t's priority, as /proc/[pid]/stat shows it: -1 less the
+// real-time priority for real-time policies, and the niceness plus 20 for
+// others. See kernel/sched/syscalls.c:task_prio().
 func (t *Task) Priority() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.sched.IsRealTime() {
+		return -1 - int(t.sched.Priority)
+	}
 	return t.niceness + 20
 }
 
@@ -513,18 +518,58 @@ func (t *Task) GetIOPrio() int {
 	return t.ioprio
 }
 
-// SetScheduler sets t's scheduler.
-func (t *Task) SetScheduler(scheduler uint) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.scheduler = scheduler
+// SchedPolicy is a task's scheduling policy.
+//
+// +stateify savable
+type SchedPolicy struct {
+	// Policy is SCHED_NORMAL, SCHED_FIFO, SCHED_RR, SCHED_BATCH, or
+	// SCHED_IDLE.
+	Policy uint
+
+	// Priority is the static priority of SCHED_FIFO and SCHED_RR, 1 to 99,
+	// and 0 for other policies.
+	Priority int32
+
+	// ResetOnFork is SCHED_RESET_ON_FORK: children revert to SCHED_NORMAL
+	// and a niceness of at least 0.
+	ResetOnFork bool
 }
 
-// GetScheduler fetches t's scheduler.
-func (t *Task) GetScheduler() uint {
+// IsRealTime returns whether p is SCHED_FIFO or SCHED_RR.
+func (p SchedPolicy) IsRealTime() bool {
+	return p.Policy == linux.SCHED_FIFO || p.Policy == linux.SCHED_RR
+}
+
+// SchedPolicy returns t's scheduling policy.
+func (t *Task) SchedPolicy() SchedPolicy {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.scheduler
+	return t.sched
+}
+
+// SetSchedPolicy sets t's scheduling policy.
+func (t *Task) SetSchedPolicy(p SchedPolicy) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.sched = p
+}
+
+// childSchedPolicy returns the scheduling policy and niceness that t's
+// children start with. See kernel/sched/core.c:sched_fork().
+func (t *Task) childSchedPolicy() (SchedPolicy, int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	p, niceness := t.sched, t.niceness
+	if p.ResetOnFork {
+		if p.IsRealTime() {
+			p = SchedPolicy{Policy: linux.SCHED_NORMAL}
+			niceness = 0
+		} else if niceness < 0 {
+			niceness = 0
+		}
+		p.ResetOnFork = false
+	}
+	return p, niceness
 }
 
 // NumaPolicy returns t's current numa policy.

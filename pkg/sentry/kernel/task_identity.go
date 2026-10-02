@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package kernel
 
 import (
@@ -169,11 +172,15 @@ func (t *Task) setKUIDsUnchecked(newR, newE, newS auth.KUID) {
 	oldR, oldE, oldS := creds.RealKUID, creds.EffectiveKUID, creds.SavedKUID
 	creds.RealKUID, creds.EffectiveKUID, creds.SavedKUID = newR, newE, newS
 
+	// With SECBIT_NO_SETUID_FIXUP, UID changes leave capabilities as they
+	// are (security/commoncap.c:cap_task_fix_setuid()).
+	fixup := creds.SecureBits&linux.SECBIT_NO_SETUID_FIXUP == 0
+
 	// "1. If one or more of the real, effective or saved set user IDs was
 	// previously 0, and as a result of the UID changes all of these IDs have a
 	// nonzero value, then all capabilities are cleared from the permitted and
 	// effective capability sets." - capabilities(7)
-	if (oldR == root || oldE == root || oldS == root) && (newR != root && newE != root && newS != root) {
+	if fixup && (oldR == root || oldE == root || oldS == root) && (newR != root && newE != root && newS != root) {
 		creds.AmbientCaps = 0
 		// prctl(2): "PR_SET_KEEPCAP: Set the state of the calling thread's
 		// "keep capabilities" flag, which determines whether the thread's permitted
@@ -198,7 +205,8 @@ func (t *Task) setKUIDsUnchecked(newR, newE, newS auth.KUID) {
 	// 3. If the effective user ID is changed from nonzero to 0, then the
 	// permitted set is copied to the effective set.
 	// """
-	if oldE == root && newE != root {
+	if !fixup {
+	} else if oldE == root && newE != root {
 		creds.EffectiveCaps = 0
 	} else if oldE != root && newE == root {
 		creds.EffectiveCaps = creds.PermittedCaps
@@ -437,38 +445,38 @@ func (t *Task) SetKeepCaps(k bool) {
 	t.creds.Store(creds)
 }
 
-// PrivilegedSecureBits is the set of securebits that are privileged.
-const PrivilegedSecureBits = linux.SECBIT_KEEP_CAPS
+// Securebits returns the securebits flags of the task.
+func (t *Task) Securebits() uint64 {
+	creds := t.Credentials()
+	bits := uint64(creds.SecureBits)
+	if creds.KeepCaps {
+		bits |= linux.SECBIT_KEEP_CAPS
+	}
+	return bits
+}
 
-// SetSecurebits sets the securebits flags of the task.
+// SetSecurebits sets the securebits flags of the task, as Linux's
+// security/commoncap.c:cap_task_prctl() does.
 //
 // Preconditions: The caller must be running on the task goroutine.
 func (t *Task) SetSecurebits(arg2 uint64) error {
-	// We only support SECBIT_KEEP_CAPS.
-	supported := uint64(linux.SECBIT_KEEP_CAPS)
-	if (arg2 & ^supported) != 0 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	creds := t.Credentials()
+	old := uint64(creds.SecureBits)
+	if creds.KeepCaps {
+		old |= linux.SECBIT_KEEP_CAPS
+	}
+	if ((old&linux.SECURE_ALL_LOCKS)>>1)&(old^arg2) != 0 || // A locked flag may not change,
+		old&linux.SECURE_ALL_LOCKS&^arg2 != 0 || // nor a lock be released,
+		arg2&^(linux.SECURE_ALL_LOCKS|linux.SECURE_ALL_BITS) != 0 || // nor an unknown flag be set,
+		!creds.HasSelfCapability(linux.CAP_SETPCAP) { // and changes are privileged.
 		return linuxerr.EPERM
 	}
-
-	if !t.HasSelfCapability(linux.CAP_SETPCAP) {
-		creds := t.Credentials()
-		var oldSec uint64
-		if creds.KeepCaps {
-			oldSec |= linux.SECBIT_KEEP_CAPS
-		}
-
-		// Linux EPERMs if the value is unchanged for unprivileged callers.
-		changed := oldSec ^ arg2
-		if changed == 0 {
-			return linuxerr.EPERM
-		}
-
-		if changed&PrivilegedSecureBits != 0 {
-			return linuxerr.EPERM
-		}
-	}
-
-	t.SetKeepCaps((arg2 & linux.SECBIT_KEEP_CAPS) != 0)
+	creds = creds.Fork() // The credentials object is immutable. See doc for creds.
+	creds.KeepCaps = arg2&linux.SECBIT_KEEP_CAPS != 0
+	creds.SecureBits = uint32(arg2 &^ linux.SECBIT_KEEP_CAPS)
+	t.creds.Store(creds)
 	return nil
 }
 

@@ -51,6 +51,34 @@ func (k *Kernel) saveStateGraph(ctx context.Context, w io.Writer, stats bool) (s
 	})
 }
 
+// cloneStateGraph makes child a copy of exactly one Kernel, k, in memory,
+// as saveStateGraph and a load of what it saved would.
+//
+// Preconditions: k.extMu must be locked.
+func (k *Kernel) cloneStateGraph(saveCtx, loadCtx context.Context, child *Kernel) (state.CloneStats, error) {
+	k.filteringBranchDanglingEndpoints = true
+	defer func() {
+		k.filteringBranchDanglingEndpoints = false
+	}()
+	return state.Clone(saveCtx, loadCtx, k, child, state.SaveOptions{
+		RejectMultipleRootObjects: true,
+	})
+}
+
+// recordStateGraph records exactly one Kernel, k, in memory, for copies
+// that are what loads of what saveStateGraph saved would be.
+//
+// Preconditions: k.extMu must be locked.
+func (k *Kernel) recordStateGraph(ctx context.Context) (*state.Recording, error) {
+	k.filteringBranchDanglingEndpoints = true
+	defer func() {
+		k.filteringBranchDanglingEndpoints = false
+	}()
+	return state.Record(ctx, k, state.SaveOptions{
+		RejectMultipleRootObjects: true,
+	})
+}
+
 // saveDanglingEndpoints is invoked by stateify.
 func (k *Kernel) saveDanglingEndpoints() []tcpip.Endpoint {
 	endpoints := tcpip.GetDanglingEndpoints()

@@ -52,6 +52,28 @@ sh_binary(
     ],
 )
 
+# Manual because it needs the host's GPU and a guest Vulkan driver built from
+# Mesa, and installs packages from Debian.
+sh_binary(
+    name = "e2e_gfx",
+    srcs = ["e2e_gfx.sh"],
+    data = glob(["gfx/*"]),
+    tags = [
+        "manual",
+    ],
+)
+
+# Manual because it needs what e2e_gfx needs, and Mesa's Vulkan driver for
+# Android, and pulls redroid's Android image.
+sh_binary(
+    name = "e2e_redroid",
+    srcs = ["e2e_redroid.sh"],
+    data = ["//runsc/ttc/gfxrenderer:guest/redroid/gpu_config.sh"],
+    tags = [
+        "manual",
+    ],
+)
+
 # Manual because it installs fuse-overlayfs from a public Ubuntu repository,
 # then exercises an in-sandbox FUSE daemon across TTC lifecycle operations.
 sh_binary(

@@ -25,6 +25,7 @@ package hvf
 #include <stddef.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <sys/ucontext.h>
@@ -1075,16 +1076,52 @@ static hv_memory_flags_t ttc_ring0_memory_flags(uint32_t access) {
 // A same-value compare-exchange never exposes a transient byte or overwrites a
 // concurrent Sentry store, but it makes the physical backing leased by HVF
 // private before hv_vm_map observes it.
-static void ttc_ring0_commit_host_pages(uintptr_t address, uint64_t length) {
+//
+// mutation_mu excludes only the Go runtime's changes. Memory that libpthread
+// or malloc manages may have become inaccessible since the Go side
+// snapshotted its regions, as a guard page does, and writing it would fault.
+// So each page's current protection is checked first; the address of the
+// first page that is no longer writable is returned, and 0 once all are
+// committed.
+static uintptr_t ttc_ring0_commit_host_pages(uintptr_t address, uint64_t length) {
 	_Atomic uint8_t *bytes = (_Atomic uint8_t *)address;
+	uint64_t writable_end = 0;
 	for (uint64_t offset = 0; offset < length;
 			offset += TTC_RING0_HOST_SLAB_SIZE) {
+		uintptr_t page = address + offset;
+		if (page >= writable_end) {
+			struct ttc_ring0_region region;
+			if (ttc_ring0_region_at(page, &region) != KERN_SUCCESS ||
+					(region.protection & VM_PROT_WRITE) == 0) {
+				return page;
+			}
+			writable_end = region.address + region.length;
+		}
 		uint8_t observed = atomic_load_explicit(&bytes[offset],
 				memory_order_relaxed);
 		while (!atomic_compare_exchange_weak_explicit(&bytes[offset],
 				&observed, observed, memory_order_relaxed,
 				memory_order_relaxed)) {}
 	}
+	return 0;
+}
+
+// Mirror requests that met a page that was no longer writable, the first few of
+// which are reported with the region there, to identify what changed.
+static _Atomic uint32_t ttc_ring0_mirror_pages_denied;
+
+static void ttc_ring0_report_denied_mirror(uintptr_t page) {
+	uint32_t seen = atomic_fetch_add_explicit(&ttc_ring0_mirror_pages_denied, 1,
+			memory_order_relaxed);
+	if (seen >= 16) return;
+	struct ttc_ring0_region region = {0};
+	int status = ttc_ring0_region_at(page, &region);
+	fprintf(stderr, "ttc hvf: skipped mirroring %#lx, no longer writable: "
+			"region status %d [%#llx, %#llx) protection %#x tag %u object %#llx\n",
+			(unsigned long)page, status, (unsigned long long)region.address,
+			(unsigned long long)(region.address + region.length),
+			region.protection, region.user_tag,
+			(unsigned long long)region.object_id);
 }
 
 // ttc_ring0_stage2_map serializes every HVF mapping operation with runtime
@@ -1117,7 +1154,15 @@ static hv_return_t ttc_ring0_stage2_map(uintptr_t host, uint64_t gpa,
 		return HV_ERROR;
 	}
 	if (tracked != 0 && (mapping->access & HV_MEMORY_WRITE) != 0) {
-		ttc_ring0_commit_host_pages(host, length);
+		uintptr_t denied = ttc_ring0_commit_host_pages(host, length);
+		if (denied != 0) {
+			pthread_mutex_unlock(&ttc_ring0_mutation_mu);
+			free(mapping);
+			// The caller leaves the range unmapped, so EL1's access to it
+			// takes the host gate instead.
+			ttc_ring0_report_denied_mirror(denied);
+			return HV_DENIED;
+		}
 	}
 	hv_return_t status = hv_vm_map((void *)host, gpa, (size_t)length,
 			ttc_ring0_memory_flags(access));

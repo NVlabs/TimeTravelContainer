@@ -72,3 +72,10 @@ func TestClassifyPortableResourcesRejectsUnannotatedInternalBind(t *testing.T) {
 		t.Fatalf("profile=%q reasons=%v, want one host-bound reason", profile, reasons)
 	}
 }
+
+func TestClassifyPortableResourcesVirtualGPUIsHostBound(t *testing.T) {
+	profile, reasons := classifyPortableResources(&config.Config{Network: config.NetworkTimeTravel, GFX: true}, map[string]*specs.Spec{"root": portableTestSpec(t)})
+	if profile != checkpoint.ResourceProfileHostBound || len(reasons) != 1 || reasons[0] != "virtual GPU is enabled" {
+		t.Fatalf("profile=%q reasons=%v, want the virtual GPU to be host-bound", profile, reasons)
+	}
+}

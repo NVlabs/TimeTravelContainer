@@ -36,10 +36,11 @@ type ramTestMap struct {
 	gpa     uint64
 	address uintptr
 	length  uint64
+	access  Stage2Access
 }
 
-func (v *ramTestVM) MapStage2(gpa uint64, address uintptr, length uint64, _ Stage2Access) error {
-	v.maps = append(v.maps, ramTestMap{gpa: gpa, address: address, length: length})
+func (v *ramTestVM) MapStage2(gpa uint64, address uintptr, length uint64, access Stage2Access) error {
+	v.maps = append(v.maps, ramTestMap{gpa: gpa, address: address, length: length, access: access})
 	if v.failMapAt != 0 && len(v.maps) == v.failMapAt {
 		return errors.New("injected stage-2 map failure")
 	}
