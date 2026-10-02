@@ -1312,6 +1312,21 @@ func (l *Loader) Destroy() {
 	refs.OnExit()
 }
 
+// restoredKernelPlatform returns the platform of a Kernel that TTC restores
+// in the running sandbox, from a distributed fork's or a dehydration's image,
+// where the sandbox's platform is not one to reuse (platform.RestoreReuser):
+// on KVM, the sandbox's own, whose VM, like the Sentry's address space that
+// it maps, every Kernel of the process may share. A new one could not be made:
+// the device file that KVM's VMs are made of is closed, and the sandbox's
+// seccomp filter refuses KVM_CREATE_VM and KVM_CREATE_VCPU. Other platforms
+// get a new one.
+func (l *Loader) restoredKernelPlatform() (platform.Platform, error) {
+	if l.root.conf.Platform == "kvm" {
+		return l.k.Platform, nil
+	}
+	return createPlatform(l.root.conf, l.root.applicationCores, nil, l.sandboxID)
+}
+
 func createPlatform(conf *config.Config, numCPU int, deviceFile *fd.FD, sandboxID string) (platform.Platform, error) {
 	platformName := conf.Platform
 	p, err := platform.Lookup(conf.Platform)

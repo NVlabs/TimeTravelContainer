@@ -160,7 +160,7 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 		l.distributedMemoryFile = nil
 		mainMF, err = createMemoryFileFromFile(l.root.conf.AppHugePages, l.hostTHP, reservedMemoryFile, false)
 		if err == nil {
-			p, err = createPlatform(l.root.conf, l.root.applicationCores, nil, l.sandboxID)
+			p, err = l.restoredKernelPlatform()
 		}
 	}
 	if err != nil {

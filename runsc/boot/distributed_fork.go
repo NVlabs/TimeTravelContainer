@@ -357,7 +357,7 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		l.distributedMemoryFile = nil
 		targetMF, err = createMemoryFileFromFile(l.root.conf.AppHugePages, l.hostTHP, reservedMemoryFile, false)
 		if err == nil {
-			p, err = createPlatform(l.root.conf, l.root.applicationCores, nil, l.sandboxID)
+			p, err = l.restoredKernelPlatform()
 		}
 	}
 	if err != nil {
