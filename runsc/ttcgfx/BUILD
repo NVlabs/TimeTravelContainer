@@ -15,5 +15,8 @@ go_binary(
     # every platform: a pure build of it renders nothing.
     pure = "off",
     visibility = ["//visibility:public"],
-    deps = ["//runsc/ttc/gfxrenderer"],
+    deps = [
+        "//runsc/ttc/gfxrenderer",
+        "//runsc/ttc/glibccompat",
+    ],
 )

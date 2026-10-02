@@ -19,7 +19,8 @@ cc_binary(
         "-Wextra",
         "-Werror",
     ],
-    linkopts = ["-ldl"],
     target_compatible_with = ["@platforms//os:linux"],
     visibility = ["//visibility:public"],
+    # Containers run it with their own glibc, of any version since 2.17.
+    deps = ["//runsc/ttc/glibccompat:start_dl"],
 )

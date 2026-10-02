@@ -23,6 +23,8 @@ import (
 	"os"
 
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer"
+	// It runs with the host's glibc, of any version since 2.17.
+	_ "gvisor.dev/gvisor/runsc/ttc/glibccompat"
 )
 
 // connFD is the descriptor of the connection to the broker or ttcd.
