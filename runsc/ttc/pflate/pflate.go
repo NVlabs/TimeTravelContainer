@@ -12,13 +12,14 @@ package pflate
 
 import (
 	"bytes"
-	"compress/flate"
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
 	"io"
 	"runtime"
 	"sync"
+
+	"github.com/klauspost/compress/flate"
 )
 
 // segmentBytes is the size of the input segments compressed apart.

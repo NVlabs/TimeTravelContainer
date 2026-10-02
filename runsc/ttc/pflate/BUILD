@@ -15,6 +15,7 @@ go_library(
         "reader.go",
     ],
     visibility = ["//runsc:__subpackages__"],
+    deps = ["@com_github_klauspost_compress//flate:go_default_library"],
 )
 
 go_test(

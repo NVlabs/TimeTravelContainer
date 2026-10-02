@@ -29,6 +29,7 @@ require (
 	github.com/gogo/protobuf v1.3.2
 	github.com/google/btree v1.1.2
 	github.com/google/subcommands v1.0.2-0.20190508160503-636abe8753b8
+	github.com/klauspost/compress v1.18.0
 	github.com/mattbaird/jsonpatch v0.0.0-20171005235357-81af80346b1a
 	github.com/moby/sys/capability v0.4.0
 	github.com/mohae/deepcopy v0.0.0-20170308212314-bb9b5e7adda9
@@ -87,7 +88,6 @@ require (
 	github.com/googleapis/gax-go/v2 v2.21.0 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
-	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
 	github.com/mdlayher/socket v0.5.1 // indirect
 	github.com/mdlayher/vsock v1.2.1 // indirect

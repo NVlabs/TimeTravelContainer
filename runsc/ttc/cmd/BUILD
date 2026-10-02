@@ -85,6 +85,7 @@ go_library(
 		"//runsc/ttc/protocol",
 		"//runsc/ttc/storage",
         "//runsc/version",
+        "@com_github_klauspost_compress//flate:go_default_library",
         "@com_github_opencontainers_runtime_spec//specs-go",
         "@org_golang_x_sys//unix:go_default_library",
         "@org_golang_x_term//:go_default_library",

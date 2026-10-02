@@ -32,6 +32,7 @@ go_library(
         "@com_github_containerd_containerd_v2//plugins/content/local",
         "@com_github_containerd_platforms//:platforms",
         "@com_github_distribution_reference//:go_default_library",
+        "@com_github_klauspost_compress//flate:go_default_library",
         "@com_github_opencontainers_image_spec//specs-go/v1:specs-go",
     ],
 )

@@ -5,11 +5,12 @@ package pflate
 
 import (
 	"bytes"
-	"compress/flate"
 	"errors"
 	"fmt"
 	"io"
 	"runtime"
+
+	"github.com/klauspost/compress/flate"
 )
 
 // finalBlock is an empty final stored block. A segment that does not end the

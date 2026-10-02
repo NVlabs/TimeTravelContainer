@@ -4,7 +4,6 @@
 package cmd
 
 import (
-	"compress/flate"
 	"context"
 	"encoding/json"
 	"errors"
@@ -25,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 	"gvisor.dev/gvisor/runsc/ttc/pflate"
 
+	"github.com/klauspost/compress/flate"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 

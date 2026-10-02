@@ -6,7 +6,6 @@ package images
 
 import (
 	"bytes"
-	"compress/flate"
 	"context"
 	"encoding/json"
 	"errors"
@@ -28,6 +27,7 @@ import (
 	"github.com/containerd/errdefs"
 	"github.com/containerd/platforms"
 	distref "github.com/distribution/reference"
+	"github.com/klauspost/compress/flate"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"gvisor.dev/gvisor/runsc/ttc/pflate"
 )
