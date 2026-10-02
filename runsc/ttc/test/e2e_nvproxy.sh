@@ -10,6 +10,11 @@
 # ends while new processes in the child use the GPU, and with
 # --nvproxy-fork=snapshot, whose children count on from the fork.
 #
+# On KVM, where a family's CUDA processes map the GPU in the Sentry's address
+# space, at the addresses that CUDA picks alike in every process, so that the
+# second of two that run at once fails, TTC refuses --nvproxy for now, which
+# is all that the test checks there.
+#
 # It needs:
 #   TTC and TTCD, the binaries;
 #   TTC_CUDA_CHECKPOINT, ttc-cuda-checkpoint;
@@ -21,7 +26,8 @@
 #   network access, to pull IMAGE (default debian:sid), whose C library
 #     runs cudaloop.
 #
-# The daemon runs with host isolation unless TTC_UNSAFE_NO_HOST_ISOLATION=1.
+# The daemon runs with host isolation unless TTC_UNSAFE_NO_HOST_ISOLATION=1,
+# on its default platform unless TTC_PLATFORM names another, such as kvm.
 set -eu
 
 TTC=${TTC:-}
@@ -30,6 +36,7 @@ TTC_CUDA_CHECKPOINT=${TTC_CUDA_CHECKPOINT:-}
 CUDALOOP=${CUDALOOP:-}
 TTC_E2E_ROOT=${TTC_E2E_ROOT:-}
 TTC_UNSAFE_NO_HOST_ISOLATION=${TTC_UNSAFE_NO_HOST_ISOLATION:-0}
+TTC_PLATFORM=${TTC_PLATFORM:-}
 IMAGE=${IMAGE:-debian:sid}
 
 fail() {
@@ -80,7 +87,29 @@ set -- daemon start
 if [ "$TTC_UNSAFE_NO_HOST_ISOLATION" = 1 ]; then
   set -- "$@" --unsafe-no-host-isolation
 fi
+if [ -n "$TTC_PLATFORM" ]; then
+  set -- "$@" --platform "$TTC_PLATFORM"
+fi
 ttc "$@"
+if [ -n "$TTC_PLATFORM" ]; then
+  case "$(ttc daemon status)" in
+    *"\"runtime_platform\":\"$TTC_PLATFORM\""*) ;;
+    *) fail "the daemon does not run on $TTC_PLATFORM" ;;
+  esac
+fi
+case "$(ttc daemon status)" in
+  *'"runtime_platform":"kvm"'*)
+    if output=$(ttc run --rm --nvproxy --nvproxy-fork=device-lost "$IMAGE" true 2>&1); then
+      fail "--nvproxy was accepted on KVM"
+    fi
+    case "$output" in
+      *"needs the systrap platform"*) ;;
+      *) fail "--nvproxy on KVM: $output" ;;
+    esac
+    echo "ttc nvproxy e2e: ok (KVM refuses --nvproxy)"
+    exit 0
+    ;;
+esac
 
 # GPUs refuse live forks unless their family says what a fork does with them.
 if output=$(ttc run --rm --nvproxy "$IMAGE" true 2>&1); then

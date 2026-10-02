@@ -19,7 +19,8 @@
 #     Debian image. Debian's Mesa has a Venus driver of its own, which the
 #     daemon's containers skip.
 #
-# The daemon runs with host isolation unless TTC_UNSAFE_NO_HOST_ISOLATION=1.
+# The daemon runs with host isolation unless TTC_UNSAFE_NO_HOST_ISOLATION=1,
+# on its default platform unless TTC_PLATFORM names another, such as kvm.
 # On macOS, it then starts renderers through a launcher, and each renderer
 # confines itself with the macOS sandbox.
 set -eu
@@ -30,6 +31,7 @@ TTC_GFX_RENDERER=${TTC_GFX_RENDERER:-}
 TTC_GFX_GUEST_DRIVER=${TTC_GFX_GUEST_DRIVER:-}
 TTC_E2E_ROOT=${TTC_E2E_ROOT:-}
 TTC_UNSAFE_NO_HOST_ISOLATION=${TTC_UNSAFE_NO_HOST_ISOLATION:-0}
+TTC_PLATFORM=${TTC_PLATFORM:-}
 DEBIAN_IMAGE=${DEBIAN_IMAGE:-debian:sid}
 # The checksums of vkoffscreen's and gloffscreen's images, whose every pixel
 # they check.
@@ -102,7 +104,16 @@ set -- daemon start
 if [ "$TTC_UNSAFE_NO_HOST_ISOLATION" = 1 ]; then
   set -- "$@" --unsafe-no-host-isolation
 fi
+if [ -n "$TTC_PLATFORM" ]; then
+  set -- "$@" --platform "$TTC_PLATFORM"
+fi
 ttc "$@"
+if [ -n "$TTC_PLATFORM" ]; then
+  case "$(ttc daemon status)" in
+    *"\"runtime_platform\":\"$TTC_PLATFORM\""*) ;;
+    *) fail "the daemon does not run on $TTC_PLATFORM" ;;
+  esac
+fi
 
 # A GPU refuses live forks unless its family says what a fork does with it.
 if output=$(ttc run --rm --gfx "$DEBIAN_IMAGE" true 2>&1); then

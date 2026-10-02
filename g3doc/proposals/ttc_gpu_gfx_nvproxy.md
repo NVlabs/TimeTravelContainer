@@ -927,11 +927,24 @@ NVIDIA RTX PRO 6000 Blackwell and its driver 590.08, a pre-release.*
     which stalled in about half of the runs while applications' windows
     failed, completed in five runs of five, in 20 to 61 s (15 s without
     `--gfx`), with no `Xid`.
+*   **KVM:** the above ran on systrap. On the same node with
+    `--platform kvm`, `e2e_gfx.sh` and `e2e_redroid.sh` pass, and llama.cpp
+    and Chromium run and fork as on systrap (llama.cpp at 29,326 tokens/s of
+    prompt and 376 of generation, a fork of 198 ms; Chromium's of 288 ms).
+    CUDA ran one process at a time in a family: the Sentry maps each
+    process's UVM memory into its own address space at the address at which
+    the process maps it, as NVIDIA's UVM driver requires, and CUDA maps it
+    at the same address in every process (0x207000000), so that the second
+    of two CUDA processes that run at once failed, and a snapshot fork's
+    child could not restore its CUDA processes beside their source's. gVisor
+    documents a like limit of `cudaMallocManaged()` on KVM. TTC refuses
+    `--nvproxy` on KVM for now, which `e2e_nvproxy.sh` checks with
+    `TTC_PLATFORM=kvm`.
 *   **Not done:** B5; forks of `--nvproxy` families to other nodes;
     NVIDIA's own Vulkan through `--nvproxy=graphics`, whose ICD does not
     initialize on the pre-release driver under 590.48.01's interface; the
-    renderer's confinement on Linux; and arm64 hosts and the KVM platform,
-    which the node did not have: everything above ran on systrap.
+    renderer's confinement on Linux; `--nvproxy` on KVM; and arm64 hosts,
+    which the node is not.
 
 ## Testing
 

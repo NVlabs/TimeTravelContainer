@@ -127,10 +127,22 @@ var nvidiaGPUDevice = regexp.MustCompile(`^nvidia[0-9]+$`)
 // the dynamic loaders of images of the host's distribution family search.
 // The service finds them for the first --nvproxy family.
 type nvproxyService struct {
+	// platform is the daemon's runtime platform.
+	platform string
+
 	once sync.Once
 	host *nvidiaHost
 	err  error
 }
+
+// errNVProxyOnKVM explains why --nvproxy families need the systrap platform,
+// for now. On KVM, the Sentry maps the UVM memory of every process of a
+// family, in every branch, into its own address space, at the address at
+// which the process maps it, as NVIDIA's UVM driver requires; and CUDA maps
+// it at the same address in every process (0x207000000 on driver 590). So
+// the second of two CUDA processes that run at once fails, and a snapshot
+// fork's child cannot restore its CUDA processes beside their source's.
+var errNVProxyOnKVM = errors.New("--nvproxy needs the systrap platform for now: on KVM, a family's CUDA processes map the GPU in one address space, at addresses that CUDA picks alike in every process, so that the second of two that run at once fails")
 
 // nvidiaHost is what a host has of NVIDIA's driver.
 type nvidiaHost struct {
@@ -323,6 +335,9 @@ func nvproxyDriverCaps(opts ttcbundle.GPUOptions) (nvconf.DriverCaps, error) {
 func (s *nvproxyService) edits(opts ttcbundle.GPUOptions) ([]ttcbundle.HostMount, []specs.LinuxDevice, error) {
 	if !opts.NVProxy {
 		return nil, nil, nil
+	}
+	if s != nil && s.platform == "kvm" {
+		return nil, nil, errNVProxyOnKVM
 	}
 	host, err := s.find()
 	if err != nil {

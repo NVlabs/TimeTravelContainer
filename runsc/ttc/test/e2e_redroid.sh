@@ -21,7 +21,8 @@
 #   optionally REDROID_DNS, the DNS server of Android's network, where the
 #     host's network blocks Android's default, 8.8.8.8.
 #
-# The daemon runs with host isolation unless TTC_UNSAFE_NO_HOST_ISOLATION=1.
+# The daemon runs with host isolation unless TTC_UNSAFE_NO_HOST_ISOLATION=1,
+# on its default platform unless TTC_PLATFORM names another, such as kvm.
 set -eu
 
 TTC=${TTC:-}
@@ -34,6 +35,7 @@ APK=${APK:-}
 REDROID_DNS=${REDROID_DNS:-}
 TTC_E2E_ROOT=${TTC_E2E_ROOT:-}
 TTC_UNSAFE_NO_HOST_ISOLATION=${TTC_UNSAFE_NO_HOST_ISOLATION:-0}
+TTC_PLATFORM=${TTC_PLATFORM:-}
 # How long Android may take to boot, in seconds.
 BOOT_TIMEOUT=${BOOT_TIMEOUT:-300}
 
@@ -100,7 +102,16 @@ set -- daemon start
 if [ "$TTC_UNSAFE_NO_HOST_ISOLATION" = 1 ]; then
   set -- "$@" --unsafe-no-host-isolation
 fi
+if [ -n "$TTC_PLATFORM" ]; then
+  set -- "$@" --platform "$TTC_PLATFORM"
+fi
 ttc "$@"
+if [ -n "$TTC_PLATFORM" ]; then
+  case "$(ttc daemon status)" in
+    *"\"runtime_platform\":\"$TTC_PLATFORM\""*) ;;
+    *) fail "the daemon does not run on $TTC_PLATFORM" ;;
+  esac
+fi
 
 # adb runs a command in Android, as its shell would; adb_in, in a branch.
 adb() {

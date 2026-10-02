@@ -207,7 +207,11 @@ guest:
 It needs a host with NVIDIA GPUs, `cudaloop` built for them, and
 `ttc-cuda-checkpoint`. A host whose driver nvproxy does not support, such as
 a pre-release one, names in `TTC_NVPROXY_DRIVER_VERSION` a driver whose
-interface it has.
+interface it has. On KVM, where TTC refuses `--nvproxy` for now, it checks
+the refusal.
+
+`e2e_gfx.sh`, `e2e_redroid.sh` and `e2e_nvproxy.sh` run their daemons on the
+platform that `TTC_PLATFORM` names, such as `kvm`, and check that they do.
 
 ```shell
 bazel build //runsc/ttc:ttc //runsc/ttcd:ttcd //runsc/ttc/cudacheckpoint:ttc-cuda-checkpoint
