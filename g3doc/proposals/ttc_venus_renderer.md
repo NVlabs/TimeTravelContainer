@@ -100,7 +100,10 @@ counts the devices that hold a token (the save's source until the kernels
 that load the save are loaded, and each loaded device until it restores the
 token, promptly), so that the last restore takes the clone and the others
 clone it again, and a save that no device loads tells the renderer to forget
-it. Checkpoints, dehydration, and remote forks, which leave the process, lose
+it. The last waits for the others' copies, which the renderer serves on
+other connections. A fan-out's first child, which has yet to restore the
+token when its siblings' metadata is recorded, passes the token on to them,
+rather than restoring it and taking another clone while the source waits. Checkpoints, dehydration, and remote forks, which leave the process, lose
 the GPU's contexts, as `--gfx-fork=device-lost` does.
 
 ## Android
@@ -166,15 +169,11 @@ Done, every milestone, on macOS (2026-10-02):
 *   Clean file pages are shared between branches.
 *   gfxstream is removed.
 
-A fork of Chromium rendering WebGL pauses it for 0.32 s, and of llama.cpp
-generating on the GPU for 0.29 s; a fork of Android pauses it for about
+A fork of Chromium rendering WebGL pauses it for 0.32 s, and a fan-out of
+llama.cpp generating on the GPU, into two children, for 0.16 s, of which
+cloning the GPU's 500 MB takes 60 ms; a fork of Android pauses it for about
 1.8 s, of which recording and copying the kernel's metadata take 0.64 s,
 and the HVF platform's flush of the guest's execution caches about 0.4 s.
-
-A fan-out's first child restores its parent's clone of the GPU, and takes
-another for its siblings, before the source resumes. Handing its siblings the
-parent's clone would save both copies of the GPU's memory, which take 40 ms
-each for llama.cpp's 500 MB.
 
 The renderer runs on macOS. Linux hosts (plan item B1 of
 `ttc_gpu_gfx_nvproxy.md`) need it to import guest memory into their Vulkan

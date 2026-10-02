@@ -99,10 +99,13 @@ type LiveForkOptions struct {
 
 	// batchChildBranchIDs and batchFilesystemResources are used by
 	// LiveForkMany to prepare its primary filesystem branch and retain the
-	// resources needed for post-resume sibling branching. They are deliberately
+	// resources needed for post-resume sibling branching. batchLoads are the
+	// loads of the siblings, which load after the primary, until which the
+	// source keeps what it saved for its children. They are deliberately
 	// not exported: callers should use LiveForkMany.
 	batchChildBranchIDs      []string
 	batchFilesystemResources vfs.LiveForkFilesystemResources
+	batchLoads               *vfs.LiveForkLoads
 }
 
 // LiveForkValidationOptions controls live-fork resource validation.
@@ -349,6 +352,9 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			vfs.CtxLiveForkFilesystemOrigins:   opts.FilesystemOrigins,
 			vfs.CtxLiveForkPreparationMetrics:  fsPreparationMetrics,
 		})
+		if opts.batchLoads != nil {
+			saveCtx = context.WithValue(saveCtx, vfs.CtxLiveForkLoads, opts.batchLoads)
+		}
 		vfsPreparationStarted := time.Now()
 		if err := k.vfs.PrepareSave(saveCtx); err != nil {
 			return fmt.Errorf("preparing VFS for live fork: %w", err)
@@ -581,9 +587,15 @@ func (k *Kernel) LiveForkMany(ctx context.Context, opts []LiveForkOptions, sourc
 	}
 
 	fsResources := make(vfs.LiveForkFilesystemResources)
+	// The siblings load what the capture of the primary saves once the
+	// capture ends: what the source's devices keep for the primary, which the
+	// primary's devices may pass on to the siblings, and what the primary's
+	// keep for the siblings, last until the loads end.
+	loads := &vfs.LiveForkLoads{}
 	primaryOpts := opts[0]
 	primaryOpts.batchChildBranchIDs = ids[:1]
 	primaryOpts.batchFilesystemResources = fsResources
+	primaryOpts.batchLoads = loads
 	if primaryOpts.FilesystemOrigins != nil {
 		primaryOpts.FilesystemOrigins = make(vfs.LiveForkFilesystemOrigins, len(opts[0].FilesystemOrigins))
 		for resource, origins := range opts[0].FilesystemOrigins {
@@ -595,6 +607,7 @@ func (k *Kernel) LiveForkMany(ctx context.Context, opts []LiveForkOptions, sourc
 	}
 	primary, err := k.LiveFork(ctx, primaryOpts)
 	if err != nil {
+		loads.Done()
 		return nil, err
 	}
 	children := make([]*Kernel, len(opts))
@@ -621,6 +634,7 @@ func (k *Kernel) LiveForkMany(ctx context.Context, opts []LiveForkOptions, sourc
 	// Recording it exists only to amortize metadata recording across
 	// additional siblings.
 	if len(opts) == 1 {
+		loads.Done()
 		if sourceReady != nil {
 			if err := sourceReady(); err != nil {
 				cleanup()
@@ -635,12 +649,10 @@ func (k *Kernel) LiveForkMany(ctx context.Context, opts []LiveForkOptions, sourc
 	// children is safe to overlap with source execution: copies read only
 	// what the recording took.
 	if err := forkPreparedFilesystemBranches(fsResources, ids[0], ids[1:], opts[0].FilesystemOrigins); err != nil {
+		loads.Done()
 		cleanup()
 		return nil, err
 	}
-	// The siblings copy what the capture recorded once the capture ends:
-	// what the primary's devices keep for them lasts until the copies end.
-	loads := &vfs.LiveForkLoads{}
 	recording, pmaSnapshots, err := primary.captureLiveForkMetadata(fsResources, loads)
 	if err != nil {
 		loads.Done()

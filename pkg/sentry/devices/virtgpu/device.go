@@ -204,8 +204,11 @@ type device struct {
 	// by submitMu.
 	snapshot []byte
 	// snapshotTaken is whether the save's preparation took snapshot, which
-	// the source drops once the save is done.
-	snapshotTaken bool `state:"nosave"`
+	// the source drops once the save is done, unless snapshotPassed: the
+	// preparation passed on the snapshot that a load left the device, which
+	// it has yet to restore.
+	snapshotTaken  bool `state:"nosave"`
+	snapshotPassed bool `state:"nosave"`
 	// snapshotReference is whether snapshot is a reference to what the
 	// renderer of the Sentry's family keeps for it (see Snapshot).
 	snapshotReference bool

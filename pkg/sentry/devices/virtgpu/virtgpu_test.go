@@ -64,6 +64,9 @@ type fakeRenderer struct {
 	// referenceSnapshots makes snapshots references, as the Venus
 	// renderer's are.
 	referenceSnapshots bool
+	// fakes are the renderers that started the renderer, which share a
+	// family's renderer's snapshots.
+	fakes *fakeRenderers
 }
 
 // fakeRenderers starts fakeRenderers.
@@ -78,6 +81,14 @@ type fakeRenderers struct {
 	failRestore bool
 	// referenceSnapshots makes new renderers' snapshots references.
 	referenceSnapshots bool
+	// copyDelay delays new renderers' restores that copy a snapshot, not as
+	// the last.
+	copyDelay time.Duration
+	// restores records the restores of reference snapshots in order:
+	// "copied" once a restore that copies one ends, and "taken" once a
+	// restore as the last starts, as a family's renderer, which serves each
+	// device on a connection of its own, would copy and take them.
+	restores []string
 }
 
 func (f *fakeRenderers) newRenderer(events RendererEvents) (Renderer, error) {
@@ -92,6 +103,7 @@ func (f *fakeRenderers) newRenderer(events RendererEvents) (Renderer, error) {
 		failRestore: f.failRestore,
 
 		referenceSnapshots: f.referenceSnapshots,
+		fakes:              f,
 	}
 	f.renderers = append(f.renderers, r)
 	return r, nil
@@ -235,6 +247,21 @@ func (r *fakeRenderer) Restore(data []byte, sizes map[uint32]uint64, last bool) 
 		r.record("Restore %v", slices.Sorted(maps.Keys(sizes)))
 	} else {
 		r.record("Restore %v, not the last", slices.Sorted(maps.Keys(sizes)))
+	}
+	if r.referenceSnapshots {
+		f := r.fakes
+		if last {
+			f.mu.Lock()
+			f.restores = append(f.restores, "taken")
+			f.mu.Unlock()
+		} else {
+			defer func() {
+				time.Sleep(f.copyDelay)
+				f.mu.Lock()
+				f.restores = append(f.restores, "copied")
+				f.mu.Unlock()
+			}()
+		}
 	}
 	var snapshot fakeSnapshot
 	if err := json.Unmarshal(data, &snapshot); err != nil {
@@ -1849,6 +1876,135 @@ func TestReferenceSnapshotSaveBeforeRestore(t *testing.T) {
 	wantCalls(t, source, "Snapshot", "ForgetSnapshot")
 	wantCalls(t, restored, "Restore [], not the last", "Snapshot")
 	wantCalls(t, e.fakes.last(t), "Restore []")
+}
+
+// TestReferenceSnapshotPassedOn checks that a loaded device that has yet to
+// restore its reference snapshot passes it on to the loads of a save in the
+// process, rather than restoring it and taking another, and that the last of
+// the devices that then hold it restores it as the last.
+func TestReferenceSnapshotPassedOn(t *testing.T) {
+	e := newTestEnv(t, ForkSnapshot)
+	e.fakes.referenceSnapshots = true
+	file := e.open()
+	if err := e.contextInit(file, 3, 1, "snap"); err != nil {
+		t.Fatal(err)
+	}
+	d := file.Impl().(*renderFD).dev
+	source := e.fakes.last(t)
+	source.takeCalls()
+	if err := d.PrepareSave(context.Background()); err != nil {
+		t.Fatalf("PrepareSave: %v", err)
+	}
+	// The source holds its snapshot until its save ends, which keeps the
+	// child from restoring it eagerly.
+	child := loadDevice(t, d, e.fakes.newRenderer)
+	inProcess := context.WithValue(context.Background(), memmap.CtxLiveForkInProcess, true)
+	if err := child.PrepareSave(inProcess); err != nil {
+		t.Fatalf("PrepareSave of the child: %v", err)
+	}
+	if e.fakes.last(t) != source {
+		t.Fatal("the child's save restored the child's snapshot")
+	}
+	grandchild := loadDevice(t, child, e.fakes.newRenderer)
+	child.BeforeResume(inProcess)
+	if child.snapshot == nil || !child.snapshotReference {
+		t.Fatal("the child dropped the snapshot that it has yet to restore")
+	}
+	d.BeforeResume(context.Background())
+	<-child.restoredEagerly
+	<-grandchild.restoredEagerly
+	// The last restore took the source's snapshot.
+	wantCalls(t, source, "Snapshot")
+	var restores []string
+	e.fakes.mu.Lock()
+	for _, r := range e.fakes.renderers[1:] {
+		restores = append(restores, r.takeCalls()...)
+	}
+	e.fakes.mu.Unlock()
+	slices.Sort(restores)
+	if want := []string{"Restore []", "Restore [], not the last"}; !slices.Equal(restores, want) {
+		t.Errorf("the restores are %q, want %q", restores, want)
+	}
+}
+
+// TestReferenceSnapshotPassedOnToBatchSiblings checks that a live fork's
+// primary child, which has yet to restore the source's reference snapshot,
+// passes it on to its batch siblings, which load after the source's save
+// and the primary's capture end.
+func TestReferenceSnapshotPassedOnToBatchSiblings(t *testing.T) {
+	e := newTestEnv(t, ForkSnapshot)
+	e.fakes.referenceSnapshots = true
+	file := e.open()
+	if err := e.contextInit(file, 3, 1, "snap"); err != nil {
+		t.Fatal(err)
+	}
+	d := file.Impl().(*renderFD).dev
+	source := e.fakes.last(t)
+	source.takeCalls()
+	loads := &vfs.LiveForkLoads{}
+	ctx := context.WithValue(context.WithValue(context.Background(), vfs.CtxLiveForkLoads, loads), memmap.CtxLiveForkInProcess, true)
+	if err := d.PrepareSave(ctx); err != nil {
+		t.Fatalf("PrepareSave: %v", err)
+	}
+	primary := loadDevice(t, d, e.fakes.newRenderer)
+	d.BeforeResume(ctx)
+	if err := primary.PrepareSave(ctx); err != nil {
+		t.Fatalf("PrepareSave of the primary: %v", err)
+	}
+	saved := saveDevice(t, primary)
+	primary.BeforeResume(ctx)
+	if e.fakes.last(t) != source {
+		t.Fatal("the primary's capture restored the primary's snapshot")
+	}
+	one := loadSavedDevice(t, saved, e.fakes.newRenderer)
+	two := loadSavedDevice(t, saved, e.fakes.newRenderer)
+	loads.Done()
+	for _, dev := range []*device{primary, one, two} {
+		<-dev.restoredEagerly
+	}
+	wantCalls(t, source, "Snapshot")
+	var restores []string
+	e.fakes.mu.Lock()
+	for _, r := range e.fakes.renderers[1:] {
+		restores = append(restores, r.takeCalls()...)
+	}
+	e.fakes.mu.Unlock()
+	slices.Sort(restores)
+	if want := []string{"Restore []", "Restore [], not the last", "Restore [], not the last"}; !slices.Equal(restores, want) {
+		t.Errorf("the restores are %q, want %q", restores, want)
+	}
+}
+
+// TestReferenceSnapshotLastWaitsForCopies checks that the last device to
+// restore a reference snapshot, which takes it, waits for the restores that
+// copy it, which the family's renderer serves on other connections.
+func TestReferenceSnapshotLastWaitsForCopies(t *testing.T) {
+	e := newTestEnv(t, ForkSnapshot)
+	e.fakes.referenceSnapshots = true
+	e.fakes.copyDelay = 100 * time.Millisecond
+	file := e.open()
+	if err := e.contextInit(file, 3, 1, "snap"); err != nil {
+		t.Fatal(err)
+	}
+	d := file.Impl().(*renderFD).dev
+	if err := d.PrepareSave(context.Background()); err != nil {
+		t.Fatalf("PrepareSave: %v", err)
+	}
+	children := []*device{
+		loadDevice(t, d, e.fakes.newRenderer),
+		loadDevice(t, d, e.fakes.newRenderer),
+		loadDevice(t, d, e.fakes.newRenderer),
+	}
+	d.BeforeResume(context.Background())
+	for _, child := range children {
+		<-child.restoredEagerly
+	}
+	e.fakes.mu.Lock()
+	restores := e.fakes.restores
+	e.fakes.mu.Unlock()
+	if want := []string{"copied", "copied", "taken"}; !slices.Equal(restores, want) {
+		t.Errorf("the renderer copied and took the snapshot as %q, want %q", restores, want)
+	}
 }
 
 // TestReferenceSnapshotWithoutChildren checks that a save that loads no
