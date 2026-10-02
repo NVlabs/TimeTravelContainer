@@ -236,9 +236,13 @@ func findContainerID(rootDir, partialID string) (FullID, error) {
 	return *rv, nil
 }
 
+// stateFileName matches the name of a state file, its container's and
+// sandbox's IDs. Compiled for each name, it was a twentieth of a listing of
+// the sandboxes, which parses every name in the root.
+var stateFileName = regexp.MustCompile(`([\w+-\.]+)_sandbox:([\w+-\.]+)\.` + stateFileExtension)
+
 func parseFileName(name string) (FullID, error) {
-	re := regexp.MustCompile(`([\w+-\.]+)_sandbox:([\w+-\.]+)\.` + stateFileExtension)
-	groups := re.FindStringSubmatch(name)
+	groups := stateFileName.FindStringSubmatch(name)
 	if len(groups) != 3 {
 		return FullID{}, fmt.Errorf("invalid state file name format: %q", name)
 	}

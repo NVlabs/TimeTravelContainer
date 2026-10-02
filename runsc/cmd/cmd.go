@@ -12,11 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package cmd holds implementations of the runsc commands.
 package cmd
 
 import (
+	"errors"
 	"fmt"
+	"os"
 
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
@@ -42,7 +47,15 @@ func (c *containerLoader) loadContainer(conf *config.Config, f *flag.FlagSet, lo
 		return nil, fmt.Errorf("a container-id is required")
 	}
 	id := f.Arg(0)
-	cont, err := container.Load(conf.RootDir, container.FullID{ContainerID: id}, loadOpts)
+	// A sandbox's own container is found by its exact ID; an abbreviated ID,
+	// or another container of the sandbox, by a search of the root, which
+	// reads every name in it.
+	exact := loadOpts
+	exact.Exact = true
+	cont, err := container.Load(conf.RootDir, container.FullID{SandboxID: id, ContainerID: id}, exact)
+	if errors.Is(err, os.ErrNotExist) {
+		cont, err = container.Load(conf.RootDir, container.FullID{ContainerID: id}, loadOpts)
+	}
 	if err != nil {
 		return nil, err
 	}
