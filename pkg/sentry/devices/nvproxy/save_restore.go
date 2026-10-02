@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package nvproxy
 
 import (
@@ -174,6 +177,10 @@ func MakeDeviceRemapping(oldIDs, newIDs []DeviceRemapID) (*DeviceRemapping, erro
 
 // beforeSave is invoked by stateify.
 func (nvp *nvproxy) beforeSave() {
+	if nvp.loseOnLoad {
+		// What loads the save loses the objects: see uvmDevice.PrepareSave.
+		return
+	}
 	// No need to hold any locks since the sandbox is paused.
 	// This avoids lock inversion between nvp.clientsMu and rootClient.objsMu.
 	for _, client := range nvp.clients {
@@ -193,6 +200,10 @@ func (nvp *nvproxy) afterLoad(ctx goContext.Context) {
 		panic(fmt.Sprintf("driver version %q not found in abis map", nvp.version))
 	}
 	nvp.abi = abiEntry.cons()
+	if nvp.loseOnLoad {
+		nvp.lose()
+		return
+	}
 	if dr := DeviceRemappingFromContext(ctx); dr != nil {
 		// Remap frontendFDs to their new frontendDevices.
 		// frontendFD.vfsfd.VirtualDentry() will still point to the original
@@ -250,7 +261,9 @@ func (nvp *nvproxy) afterLoad(ctx goContext.Context) {
 		nvp.fdsMu.Lock()
 		defer nvp.fdsMu.Unlock()
 		for fd := range nvp.frontendFDs {
-			fd.load(ctx)
+			if !fd.lost {
+				fd.load(ctx)
+			}
 		}
 	}()
 
@@ -327,6 +340,10 @@ func (fd *uvmFD) beforeSave() {
 
 // afterLoad is invoked by stateify.
 func (fd *uvmFD) afterLoad(ctx goContext.Context) {
+	if fd.lost || fd.dev.nvp.loseOnLoad {
+		fd.lose()
+		return
+	}
 	fd.hostFD = openHostDevFileForRestore(ctx, "nvidia-uvm", fd.dev.nvp.useDevGofer, fd.containerName, fd.vfsfd.StatusFlags())
 	if err := fdnotifier.AddFD(fd.hostFD, &fd.queue); err != nil {
 		panic(fmt.Sprintf("fdnotifier.AddFD(%d) failed for UVM device: %v", fd.hostFD, err))

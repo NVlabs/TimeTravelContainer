@@ -133,11 +133,21 @@ type frontendFD struct {
 	// clients are handles of clients owned by this frontendFD. clients is
 	// protected by dev.nvp.clientsMu.
 	clients map[*rootClient]struct{}
+
+	// lost is whether the file lost its GPU state, which a load of a save
+	// with ForkDeviceLost does: it has no host file.
+	lost bool
+
+	// stashedClients are clients that nvproxy.stashClients took out of what
+	// a save saves.
+	stashedClients map[*rootClient]struct{} `state:"nosave"`
 }
 
 // Release implements vfs.FileDescriptionImpl.Release.
 func (fd *frontendFD) Release(ctx context.Context) {
-	fdnotifier.RemoveFD(fd.hostFD)
+	if fd.hostFD >= 0 {
+		fdnotifier.RemoveFD(fd.hostFD)
+	}
 	fd.appQueue.Notify(waiter.EventHUp)
 
 	fd.dev.nvp.fdsMu.Lock()
@@ -167,6 +177,10 @@ func (fd *frontendFD) EventUnregister(e *waiter.Entry) {
 
 // Readiness implements waiter.Waitable.Readiness.
 func (fd *frontendFD) Readiness(mask waiter.EventMask) waiter.EventMask {
+	if fd.lost {
+		// Calls fail at once, as Linux's do for a GPU that is gone.
+		return mask
+	}
 	for {
 		cachedEvents := waiter.EventMask(fd.cachedEvents.Load())
 		maskedEvents := cachedEvents & mask
@@ -225,6 +239,9 @@ func (fd *frontendFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, 
 
 	if ctx.IsLogging(log.Debug) {
 		ctx.Debugf("nvproxy: frontend ioctl: nr = %d = %#x, argSize = %d", nr, nr, argSize)
+	}
+	if fd.lost {
+		return 0, linuxerr.EIO
 	}
 
 	fi := frontendIoctlState{
@@ -787,6 +804,7 @@ func rmAllocOSDescriptor(fi *frontendIoctlState, ioctlParams *nvgpu.IoctlNVOS02P
 		obj := &osDescMem{
 			pinnedRanges: prs,
 		}
+		pinForDMA(prs)
 		if mOwned {
 			// Transfer ownership of the temporary mapping as well. It isn't
 			// actually needed anymore, but unmapping can be very expensive and

@@ -965,8 +965,13 @@ func New(args Args) (*Loader, error) {
 	if (initialBranchID == "") != (initialFilesystemBranch == "") {
 		return nil, fmt.Errorf("TTC initial branch annotations must be specified together")
 	}
+	cudaCheckpointForFork := ""
+	if args.Conf.NVProxyFork == "snapshot" {
+		cudaCheckpointForFork = args.Conf.NVProxyCudaCheckpoint
+	}
 	l.family = NewSandboxFamily(l.k, SandboxFamilyOptions{
 		LiveForkEligible:               l.k.LiveForkEligible,
+		CudaCheckpointForFork:          cudaCheckpointForFork,
 		AllowNetworkStack:              args.Conf.Network == config.NetworkNone || args.Conf.Network == config.NetworkTimeTravel,
 		AllowSharedFilesystemResources: true,
 		WatchdogOpts:                   &dogOpts,

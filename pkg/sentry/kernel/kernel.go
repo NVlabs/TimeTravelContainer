@@ -2661,10 +2661,14 @@ func (k *Kernel) AddDevGofer(contName string, goferFD int) error {
 		return err
 	}
 
+	holdDevGofer(client)
 	k.devGofersMu.Lock()
 	defer k.devGofersMu.Unlock()
 	if k.devGofers == nil {
 		k.devGofers = make(map[string]*devutil.GoferClient)
+	}
+	if old, ok := k.devGofers[contName]; ok {
+		releaseDevGofer(old)
 	}
 	k.devGofers[contName] = client
 	return nil
@@ -2679,8 +2683,56 @@ func (k *Kernel) RemoveDevGofer(contName string) {
 	if !ok {
 		return
 	}
-	client.Close()
+	releaseDevGofer(client)
 	delete(k.devGofers, contName)
+}
+
+// devGoferHolders counts the kernels that hold each dev gofer client. A live
+// fork's children hold their source's, which the last of them closes.
+var devGoferHolders struct {
+	mu    sync.Mutex
+	count map[*devutil.GoferClient]int
+}
+
+func holdDevGofer(client *devutil.GoferClient) {
+	devGoferHolders.mu.Lock()
+	defer devGoferHolders.mu.Unlock()
+	if devGoferHolders.count == nil {
+		devGoferHolders.count = make(map[*devutil.GoferClient]int)
+	}
+	devGoferHolders.count[client]++
+}
+
+// releaseDevGofer releases a kernel's hold on client, and closes it if no
+// kernel holds it.
+func releaseDevGofer(client *devutil.GoferClient) {
+	devGoferHolders.mu.Lock()
+	devGoferHolders.count[client]--
+	last := devGoferHolders.count[client] <= 0
+	if last {
+		delete(devGoferHolders.count, client)
+	}
+	devGoferHolders.mu.Unlock()
+	if last {
+		client.Close()
+	}
+}
+
+// inheritDevGofers has k hold source's dev gofer clients, as a live fork's
+// child in source's process does: the devices that they serve are the
+// host's, which the child opens as its source does.
+func (k *Kernel) inheritDevGofers(source *Kernel) {
+	source.devGofersMu.Lock()
+	defer source.devGofersMu.Unlock()
+	k.devGofersMu.Lock()
+	defer k.devGofersMu.Unlock()
+	for name, client := range source.devGofers {
+		if k.devGofers == nil {
+			k.devGofers = make(map[string]*devutil.GoferClient)
+		}
+		holdDevGofer(client)
+		k.devGofers[name] = client
+	}
 }
 
 // GetDevGoferClient implements
@@ -2695,7 +2747,7 @@ func (k *Kernel) cleaupDevGofers() {
 	k.devGofersMu.Lock()
 	defer k.devGofersMu.Unlock()
 	for _, client := range k.devGofers {
-		client.Close()
+		releaseDevGofer(client)
 	}
 	k.devGofers = nil
 }

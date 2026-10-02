@@ -445,6 +445,9 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			if childLoaded {
 				child.releaseLoaded(opts.Clocks)
 			} else {
+				if child != nil {
+					child.cleaupDevGofers()
+				}
 				if remotePageLoad != nil {
 					remotePageLoad.Cancel()
 					_ = remotePageLoad.Wait()
@@ -459,6 +462,7 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		child = &Kernel{Platform: k.Platform}
 		child.SetMemoryFile(childMemoryFile)
 		child.initRuntimeFields()
+		child.inheritDevGofers(k)
 		if err := injectLiveForkFailure(opts, LiveForkStageChildInitialized); err != nil {
 			return err
 		}
@@ -830,10 +834,12 @@ func (k *Kernel) loadCapturedLiveForkChild(
 	child := &Kernel{Platform: k.Platform}
 	child.SetMemoryFile(k.mf)
 	child.initRuntimeFields()
+	child.inheritDevGofers(k)
 	defer func() {
 		if childLoaded {
 			return
 		}
+		child.cleaupDevGofers()
 		k.mf.Destroy()
 	}()
 	mfs := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile)

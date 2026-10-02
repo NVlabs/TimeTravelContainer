@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package nvproxy
 
 import (
@@ -82,11 +85,17 @@ type uvmFD struct {
 	memmapFile    uvmFDMemmapFile
 
 	queue waiter.Queue
+
+	// lost is whether the file lost its GPU state, which a load of a save
+	// with ForkDeviceLost does: it has no host file.
+	lost bool
 }
 
 // Release implements vfs.FileDescriptionImpl.Release.
 func (fd *uvmFD) Release(context.Context) {
-	fdnotifier.RemoveFD(fd.hostFD)
+	if fd.hostFD >= 0 {
+		fdnotifier.RemoveFD(fd.hostFD)
+	}
 	fd.queue.Notify(waiter.EventHUp)
 	fd.memmapFile.MappableRelease()
 }
@@ -94,6 +103,9 @@ func (fd *uvmFD) Release(context.Context) {
 // EventRegister implements waiter.Waitable.EventRegister.
 func (fd *uvmFD) EventRegister(e *waiter.Entry) error {
 	fd.queue.EventRegister(e)
+	if fd.hostFD < 0 {
+		return nil
+	}
 	if err := fdnotifier.UpdateFD(fd.hostFD); err != nil {
 		fd.queue.EventUnregister(e)
 		return err
@@ -104,6 +116,9 @@ func (fd *uvmFD) EventRegister(e *waiter.Entry) error {
 // EventUnregister implements waiter.Waitable.EventUnregister.
 func (fd *uvmFD) EventUnregister(e *waiter.Entry) {
 	fd.queue.EventUnregister(e)
+	if fd.hostFD < 0 {
+		return
+	}
 	if err := fdnotifier.UpdateFD(fd.hostFD); err != nil {
 		panic(fmt.Sprint("UpdateFD:", err))
 	}
@@ -111,6 +126,9 @@ func (fd *uvmFD) EventUnregister(e *waiter.Entry) {
 
 // Readiness implements waiter.Waitable.Readiness.
 func (fd *uvmFD) Readiness(mask waiter.EventMask) waiter.EventMask {
+	if fd.lost {
+		return mask
+	}
 	return fdnotifier.NonBlockingPoll(fd.hostFD, mask)
 }
 
@@ -131,6 +149,9 @@ func (fd *uvmFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args 
 
 	if ctx.IsLogging(log.Debug) {
 		ctx.Debugf("nvproxy: uvm ioctl %d = %#x", cmd, cmd)
+	}
+	if fd.lost {
+		return 0, linuxerr.EIO
 	}
 
 	ui := uvmIoctlState{

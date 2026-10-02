@@ -398,6 +398,16 @@ type Config struct {
 	// unsupported driver version.
 	NVProxyAllowUnsupportedDriver bool `flag:"nvproxy-allow-unsupported-driver"`
 
+	// NVProxyFork is what a fork does with NVIDIA GPUs while they are in
+	// use: "ineligible" refuses the fork, "device-lost" loses the GPUs'
+	// state in the child, and "snapshot" forks it.
+	NVProxyFork string `flag:"nvproxy-fork"`
+
+	// NVProxyCudaCheckpoint is the path, in containers, of the cuda-checkpoint
+	// tool with which a fork with NVProxyFork "snapshot" checkpoints the
+	// processes that use the GPUs.
+	NVProxyCudaCheckpoint string `flag:"nvproxy-cuda-checkpoint"`
+
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`
 

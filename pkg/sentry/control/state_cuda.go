@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package control
 
 import (
@@ -46,6 +49,14 @@ const (
 	// cuda-checkpoint sequentially.
 	cudaCheckpointSequentialKey = "cuda-checkpoint-sequential"
 )
+
+// CheckpointCudaForFork checkpoints the CUDA processes of k with the
+// cuda-checkpoint tool at cudaCheckpointPath, in their containers, for a fork
+// that copies their GPU state: checkpointed, they hold it in their own memory.
+// PostResume restores them, in k and in the fork's copies of k.
+func CheckpointCudaForFork(k *kernel.Kernel, cudaCheckpointPath string) error {
+	return preSaveCuda(k, &state.SaveOpts{CudaCheckpointPath: cudaCheckpointPath})
+}
 
 func preSaveCuda(k *kernel.Kernel, o *state.SaveOpts) error {
 	if o.CudaCheckpointPath == "" {
@@ -203,9 +214,13 @@ func invokeCudaCheckpoint(sctx context.Context, k *kernel.Kernel, proc *Proc, cu
 		MountNamespace: mntns,
 		PIDNamespace:   leader.PIDNamespace(),
 	}
-	// Provision environment variables from leader's container spec.
+	// Provision environment variables from leader's container spec. The
+	// kernel of a live fork's branch has no saver, and gives cuda-checkpoint
+	// none.
 	contName := k.ContainerName(contID)
-	args.Envv = k.Saver().SpecEnviron(contName)
+	if saver := k.Saver(); saver != nil {
+		args.Envv = saver.SpecEnviron(contName)
+	}
 
 	// Provide standard streams to cuda-checkpoint. Use /dev/null as stdin
 	// and direct cuda-checkpoint's stdout/stderr to a pipe.

@@ -196,6 +196,8 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool("nvproxy-docker", false, "LEGACY: Injects nvidia-container-runtime-hook as a prestart hook. Try to use nvidia-container-runtime or `docker run --gpus` instead. Or manually add nvidia-container-runtime-hook as a prestart hook and set up NVIDIA_VISIBLE_DEVICES container environment variable.")
 	flagSet.String("nvproxy-driver-version", "", "NVIDIA driver ABI version to use. If empty, autodetect installed driver version. The special value 'latest' may also be used to use the latest ABI.")
 	flagSet.Bool("nvproxy-allow-unsupported-driver", false, "allow nvproxy to be initialized with an unsupported driver version.")
+	flagSet.String("nvproxy-fork", "ineligible", `what a fork does with NVIDIA GPUs while they are in use: "ineligible", "device-lost", or "snapshot".`)
+	flagSet.String("nvproxy-cuda-checkpoint", "", `the path, in containers, of the cuda-checkpoint tool with which a fork with --nvproxy-fork=snapshot checkpoints the processes that use the GPUs.`)
 	flagSet.String("nvproxy-allowed-driver-capabilities", "utility,compute", "Comma separated list of NVIDIA driver capabilities that are allowed to be requested by the container. If 'all' is specified here, it is resolved to all driver capabilities supported in nvproxy. If 'all' is requested by the container, it is resolved to this list.")
 	flagSet.Bool("rdmaproxy", false, "WIP: enable RDMA support for containers with /dev/infiniband/uverbs* devices.")
 	flagSet.Bool("tpuproxy", false, "LEGACY: enable support for TPU devices. TPU support gets automatically enabled if TPU devices are present in the OCI spec.")

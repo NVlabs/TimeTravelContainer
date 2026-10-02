@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package nvproxy implements proxying for the Nvidia GPU Linux kernel driver:
 // https://github.com/NVIDIA/open-gpu-kernel-modules.
 //
@@ -58,6 +61,9 @@ type Options struct {
 
 	// If UseDevGofer is true, open device files via gofer.
 	UseDevGofer bool
+
+	// ForkPolicy is what a fork does with the GPUs while they are in use.
+	ForkPolicy ForkPolicy
 }
 
 // Register registers all devices implemented by this package, and specified by
@@ -85,6 +91,7 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 		version:                opts.DriverVersion,
 		capsEnabled:            opts.DriverCaps,
 		useDevGofer:            opts.UseDevGofer,
+		forkPolicy:             opts.ForkPolicy,
 		procDriverNvidiaParams: opts.HostSettings.ProcDriverNvidiaParams,
 		frontendFDs:            make(map[*frontendFD]struct{}),
 		clients:                make(map[nvgpu.Handle]*rootClient),
@@ -213,6 +220,18 @@ type nvproxy struct {
 	procDriverNvidiaParams string
 	devInfo                DeviceInfo
 	regularDevs            [nvgpu.NV_MINOR_DEVICE_NUMBER_REGULAR_MAX + 1]*frontendDevice
+
+	// forkPolicy is what a fork does with the GPUs while they are in use.
+	forkPolicy ForkPolicy
+	// loseOnLoad is set from PrepareSave to BeforeResume of a save, with
+	// ForkDeviceLost, so that what loads the save loses the GPUs' state.
+	// Loads that copy a loaded copy, as a live fork's batch siblings do, lose
+	// it too.
+	loseOnLoad bool
+	// stashed is whether stashClients has taken the clients out of what a
+	// save saves, into stashedClients.
+	stashed        bool                         `state:"nosave"`
+	stashedClients map[nvgpu.Handle]*rootClient `state:"nosave"`
 
 	fdsMu       fdsMutex `state:"nosave"`
 	frontendFDs map[*frontendFD]struct{}

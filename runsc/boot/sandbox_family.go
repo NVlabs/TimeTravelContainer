@@ -38,6 +38,7 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
@@ -666,7 +667,11 @@ type SandboxFamily struct {
 	defaultStartedOnce sync.Once
 	// allowNetworkStack is true only when loader configuration proves that
 	// network state has no host-facing links.
-	liveForkEligible               bool
+	liveForkEligible bool
+	// cudaCheckpointForFork is, for --nvproxy-fork=snapshot, the path in
+	// containers of the cuda-checkpoint tool with which a fork checkpoints the
+	// processes that use NVIDIA GPUs.
+	cudaCheckpointForFork          string
 	allowNetworkStack              bool
 	allowSharedFilesystemResources bool
 	watchdogOpts                   *watchdog.Opts
@@ -712,7 +717,11 @@ type DistributedForkHandoffStatus struct {
 
 // SandboxFamilyOptions controls eligibility policy shared by all branches.
 type SandboxFamilyOptions struct {
-	LiveForkEligible               bool
+	LiveForkEligible bool
+	// CudaCheckpointForFork is, for --nvproxy-fork=snapshot, the path in
+	// containers of the cuda-checkpoint tool with which a fork checkpoints the
+	// processes that use NVIDIA GPUs.
+	CudaCheckpointForFork          string
 	AllowNetworkStack              bool
 	AllowSharedFilesystemResources bool
 	WatchdogOpts                   *watchdog.Opts
@@ -787,6 +796,7 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 	}
 	f := &SandboxFamily{
 		liveForkEligible:               opts.LiveForkEligible,
+		cudaCheckpointForFork:          opts.CudaCheckpointForFork,
 		allowNetworkStack:              opts.AllowNetworkStack,
 		allowSharedFilesystemResources: opts.AllowSharedFilesystemResources,
 		watchdogOpts:                   opts.WatchdogOpts,
@@ -1954,6 +1964,16 @@ func (f *SandboxFamily) ForkMany(args *ForkBranchesArgs) ([]BranchInfo, error) {
 	// Waiter queues are part of pipe and PTY state. Remove host-side console
 	// waiters before cloning so no control callback is inherited by the child.
 	f.cancelConsoleWaits(source)
+
+	// With --nvproxy-fork=snapshot, the processes that use NVIDIA GPUs hold
+	// the GPUs' state in their own memory, which the fork copies, while
+	// cuda-checkpoint has them checkpointed. The resumes of the source and of
+	// the children restore them.
+	if f.cudaCheckpointForFork != "" && nvproxy.AnyFrontendDevicesOpen(source.k.VFS()) {
+		if err := control.CheckpointCudaForFork(source.k, f.cudaCheckpointForFork); err != nil {
+			return fail(fmt.Errorf("checkpointing the CUDA processes of branch %q: %w", sourceID, err))
+		}
+	}
 
 	metrics := make([]SandboxForkMetrics, len(childBranches))
 	if !sourceWasPaused {

@@ -44,6 +44,7 @@ go_library(
     srcs = [
         "caps.go",
         "fds_mutex.go",
+        "fork.go",
         "frontend.go",
         "frontend_mmap.go",
         "frontend_mmap_mutex.go",
@@ -95,6 +96,7 @@ go_library(
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/memmap",
         "//pkg/sentry/mm",
+        "//pkg/sentry/pgalloc",
         "//pkg/sentry/vfs",
         "//pkg/sync",
         "//pkg/sync/locking",

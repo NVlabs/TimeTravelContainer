@@ -12,10 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package nvproxy
 
 import (
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/safemem"
@@ -29,11 +33,18 @@ func (fd *uvmFD) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) error
 	// UVM_VALIDATE_VA_RANGE, and probably other ioctls, expect that
 	// application mmaps of /dev/nvidia-uvm are immediately visible to the
 	// driver.
+	if fd.lost {
+		return linuxerr.EIO
+	}
 	return vfs.GenericProxyDeviceConfigureMMap(&fd.vfsfd, fd, opts)
 }
 
-// Translate implements memmap.Mappable.Translate.
+// Translate implements memmap.Mappable.Translate. The mappings of a lost
+// file raise SIGBUS.
 func (fd *uvmFD) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
+	if fd.lost {
+		return nil, &memmap.BusError{Err: linuxerr.EIO}
+	}
 	return []memmap.Translation{
 		{
 			Source: optional,

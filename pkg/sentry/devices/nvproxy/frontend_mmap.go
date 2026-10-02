@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package nvproxy
 
 import (
@@ -21,6 +24,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/nvgpu"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/fsutil"
@@ -33,11 +37,18 @@ func (fd *frontendFD) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) 
 	// Nvidia kernel driver: kernel-open/nvidia/nv-mmap.c:nvidia_mmap_helper()
 	// requires vm_pgoff == 0, so trying to lazily fault any subset of the
 	// mapping that doesn't include the beginning will fail.
+	if fd.lost {
+		return linuxerr.EIO
+	}
 	return vfs.GenericProxyDeviceConfigureMMap(&fd.vfsfd, fd, opts)
 }
 
-// Translate implements memmap.Mappable.Translate.
+// Translate implements memmap.Mappable.Translate. The mappings of a lost
+// file raise SIGBUS: the memory that they mapped is the source's.
 func (fd *frontendFD) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
+	if fd.lost {
+		return nil, &memmap.BusError{Err: linuxerr.EIO}
+	}
 	return []memmap.Translation{
 		{
 			Source: optional,
