@@ -583,6 +583,13 @@ func ttcVolumeFilters() seccomp.SyscallRules {
 		unix.SYS_FDATASYNC: seccomp.PerArg{
 			seccomp.NonNegativeFD{},
 		},
+		// A volume without a size limit reports to statfs(2) the host
+		// filesystem that stores its repository, which it asks of the
+		// repository's directory.
+		unix.SYS_FSTATFS: seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.AnyValue{},
+		},
 		unix.SYS_IOCTL: seccomp.Or{
 			seccomp.PerArg{
 				seccomp.NonNegativeFD{},

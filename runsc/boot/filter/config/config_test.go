@@ -132,6 +132,18 @@ func TestTTCVolumeAllowsActiveRepositoryCollection(t *testing.T) {
 	}
 }
 
+// A volume without a size limit asks its repository's directory for the
+// host filesystem's size, which statfs(2) of a container's root reports.
+func TestTTCVolumeAllowsHostFilesystemSize(t *testing.T) {
+	rules, _ := Rules(Options{
+		Platform:  (&systrap.Systrap{}).SeccompInfo(),
+		TTCVolume: true,
+	})
+	if !rules.Has(unix.SYS_FSTATFS) {
+		t.Fatal("TTC volume seccomp rules reject fstatfs of the repository's directory")
+	}
+}
+
 // TestOptionsConfigKey verifies the behavior of `Options.ConfigKey`.
 func TestOptionsConfigKey(t *testing.T) {
 	// mutateFn mutates the value of a specific Options field.
