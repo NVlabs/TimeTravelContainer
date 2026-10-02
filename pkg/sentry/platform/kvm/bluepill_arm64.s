@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 #include "textflag.h"
 
 // VCPU_CPU is the location of the CPU in the vCPU struct.
@@ -154,15 +157,29 @@ TEXT ·currentEL(SB),NOSPLIT,$0-8
 	RET
 
 // func checkPAC() bool
+//
+// PACIA1716 signs R17 with the modifier in R16 if the thread's instruction
+// key A is enabled, and is a NOP otherwise. A signature leaves the address
+// unchanged when its PAC is zero, which a user address's PAC of 7 bits is
+// once in 128 signatures: a single one, as with PACIASP before, took one
+// thread in 128 for one without the key, which then kept it. Four, under
+// different modifiers, miss the key once in 2^28.
 TEXT ·checkPAC(SB),NOSPLIT,$0-1
-	MOVD	R30, R0			// Save LR
-	WORD	$0xd503233f		// PACIASP (signs R30)
-	CMP	R0, R30
+	MOVD	$·checkPAC(SB), R0	// An address to sign.
+	MOVD	$4, R2			// Signatures left; also their modifier.
 	MOVD	$0, R1
-	BEQ	same
+loop:
+	MOVD	R0, R17
+	MOVD	R2, R16
+	WORD	$0xd503211f		// PACIA1716 (signs R17 with R16)
+	CMP	R0, R17
+	BNE	enabled
+	SUB	$1, R2, R2
+	CBNZ	R2, loop
+	B	done
+enabled:
 	MOVD	$1, R1
-same:
-	MOVD	R0, R30			// Restore LR
+done:
 	MOVB	R1, ret+0(FP)
 	RET
 
