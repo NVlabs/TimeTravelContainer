@@ -387,6 +387,8 @@ type daemonServer struct {
 	closingConsoleClient map[string]int
 	// gfx starts GPU renderers for sandboxes of --gfx families.
 	gfx *gfxService
+	// nvproxy gives --nvproxy families the host's NVIDIA GPUs.
+	nvproxy *nvproxyService
 }
 
 // retireBeforeReply completes clustered identity retirement before a
@@ -2793,6 +2795,7 @@ func (s *daemonServer) configureVolumeBackend(backend *runtimeBackend) {
 	backend.sharedReferences = s.sharedReferences
 	backend.portIngress = s.portIngress
 	backend.gfx = s.gfx
+	backend.nvproxy = s.nvproxy
 	backend.lockLifecycle = func() func() { return s.lockDataRoot(backend.dataRoot) }
 	backend.operations = &s.operations
 }
@@ -6256,6 +6259,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 	}
 	server.gfx = newGFXService(run, filepath.Join(localRoot, "gfx"), gfx, stderr)
 	defer server.gfx.Close()
+	server.nvproxy = &nvproxyService{}
 	if err := compactDaemonMutations(server.mutationRoot(), daemonMutationRetention); err != nil && stderr != nil {
 		fmt.Fprintf(stderr, "ttcd: warning: compacting daemon mutation history: %v\n", err)
 	}

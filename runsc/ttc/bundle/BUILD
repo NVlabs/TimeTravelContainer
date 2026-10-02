@@ -21,6 +21,7 @@ go_library(
     deps = [
         "//pkg/abi/linux",
         "//pkg/log",
+        "//pkg/sentry/devices/nvproxy/nvconf",
         "//pkg/ttcpack",
         "//pkg/ttcsnapshot",
         "//pkg/ttcvolume",

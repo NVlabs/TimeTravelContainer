@@ -63,6 +63,17 @@ sh_binary(
     ],
 )
 
+# Manual because it needs the host's NVIDIA GPUs, and a CUDA program built for
+# them, and pulls a Debian image.
+sh_binary(
+    name = "e2e_nvproxy",
+    srcs = ["e2e_nvproxy.sh"],
+    data = glob(["nvproxy/*"]),
+    tags = [
+        "manual",
+    ],
+)
+
 # Manual because it needs what e2e_gfx needs, and Mesa's Vulkan driver for
 # Android, and pulls redroid's Android image.
 sh_binary(

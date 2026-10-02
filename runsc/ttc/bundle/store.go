@@ -543,6 +543,9 @@ type PrepareOptions struct {
 	// guest's libraries use the family's devices. A container gets those that
 	// its image and options leave unset.
 	DeviceEnv []string
+	// DeviceNodes are the host's devices that the family's containers have,
+	// such as NVIDIA's for --nvproxy, which runsc's device gofer serves.
+	DeviceNodes []specs.LinuxDevice
 	// VolumeCopyMode is the copy policy already verified by ttcd at startup.
 	// Empty permits Store-only callers to probe either supported mode.
 	VolumeCopyMode ttcvolume.CopyMode
@@ -1678,6 +1681,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		return Prepared{}, err
 	}
 	spec.Process.Env = addDefaultEnv(spec.Process.Env, opts.DeviceEnv)
+	spec.Linux.Devices = append(spec.Linux.Devices, opts.DeviceNodes...)
 	if s.CPUFeatures != "" {
 		if spec.Annotations == nil {
 			spec.Annotations = make(map[string]string)

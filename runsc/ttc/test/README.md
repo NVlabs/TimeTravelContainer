@@ -189,6 +189,36 @@ APK=/path/to/app.apk \
   "$PWD/runsc/ttc/test/e2e_redroid.sh"
 ```
 
+`e2e_nvproxy.sh` covers the host's NVIDIA GPUs, `--nvproxy`, in a Debian
+guest:
+
+*   the refusal of `--nvproxy` without fork semantics;
+*   the driver's device nodes, `nvidia-smi`, and a CUDA program,
+    `nvproxy/cudaloop.cu`, which counts on the GPU and checks the count;
+*   a live fork with `--nvproxy-fork=device-lost` while the guest counts. In
+    the child, the process that was counting must end, not hang or count
+    on, and a new one must count. The source must count on;
+*   live forks of a family with `--nvproxy-fork=snapshot` while the guest
+    counts: a child, two children at once, and a child's child. Every
+    branch's count must finish, checked at every step, the children's from
+    their parents' count at the fork.
+
+It needs a host with NVIDIA GPUs, `cudaloop` built for them, and
+`ttc-cuda-checkpoint`. A host whose driver nvproxy does not support, such as
+a pre-release one, names in `TTC_NVPROXY_DRIVER_VERSION` a driver whose
+interface it has.
+
+```shell
+bazel build //runsc/ttc:ttc //runsc/ttcd:ttcd //runsc/ttc/cudacheckpoint:ttc-cuda-checkpoint
+nvcc -O2 -o /tmp/cudaloop runsc/ttc/test/nvproxy/cudaloop.cu
+
+TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
+TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
+TTC_CUDA_CHECKPOINT="$PWD/bazel-bin/runsc/ttc/cudacheckpoint/ttc-cuda-checkpoint" \
+CUDALOOP=/tmp/cudaloop \
+  "$PWD/runsc/ttc/test/e2e_nvproxy.sh"
+```
+
 `e2e_fanout_lifecycle.sh` creates 32 siblings from one source pause, writes a
 different 4 KiB page in every branch, and dehydrates/rehydrates alternating
 branches before verifying their private contents. Set

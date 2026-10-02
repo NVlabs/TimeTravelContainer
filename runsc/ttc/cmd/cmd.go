@@ -1508,6 +1508,9 @@ func liveForkWaiverReason(waived bool, networkMode string, gpu ttcbundle.GPUOpti
 	if gpu.GFX && gpu.GFXFork == "" {
 		return "explicit waiver for the virtual GPU"
 	}
+	if gpu.NVProxy && gpu.NVProxyFork == "" {
+		return "explicit waiver for NVIDIA GPUs"
+	}
 	return "explicitly waived during container creation"
 }
 
@@ -6582,6 +6585,7 @@ type runtimeBackend struct {
 	distributedSource     *distributedSourceRuntime
 	portIngress           *portIngressManager
 	gfx                   *gfxService
+	nvproxy               *nvproxyService
 	nodeID                string
 	cancelClient          func()
 	clientCanceled        <-chan struct{}
@@ -7838,6 +7842,11 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 	if err != nil {
 		return containerRunResult{}, err
 	}
+	nvidiaMounts, deviceNodes, err := b.nvproxy.edits(request.gpu)
+	if err != nil {
+		return containerRunResult{}, err
+	}
+	deviceMounts = append(deviceMounts, nvidiaMounts...)
 	filesystemOrigins, finishFilesystemOrigins := b.newFilesystemOriginScope()
 	persistedPorts := request.publishedPorts
 	if b.portIngress.Clustered() {
@@ -7900,6 +7909,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 		GPUOptions:              request.gpu,
 		DeviceMounts:            deviceMounts,
 		DeviceEnv:               deviceEnv,
+		DeviceNodes:             deviceNodes,
 		Progress:                b.imageProgress(),
 		VolumeCopyMode:          b.volumeCopyMode,
 		NodeID:                  b.nodeID,
@@ -7991,6 +8001,11 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	nvidiaMounts, deviceNodes, err := b.nvproxy.edits(request.gpu)
+	if err != nil {
+		return "", err
+	}
+	deviceMounts = append(deviceMounts, nvidiaMounts...)
 	filesystemOrigins, finishFilesystemOrigins := b.newFilesystemOriginScope()
 	createdNodeID := b.nodeID
 	prepared, err := store.Prepare(context.Background(), ttcbundle.PrepareOptions{
@@ -8048,6 +8063,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 		GPUOptions:         request.gpu,
 		DeviceMounts:       deviceMounts,
 		DeviceEnv:          deviceEnv,
+		DeviceNodes:        deviceNodes,
 		Progress:           b.imageProgress(),
 		VolumeCopyMode:     b.volumeCopyMode,
 		// A created branch owns mutable local filesystem state even though it has
@@ -11200,7 +11216,12 @@ func (b *runtimeBackend) configuredRunscArgsForBranch(info ttcbundle.ContainerIn
 	if err != nil {
 		return nil, err
 	}
-	return append(args, gfxArgs...), nil
+	nvproxyArgs, err := b.nvproxy.runscArgs(info.GPUOptions)
+	if err != nil {
+		return nil, err
+	}
+	args = append(args, gfxArgs...)
+	return append(args, nvproxyArgs...), nil
 }
 
 // rawSocketsRequested returns whether a container's capability options ask

@@ -6,6 +6,8 @@ package bundle
 import (
 	"errors"
 	"fmt"
+
+	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 )
 
 // GPU fork semantics, as --gfx-fork and --nvproxy-fork spell them. A GPU
@@ -38,7 +40,7 @@ type GPUOptions struct {
 // that a family's GPU devices and its live-fork eligibility must agree.
 var (
 	errGFXNeedsForkSemantics     = errors.New("the virtual GPU refuses live forks unless --gfx-fork says what a fork does with it; pass --gfx-fork=device-lost or --gfx-fork=snapshot, or --waive-live-fork")
-	errNVProxyNeedsForkSemantics = errors.New("NVIDIA GPUs refuse live forks unless --nvproxy-fork says what a fork does with them; pass --nvproxy-fork=device-lost, or --waive-live-fork")
+	errNVProxyNeedsForkSemantics = errors.New("NVIDIA GPUs refuse live forks unless --nvproxy-fork says what a fork does with them; pass --nvproxy-fork=device-lost or --nvproxy-fork=snapshot, or --waive-live-fork")
 )
 
 // ValidateGPUOptions returns an error if a new family's GPU options are
@@ -48,11 +50,37 @@ func ValidateGPUOptions(opts GPUOptions, liveForkEligible bool, goos string) err
 	if err := checkGPURecord(opts, liveForkEligible); err != nil {
 		return err
 	}
-	if opts.NVProxy {
-		if goos == "darwin" {
-			return errors.New("--nvproxy uses the host's NVIDIA GPUs, which macOS hosts do not have")
-		}
-		return errors.New("--nvproxy is not supported yet")
+	if opts.NVProxy && goos == "darwin" {
+		return errors.New("--nvproxy uses the host's NVIDIA GPUs, which macOS hosts do not have")
+	}
+	return nil
+}
+
+// DefaultNVProxyCaps are the driver capabilities of --nvproxy without CAPS,
+// NVIDIA's container toolkit's default.
+const DefaultNVProxyCaps = "compute,utility"
+
+// NVProxyDriverCaps returns the driver capabilities of a family with
+// --nvproxy, as runsc's --nvproxy-allowed-driver-capabilities spells them.
+func (opts GPUOptions) NVProxyDriverCaps() string {
+	if opts.NVProxyCaps != "" {
+		return opts.NVProxyCaps
+	}
+	return DefaultNVProxyCaps
+}
+
+// validateNVProxyCaps returns an error unless caps, of --nvproxy=CAPS, are
+// driver capabilities that a container may have.
+func validateNVProxyCaps(caps string) error {
+	parsed, all, err := nvconf.DriverCapsFromString(caps)
+	if err != nil {
+		return fmt.Errorf("--nvproxy=%s: %w", caps, err)
+	}
+	if !all && parsed == 0 {
+		return fmt.Errorf("--nvproxy=%s: no driver capabilities", caps)
+	}
+	if unsupported := parsed &^ nvconf.AllContainerDriverCaps; unsupported != 0 {
+		return fmt.Errorf("--nvproxy=%s: unsupported driver capabilities %v; containers may have %v", caps, unsupported, nvconf.AllContainerDriverCaps)
 	}
 	return nil
 }
@@ -74,6 +102,18 @@ func checkGPURecord(opts GPUOptions, liveForkEligible bool) error {
 	}
 	if opts.NVProxyCaps != "" && !opts.NVProxy {
 		return errors.New("NVIDIA driver capabilities require --nvproxy")
+	}
+	if opts.NVProxyCaps != "" {
+		if err := validateNVProxyCaps(opts.NVProxyCaps); err != nil {
+			return err
+		}
+	}
+	if opts.NVProxyFork == GPUForkSnapshot {
+		// cuda-checkpoint moves only CUDA's state into a process's memory.
+		caps, all, _ := nvconf.DriverCapsFromString(opts.NVProxyDriverCaps())
+		if all || caps&^(nvconf.CapCompute|nvconf.CapUtility) != 0 {
+			return fmt.Errorf("--nvproxy-fork=snapshot forks CUDA's state only, and allows only the compute and utility driver capabilities, not %s", opts.NVProxyDriverCaps())
+		}
 	}
 	forkSemantics := opts.GFXFork != "" || opts.NVProxyFork != ""
 	switch {
