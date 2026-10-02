@@ -101,7 +101,13 @@ func (fs FeatureSet) HasFeature(feature Feature) bool {
 func (fs FeatureSet) WriteCPUInfoTo(cpu, numCPU uint, w io.Writer) {
 	fmt.Fprintf(w, "processor\t: %d\n", cpu)
 	fmt.Fprintf(w, "BogoMIPS\t: %.02f\n", fs.cpuFreqMHz) // It's bogus anyway.
-	fmt.Fprintf(w, "Features\t\t: %s\n", fs.FlagString())
+	// The features are those that AT_HWCAP gives guests, which they may
+	// depend on (AllowedHWCap1): a compiler that tunes for the CPU it reads
+	// here, as gcc's -mcpu=native does, used SVE, whose state gVisor does not
+	// keep, and which the KVM platform's vCPUs lack.
+	allowed := fs
+	allowed.hwCap.hwCap1 = fs.AllowedHWCap1()
+	fmt.Fprintf(w, "Features\t\t: %s\n", allowed.FlagString())
 	fmt.Fprintf(w, "CPU implementer\t: 0x%x\n", fs.cpuImplHex)
 	fmt.Fprintf(w, "CPU architecture\t: %d\n", fs.cpuArchDec)
 	fmt.Fprintf(w, "CPU variant\t: 0x%x\n", fs.cpuVarHex)

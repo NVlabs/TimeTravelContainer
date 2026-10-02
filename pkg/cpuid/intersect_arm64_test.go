@@ -5,7 +5,11 @@
 
 package cpuid
 
-import "testing"
+import (
+	"slices"
+	"strings"
+	"testing"
+)
 
 func TestIntersectMasksHWCap(t *testing.T) {
 	fs := FeatureSet{hwCap: hwCap{hwCap1: HWCAP_FP | HWCAP_ASIMD | HWCAP_AES, hwCap2: 1}}
@@ -24,5 +28,23 @@ func TestIntersectMasksHWCap(t *testing.T) {
 	}
 	if _, err := fs.Intersect(map[Feature]struct{}{64: {}}); err == nil {
 		t.Error("Intersect accepted a feature without a HWCAP bit")
+	}
+}
+
+func TestCPUInfoListsOnlyGuestFeatures(t *testing.T) {
+	// The host has SVE, whose state gVisor does not keep: AT_HWCAP does not
+	// give it to guests (AllowedHWCap1), and /proc/cpuinfo must not list it,
+	// or a compiler tuning for the CPU (gcc's -mcpu=native) uses it.
+	fs := FeatureSet{hwCap: hwCap{hwCap1: HWCAP_FP | HWCAP_ASIMD | HWCAP_SVE}}
+	var b strings.Builder
+	fs.WriteCPUInfoTo(0, 1, &b)
+	var features []string
+	for _, line := range strings.Split(b.String(), "\n") {
+		if name, value, ok := strings.Cut(line, ":"); ok && strings.TrimSpace(name) == "Features" {
+			features = strings.Fields(value)
+		}
+	}
+	if !slices.Contains(features, "fp") || !slices.Contains(features, "asimd") || slices.Contains(features, "sve") {
+		t.Errorf("Features = %q, want fp and asimd, and not sve", features)
 	}
 }

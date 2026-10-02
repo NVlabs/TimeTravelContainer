@@ -758,7 +758,6 @@ el0_da:
 el0_ia:
 	EXCEPTION_EL0(PageFault)
 el0_fpsimd_acc:
-el0_sve_acc:
 	FPSIMD_DISABLE_TRAP(RSV_REG)
 	FPSTATE_EL0_LOAD()
 
@@ -772,6 +771,11 @@ el0_sve_acc:
 	MOVD PTRACE_R19(RSV_REG_APP), RSV_REG_APP
 
 	ERET()  // return to el0.
+el0_sve_acc:
+	// The vCPU has no SVE: as on a CPU without it, an SVE instruction is
+	// undefined. Enabling FP/SIMD alone, as for an FP/SIMD access, returned
+	// to an instruction that trapped again, forever.
+	EXCEPTION_EL0(El0SyncSveAcc)
 el0_fpsimd_exc:
 	EXCEPTION_EL0(El0SyncFpsimdExc)
 el0_sp_pc:
