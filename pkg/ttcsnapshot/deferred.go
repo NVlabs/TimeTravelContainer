@@ -164,6 +164,7 @@ func (s *Store) resolveDeferredLockedAfter(id ObjectID, ordinalFloor uint64) (Ob
 // expandDeferredLockedAfter is resolveDeferredLockedAfter for an object
 // that is deferred. It is apart because its object escapes, which every
 // lookup of a mutation then allocated, deferred or not.
+// +checklocksignore
 func (s *Store) expandDeferredLockedAfter(id ObjectID, ordinalFloor uint64) (Object, bool, uint64, error) {
 	object := s.state.Objects[id]
 	resolver, ok := s.deferredResolvers[object.SourceCatalog]

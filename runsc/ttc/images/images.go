@@ -852,7 +852,7 @@ func Commit(ctx context.Context, opts CommitOptions) (Info, error) {
 	// by another algorithm.
 	blobDigester := algorithm.Digester()
 	storeDigests := writer.Digest().Algorithm() == algorithm
-	var blobHash io.Writer = io.Discard
+	blobHash := io.Discard
 	if !storeDigests {
 		blobHash = blobDigester.Hash()
 	}

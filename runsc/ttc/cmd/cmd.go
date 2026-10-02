@@ -6423,9 +6423,13 @@ type consoleSidecarOwner interface {
 // true once the old init is known to have terminated, or false when the stop
 // was abandoned while it could still exit naturally later.
 func (b *runtimeBackend) beginExplicitInitStop(target selector) (func(bool), error) {
+	stops := b.explicitInitStops
+	if stops == nil {
+		return nil, fmt.Errorf("stopping %s: this backend counts no explicit stops", target)
+	}
 	if b.consoleSidecars == nil {
-		atomic.AddInt32(&b.explicitInitStops, 1)
-		return func(bool) { atomic.AddInt32(&b.explicitInitStops, -1) }, nil
+		stops.Add(1)
+		return func(bool) { stops.Add(-1) }, nil
 	}
 	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
@@ -6436,9 +6440,9 @@ func (b *runtimeBackend) beginExplicitInitStop(target selector) (func(bool), err
 		return nil, err
 	}
 	finishConsole := b.consoleSidecars.SuppressConsoleExitOnce(paths.Lock)
-	atomic.AddInt32(&b.explicitInitStops, 1)
+	stops.Add(1)
 	return func(commit bool) {
-		atomic.AddInt32(&b.explicitInitStops, -1)
+		stops.Add(-1)
 		finishConsole(commit)
 	}, nil
 }
@@ -6611,8 +6615,10 @@ type runtimeBackend struct {
 	// user-facing `ttc wait`. The foreground lifecycle operation owns
 	// discard/publication ordering and must not recursively invoke the
 	// spontaneous-exit finalizer from its wait path. A family's stop stops
-	// its branches together, and their waits read it as they go.
-	explicitInitStops int32
+	// its branches together, and their waits read it as they go. A request's
+	// backend (directBackend) has its own, which the backend's copies share;
+	// another backend has none, and stops no branch.
+	explicitInitStops *atomic.Int32
 	// lifecycleReady releases the daemon lifecycle lock after an attached
 	// run/start has finished creating its runtime but before it waits for the
 	// guest. Detached commands release the lock when the command returns.
@@ -18093,7 +18099,7 @@ func (b *runtimeBackend) wait(target selector) (uint32, error) {
 // installations by the follower and this synchronous path are equivalent.
 func (b *runtimeBackend) completeWaitedInitExit(target selector, status uint32) error {
 	b.recordWaitState(target, status)
-	if atomic.LoadInt32(&b.explicitInitStops) != 0 {
+	if stops := b.explicitInitStops; stops != nil && stops.Load() != 0 {
 		return nil
 	}
 	// Standalone start already consumes the durable exited state directly and

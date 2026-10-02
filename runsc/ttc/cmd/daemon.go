@@ -2782,6 +2782,7 @@ func directBackend(opts options, stdin io.Reader, stdout, stderr io.Writer) *run
 		stdin:                 stdin,
 		stdout:                stdout,
 		stderr:                stderr,
+		explicitInitStops:     new(atomic.Int32),
 	}
 }
 

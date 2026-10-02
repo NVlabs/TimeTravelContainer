@@ -493,11 +493,17 @@ func (r *distributedSourceRuntime) tryLockSnapshotOrigins(origins []uint64) ([]u
 			locked = append(locked, encoded)
 		}
 	}
-	return locked, func() {
-		for lock, held := range taken {
-			if held {
-				lock.Unlock()
-			}
+	return locked, func() { unlockTaken(taken) }
+}
+
+// unlockTaken unlocks the locks of taken that were taken.
+//
+// +checklocksignore: the locks are map keys, which checklocks cannot follow
+// through TryLock.
+func unlockTaken(taken map[*sync.Mutex]bool) {
+	for lock, held := range taken {
+		if held {
+			lock.Unlock()
 		}
 	}
 }

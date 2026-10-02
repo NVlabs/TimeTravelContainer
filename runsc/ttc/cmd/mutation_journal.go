@@ -411,6 +411,8 @@ func (j *mutationJournal) writeLocked(record daemonMutationRecord, frame []byte)
 // then looks again.
 //
 // Preconditions: j.mu is locked.
+//
+// +checklocks:j.mu
 func (j *mutationJournal) waitDurableLocked(written int64) error {
 	for j.durable < written {
 		if j.broken != nil {
