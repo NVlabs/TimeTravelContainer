@@ -169,18 +169,19 @@ TTC_GFX_GUEST_DRIVER=/path/to/dir/of/libvulkan_virtio.so \
   "$PWD/runsc/ttc/test/e2e_gfx.sh"
 ```
 
-`e2e_redroid.sh` boots Android with the virtual GPU: redroid's arm64 image,
-whose init is the container's, with Mesa's Venus Vulkan driver for Android
-and `runsc/ttc/gfxrenderer/guest/redroid/gpu_config.sh`, in a family with
-`--gfx-fork=snapshot`. It checks that SurfaceFlinger composes with ANGLE on
-the GPU, that Android's network comes up on `eth0` and validates on the
-internet, that Settings, and the app of `APK` once it installs, render on
-the GPU, and that the screen records to video, as scrcpy needs. Then it
-forks Android live, and checks that both branches run on, with the same
-framework, and that Settings renders in the child. The screens and the
-recording are left in `out/` of `TTC_E2E_ROOT`, when that is set. Besides
-what `e2e_gfx.sh` needs, it needs the driver that
-`runsc/ttc/gfxrenderer/guest/build_mesa_venus_android.sh` builds:
+`e2e_redroid.sh` boots Android with the virtual GPU: redroid's image, of the
+host's architecture, whose init is the container's, with Mesa's Venus Vulkan
+driver for Android and `runsc/ttc/gfxrenderer/guest/redroid/gpu_config.sh`, in a
+family with `--gfx-fork=snapshot`. It checks that SurfaceFlinger composes with
+ANGLE on the GPU, that Android's network comes up on `eth0` and validates on the
+internet, that Settings, and the app of `APK` once it installs, render on the
+GPU, and that the screen records to video, as scrcpy needs. Then it forks
+Android live, and checks that both branches run on, with the same framework, and
+that Settings renders in the child. The screens and the recording are left in
+`out/` of `TTC_E2E_ROOT`, when that is set. Besides what `e2e_gfx.sh` needs, it
+needs the driver that `runsc/ttc/gfxrenderer/guest/build_mesa_venus_android.sh`
+builds (with `ARCH=x86_64` for x86-64 hosts). Where the host's network blocks
+Android's DNS server, 8.8.8.8, `REDROID_DNS` names another.
 
 ```shell
 TTC=... TTCD=... TTC_GFX_RENDERER=... TTC_GFX_GUEST_DRIVER=... \

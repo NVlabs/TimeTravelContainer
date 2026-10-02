@@ -175,10 +175,15 @@ cloning the GPU's 500 MB takes 60 ms; a fork of Android pauses it for about
 1.8 s, of which recording and copying the kernel's metadata take 0.64 s,
 and the HVF platform's flush of the guest's execution caches about 0.4 s.
 
-The renderer runs on macOS. Linux hosts (plan item B1 of
-`ttc_gpu_gfx_nvproxy.md`) need it to import guest memory into their Vulkan
-drivers as macOS's does with `VK_EXT_external_memory_metal`, by
-`VK_EXT_external_memory_host` or a dma-buf.
+The renderer runs on macOS, and on Linux (plan item B1 of
+`ttc_gpu_gfx_nvproxy.md`, 2026-10-02), where it imports guest memory into
+the host's Vulkan driver with `VK_EXT_external_memory_host`, as it does on
+macOS with `VK_EXT_external_memory_metal`. On an NVIDIA GPU, `e2e_gfx.sh`,
+llama.cpp, Chromium's WebGL, and redroid run and fork as on macOS. NVIDIA's
+driver does not render to linear images, which Android's buffers are, so
+the images that guests render to in their dma-bufs are shadows: optimal
+images in GPU memory that the renderer copies to and from the linear images
+(see `runsc/ttc/gfxrenderer/README.md`).
 
 ## Milestones
 

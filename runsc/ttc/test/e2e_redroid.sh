@@ -15,9 +15,11 @@
 # TTC_GFX_RENDERER, TTC_GFX_GUEST_DRIVER), and:
 #   ANDROID_GFX_DRIVER, Mesa's Venus Vulkan driver for Android
 #     (runsc/ttc/gfxrenderer/guest/build_mesa_venus_android.sh);
-#   REDROID_IMAGE, an arm64 redroid image (default
+#   REDROID_IMAGE, a redroid image of the host's architecture (default
 #     redroid/redroid:14.0.0_64only-latest), which the daemon pulls;
-#   optionally APK, an app to install and launch.
+#   optionally APK, an app to install and launch;
+#   optionally REDROID_DNS, the DNS server of Android's network, where the
+#     host's network blocks Android's default, 8.8.8.8.
 #
 # The daemon runs with host isolation unless TTC_UNSAFE_NO_HOST_ISOLATION=1.
 set -eu
@@ -29,6 +31,7 @@ TTC_GFX_GUEST_DRIVER=${TTC_GFX_GUEST_DRIVER:-}
 ANDROID_GFX_DRIVER=${ANDROID_GFX_DRIVER:-}
 REDROID_IMAGE=${REDROID_IMAGE:-redroid/redroid:14.0.0_64only-latest}
 APK=${APK:-}
+REDROID_DNS=${REDROID_DNS:-}
 TTC_E2E_ROOT=${TTC_E2E_ROOT:-}
 TTC_UNSAFE_NO_HOST_ISOLATION=${TTC_UNSAFE_NO_HOST_ISOLATION:-0}
 # How long Android may take to boot, in seconds.
@@ -111,9 +114,12 @@ adb_in() {
 
 # Android's init is the container's. Before it starts, the container gets
 # the Android driver, and redroid's graphics configuration for the GPU.
+set -- qemu=1 androidboot.hardware=redroid androidboot.use_memfd=true
+if [ -n "$REDROID_DNS" ]; then
+  set -- "$@" androidboot.redroid_net_ndns=1 "androidboot.redroid_net_dns1=$REDROID_DNS"
+fi
 ttc create --name "$NAME" --gfx --gfx-fork snapshot --cap-add ALL --network ttc --nat \
-  --entrypoint /init "$REDROID_IMAGE" \
-  qemu=1 androidboot.hardware=redroid androidboot.use_memfd=true >/dev/null
+  --entrypoint /init "$REDROID_IMAGE" "$@" >/dev/null
 ttc cp "$ANDROID_GFX_DRIVER" "$NAME@main:/vendor/lib64/hw/$ANDROID_DRIVER" >/dev/null
 ttc cp "$GPU_CONFIG" "$NAME@main:/vendor/bin/gpu_config.sh" >/dev/null
 ttc start "$NAME" >/dev/null

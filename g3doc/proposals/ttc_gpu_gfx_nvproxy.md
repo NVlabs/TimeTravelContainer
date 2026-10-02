@@ -859,6 +859,80 @@ that.
     `std::optional` at the wrong offset. The Bluetooth service restarts
     until Android gives up.
 
+*Status (2026-10-02): B1 to B4 run on Linux, on an x86-64 host with an
+NVIDIA RTX PRO 6000 Blackwell and its driver 590.08, a pre-release.*
+
+*   **B1, `--gfx`:** the renderer builds with cgo on Linux and renders on the
+    host's Vulkan. Guests' host-visible memory is the renderer's shared
+    memory, which it imports with `VK_EXT_external_memory_host`, into the
+    memory types into which the host's driver imports it; guests see the
+    others as memory they cannot map. Guests see no software rasterizer, such
+    as llvmpipe, where the host has a GPU. Zink, which Mesa's OpenGL loads
+    for the render node, picks the Vulkan device whose DRM properties name
+    the node, which Mesa's Venus driver hides on NVIDIA hosts to steer X11's
+    and Wayland's presentation; TTC's build of the driver keeps them
+    (`guest/patches/0001`). The Sentry may size its renderer sockets'
+    buffers (`setsockopt`), which its seccomp filter refused where the
+    container had no network. `e2e_gfx.sh` passes. llama.cpp's Vulkan
+    backend processes Qwen2.5 0.5B's prompts at 32,951 tokens/s and
+    generates 369 tokens/s, and a fork in the middle of greedy generation
+    gives both branches the unforked run's text. Headless Chromium draws
+    WebGL with ANGLE on Vulkan, and a fork pauses it for 0.34 s, after which
+    both branches check every frame of 3,000.
+*   **B2, `--nvproxy[=CAPS]`:** ttcd gives the containers of such families
+    the host's NVIDIA device nodes, which runsc's device gofer serves, and
+    the files of NVIDIA's user-space driver that their capabilities need:
+    its libraries, at the host's paths and their SONAMEs' (the images of the
+    host's distribution search them), `nvidia-smi`, and the loaders'
+    manifests. A driver that nvproxy does not support, such as a
+    pre-release, runs with `TTC_NVPROXY_DRIVER_VERSION`, in ttcd's
+    environment, naming a driver whose interface it has. `nvidia-smi` and
+    CUDA work.
+*   **B3, `--nvproxy-fork=device-lost`:** the child's NVIDIA files fail every
+    call with `EIO`, and their mappings raise `SIGBUS`; a save leaves the
+    driver's objects, the source's, out. What the child opens works: it
+    shares its source's connection to the device gofer. The source must
+    keep the pages that the GPU reads and writes by DMA, which the driver
+    pinned for it, in private and in shared anonymous memory: a fork had
+    them copied on the source's next write, after which the GPU wrote pages
+    that the source no longer had. The source now keeps them, and the
+    fork's children get copies, as Linux's fork does with pages pinned for
+    DMA.
+*   **B4, `--nvproxy-fork=snapshot`:** a fork checkpoints the family's CUDA
+    processes with `ttc-cuda-checkpoint`, TTC's tool that calls CUDA's
+    checkpoint API, which ttcd mounts into such containers. The resumes of
+    the source and of each child restore them. In `e2e_nvproxy.sh`, a
+    process counting on the GPU, which checks its count in device memory at
+    every step, counts on from the fork in a child, two children at once,
+    and a child's child. A fork of a process with 64 MiB of device memory
+    took 1.2 s. As decided above, such families have only the `compute` and
+    `utility` capabilities.
+*   **B6 on NVIDIA hosts:** redroid's x86-64 image boots with `--gfx`;
+    SurfaceFlinger composes with ANGLE on the virtual GPU; Android's network
+    validates, with `REDROID_DNS` in `e2e_redroid.sh` where the host's
+    network blocks 8.8.8.8; applications render on the GPU; the screen
+    records; and a live fork's branches both run on: `e2e_redroid.sh`
+    passes. Android's buffers are linear images in the renderer's shared
+    memory, to which NVIDIA's driver does not render: it lists color
+    attachments among no format's linear tiling features, refuses input
+    attachments, which Android's swapchains ask for, on linear images, and
+    faults (`Xid 69`) when it renders to one. So the images that guests
+    render to in their dma-bufs are shadows (`venus/shadow_unsafe.go`):
+    optimal images in GPU memory, which the guest's commands use, and which
+    the renderer copies to the buffers' linear images where the guest gives
+    an image to a foreign queue family and at the end of each command
+    buffer that rendered to it, and from them where the guest takes one
+    from a foreign queue family. Images that are only sampled, as
+    applications' windows are by SurfaceFlinger, are not shadows. Boot,
+    which stalled in about half of the runs while applications' windows
+    failed, completed in five runs of five, in 20 to 61 s (15 s without
+    `--gfx`), with no `Xid`.
+*   **Not done:** B5; forks of `--nvproxy` families to other nodes;
+    NVIDIA's own Vulkan through `--nvproxy=graphics`, whose ICD does not
+    initialize on the pre-release driver under 590.48.01's interface; the
+    renderer's confinement on Linux; and arm64 hosts and the KVM platform,
+    which the node did not have: everything above ran on systrap.
+
 ## Testing
 
 *   **Unit tests:** the Sentry's device against a fake renderer:
