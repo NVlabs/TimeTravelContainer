@@ -961,11 +961,30 @@ NVIDIA RTX PRO 6000 Blackwell and its driver 590.08, a pre-release.*
     (`NV2080_CTRL_CMD_FLA_GET_FABRIC_MEM_STATS`), and the Sentry's sysfs
     lacks the memory block size and the GPUs' NUMA nodes that the driver's
     library reads.
+*   **One binary to install:** on Linux, where ttcd links no C library,
+    ttcd carries the renderer and `ttc-cuda-checkpoint`, gzip-compressed,
+    2 MB of its 84 (`runsc/ttc/hostbin`). It runs the renderer from a
+    sealed memory file, through a link named `ttc-gfx-renderer` that names
+    the process, and writes `ttc-cuda-checkpoint` into its root for the
+    containers that mount it. Both define anew, for their own calls,
+    the C library functions that glibc 2.32 and 2.34 gave new versions,
+    and call their oldest (`runsc/ttc/glibccompat`): they run with any
+    glibc since 2.17, as in CentOS 7, Ubuntu 18.04 and 20.04 containers,
+    on x86-64 and arm64. On macOS, where ttcd links C and the renderer
+    loads its graphics libraries itself, ttcd is the renderer, as
+    `ttcd _gfx-renderer MODE`. With nothing installed but ttc and ttcd,
+    `e2e_gfx.sh` and `e2e_nvproxy.sh` pass on the x86 node, and
+    `e2e_gfx.sh` on the GB300 node, on systrap and KVM. A cross-build for
+    another architecture, whose rules_go platform has no cgo, carries
+    neither.
 *   **Not done:** B5; forks of `--nvproxy` families to other nodes;
     NVIDIA's own Vulkan through `--nvproxy=graphics`, whose ICD does not
     initialize on the pre-release driver under 590.48.01's interface; the
     renderer's confinement on Linux; `--nvproxy` on KVM; on arm64, CUDA,
-    Android, and SVE on KVM.
+    Android, and SVE on KVM; ttcd as the renderer on macOS, which no Mac
+    has built or run yet; and a guest driver for containers whose glibc
+    is older than 2.38, which the guest's Venus driver, built on Debian
+    sid, needs.
 
 ## Testing
 
