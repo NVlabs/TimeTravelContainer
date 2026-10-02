@@ -155,6 +155,27 @@ const graphTablesPerTransaction = 128
 // graphTablesPerTransaction new tables writes.
 const graphTransactionJournalBytes = 2 << 20
 
+// graphTablesPerTransactionLimit bounds the tables one transaction maps
+// however little the last wrote. Tables the graph shared may be followed by
+// tables it does not, a publication having changed meanwhile the origins a
+// capture may share: a batch of all the 1,408 tables left after the first
+// of a 1.5 GiB branch's wrote 18 MB, where a transaction may write 8 MiB.
+// As many new tables as this write about 4 MiB.
+const graphTablesPerTransactionLimit = 2 * graphTablesPerTransaction
+
+// nextGraphTableBatch returns how many tables the next transaction maps, of
+// remaining, after one that mapped tables and wrote written bytes: as many as
+// would write what graphTablesPerTransaction new tables do, within
+// graphTablesPerTransactionLimit.
+func nextGraphTableBatch(written, tables, remaining int64) int {
+	batch := int64(graphTablesPerTransaction)
+	if written > 0 && tables > 0 {
+		perTable := max(written/tables, 1)
+		batch = max(graphTransactionJournalBytes/perTable, graphTablesPerTransaction)
+	}
+	return int(max(min(batch, graphTablesPerTransactionLimit, remaining), 1))
+}
+
 // heldPinComponent names the pins under which a capture holds the pages it
 // shares with other origins until its trees refer to them:
 // <rootPrefix>/held/<chunk>.
@@ -386,14 +407,10 @@ func importCapture(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, o
 			if err := graph.CommitMemoryTablesReusing(origin, tables[begin:end], chunks, reuse); err != nil {
 				return fmt.Errorf("committing graph memory tables: %w", err)
 			}
-			// Tables the graph shares write little: as many go in the next
-			// transaction as write what new tables of 128 MiB of memory do. A
-			// checkpoint meanwhile leaves the journal shorter.
-			batch = graphTablesPerTransaction
-			if written := graph.JournalBytes() - before; written > 0 {
-				perTable := max(written/int64(end-begin), 1)
-				batch = int(min(max(graphTransactionJournalBytes/perTable, graphTablesPerTransaction), int64(len(tables))))
-			}
+			// Tables the graph shares write little: more go in the next
+			// transaction. A checkpoint meanwhile leaves the journal
+			// shorter.
+			batch = nextGraphTableBatch(graph.JournalBytes()-before, int64(end-begin), int64(len(tables)-end))
 			begin = end
 			if err := checkpointGraphImportIfNeeded(graph, graphImportCheckpointBytes); err != nil {
 				return err

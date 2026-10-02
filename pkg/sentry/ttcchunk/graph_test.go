@@ -77,3 +77,32 @@ func TestHeldPagePinsOutliveTheirOriginsHandoff(t *testing.T) {
 		}
 	}
 }
+
+// A transaction maps more tables after one whose tables the graph shared,
+// but never more than new tables could fill a transaction with.
+func TestNextGraphTableBatch(t *testing.T) {
+	for _, test := range []struct {
+		written, tables, remaining int64
+		want                       int
+	}{
+		// A checkpoint between left the journal shorter.
+		{-1 << 20, 128, 1408, graphTablesPerTransaction},
+		{0, 128, 1408, graphTablesPerTransaction},
+		// New tables.
+		{graphTransactionJournalBytes, 128, 1408, graphTablesPerTransaction},
+		{128 * 8 << 10, 128, 1408, 256},
+		// Shared tables, which once made a batch of all 1,408 left.
+		{128, 128, 1408, graphTablesPerTransactionLimit},
+		{128 << 10, 128, 1408, graphTablesPerTransactionLimit},
+		{128, 128, 10, 10},
+	} {
+		if got := nextGraphTableBatch(test.written, test.tables, test.remaining); got != test.want {
+			t.Errorf("nextGraphTableBatch(%d, %d, %d) = %d, want %d", test.written, test.tables, test.remaining, got, test.want)
+		}
+	}
+	// New tables write about graphTransactionJournalBytes for each
+	// graphTablesPerTransaction; a transaction may write 8 MiB.
+	if worst := graphTablesPerTransactionLimit * graphTransactionJournalBytes / graphTablesPerTransaction; worst > (8<<20)/2 {
+		t.Fatalf("a batch of new tables may write %d bytes", worst)
+	}
+}
