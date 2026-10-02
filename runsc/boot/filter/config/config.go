@@ -43,6 +43,7 @@ type Options struct {
 	TimeTravelNetworkNAT  bool
 	HostFilesystem        bool
 	TTCVolume             bool
+	GFX                   bool
 	ProfileEnable         bool
 	NVProxy               bool
 	NVProxyCaps           nvconf.DriverCaps
@@ -74,6 +75,7 @@ func (opt Options) ConfigKey() string {
 	fmt.Fprintf(&sb, "TimeTravelNetworkNAT=%t ", opt.TimeTravelNetworkNAT)
 	fmt.Fprintf(&sb, "HostFilesystem=%t ", opt.HostFilesystem)
 	fmt.Fprintf(&sb, "TTCVolume=%t ", opt.TTCVolume)
+	fmt.Fprintf(&sb, "GFX=%t ", opt.GFX)
 	fmt.Fprintf(&sb, "ProfileEnable=%t ", opt.ProfileEnable)
 	fmt.Fprintf(&sb, "Instrumentation=%t ", isInstrumentationEnabled())
 	fmt.Fprintf(&sb, "NVProxy=%t ", opt.NVProxy)
@@ -169,6 +171,9 @@ func rules(opt Options, vars precompiledseccomp.Values) (seccomp.SyscallRules, s
 	}
 	if opt.TTCVolume {
 		s.Merge(ttcVolumeFilters())
+	}
+	if opt.GFX {
+		s.Merge(gfxFilters())
 	}
 	if opt.NVProxy {
 		s.Merge(nvproxy.Filters(opt.NVProxyCaps))

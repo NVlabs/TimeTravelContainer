@@ -1453,6 +1453,7 @@ func (l *Loader) installSeccompFilters() error {
 			TimeTravelNetworkNAT:  l.root.conf.Network == config.NetworkTimeTravel && l.root.conf.TimeTravelNetworkNAT,
 			HostFilesystem:        l.root.conf.DirectFS,
 			TTCVolume:             len(l.ttcVolumeRepositories) != 0,
+			GFX:                   l.root.conf.GFX,
 			ProfileEnable:         l.root.conf.ProfileEnable,
 			NVProxy:               nvproxyEnabled,
 			NVProxyCaps:           nvproxyCaps,

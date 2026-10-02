@@ -144,6 +144,17 @@ func TestTTCVolumeAllowsHostFilesystemSize(t *testing.T) {
 	}
 }
 
+// The Sentry sizes the buffers of its sockets to GPU renderers.
+func TestGFXAllowsRendererSocketBuffers(t *testing.T) {
+	rules, _ := Rules(Options{
+		Platform: (&systrap.Systrap{}).SeccompInfo(),
+		GFX:      true,
+	})
+	if !rules.Has(unix.SYS_SETSOCKOPT) {
+		t.Fatal("virtual GPU seccomp rules reject setsockopt of renderer sockets' buffer sizes")
+	}
+}
+
 // TestOptionsConfigKey verifies the behavior of `Options.ConfigKey`.
 func TestOptionsConfigKey(t *testing.T) {
 	// mutateFn mutates the value of a specific Options field.
@@ -170,6 +181,7 @@ func TestOptionsConfigKey(t *testing.T) {
 		"TimeTravelNetworkNAT":  func(opt *Options) { opt.TimeTravelNetworkNAT = !opt.TimeTravelNetworkNAT },
 		"HostFilesystem":        func(opt *Options) { opt.HostFilesystem = !opt.HostFilesystem },
 		"TTCVolume":             func(opt *Options) { opt.TTCVolume = !opt.TTCVolume },
+		"GFX":                   func(opt *Options) { opt.GFX = !opt.GFX },
 		"ProfileEnable":         func(opt *Options) { opt.ProfileEnable = !opt.ProfileEnable },
 		"NVProxy":               func(opt *Options) { opt.NVProxy = !opt.NVProxy },
 		"NVProxyCaps":           func(opt *Options) { opt.NVProxyCaps = ^opt.NVProxyCaps },
