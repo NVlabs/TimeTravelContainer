@@ -5,16 +5,18 @@
 
 # Manual end-to-end coverage for Android in TTC: redroid (an Android image
 # for containers) boots, as its container's init, with the virtual GPU
-# (--gfx); SurfaceFlinger composes with ANGLE on gfxstream's Vulkan driver;
+# (--gfx); SurfaceFlinger composes with ANGLE on the renderer's Vulkan driver;
 # Android's network comes up and validates; apps render on the GPU; the
 # screen records to video, as screen mirroring such as scrcpy's needs; given
 # one, an APK installs and runs; and a live fork of Android, whose GPU state
 # the child restores, runs on in both branches.
 #
 # It needs what runsc/ttc/test/e2e_gfx.sh needs (TTC, TTCD,
-# TTC_GFX_RENDERER, TTC_GFXSTREAM_LIBRARY, TTC_GFX_GUEST_DRIVER), and:
-#   ANDROID_GFX_DRIVER, gfxstream's Vulkan driver for Android
-#     (runsc/ttc/gfxrenderer/guest/build_mesa_gfxstream_android.sh);
+# TTC_GFX_RENDERER, TTC_GFX_BACKEND, TTC_GFXSTREAM_LIBRARY for gfxstream,
+# TTC_GFX_GUEST_DRIVER), and:
+#   ANDROID_GFX_DRIVER, the backend's Vulkan driver for Android: Mesa's Venus
+#     driver (runsc/ttc/gfxrenderer/guest/build_mesa_venus_android.sh), or
+#     gfxstream's (build_mesa_gfxstream_android.sh);
 #   REDROID_IMAGE, an arm64 redroid image (default
 #     redroid/redroid:14.0.0_64only-latest), which the daemon pulls;
 #   optionally APK, an app to install and launch.
@@ -25,6 +27,7 @@ set -eu
 TTC=${TTC:-}
 TTCD=${TTCD:-}
 TTC_GFX_RENDERER=${TTC_GFX_RENDERER:-}
+TTC_GFX_BACKEND=${TTC_GFX_BACKEND:-gfxstream}
 TTC_GFXSTREAM_LIBRARY=${TTC_GFXSTREAM_LIBRARY:-}
 TTC_GFX_GUEST_DRIVER=${TTC_GFX_GUEST_DRIVER:-}
 ANDROID_GFX_DRIVER=${ANDROID_GFX_DRIVER:-}
@@ -43,11 +46,24 @@ fail() {
 [ -x "$TTC" ] || fail "set TTC to the ttc binary"
 [ -x "$TTCD" ] || fail "set TTCD to the matching ttcd binary"
 [ -x "$TTC_GFX_RENDERER" ] || fail "set TTC_GFX_RENDERER to ttc-gfx-renderer"
-[ -f "$TTC_GFXSTREAM_LIBRARY" ] || fail "set TTC_GFXSTREAM_LIBRARY to gfxstream's host library"
-[ -f "$TTC_GFX_GUEST_DRIVER/libvulkan_gfxstream.so" ] ||
-  fail "set TTC_GFX_GUEST_DRIVER to a directory with Mesa's libvulkan_gfxstream.so"
+case "$TTC_GFX_BACKEND" in
+  venus)
+    GUEST_DRIVER=libvulkan_virtio.so
+    ANDROID_DRIVER=vulkan.virtio.so
+    DEVICE="Virtio-GPU Venus"
+    ;;
+  gfxstream)
+    GUEST_DRIVER=libvulkan_gfxstream.so
+    ANDROID_DRIVER=vulkan.gfxstream.so
+    DEVICE="Virtio-GPU GFXStream"
+    [ -f "$TTC_GFXSTREAM_LIBRARY" ] || fail "set TTC_GFXSTREAM_LIBRARY to gfxstream's host library"
+    ;;
+  *) fail "unknown TTC_GFX_BACKEND $TTC_GFX_BACKEND" ;;
+esac
+[ -f "$TTC_GFX_GUEST_DRIVER/$GUEST_DRIVER" ] ||
+  fail "set TTC_GFX_GUEST_DRIVER to a directory with Mesa's $GUEST_DRIVER"
 [ -f "$ANDROID_GFX_DRIVER" ] ||
-  fail "set ANDROID_GFX_DRIVER to gfxstream's Vulkan driver for Android"
+  fail "set ANDROID_GFX_DRIVER to the backend's Vulkan driver for Android"
 [ -z "$APK" ] || [ -f "$APK" ] || fail "APK $APK does not exist"
 owned_root=false
 if [ -z "$TTC_E2E_ROOT" ]; then
@@ -73,8 +89,8 @@ if [ "$(uname -s)" = Darwin ]; then
   /usr/bin/codesign --force --sign - \
     --entitlements "$TEST_DIR/../../hvf.entitlements" "$BIN_DIR/ttcd" >/dev/null
 fi
-export TTC_GFXSTREAM_LIBRARY
-install -m 0644 "$TTC_GFX_GUEST_DRIVER/libvulkan_gfxstream.so" "$DRIVER_DIR/"
+export TTC_GFX_BACKEND TTC_GFXSTREAM_LIBRARY
+install -m 0644 "$TTC_GFX_GUEST_DRIVER/$GUEST_DRIVER" "$DRIVER_DIR/"
 export TTC_GFX_GUEST_DRIVER="$DRIVER_DIR"
 
 ttc() {
@@ -114,7 +130,7 @@ adb_in() {
 ttc create --name "$NAME" --gfx --gfx-fork snapshot --cap-add ALL --network ttc --nat \
   --entrypoint /init "$REDROID_IMAGE" \
   qemu=1 androidboot.hardware=redroid androidboot.use_memfd=true >/dev/null
-ttc cp "$ANDROID_GFX_DRIVER" "$NAME@main:/vendor/lib64/hw/vulkan.gfxstream.so" >/dev/null
+ttc cp "$ANDROID_GFX_DRIVER" "$NAME@main:/vendor/lib64/hw/$ANDROID_DRIVER" >/dev/null
 ttc cp "$GPU_CONFIG" "$NAME@main:/vendor/bin/gpu_config.sh" >/dev/null
 ttc start "$NAME" >/dev/null
 
@@ -129,7 +145,7 @@ echo "ttc redroid e2e: booted"
 gles=$(adb /system/bin/dumpsys SurfaceFlinger 2>&1 | grep '^GLES:') ||
   fail "SurfaceFlinger reports no GLES renderer"
 case "$gles" in
-  *ANGLE*"Virtio-GPU GFXStream"*) ;;
+  *ANGLE*"$DEVICE"*) ;;
   *) fail "SurfaceFlinger composes without the virtual GPU: $gles" ;;
 esac
 echo "ttc redroid e2e: $gles"
@@ -144,7 +160,7 @@ done
 echo "ttc redroid e2e: the network is validated"
 
 # launch PACKAGE [BRANCH] starts the package's launcher activity, and checks
-# that it renders with ANGLE on gfxstream's driver.
+# that it renders with ANGLE on the backend's driver.
 launch() {
   branch=${2:-main}
   component=$(adb_in "$branch" /system/bin/cmd package resolve-activity --brief \
@@ -162,8 +178,8 @@ launch() {
     *) fail "$1 does not render with ANGLE" ;;
   esac
   case "$maps" in
-    *vulkan.gfxstream.so*) ;;
-    *) fail "$1 does not use gfxstream's Vulkan driver" ;;
+    *"$ANDROID_DRIVER"*) ;;
+    *) fail "$1 does not use the backend's Vulkan driver" ;;
   esac
   adb_in "$branch" /system/bin/screencap -p "/data/local/tmp/$1.png" || fail "screencap"
   ttc cp "$NAME@$branch:/data/local/tmp/$1.png" "$OUT_DIR/$branch-$1.png" >/dev/null
