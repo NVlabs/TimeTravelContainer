@@ -260,6 +260,55 @@ func TestAddressSpaceUnmapSkipsSparseHoles(t *testing.T) {
 	}
 }
 
+// TestAddressSpaceForkBatchesUnmaps checks that the unmaps that establish a
+// fork's copy-on-write, between PreFork and PostFork, take one monitor
+// transaction, rather than one for each range.
+func TestAddressSpaceForkBatchesUnmaps(t *testing.T) {
+	vm := &relocationTestVM{}
+	p, closePlatform := newAddressSpaceTestPlatform(t, vm)
+	defer closePlatform()
+	as := indexed(&addressSpace{id: 1, platform: p, mappings: map[hostarch.Addr]addressMapping{
+		0x2000: {frame: 1},
+		0x4000: {frame: 2},
+		0x5000: {frame: 3},
+		0x8000: {frame: 4},
+		0x9000: {frame: 5}, // Not unmapped.
+	}})
+	as.PreFork()
+	as.Unmap(0x8000, hostarch.PageSize)
+	as.Unmap(0x2000, hostarch.PageSize)
+	as.Unmap(0x4000, 2*hostarch.PageSize)
+	// An overlapping range unmaps nothing twice.
+	as.Unmap(0x5000, hostarch.PageSize)
+	vm.mu.Lock()
+	deferred := len(vm.commands)
+	vm.mu.Unlock()
+	if deferred != 0 {
+		t.Fatalf("Unmap issued %d monitor commands during a fork, want none until PostFork", deferred)
+	}
+	as.PostFork()
+
+	vm.mu.Lock()
+	defer vm.mu.Unlock()
+	if len(vm.commands) != 1 {
+		t.Fatalf("monitor commands = %+v, want one", vm.commands)
+	}
+	ops := vm.commands[0].Operations
+	if len(ops) != 3 || ops[0].VA != 0x2000 || ops[1].VA != 0x4000 || ops[1].Length != 2*hostarch.PageSize || ops[2].VA != 0x8000 {
+		t.Fatalf("fork unmap operations = %+v", ops)
+	}
+	if len(as.mappings) != 1 {
+		t.Fatalf("remaining mappings = %+v, want only 0x9000", as.mappings)
+	}
+	// After the fork, Unmap unmaps at once.
+	vm.mu.Unlock()
+	as.Unmap(0x9000, hostarch.PageSize)
+	vm.mu.Lock()
+	if len(vm.commands) != 2 || len(as.mappings) != 0 {
+		t.Fatalf("after the fork, monitor commands = %d and mappings = %+v", len(vm.commands), as.mappings)
+	}
+}
+
 func TestAddressSpaceUnmapRecordsAcknowledgedBatches(t *testing.T) {
 	vm := &relocationTestVM{failApplyAt: 2}
 	p, closePlatform := newAddressSpaceTestPlatform(t, vm)
