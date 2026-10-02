@@ -940,11 +940,32 @@ NVIDIA RTX PRO 6000 Blackwell and its driver 590.08, a pre-release.*
     documents a like limit of `cudaMallocManaged()` on KVM. TTC refuses
     `--nvproxy` on KVM for now, which `e2e_nvproxy.sh` checks with
     `TTC_PLATFORM=kvm`.
+*   **arm64:** a node with a GB300, a Grace CPU beside a Blackwell GPU, and
+    NVIDIA's driver 610.43.02, ran the same on systrap and KVM.
+    `e2e_gfx.sh` passes on both. Chromium's WebGL forks and draws on in
+    both branches, in 638 ms on systrap and 473 ms on KVM. llama.cpp runs
+    on systrap, at 10,263 tokens/s of prompt and 78 of generation, and a
+    fork of 267 ms leaves both branches the unforked run's text; on KVM,
+    built in a guest there, at 19,318 and 64, and a fork of 230 ms (a build
+    for the host's CPU uses SVE, which KVM's vCPUs lack, and is refused
+    with `SIGILL`). Android does not boot: the driver faults (`SIGSEGV`
+    at 0x10) in `vkCreateGraphicsPipelines`, compiling 32 of the pipelines
+    that ANGLE makes for SurfaceFlinger, valid SPIR-V that the x86 node's
+    pre-release driver fails to compile ("NVVM compilation failed"), and
+    the renderer dies each time Android tries again. CUDA does not start
+    under `--nvproxy` ("cudaErrorSystemNotReady"): on Grace, CUDA requires
+    pageable memory access through ATS, which the driver turns off for a
+    process that, as every one of nvproxy's does, initializes UVM in its
+    multi-process sharing mode. Two gaps before it, also Grace's, have
+    fixes not in this tree: nvproxy refuses a fabric memory control
+    (`NV2080_CTRL_CMD_FLA_GET_FABRIC_MEM_STATS`), and the Sentry's sysfs
+    lacks the memory block size and the GPUs' NUMA nodes that the driver's
+    library reads.
 *   **Not done:** B5; forks of `--nvproxy` families to other nodes;
     NVIDIA's own Vulkan through `--nvproxy=graphics`, whose ICD does not
     initialize on the pre-release driver under 590.48.01's interface; the
-    renderer's confinement on Linux; `--nvproxy` on KVM; and arm64 hosts,
-    which the node is not.
+    renderer's confinement on Linux; `--nvproxy` on KVM; on arm64, CUDA,
+    Android, and SVE on KVM.
 
 ## Testing
 
