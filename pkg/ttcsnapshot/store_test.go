@@ -3898,6 +3898,32 @@ func TestMemoryPageIndexMatchesAMap(t *testing.T) {
 	}
 }
 
+// An object removed and installed again while a sync of names is under way
+// stays to be synced, though the sync began with it; and the store lets go
+// of its record of names once it is empty.
+func TestUnsyncedNameReinstalledDuringSync(t *testing.T) {
+	store, err := OpenLocalDataStore(filepath.Join(t.TempDir(), "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := ObjectID{Snapshot: 1, Kind: ObjectKindMemoryChunk, Ordinal: 1}
+	store.noteUnsyncedName(id)
+	syncing := store.unsyncedNamesOf([]ObjectID{id})
+	store.forgetUnsyncedName(id)
+	if store.unsyncedNames != nil {
+		t.Fatalf("an empty record of unsynced names is kept: %v", store.unsyncedNames)
+	}
+	store.noteUnsyncedName(id)
+	store.forgetSyncedNames(syncing)
+	if _, ok := store.unsyncedNames[id]; !ok {
+		t.Fatal("a sync that began before the object was installed again forgot its name")
+	}
+	store.forgetSyncedNames(store.unsyncedNamesOf([]ObjectID{id}))
+	if store.unsyncedNames != nil {
+		t.Fatalf("names synced, the record is kept: %v", store.unsyncedNames)
+	}
+}
+
 // The cached chunks of a retired origin go when the cache next looks, with
 // their directories; a live origin's stay, and so do the graph's own.
 func TestEvictDeadCachedChunks(t *testing.T) {

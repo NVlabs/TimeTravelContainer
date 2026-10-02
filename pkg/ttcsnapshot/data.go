@@ -46,9 +46,12 @@ type LocalDataStore struct {
 	// directory entries a later fence must make durable, keyed by object with
 	// a generation so a concurrent reinstall is not forgotten by a sync that
 	// began before it. Removal forgets them: a removed object has no name to
-	// make durable.
-	namesMu       sync.Mutex
-	unsyncedNames map[ObjectID]unsyncedName
+	// make durable. Generations come from nameGeneration, which never goes
+	// back: a reinstall after a removal, its entry forgotten, takes one no
+	// sync under way has seen.
+	namesMu        sync.Mutex
+	unsyncedNames  map[ObjectID]unsyncedName
+	nameGeneration uint64
 	// chunkCache makes sweeps keep, within memoryChunkCacheTarget, memory
 	// chunks their graph no longer holds: those of origins the graph does not
 	// hold as its own, whose images the shared store has, and which a restore
@@ -167,14 +170,26 @@ func (store *LocalDataStore) noteUnsyncedName(id ObjectID) {
 	if store.unsyncedNames == nil {
 		store.unsyncedNames = make(map[ObjectID]unsyncedName)
 	}
-	current := store.unsyncedNames[id]
-	store.unsyncedNames[id] = unsyncedName{id: id, generation: current.generation + 1}
+	store.nameGeneration++
+	store.unsyncedNames[id] = unsyncedName{id: id, generation: store.nameGeneration}
 }
 
 func (store *LocalDataStore) forgetUnsyncedName(id ObjectID) {
 	store.namesMu.Lock()
 	delete(store.unsyncedNames, id)
+	store.dropEmptyUnsyncedNamesLocked()
 	store.namesMu.Unlock()
+}
+
+// dropEmptyUnsyncedNamesLocked lets go of unsyncedNames once it is empty: a
+// map keeps the room of the most entries it held, and dehydrations name
+// thousands of chunks each between fences.
+//
+// Preconditions: store.namesMu is locked.
+func (store *LocalDataStore) dropEmptyUnsyncedNamesLocked() {
+	if len(store.unsyncedNames) == 0 {
+		store.unsyncedNames = nil
+	}
 }
 
 // SyncNewNames makes durable the directory entries of every object installed
@@ -1130,6 +1145,7 @@ func (store *LocalDataStore) forgetSyncedNames(synced map[ObjectID]unsyncedName)
 			delete(store.unsyncedNames, key)
 		}
 	}
+	store.dropEmptyUnsyncedNamesLocked()
 }
 
 // SyncObjectDirectories makes the names of objects durable without syncing
