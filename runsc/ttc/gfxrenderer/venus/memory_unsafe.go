@@ -117,18 +117,19 @@ func allocateMemory(s *stream, cmd *vn.Command, args unsafe.Pointer) {
 		}
 		r.mem.incRef()
 		shm = r.mem
-		// Replace the resource's import with the Metal import.
-		imp, err := s.importMetal(dev, shm, resInfo.PNext)
+		// Replace the resource's import with the host's.
+		imp, buf, err := s.importHost(dev, shm, resInfo.PNext)
 		if err != nil {
+			s.ctx.logf("vkAllocateMemory: %v", err)
 			shm.decRef()
 			a.Ret = vn.VK_ERROR_INVALID_EXTERNAL_HANDLE
 			return
 		}
-		setNext(prev, unsafe.Pointer(imp))
-		mem.metalBuffer = imp.handle
+		setNext(prev, imp)
+		mem.metalBuffer = buf
 		mem.imported = true
 		info.AllocationSize = uint64(len(shm.data))
-	} else if mem.propertyFlags&vkMemoryPropertyHostVisible != 0 && dev.metal != nil {
+	} else if mem.propertyFlags&vkMemoryPropertyHostVisible != 0 && dev.importsHostMemory() {
 		var err error
 		shm, err = newSharedMemory(info.AllocationSize)
 		if err != nil {
@@ -136,15 +137,15 @@ func allocateMemory(s *stream, cmd *vn.Command, args unsafe.Pointer) {
 			a.Ret = vn.VK_ERROR_OUT_OF_HOST_MEMORY
 			return
 		}
-		imp, err := s.importMetal(dev, shm, info.PNext)
+		imp, buf, err := s.importHost(dev, shm, info.PNext)
 		if err != nil {
 			s.ctx.logf("vkAllocateMemory: %v", err)
 			shm.decRef()
 			a.Ret = vn.VK_ERROR_OUT_OF_HOST_MEMORY
 			return
 		}
-		info.PNext = unsafe.Pointer(imp)
-		mem.metalBuffer = imp.handle
+		info.PNext = imp
+		mem.metalBuffer = buf
 		info.AllocationSize = uint64(len(shm.data))
 	}
 	mem.shm = shm

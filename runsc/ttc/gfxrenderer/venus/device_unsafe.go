@@ -112,6 +112,9 @@ func createDevice(s *stream, cmd *vn.Command, args unsafe.Pointer) {
 	if pd.extPortabilitySubset {
 		ours = append(ours, "VK_KHR_portability_subset")
 	}
+	if pd.hostImportTypes != 0 {
+		ours = append(ours, extExternalMemoryHost)
+	}
 	if len(ours) != 0 {
 		exts = append(exts, unsafe.Slice((*unsafe.Pointer)(s.cstrings(ours)), len(ours))...)
 	}

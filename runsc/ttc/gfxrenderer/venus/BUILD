@@ -18,6 +18,7 @@ go_library(
         "dispatch_unsafe.go",
         "dmabuf_unsafe.go",
         "hostcopy_unsafe.go",
+        "hostimport_unsafe.go",
         "instance_unsafe.go",
         "journal_unsafe.go",
         "layout_unsafe.go",

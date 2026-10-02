@@ -64,7 +64,13 @@ type physicalDevice struct {
 	queueFamilies []vn.VkQueueFamilyProperties
 	// What the renderer needs of the host's extensions.
 	extMetal, extMetalObjects, extPortabilitySubset bool
+	extHostMemory                                   bool
 	devices                                         map[*device]struct{}
+	// hostImportTypes are the memory types that import shared memory by its
+	// address, and hostImportAlignment the alignment that such memory
+	// takes: see hostimport.go.
+	hostImportTypes     uint32
+	hostImportAlignment uint64
 
 	// What the renderer offers beyond the host's Vulkan: see quirks.go and
 	// dmabuf.go.
@@ -428,10 +434,36 @@ func (s *stream) enumerate(inst *instance) int32 {
 	if a.Ret != vn.VK_SUCCESS {
 		return a.Ret
 	}
-	inst.handles = append([]vn.Handle(nil), unsafe.Slice(handles, *count)...)
+	inst.handles = s.hardwareDevices(inst, unsafe.Slice(handles, *count))
 	inst.physicalDevices = make([]*physicalDevice, len(inst.handles))
 	inst.enumerated = true
 	return vn.VK_SUCCESS
+}
+
+// physicalDeviceTypeCPU is VK_PHYSICAL_DEVICE_TYPE_CPU.
+const physicalDeviceTypeCPU = 4
+
+// hardwareDevices returns the physical devices of handles that guests get:
+// the host's GPUs, without its software rasterizers, such as llvmpipe, where
+// it has a GPU. A guest renders in software faster with its own, and would
+// find two virtual GPUs.
+func (s *stream) hardwareDevices(inst *instance, handles []vn.Handle) []vn.Handle {
+	var gpus, cpus []vn.Handle
+	for _, h := range handles {
+		props := newArgs[vn.Args_vkGetPhysicalDeviceProperties](s)
+		props.PhysicalDevice = h
+		props.PProperties = unsafe.Pointer(alloc[vn.VkPhysicalDeviceProperties](s, 1))
+		vk.Call(vn.VK_COMMAND_TYPE_vkGetPhysicalDeviceProperties_EXT, inst.pdTable, unsafe.Pointer(props))
+		if (*vn.VkPhysicalDeviceProperties)(props.PProperties).DeviceType == physicalDeviceTypeCPU {
+			cpus = append(cpus, h)
+		} else {
+			gpus = append(gpus, h)
+		}
+	}
+	if len(gpus) == 0 {
+		return cpus
+	}
+	return gpus
 }
 
 func (s *stream) commandInstance(cmd *vn.Command, args unsafe.Pointer) *instance {
@@ -523,6 +555,12 @@ func (s *stream) newPhysicalDevice(inst *instance, h vn.Handle) *physicalDevice 
 				pd.extMetalObjects = true
 			case "VK_KHR_portability_subset":
 				pd.extPortabilitySubset = true
+			case extExternalMemoryHost:
+				// The renderer's, to import the shared memory that
+				// guests map; guests' host pointers mean nothing to
+				// the host.
+				pd.extHostMemory = true
+				continue
 			}
 			if spec, ok := specs[name]; ok {
 				e.SpecVersion = min(e.SpecVersion, spec)
@@ -548,13 +586,14 @@ func (s *stream) newPhysicalDevice(inst *instance, h vn.Handle) *physicalDevice 
 		vk.Call(vn.VK_COMMAND_TYPE_vkGetPhysicalDeviceQueueFamilyProperties_EXT, t, unsafe.Pointer(qf))
 		pd.queueFamilies = append([]vn.VkQueueFamilyProperties(nil), unsafe.Slice(list, *qcount)...)
 	}
+	s.initHostImport(pd)
 	s.initQuirks(pd, hostExtensions)
 	return pd
 }
 
 // enumeratePhysicalDeviceGroups executes vkEnumeratePhysicalDeviceGroups,
 // whose groups name physical devices by the guest's IDs, as virglrenderer's
-// does.
+// does. Groups of devices that guests do not get are left out.
 func enumeratePhysicalDeviceGroups(s *stream, cmd *vn.Command, args unsafe.Pointer) {
 	a := (*vn.Args_vkEnumeratePhysicalDeviceGroups)(args)
 	inst := s.commandInstance(cmd, args)
@@ -564,40 +603,70 @@ func enumeratePhysicalDeviceGroups(s *stream, cmd *vn.Command, args unsafe.Point
 	if a.Ret = s.enumerate(inst); a.Ret != vn.VK_SUCCESS {
 		return
 	}
-	orig := a.PPhysicalDeviceGroupProperties
-	count := *(*uint32)(a.PPhysicalDeviceGroupCount)
-	if orig != nil {
-		groups := alloc[vn.VkPhysicalDeviceGroupProperties](s, int(count))
-		for i := range unsafe.Slice(groups, count) {
-			unsafe.Slice(groups, count)[i].SType = vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GROUP_PROPERTIES
-		}
-		a.PPhysicalDeviceGroupProperties = unsafe.Pointer(groups)
-	}
-	s.call(cmd, args)
-	if a.Ret != vn.VK_SUCCESS || orig == nil {
-		a.PPhysicalDeviceGroupProperties = orig
+	// The host's groups, all of them.
+	host := newArgs[vn.Args_vkEnumeratePhysicalDeviceGroups](s)
+	host.Instance = inst.handle
+	hostCount := alloc[uint32](s, 1)
+	host.PPhysicalDeviceGroupCount = unsafe.Pointer(hostCount)
+	vk.Call(vn.VK_COMMAND_TYPE_vkEnumeratePhysicalDeviceGroups_EXT, inst.table, unsafe.Pointer(host))
+	if host.Ret != vn.VK_SUCCESS {
+		a.Ret = host.Ret
 		return
 	}
-	count = *(*uint32)(a.PPhysicalDeviceGroupCount)
-	host := unsafe.Slice((*vn.VkPhysicalDeviceGroupProperties)(a.PPhysicalDeviceGroupProperties), count)
-	out := unsafe.Slice((*vn.VkPhysicalDeviceGroupProperties)(orig), count)
-	a.PPhysicalDeviceGroupProperties = orig
-	for i := range host {
-		out[i].PhysicalDeviceCount = host[i].PhysicalDeviceCount
-		out[i].SubsetAllocation = host[i].SubsetAllocation
-		for j := uint32(0); j < host[i].PhysicalDeviceCount && j < uint32(len(host[i].PhysicalDevices)); j++ {
-			var pd *physicalDevice
+	groups := alloc[vn.VkPhysicalDeviceGroupProperties](s, int(*hostCount))
+	for i := range unsafe.Slice(groups, *hostCount) {
+		unsafe.Slice(groups, *hostCount)[i].SType = vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GROUP_PROPERTIES
+	}
+	host.PPhysicalDeviceGroupProperties = unsafe.Pointer(groups)
+	vk.Call(vn.VK_COMMAND_TYPE_vkEnumeratePhysicalDeviceGroups_EXT, inst.table, unsafe.Pointer(host))
+	if host.Ret != vn.VK_SUCCESS && host.Ret != vn.VK_INCOMPLETE {
+		a.Ret = host.Ret
+		return
+	}
+	// The groups of the devices that guests get, by the guests' IDs.
+	var kept []vn.VkPhysicalDeviceGroupProperties
+	for _, g := range unsafe.Slice(groups, *hostCount) {
+		out := g
+		keep := g.PhysicalDeviceCount != 0
+		for j := uint32(0); j < g.PhysicalDeviceCount && j < uint32(len(g.PhysicalDevices)); j++ {
+			index := -1
 			for k, h := range inst.handles {
-				if h == host[i].PhysicalDevices[j] {
-					pd = inst.physicalDevices[k]
+				if h == g.PhysicalDevices[j] {
+					index = k
 				}
 			}
+			if index < 0 {
+				keep = false
+				break
+			}
+			pd := inst.physicalDevices[index]
 			if pd == nil {
 				// The guest must enumerate physical devices first.
 				a.Ret = vn.VK_ERROR_INITIALIZATION_FAILED
 				return
 			}
-			out[i].PhysicalDevices[j] = vn.Handle(pd.obj.id)
+			out.PhysicalDevices[j] = vn.Handle(pd.obj.id)
 		}
+		if keep {
+			kept = append(kept, out)
+		}
+	}
+	countp := (*uint32)(a.PPhysicalDeviceGroupCount)
+	if a.PPhysicalDeviceGroupProperties == nil {
+		*countp = uint32(len(kept))
+		a.Ret = vn.VK_SUCCESS
+		return
+	}
+	n := min(*countp, uint32(len(kept)))
+	out := unsafe.Slice((*vn.VkPhysicalDeviceGroupProperties)(a.PPhysicalDeviceGroupProperties), n)
+	for i := range out {
+		out[i].PhysicalDeviceCount = kept[i].PhysicalDeviceCount
+		out[i].PhysicalDevices = kept[i].PhysicalDevices
+		out[i].SubsetAllocation = kept[i].SubsetAllocation
+	}
+	*countp = n
+	a.Ret = vn.VK_SUCCESS
+	if n < uint32(len(kept)) {
+		a.Ret = vn.VK_INCOMPLETE
 	}
 }

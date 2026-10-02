@@ -11,9 +11,9 @@ package(
 go_binary(
     name = "ttc-gfx-renderer",
     srcs = ["main.go"],
-    # The renderer calls Vulkan, which it loads with dlopen, through cgo.
-    # Like ttcd's, Linux configurations keep the repository's default.
-    pure = select_system(darwin = "off", linux = "auto"),
+    # The renderer calls Vulkan, which it loads with dlopen, through cgo, on
+    # every platform: a pure build of it renders nothing.
+    pure = "off",
     visibility = ["//visibility:public"],
     deps = ["//runsc/ttc/gfxrenderer"],
 )

@@ -46,8 +46,10 @@ func (pd *physicalDevice) initExternalMemory(hostExtensions map[string]bool) {
 			pd.hostVisibleTypes |= 1 << i
 		}
 	}
-	// Shared memory backs host-visible memory only with Metal's import.
-	if hostExtensions["VK_EXT_external_memory_dma_buf"] || !pd.extMetal || !pd.extMetalObjects || pd.hostVisibleTypes == 0 {
+	// Shared memory backs host-visible memory only where the renderer
+	// imports it (hostimport.go). Guests' dma-bufs are blob resources, not
+	// the host's, though the host's Vulkan has its own.
+	if !pd.importsHostMemory() || pd.hostVisibleTypes == 0 {
 		return
 	}
 	pd.emulateDmaBuf = true

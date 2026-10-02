@@ -25,6 +25,14 @@ reference to the clone, which the children restore.
 The renderer loads the Vulkan loader with `dlopen`: on macOS, Homebrew's
 `vulkan-loader` and `molten-vk`; on Linux, the host's loader and driver.
 
+Guests map host-visible memory, which is the renderer's shared memory. On
+macOS the renderer imports it into Vulkan as `MTLBuffer`s
+(`VK_EXT_external_memory_metal`); on Linux, by its address
+(`VK_EXT_external_memory_host`), into the memory types that the host's
+driver imports it into, which it probes once per GPU: the others guests see
+as memory they cannot map. Guests see no software rasterizer, such as
+llvmpipe, where the host has a GPU.
+
 ## Confinement
 
 A renderer decodes guests' command streams, so it confines itself before it

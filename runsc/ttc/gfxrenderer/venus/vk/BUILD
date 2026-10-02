@@ -14,6 +14,7 @@ package(
 cc_library(
     name = "headers",
     hdrs = glob(["include/**/*.h"]) + [
+        "hostmem.h",
         "metal.h",
         "vn_protocol_renderer_cs.h",
         "vn_protocol_renderer_defines.h",
@@ -37,6 +38,8 @@ go_library(
     srcs = [
         "doc.go",
         "hostcopy_unsafe.go",
+        "hostmem.c",
+        "hostmem_unsafe.go",
         "metal.c",
         "metal_unsafe.go",
         "shm.go",
