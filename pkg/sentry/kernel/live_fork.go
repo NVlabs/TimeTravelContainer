@@ -377,8 +377,11 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		}
 
 		memoryPreparationStarted := time.Now()
-		pmaSnapshots, clearPMASnapshots := k.prepareMemoryManagersForLiveFork()
+		pmaSnapshots, clearPMASnapshots, err := k.prepareMemoryManagersForLiveFork()
 		defer clearPMASnapshots()
+		if err != nil {
+			return fmt.Errorf("preparing memory for live fork: %w", err)
+		}
 		k.mf.MarkSavable()
 		if opts.Metrics != nil {
 			opts.Metrics.MemoryPreparation = time.Since(memoryPreparationStarted)
@@ -777,9 +780,15 @@ func (k *Kernel) captureLiveForkMetadata(fsResources vfs.LiveForkFilesystemResou
 			return fmt.Errorf("live fork does not yet support %d private filesystem MemoryFiles", len(mfs))
 		}
 
+		// The paused child that this records has pinned nothing for DMA, so
+		// the snapshots hold no copies, which their clearing would release
+		// before the siblings load.
 		var clearSnapshots func()
-		snapshots, clearSnapshots = k.prepareMemoryManagersForLiveFork()
+		snapshots, clearSnapshots, err = k.prepareMemoryManagersForLiveFork()
 		defer clearSnapshots()
+		if err != nil {
+			return fmt.Errorf("preparing memory for live fork: %w", err)
+		}
 		k.mf.MarkSavable()
 
 		if recording, err = k.recordStateGraph(saveCtx); err != nil {
@@ -1380,35 +1389,47 @@ func (k *Kernel) privatizeLiveForkVDSOParamPage() error {
 
 // prepareMemoryManagersForLiveFork transitions all private PMAs to COW.
 // Tasks are paused, so Task.image and runState may be read without Task.mu.
-func (k *Kernel) prepareMemoryManagersForLiveFork() (mm.LiveForkPMASnapshots, func()) {
+// The returned function, which must be called even if it fails, clears what
+// it prepared.
+func (k *Kernel) prepareMemoryManagersForLiveFork() (mm.LiveForkPMASnapshots, func(), error) {
 	prepared := make(map[*mm.MemoryManager]struct{})
 	snapshots := make(mm.LiveForkPMASnapshots)
 	nextKey := uint64(1)
-	prepare := func(memMgr *mm.MemoryManager) {
+	prepare := func(memMgr *mm.MemoryManager) error {
 		if memMgr == nil {
-			return
+			return nil
 		}
 		if _, ok := prepared[memMgr]; ok {
-			return
+			return nil
 		}
-		snapshots[nextKey] = memMgr.PrepareLiveForkSnapshot(nextKey)
+		snapshot, err := memMgr.PrepareLiveForkSnapshot(nextKey)
+		if err != nil {
+			return err
+		}
+		snapshots[nextKey] = snapshot
 		nextKey++
 		prepared[memMgr] = struct{}{}
+		return nil
+	}
+	clear := func() {
+		for memMgr := range prepared {
+			memMgr.ClearLiveForkPMASnapshot()
+		}
 	}
 
 	k.tasks.mu.RLock()
 	defer k.tasks.mu.RUnlock()
 	for t := range k.tasks.Root.tids {
-		prepare(t.image.MemoryManager)
+		if err := prepare(t.image.MemoryManager); err != nil {
+			return nil, clear, err
+		}
 		if r, ok := t.runState.(*runExecveAfterSiblingExitStop); ok {
-			prepare(r.image.MemoryManager)
+			if err := prepare(r.image.MemoryManager); err != nil {
+				return nil, clear, err
+			}
 		}
 	}
-	return snapshots, func() {
-		for memMgr := range prepared {
-			memMgr.ClearLiveForkPMASnapshot()
-		}
-	}
+	return snapshots, clear, nil
 }
 
 // prepareMemoryManagersForDistributedFork establishes CoW while leaving PMAs

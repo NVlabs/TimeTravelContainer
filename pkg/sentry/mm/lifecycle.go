@@ -29,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/usage"
 )
 
 // NewMemoryManager returns a new MemoryManager with no mappings and 1 user.
@@ -74,7 +75,8 @@ func (mm *MemoryManager) MmapLayoutRandomized() bool {
 //
 // Preconditions: Tasks using mm are externally stopped.
 func (mm *MemoryManager) PrepareLiveFork() {
-	mm.prepareLiveFork(0)
+	// Without a snapshot it copies nothing, and only copying fails.
+	_, _ = mm.prepareLiveFork(0)
 }
 
 // LiveForkPMASnapshot is an immutable, in-memory representation of PMA
@@ -93,8 +95,10 @@ type liveForkPMAEntry struct {
 type LiveForkPMASnapshots map[uint64]*LiveForkPMASnapshot
 
 // PrepareLiveForkSnapshot establishes CoW and captures PMA metadata without
-// encoding every resident range through the generic state stream.
-func (mm *MemoryManager) PrepareLiveForkSnapshot(key uint64) *LiveForkPMASnapshot {
+// encoding every resident range through the generic state stream. The
+// snapshot's children get copies of the pages that devices' DMA uses, which
+// the source keeps.
+func (mm *MemoryManager) PrepareLiveForkSnapshot(key uint64) (*LiveForkPMASnapshot, error) {
 	if key == 0 {
 		panic("live-fork PMA snapshot key must be nonzero")
 	}
@@ -105,10 +109,10 @@ func (mm *MemoryManager) PrepareLiveForkSnapshot(key uint64) *LiveForkPMASnapsho
 // in-process PMA snapshot key. PMAs therefore remain in the normal state
 // stream and can be reconstructed by another Sentry process.
 func (mm *MemoryManager) PrepareDistributedForkCOW() {
-	mm.prepareLiveFork(0)
+	_, _ = mm.prepareLiveFork(0)
 }
 
-func (mm *MemoryManager) prepareLiveFork(key uint64) *LiveForkPMASnapshot {
+func (mm *MemoryManager) prepareLiveFork(key uint64) (*LiveForkPMASnapshot, error) {
 	mm.AddressSpace().PreFork()
 	defer mm.AddressSpace().PostFork()
 
@@ -119,9 +123,28 @@ func (mm *MemoryManager) prepareLiveFork(key uint64) *LiveForkPMASnapshot {
 	if key != 0 {
 		snapshot = &LiveForkPMASnapshot{}
 	}
+	// A device's DMA uses pages that a driver pinned, which copy-on-write
+	// would take from their process: see pgalloc.MemoryFile.PinForDMA.
+	dmaPinned := mm.mf.AnyDMAPinned()
 	var unmapAR hostarch.AddrRange
 	for pseg := mm.pmas.FirstSegment(); pseg.Ok(); pseg = pseg.NextSegment() {
 		pma := pseg.ValuePtr()
+		if dmaPinned && pma.private {
+			if mf, ok := pma.file.(*pgalloc.MemoryFile); ok && mf.DMAPinned(pseg.fileRange()) {
+				if snapshot != nil {
+					entry, err := mm.copyForLiveForkLocked(pseg)
+					if err != nil {
+						if unmapAR.Length() != 0 {
+							mm.unmapASLocked(unmapAR)
+						}
+						mm.releaseLiveForkCopiesLocked()
+						return nil, fmt.Errorf("copying %d bytes that a device's DMA uses for a live fork: %w", pseg.Range().Length(), err)
+					}
+					snapshot.entries = append(snapshot.entries, entry)
+				}
+				continue
+			}
+		}
 		if pma.private && !pma.needCOW {
 			pma.needCOW = true
 			if pma.effectivePerms.Write {
@@ -137,6 +160,9 @@ func (mm *MemoryManager) prepareLiveFork(key uint64) *LiveForkPMASnapshot {
 			}
 			pma.maxPerms.Write = false
 		}
+		if _, ok := pma.file.(memmap.LiveForkUnsharedFile); ok && snapshot != nil {
+			continue
+		}
 		if snapshot != nil {
 			pmaCopy := *pma
 			pmaCopy.internalMappings = safemem.BlockSeq{}
@@ -147,14 +173,68 @@ func (mm *MemoryManager) prepareLiveFork(key uint64) *LiveForkPMASnapshot {
 		mm.unmapASLocked(unmapAR)
 	}
 	mm.liveForkPMAKey = key
-	return snapshot
+	return snapshot, nil
+}
+
+// copyForLiveForkLocked returns the entry of a live fork's PMA metadata
+// snapshot for pseg, a private pma whose pages a device's DMA uses, which
+// maps a copy of them: the source keeps the pages, as Linux's fork does
+// pages pinned for DMA. The children share the copy, copy-on-write.
+//
+// Preconditions: mm.activeMu is locked for writing.
+func (mm *MemoryManager) copyForLiveForkLocked(pseg pmaIterator) (liveForkPMAEntry, error) {
+	if err := pseg.getInternalMappingsLocked(); err != nil {
+		return liveForkPMAEntry{}, err
+	}
+	ar := pseg.Range()
+	reader := safemem.BlockSeqReader{Blocks: mm.internalMappingsLocked(pseg, ar)}
+	fr, err := mm.mf.Allocate(uint64(ar.Length()), pgalloc.AllocOpts{
+		Kind:       usage.Anonymous,
+		Mode:       pgalloc.AllocateAndWritePopulate,
+		ReaderFunc: reader.ReadToBlocks,
+	})
+	if err == nil && fr.Length() != uint64(ar.Length()) {
+		err = fmt.Errorf("copied %d of %d bytes", fr.Length(), ar.Length())
+	}
+	pma := pseg.ValuePtr()
+	if source, ok := pma.file.(*pgalloc.MemoryFile); err == nil && ok {
+		err = mm.mf.AdoptCOWIdentities(source, pseg.fileRange(), fr)
+	}
+	if err != nil {
+		if fr.Length() != 0 {
+			mm.mf.DecRef(fr)
+		}
+		return liveForkPMAEntry{}, err
+	}
+	mm.liveForkCopies = append(mm.liveForkCopies, fr)
+	copied := *pma
+	copied.file = mm.mf
+	copied.off = fr.Start
+	copied.needCOW = true
+	copied.effectivePerms.Write = false
+	copied.maxPerms.Write = false
+	copied.internalMappings = safemem.BlockSeq{}
+	return liveForkPMAEntry{ar: ar, pma: copied}, nil
+}
+
+// releaseLiveForkCopiesLocked releases the references that a PMA metadata
+// snapshot holds on its copies.
+//
+// Preconditions: mm.activeMu is locked for writing.
+func (mm *MemoryManager) releaseLiveForkCopiesLocked() {
+	for _, fr := range mm.liveForkCopies {
+		mm.mf.DecRef(fr)
+	}
+	mm.liveForkCopies = nil
 }
 
 // ClearLiveForkPMASnapshot restores normal state serialization after a live
-// fork metadata capture.
+// fork metadata capture, whose loads hold their own references on what it
+// copied.
 func (mm *MemoryManager) ClearLiveForkPMASnapshot() {
 	mm.activeMu.Lock()
 	mm.liveForkPMAKey = 0
+	mm.releaseLiveForkCopiesLocked()
 	mm.activeMu.Unlock()
 }
 

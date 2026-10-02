@@ -107,6 +107,9 @@ type MemoryFile struct {
 
 	mu memoryFileMutex
 
+	// dmaPins are the ranges of the file that devices' DMA uses.
+	dmaPins dmaPins
+
 	// remoteCOWMu protects remoteCOWSnapshots. It is independent of mu so COW
 	// notifications can be emitted only after MemoryManager locks are dropped.
 	remoteCOWMu        sync.RWMutex

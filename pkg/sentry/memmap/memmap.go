@@ -660,6 +660,18 @@ type LiveForkSharedFile interface {
 	LiveForkShared() bool
 }
 
+// LiveForkUnsharedFile is implemented by Files whose pages a live fork's
+// child, or what loads a save, must not map as the process that it copies
+// does: the memory of a device that serves that process, such as the GPU
+// memory of its channels. The copy's mappings fault again, on its own
+// Mappables.
+type LiveForkUnsharedFile interface {
+	File
+
+	// LiveForkUnshared marks the File.
+	LiveForkUnshared()
+}
+
 // HostMemoryFile is implemented by Files whose contents are memory that the
 // Sentry shares with another host process, such as a GPU renderer, which must
 // see the application's writes at once, as the application must see its. A

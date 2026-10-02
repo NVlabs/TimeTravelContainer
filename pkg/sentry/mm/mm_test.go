@@ -63,10 +63,12 @@ func (mm *MemoryManager) realUsageAS() uint64 {
 
 func cloneMemoryManagerMetadata(ctx context.Context, src *MemoryManager) (*MemoryManager, error) {
 	const snapshotKey = 1
-	snapshots := LiveForkPMASnapshots{
-		snapshotKey: src.PrepareLiveForkSnapshot(snapshotKey),
-	}
+	snapshot, err := src.PrepareLiveForkSnapshot(snapshotKey)
 	defer src.ClearLiveForkPMASnapshot()
+	if err != nil {
+		return nil, err
+	}
+	snapshots := LiveForkPMASnapshots{snapshotKey: snapshot}
 	src.mf.MarkSavable()
 
 	var metadata bytes.Buffer
@@ -299,8 +301,12 @@ func TestLiveForkRemoteMemoryClone(t *testing.T) {
 	}
 
 	const snapshotKey = 1
-	pmaSnapshots := LiveForkPMASnapshots{snapshotKey: parent.PrepareLiveForkSnapshot(snapshotKey)}
+	pmaSnapshot, err := parent.PrepareLiveForkSnapshot(snapshotKey)
 	defer parent.ClearLiveForkPMASnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pmaSnapshots := LiveForkPMASnapshots{snapshotKey: pmaSnapshot}
 	parent.mf.MarkSavable()
 	var metadata bytes.Buffer
 	if _, err := state.Save(ctx, &metadata, parent); err != nil {
@@ -480,8 +486,11 @@ func TestLiveForkSourceCOWEmitsRemotePushHint(t *testing.T) {
 	if _, err := parent.CopyOut(ctx, addr, []byte{1}, usermem.IOOpts{}); err != nil {
 		t.Fatal(err)
 	}
-	parent.PrepareLiveForkSnapshot(1)
+	_, err = parent.PrepareLiveForkSnapshot(1)
 	defer parent.ClearLiveForkPMASnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
 	pseg := parent.pmas.FindSegment(addr)
 	if !pseg.Ok() {
 		t.Fatal("parent PMA missing")

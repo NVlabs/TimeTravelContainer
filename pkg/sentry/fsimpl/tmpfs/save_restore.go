@@ -121,7 +121,11 @@ func (fs *filesystem) PrepareSave(ctx context.Context) error {
 		share := memmap.IsLiveForkInProcess(ctx)
 		var kept []*regularFile
 		for _, file := range files {
-			if file.prepareLiveFork(share) {
+			keep, err := file.prepareLiveFork(share)
+			if err != nil {
+				return err
+			}
+			if keep {
 				kept = append(kept, file)
 			}
 		}
@@ -219,6 +223,17 @@ func (fs *filesystem) BeforeResume(ctx context.Context) {
 	if resource, filtered := vfs.LiveForkFilesystemResourceFromContext(ctx); filtered &&
 		(fs.diskVolume == nil || fs.diskVolume.ResourceID != resource) {
 		return
+	}
+	if fs.diskVolume == nil {
+		fs.liveForkMu.Lock()
+		files := make([]*regularFile, 0, len(fs.liveForkFiles))
+		for file := range fs.liveForkFiles {
+			files = append(files, file)
+		}
+		fs.liveForkMu.Unlock()
+		for _, file := range files {
+			file.releaseLiveForkCopies()
+		}
 	}
 	fs.restoreDiskNamespaceAfterSave()
 }

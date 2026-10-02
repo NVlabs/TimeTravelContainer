@@ -86,6 +86,12 @@ type regularFile struct {
 	// Protected by dataMu.
 	cow fsutil.FileRangeSet
 
+	// forkCopies maps, while a live fork's children load, logical file
+	// ranges whose data devices' DMA uses, which the file keeps, to copies,
+	// which the children take instead. It owns a reference on each copy.
+	// Protected by dataMu.
+	forkCopies fsutil.FileRangeSet
+
 	// seals represents file seals on this inode.
 	//
 	// Protected by dataMu.
@@ -209,6 +215,16 @@ func (rf *regularFile) afterLoad(ctx goContext.Context) {
 	if err := fsutil.RelocateFileRangeSet(ctx, rf.inode.fs.mf, &rf.cow); err != nil {
 		panic(fmt.Sprintf("relocating tmpfs file CoW metadata: %v", err))
 	}
+	// A live fork's child takes copies of the pages that devices' DMA uses
+	// in its source, which keeps them (see prepareLiveFork).
+	for seg := rf.forkCopies.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+		dataSeg := rf.data.FindSegment(seg.Start())
+		if !dataSeg.Ok() || !dataSeg.Range().IsSupersetOf(seg.Range()) {
+			panic(fmt.Sprintf("tmpfs live-fork copy of %v has no data segment", seg.Range()))
+		}
+		rf.data.Isolate(dataSeg, seg.Range()).SetValue(seg.Value())
+	}
+	rf.forkCopies.RemoveAll()
 	if rf.inode.fs.diskVolume != nil {
 		rf.diskMap = nil
 		rf.diskObject = ""
@@ -248,11 +264,13 @@ func (rf *regularFile) afterLoad(ctx goContext.Context) {
 // the fork, to map the object that it has then.
 //
 // A file of the Sentry's memory makes its translations fault again, and
-// marks every present page as shared with the child, which a write copies.
-// Private PMAs must be preserved: they contain application-owned
-// modifications, such as dynamic linker relocations, that are no longer
-// represented by the tmpfs file.
-func (rf *regularFile) prepareLiveFork(share bool) bool {
+// marks every present page as shared with the child, which a write copies,
+// but for pages that devices' DMA uses, which the file keeps: if share is
+// set, the fork's children in the process take copies of those, until
+// releaseLiveForkCopies. Private PMAs must be preserved: they contain
+// application-owned modifications, such as dynamic linker relocations, that
+// are no longer represented by the tmpfs file.
+func (rf *regularFile) prepareLiveFork(share bool) (bool, error) {
 	rf.mapsMu.Lock()
 	defer rf.mapsMu.Unlock()
 	if rf.inode.fs.diskVolume != nil {
@@ -269,7 +287,7 @@ func (rf *regularFile) prepareLiveFork(share bool) bool {
 			rf.diskMapMu.Unlock()
 			// A fork's child maps what its parent's translations do, without
 			// a mapping of its own.
-			return rf.diskMap != nil || !rf.mappings.IsEmpty()
+			return rf.diskMap != nil || !rf.mappings.IsEmpty(), nil
 		}
 		// A mapping of the branch's object would write the sealed object, or
 		// its translations could not leave the Sentry's process. The mapping
@@ -277,16 +295,77 @@ func (rf *regularFile) prepareLiveFork(share bool) bool {
 		rf.releaseDiskMapLocked()
 		rf.diskMapMu.Unlock()
 		rf.mappings.InvalidateAll(memmap.InvalidateOpts{})
-		return false
+		return false, nil
 	}
 	rf.mappings.InvalidateAll(memmap.InvalidateOpts{})
 	rf.dataMu.Lock()
+	defer rf.dataMu.Unlock()
 	rf.cow.RemoveAll()
+	mf := rf.inode.fs.mf
+	dmaPinned := mf.AnyDMAPinned()
 	for seg := rf.data.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+		if dmaPinned && mf.DMAPinned(seg.FileRange()) {
+			// A device's DMA uses the pages, which a copy on write would
+			// take from the file (see pgalloc.MemoryFile.PinForDMA): the
+			// file keeps them, and the fork's children get a copy.
+			if share {
+				copied, err := rf.copyForLiveForkLocked(seg.FileRange())
+				if err != nil {
+					return false, fmt.Errorf("copying %d bytes that a device's DMA uses for a live fork: %w", seg.Range().Length(), err)
+				}
+				rf.forkCopies.Insert(rf.forkCopies.FindGap(seg.Start()), seg.Range(), copied.Start)
+			}
+			continue
+		}
 		rf.cow.Insert(rf.cow.FindGap(seg.Start()), seg.Range(), seg.Value())
 	}
-	rf.dataMu.Unlock()
-	return false
+	return false, nil
+}
+
+// copyForLiveForkLocked returns a copy of the file's data at fr, of the
+// file's MemoryFile, which holds a reference on it.
+//
+// Preconditions: rf.dataMu is locked for writing.
+func (rf *regularFile) copyForLiveForkLocked(fr memmap.FileRange) (memmap.FileRange, error) {
+	mf := rf.inode.fs.mf
+	copied, err := mf.Allocate(fr.Length(), pgalloc.AllocOpts{
+		Kind: rf.memoryUsageKind,
+		Mode: pgalloc.AllocateAndWritePopulate,
+	})
+	if err != nil {
+		return memmap.FileRange{}, err
+	}
+	mappings, lease, err := memmap.MapInternalBatchWithLease(mf, []memmap.InternalMappingRequest{
+		{Range: fr, Access: hostarch.Read},
+		{Range: copied, Access: hostarch.Write},
+	})
+	if err != nil {
+		mf.DecRef(copied)
+		return memmap.FileRange{}, err
+	}
+	n, err := safemem.CopySeq(mappings[1], mappings[0])
+	if lease != nil {
+		lease.Release()
+	}
+	if err == nil && n != fr.Length() {
+		err = io.ErrUnexpectedEOF
+	}
+	if err != nil {
+		mf.DecRef(copied)
+		return memmap.FileRange{}, err
+	}
+	return copied, nil
+}
+
+// releaseLiveForkCopies releases the copies that prepareLiveFork made for a
+// fork's children, which hold their own references on them once they loaded.
+func (rf *regularFile) releaseLiveForkCopies() {
+	rf.dataMu.Lock()
+	defer rf.dataMu.Unlock()
+	for seg := rf.forkCopies.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+		rf.inode.fs.mf.DecRef(seg.FileRange())
+	}
+	rf.forkCopies.RemoveAll()
 }
 
 // diskTranslationLocked returns the mapping of the file's volume object that

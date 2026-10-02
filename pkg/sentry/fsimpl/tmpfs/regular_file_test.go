@@ -47,6 +47,17 @@ type lockDetectingIO struct {
 	mu stdsync.RWMutex
 }
 
+// mustPrepareLiveFork returns rf.prepareLiveFork(share), and fails t if it
+// fails.
+func mustPrepareLiveFork(t *testing.T, rf *regularFile, share bool) bool {
+	t.Helper()
+	keep, err := rf.prepareLiveFork(share)
+	if err != nil {
+		t.Fatalf("preparing a file for a live fork: %v", err)
+	}
+	return keep
+}
+
 func (i *lockDetectingIO) CopyIn(ctx context.Context, addr hostarch.Addr, dst []byte, opts usermem.IOOpts) (int, error) {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
@@ -124,7 +135,7 @@ func TestPrepareLiveForkPreservesPrivatePMAs(t *testing.T) {
 	}
 	defer rf.RemoveMapping(ctx, ms, ar, 0, true)
 
-	rf.prepareLiveFork(true /* share */)
+	mustPrepareLiveFork(t, rf, true /* share */)
 	if !ms.invalidated {
 		t.Fatal("prepareLiveFork did not invalidate file-backed translations")
 	}
@@ -186,7 +197,7 @@ func TestLiveForkPWriteFromSameMemoryManagerDoesNotReenterActiveLock(t *testing.
 		t.Fatalf("AddMapping: %v", err)
 	}
 	defer rf.RemoveMapping(ctx, ms, ar, 0, true)
-	rf.prepareLiveFork(true /* share */)
+	mustPrepareLiveFork(t, rf, true /* share */)
 	ms.invalidated = false
 
 	src := usermem.IOSequence{
@@ -225,7 +236,7 @@ func TestLiveForkCopyOnWriteSkipsAdjacentRange(t *testing.T) {
 		t.Fatalf("initial PWrite: n=%d err=%v", n, err)
 	}
 	rf := fd.Impl().(*regularFileFD).inode().impl.(*regularFile)
-	rf.prepareLiveFork(true /* share */)
+	mustPrepareLiveFork(t, rf, true /* share */)
 
 	// Leave a CoW range that ends exactly where the requested translation
 	// starts. FileRangeSet.LowerBoundSegment may return that preceding segment,
@@ -253,7 +264,7 @@ func TestLiveForkCopyOnWriteRemovesFinalRange(t *testing.T) {
 		t.Fatalf("initial PWrite: n=%d err=%v", n, err)
 	}
 	rf := fd.Impl().(*regularFileFD).inode().impl.(*regularFile)
-	rf.prepareLiveFork(true /* share */)
+	mustPrepareLiveFork(t, rf, true /* share */)
 
 	rf.dataMu.Lock()
 	err = rf.copyOnWriteLocked(ctx, memmap.MappableRange{Start: 0, End: hostarch.PageSize})
@@ -578,13 +589,13 @@ func TestDiskVolumeLiveForkKeepsInheritedTranslationsTracked(t *testing.T) {
 	// a mapping of the file's object of its own.
 	rf.mappings.AddMapping(ms, ar, 0, false)
 	rf.afterLoad(ctx)
-	if !rf.prepareLiveFork(true /* share */) {
+	if !mustPrepareLiveFork(t, rf, true /* share */) {
 		t.Fatal("an in-process fork stopped tracking the child's inherited translations")
 	}
 	if ms.invalidated {
 		t.Fatal("an in-process fork invalidated translations of a sealed object")
 	}
-	if rf.prepareLiveFork(false /* share */) {
+	if mustPrepareLiveFork(t, rf, false /* share */) {
 		t.Fatal("a fork that leaves the process kept the file's translations")
 	}
 	if !ms.invalidated {

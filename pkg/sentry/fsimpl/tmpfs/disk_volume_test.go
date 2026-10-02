@@ -317,7 +317,7 @@ func TestPrepareLiveForkClosesDiskMmapObject(t *testing.T) {
 	}
 
 	// A fork that leaves the process.
-	if file.prepareLiveFork(false /* share */) {
+	if mustPrepareLiveFork(t, file, false /* share */) {
 		t.Fatal("prepareLiveFork kept the file's mapping")
 	}
 	if file.diskMap != nil {
@@ -737,7 +737,7 @@ func TestLiveForkSharesSealedDiskMappings(t *testing.T) {
 
 	// An in-process fork keeps the translations of a file that nothing maps
 	// writable: what they map, the fork seals.
-	if !parent.prepareLiveFork(true /* share */) {
+	if !mustPrepareLiveFork(t, parent, true /* share */) {
 		t.Fatal("prepareLiveFork did not keep the file's mapping")
 	}
 	if ms.invalidated {
@@ -796,7 +796,7 @@ func TestDiskVolumeWritableMappingAfterForkCopies(t *testing.T) {
 		t.Fatalf("AddMapping: %v", err)
 	}
 	sealed := translatePage(t, parent, hostarch.Read)
-	parent.prepareLiveFork(true /* share */)
+	mustPrepareLiveFork(t, parent, true /* share */)
 	if err := repository.Fork(ttcvolume.MainBranch, "child"); err != nil {
 		t.Fatalf("Fork: %v", err)
 	}

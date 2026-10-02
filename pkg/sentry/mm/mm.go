@@ -135,6 +135,11 @@ type MemoryManager struct {
 	// Placing it before pmas ensures it is available to loadPmas.
 	liveForkPMAKey uint64
 
+	// liveForkCopies are the copies of pages that devices' DMA uses, which
+	// the in-memory PMA metadata snapshot gives a live fork's children. The
+	// snapshot holds a reference on them until ClearLiveForkPMASnapshot.
+	liveForkCopies []memmap.FileRange `state:"nosave"`
+
 	// pmas stores platform mapping areas used to implement vmas. Since pmas
 	// are stored by value, clients should usually use pmaIterator.ValuePtr()
 	// instead of pmaIterator.Value() to get a pointer to the pma rather than

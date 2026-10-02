@@ -161,15 +161,23 @@ func (mm *MemoryManager) afterLoad(ctx goContext.Context) {
 
 // savePmas is invoked by stateify. Live fork keeps PMA metadata in an
 // in-memory snapshot rather than reflecting every resident range through the
-// generic wire encoder. Durable checkpoints retain the normal representation.
+// generic wire encoder. Durable checkpoints retain the normal representation,
+// but for PMAs of devices' memory, which what loads them does not map (see
+// memmap.LiveForkUnsharedFile).
 func (mm *MemoryManager) savePmas() []pmaFlatSegment {
 	if mm.liveForkPMAKey != 0 {
 		return nil
 	}
 	saved := mm.pmas.ExportSlice()
+	kept := saved[:0]
+	for _, seg := range saved {
+		if _, ok := seg.Value.file.(memmap.LiveForkUnsharedFile); !ok {
+			kept = append(kept, seg)
+		}
+	}
 	// State serialization preserves slice capacity. Prevent unused capacity
 	// from being encoded as zero-valued PMA segments.
-	return saved[:len(saved):len(saved)]
+	return kept[:len(kept):len(kept)]
 }
 
 // CaptureMemoryFileRanges records the MemoryFile ranges directly referenced
@@ -207,6 +215,10 @@ func (mm *MemoryManager) CaptureMemoryFileRanges(capture *pgalloc.MemoryRangeCap
 	mm.activeMu.RLock()
 	defer mm.activeMu.RUnlock()
 	for pseg := mm.pmas.FirstSegment(); pseg.Ok(); pseg = pseg.NextSegment() {
+		if _, ok := pseg.ValuePtr().file.(memmap.LiveForkUnsharedFile); ok {
+			// savePmas leaves it out.
+			continue
+		}
 		mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile)
 		if !ok {
 			return fmt.Errorf("serializable PMA %v is backed by unsupported file %T", pseg.Range(), pseg.ValuePtr().file)

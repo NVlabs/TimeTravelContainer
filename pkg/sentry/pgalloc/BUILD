@@ -196,6 +196,7 @@ go_library(
         "apl_unloaded_set.go",
         "context.go",
         "debug.go",
+        "dma_pin.go",
         "evictable_range.go",
         "evictable_range_set.go",
         "host_ops_darwin.go",
