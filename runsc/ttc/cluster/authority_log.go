@@ -345,7 +345,8 @@ func (l *authorityLog) startSegment() error {
 	if err != nil {
 		return err
 	}
-	if _, err := file.Write(authoritySegmentHeaderBytes(l.epoch, l.next)); err == nil {
+	_, err = file.Write(authoritySegmentHeaderBytes(l.epoch, l.next))
+	if err == nil {
 		err = file.Sync()
 	}
 	if err == nil {
