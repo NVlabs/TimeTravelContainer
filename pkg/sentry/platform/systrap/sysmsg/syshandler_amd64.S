@@ -236,13 +236,23 @@ asm_restore_state_guest_gs:
   movq %rdi, %rcx
   restore_fpstate
 
-  movq offsetof_thread_context_ptregs_rsp(%rcx), %rax
-  push %rax
-  movq offsetof_thread_context_ptregs_eflags(%rcx), %rbx
-  push %rbx
+  // The context need not be returning from a system call: switch_context
+  // gives this stub thread whichever context is ready, one that stopped at a
+  // fault or an interrupt as well, and a stub thread that entered this handler
+  // before its address space disabled patching resumes contexts from here
+  // until it leaves. Every register, RCX and R11 among them, is therefore
+  // restored as the context has it, and IRETQ, from a frame on this stack,
+  // restores RIP, RFLAGS and RSP at once, which leaves no register to hold the
+  // return address. CS and SS are the stub's, which are the application's.
+  xorl %eax, %eax
+  movw %ss, %ax
+  pushq %rax
+  pushq offsetof_thread_context_ptregs_rsp(%rcx)
+  pushq offsetof_thread_context_ptregs_eflags(%rcx)
+  movw %cs, %ax
+  pushq %rax
+  pushq offsetof_thread_context_ptregs_rip(%rcx)
 
-  // Restore all registers except RCX. A native syscall leaves RCX containing
-  // its return address, so use it for the final jump as well.
   movq offsetof_thread_context_ptregs_r15(%rcx), %r15
   movq offsetof_thread_context_ptregs_r14(%rcx), %r14
   movq offsetof_thread_context_ptregs_r13(%rcx), %r13
@@ -257,10 +267,8 @@ asm_restore_state_guest_gs:
   movq offsetof_thread_context_ptregs_rdx(%rcx), %rdx
   movq offsetof_thread_context_ptregs_rsi(%rcx), %rsi
   movq offsetof_thread_context_ptregs_rdi(%rcx), %rdi
-  movq offsetof_thread_context_ptregs_rip(%rcx), %rcx
+  movq offsetof_thread_context_ptregs_rcx(%rcx), %rcx
 
-  popfq
-  movq 0(%rsp), %rsp
-  jmp *%rcx
+  iretq
 
 .size __export_syshandler, . - __export_syshandler

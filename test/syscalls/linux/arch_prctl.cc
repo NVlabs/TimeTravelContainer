@@ -18,7 +18,16 @@
  */
 
 #include <asm/prctl.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <thread>  // NOLINT
+#include <vector>
 
 #include "gtest/gtest.h"
 #include "test/util/test_util.h"
@@ -71,6 +80,109 @@ TEST(ArchPrctlTest, GetSetGS) {
   EXPECT_EQ(current, reinterpret_cast<uintptr_t>(&value));
 
   ASSERT_THAT(arch_prctl(ARCH_SET_GS, orig), SyscallSucceeds());
+}
+
+// PatchableGetppid calls getppid with the instruction sequence that systrap
+// patches: mov $SYS_getppid, %eax; syscall.
+long PatchableGetppid() {
+  long ret;
+  asm volatile("mov %1, %%eax\n\tsyscall"
+               : "=a"(ret)
+               : "i"(SYS_getppid)
+               : "rcx", "r11", "memory");
+  return ret;
+}
+
+// GSRound has threads make patched system calls, sets GS, which ends systrap's
+// syscall patching for the address space, and has some of the threads then
+// take a page fault at each of many pages with an index in RCX. It returns 0
+// if every fault left RCX and R11 as they were.
+int GSRound() {
+  constexpr int kWorkers = 16;
+  constexpr int kVictims = 8;
+  constexpr int kPages = 2000;
+  std::atomic<int> phase(0);
+  std::atomic<int> result(0);
+  std::vector<std::thread> threads;
+  for (int i = 0; i < kWorkers; i++) {
+    threads.emplace_back([&] {
+      while (phase.load() == 0) {
+        PatchableGetppid();
+      }
+    });
+  }
+  for (int i = 0; i < kVictims; i++) {
+    threads.emplace_back([&] {
+      while (phase.load() == 0) {
+        PatchableGetppid();
+      }
+      const size_t len = kPages * kPageSize;
+      char* base = static_cast<char*>(mmap(nullptr, len, PROT_READ | PROT_WRITE,
+                                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+      if (base == MAP_FAILED) {
+        result.store(2);
+        return;
+      }
+      for (int p = 0; p < kPages; p++) {
+        uint64_t rcx, r11;
+        // The first write to each page faults, and is retried with the
+        // registers that the thread resumes with.
+        asm volatile(
+            "xor %%ecx, %%ecx\n\t"
+            "mov $0x1234, %%r11d\n\t"
+            "movb $1, (%[page],%%rcx,1)\n\t"
+            "mov %%rcx, %[rcx]\n\t"
+            "mov %%r11, %[r11]\n\t"
+            : [rcx] "=r"(rcx), [r11] "=r"(r11)
+            : [page] "r"(base + p * kPageSize)
+            : "rcx", "r11", "memory");
+        if (rcx != 0 || r11 != 0x1234) {
+          result.store(1);
+          break;
+        }
+      }
+      munmap(base, len);
+    });
+  }
+  struct timespec ts = {.tv_sec = 0, .tv_nsec = 100 * 1000 * 1000};
+  nanosleep(&ts, nullptr);
+  uint64_t value = 0;
+  if (arch_prctl(ARCH_SET_GS, reinterpret_cast<uintptr_t>(&value)) != 0) {
+    result.store(3);
+  }
+  phase.store(1);
+  for (auto& t : threads) {
+    t.join();
+  }
+  return result.load();
+}
+
+// A thread that owns GS resumes from a fault with its registers intact while
+// other threads make system calls that systrap patches. A systrap stub thread
+// that entered the fast system call handler before GS was set resumes
+// whichever context is ready, not only one that returns from a system call.
+TEST(ArchPrctlTest, GSOwnerRegistersSurviveFaults) {
+  uintptr_t orig;
+  if (arch_prctl(ARCH_GET_GS, reinterpret_cast<uintptr_t>(&orig)) == -1 &&
+      errno == EINVAL) {
+    GTEST_SKIP() << "execution platform reserves GS";
+  }
+  // Each round sets GS in a child of its own, whose address space has syscall
+  // patching enabled until then. A round finds the race often, not always.
+  // The test finds nothing in a process that set GS before it, as
+  // GetSetGS does, whose children have no patching to end.
+  for (int round = 0; round < 20; round++) {
+    pid_t pid = fork();
+    if (pid == 0) {
+      _exit(GSRound());
+    }
+    ASSERT_THAT(pid, SyscallSucceeds());
+    int status;
+    ASSERT_THAT(RetryEINTR(waitpid)(pid, &status, 0),
+                SyscallSucceedsWithValue(pid));
+    ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+        << "round " << round << ": status " << status;
+  }
 }
 
 }  // namespace
