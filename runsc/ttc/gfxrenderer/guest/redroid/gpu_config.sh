@@ -7,17 +7,11 @@
 # allocates buffers on the GPU's virtio-gpu render node, the renderer's
 # Vulkan driver drives it, and the image's ANGLE implements OpenGL ES on the
 # driver. The driver is Mesa's Venus driver (build_mesa_venus_android.sh),
-# /vendor/lib64/hw/vulkan.virtio.so, for TTC's Venus renderer, or else
-# gfxstream's (build_mesa_gfxstream_android.sh),
-# /vendor/lib64/hw/vulkan.gfxstream.so.
+# /vendor/lib64/hw/vulkan.virtio.so.
 echo "use TTC's virtual GPU"
 chmod 666 /dev/dri/renderD128
 setprop ro.hardware.gralloc cros
-if [ -e /vendor/lib64/hw/vulkan.virtio.so ]; then
-    setprop ro.hardware.vulkan virtio
-else
-    setprop ro.hardware.vulkan gfxstream
-fi
+setprop ro.hardware.vulkan virtio
 setprop ro.hardware.egl angle
 
 # Video encoding, which screen mirroring such as scrcpy's uses: redroid turns

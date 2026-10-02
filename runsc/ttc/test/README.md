@@ -138,7 +138,7 @@ TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
 
 *   the refusal of `--gfx` without fork semantics;
 *   the render node and its sysfs entries, and `vulkaninfo`, which must find
-    the GPU once although Debian's Mesa brings a gfxstream driver of its own;
+    the GPU once although Debian's Mesa brings a Venus driver of its own;
 *   repeated offscreen compute and render runs, whose every pixel
     `gfx/vkoffscreen.c` checks;
 *   OpenGL ES on EGL's surfaceless platform, which must render by Zink on the
@@ -147,16 +147,15 @@ TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
 *   a live fork with `--gfx-fork=device-lost` while the guest renders. In the
     child, the process that was rendering must die of `SIGBUS`, not hang, and
     a new one must render. The source must render on;
-*   two branches rendering at once, each with its own renderer, and no
+*   two branches rendering at once, with their family's renderer, and no
     renderer left once nothing uses the GPU;
-*   a live fork of a family with `--gfx-fork=snapshot` while the guest
-    renders with Vulkan and OpenGL ES: both the source's and the child's
-    render loops must finish, every frame checked, the child's on a renderer
-    restored from the source's snapshot.
+*   live forks of a family with `--gfx-fork=snapshot` while the guest
+    renders with Vulkan and OpenGL ES: a child, two children at once, and a
+    child's child. Every branch's render loops must finish, every frame
+    checked, the children's on clones of their parents' GPU state.
 
-It needs `ttc-gfx-renderer`, gfxstream's host library, and Mesa's gfxstream
-Vulkan driver for the guest (see `runsc/ttc/gfxrenderer/README.md`), and the
-network. The daemon runs with host isolation unless
+It needs `ttc-gfx-renderer`, Mesa's Venus Vulkan driver for the guest (see
+`runsc/ttc/gfxrenderer/README.md`), and the network. The daemon runs with host isolation unless
 `TTC_UNSAFE_NO_HOST_ISOLATION=1`; on macOS the test then checks that the
 renderers confine themselves.
 
@@ -166,13 +165,12 @@ bazel build //runsc/ttc:ttc //runsc/ttcd:ttcd //runsc/ttcgfx:ttc-gfx-renderer
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
 TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
 TTC_GFX_RENDERER="$PWD/bazel-bin/runsc/ttcgfx/ttc-gfx-renderer_/ttc-gfx-renderer" \
-TTC_GFXSTREAM_LIBRARY=/path/to/libgfxstream_backend.dylib \
-TTC_GFX_GUEST_DRIVER=/path/to/dir/of/libvulkan_gfxstream.so \
+TTC_GFX_GUEST_DRIVER=/path/to/dir/of/libvulkan_virtio.so \
   "$PWD/runsc/ttc/test/e2e_gfx.sh"
 ```
 
 `e2e_redroid.sh` boots Android with the virtual GPU: redroid's arm64 image,
-whose init is the container's, with gfxstream's Vulkan driver for Android
+whose init is the container's, with Mesa's Venus Vulkan driver for Android
 and `runsc/ttc/gfxrenderer/guest/redroid/gpu_config.sh`, in a family with
 `--gfx-fork=snapshot`. It checks that SurfaceFlinger composes with ANGLE on
 the GPU, that Android's network comes up on `eth0` and validates on the
@@ -182,12 +180,11 @@ forks Android live, and checks that both branches run on, with the same
 framework, and that Settings renders in the child. The screens and the
 recording are left in `out/` of `TTC_E2E_ROOT`, when that is set. Besides
 what `e2e_gfx.sh` needs, it needs the driver that
-`runsc/ttc/gfxrenderer/guest/build_mesa_gfxstream_android.sh` builds:
+`runsc/ttc/gfxrenderer/guest/build_mesa_venus_android.sh` builds:
 
 ```shell
-TTC=... TTCD=... TTC_GFX_RENDERER=... TTC_GFXSTREAM_LIBRARY=... \
-TTC_GFX_GUEST_DRIVER=... \
-ANDROID_GFX_DRIVER=/path/to/vulkan.gfxstream.so \
+TTC=... TTCD=... TTC_GFX_RENDERER=... TTC_GFX_GUEST_DRIVER=... \
+ANDROID_GFX_DRIVER=/path/to/vulkan.virtio.so \
 APK=/path/to/app.apk \
   "$PWD/runsc/ttc/test/e2e_redroid.sh"
 ```

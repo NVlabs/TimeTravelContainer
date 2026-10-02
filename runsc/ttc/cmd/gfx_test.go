@@ -13,23 +13,12 @@ import (
 	"testing"
 
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
-	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer"
 )
 
 func TestGFXGuestEdits(t *testing.T) {
-	for _, backend := range []string{gfxrenderer.BackendGfxstream, gfxrenderer.BackendVenus} {
-		t.Run(backend, func(t *testing.T) {
-			testGFXGuestEdits(t, backend)
-		})
-	}
-}
-
-func testGFXGuestEdits(t *testing.T, backend string) {
-	t.Setenv("TTC_GFX_BACKEND", backend)
-	d := gfxGuestDrivers[backend]
-	driverPath := filepath.Join(gfxGuestDriverDir, d.name)
+	driverPath := filepath.Join(gfxGuestDriverDir, gfxGuestDriverName)
 	driverDir := t.TempDir()
-	driver := filepath.Join(driverDir, d.name)
+	driver := filepath.Join(driverDir, gfxGuestDriverName)
 	if err := os.WriteFile(driver, []byte("driver"), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -47,8 +36,8 @@ func testGFXGuestEdits(t *testing.T, backend string) {
 		if err != nil {
 			t.Fatalf("guestEdits: %v", err)
 		}
-		if !slices.Equal(env, d.env) {
-			t.Errorf("env = %q, want %q", env, d.env)
+		if !slices.Equal(env, gfxGuestDriverEnv) {
+			t.Errorf("env = %q, want %q", env, gfxGuestDriverEnv)
 		}
 		sources := make(map[string]string)
 		for _, m := range mounts {
@@ -62,7 +51,7 @@ func testGFXGuestEdits(t *testing.T, backend string) {
 				LibraryPath string `json:"library_path"`
 			}
 		}
-		content, err := os.ReadFile(sources[d.manifest])
+		content, err := os.ReadFile(sources[gfxGuestDriverManifest])
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -73,7 +62,7 @@ func testGFXGuestEdits(t *testing.T, backend string) {
 		if err != nil || !bytes.Equal(content, []byte(gfxGuestDriconf)) {
 			t.Errorf("OpenGL configuration %q, %v", content, err)
 		}
-		for _, source := range []string{sources[d.manifest], sources[gfxGuestDriconfPath]} {
+		for _, source := range []string{sources[gfxGuestDriverManifest], sources[gfxGuestDriconfPath]} {
 			if info, err := os.Stat(source); err != nil || info.Mode().Perm() != 0444 {
 				t.Errorf("stat %s: %v, %v; want mode 0444", source, info, err)
 			}
@@ -92,7 +81,7 @@ func testGFXGuestEdits(t *testing.T, backend string) {
 
 func TestGFXGuestEditsWithoutZink(t *testing.T) {
 	driverDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(driverDir, gfxGuestDrivers[gfxBackend()].name), []byte("driver"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(driverDir, gfxGuestDriverName), []byte("driver"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("TTC_GFX_GUEST_DRIVER", driverDir)

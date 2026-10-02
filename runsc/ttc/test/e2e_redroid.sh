@@ -12,11 +12,9 @@
 # the child restores, runs on in both branches.
 #
 # It needs what runsc/ttc/test/e2e_gfx.sh needs (TTC, TTCD,
-# TTC_GFX_RENDERER, TTC_GFX_BACKEND, TTC_GFXSTREAM_LIBRARY for gfxstream,
-# TTC_GFX_GUEST_DRIVER), and:
-#   ANDROID_GFX_DRIVER, the backend's Vulkan driver for Android: Mesa's Venus
-#     driver (runsc/ttc/gfxrenderer/guest/build_mesa_venus_android.sh), or
-#     gfxstream's (build_mesa_gfxstream_android.sh);
+# TTC_GFX_RENDERER, TTC_GFX_GUEST_DRIVER), and:
+#   ANDROID_GFX_DRIVER, Mesa's Venus Vulkan driver for Android
+#     (runsc/ttc/gfxrenderer/guest/build_mesa_venus_android.sh);
 #   REDROID_IMAGE, an arm64 redroid image (default
 #     redroid/redroid:14.0.0_64only-latest), which the daemon pulls;
 #   optionally APK, an app to install and launch.
@@ -27,8 +25,6 @@ set -eu
 TTC=${TTC:-}
 TTCD=${TTCD:-}
 TTC_GFX_RENDERER=${TTC_GFX_RENDERER:-}
-TTC_GFX_BACKEND=${TTC_GFX_BACKEND:-gfxstream}
-TTC_GFXSTREAM_LIBRARY=${TTC_GFXSTREAM_LIBRARY:-}
 TTC_GFX_GUEST_DRIVER=${TTC_GFX_GUEST_DRIVER:-}
 ANDROID_GFX_DRIVER=${ANDROID_GFX_DRIVER:-}
 REDROID_IMAGE=${REDROID_IMAGE:-redroid/redroid:14.0.0_64only-latest}
@@ -46,24 +42,13 @@ fail() {
 [ -x "$TTC" ] || fail "set TTC to the ttc binary"
 [ -x "$TTCD" ] || fail "set TTCD to the matching ttcd binary"
 [ -x "$TTC_GFX_RENDERER" ] || fail "set TTC_GFX_RENDERER to ttc-gfx-renderer"
-case "$TTC_GFX_BACKEND" in
-  venus)
-    GUEST_DRIVER=libvulkan_virtio.so
-    ANDROID_DRIVER=vulkan.virtio.so
-    DEVICE="Virtio-GPU Venus"
-    ;;
-  gfxstream)
-    GUEST_DRIVER=libvulkan_gfxstream.so
-    ANDROID_DRIVER=vulkan.gfxstream.so
-    DEVICE="Virtio-GPU GFXStream"
-    [ -f "$TTC_GFXSTREAM_LIBRARY" ] || fail "set TTC_GFXSTREAM_LIBRARY to gfxstream's host library"
-    ;;
-  *) fail "unknown TTC_GFX_BACKEND $TTC_GFX_BACKEND" ;;
-esac
+GUEST_DRIVER=libvulkan_virtio.so
+ANDROID_DRIVER=vulkan.virtio.so
+DEVICE="Virtio-GPU Venus"
 [ -f "$TTC_GFX_GUEST_DRIVER/$GUEST_DRIVER" ] ||
   fail "set TTC_GFX_GUEST_DRIVER to a directory with Mesa's $GUEST_DRIVER"
 [ -f "$ANDROID_GFX_DRIVER" ] ||
-  fail "set ANDROID_GFX_DRIVER to the backend's Vulkan driver for Android"
+  fail "set ANDROID_GFX_DRIVER to Mesa's Venus driver for Android"
 [ -z "$APK" ] || [ -f "$APK" ] || fail "APK $APK does not exist"
 owned_root=false
 if [ -z "$TTC_E2E_ROOT" ]; then
@@ -89,7 +74,6 @@ if [ "$(uname -s)" = Darwin ]; then
   /usr/bin/codesign --force --sign - \
     --entitlements "$TEST_DIR/../../hvf.entitlements" "$BIN_DIR/ttcd" >/dev/null
 fi
-export TTC_GFX_BACKEND TTC_GFXSTREAM_LIBRARY
 install -m 0644 "$TTC_GFX_GUEST_DRIVER/$GUEST_DRIVER" "$DRIVER_DIR/"
 export TTC_GFX_GUEST_DRIVER="$DRIVER_DIR"
 

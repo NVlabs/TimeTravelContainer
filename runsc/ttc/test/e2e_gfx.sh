@@ -12,16 +12,12 @@
 # It needs:
 #   TTC and TTCD, the binaries;
 #   TTC_GFX_RENDERER, ttc-gfx-renderer;
-#   TTC_GFX_BACKEND, the renderer's backend: venus, TTC's renderer for
-#     Mesa's Venus driver, or gfxstream, the default, which needs
-#     TTC_GFXSTREAM_LIBRARY, gfxstream's host library (see
-#     runsc/ttc/gfxrenderer/README.md);
-#   TTC_GFX_GUEST_DRIVER, a directory with the backend's Mesa driver for the
-#     guest's architecture (runsc/ttc/gfxrenderer/guest/):
-#     libvulkan_virtio.so for venus, libvulkan_gfxstream.so for gfxstream;
+#   TTC_GFX_GUEST_DRIVER, a directory with Mesa's Venus driver,
+#     libvulkan_virtio.so, for the guest's architecture
+#     (runsc/ttc/gfxrenderer/guest/build_mesa_venus.sh);
 #   network access, to install vulkan-tools, Mesa, and a compiler in a
-#     Debian image. Debian's Mesa has Venus and gfxstream drivers of its own,
-#     which the daemon's containers skip.
+#     Debian image. Debian's Mesa has a Venus driver of its own, which the
+#     daemon's containers skip.
 #
 # The daemon runs with host isolation unless TTC_UNSAFE_NO_HOST_ISOLATION=1.
 # On macOS, it then starts renderers through a launcher, and each renderer
@@ -31,8 +27,6 @@ set -eu
 TTC=${TTC:-}
 TTCD=${TTCD:-}
 TTC_GFX_RENDERER=${TTC_GFX_RENDERER:-}
-TTC_GFX_BACKEND=${TTC_GFX_BACKEND:-gfxstream}
-TTC_GFXSTREAM_LIBRARY=${TTC_GFXSTREAM_LIBRARY:-}
 TTC_GFX_GUEST_DRIVER=${TTC_GFX_GUEST_DRIVER:-}
 TTC_E2E_ROOT=${TTC_E2E_ROOT:-}
 TTC_UNSAFE_NO_HOST_ISOLATION=${TTC_UNSAFE_NO_HOST_ISOLATION:-0}
@@ -50,18 +44,8 @@ fail() {
 [ -x "$TTC" ] || fail "set TTC to the ttc binary"
 [ -x "$TTCD" ] || fail "set TTCD to the matching ttcd binary"
 [ -x "$TTC_GFX_RENDERER" ] || fail "set TTC_GFX_RENDERER to ttc-gfx-renderer"
-case "$TTC_GFX_BACKEND" in
-  venus)
-    GUEST_DRIVER=libvulkan_virtio.so
-    DEVICE="Virtio-GPU Venus"
-    ;;
-  gfxstream)
-    GUEST_DRIVER=libvulkan_gfxstream.so
-    DEVICE="Virtio-GPU GFXStream"
-    [ -f "$TTC_GFXSTREAM_LIBRARY" ] || fail "set TTC_GFXSTREAM_LIBRARY to gfxstream's host library"
-    ;;
-  *) fail "unknown TTC_GFX_BACKEND $TTC_GFX_BACKEND" ;;
-esac
+GUEST_DRIVER=libvulkan_virtio.so
+DEVICE="Virtio-GPU Venus"
 [ -f "$TTC_GFX_GUEST_DRIVER/$GUEST_DRIVER" ] ||
   fail "set TTC_GFX_GUEST_DRIVER to a directory with Mesa's $GUEST_DRIVER"
 owned_root=false
@@ -92,7 +76,6 @@ if [ "$(uname -s)" = Darwin ]; then
   /usr/bin/codesign --force --sign - \
     --entitlements "$TEST_DIR/../../hvf.entitlements" "$BIN_DIR/ttcd" >/dev/null
 fi
-export TTC_GFX_BACKEND TTC_GFXSTREAM_LIBRARY
 # The daemon gives --gfx containers the guest's driver.
 install -m 0644 "$TTC_GFX_GUEST_DRIVER/$GUEST_DRIVER" "$DRIVER_DIR/"
 export TTC_GFX_GUEST_DRIVER="$DRIVER_DIR"
@@ -226,10 +209,8 @@ case "$source_log" in
   *) fail "the source's render loop: $source_log" ;;
 esac
 
-# Two new branches render at once, with a renderer each (gfxstream) or the
-# family's (Venus). Their resource IDs start alike, which once made
-# gfxstream's renderers share command rings through macOS's global shared
-# memory names.
+# Two new branches render at once, with the family's renderer, which keeps
+# their contexts and resources apart: their IDs start alike.
 ttc fork "$NAME@main" one two >/dev/null
 for branch in one two; do
   ttc exec -d "$NAME@$branch" sh -c \
@@ -253,7 +234,7 @@ wait_pair two "iteration 2 ok"
 # themselves. python3 asks the kernel's sandbox.
 if [ "$(uname -s)" = Darwin ] && [ "$TTC_UNSAFE_NO_HOST_ISOLATION" != 1 ] &&
   command -v python3 >/dev/null; then
-  renderers=$(pgrep -f "$BIN_DIR/ttc-gfx-renderer serve" || true)
+  renderers=$(pgrep -f "$BIN_DIR/ttc-gfx-renderer serve-family" || true)
   [ -n "$renderers" ] || fail "no renderer runs while two branches render"
   for pid in $renderers; do
     python3 -c '
@@ -275,9 +256,9 @@ done
 
 # Nothing uses the GPU now, so no renderer runs.
 deadline=$(($(date +%s) + 30))
-while pgrep -f "$BIN_DIR/ttc-gfx-renderer serve" >/dev/null; do
+while pgrep -f "$BIN_DIR/ttc-gfx-renderer serve-family" >/dev/null; do
   if [ "$(date +%s)" -ge "$deadline" ]; then
-    fail "renderers outlive their GPU's use: $(pgrep -fl "$BIN_DIR/ttc-gfx-renderer serve")"
+    fail "renderers outlive their GPU's use: $(pgrep -fl "$BIN_DIR/ttc-gfx-renderer serve-family")"
   fi
   sleep 0.5
 done
@@ -285,19 +266,12 @@ done
 ttc rm -f "$NAME" >/dev/null
 
 # A family with --gfx-fork=snapshot: a fork's child resumes the GPU's state,
-# in a renderer that restores the source's snapshot. gfxstream's snapshots
-# rebuild Vulkan objects and memory, but not the commands of recorded
-# command buffers, so its Vulkan render loop records them again each time;
-# Zink records its own for each draw. Venus's renderer clones the branch's
-# GPU, recorded command buffers too, so its loop records them once, and it
-# forks twice more: two children at once, and a child's child.
+# which the family's renderer clones, recorded command buffers too, so the
+# Vulkan render loop records them once; Zink records its own for each draw.
+# The family forks thrice: a child, two children at once, and a child's
+# child.
 SNAP="$NAME-snap"
-RERECORD=rerecord
-SNAP_BRANCHES=kid
-if [ "$TTC_GFX_BACKEND" = venus ]; then
-  RERECORD=
-  SNAP_BRANCHES="kid one two grandkid"
-fi
+SNAP_BRANCHES="kid one two grandkid"
 ttc run -d --name "$SNAP" --gfx --gfx-fork=snapshot --network ttc --nat \
   -v "$WORK_DIR:/work:ro" \
   "$DEBIAN_IMAGE" sleep infinity >/dev/null
@@ -308,7 +282,7 @@ ttc exec "$SNAP@main" sh -c '
     libegl1 libgles2 libegl-mesa0 libgl1-mesa-dri >/dev/null 2>&1
 ' || fail "preparing the snapshot family's container"
 ttc exec -d "$SNAP@main" sh -c \
-  "cd /work && ./vkoffscreen compute.spv square.spv red.spv 300 20 $RERECORD >/tmp/loop.log 2>&1
+  "cd /work && ./vkoffscreen compute.spv square.spv red.spv 300 20 >/tmp/loop.log 2>&1
    echo \"exit=\$?\" >>/tmp/loop.log" >/dev/null
 ttc exec -d -e "$ZINK" "$SNAP@main" sh -c \
   'cd /work && ./gloffscreen 300 20 >/tmp/gl.log 2>&1
@@ -316,12 +290,10 @@ ttc exec -d -e "$ZINK" "$SNAP@main" sh -c \
 wait_log "$SNAP@main" "iteration 3 ok" 60
 wait_log "$SNAP@main" "iteration 3 ok" 60 /tmp/gl.log
 ttc fork "$SNAP@main" kid >/dev/null
-if [ "$TTC_GFX_BACKEND" = venus ]; then
-  sleep 1
-  ttc fork "$SNAP@main" one two >/dev/null
-  sleep 1
-  ttc fork "$SNAP@one" grandkid >/dev/null
-fi
+sleep 1
+ttc fork "$SNAP@main" one two >/dev/null
+sleep 1
+ttc fork "$SNAP@one" grandkid >/dev/null
 for target in "$SNAP@main" $(for b in $SNAP_BRANCHES; do echo "$SNAP@$b"; done); do
   wait_log "$target" "^exit=" 180
   loop_log=$(ttc exec "$target" cat /tmp/loop.log)

@@ -19,7 +19,7 @@ import (
 // the broker then starts another.
 func TestFamilyRenderer(t *testing.T) {
 	t.Setenv(helperEnv, "1")
-	opts := &BrokerOptions{Renderer: os.Args[0], Options: Options{Backend: BackendVenus}, Stderr: os.Stderr}
+	opts := &BrokerOptions{Renderer: os.Args[0], Stderr: os.Stderr}
 	fd, family, err := connectFamilyRenderer(opts, nil)
 	if err != nil {
 		t.Fatalf("connecting to a family's renderer: %v", err)

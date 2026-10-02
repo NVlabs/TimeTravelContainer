@@ -1,10 +1,10 @@
 # A Venus renderer for TTC
 
-Status: in progress (2026-10-02).
+Status: done (2026-10-02): the Venus renderer replaced gfxstream.
 
 ## Goal
 
-TTC's virtual GPU (`--gfx`) renders with gfxstream, a large C++ host that
+TTC's virtual GPU (`--gfx`) rendered with gfxstream, a large C++ host that
 assumes one guest per process and forks by serializing its state to files and
 replaying it, recompiling every shader in the child. This replaces it with a
 host that TTC owns, written in Go, for guests that use Mesa's Venus Vulkan
@@ -75,10 +75,8 @@ contexts and resources, as each branch's device numbers them. A fork's child
 context shares its parent's host device, so that it can share the parent's
 compiled objects.
 
-ttcd selects the backend with `TTC_GFX_BACKEND` (`gfxstream`, the default, or
-`venus`), and gives containers the matching guest driver: Mesa's
-`libvulkan_virtio.so` for Venus, built by
-`runsc/ttc/gfxrenderer/guest/build_mesa_venus.sh`.
+ttcd gives containers the guest driver, Mesa's `libvulkan_virtio.so`, built
+by `runsc/ttc/gfxrenderer/guest/build_mesa_venus.sh`.
 
 ## Forks
 
@@ -107,21 +105,81 @@ the GPU's contexts, as `--gfx-fork=device-lost` does.
 
 ## Android
 
-Mesa's Venus driver, built with the NDK, serves as Android's Vulkan HAL, and
-ANGLE runs on it. Android's buffers (gralloc, minigbm) must be importable
-into Vulkan by resource ID. Their memory will be shared memory, as
-host-visible memory is, laid out with the row pitch that MoltenVK uses for
-linear images of that format, so that importing them shares rather than
-copies.
+Mesa's Venus driver, built with the NDK
+(`runsc/ttc/gfxrenderer/guest/build_mesa_venus_android.sh`), serves as
+Android's Vulkan HAL, and ANGLE runs on it, for SurfaceFlinger and apps.
+Android's buffers are minigbm's, its gralloc for virtio-gpu, which allocates
+them with cross-domain contexts (capability set 5,
+`venus/crossdomain_unsafe.go`): the renderer answers minigbm's queries of
+images' requirements with the layouts of the host's linear images, which a
+device of its own asks MoltenVK for (`venus/layout_unsafe.go`), and gives
+it blobs of shared memory of those layouts. The guest's Vulkan imports a
+buffer as a linear image of its memory (`venus/modifier_unsafe.go`, which
+emulates `VK_EXT_image_drm_format_modifier` for linear images and
+`VK_EXT_queue_family_foreign`), so that what the GPU renders, the CPU reads
+and another process samples, without copies. minigbm built against
+ChromeOS's headers creates its blobs with ChromeOS's
+`VIRTGPU_BLOB_FLAG_CREATE_GUEST_HANDLE`, which the Sentry accepts.
+
+## Kernel metadata
+
+A live fork's child was the source's kernel serialized and decoded.
+`state.Clone` copies it in memory instead: it records the graph as Save
+would encode it, calling each struct's StateSave once and taking what it
+saves when it saves it, resolving objects by their address ranges, and
+copies the recording as Load would decode it, calling StateLoad and the
+callbacks that it registers in the order that their dependencies require.
+A fan-out's siblings copy one recording of the first child (`state.Record`,
+`Recording.Copy`), at once, while the source runs on.
+
+## File pages
+
+A fork shares its source's memory with the child, which a write copies. File
+pages are the files', which a fork used to drop from its source's mappings,
+and which each branch then faulted again:
+
+*   the pages of files of the image's layers, which the gofer caches in the
+    family's memory file, stay mapped, and the child references them;
+*   the pages of files of a container's TTC volume, its upper layer, map the
+    objects of the volume that a fork seals, which a write copies first.
+    Files that a branch maps read-only map a sealed object with a mapping
+    that every branch of the family shares (`tmpfs.diskMapping`), and its
+    host page cache, and the copies of its pages that HVF's staging keeps;
+    the fork's source keeps its translations, and the child takes them
+    (`memmap.LiveForkSharedFile`). Software installed in a container, such
+    as Chromium, mapped hundreds of megabytes so.
 
 ## Status
 
-*   Done: the generator and protocol (1); the host core (2): `vulkaninfo`,
-    `vkoffscreen`, and OpenGL by Zink in a Linux guest; one renderer per
-    family (5); fork cloning (6): forks, fan-outs, and forks of children
-    render on, Vulkan and Zink alike.
-*   Next: Linux parity checks (3), Android (4), kernel metadata (7), file
-    pages (8).
+Done, every milestone, on macOS (2026-10-02):
+
+*   Linux guests: `vulkaninfo`, `vkoffscreen`, and OpenGL by Zink
+    (`e2e_gfx.sh`); and, checked by hand, llama.cpp's Vulkan backend (6,700
+    tokens/s of prompt and 279 of generation for Qwen2.5 0.5B, against
+    gfxstream's 257) and Chromium's WebGL by ANGLE.
+*   Android: SurfaceFlinger, apps, screen recording, and APKs
+    (`e2e_redroid.sh`).
+*   Forks of each, fan-outs, and forks of children render on. A fork clones
+    a branch's GPU in milliseconds, no shader compiled again.
+*   Kernel metadata is cloned in memory, and fan-outs' siblings copy one
+    recording.
+*   Clean file pages are shared between branches.
+*   gfxstream is removed.
+
+A fork of Chromium rendering WebGL pauses it for 0.32 s, and of llama.cpp
+generating on the GPU for 0.29 s; a fork of Android pauses it for about
+1.8 s, of which recording and copying the kernel's metadata take 0.64 s,
+and the HVF platform's flush of the guest's execution caches about 0.4 s.
+
+A fan-out's first child restores its parent's clone of the GPU, and takes
+another for its siblings, before the source resumes. Handing its siblings the
+parent's clone would save both copies of the GPU's memory, which take 40 ms
+each for llama.cpp's 500 MB.
+
+The renderer runs on macOS. Linux hosts (plan item B1 of
+`ttc_gpu_gfx_nvproxy.md`) need it to import guest memory into their Vulkan
+drivers as macOS's does with `VK_EXT_external_memory_metal`, by
+`VK_EXT_external_memory_host` or a dma-buf.
 
 ## Milestones
 

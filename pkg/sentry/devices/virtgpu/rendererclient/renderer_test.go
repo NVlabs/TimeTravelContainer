@@ -5,7 +5,6 @@ package rendererclient
 
 import (
 	"os"
-	"os/exec"
 	"testing"
 	"time"
 
@@ -19,72 +18,87 @@ import (
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer"
 )
 
-// TestRealRenderer drives ttc-gfx-renderer with gfxstream, whose host library
-// TTC_GFXSTREAM_LIBRARY names, on the host's GPU.
-func TestRealRenderer(t *testing.T) {
-	library := os.Getenv("TTC_GFXSTREAM_LIBRARY")
-	if library == "" {
-		t.Skip("TTC_GFXSTREAM_LIBRARY does not name gfxstream's host library")
-	}
+// startBroker serves ttc-gfx-renderer's broker, as ttcd does, and returns
+// the Sentry's Broker of it, and a function that closes the Broker and
+// returns what serving it returned. It skips the test if the renderer cannot
+// render on this host.
+func startBroker(t *testing.T) (*Broker, func() error) {
+	t.Helper()
 	renderer, err := testutil.FindFile("runsc/ttcgfx/ttc-gfx-renderer")
 	if err != nil {
 		t.Fatalf("finding the renderer: %v", err)
 	}
-	sentrySock, rendererSock, err := unet.SocketPair(false /* packet */)
+	opts := gfxrenderer.BrokerOptions{Renderer: renderer, Stderr: os.Stderr}
+	if _, err := gfxrenderer.ProbeRenderer(opts); err != nil {
+		t.Skipf("the renderer cannot render here: %v", err)
+	}
+	sentrySock, brokerSock, err := unet.SocketPair(false /* packet */)
 	if err != nil {
 		t.Fatal(err)
 	}
-	rendererFD, err := rendererSock.Release()
+	brokerFD, err := brokerSock.Release()
 	if err != nil {
 		t.Fatal(err)
 	}
-	rendererFile := os.NewFile(uintptr(rendererFD), "renderer")
-	cmd := exec.Command(renderer, "serve", "--library", library)
-	cmd.ExtraFiles = []*os.File{rendererFile}
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("starting the renderer: %v", err)
-	}
-	rendererFile.Close()
-	defer cmd.Wait()
-
+	served := make(chan error, 1)
+	go func() {
+		served <- gfxrenderer.ServeBroker(brokerFD, opts)
+	}()
 	sentryFD, err := sentrySock.Release()
 	if err != nil {
 		t.Fatal(err)
 	}
-	ev := &events{lost: make(chan error, 1)}
-	c, err := New(sentryFD, ev)
+	broker, err := NewBroker(sentryFD)
 	if err != nil {
-		t.Fatalf("connecting to the renderer: %v", err)
+		t.Fatal(err)
 	}
-	defer c.Close()
+	return broker, func() error {
+		broker.Close()
+		return <-served
+	}
+}
 
-	if err := c.CreateContext(1, linux.VIRTGPU_DRM_CAPSET_GFXSTREAM_VULKAN, "renderer-test"); err != nil {
+// ringSize is the size of a blob that holds a Venus command ring.
+const ringSize = 1<<20 + 12<<10
+
+// newRing creates context 1 of the Venus capability set, and blob resource 1,
+// shared memory as Venus's driver creates for its rings, which it maps.
+func newRing(t *testing.T, r virtgpu.Renderer, name string) virtgpu.ResourceMemory {
+	t.Helper()
+	if err := r.CreateContext(1, linux.VIRTGPU_DRM_CAPSET_VENUS, name); err != nil {
 		t.Fatalf("CreateContext: %v", err)
 	}
-	// The guest driver's command ring: a blob without a host allocation.
-	const ringSize = 1<<20 + 12<<10
-	if err := c.CreateBlob(1, 1, virtgpu.BlobArgs{
+	if err := r.CreateBlob(1, 1, virtgpu.BlobArgs{
 		Mem:   linux.VIRTGPU_BLOB_MEM_HOST3D,
-		Flags: linux.VIRTGPU_BLOB_FLAG_USE_MAPPABLE | linux.VIRTGPU_BLOB_FLAG_USE_SHAREABLE,
+		Flags: linux.VIRTGPU_BLOB_FLAG_USE_MAPPABLE,
 		Size:  ringSize,
 	}); err != nil {
 		t.Fatalf("CreateBlob: %v", err)
 	}
-	c.AttachResource(1, 1)
-	mem, err := c.MapResource(1)
+	r.AttachResource(1, 1)
+	mem, err := r.MapResource(1)
 	if err != nil {
 		t.Fatalf("MapResource: %v", err)
 	}
-	fr := memmap.FileRange{Start: mem.Offset(), End: mem.Offset() + hostarch.PageSize}
-	mem.File().IncRef(fr, 0)
-	ims, err := mem.File().MapInternal(fr, hostarch.ReadWrite)
+	return mem
+}
+
+// TestRealRenderer drives ttc-gfx-renderer, on the host's GPU.
+func TestRealRenderer(t *testing.T) {
+	broker, closeBroker := startBroker(t)
+	defer func() {
+		if err := closeBroker(); err != nil {
+			t.Errorf("ServeBroker: %v", err)
+		}
+	}()
+	ev := &events{lost: make(chan error, 1)}
+	c, err := broker.NewRenderer(ev)
 	if err != nil {
-		t.Fatalf("MapInternal: %v", err)
+		t.Fatalf("NewRenderer: %v", err)
 	}
-	if _, err := safemem.ZeroSeq(ims); err != nil {
-		t.Fatalf("writing the ring: %v", err)
-	}
+	defer c.Close()
+	mem := newRing(t, c, "renderer-test")
+	copyMemory(t, mem, 0, make([]byte, hostarch.PageSize), true)
 
 	// With nothing submitted, the renderer signals fences at once.
 	for _, f := range []virtgpu.Fence{
@@ -118,7 +132,6 @@ func TestRealRenderer(t *testing.T) {
 
 	c.DetachResource(1, 1)
 	c.DestroyResource(1)
-	mem.File().DecRef(fr)
 	mem.Release()
 	c.DestroyContext(1)
 	select {
@@ -128,40 +141,10 @@ func TestRealRenderer(t *testing.T) {
 	}
 }
 
-// TestBroker starts a renderer through the broker, as the Sentry does.
+// TestBroker connects branches to their family's renderer through the
+// broker, as the Sentry does.
 func TestBroker(t *testing.T) {
-	library := os.Getenv("TTC_GFXSTREAM_LIBRARY")
-	if library == "" {
-		t.Skip("TTC_GFXSTREAM_LIBRARY does not name gfxstream's host library")
-	}
-	renderer, err := testutil.FindFile("runsc/ttcgfx/ttc-gfx-renderer")
-	if err != nil {
-		t.Fatalf("finding the renderer: %v", err)
-	}
-	sentrySock, brokerSock, err := unet.SocketPair(false /* packet */)
-	if err != nil {
-		t.Fatal(err)
-	}
-	brokerFD, err := brokerSock.Release()
-	if err != nil {
-		t.Fatal(err)
-	}
-	served := make(chan error, 1)
-	go func() {
-		served <- gfxrenderer.ServeBroker(brokerFD, gfxrenderer.BrokerOptions{
-			Renderer: renderer,
-			Options:  gfxrenderer.Options{Library: library},
-			Stderr:   os.Stderr,
-		})
-	}()
-	sentryFD, err := sentrySock.Release()
-	if err != nil {
-		t.Fatal(err)
-	}
-	broker, err := NewBroker(sentryFD)
-	if err != nil {
-		t.Fatal(err)
-	}
+	broker, closeBroker := startBroker(t)
 	// Two renderers, as two branches would have.
 	for i := 0; i < 2; i++ {
 		ev := &events{lost: make(chan error, 1)}
@@ -169,63 +152,28 @@ func TestBroker(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewRenderer: %v", err)
 		}
-		if err := r.CreateContext(1, linux.VIRTGPU_DRM_CAPSET_GFXSTREAM_VULKAN, "broker-test"); err != nil {
+		if err := r.CreateContext(1, linux.VIRTGPU_DRM_CAPSET_VENUS, "broker-test"); err != nil {
 			t.Errorf("CreateContext: %v", err)
 		}
 		r.Close()
 	}
-	broker.Close()
-	if err := <-served; err != nil {
+	if err := closeBroker(); err != nil {
 		t.Errorf("ServeBroker: %v", err)
 	}
 }
 
-// TestRealSnapshot takes a snapshot of a renderer, restores it in another,
-// and checks that the other's blob holds what the first's did.
+// TestRealSnapshot takes a snapshot of a branch's renderer, restores it in
+// another branch's, and checks that the other's blob holds what the first's
+// did.
 func TestRealSnapshot(t *testing.T) {
-	library := os.Getenv("TTC_GFXSTREAM_LIBRARY")
-	if library == "" {
-		t.Skip("TTC_GFXSTREAM_LIBRARY does not name gfxstream's host library")
-	}
-	renderer, err := testutil.FindFile("runsc/ttcgfx/ttc-gfx-renderer")
-	if err != nil {
-		t.Fatalf("finding the renderer: %v", err)
-	}
-	sentrySock, brokerSock, err := unet.SocketPair(false /* packet */)
-	if err != nil {
-		t.Fatal(err)
-	}
-	brokerFD, err := brokerSock.Release()
-	if err != nil {
-		t.Fatal(err)
-	}
-	served := make(chan error, 1)
-	go func() {
-		served <- gfxrenderer.ServeBroker(brokerFD, gfxrenderer.BrokerOptions{
-			Renderer: renderer,
-			Options:  gfxrenderer.Options{Library: library},
-			Stderr:   os.Stderr,
-		})
-	}()
-	sentryFD, err := sentrySock.Release()
-	if err != nil {
-		t.Fatal(err)
-	}
-	broker, err := NewBroker(sentryFD)
-	if err != nil {
-		t.Fatal(err)
-	}
-	broker.Snapshots = true
+	broker, closeBroker := startBroker(t)
 	defer func() {
-		broker.Close()
-		if err := <-served; err != nil {
+		if err := closeBroker(); err != nil {
 			t.Errorf("ServeBroker: %v", err)
 		}
 	}()
 
-	// A command ring's blob, whose transfer buffer, past the rings' storage,
-	// holds a message.
-	const ringSize = 1<<20 + 12<<10
+	// A command ring's blob, whose last page holds a message.
 	const offset = ringSize - hostarch.PageSize
 	message := []byte("taken with a snapshot")
 	source, err := broker.NewRenderer(&events{lost: make(chan error, 1)})
@@ -233,21 +181,7 @@ func TestRealSnapshot(t *testing.T) {
 		t.Fatalf("NewRenderer: %v", err)
 	}
 	defer source.Close()
-	if err := source.CreateContext(1, linux.VIRTGPU_DRM_CAPSET_GFXSTREAM_VULKAN, "snapshot-test"); err != nil {
-		t.Fatalf("CreateContext: %v", err)
-	}
-	if err := source.CreateBlob(1, 1, virtgpu.BlobArgs{
-		Mem:   linux.VIRTGPU_BLOB_MEM_HOST3D,
-		Flags: linux.VIRTGPU_BLOB_FLAG_USE_MAPPABLE | linux.VIRTGPU_BLOB_FLAG_USE_SHAREABLE,
-		Size:  ringSize,
-	}); err != nil {
-		t.Fatalf("CreateBlob: %v", err)
-	}
-	source.AttachResource(1, 1)
-	sourceMem, err := source.MapResource(1)
-	if err != nil {
-		t.Fatalf("MapResource: %v", err)
-	}
+	sourceMem := newRing(t, source, "snapshot-test")
 	defer sourceMem.Release()
 	copyMemory(t, sourceMem, offset, message, true)
 
@@ -255,10 +189,14 @@ func TestRealSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
-	// The source renders on after its snapshot.
-	if err := source.CreateContext(2, linux.VIRTGPU_DRM_CAPSET_GFXSTREAM_VULKAN, "after-snapshot"); err != nil {
+	if !snapshot.Reference {
+		t.Errorf("the renderer of the family took a snapshot of %d bytes, not a reference to a clone", len(snapshot.Data))
+	}
+	// The source renders on after its snapshot, and its writes are its own.
+	if err := source.CreateContext(2, linux.VIRTGPU_DRM_CAPSET_VENUS, "after-snapshot"); err != nil {
 		t.Errorf("CreateContext after a snapshot: %v", err)
 	}
+	copyMemory(t, sourceMem, offset, []byte("changed"), true)
 
 	child, err := broker.NewRenderer(&events{lost: make(chan error, 1)})
 	if err != nil {

@@ -52,8 +52,8 @@ sh_binary(
     ],
 )
 
-# Manual because it needs the host's GPU, gfxstream's host library, and a
-# guest Vulkan driver built from Mesa, and installs packages from Debian.
+# Manual because it needs the host's GPU and a guest Vulkan driver built from
+# Mesa, and installs packages from Debian.
 sh_binary(
     name = "e2e_gfx",
     srcs = ["e2e_gfx.sh"],
@@ -63,8 +63,8 @@ sh_binary(
     ],
 )
 
-# Manual because it needs what e2e_gfx needs, and gfxstream's Vulkan driver
-# for Android, and pulls redroid's Android image.
+# Manual because it needs what e2e_gfx needs, and Mesa's Vulkan driver for
+# Android, and pulls redroid's Android image.
 sh_binary(
     name = "e2e_redroid",
     srcs = ["e2e_redroid.sh"],

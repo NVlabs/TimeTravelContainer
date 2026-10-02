@@ -37,8 +37,8 @@ type Client struct {
 
 var _ virtgpu.Renderer = (*Client)(nil)
 
-// startTimeout is how long a renderer may take to start. gfxstream can hang
-// instead of failing to start.
+// startTimeout is how long a renderer may take to start: a GPU's driver can
+// hang rather than fail.
 const startTimeout = time.Minute
 
 // New returns a Client of the renderer connected to the Unix stream socket

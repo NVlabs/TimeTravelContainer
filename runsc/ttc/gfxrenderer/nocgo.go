@@ -7,19 +7,14 @@ package gfxrenderer
 
 import "errors"
 
-var errNoCgo = errors.New("the renderer was built without cgo, which it needs to load gfxstream")
-
-// Serve renders for the Sentry connected to fd. Without cgo, it cannot.
-func Serve(fd int, opts Options) error {
-	return errNoCgo
-}
+var errNoCgo = errors.New("the renderer was built without cgo, which it needs to call Vulkan")
 
 // ServeFamily serves the branches of a family. Without cgo, it cannot.
-func ServeFamily(fd int, opts Options) error {
+func ServeFamily(fd int) error {
 	return errNoCgo
 }
 
-// Probe returns gfxstream's capability sets. Without cgo, it cannot.
-func Probe(opts Options) ([]Capset, error) {
+// Probe returns the renderer's capability sets. Without cgo, it cannot.
+func Probe() ([]Capset, error) {
 	return nil, errNoCgo
 }

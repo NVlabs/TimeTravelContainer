@@ -45,10 +45,10 @@ func socketpair() ([2]int, error) {
 	return fds, nil
 }
 
-// ServeLauncher starts renderers, of the executable renderer with opts, for
-// the ttcd connected to the Unix stream socket fd, which it takes, until
-// ttcd disconnects. Renderers run until their Sentries disconnect.
-func ServeLauncher(fd int, renderer string, opts Options) error {
+// ServeLauncher starts renderers, of the executable renderer, for the ttcd
+// connected to the Unix stream socket fd, which it takes, until ttcd
+// disconnects. Renderers run until the branches that they serve disconnect.
+func ServeLauncher(fd int, renderer string) error {
 	conn, err := gfxproto.NewConn(fd)
 	if err != nil {
 		unix.Close(fd)
@@ -76,21 +76,13 @@ func ServeLauncher(fd int, renderer string, opts Options) error {
 			}
 			fd := m.FDs[0]
 			m.FDs = nil
-			withFlags := opts
-			withFlags.Snapshots = p.Flags&gfxproto.RendererFlagSnapshots != 0
-			mode := "serve"
-			if p.Flags&gfxproto.RendererFlagFamily != 0 {
-				mode = "serve-family"
-			}
-			err = launchRenderer(renderer, mode, withFlags, fd)
+			err = launchRenderer(renderer, fd)
 		case gfxproto.MsgLaunchProbe:
 			var p gfxproto.LaunchProbe
 			if _, err = m.Decode(&p); err != nil {
 				break
 			}
-			withFlags := opts
-			withFlags.Snapshots = p.Flags&gfxproto.RendererFlagSnapshots != 0
-			trailer, err = ProbeRenderer(BrokerOptions{Renderer: renderer, Options: withFlags, Stderr: os.Stderr})
+			trailer, err = ProbeRenderer(BrokerOptions{Renderer: renderer, Stderr: os.Stderr})
 		default:
 			m.CloseFDs()
 			return fmt.Errorf("unexpected %v", m.Type)
@@ -107,12 +99,12 @@ func ServeLauncher(fd int, renderer string, opts Options) error {
 	}
 }
 
-// launchRenderer starts a renderer in mode, "serve" or "serve-family",
-// whose connection is fd, which it takes, and the renderer gets as its fd 3.
-func launchRenderer(renderer, mode string, opts Options, fd int) error {
-	conn := os.NewFile(uintptr(fd), "gfx-renderer-connection")
+// launchRenderer starts the renderer of a family, whose control connection
+// is fd, which it takes, and the renderer gets as its fd 3.
+func launchRenderer(renderer string, fd int) error {
+	conn := os.NewFile(uintptr(fd), "gfx-renderer-control")
 	defer conn.Close()
-	cmd := exec.Command(renderer, append([]string{mode}, opts.flags()...)...)
+	cmd := exec.Command(renderer, "serve-family")
 	cmd.ExtraFiles = []*os.File{conn}
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
@@ -141,8 +133,8 @@ type Launcher struct {
 }
 
 // StartLauncher starts a launcher, opts.Renderer in its launch mode, which
-// starts renderers with opts.Options, and logs to opts.Stderr. The launcher
-// runs until the Launcher is closed, or its process exits.
+// starts renderers, and logs to opts.Stderr. The launcher runs until the
+// Launcher is closed, or its process exits.
 func StartLauncher(opts BrokerOptions) (*Launcher, error) {
 	fds, err := socketpair()
 	if err != nil {
@@ -150,7 +142,7 @@ func StartLauncher(opts BrokerOptions) (*Launcher, error) {
 	}
 	launcherEnd := os.NewFile(uintptr(fds[1]), "gfx-launcher-connection")
 	defer launcherEnd.Close()
-	cmd := exec.Command(opts.Renderer, append([]string{"launch"}, opts.Options.flags()...)...)
+	cmd := exec.Command(opts.Renderer, "launch")
 	// The connection is the launcher's fd 3.
 	cmd.ExtraFiles = []*os.File{launcherEnd}
 	cmd.Stdout = opts.Stderr
@@ -194,15 +186,14 @@ func (l *Launcher) call(typ gfxproto.MsgType, p any, fds ...int) ([]byte, error)
 	return trailer, nil
 }
 
-// StartRenderer asks the launcher to start a renderer with flags,
-// gfxproto.RendererFlag*, and returns the other end of the renderer's
-// connection, for its Sentry.
-func (l *Launcher) StartRenderer(flags uint32) (int, error) {
+// StartRenderer asks the launcher to start the renderer of a family, and
+// returns the other end of the renderer's control connection.
+func (l *Launcher) StartRenderer() (int, error) {
 	fds, err := socketpair()
 	if err != nil {
 		return -1, err
 	}
-	_, err = l.call(gfxproto.MsgLaunchRenderer, &gfxproto.LaunchRenderer{Flags: flags}, fds[1])
+	_, err = l.call(gfxproto.MsgLaunchRenderer, &gfxproto.LaunchRenderer{}, fds[1])
 	unix.Close(fds[1])
 	if err != nil {
 		unix.Close(fds[0])
@@ -211,10 +202,10 @@ func (l *Launcher) StartRenderer(flags uint32) (int, error) {
 	return fds[0], nil
 }
 
-// Probe asks the launcher for the capability sets of a renderer with flags,
-// gfxproto.RendererFlag*, as the renderer's probe prints them.
-func (l *Launcher) Probe(flags uint32) ([]byte, error) {
-	return l.call(gfxproto.MsgLaunchProbe, &gfxproto.LaunchProbe{Flags: flags})
+// Probe asks the launcher for the renderer's capability sets, as its probe
+// prints them.
+func (l *Launcher) Probe() ([]byte, error) {
+	return l.call(gfxproto.MsgLaunchProbe, &gfxproto.LaunchProbe{})
 }
 
 // Close closes the connection, which makes the launcher exit.

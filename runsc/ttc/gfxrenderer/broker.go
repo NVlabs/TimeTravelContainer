@@ -22,9 +22,6 @@ type BrokerOptions struct {
 	// Renderer is the path of ttc-gfx-renderer.
 	Renderer string
 
-	// Options configures the renderers.
-	Options Options
-
 	// Stderr receives the renderers' logs.
 	Stderr io.Writer
 
@@ -37,22 +34,20 @@ type BrokerOptions struct {
 	Unconfined bool
 }
 
-// args returns the arguments of a renderer in mode, "serve" or "probe".
+// args returns the arguments of a renderer in mode, "serve-family" or
+// "probe".
 func (o *BrokerOptions) args(mode string) []string {
-	args := append([]string{mode}, o.Options.flags()...)
+	args := []string{mode}
 	if o.Unconfined {
 		args = append(args, "--unconfined")
 	}
 	return args
 }
 
-// ServeBroker starts renderers for the Sentry connected to the Unix stream
-// socket fd, which it takes, until the Sentry disconnects. Each renderer
-// exits when its Sentry disconnects from it.
-//
-// With the Venus backend, one renderer serves the Sentry's family, a
-// connection for each branch, so that a fork's child shares what its parent
-// compiled. Otherwise, each branch has a renderer of its own.
+// ServeBroker connects the branches of the Sentry connected to the Unix
+// stream socket fd, which it takes, to the renderer of their family, until
+// the Sentry disconnects, starting one when there is none. The renderer
+// exits once it serves no branch.
 func ServeBroker(fd int, opts BrokerOptions) error {
 	conn, err := gfxproto.NewConn(fd)
 	if err != nil {
@@ -84,11 +79,7 @@ func ServeBroker(fd int, opts BrokerOptions) error {
 			return err
 		}
 		var sentryFD int
-		if opts.Options.Backend == BackendVenus {
-			sentryFD, family, err = connectFamilyRenderer(&opts, family)
-		} else {
-			sentryFD, err = startRenderer(&opts, p.Flags)
-		}
+		sentryFD, family, err = connectFamilyRenderer(&opts, family)
 		if err != nil {
 			log.Printf("starting a GPU renderer: %v", err)
 			if err := conn.Send(gfxproto.MsgReply, m.Seq, &gfxproto.Reply{Errno: uint32(unix.ENODEV)}, nil); err != nil {
@@ -102,33 +93,6 @@ func ServeBroker(fd int, opts BrokerOptions) error {
 			return err
 		}
 	}
-}
-
-// startRenderer starts a renderer with flags, gfxproto.RendererFlag*, and
-// returns the Sentry's end of a connection to it.
-func startRenderer(opts *BrokerOptions, flags uint32) (int, error) {
-	if opts.Launcher != nil {
-		return opts.Launcher.StartRenderer(flags)
-	}
-	fds, err := socketpair()
-	if err != nil {
-		return -1, err
-	}
-	rendererEnd := os.NewFile(uintptr(fds[1]), "gfx-renderer-connection")
-	defer rendererEnd.Close()
-	withFlags := *opts
-	withFlags.Options.Snapshots = flags&gfxproto.RendererFlagSnapshots != 0
-	cmd := exec.Command(opts.Renderer, withFlags.args("serve")...)
-	// The connection is the renderer's fd 3.
-	cmd.ExtraFiles = []*os.File{rendererEnd}
-	cmd.Stdout = opts.Stderr
-	cmd.Stderr = opts.Stderr
-	if err := cmd.Start(); err != nil {
-		unix.Close(fds[0])
-		return -1, err
-	}
-	go cmd.Wait()
-	return fds[0], nil
 }
 
 // connectFamilyRenderer returns the Sentry's end of a new connection to the
@@ -194,7 +158,7 @@ func startFamilyRenderer(opts *BrokerOptions) (*gfxproto.Conn, error) {
 	var fd int
 	if opts.Launcher != nil {
 		var err error
-		if fd, err = opts.Launcher.StartRenderer(gfxproto.RendererFlagFamily); err != nil {
+		if fd, err = opts.Launcher.StartRenderer(); err != nil {
 			return nil, err
 		}
 	} else {
@@ -224,16 +188,12 @@ func startFamilyRenderer(opts *BrokerOptions) (*gfxproto.Conn, error) {
 	return conn, nil
 }
 
-// ProbeRenderer returns the capability sets of a renderer with
-// opts.Options, as its probe prints them, through opts.Launcher if it is not
-// nil. If the probe fails, what it logged goes to opts.Stderr.
+// ProbeRenderer returns the renderer's capability sets, as its probe prints
+// them, through opts.Launcher if it is not nil. If the probe fails, what it
+// logged goes to opts.Stderr.
 func ProbeRenderer(opts BrokerOptions) ([]byte, error) {
 	if opts.Launcher != nil {
-		var flags uint32
-		if opts.Options.Snapshots {
-			flags |= gfxproto.RendererFlagSnapshots
-		}
-		return opts.Launcher.Probe(flags)
+		return opts.Launcher.Probe()
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()

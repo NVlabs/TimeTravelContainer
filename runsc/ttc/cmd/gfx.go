@@ -26,40 +26,21 @@ import (
 const gfxRendererName = "ttc-gfx-renderer"
 
 // The guest's Vulkan driver, which ttcd gives the containers of --gfx
-// families: Mesa's gfxstream driver, or its Venus driver with the Venus
-// backend. ttcd looks for it in gfx-guest/ARCH beside itself, ARCH being the
-// guest's, aarch64 or x86_64, unless TTC_GFX_GUEST_DRIVER names its
-// directory.
-type gfxGuestDriver struct {
-	// name is the driver's file name.
-	name string
-	// manifest is where the Vulkan loader of containers finds the driver's
-	// manifest, among those of the drivers that images install.
-	manifest string
-	// env are the environment variables of containers, unless they set
-	// them.
-	env []string
-}
+// families, is Mesa's Venus driver. ttcd looks for it in gfx-guest/ARCH
+// beside itself, ARCH being the guest's, aarch64 or x86_64, unless
+// TTC_GFX_GUEST_DRIVER names its directory.
+const (
+	// gfxGuestDriverName is the driver's file name.
+	gfxGuestDriverName = "libvulkan_virtio.so"
+	// gfxGuestDriverManifest is where the Vulkan loader of containers finds
+	// the driver's manifest, among those of the drivers that images install.
+	gfxGuestDriverManifest = "/usr/share/vulkan/icd.d/ttc_venus_icd.json"
+)
 
-// gfxGuestDrivers are the guest's drivers, by the renderer's backend.
-var gfxGuestDrivers = map[string]gfxGuestDriver{
-	gfxrenderer.BackendGfxstream: {
-		name:     "libvulkan_gfxstream.so",
-		manifest: "/usr/share/vulkan/icd.d/ttc_gfxstream_icd.json",
-		// The Vulkan loader skips the gfxstream drivers that images
-		// install, of Mesa before TTC's patches, which would drive the
-		// virtual GPU as a second device, the one that applications
-		// prefer.
-		env: []string{"VK_LOADER_DRIVERS_DISABLE=gfxstream_vk_icd*"},
-	},
-	gfxrenderer.BackendVenus: {
-		name:     "libvulkan_virtio.so",
-		manifest: "/usr/share/vulkan/icd.d/ttc_venus_icd.json",
-		// The Vulkan loader skips the Venus drivers that images install,
-		// which would drive the virtual GPU as a second device.
-		env: []string{"VK_LOADER_DRIVERS_DISABLE=virtio_icd*"},
-	},
-}
+// gfxGuestDriverEnv are the environment variables of containers, unless
+// they set them: the Vulkan loader skips the Venus drivers that images
+// install, which would drive the virtual GPU as a second device.
+var gfxGuestDriverEnv = []string{"VK_LOADER_DRIVERS_DISABLE=virtio_icd*"}
 
 const (
 	// gfxGuestDriverDir is where containers find the driver.
@@ -69,14 +50,6 @@ const (
 	// Vulkan driver: the GPU has no OpenGL driver.
 	gfxGuestDriconfPath = "/usr/share/drirc.d/50-ttc-gfx.conf"
 )
-
-// gfxBackend returns the renderer's backend, which TTC_GFX_BACKEND names.
-func gfxBackend() string {
-	if b := os.Getenv("TTC_GFX_BACKEND"); b != "" {
-		return b
-	}
-	return gfxrenderer.BackendGfxstream
-}
 
 // gfxGuestDriconf has Mesa's OpenGL drive virtio-gpu devices by Zink. If
 // Zink fails, as without a Vulkan driver for the device, Mesa renders in
@@ -163,12 +136,10 @@ type gfxService struct {
 	mu       sync.Mutex
 	started  bool
 	err      error
-	opts     gfxrenderer.BrokerOptions
 	listener *net.UnixListener
 	// capsets are the renderer's capability sets, as runsc's --gfx-capsets
-	// spells them, by whether the renderer takes snapshots: the features of
-	// such renderers, which the capability sets offer guests, differ.
-	capsets map[bool]string
+	// spells them.
+	capsets string
 }
 
 // newGFXService returns a service whose broker socket is in run, the daemon's
@@ -195,9 +166,8 @@ func guestArch() string {
 	}
 }
 
-// guestDriver returns the path of the guest's Vulkan driver of the
-// renderer's backend.
-func guestDriver(d gfxGuestDriver) (string, error) {
+// guestDriver returns the path of the guest's Vulkan driver.
+func guestDriver() (string, error) {
 	dir := os.Getenv("TTC_GFX_GUEST_DRIVER")
 	if dir == "" {
 		exe, err := os.Executable()
@@ -206,7 +176,7 @@ func guestDriver(d gfxGuestDriver) (string, error) {
 		}
 		dir = filepath.Join(filepath.Dir(exe), "gfx-guest", guestArch())
 	}
-	driver := filepath.Join(dir, d.name)
+	driver := filepath.Join(dir, gfxGuestDriverName)
 	if _, err := os.Stat(driver); err != nil {
 		return "", err
 	}
@@ -215,20 +185,15 @@ func guestDriver(d gfxGuestDriver) (string, error) {
 
 // guestEdits returns what gives the containers of a family with the given
 // GPU options the guest's side of the virtual GPU: the mounts of the guest's
-// Vulkan driver of the renderer's backend, of the manifest that the Vulkan
-// loader finds it by, and, with gfxGuestZinkByDefault, of Mesa's OpenGL
-// configuration, and the driver's environment variables. Without a driver
-// for the guest's architecture, it returns none: the containers must bring
-// their own.
+// Vulkan driver, of the manifest that the Vulkan loader finds it by, and,
+// with gfxGuestZinkByDefault, of Mesa's OpenGL configuration, and the
+// driver's environment variables. Without a driver for the guest's
+// architecture, it returns none: the containers must bring their own.
 func (g *gfxService) guestEdits(opts ttcbundle.GPUOptions) ([]ttcbundle.HostMount, []string, error) {
 	if !opts.GFX || g == nil {
 		return nil, nil, nil
 	}
-	d, ok := gfxGuestDrivers[gfxBackend()]
-	if !ok {
-		return nil, nil, fmt.Errorf("no GPU renderer backend %q", gfxBackend())
-	}
-	driver, err := guestDriver(d)
+	driver, err := guestDriver()
 	if err != nil {
 		g.noGuestDriver.Do(func() {
 			if g.stderr != nil {
@@ -240,7 +205,7 @@ func (g *gfxService) guestEdits(opts ttcbundle.GPUOptions) ([]ttcbundle.HostMoun
 	manifest, err := json.MarshalIndent(map[string]any{
 		"file_format_version": "1.0.1",
 		"ICD": map[string]string{
-			"library_path": filepath.Join(gfxGuestDriverDir, d.name),
+			"library_path": filepath.Join(gfxGuestDriverDir, gfxGuestDriverName),
 			"library_arch": "64",
 			"api_version":  "1.1.363",
 		},
@@ -248,13 +213,13 @@ func (g *gfxService) guestEdits(opts ttcbundle.GPUOptions) ([]ttcbundle.HostMoun
 	if err != nil {
 		return nil, nil, err
 	}
-	manifestPath, err := g.writeGuestFile(filepath.Base(d.manifest), append(manifest, '\n'))
+	manifestPath, err := g.writeGuestFile(filepath.Base(gfxGuestDriverManifest), append(manifest, '\n'))
 	if err != nil {
 		return nil, nil, fmt.Errorf("the guest's Vulkan driver manifest: %w", err)
 	}
 	mounts := []ttcbundle.HostMount{
-		{Source: driver, Destination: filepath.Join(gfxGuestDriverDir, d.name)},
-		{Source: manifestPath, Destination: d.manifest},
+		{Source: driver, Destination: filepath.Join(gfxGuestDriverDir, gfxGuestDriverName)},
+		{Source: manifestPath, Destination: gfxGuestDriverManifest},
 	}
 	if gfxGuestZinkByDefault {
 		driconfPath, err := g.writeGuestFile(filepath.Base(gfxGuestDriconfPath), []byte(gfxGuestDriconf))
@@ -263,7 +228,7 @@ func (g *gfxService) guestEdits(opts ttcbundle.GPUOptions) ([]ttcbundle.HostMoun
 		}
 		mounts = append(mounts, ttcbundle.HostMount{Source: driconfPath, Destination: gfxGuestDriconfPath})
 	}
-	return mounts, append([]string(nil), d.env...), nil
+	return mounts, append([]string(nil), gfxGuestDriverEnv...), nil
 }
 
 // writeGuestFile writes a file, named name, of the guest's side of the
@@ -299,7 +264,7 @@ func (g *gfxService) writeGuestFile(name string, content []byte) (string, error)
 	return path, nil
 }
 
-// rendererOptions returns where the renderer and gfxstream are.
+// rendererOptions returns where the renderer is.
 func rendererOptions() (gfxrenderer.BrokerOptions, error) {
 	renderer := os.Getenv("TTC_GFX_RENDERER")
 	if renderer == "" {
@@ -312,13 +277,7 @@ func rendererOptions() (gfxrenderer.BrokerOptions, error) {
 	if _, err := os.Stat(renderer); err != nil {
 		return gfxrenderer.BrokerOptions{}, fmt.Errorf("the GPU renderer: %w; install %s beside ttcd, or name it with TTC_GFX_RENDERER", err, gfxRendererName)
 	}
-	return gfxrenderer.BrokerOptions{
-		Renderer: renderer,
-		Options: gfxrenderer.Options{
-			Backend: gfxBackend(),
-			Library: os.Getenv("TTC_GFXSTREAM_LIBRARY"),
-		},
-	}, nil
+	return gfxrenderer.BrokerOptions{Renderer: renderer}, nil
 }
 
 // runscArgs returns runsc's flags for a branch of a family with the given
@@ -342,10 +301,6 @@ func (g *gfxService) runscArgs(opts ttcbundle.GPUOptions) ([]string, error) {
 	if g.err != nil {
 		return nil, fmt.Errorf("the virtual GPU is unavailable: %w", g.err)
 	}
-	capsets, err := g.capsetsLocked(opts.GFXFork == ttcbundle.GPUForkSnapshot)
-	if err != nil {
-		return nil, fmt.Errorf("the virtual GPU is unavailable: %w", err)
-	}
 	fork := "ineligible"
 	if opts.GFXFork != "" {
 		fork = opts.GFXFork
@@ -353,27 +308,9 @@ func (g *gfxService) runscArgs(opts ttcbundle.GPUOptions) ([]string, error) {
 	return []string{
 		"--gfx=true",
 		"--gfx-fork=" + fork,
-		"--gfx-capsets=" + capsets,
+		"--gfx-capsets=" + g.capsets,
 		"--gfx-broker=" + g.socket,
 	}, nil
-}
-
-// capsetsLocked returns the capability sets of a renderer that takes
-// snapshots or not, probing it the first time.
-//
-// Preconditions: g.mu is locked. The service started.
-func (g *gfxService) capsetsLocked(snapshots bool) (string, error) {
-	if capsets, ok := g.capsets[snapshots]; ok {
-		return capsets, nil
-	}
-	opts := g.opts
-	opts.Options.Snapshots = snapshots
-	capsets, err := probeRenderer(opts)
-	if err != nil {
-		return "", err
-	}
-	g.capsets[snapshots] = capsets
-	return capsets, nil
 }
 
 // startLocked probes the renderer, and serves the broker socket.
@@ -390,10 +327,8 @@ func (g *gfxService) startLocked() error {
 	opts.Launcher = g.host.launcher
 	opts.Unconfined = g.host.unconfined
 	opts.Stderr = g.stderr
-	g.opts = opts
-	g.capsets = make(map[bool]string)
 	// A renderer that does not start fails the service, not only a family.
-	if _, err := g.capsetsLocked(false); err != nil {
+	if g.capsets, err = probeRenderer(opts); err != nil {
 		return err
 	}
 	if err := os.Remove(g.socket); err != nil && !errors.Is(err, os.ErrNotExist) {

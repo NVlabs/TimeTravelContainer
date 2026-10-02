@@ -252,19 +252,17 @@ type (
 		Ring    uint32
 	}
 
-	// StartRenderer asks the broker to start a renderer, with Flags,
-	// RendererFlag*. The broker replies with the descriptor of a connection
-	// to it, a Unix stream socket, on which the renderer sends Hello.
-	StartRenderer struct {
-		Flags uint32
-	}
+	// StartRenderer asks the broker for a renderer of a branch. The broker
+	// replies with the descriptor of a connection to the renderer of the
+	// Sentry's family, a Unix stream socket, on which the renderer sends
+	// Hello.
+	StartRenderer struct{}
 
-	// LaunchRenderer asks the launcher to start a renderer, with Flags,
-	// RendererFlag*, whose connection to its Sentry is the message's
-	// descriptor. The reply's trailer says why it failed, if it did.
-	LaunchRenderer struct {
-		Flags uint32
-	}
+	// LaunchRenderer asks the launcher to start the renderer of a family,
+	// whose control connection, on which it takes ServeConnection, is the
+	// message's descriptor. The reply's trailer says why it failed, if it
+	// did.
+	LaunchRenderer struct{}
 
 	// Snapshot asks the renderer for a snapshot of its state. The reply's
 	// descriptor is shared memory that holds the snapshot, of the reply's
@@ -297,12 +295,10 @@ type (
 		Reserved uint32
 	}
 
-	// LaunchProbe asks the launcher for the capability sets of a renderer
-	// with Flags, RendererFlag*. The reply's trailer is what the renderer's
-	// probe printed, or why it failed.
-	LaunchProbe struct {
-		Flags uint32
-	}
+	// LaunchProbe asks the launcher for the renderer's capability sets. The
+	// reply's trailer is what the renderer's probe printed, or why it
+	// failed.
+	LaunchProbe struct{}
 
 	// ServeConnection gives the renderer of a family a connection to serve,
 	// the message's descriptor, a branch's. The renderer replies once it
@@ -313,11 +309,6 @@ type (
 		Reserved uint32
 	}
 )
-
-// RendererFlagSnapshots is a flag of StartRenderer and LaunchRenderer: the
-// renderer takes snapshots and restores them, which costs it memory from its
-// start, since it records how to rebuild its Vulkan objects.
-const RendererFlagSnapshots = 1 << 0
 
 // SnapshotFlagReference is a flag of a Snapshot's reply: the snapshot is a
 // reference to what the renderer, which serves the family of the Sentry's
@@ -330,11 +321,6 @@ const SnapshotFlagReference = 1 << 0
 // snapshot, so that a renderer that kept what the snapshot needs may take
 // it rather than copy it.
 const RestoreFlagLast = 1 << 0
-
-// RendererFlagFamily is a flag of LaunchRenderer: the renderer serves the
-// branches of a family, and its descriptor is not a Sentry's connection but
-// the broker's, on which ServeConnection gives it connections to serve.
-const RendererFlagFamily = 1 << 1
 
 const (
 	// headerSize is the size of a message's header: its type, the length of

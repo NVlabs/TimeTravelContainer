@@ -3904,7 +3904,7 @@ func TestMemorySwapFollowsDocker(t *testing.T) {
 
 func TestAddDefaultEnv(t *testing.T) {
 	env := []string{"PATH=/bin", "VK_LOADER_DRIVERS_DISABLE=mine"}
-	got := addDefaultEnv(env, []string{"VK_LOADER_DRIVERS_DISABLE=gfxstream_vk_icd*", "MESA_DEBUG=silent"})
+	got := addDefaultEnv(env, []string{"VK_LOADER_DRIVERS_DISABLE=virtio_icd*", "MESA_DEBUG=silent"})
 	want := []string{"PATH=/bin", "VK_LOADER_DRIVERS_DISABLE=mine", "MESA_DEBUG=silent"}
 	if !slices.Equal(got, want) {
 		t.Errorf("addDefaultEnv = %q, want %q", got, want)

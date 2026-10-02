@@ -5,6 +5,13 @@ macOS (HVF, Apple Silicon). Phase B, the rest, is implemented afterwards on
 Linux (x86-64 and arm64, with NVIDIA GPUs) from this document, which is meant
 to stand on its own.*
 
+*Update, 2026-10-02: the virtual GPU no longer renders with gfxstream, but
+with TTC's own renderer, written in Go, for Mesa's Venus driver, which serves
+a family's branches in one process and clones a branch's GPU for a fork,
+sharing what it compiled. See `ttc_venus_renderer.md`. What this document
+says of gfxstream records how Phase A was done; the handoff to Phase B
+below is current.*
+
 ## Summary
 
 TTC families gain two independent ways to use a GPU, each switched on and
@@ -676,25 +683,27 @@ Phase A is done on macOS (A0-A5); A6 is optional. What Phase B inherits:
     *   the renderer's client, the broker's client, and the renderer's memory
         in the Sentry, `.../virtgpu/rendererclient`; the protocol,
         `pkg/gfxproto`;
-    *   the renderer, `runsc/ttcgfx` and `runsc/ttc/gfxrenderer`: the cgo shim
-        over gfxstream, the broker, the launcher, confinement, and snapshots;
-        TTC's gfxstream patches in `patches/`, and the guest driver's build in
-        `guest/`;
+    *   the renderer, `runsc/ttcgfx` and `runsc/ttc/gfxrenderer`: the broker,
+        the launcher, confinement, the renderer of a family, and its Venus
+        backend, `venus/`, which clones a branch's GPU for a fork; the guest
+        drivers' builds, for Linux and Android, in `guest/`;
     *   the daemon and runsc: `runsc/ttc/cmd/gfx.go` (`gfxHost`,
         `gfxService`), `runsc/ttc/bundle/gpu.go` (the flags and the family
         record), `runsc/boot/gfx.go`, and `runsc/sandbox/gfx.go`;
     *   the save hook for devices, `vfs.DeviceSaveRestoreExtension`;
     *   tests: `virtgpu_test.go`, against a fake renderer; the
-        `rendererclient` tests, against a real one (`TTC_GFXSTREAM_LIBRARY`);
-        and `runsc/ttc/test/e2e_gfx.sh`.
+        `rendererclient` tests, against a real one, on a host with a GPU; and
+        `runsc/ttc/test/e2e_gfx.sh` and `e2e_redroid.sh`.
 *   **B1 needs, on Linux:**
     *   the renderer built with cgo: `runsc/ttcgfx`'s `pure` is `auto` on
         Linux, which builds `nocgo.go`, a renderer that fails;
-    *   gfxstream built on the host's Vulkan driver, with TTC's patches.
-        Patch 0002 matters only on macOS, where shared memory has names;
-        gfxstream uses `memfd_create` on Linux;
-    *   blob memory that the Sentry maps through its descriptor: `SystemBlob`
-        memory is a memfd. The Sentry's `hostMemory` offers `DataFD`, for
+    *   the Venus renderer on the host's Vulkan driver: its shared memory is
+        a memfd on Linux (`venus/vk/shm.go`), which it must import into
+        Vulkan as macOS's imports it with `VK_EXT_external_memory_metal`:
+        with `VK_EXT_external_memory_host`, or as a dma-buf or opaque
+        descriptor where the driver takes one;
+    *   blob memory that the Sentry maps through its descriptor, the
+        renderer's memfds. The Sentry's `hostMemory` offers `DataFD`, for
         systrap; KVM maps what the Sentry maps;
     *   seccomp rules for the Sentry's broker and renderer connections:
         `sendmsg` and `recvmsg` with descriptors, `mmap` of the memfds they
@@ -704,19 +713,20 @@ Phase A is done on macOS (A0-A5); A6 is optional. What Phase B inherits:
         Linux, so renderers run as ttcd's children, with its privileges.
         Linux's namespaces and seccomp filters nest, so no launcher is needed:
         renderers can confine themselves under a confined ttcd;
-    *   the guest driver for x86-64 guests: `guest/build_mesa_gfxstream.sh`
+    *   the guest driver for x86-64 guests: `guest/build_mesa_venus.sh`
         builds for the architecture of the container it runs in;
     *   `e2e_gfx.sh` on x86-64 and arm64 hosts.
 *   **Lessons that carry over:**
-    *   gfxstream's guest driver spins, rather than fails, when its renderer
-        is gone; `device-lost` ends such processes with `SIGBUS`;
+    *   GPU drivers in guests wait for their renderers rather than fail
+        when they are gone; `device-lost` ends such processes with `SIGBUS`;
     *   a family's branches share one Sentry, so a branch's host resources
         need explicit release: the device closes renderers that nothing uses;
     *   a fork fails cleanly at `vfs.PrepareSave`, not in `beforeSave`, which
         is where a device captures state outside the sandbox;
-    *   gfxstream's snapshots rebuild Vulkan objects and memory, but not
-        recorded commands. They need `VulkanSnapshots` from the renderer's
-        start, and batched descriptor set updates off;
+    *   a fork's GPU state is a clone in the family's renderer, which the
+        children restore: nothing is serialized, so a fork that leaves the
+        process (a checkpoint, dehydration, or a remote fork) loses the
+        GPU's contexts, as `device-lost` does;
     *   nvproxy can follow the same structure: a fork policy on the device,
         its checks in `ValidateLiveFork` and `ValidateLiveForkMapping`, and
         `cuda-checkpoint` in a `DeviceSaveRestoreExtension`.
@@ -756,7 +766,7 @@ compatible nodes.
 
 *   binder in the Sentry, through binderfs (`binder`, `hwbinder`, `vndbinder`);
 *   ashmem or memfd, and whatever else Android's init requires;
-*   an image whose Vulkan driver is Mesa's gfxstream driver and whose GLES is
+*   an image whose Vulkan driver is Mesa's Venus driver and whose GLES is
     ANGLE, as Cuttlefish images are;
 *   display through scrcpy over adb, or VNC;
 *   the device-lost experiment: SurfaceFlinger is expected to crash and

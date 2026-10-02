@@ -14,14 +14,10 @@ go_library(
         "broker.go",
         "confine_darwin.go",
         "confine_linux.go",
-        "gfxstream.go",
+        "gfxrenderer.go",
         "launcher.go",
         "nocgo.go",
-        "options.go",
         "renderer.go",
-        "shm_darwin.go",
-        "shm_linux.go",
-        "snapshot.go",
     ],
     bazel_cgo = True,
     stateify = False,
@@ -43,7 +39,6 @@ go_test(
     srcs = [
         "family_test.go",
         "launcher_test.go",
-        "snapshot_test.go",
     ],
     library = ":gfxrenderer",
     # The renderer of a family serves with the Venus backend, which calls

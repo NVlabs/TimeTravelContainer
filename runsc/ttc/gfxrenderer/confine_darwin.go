@@ -13,14 +13,13 @@ import (
 
 // Confine confines the renderer, and whatever it starts, with the macOS
 // sandbox to seatbelt.RendererProfile. The renderer calls it before it loads
-// gfxstream or reads anything from its Sentry.
+// Vulkan or reads anything from its Sentry.
 //
 // It fails in a process that is confined already, such as a child of a
 // confined ttcd: macOS lets no process change its profile, and ttcd's bars
 // the GPU. Such a daemon starts renderers through a launcher that it started
 // before it confined itself (see ServeLauncher).
-func Confine(opts Options) error {
-	setVulkanLoader()
+func Confine() error {
 	var readable []string
 	add := func(path string) {
 		if !strings.Contains(path, "/") {
@@ -40,9 +39,7 @@ func Confine(opts Options) error {
 	if exe, err := os.Executable(); err == nil {
 		add(exe)
 	}
-	add(opts.library())
-	add(os.Getenv("ANDROID_EMU_VK_LOADER_PATH"))
-	profile, err := seatbelt.RendererProfile(readable, opts.ScratchDir)
+	profile, err := seatbelt.RendererProfile(readable)
 	if err != nil {
 		return err
 	}

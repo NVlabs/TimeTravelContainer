@@ -260,9 +260,9 @@ func (r *resource) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcA
 // maps the memory of the renderer that restores the source's snapshot.
 // Otherwise the resource was lost, and accesses raise SIGBUS, as accesses to
 // memory of a device that is gone may. That is the fail-fast end of
-// ForkDeviceLost for the processes that used the GPU: gfxstream's guest
-// driver waits for its renderer's replies by spinning on its command ring,
-// and treats a reply that cannot come as fatal.
+// ForkDeviceLost for the processes that used the GPU: the guest's Venus
+// driver waits for its renderer by polling the memory that they share, which
+// nothing would write again.
 func (r *resource) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
 	d := r.dev
 	d.mu.Lock()

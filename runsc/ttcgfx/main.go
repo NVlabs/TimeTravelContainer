@@ -2,18 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Binary ttc-gfx-renderer is TTC's GPU renderer. ttcd starts one for each
-// branch whose virtual GPU is in use:
+// family whose virtual GPU is in use:
 //
-//	ttc-gfx-renderer serve [flags]   renders for the Sentry connected to fd 3
-//	ttc-gfx-renderer serve-family [flags]
+//	ttc-gfx-renderer serve-family [--unconfined]
 //	                                 renders for the branches of a family,
 //	                                 whose connections the broker connected
 //	                                 to fd 3 gives it
-//	ttc-gfx-renderer probe [flags]   prints the renderer's capability sets
-//	ttc-gfx-renderer launch [flags]  starts renderers, with flags, for the
-//	                                 ttcd connected to fd 3
+//	ttc-gfx-renderer probe [--unconfined]
+//	                                 prints the renderer's capability sets
+//	ttc-gfx-renderer launch          starts renderers for the ttcd connected
+//	                                 to fd 3
 //
-// A renderer confines itself before it loads gfxstream, unless --unconfined.
+// A renderer confines itself before it loads Vulkan, unless --unconfined.
 package main
 
 import (
@@ -21,12 +21,11 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer"
 )
 
-// connFD is the descriptor of the connection to the Sentry.
+// connFD is the descriptor of the connection to the broker or ttcd.
 const connFD = 3
 
 func main() {
@@ -34,33 +33,13 @@ func main() {
 		usage()
 	}
 	flags := flag.NewFlagSet(os.Args[1], flag.ExitOnError)
-	var opts gfxrenderer.Options
-	flags.StringVar(&opts.Backend, "backend", "", "the renderer's backend: gfxstream (the default) or venus")
-	flags.StringVar(&opts.Library, "library", "", "path of gfxstream's host library")
-	flags.StringVar(&opts.Features, "features", "", "gfxstream renderer features")
-	flags.BoolVar(&opts.Snapshots, "snapshots", false, "take snapshots and restore them")
 	unconfined := flags.Bool("unconfined", false, "run without the renderer's sandbox, as ttcd does with --unsafe-no-host-isolation")
 	flags.Parse(os.Args[2:])
 	mode := os.Args[1]
 	switch mode {
-	case "serve", "serve-family", "probe":
-		if mode == "serve" && opts.Snapshots {
-			// gfxstream takes and restores snapshots in a directory, which
-			// is the renderer's own.
-			dir, err := os.MkdirTemp("", "ttc-gfx-snapshots.")
-			if err != nil {
-				fatal(err)
-			}
-			defer os.RemoveAll(dir)
-			// The sandbox's rules name the directory's own path, not one
-			// through a symbolic link, such as macOS's /var.
-			if dir, err = filepath.EvalSymlinks(dir); err != nil {
-				fatal(err)
-			}
-			opts.ScratchDir = dir
-		}
+	case "serve-family", "probe":
 		if !*unconfined {
-			if err := gfxrenderer.Confine(opts); err != nil {
+			if err := gfxrenderer.Confine(); err != nil {
 				fatal(fmt.Errorf("confining the renderer: %w", err))
 			}
 		}
@@ -72,19 +51,12 @@ func main() {
 		usage()
 	}
 	switch mode {
-	case "serve":
-		if err := gfxrenderer.Serve(connFD, opts); err != nil {
-			if opts.ScratchDir != "" {
-				os.RemoveAll(opts.ScratchDir)
-			}
-			fatal(err)
-		}
 	case "serve-family":
-		if err := gfxrenderer.ServeFamily(connFD, opts); err != nil {
+		if err := gfxrenderer.ServeFamily(connFD); err != nil {
 			fatal(err)
 		}
 	case "probe":
-		capsets, err := gfxrenderer.Probe(opts)
+		capsets, err := gfxrenderer.Probe()
 		if err != nil {
 			fatal(err)
 		}
@@ -98,7 +70,7 @@ func main() {
 		if err != nil {
 			fatal(err)
 		}
-		if err := gfxrenderer.ServeLauncher(connFD, exe, opts); err != nil {
+		if err := gfxrenderer.ServeLauncher(connFD, exe); err != nil {
 			fatal(err)
 		}
 	}
@@ -110,7 +82,7 @@ func fatal(err error) {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: ttc-gfx-renderer serve|serve-family|probe [--backend BACKEND] [--library PATH] [--features FEATURES] [--snapshots] [--unconfined]")
-	fmt.Fprintln(os.Stderr, "       ttc-gfx-renderer launch [--backend BACKEND] [--library PATH] [--features FEATURES]")
+	fmt.Fprintln(os.Stderr, "usage: ttc-gfx-renderer serve-family|probe [--unconfined]")
+	fmt.Fprintln(os.Stderr, "       ttc-gfx-renderer launch")
 	os.Exit(2)
 }

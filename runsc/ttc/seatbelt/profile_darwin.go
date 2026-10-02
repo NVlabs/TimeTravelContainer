@@ -42,19 +42,15 @@ const DaemonProfile = `(version 1)
 
 // RendererProfile returns the profile that ttc-gfx-renderer, TTC's GPU
 // renderer, confines itself to before it reads anything from its Sentry. It
-// decodes a guest's command streams with gfxstream, so it gets only what
-// rendering takes:
+// decodes guests' command streams, so it gets only what rendering takes:
 //
 //   - reading Apple's system files; the package prefixes where Homebrew
 //     installs the Vulkan loader and MoltenVK, /opt/homebrew and /usr/local;
-//     and readable, the files of the renderer, gfxstream, and the loader,
-//     and the metadata of the directories above them, which resolving
-//     their paths reads;
+//     and readable, the renderer's files, and the metadata of the
+//     directories above them, which resolving their paths reads;
 //   - the GPU's IOKit user clients, and IOSurface's;
-//   - POSIX shared memory of the names that the renderer and gfxstream give
-//     it, "/ttcgfx." and "/gfxs.", random and unlinked at once;
-//   - if scratch is not empty, reading and writing the directory scratch,
-//     where the renderer takes and restores snapshots.
+//   - POSIX shared memory of the names that the renderer gives it,
+//     "/ttcgfx.", random and unlinked at once.
 //
 // It denies the rest, such as writing files, the network, starting
 // processes, and the services of the system that Apple's system.sb does
@@ -62,7 +58,7 @@ const DaemonProfile = `(version 1)
 //
 // A path with a control character, which the profile cannot spell, is an
 // error.
-func RendererProfile(readable []string, scratch string) (string, error) {
+func RendererProfile(readable []string) (string, error) {
 	var b strings.Builder
 	b.WriteString(`(version 1)
 (deny default)
@@ -74,9 +70,6 @@ func RendererProfile(readable []string, scratch string) (string, error) {
     (subpath "/opt/homebrew")
     (subpath "/usr/local")`)
 	ancestors := make(map[string]bool)
-	if strings.IndexFunc(scratch, unicode.IsControl) >= 0 {
-		return "", fmt.Errorf("path %q has a control character", scratch)
-	}
 	for _, path := range readable {
 		if strings.IndexFunc(path, unicode.IsControl) >= 0 {
 			return "", fmt.Errorf("path %q has a control character", path)
@@ -95,12 +88,8 @@ func RendererProfile(readable []string, scratch string) (string, error) {
     (iokit-connection "IOAccelerator")
     (iokit-user-client-class "IOSurfaceRootUserClient"))
 (allow ipc-posix-shm-read* ipc-posix-shm-write-create ipc-posix-shm-write-data ipc-posix-shm-write-unlink
-    (ipc-posix-name-prefix "/ttcgfx.")
-    (ipc-posix-name-prefix "/gfxs."))
+    (ipc-posix-name-prefix "/ttcgfx."))
 `)
-	if scratch != "" {
-		fmt.Fprintf(&b, "(allow file-read* file-write* (subpath %s))\n", quote(scratch))
-	}
 	return b.String(), nil
 }
 

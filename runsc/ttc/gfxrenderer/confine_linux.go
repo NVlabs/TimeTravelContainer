@@ -6,6 +6,6 @@ package gfxrenderer
 // Confine does nothing yet: Linux's renderers run as ttcd's children, with
 // ttcd's privileges. Confining them, as runsc confines its sandboxes, is for
 // the renderer's Linux support (plan item B1) to do.
-func Confine(Options) error {
+func Confine() error {
 	return nil
 }

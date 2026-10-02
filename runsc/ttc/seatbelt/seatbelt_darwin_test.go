@@ -53,7 +53,7 @@ func TestHelperProcess(t *testing.T) {
 		// its own, as the renderer admits its executable.
 		linked := filepath.Join(dir, "link", "readable")
 		readable := filepath.Join(dir, "real", "readable")
-		profile, err := RendererProfile([]string{linked, readable}, filepath.Join(dir, "scratch"))
+		profile, err := RendererProfile([]string{linked, readable})
 		if err != nil {
 			fail("RendererProfile: %v", err)
 		}
@@ -76,9 +76,6 @@ func TestHelperProcess(t *testing.T) {
 		}
 		if err := os.WriteFile(filepath.Join(dir, "written"), []byte("x"), 0600); err == nil {
 			fail("wrote a file, which the profile denies")
-		}
-		if err := os.WriteFile(filepath.Join(dir, "scratch", "written"), []byte("x"), 0600); err != nil {
-			fail("writing a file in the scratch directory: %v", err)
 		}
 		if conn, err := net.Dial("tcp", address); err == nil {
 			conn.Close()
@@ -228,10 +225,8 @@ func TestRendererProfile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"real", "scratch"} {
-		if err := os.Mkdir(filepath.Join(dir, name), 0700); err != nil {
-			t.Fatal(err)
-		}
+	if err := os.Mkdir(filepath.Join(dir, "real"), 0700); err != nil {
+		t.Fatal(err)
 	}
 	if err := os.Symlink("real", filepath.Join(dir, "link")); err != nil {
 		t.Fatal(err)
@@ -249,17 +244,14 @@ func TestRendererProfile(t *testing.T) {
 }
 
 func TestRendererProfileQuotes(t *testing.T) {
-	profile, err := RendererProfile([]string{`/a "b" \c`}, "")
+	profile, err := RendererProfile([]string{`/a "b" \c`})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if want := `(literal "/a \"b\" \\c")`; !strings.Contains(profile, want) {
 		t.Errorf("profile has no %s:\n%s", want, profile)
 	}
-	if _, err := RendererProfile([]string{"/a\nb"}, ""); err == nil {
+	if _, err := RendererProfile([]string{"/a\nb"}); err == nil {
 		t.Error("a path with a newline was accepted")
-	}
-	if _, err := RendererProfile(nil, "/a\nb"); err == nil {
-		t.Error("a scratch directory with a newline was accepted")
 	}
 }

@@ -11,7 +11,7 @@ package(
 go_binary(
     name = "ttc-gfx-renderer",
     srcs = ["main.go"],
-    # The renderer loads gfxstream, a C++ library, with dlopen, through cgo.
+    # The renderer calls Vulkan, which it loads with dlopen, through cgo.
     # Like ttcd's, Linux configurations keep the repository's default.
     pure = select_system(darwin = "off", linux = "auto"),
     visibility = ["//visibility:public"],
