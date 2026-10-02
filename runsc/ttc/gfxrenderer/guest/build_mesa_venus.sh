@@ -11,10 +11,12 @@
 #   ttc cp mesabuild@main:/out - | tar -x
 #
 # It installs lib/<triple>/libvulkan_virtio.so and a Vulkan ICD manifest
-# under share/vulkan/icd.d. The driver links libdrm and the C++ runtime
+# under share/vulkan/icd.d, with TTC's patches (patches/, beside this
+# script) applied. The driver links libdrm and the C++ runtime
 # statically, and needs no expat, so it needs only the C library in the
 # guest.
 set -eu
+PATCHES=$(cd "$(dirname "$0")" && pwd)/patches
 PREFIX=${PREFIX:-/out}
 # The commit that the virtual GPU was developed against, and the version of
 # the Venus protocol that it pins.
@@ -37,6 +39,9 @@ if [ ! -d mesa/subprojects/venus-protocol ]; then
     git clone -q --depth 1 --branch "$VENUS_PROTOCOL_TAG" \
         https://gitlab.freedesktop.org/virgl/venus-protocol.git mesa/subprojects/venus-protocol
 fi
+for patch in "$PATCHES"/*.patch; do
+    git -C mesa apply --reverse --check "$patch" 2>/dev/null || git -C mesa apply "$patch"
+done
 cd mesa
 meson setup build -Dprefix="$PREFIX" -Dvulkan-drivers=virtio -Dgallium-drivers= \
     -Dplatforms= -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dopengl=false \

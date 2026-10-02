@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Builds Mesa's Venus Vulkan driver (virtio) for Android (arm64), the guest
+# Builds Mesa's Venus Vulkan driver (virtio) for Android (arm64, or x86-64
+# with ARCH=x86_64), the guest
 # side of --gfx for Android containers such as redroid's with TTC's Venus
 # renderer, into $PREFIX/lib64/hw/vulkan.virtio.so (default PREFIX:
 # ./out-android-venus). Run it on macOS or x86-64 Linux, with the Android
@@ -19,7 +20,16 @@
 # Vulkan HAL of ro.hardware.vulkan=virtio.
 set -eu
 : "${ANDROID_NDK:?set ANDROID_NDK to the Android NDK}"
+# TTC's patches to Mesa, beside this script.
+PATCHES=$(cd "$(dirname "$0")" && pwd)/patches
 API=${API:-34}
+# The guest's architecture: aarch64, or x86_64.
+ARCH=${ARCH:-aarch64}
+case "$ARCH" in
+aarch64) CPU=armv8-a ;;
+x86_64) CPU=x86_64 ;;
+*) echo "unsupported architecture: $ARCH" >&2; exit 1 ;;
+esac
 PREFIX=${PREFIX:-$PWD/out-android-venus}
 # The commit that the virtual GPU was developed against, and the version of
 # the Venus protocol that it pins.
@@ -33,7 +43,7 @@ Linux) HOST_TAG=linux-x86_64 ;;
 *) echo "unsupported host: $(uname -s)" >&2; exit 1 ;;
 esac
 TOOLCHAIN=$ANDROID_NDK/toolchains/llvm/prebuilt/$HOST_TAG/bin
-[ -x "$TOOLCHAIN/aarch64-linux-android$API-clang" ] || {
+[ -x "$TOOLCHAIN/$ARCH-linux-android$API-clang" ] || {
     echo "no NDK compiler for API $API in $TOOLCHAIN" >&2
     exit 1
 }
@@ -49,11 +59,15 @@ if [ ! -d mesa/subprojects/venus-protocol ]; then
     git clone -q --depth 1 --branch "$VENUS_PROTOCOL_TAG" \
         https://gitlab.freedesktop.org/virgl/venus-protocol.git mesa/subprojects/venus-protocol
 fi
-cat >android-aarch64.cross <<CROSS
+for patch in "$PATCHES"/*.patch; do
+    git -C mesa apply --reverse --check "$patch" 2>/dev/null || git -C mesa apply "$patch"
+done
+cat >android-$ARCH.cross <<CROSS
 [binaries]
-c = '$TOOLCHAIN/aarch64-linux-android$API-clang'
-cpp = '$TOOLCHAIN/aarch64-linux-android$API-clang++'
+c = '$TOOLCHAIN/$ARCH-linux-android$API-clang'
+cpp = '$TOOLCHAIN/$ARCH-linux-android$API-clang++'
 ar = '$TOOLCHAIN/llvm-ar'
+nm = '$TOOLCHAIN/llvm-nm'
 strip = '$TOOLCHAIN/llvm-strip'
 pkg-config = 'false'
 
@@ -62,12 +76,12 @@ needs_exe_wrapper = true
 
 [host_machine]
 system = 'android'
-cpu_family = 'aarch64'
-cpu = 'armv8-a'
+cpu_family = '$ARCH'
+cpu = '$CPU'
 endian = 'little'
 CROSS
 cd mesa
-meson setup build --cross-file ../android-aarch64.cross -Dplatforms=android \
+meson setup build-$ARCH --cross-file ../android-$ARCH.cross -Dplatforms=android \
     -Dplatform-sdk-version="$API" -Dandroid-stub=true -Dandroid-libbacktrace=disabled \
     -Dvulkan-drivers=virtio -Dgallium-drivers= -Dglx=disabled -Degl=disabled -Dgbm=disabled \
     -Dopengl=false -Dgles1=disabled -Dgles2=disabled -Dllvm=disabled -Dvideo-codecs= \
@@ -75,9 +89,9 @@ meson setup build --cross-file ../android-aarch64.cross -Dplatforms=android \
     -Dallow-fallback-for=libdrm --force-fallback-for=libdrm -Dlibdrm:default_library=static \
     "-Dcpp_link_args=['-static-libstdc++']" \
     -Dbuildtype=release >"$BUILD/meson-setup.log" 2>&1 || { tail -30 "$BUILD/meson-setup.log"; exit 1; }
-ninja -C build src/virtio/vulkan/libvulkan_virtio.so >"$BUILD/ninja.log" 2>&1 ||
+ninja -C build-$ARCH src/virtio/vulkan/libvulkan_virtio.so >"$BUILD/ninja.log" 2>&1 ||
     { grep -m5 -B2 -A8 'error:' "$BUILD/ninja.log"; exit 1; }
 mkdir -p "$PREFIX/lib64/hw"
 "$TOOLCHAIN/llvm-strip" -o "$PREFIX/lib64/hw/vulkan.virtio.so" \
-    build/src/virtio/vulkan/libvulkan_virtio.so
+    build-$ARCH/src/virtio/vulkan/libvulkan_virtio.so
 ls -la "$PREFIX/lib64/hw/vulkan.virtio.so"

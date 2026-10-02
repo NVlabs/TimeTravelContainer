@@ -54,7 +54,10 @@ bazel test //pkg/sentry/devices/virtgpu/rendererclient:rendererclient_test
 ## The guest's driver
 
 Guests use Mesa's Venus Vulkan driver. `guest/build_mesa_venus.sh` builds it
-in a Debian container of the guest's architecture.
+in a Debian container of the guest's architecture, with TTC's patches
+(`guest/patches/`): on NVIDIA hosts, Mesa hides the device's DRM properties,
+for X11's and Wayland's presentation, which the driver has none of, and
+Zink then finds no device for the render node.
 
 ttcd gives it to the containers of `--gfx` families: it mounts, read-only,
 
@@ -85,13 +88,14 @@ applications render in software.
 
 ### Android
 
-`guest/build_mesa_venus_android.sh` builds the driver for Android (arm64)
-with the NDK, on macOS or Linux, into `vulkan.virtio.so`, which Android
-loads as the Vulkan HAL of `ro.hardware.vulkan=virtio`. Android's buffers
-are minigbm's, the gralloc of Android images for virtio-gpu: minigbm asks
-the renderer, by a cross-domain context, how to lay out each image, and the
-renderer answers with the layout of the host's linear images, so that the
-images that the guest's Vulkan creates of a buffer share its memory.
+`guest/build_mesa_venus_android.sh` builds the driver for Android (arm64, or
+x86-64 with `ARCH=x86_64`) with the NDK, on macOS or Linux, into
+`vulkan.virtio.so`, which Android loads as the Vulkan HAL of
+`ro.hardware.vulkan=virtio`. Android's buffers are minigbm's, the gralloc of
+Android images for virtio-gpu: minigbm asks the renderer, by a cross-domain
+context, how to lay out each image, and the renderer answers with the layout
+of the host's linear images, so that the images that the guest's Vulkan
+creates of a buffer share its memory.
 
 redroid, an Android image for containers, runs in TTC with the GPU: its init
 is the container's, and `guest/redroid/gpu_config.sh`, which replaces the
