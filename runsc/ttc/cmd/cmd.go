@@ -12611,6 +12611,9 @@ func (b *runtimeBackend) listRuntimeFamilies() ([]Family, error) {
 // given IDs, or of every sandbox if none is given. It asks no other sandbox
 // about itself.
 func (b *runtimeBackend) listRuntimeFamiliesOf(ids ...string) ([]Family, error) {
+	if embeddedRuntime(b.runsc) {
+		return embeddedRuntimeFamilies(b.root, ids)
+	}
 	var states []runtimeSandboxState
 	var err error
 	if len(ids) != 0 {
@@ -12626,31 +12629,36 @@ func (b *runtimeBackend) listRuntimeFamiliesOf(ids ...string) ([]Family, error) 
 		if state.ID == "" {
 			continue
 		}
-		family := Family{ID: state.ID, State: normalizeLifecycleState(state.Status), SandboxPID: state.PID, Branches: []Branch{}}
 		output, err := b.command("timetravel", state.ID, "branches")
-		if err != nil {
-			family.Error = err.Error()
-			family.Branches = append(family.Branches, Branch{ID: defaultBranchID, State: normalizeLifecycleState(state.Status)})
-			families = append(families, family)
-			continue
-		}
-		var branches []runscBranchInfo
-		if err := json.Unmarshal(output, &branches); err != nil {
-			family.Error = fmt.Sprintf("decoding runsc branch list: %v", err)
-			family.Branches = append(family.Branches, Branch{ID: defaultBranchID, State: normalizeLifecycleState(state.Status)})
-			families = append(families, family)
-			continue
-		}
-		for _, branch := range branches {
-			family.Branches = append(family.Branches, branchView(branch))
-			if branch.ID == defaultBranchID {
-				family.State = normalizeLifecycleState(branch.State)
-			}
-		}
-		sort.Slice(family.Branches, func(i, j int) bool { return family.Branches[i].ID < family.Branches[j].ID })
-		families = append(families, family)
+		families = append(families, runtimeFamily(state, output, err))
 	}
 	return families, nil
+}
+
+// runtimeFamily is the family of the sandbox in state, of the branches its
+// runtime listed in output, or of its main branch alone if the runtime could
+// not list them, err saying why.
+func runtimeFamily(state runtimeSandboxState, output []byte, err error) Family {
+	family := Family{ID: state.ID, State: normalizeLifecycleState(state.Status), SandboxPID: state.PID, Branches: []Branch{}}
+	if err != nil {
+		family.Error = err.Error()
+		family.Branches = append(family.Branches, Branch{ID: defaultBranchID, State: normalizeLifecycleState(state.Status)})
+		return family
+	}
+	var branches []runscBranchInfo
+	if err := json.Unmarshal(output, &branches); err != nil {
+		family.Error = fmt.Sprintf("decoding runsc branch list: %v", err)
+		family.Branches = append(family.Branches, Branch{ID: defaultBranchID, State: normalizeLifecycleState(state.Status)})
+		return family
+	}
+	for _, branch := range branches {
+		family.Branches = append(family.Branches, branchView(branch))
+		if branch.ID == defaultBranchID {
+			family.State = normalizeLifecycleState(branch.State)
+		}
+	}
+	sort.Slice(family.Branches, func(i, j int) bool { return family.Branches[i].ID < family.Branches[j].ID })
+	return family
 }
 
 type runscExecSession struct {

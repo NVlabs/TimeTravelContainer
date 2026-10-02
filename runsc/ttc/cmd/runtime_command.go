@@ -6,13 +6,16 @@ package cmd
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -32,6 +35,98 @@ func runscCommand(path string, args ...string) *exec.Cmd {
 		args = append([]string{"runsc"}, args...)
 	}
 	return exec.Command(path, args...)
+}
+
+// loadEmbeddedContainer loads the container with id, the ID of its sandbox's
+// own container, as TTC names its families', by that exact ID, and searches
+// the runtime root for an abbreviated ID only if there is none: the search
+// read every name in the root, and every command on a family paid for it.
+func loadEmbeddedContainer(root, id string, opts container.LoadOpts) (*container.Container, error) {
+	exact := opts
+	exact.Exact = true
+	c, err := container.Load(root, container.FullID{SandboxID: id, ContainerID: id}, exact)
+	if err == nil || !errors.Is(err, os.ErrNotExist) {
+		return c, err
+	}
+	return container.Load(root, container.FullID{ContainerID: id}, opts)
+}
+
+// runtimeListConcurrency bounds the sandboxes a listing asks at once.
+const runtimeListConcurrency = 8
+
+// embeddedRuntimeFamilies is listRuntimeFamiliesOf with the runtime embedded:
+// it reads each sandbox's state once, by its exact ID, and asks the sandboxes
+// for their branches at once. Through runsc's commands a listing read each
+// state twice, the second time searching the runtime root for it, and asked
+// one sandbox after another: `ps -a` took 37 ms with 40 families.
+func embeddedRuntimeFamilies(root string, ids []string) ([]Family, error) {
+	var sandboxes []container.FullID
+	if len(ids) == 0 {
+		var err error
+		if sandboxes, err = container.ListSandboxes(root); err != nil {
+			return nil, err
+		}
+	} else {
+		for _, id := range ids {
+			sandboxes = append(sandboxes, container.FullID{SandboxID: id, ContainerID: id})
+		}
+	}
+	families := make([]Family, len(sandboxes))
+	forEachConcurrently(len(sandboxes), runtimeListConcurrency, func(i int) {
+		// Like runsc list, pass over a sandbox that cannot be loaded, as one
+		// being deleted.
+		c, err := container.Load(root, sandboxes[i], container.LoadOpts{Exact: true})
+		if err != nil {
+			return
+		}
+		state := c.State()
+		if state.ID == "" {
+			return
+		}
+		var output []byte
+		branches, err := c.Sandbox.ListBranches()
+		if err != nil {
+			err = fmt.Errorf("timetravel branches failed: %v", err)
+		} else {
+			output, err = json.Marshal(branches)
+		}
+		families[i] = runtimeFamily(runtimeSandboxState{ID: state.ID, PID: state.Pid, Status: string(state.Status)}, output, err)
+	})
+	listed := families[:0]
+	for _, family := range families {
+		if family.ID != "" {
+			listed = append(listed, family)
+		}
+	}
+	sort.Slice(listed, func(i, j int) bool { return listed[i].ID < listed[j].ID })
+	return listed, nil
+}
+
+// forEachConcurrently calls do with each index below n, on at most limit
+// goroutines at once, and returns once every call has.
+func forEachConcurrently(n, limit int, do func(int)) {
+	if limit = min(limit, n); limit <= 1 {
+		for i := range n {
+			do(i)
+		}
+		return
+	}
+	indexes := make(chan int)
+	var wg sync.WaitGroup
+	for range limit {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range indexes {
+				do(i)
+			}
+		}()
+	}
+	for i := range n {
+		indexes <- i
+	}
+	close(indexes)
+	wg.Wait()
 }
 
 // embeddedRuntime reports whether path is the OCI runtime embedded in ttcd,
@@ -147,7 +242,7 @@ func embeddedRuntimeCommand(root string, args []string) ([]byte, bool, error) {
 		default:
 			return nil, false, nil
 		}
-		c, err := container.Load(root, container.FullID{ContainerID: rest[0]}, container.LoadOpts{SkipCheck: true})
+		c, err := loadEmbeddedContainer(root, rest[0], container.LoadOpts{SkipCheck: true})
 		if err != nil {
 			return nil, true, fmt.Errorf("loading container: %v", err)
 		}
@@ -167,7 +262,7 @@ func embeddedRuntimeCommand(root string, args []string) ([]byte, bool, error) {
 		if len(rest) < 3 || rest[1] != "fork" {
 			return nil, false, nil
 		}
-		c, err := container.Load(root, container.FullID{ContainerID: rest[0]}, container.LoadOpts{SkipCheck: true})
+		c, err := loadEmbeddedContainer(root, rest[0], container.LoadOpts{SkipCheck: true})
 		if err != nil {
 			return nil, true, fmt.Errorf("loading container: %v", err)
 		}
@@ -194,7 +289,7 @@ func embeddedRuntimeCommand(root string, args []string) ([]byte, bool, error) {
 		}
 		output = states
 	case len(args) == 2 && args[0] == "state":
-		c, err := container.Load(root, container.FullID{ContainerID: args[1]}, container.LoadOpts{})
+		c, err := loadEmbeddedContainer(root, args[1], container.LoadOpts{})
 		if err != nil {
 			return nil, true, fmt.Errorf("loading container: %v", err)
 		}
@@ -231,7 +326,7 @@ func embeddedRuntimeCommand(root string, args []string) ([]byte, bool, error) {
 		default:
 			return nil, false, nil
 		}
-		c, err := container.Load(root, container.FullID{ContainerID: rest[0]}, container.LoadOpts{SkipCheck: true})
+		c, err := loadEmbeddedContainer(root, rest[0], container.LoadOpts{SkipCheck: true})
 		if err != nil {
 			return nil, true, fmt.Errorf("loading container: %v", err)
 		}
