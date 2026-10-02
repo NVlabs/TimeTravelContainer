@@ -1926,6 +1926,19 @@ func (s *daemonServer) activateMaterializedLifecycleTargets(backend *runtimeBack
 // fails. Retrying is then routed back to the node that may hold local staging
 // state, while node drain can still move or republish the cold branch.
 func (s *daemonServer) claimUnplacedLifecycleTargets(backend *runtimeBackend, args []string) error {
+	return s.claimLifecycleTargets(backend, args, true)
+}
+
+// reclaimCompletedLifecycleTargets repeats claimUnplacedLifecycleTargets once
+// the command has run: its branches run on this node, or are its, whether or
+// not the node accepts new work by then. The work it ran may have taken the
+// node's memory past its target: refusing then reported a start that had
+// succeeded as failed.
+func (s *daemonServer) reclaimCompletedLifecycleTargets(backend *runtimeBackend, args []string) error {
+	return s.claimLifecycleTargets(backend, args, false)
+}
+
+func (s *daemonServer) claimLifecycleTargets(backend *runtimeBackend, args []string, admit bool) error {
 	if s == nil || backend == nil || s.clusterDirectory == nil || s.clusterCapabilities == nil || !daemonCommandClaimsUnplaced(args) {
 		return nil
 	}
@@ -1936,7 +1949,7 @@ func (s *daemonServer) claimUnplacedLifecycleTargets(backend *runtimeBackend, ar
 	if err != nil {
 		return fmt.Errorf("renewing cold-branch placement authority: %w", err)
 	}
-	if !node.AcceptsPlacement(time.Now()) {
+	if admit && !node.AcceptsPlacement(time.Now()) {
 		return fmt.Errorf("cluster node %q is not accepting cold-branch placement (state=%s)", node.NodeID, node.State)
 	}
 	placements, err := backend.placementCatalog()

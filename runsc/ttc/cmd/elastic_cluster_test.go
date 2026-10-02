@@ -1213,6 +1213,18 @@ func TestClaimUnplacedLifecycleTargetRecordsSelectedNode(t *testing.T) {
 	if _, _, err := daemonCommandPlacementWithCatalog(root, placements, []string{"exec", "web@main", "true"}); err == nil {
 		t.Fatal("materializing branch allowed guest execution")
 	}
+	// Its memory past its target, the node admits no cold branch, but a
+	// branch it ran stays its own: the claim repeated once the command ran
+	// succeeds.
+	if _, err := directory.Heartbeat(node.NodeID, node.Incarnation, 1<<61, time.Now(), time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.claimUnplacedLifecycleTargets(backend, []string{"start", "web@main"}); err == nil || !strings.Contains(err.Error(), "state=pressured") {
+		t.Fatalf("a pressured node admitted a cold branch: %v", err)
+	}
+	if err := server.reclaimCompletedLifecycleTargets(backend, []string{"start", "web@main"}); err != nil {
+		t.Fatalf("re-claiming the branch a pressured node ran: %v", err)
+	}
 }
 
 // Placement reconciliation leaves alone a family that a long operation works

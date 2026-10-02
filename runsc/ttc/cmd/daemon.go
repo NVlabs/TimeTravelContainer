@@ -7778,7 +7778,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			// dehydration after the pre-command claim but before rehydrate
 			// consumes the durable image. Repeat the idempotent claim at the
 			// successful execution boundary before catalog reconciliation.
-			if err := s.claimUnplacedLifecycleTargets(mutationBackend, request.Args); err != nil {
+			if err := s.reclaimCompletedLifecycleTargets(mutationBackend, request.Args); err != nil {
 				fmt.Fprintf(&mutationStderr, "ttcd: claiming completed rehydration placement: %v\n", err)
 				status = 1
 			} else if daemonCommandNeedsMutationLock(request.Args) {
@@ -7825,7 +7825,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	}
 	s.recordCommandEvents(opts.dataRoot, request.Args, status, backend.resolvedFamilies)
 	if status == 0 {
-		if err := s.claimUnplacedLifecycleTargets(backend, request.Args); err != nil {
+		if err := s.reclaimCompletedLifecycleTargets(backend, request.Args); err != nil {
 			fmt.Fprintf(backend.stderr, "ttcd: claiming completed rehydration placement: %v\n", err)
 			status = 1
 		} else if daemonCommandNeedsMutationLock(request.Args) {
