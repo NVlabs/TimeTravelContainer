@@ -14,6 +14,7 @@ go_library(
     force_add_state_pkg = True,
     srcs = [
         "capture_reuse.go",
+        "carried.go",
         "catalog_claims.go",
         "checkpoint.go",
         "cmd.go",
@@ -104,6 +105,7 @@ go_test(
     name = "cmd_test",
     size = "small",
     srcs = [
+        "carried_test.go",
         "cmd_test.go",
         "cmd_host_darwin_test.go",
         "console_followers_test.go",

@@ -17,7 +17,8 @@
 #
 # It needs:
 #   TTC and TTCD, the binaries;
-#   TTC_CUDA_CHECKPOINT, ttc-cuda-checkpoint;
+#   optionally TTC_CUDA_CHECKPOINT, a ttc-cuda-checkpoint to give containers
+#     instead of the daemon's;
 #   CUDALOOP, cudaloop built for the host's GPU, for instance with
 #     nvcc -O2 -o cudaloop runsc/ttc/test/nvproxy/cudaloop.cu;
 #   a host with NVIDIA GPUs and a driver that nvproxy supports, or
@@ -46,7 +47,8 @@ fail() {
 
 [ -x "$TTC" ] || fail "set TTC to the ttc binary"
 [ -x "$TTCD" ] || fail "set TTCD to the matching ttcd binary"
-[ -x "$TTC_CUDA_CHECKPOINT" ] || fail "set TTC_CUDA_CHECKPOINT to ttc-cuda-checkpoint"
+[ -z "$TTC_CUDA_CHECKPOINT" ] || [ -x "$TTC_CUDA_CHECKPOINT" ] ||
+  fail "TTC_CUDA_CHECKPOINT names no ttc-cuda-checkpoint"
 [ -x "$CUDALOOP" ] || fail "set CUDALOOP to cudaloop, built for the host's GPU"
 [ -c /dev/nvidiactl ] || fail "the host has no NVIDIA driver"
 owned_root=false
@@ -62,9 +64,14 @@ WORK_DIR="$TTC_E2E_ROOT/work"
 mkdir -p "$BIN_DIR" "$WORK_DIR"
 install -m 0755 "$(readlink -f "$TTC")" "$BIN_DIR/ttc"
 install -m 0755 "$(readlink -f "$TTCD")" "$BIN_DIR/ttcd"
-# The daemon finds ttc-cuda-checkpoint beside itself.
-install -m 0755 "$(readlink -f "$TTC_CUDA_CHECKPOINT")" "$BIN_DIR/ttc-cuda-checkpoint"
-unset TTC_CUDA_CHECKPOINT
+# The daemon gives containers the ttc-cuda-checkpoint that it carries,
+# unless TTC_CUDA_CHECKPOINT names another.
+if [ -n "$TTC_CUDA_CHECKPOINT" ]; then
+  TTC_CUDA_CHECKPOINT=$(readlink -f "$TTC_CUDA_CHECKPOINT")
+  export TTC_CUDA_CHECKPOINT
+else
+  unset TTC_CUDA_CHECKPOINT
+fi
 install -m 0755 "$(readlink -f "$CUDALOOP")" "$WORK_DIR/cudaloop"
 
 ttc() {

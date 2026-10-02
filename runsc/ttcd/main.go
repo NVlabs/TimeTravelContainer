@@ -15,11 +15,18 @@ import (
 	"gvisor.dev/gvisor/runsc/processutil"
 	"gvisor.dev/gvisor/runsc/ttc/cmd"
 	"gvisor.dev/gvisor/runsc/ttc/copyguest"
+	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer"
+	"gvisor.dev/gvisor/runsc/ttc/hostbin"
 	"gvisor.dev/gvisor/runsc/version"
 )
 
 func main() {
+	if len(os.Args) >= 2 && os.Args[1] == cmd.GFXRendererArg {
+		// ttcd is its GPU renderer on macOS (see cmd.GFXRendererArg).
+		os.Exit(gfxrenderer.Main(os.Args[2:], []string{cmd.GFXRendererArg}))
+	}
 	cmd.SetGuestCopyHelper(copyguest.Binary())
+	cmd.SetCarriedHelpers(hostbin.GFXRenderer(), hostbin.CUDACheckpoint())
 	if len(os.Args) >= 2 && os.Args[1] == "_cp-helper" {
 		os.Exit(cmd.RunCopyHelper(os.Args[2:], os.Stdin, os.Stdout, os.Stderr))
 	}

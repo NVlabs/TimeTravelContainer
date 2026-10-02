@@ -28,8 +28,8 @@ const nvproxyDriverVersionEnv = "TTC_NVPROXY_DRIVER_VERSION"
 
 // ttcd gives the containers of --nvproxy-fork=snapshot families its
 // ttc-cuda-checkpoint, with which their forks checkpoint the processes that
-// use the GPUs. ttcd looks for it beside itself, unless TTC_CUDA_CHECKPOINT
-// names it.
+// use the GPUs: the one that TTC_CUDA_CHECKPOINT names, the one that ttcd
+// carries, or the one beside ttcd.
 const (
 	cudaCheckpointName = "ttc-cuda-checkpoint"
 	cudaCheckpointEnv  = "TTC_CUDA_CHECKPOINT"
@@ -37,10 +37,18 @@ const (
 	cudaCheckpointPath = "/usr/lib/ttc-nvidia/cuda-checkpoint"
 )
 
-// cudaCheckpointTool returns the path of ttcd's ttc-cuda-checkpoint.
-func cudaCheckpointTool() (string, error) {
+// cudaCheckpointTool returns the path of ttcd's ttc-cuda-checkpoint, which
+// it writes in dir if it carries it.
+func cudaCheckpointTool(dir string) (string, error) {
 	tool := os.Getenv(cudaCheckpointEnv)
 	if tool == "" {
+		carried, err := carriedCUDACheckpoint(dir)
+		if err != nil {
+			return "", fmt.Errorf("writing the %s that ttcd carries: %w", cudaCheckpointName, err)
+		}
+		if carried != "" {
+			return carried, nil
+		}
 		exe, err := os.Executable()
 		if err != nil {
 			return "", err
@@ -48,7 +56,7 @@ func cudaCheckpointTool() (string, error) {
 		tool = filepath.Join(filepath.Dir(exe), cudaCheckpointName)
 	}
 	if _, err := os.Stat(tool); err != nil {
-		return "", fmt.Errorf("--nvproxy-fork=snapshot needs %s: %w; install it beside ttcd, or name it with %s", cudaCheckpointName, err, cudaCheckpointEnv)
+		return "", fmt.Errorf("--nvproxy-fork=snapshot needs %s: %w; this ttcd carries none: install it beside ttcd, or name it with %s", cudaCheckpointName, err, cudaCheckpointEnv)
 	}
 	return tool, nil
 }
@@ -129,6 +137,9 @@ var nvidiaGPUDevice = regexp.MustCompile(`^nvidia[0-9]+$`)
 type nvproxyService struct {
 	// platform is the daemon's runtime platform.
 	platform string
+	// dir is the service's directory, which holds files that it gives
+	// containers.
+	dir string
 
 	once sync.Once
 	host *nvidiaHost
@@ -357,7 +368,11 @@ func (s *nvproxyService) edits(opts ttcbundle.GPUOptions) ([]ttcbundle.HostMount
 		}
 	}
 	if opts.NVProxyFork == ttcbundle.GPUForkSnapshot {
-		tool, err := cudaCheckpointTool()
+		var dir string
+		if s != nil {
+			dir = s.dir
+		}
+		tool, err := cudaCheckpointTool(dir)
 		if err != nil {
 			return nil, nil, err
 		}

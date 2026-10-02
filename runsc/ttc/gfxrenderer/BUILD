@@ -16,6 +16,7 @@ go_library(
         "confine_linux.go",
         "gfxrenderer.go",
         "launcher.go",
+        "main.go",
         "nocgo.go",
         "renderer.go",
     ],
@@ -39,6 +40,7 @@ go_test(
     srcs = [
         "family_test.go",
         "launcher_test.go",
+        "main_test.go",
     ],
     library = ":gfxrenderer",
     # The renderer of a family serves with the Venus backend, which calls

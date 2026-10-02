@@ -19,8 +19,13 @@ import (
 
 // BrokerOptions configures a renderers' broker.
 type BrokerOptions struct {
-	// Renderer is the path of ttc-gfx-renderer.
+	// Renderer is the path of ttc-gfx-renderer, or of an executable that is
+	// it with RendererArgs.
 	Renderer string
+
+	// RendererArgs precede a renderer's mode in its arguments: ttcd's
+	// _gfx-renderer, where ttcd is the renderer.
+	RendererArgs []string
 
 	// Stderr receives the renderers' logs.
 	Stderr io.Writer
@@ -34,10 +39,10 @@ type BrokerOptions struct {
 	Unconfined bool
 }
 
-// args returns the arguments of a renderer in mode, "serve-family" or
-// "probe".
+// args returns the arguments of a renderer in mode, "serve-family",
+// "probe" or "launch".
 func (o *BrokerOptions) args(mode string) []string {
-	args := []string{mode}
+	args := append(append([]string(nil), o.RendererArgs...), mode)
 	if o.Unconfined {
 		args = append(args, "--unconfined")
 	}

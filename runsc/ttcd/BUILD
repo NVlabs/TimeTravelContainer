@@ -22,6 +22,8 @@ go_binary(
         "//runsc/processutil",
         "//runsc/ttc/cmd",
         "//runsc/ttc/copyguest",
+        "//runsc/ttc/gfxrenderer",
+        "//runsc/ttc/hostbin",
         "//runsc/version",
     ],
 )
@@ -38,6 +40,8 @@ go_test(
         "//runsc/processutil",
         "//runsc/ttc/cmd",
         "//runsc/ttc/copyguest",
+        "//runsc/ttc/gfxrenderer",
+        "//runsc/ttc/hostbin",
         "//runsc/version",
     ],
 )

@@ -512,6 +512,82 @@ func processStatm(pid int) (resident, shared uint64, err error) {
 	return residentPages * pageSize, sharedPages * pageSize, nil
 }
 
+// carriedExecutableFD is the least descriptor at which the daemon keeps a
+// memory file that it executes: above those that os/exec places, and moves,
+// in the children that execute it from /proc/self/fd.
+const carriedExecutableFD = 256
+
+// mfdExec is memfd_create's MFD_EXEC, which systems whose memory files are
+// not executable by default (vm.memfd_noexec, Linux 6.3) need.
+const mfdExec = 0x10
+
+// runnableExecutable returns a path from which content, an executable named
+// name, runs: a sealed memory file, which the daemon keeps open, or, where a
+// memory file cannot run, a file in dir.
+func runnableExecutable(name string, content []byte, dir string) (string, error) {
+	path, err := memoryExecutable(name, content)
+	if err != nil {
+		if dir == "" {
+			return "", err
+		}
+		return writeContainerFile(dir, name, content, 0555)
+	}
+	if dir == "" {
+		return path, nil
+	}
+	// A process takes its name from the path that it executes, which would
+	// name it N, the memory file's descriptor: a link in dir, named name, to
+	// the memory file names it name.
+	link := filepath.Join(dir, name)
+	tmp := filepath.Join(dir, "."+name+".link")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return path, nil
+	}
+	_ = os.Remove(tmp)
+	if err := os.Symlink(path, tmp); err != nil {
+		return path, nil
+	}
+	if err := os.Rename(tmp, link); err != nil {
+		_ = os.Remove(tmp)
+		return path, nil
+	}
+	return link, nil
+}
+
+// memoryExecutable returns the path of a sealed memory file, named name, with
+// content, that the daemon keeps open and children execute.
+func memoryExecutable(name string, content []byte) (string, error) {
+	flags := unix.MFD_CLOEXEC | unix.MFD_ALLOW_SEALING
+	fd, err := unix.MemfdCreate(name, flags|mfdExec)
+	if err == unix.EINVAL {
+		// A kernel before 6.3, whose memory files are executable.
+		fd, err = unix.MemfdCreate(name, flags)
+	}
+	if err != nil {
+		return "", fmt.Errorf("creating a memory file for %s: %w", name, err)
+	}
+	f := os.NewFile(uintptr(fd), name)
+	defer f.Close()
+	if _, err := f.Write(content); err != nil {
+		return "", fmt.Errorf("writing %s: %w", name, err)
+	}
+	if _, err := unix.FcntlInt(f.Fd(), unix.F_ADD_SEALS, unix.F_SEAL_SEAL|unix.F_SEAL_SHRINK|unix.F_SEAL_GROW|unix.F_SEAL_WRITE); err != nil {
+		return "", fmt.Errorf("sealing %s: %w", name, err)
+	}
+	kept, err := unix.FcntlInt(f.Fd(), unix.F_DUPFD_CLOEXEC, carriedExecutableFD)
+	if err != nil {
+		return "", fmt.Errorf("keeping %s: %w", name, err)
+	}
+	path := fmt.Sprintf("/proc/self/fd/%d", kept)
+	// A system whose memory files do not run, or that has no /proc, says so
+	// here.
+	if err := unix.Access(path, unix.X_OK); err != nil {
+		unix.Close(kept)
+		return "", fmt.Errorf("%s in a memory file: %w", name, err)
+	}
+	return path, nil
+}
+
 // cloexecStreamSocketpair creates a close-on-exec AF_UNIX stream pair.
 func cloexecStreamSocketpair() ([2]int, error) {
 	return unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)

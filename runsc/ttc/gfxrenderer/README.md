@@ -17,6 +17,19 @@ virtual GPU's in `g3doc/proposals/ttc_gpu_gfx_nvproxy.md`.
 *   `launch` starts renderers for the ttcd connected to its fd 3
     (`ServeLauncher`), on macOS.
 
+ttcd is the renderer, or carries it, so that a host needs no file of it.
+On macOS, where ttcd links C and loads the renderer's graphics libraries only
+when it renders, ttcd runs as the renderer with `ttcd _gfx-renderer MODE`
+(`GFXRendererArg` in `runsc/ttc/cmd`). On Linux, where ttcd links no C
+library and the renderer does, ttcd carries the renderer, gzip-compressed
+(`runsc/ttc/hostbin`), and runs it from a sealed memory file, or from a file
+in its root where memory files cannot run. Its C library functions are
+bound to versions that every glibc since 2.17 has (`runsc/ttc/glibccompat`).
+`TTC_GFX_RENDERER` names a renderer to run instead; a ttcd that carries
+none, as one cross-built for another architecture (`--config=aarch64`) or
+built with `--//runsc/ttc/hostbin:carry_helpers=false`, runs the one beside
+it.
+
 A fork's child shares its parent's renderer: the renderer clones the
 branch's GPU contexts for it, sharing their compiled objects, so that no
 shader is compiled again and nothing is serialized. A snapshot is a
@@ -46,7 +59,7 @@ loader and MoltenVK must be installed under a package prefix.
 
 macOS lets no process change its sandbox profile, and ttcd's bars the GPU,
 so ttcd's children cannot confine themselves to the renderer's. A ttcd with
-host isolation therefore starts `ttc-gfx-renderer launch` before it confines
+host isolation therefore starts its renderer's `launch` before it confines
 itself, and has it start the renderers and probes. The launcher stays
 unconfined, so that its children can confine themselves, and does nothing
 but start the renderer's executable with fixed arguments.

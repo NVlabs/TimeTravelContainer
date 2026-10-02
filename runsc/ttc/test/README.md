@@ -154,17 +154,17 @@ TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
     child's child. Every branch's render loops must finish, every frame
     checked, the children's on clones of their parents' GPU state.
 
-It needs `ttc-gfx-renderer`, Mesa's Venus Vulkan driver for the guest (see
-`runsc/ttc/gfxrenderer/README.md`), and the network. The daemon runs with host isolation unless
-`TTC_UNSAFE_NO_HOST_ISOLATION=1`; on macOS the test then checks that the
-renderers confine themselves.
+It needs Mesa's Venus Vulkan driver for the guest (see
+`runsc/ttc/gfxrenderer/README.md`), and the network. ttcd is the renderer,
+or carries it; `TTC_GFX_RENDERER` names one to run instead. The daemon runs
+with host isolation unless `TTC_UNSAFE_NO_HOST_ISOLATION=1`; on macOS the
+test then checks that the renderers confine themselves.
 
 ```shell
-bazel build //runsc/ttc:ttc //runsc/ttcd:ttcd //runsc/ttcgfx:ttc-gfx-renderer
+bazel build //runsc/ttc:ttc //runsc/ttcd:ttcd
 
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
 TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
-TTC_GFX_RENDERER="$PWD/bazel-bin/runsc/ttcgfx/ttc-gfx-renderer_/ttc-gfx-renderer" \
 TTC_GFX_GUEST_DRIVER=/path/to/dir/of/libvulkan_virtio.so \
   "$PWD/runsc/ttc/test/e2e_gfx.sh"
 ```
@@ -184,7 +184,7 @@ builds (with `ARCH=x86_64` for x86-64 hosts). Where the host's network blocks
 Android's DNS server, 8.8.8.8, `REDROID_DNS` names another.
 
 ```shell
-TTC=... TTCD=... TTC_GFX_RENDERER=... TTC_GFX_GUEST_DRIVER=... \
+TTC=... TTCD=... TTC_GFX_GUEST_DRIVER=... \
 ANDROID_GFX_DRIVER=/path/to/vulkan.virtio.so \
 APK=/path/to/app.apk \
   "$PWD/runsc/ttc/test/e2e_redroid.sh"
@@ -204,8 +204,9 @@ guest:
     branch's count must finish, checked at every step, the children's from
     their parents' count at the fork.
 
-It needs a host with NVIDIA GPUs, `cudaloop` built for them, and
-`ttc-cuda-checkpoint`. A host whose driver nvproxy does not support, such as
+It needs a host with NVIDIA GPUs, and `cudaloop` built for them. ttcd
+carries `ttc-cuda-checkpoint`; `TTC_CUDA_CHECKPOINT` names one to give
+containers instead. A host whose driver nvproxy does not support, such as
 a pre-release one, names in `TTC_NVPROXY_DRIVER_VERSION` a driver whose
 interface it has. On KVM, where TTC refuses `--nvproxy` for now, it checks
 the refusal.
@@ -214,12 +215,11 @@ the refusal.
 platform that `TTC_PLATFORM` names, such as `kvm`, and check that they do.
 
 ```shell
-bazel build //runsc/ttc:ttc //runsc/ttcd:ttcd //runsc/ttc/cudacheckpoint:ttc-cuda-checkpoint
+bazel build //runsc/ttc:ttc //runsc/ttcd:ttcd
 nvcc -O2 -o /tmp/cudaloop runsc/ttc/test/nvproxy/cudaloop.cu
 
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
 TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
-TTC_CUDA_CHECKPOINT="$PWD/bazel-bin/runsc/ttc/cudacheckpoint/ttc-cuda-checkpoint" \
 CUDALOOP=/tmp/cudaloop \
   "$PWD/runsc/ttc/test/e2e_nvproxy.sh"
 ```

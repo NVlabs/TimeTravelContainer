@@ -31,16 +31,22 @@ func TestMain(m *testing.M) {
 func helperMain() {
 	args := os.Args[1:]
 	fake := os.Getenv(helperFakeEnv)
+	// The renderer may be an executable that is it with arguments, as ttcd
+	// is with _gfx-renderer.
+	var rendererArgs []string
+	if args[0] == "_gfx-renderer" {
+		rendererArgs, args = args[:1], args[1:]
+	}
 	switch args[0] {
 	case "launch":
-		if err := ServeLauncher(3, os.Args[0]); err != nil {
+		if err := ServeLauncher(3, os.Args[0], rendererArgs); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
 	case "serve-family":
 		if fake != "" {
 			conn := os.NewFile(3, "connection")
-			fmt.Fprint(conn, strings.Join(args, " "))
+			fmt.Fprint(conn, strings.Join(os.Args[1:], " "))
 			break
 		}
 		if err := ServeFamily(3); err != nil {
@@ -52,7 +58,7 @@ func helperMain() {
 			fmt.Fprintln(os.Stderr, "no GPU here")
 			os.Exit(1)
 		}
-		fmt.Printf("%q\n", strings.Join(args, " "))
+		fmt.Printf("%q\n", strings.Join(os.Args[1:], " "))
 	}
 	os.Exit(0)
 }
@@ -98,4 +104,28 @@ func TestLauncherProbeFails(t *testing.T) {
 		t.Fatalf("StartRenderer after a failed probe: %v", err)
 	}
 	os.NewFile(uintptr(fd), "renderer").Close()
+}
+
+func TestLauncherWithRendererArgs(t *testing.T) {
+	t.Setenv(helperEnv, "1")
+	t.Setenv(helperFakeEnv, "1")
+	l, err := StartLauncher(BrokerOptions{Renderer: os.Args[0], RendererArgs: []string{"_gfx-renderer"}, Stderr: os.Stderr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	fd, err := l.StartRenderer()
+	if err != nil {
+		t.Fatalf("StartRenderer: %v", err)
+	}
+	conn := os.NewFile(uintptr(fd), "renderer")
+	got, err := io.ReadAll(conn)
+	conn.Close()
+	if err != nil || string(got) != "_gfx-renderer serve-family" {
+		t.Errorf("the renderer was started with %q, %v; want _gfx-renderer serve-family", got, err)
+	}
+	output, err := l.Probe()
+	if err != nil || string(output) != "\"_gfx-renderer probe\"\n" {
+		t.Errorf("Probe: %q, %v", output, err)
+	}
 }

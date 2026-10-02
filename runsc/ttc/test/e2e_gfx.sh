@@ -11,7 +11,8 @@
 #
 # It needs:
 #   TTC and TTCD, the binaries;
-#   TTC_GFX_RENDERER, ttc-gfx-renderer;
+#   optionally TTC_GFX_RENDERER, a ttc-gfx-renderer to run instead of the
+#     daemon's;
 #   TTC_GFX_GUEST_DRIVER, a directory with Mesa's Venus driver,
 #     libvulkan_virtio.so, for the guest's architecture
 #     (runsc/ttc/gfxrenderer/guest/build_mesa_venus.sh);
@@ -45,7 +46,8 @@ fail() {
 
 [ -x "$TTC" ] || fail "set TTC to the ttc binary"
 [ -x "$TTCD" ] || fail "set TTCD to the matching ttcd binary"
-[ -x "$TTC_GFX_RENDERER" ] || fail "set TTC_GFX_RENDERER to ttc-gfx-renderer"
+[ -z "$TTC_GFX_RENDERER" ] || [ -x "$TTC_GFX_RENDERER" ] ||
+  fail "TTC_GFX_RENDERER names no ttc-gfx-renderer"
 GUEST_DRIVER=libvulkan_virtio.so
 DEVICE="Virtio-GPU Venus"
 [ -f "$TTC_GFX_GUEST_DRIVER/$GUEST_DRIVER" ] ||
@@ -68,10 +70,14 @@ WORK_DIR="$TTC_E2E_ROOT/work"
 mkdir -p "$BIN_DIR" "$DRIVER_DIR"
 install -m 0755 "$(readlink -f "$TTC")" "$BIN_DIR/ttc"
 install -m 0755 "$(readlink -f "$TTCD")" "$BIN_DIR/ttcd"
-# The daemon finds the renderer beside itself, unless TTC_GFX_RENDERER names
-# another.
-install -m 0755 "$(readlink -f "$TTC_GFX_RENDERER")" "$BIN_DIR/ttc-gfx-renderer"
-unset TTC_GFX_RENDERER
+# The daemon runs the renderer that it carries on Linux, and is it on macOS,
+# unless TTC_GFX_RENDERER names another.
+if [ -n "$TTC_GFX_RENDERER" ]; then
+  TTC_GFX_RENDERER=$(readlink -f "$TTC_GFX_RENDERER")
+  export TTC_GFX_RENDERER
+else
+  unset TTC_GFX_RENDERER
+fi
 if [ "$(uname -s)" = Darwin ]; then
   # A copy loses its ad-hoc signature; Hypervisor.framework requires the
   # entitlement on the executable at its final path.

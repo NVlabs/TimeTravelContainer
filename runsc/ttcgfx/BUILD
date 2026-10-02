@@ -11,6 +11,11 @@ package(
 go_binary(
     name = "ttc-gfx-renderer",
     srcs = ["main.go"],
+    # ttcd carries it: without Go's symbol table and DWARF, it is smaller.
+    gc_linkopts = [
+        "-s",
+        "-w",
+    ],
     # The renderer calls Vulkan, which it loads with dlopen, through cgo, on
     # every platform: a pure build of it renders nothing.
     pure = "off",

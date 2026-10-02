@@ -45,10 +45,12 @@ func socketpair() ([2]int, error) {
 	return fds, nil
 }
 
-// ServeLauncher starts renderers, of the executable renderer, for the ttcd
-// connected to the Unix stream socket fd, which it takes, until ttcd
-// disconnects. Renderers run until the branches that they serve disconnect.
-func ServeLauncher(fd int, renderer string) error {
+// ServeLauncher starts renderers, of the executable renderer with
+// rendererArgs, for the ttcd connected to the Unix stream socket fd, which it
+// takes, until ttcd disconnects. Renderers run until the branches that they
+// serve disconnect.
+func ServeLauncher(fd int, renderer string, rendererArgs []string) error {
+	opts := BrokerOptions{Renderer: renderer, RendererArgs: rendererArgs, Stderr: os.Stderr}
 	conn, err := gfxproto.NewConn(fd)
 	if err != nil {
 		unix.Close(fd)
@@ -76,13 +78,13 @@ func ServeLauncher(fd int, renderer string) error {
 			}
 			fd := m.FDs[0]
 			m.FDs = nil
-			err = launchRenderer(renderer, fd)
+			err = launchRenderer(&opts, fd)
 		case gfxproto.MsgLaunchProbe:
 			var p gfxproto.LaunchProbe
 			if _, err = m.Decode(&p); err != nil {
 				break
 			}
-			trailer, err = ProbeRenderer(BrokerOptions{Renderer: renderer, Stderr: os.Stderr})
+			trailer, err = ProbeRenderer(opts)
 		default:
 			m.CloseFDs()
 			return fmt.Errorf("unexpected %v", m.Type)
@@ -101,10 +103,10 @@ func ServeLauncher(fd int, renderer string) error {
 
 // launchRenderer starts the renderer of a family, whose control connection
 // is fd, which it takes, and the renderer gets as its fd 3.
-func launchRenderer(renderer string, fd int) error {
+func launchRenderer(opts *BrokerOptions, fd int) error {
 	conn := os.NewFile(uintptr(fd), "gfx-renderer-control")
 	defer conn.Close()
-	cmd := exec.Command(renderer, "serve-family")
+	cmd := exec.Command(opts.Renderer, opts.args("serve-family")...)
 	cmd.ExtraFiles = []*os.File{conn}
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
@@ -142,7 +144,8 @@ func StartLauncher(opts BrokerOptions) (*Launcher, error) {
 	}
 	launcherEnd := os.NewFile(uintptr(fds[1]), "gfx-launcher-connection")
 	defer launcherEnd.Close()
-	cmd := exec.Command(opts.Renderer, "launch")
+	launch := BrokerOptions{Renderer: opts.Renderer, RendererArgs: opts.RendererArgs}
+	cmd := exec.Command(opts.Renderer, launch.args("launch")...)
 	// The connection is the launcher's fd 3.
 	cmd.ExtraFiles = []*os.File{launcherEnd}
 	cmd.Stdout = opts.Stderr

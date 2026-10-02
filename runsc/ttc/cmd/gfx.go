@@ -21,8 +21,8 @@ import (
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer"
 )
 
-// gfxRendererName is the file name of the GPU renderer, which ttcd looks for
-// beside itself unless TTC_GFX_RENDERER names it.
+// gfxRendererName is the file name of the GPU renderer, which a ttcd that
+// carries none looks for beside itself (rendererOptions).
 const gfxRendererName = "ttc-gfx-renderer"
 
 // The guest's Vulkan driver, which ttcd gives the containers of --gfx
@@ -98,7 +98,8 @@ func startGFXHost(unsafeNoHostIsolation bool, stderr io.Writer) gfxHost {
 	if runtime.GOOS != "darwin" {
 		return gfxHost{}
 	}
-	opts, err := rendererOptions()
+	// The launcher is macOS's, whose renderer is ttcd: it needs no directory.
+	opts, err := rendererOptions("")
 	if err != nil {
 		return gfxHost{err: err}
 	}
@@ -233,16 +234,23 @@ func (g *gfxService) guestEdits(opts ttcbundle.GPUOptions) ([]ttcbundle.HostMoun
 
 // writeGuestFile writes a file, named name, of the guest's side of the
 // virtual GPU in the service's directory, unless it has it already, and
-// returns its path.
+// returns its path. Every user of a container reads it, as they read
+// /etc/hosts.
 func (g *gfxService) writeGuestFile(name string, content []byte) (string, error) {
-	if err := os.MkdirAll(g.dir, 0700); err != nil {
+	return writeContainerFile(g.dir, name, content, 0444)
+}
+
+// writeContainerFile writes a file, named name, that containers get by a
+// mount, in dir, unless it has it already, with mode, and returns its path.
+func writeContainerFile(dir, name string, content []byte, mode os.FileMode) (string, error) {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", err
 	}
-	path := filepath.Join(g.dir, name)
+	path := filepath.Join(dir, name)
 	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, content) {
 		return path, nil
 	}
-	tmp, err := os.CreateTemp(g.dir, name+".*")
+	tmp, err := os.CreateTemp(dir, name+".*")
 	if err != nil {
 		return "", err
 	}
@@ -250,9 +258,8 @@ func (g *gfxService) writeGuestFile(name string, content []byte) (string, error)
 	if closeErr := tmp.Close(); err == nil {
 		err = closeErr
 	}
-	// Every user of a container reads it, as they read /etc/hosts.
 	if err == nil {
-		err = os.Chmod(tmp.Name(), 0444)
+		err = os.Chmod(tmp.Name(), mode)
 	}
 	if err == nil {
 		err = os.Rename(tmp.Name(), path)
@@ -264,18 +271,39 @@ func (g *gfxService) writeGuestFile(name string, content []byte) (string, error)
 	return path, nil
 }
 
-// rendererOptions returns where the renderer is.
-func rendererOptions() (gfxrenderer.BrokerOptions, error) {
-	renderer := os.Getenv("TTC_GFX_RENDERER")
-	if renderer == "" {
-		exe, err := os.Executable()
-		if err != nil {
-			return gfxrenderer.BrokerOptions{}, err
+// GFXRendererArg is the argument with which ttcd runs as its GPU renderer.
+// On macOS ttcd is its renderer, which loads its graphics libraries only when
+// it runs as it. On Linux, where ttcd links no C library and the renderer
+// does, ttcd carries the renderer, and runs it from a memory file
+// (carriedRenderer).
+const GFXRendererArg = "_gfx-renderer"
+
+// rendererOptions returns how the renderer starts: the one that
+// TTC_GFX_RENDERER names; on macOS, ttcd; on Linux, the one that ttcd
+// carries, or the one beside ttcd. dir is a directory of the daemon's, for a
+// file of the carried renderer, where a memory file cannot run.
+func rendererOptions(dir string) (gfxrenderer.BrokerOptions, error) {
+	if renderer := os.Getenv("TTC_GFX_RENDERER"); renderer != "" {
+		if _, err := os.Stat(renderer); err != nil {
+			return gfxrenderer.BrokerOptions{}, fmt.Errorf("the GPU renderer: %w", err)
 		}
-		renderer = filepath.Join(filepath.Dir(exe), gfxRendererName)
+		return gfxrenderer.BrokerOptions{Renderer: renderer}, nil
 	}
+	exe, err := os.Executable()
+	if err != nil {
+		return gfxrenderer.BrokerOptions{}, err
+	}
+	if runtime.GOOS == "darwin" {
+		return gfxrenderer.BrokerOptions{Renderer: exe, RendererArgs: []string{GFXRendererArg}}, nil
+	}
+	if renderer, err := carriedRenderer(dir); err != nil {
+		return gfxrenderer.BrokerOptions{}, fmt.Errorf("the GPU renderer that ttcd carries: %w", err)
+	} else if renderer != "" {
+		return gfxrenderer.BrokerOptions{Renderer: renderer}, nil
+	}
+	renderer := filepath.Join(filepath.Dir(exe), gfxRendererName)
 	if _, err := os.Stat(renderer); err != nil {
-		return gfxrenderer.BrokerOptions{}, fmt.Errorf("the GPU renderer: %w; install %s beside ttcd, or name it with TTC_GFX_RENDERER", err, gfxRendererName)
+		return gfxrenderer.BrokerOptions{}, fmt.Errorf("the GPU renderer: %w; this ttcd carries none: install %s beside it, or name it with TTC_GFX_RENDERER", err, gfxRendererName)
 	}
 	return gfxrenderer.BrokerOptions{Renderer: renderer}, nil
 }
@@ -320,7 +348,7 @@ func (g *gfxService) startLocked() error {
 	if g.host.err != nil {
 		return g.host.err
 	}
-	opts, err := rendererOptions()
+	opts, err := rendererOptions(g.dir)
 	if err != nil {
 		return err
 	}

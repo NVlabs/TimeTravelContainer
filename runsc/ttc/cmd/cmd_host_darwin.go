@@ -371,6 +371,13 @@ func runtimeMemoryBytes(localRoot string, runtimes []string) (map[string]uint64,
 	return held, nil
 }
 
+// runnableExecutable writes content, an executable named name, in dir, and
+// returns its path. ttcd carries no executable on macOS, where it is its
+// renderer.
+func runnableExecutable(name string, content []byte, dir string) (string, error) {
+	return writeContainerFile(dir, name, content, 0555)
+}
+
 // cloexecStreamSocketpair creates a close-on-exec AF_UNIX stream pair. Darwin
 // has no SOCK_CLOEXEC; ForkLock keeps a concurrent exec from inheriting the
 // descriptors before they are marked, as os.Pipe does here.
