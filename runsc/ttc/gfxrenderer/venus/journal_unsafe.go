@@ -386,11 +386,18 @@ func registerJournal() {
 	})
 	handle(vn.VK_COMMAND_TYPE_vkBindBufferMemory_EXT, func(s *stream, cmd *vn.Command, args unsafe.Pointer) {
 		a := (*vn.Args_vkBindBufferMemory)(args)
-		s.bind(cmd, args, []binding{{uint64(a.Buffer), uint64(a.Memory), a.MemoryOffset}})
+		s.bind(cmd, args, []binding{{uint64(a.Buffer), uint64(a.Memory), a.MemoryOffset}}, nil)
 	})
+	// The guest's memory binds a shadow's linear image (see
+	// shadow_unsafe.go).
 	handle(vn.VK_COMMAND_TYPE_vkBindImageMemory_EXT, func(s *stream, cmd *vn.Command, args unsafe.Pointer) {
 		a := (*vn.Args_vkBindImageMemory)(args)
-		s.bind(cmd, args, []binding{{uint64(a.Image), uint64(a.Memory), a.MemoryOffset}})
+		linear := s.linearImage(uint64(a.Image))
+		s.bind(cmd, args, []binding{{uint64(a.Image), uint64(a.Memory), a.MemoryOffset}}, func() {
+			if linear != 0 {
+				a.Image = linear
+			}
+		})
 	})
 	handle(vn.VK_COMMAND_TYPE_vkBindBufferMemory2_EXT, func(s *stream, cmd *vn.Command, args unsafe.Pointer) {
 		a := (*vn.Args_vkBindBufferMemory2)(args)
@@ -398,12 +405,20 @@ func registerJournal() {
 		for _, info := range unsafe.Slice((*vn.VkBindBufferMemoryInfo)(a.PBindInfos), a.BindInfoCount) {
 			bs = append(bs, binding{uint64(info.Buffer), uint64(info.Memory), info.MemoryOffset})
 		}
-		s.bind(cmd, args, bs)
+		s.bind(cmd, args, bs, nil)
 	})
 	handle(vn.VK_COMMAND_TYPE_vkBindImageMemory2_EXT, func(s *stream, cmd *vn.Command, args unsafe.Pointer) {
 		a := (*vn.Args_vkBindImageMemory2)(args)
+		infos := unsafe.Slice((*vn.VkBindImageMemoryInfo)(a.PBindInfos), a.BindInfoCount)
 		var bs []binding
-		for _, info := range unsafe.Slice((*vn.VkBindImageMemoryInfo)(a.PBindInfos), a.BindInfoCount) {
+		var linear []vn.Handle
+		for i, info := range infos {
+			if l := s.linearImage(uint64(info.Image)); l != 0 {
+				if linear == nil {
+					linear = make([]vn.Handle, len(infos))
+				}
+				linear[i] = l
+			}
 			if findStruct(info.PNext, vn.VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO) != nil {
 				// A plane of a disjoint image, which a child does not
 				// rebind.
@@ -411,7 +426,13 @@ func registerJournal() {
 			}
 			bs = append(bs, binding{uint64(info.Image), uint64(info.Memory), info.MemoryOffset})
 		}
-		s.bind(cmd, args, bs)
+		s.bind(cmd, args, bs, func() {
+			for i, l := range linear {
+				if l != 0 {
+					infos[i].Image = l
+				}
+			}
+		})
 	})
 	handle(vn.VK_COMMAND_TYPE_vkUpdateDescriptorSets_EXT, func(s *stream, cmd *vn.Command, args unsafe.Pointer) {
 		a := (*vn.Args_vkUpdateDescriptorSets)(args)
@@ -448,15 +469,17 @@ func registerJournal() {
 		s.ctx.mu.RLock()
 		for _, o := range pool.children {
 			o.recording = nil
+			o.shadowWrites = nil
 		}
 		s.ctx.mu.RUnlock()
 	})
 }
 
 // bind executes a command that binds memory to buffers or images, which it
-// keeps.
-func (s *stream) bind(cmd *vn.Command, args unsafe.Pointer, bs []binding) {
-	if !s.call(cmd, args) {
+// keeps, once fix, if not nil, fixed its arguments, whose handles are
+// replaced.
+func (s *stream) bind(cmd *vn.Command, args unsafe.Pointer, bs []binding, fix func()) {
+	if !s.callFixed(cmd, args, fix) {
 		return
 	}
 	if r, ok := cmd.Result(args); ok && r != vn.VK_SUCCESS {

@@ -84,6 +84,9 @@ type physicalDevice struct {
 	hostVisibleTypes uint32
 	// familyCount is the number of queue families that guests see.
 	familyCount uint32
+	// formats caches the host's format properties, which a fork's child
+	// shares.
+	formats *formatCache
 }
 
 // newArgs allocates a call's arguments in the stream's pool.
@@ -523,7 +526,12 @@ func enumeratePhysicalDevices(s *stream, cmd *vn.Command, args unsafe.Pointer) {
 // newPhysicalDevice returns a physical device of the host's, whose
 // properties it caches.
 func (s *stream) newPhysicalDevice(inst *instance, h vn.Handle) *physicalDevice {
-	pd := &physicalDevice{inst: inst, handle: h, devices: make(map[*device]struct{})}
+	pd := &physicalDevice{
+		inst:    inst,
+		handle:  h,
+		devices: make(map[*device]struct{}),
+		formats: &formatCache{props: make(map[uint32]vn.VkFormatProperties)},
+	}
 	t := inst.pdTable
 
 	props := newArgs[vn.Args_vkGetPhysicalDeviceProperties](s)

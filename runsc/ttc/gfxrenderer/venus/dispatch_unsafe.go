@@ -50,6 +50,7 @@ func init() {
 	registerQuirks()
 	registerExternalMemory()
 	registerModifiers()
+	registerShadows()
 	registerHostCopy()
 	registerJournal()
 	refuse(

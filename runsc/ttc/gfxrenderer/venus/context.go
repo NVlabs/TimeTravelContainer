@@ -39,6 +39,16 @@ type object struct {
 	// memory that the renderer emulates (see dmabuf.go).
 	external bool
 
+	// What shadows need (see shadow_unsafe.go): an image's shadow, if it is
+	// one; the shadow that an image view views; a framebuffer's attachments
+	// that view shadows; what a render pass does with its attachments; and
+	// the shadows that a command buffer wrote since it began.
+	shadow        *shadowImage
+	viewOf        *object
+	fbShadows     []fbShadow
+	attachmentOps []attachmentOp
+	shadowWrites  []shadowWrite
+
 	// shared, if not nil, counts the contexts whose objects share the
 	// object's host handle: a fork's child shares its parent's immutable
 	// objects, such as pipelines. The last one destroys it.

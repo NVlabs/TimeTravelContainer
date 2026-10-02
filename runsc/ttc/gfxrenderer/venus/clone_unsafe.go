@@ -407,6 +407,7 @@ func (cl *cloner) cloneDevices(c, cc *Context) {
 		co := &object{typ: o.typ, id: o.id, handle: o.handle, dev: cl.devices[o.dev], shared: o.shared}
 		co.seq = o.seq
 		co.layoutBindings = o.layoutBindings
+		co.attachmentOps = o.attachmentOps
 		cc.addObject(co)
 	}
 }
@@ -545,7 +546,7 @@ func (s *stream) bindMemory(o, co *object) bool {
 	// vkBindBufferMemory and vkBindImageMemory take the same arguments.
 	a := newArgs[vn.Args_vkBindBufferMemory](s)
 	a.Device = co.dev.handle
-	a.Buffer = co.handle
+	a.Buffer = co.memoryHandle()
 	a.Memory = mem.handle
 	a.MemoryOffset = o.boundOffset
 	vk.Call(typ, co.dev.table, unsafe.Pointer(a))
@@ -1011,7 +1012,8 @@ func formatAspects(format uint32) uint32 {
 }
 
 // copyImage copies the contents of image o of the parent to the child's co
-// with the GPU, every level and layer.
+// with the GPU, every level and layer. A shadow's are its own optimal
+// image's (see shadow_unsafe.go).
 func (b *copyBatch) copyImage(o, co *object) {
 	info := o.image
 	if info.tiling != imageTilingOptimal {

@@ -243,15 +243,31 @@ func (s *stream) call(cmd *vn.Command, args unsafe.Pointer) bool {
 	return ok
 }
 
+// callFixed calls the command as call does, once fix, if not nil, fixed
+// its arguments, whose handles are replaced.
+func (s *stream) callFixed(cmd *vn.Command, args unsafe.Pointer, fix func()) bool {
+	_, ok := s.callObjectFixed(cmd, args, fix)
+	return ok
+}
+
 // callObject calls the command as call does, and returns the object that
 // its first argument is, of a command of a device or its children.
 func (s *stream) callObject(cmd *vn.Command, args unsafe.Pointer) (*object, bool) {
+	return s.callObjectFixed(cmd, args, nil)
+}
+
+// callObjectFixed calls the command as callObject does, once fix, if not
+// nil, fixed its arguments, whose handles are replaced.
+func (s *stream) callObjectFixed(cmd *vn.Command, args unsafe.Pointer, fix func()) (*object, bool) {
 	t, o, q, ok := s.table(cmd, args)
 	if !ok {
 		s.fail("%s: no table", cmd.Name)
 		return nil, false
 	}
 	cmd.ReplaceHandles(s.r, args)
+	if fix != nil {
+		fix()
+	}
 	var called bool
 	if q != nil {
 		// Vulkan requires that the use of a queue be externally

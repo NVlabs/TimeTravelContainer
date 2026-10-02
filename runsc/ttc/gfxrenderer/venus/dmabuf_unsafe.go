@@ -97,30 +97,47 @@ func registerExternalMemory() {
 		if pd == nil {
 			return
 		}
-		if pd.emulateModifiers {
-			info := (*vn.VkPhysicalDeviceImageFormatInfo2)(a.PImageFormatInfo)
-			if info.Tiling == imageTilingDrmFormatModifier {
-				p := findStruct(info.PNext, vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT)
-				if p == nil || (*vn.VkPhysicalDeviceImageDrmFormatModifierInfoEXT)(p).DrmFormatModifier != drmFormatModLinear {
-					a.Ret = vn.VK_ERROR_FORMAT_NOT_SUPPORTED
-					return
-				}
-				removeStructs(unsafe.Pointer(info), vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT)
-				info.Tiling = imageTilingLinear
+		info := (*vn.VkPhysicalDeviceImageFormatInfo2)(a.PImageFormatInfo)
+		modifier := false
+		if pd.emulateModifiers && info.Tiling == imageTilingDrmFormatModifier {
+			p := findStruct(info.PNext, vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT)
+			if p == nil || (*vn.VkPhysicalDeviceImageDrmFormatModifierInfoEXT)(p).DrmFormatModifier != drmFormatModLinear {
+				a.Ret = vn.VK_ERROR_FORMAT_NOT_SUPPORTED
+				return
 			}
+			removeStructs(unsafe.Pointer(info), vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT)
+			info.Tiling = imageTilingLinear
+			modifier = true
 		}
 		var handleType uint32
 		if pd.emulateDmaBuf {
-			info := unsafe.Pointer(a.PImageFormatInfo)
-			if p := findStruct(info, vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO); p != nil {
+			if p := findStruct(unsafe.Pointer(info), vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO); p != nil {
 				ext := (*vn.VkPhysicalDeviceExternalImageFormatInfo)(p)
 				if ext.HandleType&emulatedHandleTypes != 0 {
 					handleType = ext.HandleType
-					removeStructs(info, vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO)
+					removeStructs(unsafe.Pointer(info), vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO)
 				}
 			}
 		}
-		if !s.call(cmd, args) || handleType == 0 || a.Ret != vn.VK_SUCCESS {
+		// The linear image of a guest's dma-buf may be a shadow (see
+		// shadow_unsafe.go), which can have what both it and its linear
+		// image can.
+		var linear *vn.VkImageFormatProperties
+		if (modifier || handleType != 0) && s.shadows(pd, info.Format, info.Type, info.Tiling, info.Usage) {
+			if linear = s.linearImageFormatProperties(pd, info.Format, info.Type, info.Flags); linear == nil {
+				a.Ret = vn.VK_ERROR_FORMAT_NOT_SUPPORTED
+				return
+			}
+			info.Tiling = imageTilingOptimal
+			info.Usage |= imageUsageTransfers
+		}
+		if !s.call(cmd, args) || a.Ret != vn.VK_SUCCESS {
+			return
+		}
+		if linear != nil {
+			limitImageFormatProperties(&(*vn.VkImageFormatProperties2)(a.PImageFormatProperties).ImageFormatProperties, linear)
+		}
+		if handleType == 0 {
 			return
 		}
 		if p := findStruct(a.PImageFormatProperties, vn.VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES); p != nil {
@@ -140,7 +157,14 @@ func registerExternalMemory() {
 	handle(vn.VK_COMMAND_TYPE_vkGetImageMemoryRequirements_EXT, func(s *stream, cmd *vn.Command, args unsafe.Pointer) {
 		a := (*vn.Args_vkGetImageMemoryRequirements)(args)
 		o := s.ctx.lookup(uint64(a.Image))
-		if s.call(cmd, args) && o != nil && o.external {
+		// A shadow's memory is its linear image's.
+		linear := s.linearImage(uint64(a.Image))
+		called := s.callFixed(cmd, args, func() {
+			if linear != 0 {
+				a.Image = linear
+			}
+		})
+		if called && o != nil && o.external {
 			restrictToHostVisible(o.dev, &(*vn.VkMemoryRequirements)(a.PMemoryRequirements).MemoryTypeBits)
 		}
 	})
@@ -154,8 +178,15 @@ func registerExternalMemory() {
 	})
 	handle(vn.VK_COMMAND_TYPE_vkGetImageMemoryRequirements2_EXT, func(s *stream, cmd *vn.Command, args unsafe.Pointer) {
 		a := (*vn.Args_vkGetImageMemoryRequirements2)(args)
-		o := s.ctx.lookup(*(*uint64)(unsafe.Add(a.PInfo, 16)))
-		if s.call(cmd, args) && o != nil && o.external {
+		info := (*vn.VkImageMemoryRequirementsInfo2)(a.PInfo)
+		o := s.ctx.lookup(uint64(info.Image))
+		linear := s.linearImage(uint64(info.Image))
+		called := s.callFixed(cmd, args, func() {
+			if linear != 0 {
+				info.Image = linear
+			}
+		})
+		if called && o != nil && o.external {
 			restrictToHostVisible(o.dev, &(*vn.VkMemoryRequirements2)(a.PMemoryRequirements).MemoryRequirements.MemoryTypeBits)
 		}
 	})
@@ -180,9 +211,15 @@ func registerExternalMemory() {
 		createInfo := *(*unsafe.Pointer)(unsafe.Add(a.PInfo, 16))
 		external := stripExternal(dev, createInfo, vn.VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO)
 		if createInfo != nil {
-			if _, ok := linearizeImageInfo(dev.pd, (*vn.VkImageCreateInfo)(createInfo)); !ok {
+			ci := (*vn.VkImageCreateInfo)(createInfo)
+			modifier := ci.Tiling == imageTilingDrmFormatModifier
+			if _, ok := linearizeImageInfo(dev.pd, ci); !ok {
 				s.fail("%s: an image of no modifier that the renderer has", cmd.Name)
 				return
+			}
+			// A shadow's memory is its linear image's.
+			if (modifier || external) && s.shadows(dev.pd, ci.Format, ci.ImageType, ci.Tiling, ci.Usage) {
+				ci.Usage = imageUsageTransfers
 			}
 		}
 		if s.call(cmd, args) && external {

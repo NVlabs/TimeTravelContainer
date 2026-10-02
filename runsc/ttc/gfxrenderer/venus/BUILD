@@ -30,6 +30,7 @@ go_library(
         "quirks_unsafe.go",
         "ring_unsafe.go",
         "server_unsafe.go",
+        "shadow_unsafe.go",
         "stream_unsafe.go",
         "transport_unsafe.go",
         "venus.go",

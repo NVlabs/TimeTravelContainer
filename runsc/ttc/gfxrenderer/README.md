@@ -105,6 +105,18 @@ context, how to lay out each image, and the renderer answers with the layout
 of the host's linear images, so that the images that the guest's Vulkan
 creates of a buffer share its memory.
 
+Where the host's driver cannot give a linear image what the guest uses an
+image of a buffer for, as NVIDIA's cannot render to linear images, the image
+is a shadow (`venus/shadow_unsafe.go`): an optimal image in GPU memory, which
+the guest's commands use, and the linear image in the buffer's memory, which
+the guest sees, kept in step by the renderer's copies. They copy the linear
+image to the shadow where the guest takes the image from a foreign or
+external queue family, and the shadow to the linear image where it gives the
+image to one, and at the end of each command buffer that rendered or copied
+to it. Images that are only sampled, and every image where linear images
+have what optimal ones have, as with MoltenVK on Apple silicon, are not
+shadows.
+
 redroid, an Android image for containers, runs in TTC with the GPU: its init
 is the container's, and `guest/redroid/gpu_config.sh`, which replaces the
 image's `/vendor/bin/gpu_config.sh`, has it use the image's minigbm

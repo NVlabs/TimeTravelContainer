@@ -322,4 +322,5 @@ func (s *stream) destroyHostObject(dev *device, o *object) {
 	a.Device = dev.handle
 	a.Buffer = o.handle
 	vk.Call(typ, dev.table, unsafe.Pointer(a))
+	s.releaseShadow(o)
 }

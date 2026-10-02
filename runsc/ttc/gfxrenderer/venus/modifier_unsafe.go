@@ -15,18 +15,19 @@ import (
 // DRM format modifiers and foreign queue families, which Mesa's Venus driver
 // requires of the renderer to offer Android's buffers to applications
 // (VK_ANDROID_external_memory_android_hardware_buffer and
-// VK_ANDROID_native_buffer), where the host's Vulkan lacks them, as MoltenVK
-// does:
+// VK_ANDROID_native_buffer), for the guests' dma-bufs that the renderer
+// emulates (see dmabuf_unsafe.go): the host's Vulkan may lack them, as
+// MoltenVK does, and its own modifiers, as NVIDIA's on Linux, describe its
+// own memory, not the renderer's shared memory that guests' dma-bufs are.
 //
 //   - VK_EXT_image_drm_format_modifier, with one modifier, linear: an image
-//     of a modifier is a linear image of the host's. Its layout is the
-//     host's, which Android's buffers have (see crossdomain_unsafe.go).
+//     of a modifier is a linear image of the host's, or a shadow where its
+//     usage needs what the host's linear images lack (see
+//     shadow_unsafe.go). Its layout is the host's, which Android's buffers
+//     have (see crossdomain_unsafe.go).
 //   - VK_EXT_queue_family_foreign: the host's driver sees no transfer to or
 //     from a foreign queue family, which its own transfers, of external
 //     memory that is host memory, would not do anything for either.
-//
-// Both depend on the external memory that the renderer emulates (see
-// dmabuf_unsafe.go).
 
 const (
 	extImageDrmFormatModifier = "VK_EXT_image_drm_format_modifier"
@@ -49,7 +50,7 @@ const (
 // initModifiers settles whether pd emulates DRM format modifiers and
 // foreign queue families.
 func (pd *physicalDevice) initModifiers(hostExtensions map[string]bool) {
-	if !pd.emulateDmaBuf || hostExtensions[extImageDrmFormatModifier] {
+	if !pd.emulateDmaBuf {
 		return
 	}
 	pd.emulateModifiers = true
@@ -204,21 +205,35 @@ func registerModifiers() {
 	handle(vn.VK_COMMAND_TYPE_vkGetPhysicalDeviceFormatProperties2_EXT, func(s *stream, cmd *vn.Command, args unsafe.Pointer) {
 		a := (*vn.Args_vkGetPhysicalDeviceFormatProperties2)(args)
 		pd := s.physicalDevice(cmd, args)
-		if pd == nil || !s.call(cmd, args) || !pd.emulateModifiers {
+		if pd == nil {
 			return
 		}
-		// The host's driver leaves the structs of modifiers, which it does
-		// not know, as they are.
+		// The lists of modifiers are the renderer's, which the host's driver
+		// fills in if it has modifiers of its own: their capacities are the
+		// guest's.
 		props := (*vn.VkFormatProperties2)(a.PFormatProperties)
-		features := props.FormatProperties.LinearTilingFeatures
+		var list, list2 unsafe.Pointer
+		var capacity, capacity2 uint32
+		if pd.emulateModifiers {
+			if list = findStruct(props.PNext, vn.VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT); list != nil {
+				capacity = (*vn.VkDrmFormatModifierPropertiesListEXT)(list).DrmFormatModifierCount
+			}
+			if list2 = findStruct(props.PNext, vn.VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT); list2 != nil {
+				capacity2 = (*vn.VkDrmFormatModifierPropertiesList2EXT)(list2).DrmFormatModifierCount
+			}
+		}
+		if !s.call(cmd, args) || !pd.emulateModifiers {
+			return
+		}
+		features := modifierFeatures(a.Format, &props.FormatProperties)
 		count := uint32(0)
 		if features != 0 {
 			count = 1
 		}
-		if p := findStruct(props.PNext, vn.VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT); p != nil {
-			l := (*vn.VkDrmFormatModifierPropertiesListEXT)(p)
+		if list != nil {
+			l := (*vn.VkDrmFormatModifierPropertiesListEXT)(list)
 			if l.PDrmFormatModifierProperties != nil {
-				l.DrmFormatModifierCount = min(l.DrmFormatModifierCount, count)
+				l.DrmFormatModifierCount = min(capacity, count)
 				if l.DrmFormatModifierCount != 0 {
 					*(*vn.VkDrmFormatModifierPropertiesEXT)(l.PDrmFormatModifierProperties) = vn.VkDrmFormatModifierPropertiesEXT{
 						DrmFormatModifier:               drmFormatModLinear,
@@ -230,10 +245,10 @@ func registerModifiers() {
 				l.DrmFormatModifierCount = count
 			}
 		}
-		if p := findStruct(props.PNext, vn.VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT); p != nil {
-			l := (*vn.VkDrmFormatModifierPropertiesList2EXT)(p)
+		if list2 != nil {
+			l := (*vn.VkDrmFormatModifierPropertiesList2EXT)(list2)
 			if l.PDrmFormatModifierProperties != nil {
-				l.DrmFormatModifierCount = min(l.DrmFormatModifierCount, count)
+				l.DrmFormatModifierCount = min(capacity2, count)
 				if l.DrmFormatModifierCount != 0 {
 					*(*vn.VkDrmFormatModifierProperties2EXT)(l.PDrmFormatModifierProperties) = vn.VkDrmFormatModifierProperties2EXT{
 						DrmFormatModifier:               drmFormatModLinear,
@@ -268,13 +283,19 @@ func registerModifiers() {
 		(*vn.VkImageDrmFormatModifierPropertiesEXT)(a.PProperties).DrmFormatModifier = drmFormatModLinear
 		a.Ret = vn.VK_SUCCESS
 	})
+	// The layouts of a shadow's subresources are its linear image's.
 	handle(vn.VK_COMMAND_TYPE_vkGetImageSubresourceLayout_EXT, func(s *stream, cmd *vn.Command, args unsafe.Pointer) {
 		a := (*vn.Args_vkGetImageSubresourceLayout)(args)
 		if o := s.ctx.lookup(uint64(a.Image)); o != nil && o.image != nil {
 			sub := (*vn.VkImageSubresource)(a.PSubresource)
 			sub.AspectMask = subresourceAspect(o.image.format, sub.AspectMask)
 		}
-		s.call(cmd, args)
+		linear := s.linearImage(uint64(a.Image))
+		s.callFixed(cmd, args, func() {
+			if linear != 0 {
+				a.Image = linear
+			}
+		})
 	})
 	handle(vn.VK_COMMAND_TYPE_vkGetImageSubresourceLayout2_EXT, func(s *stream, cmd *vn.Command, args unsafe.Pointer) {
 		a := (*vn.Args_vkGetImageSubresourceLayout2)(args)
@@ -282,31 +303,53 @@ func registerModifiers() {
 			sub := &(*vn.VkImageSubresource2)(a.PSubresource).ImageSubresource
 			sub.AspectMask = subresourceAspect(o.image.format, sub.AspectMask)
 		}
-		s.call(cmd, args)
+		linear := s.linearImage(uint64(a.Image))
+		s.callFixed(cmd, args, func() {
+			if linear != 0 {
+				a.Image = linear
+			}
+		})
 	})
 
-	// Barriers, which the command buffers that record them journal.
+	// Barriers, which the command buffers that record them journal, with
+	// what shadows need of them.
 	handle(vn.VK_COMMAND_TYPE_vkCmdPipelineBarrier_EXT, func(s *stream, cmd *vn.Command, args unsafe.Pointer) {
 		a := (*vn.Args_vkCmdPipelineBarrier)(args)
-		foreignBarriers(a.PImageMemoryBarriers, a.ImageMemoryBarrierCount, a.PBufferMemoryBarriers, a.BufferMemoryBarrierCount, false)
-		passThrough(s, cmd, args)
+		s.barrierCommand(cmd, args, func(cb *object) ([]shadowCopy, []shadowCopy) {
+			release, acquire := s.shadowTransfers(cb, a.PImageMemoryBarriers, a.ImageMemoryBarrierCount, false, true)
+			foreignBarriers(a.PImageMemoryBarriers, a.ImageMemoryBarrierCount, a.PBufferMemoryBarriers, a.BufferMemoryBarrierCount, false)
+			return release, acquire
+		})
 	})
 	handle(vn.VK_COMMAND_TYPE_vkCmdWaitEvents_EXT, func(s *stream, cmd *vn.Command, args unsafe.Pointer) {
 		a := (*vn.Args_vkCmdWaitEvents)(args)
-		foreignBarriers(a.PImageMemoryBarriers, a.ImageMemoryBarrierCount, a.PBufferMemoryBarriers, a.BufferMemoryBarrierCount, false)
-		passThrough(s, cmd, args)
+		s.barrierCommand(cmd, args, func(cb *object) ([]shadowCopy, []shadowCopy) {
+			release, acquire := s.shadowTransfers(cb, a.PImageMemoryBarriers, a.ImageMemoryBarrierCount, false, true)
+			foreignBarriers(a.PImageMemoryBarriers, a.ImageMemoryBarrierCount, a.PBufferMemoryBarriers, a.BufferMemoryBarrierCount, false)
+			return release, acquire
+		})
 	})
 	handle(vn.VK_COMMAND_TYPE_vkCmdPipelineBarrier2_EXT, func(s *stream, cmd *vn.Command, args unsafe.Pointer) {
-		foreignDependencies((*vn.Args_vkCmdPipelineBarrier2)(args).PDependencyInfo, 1)
-		passThrough(s, cmd, args)
+		deps := (*vn.Args_vkCmdPipelineBarrier2)(args).PDependencyInfo
+		s.barrierCommand(cmd, args, func(cb *object) ([]shadowCopy, []shadowCopy) {
+			release, acquire := s.shadowDependencies(cb, deps, 1, true)
+			foreignDependencies(deps, 1)
+			return release, acquire
+		})
 	})
 	handle(vn.VK_COMMAND_TYPE_vkCmdWaitEvents2_EXT, func(s *stream, cmd *vn.Command, args unsafe.Pointer) {
 		a := (*vn.Args_vkCmdWaitEvents2)(args)
-		foreignDependencies(a.PDependencyInfos, a.EventCount)
-		passThrough(s, cmd, args)
+		s.barrierCommand(cmd, args, func(cb *object) ([]shadowCopy, []shadowCopy) {
+			release, acquire := s.shadowDependencies(cb, a.PDependencyInfos, a.EventCount, true)
+			foreignDependencies(a.PDependencyInfos, a.EventCount)
+			return release, acquire
+		})
 	})
 	handle(vn.VK_COMMAND_TYPE_vkCmdSetEvent2_EXT, func(s *stream, cmd *vn.Command, args unsafe.Pointer) {
-		foreignDependencies((*vn.Args_vkCmdSetEvent2)(args).PDependencyInfo, 1)
+		// The barriers execute where vkCmdWaitEvents2 waits for the event.
+		deps := (*vn.Args_vkCmdSetEvent2)(args).PDependencyInfo
+		s.shadowDependencies(s.commandBuffer(firstID(args)), deps, 1, false)
+		foreignDependencies(deps, 1)
 		passThrough(s, cmd, args)
 	})
 }

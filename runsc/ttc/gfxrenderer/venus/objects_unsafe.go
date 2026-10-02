@@ -134,9 +134,6 @@ func registerObjects() {
 		a := (*vn.Args_vkCreateImage)(args)
 		s.createExternable(cmd, args, vn.VK_OBJECT_TYPE_IMAGE, a.PImage, a.PCreateInfo, vn.VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO)
 	})
-	handle(vn.VK_COMMAND_TYPE_vkCreateRenderPass2_EXT, func(s *stream, cmd *vn.Command, args unsafe.Pointer) {
-		s.createObject(cmd, args, vn.VK_OBJECT_TYPE_RENDER_PASS, (*vn.Args_vkCreateRenderPass2)(args).PRenderPass)
-	})
 
 	// Pools.
 	handle(vn.VK_COMMAND_TYPE_vkCreateCommandPool_EXT, func(s *stream, cmd *vn.Command, args unsafe.Pointer) {
@@ -229,20 +226,37 @@ func (s *stream) createExternable(cmd *vn.Command, args unsafe.Pointer, typ int3
 	external := stripExternal(dev, info, stype)
 	var img *imageInfo
 	var layouts []vn.VkSubresourceLayout
+	var linear *vn.VkImageCreateInfo
 	if typ == vn.VK_OBJECT_TYPE_IMAGE {
+		ci := (*vn.VkImageCreateInfo)(info)
+		modifier := ci.Tiling == imageTilingDrmFormatModifier
 		var ok bool
-		if layouts, ok = linearizeImageInfo(dev.pd, (*vn.VkImageCreateInfo)(info)); !ok {
+		if layouts, ok = linearizeImageInfo(dev.pd, ci); !ok {
 			(*vn.Args_vkCreateImage)(args).Ret = vn.VK_ERROR_FORMAT_NOT_SUPPORTED
 			return
 		}
-		img = newImageInfo((*vn.VkImageCreateInfo)(info))
-	}
-	if o := s.createObject(cmd, args, typ, out); o != nil {
-		o.external = external
-		o.image = img
-		if layouts != nil {
-			s.checkLinearLayout(dev, o.handle, img.format, layouts)
+		// The linear image of a guest's dma-buf may be a shadow (see
+		// shadow_unsafe.go).
+		if (modifier || external) && s.shadows(dev.pd, ci.Format, ci.ImageType, ci.Tiling, ci.Usage) {
+			linear = s.shadowCreateInfo(ci)
 		}
+		img = newImageInfo(ci)
+	}
+	o := s.createObject(cmd, args, typ, out)
+	if o == nil {
+		return
+	}
+	o.external = external
+	o.image = img
+	if linear != nil && !s.createShadow(o, linear) {
+		// The guest's image fails as a whole.
+		s.destroyHostObject(dev, o)
+		s.ctx.removeObject(o)
+		(*vn.Args_vkCreateImage)(args).Ret = vn.VK_ERROR_OUT_OF_DEVICE_MEMORY
+		return
+	}
+	if layouts != nil {
+		s.checkLinearLayout(dev, o.memoryHandle(), img.format, layouts)
 	}
 }
 
