@@ -690,22 +690,27 @@ type BranchInfo struct {
 	// containing a process-free branch's kernel/process metadata. They are
 	// present only while a branch is dehydrated; live branches have already
 	// consumed this auxiliary snapshot root.
-	ControlRoot               string    `json:"control_root,omitempty"`
-	ControlRootObject         string    `json:"control_root_object,omitempty"`
-	ForkTotalNS               int64     `json:"fork_total_ns,omitempty"`
-	SourceDowntimeNS          int64     `json:"source_downtime_ns,omitempty"`
-	KernelForkNS              int64     `json:"kernel_fork_ns,omitempty"`
-	ForkValidationNS          int64     `json:"fork_validation_ns,omitempty"`
-	ForkSharedMemoryNS        int64     `json:"fork_shared_memory_ns,omitempty"`
-	ForkMappingInvalidationNS int64     `json:"fork_mapping_invalidation_ns,omitempty"`
-	ForkVFSPreparationNS      int64     `json:"fork_vfs_preparation_ns,omitempty"`
-	ForkMemoryPreparationNS   int64     `json:"fork_memory_preparation_ns,omitempty"`
-	ForkMetadataStreamNS      int64     `json:"fork_metadata_stream_ns,omitempty"`
-	ForkMetadataBytes         int64     `json:"fork_metadata_bytes,omitempty"`
-	ForkMetadataRecordNS      int64     `json:"fork_metadata_record_ns,omitempty"`
-	ForkMetadataObjects       int64     `json:"fork_metadata_objects,omitempty"`
-	ForkChildRestoreNS        int64     `json:"fork_child_restore_ns,omitempty"`
-	CreatedAt                 time.Time `json:"created_at"`
+	ControlRoot                 string    `json:"control_root,omitempty"`
+	ControlRootObject           string    `json:"control_root_object,omitempty"`
+	ForkTotalNS                 int64     `json:"fork_total_ns,omitempty"`
+	SourceDowntimeNS            int64     `json:"source_downtime_ns,omitempty"`
+	KernelForkNS                int64     `json:"kernel_fork_ns,omitempty"`
+	ForkValidationNS            int64     `json:"fork_validation_ns,omitempty"`
+	ForkSharedMemoryNS          int64     `json:"fork_shared_memory_ns,omitempty"`
+	ForkMappingInvalidationNS   int64     `json:"fork_mapping_invalidation_ns,omitempty"`
+	ForkVFSPreparationNS        int64     `json:"fork_vfs_preparation_ns,omitempty"`
+	ForkDevicePreparationNS     int64     `json:"fork_device_preparation_ns,omitempty"`
+	ForkFSMetadataFlushNS       int64     `json:"fork_fs_metadata_flush_ns,omitempty"`
+	ForkFSRuntimeInvalidationNS int64     `json:"fork_fs_runtime_invalidation_ns,omitempty"`
+	ForkFSBranchSealNS          int64     `json:"fork_fs_branch_seal_ns,omitempty"`
+	ForkFSNamespacePruneNS      int64     `json:"fork_fs_namespace_prune_ns,omitempty"`
+	ForkMemoryPreparationNS     int64     `json:"fork_memory_preparation_ns,omitempty"`
+	ForkMetadataStreamNS        int64     `json:"fork_metadata_stream_ns,omitempty"`
+	ForkMetadataBytes           int64     `json:"fork_metadata_bytes,omitempty"`
+	ForkMetadataRecordNS        int64     `json:"fork_metadata_record_ns,omitempty"`
+	ForkMetadataObjects         int64     `json:"fork_metadata_objects,omitempty"`
+	ForkChildRestoreNS          int64     `json:"fork_child_restore_ns,omitempty"`
+	CreatedAt                   time.Time `json:"created_at"`
 }
 
 // RuntimeMemoryBacking retains an immutable process-memory graph while a live

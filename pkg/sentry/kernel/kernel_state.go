@@ -61,6 +61,20 @@ func (k *Kernel) cloneStateGraph(saveCtx, loadCtx context.Context, child *Kernel
 	})
 }
 
+// recordStateGraph records exactly one Kernel, k, in memory, for copies
+// that are what loads of what saveStateGraph saved would be.
+//
+// Preconditions: k.extMu must be locked.
+func (k *Kernel) recordStateGraph(ctx context.Context) (*state.Recording, error) {
+	k.filteringBranchDanglingEndpoints = true
+	defer func() {
+		k.filteringBranchDanglingEndpoints = false
+	}()
+	return state.Record(ctx, k, state.SaveOptions{
+		RejectMultipleRootObjects: true,
+	})
+}
+
 // saveDanglingEndpoints is invoked by stateify.
 func (k *Kernel) saveDanglingEndpoints() []tcpip.Endpoint {
 	endpoints := tcpip.GetDanglingEndpoints()

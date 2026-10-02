@@ -92,6 +92,20 @@ func runTestCases(t *testing.T, shouldFail bool, prefix string, objects []any) {
 				if cloned := cloneObjectPtr.Elem().Interface(); !checkEqual(root, cloned) {
 					t.Fatalf("Clone differs:\n\toriginal: %#v\n\tclone:    %#v\n", root, cloned)
 				}
+				// So are the copies of a recording.
+				rec, err := state.Record(context.Background(), saveObjectPtr.Interface(), state.SaveOptions{})
+				if err != nil {
+					t.Fatalf("Record failed unexpectedly: %v", err)
+				}
+				for i := 0; i < 2; i++ {
+					copyObjectPtr := reflect.New(reflect.TypeOf(root))
+					if _, err := rec.Copy(context.Background(), copyObjectPtr.Interface()); err != nil {
+						t.Fatalf("Copy failed unexpectedly: %v", err)
+					}
+					if copied := copyObjectPtr.Elem().Interface(); !checkEqual(root, copied) {
+						t.Fatalf("Copy %d differs:\n\toriginal: %#v\n\tcopy:     %#v\n", i, root, copied)
+					}
+				}
 			}
 			saveStats, err := state.Save(context.Background(), saveBuffer, saveObjectPtr.Interface())
 			if err != nil {

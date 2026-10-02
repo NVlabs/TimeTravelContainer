@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"sync"
 	"time"
 	"unsafe"
 )
@@ -40,15 +41,28 @@ type CloneStats struct {
 //
 // The source must not change during the call but for what its StateSave
 // methods change.
-func Clone(saveCtx, loadCtx context.Context, srcPtr, dstPtr any, opts SaveOptions) (stats CloneStats, err error) {
-	src := reflect.ValueOf(srcPtr).Elem()
-	dst := reflect.ValueOf(dstPtr).Elem()
-	if src.Type() != dst.Type() {
-		return stats, fmt.Errorf("cloning a %v into a %v", src.Type(), dst.Type())
+func Clone(saveCtx, loadCtx context.Context, srcPtr, dstPtr any, opts SaveOptions) (CloneStats, error) {
+	r, err := Record(saveCtx, srcPtr, opts)
+	if err != nil {
+		return CloneStats{}, err
 	}
-	cs := cloneState{
+	return r.copy(loadCtx, dstPtr, true /* adopt */)
+}
+
+// Recording is what Record recorded of an object graph, which Copy copies,
+// once or more, concurrently. It holds what the source's StateSave methods
+// saved as it was then: the source may change afterward.
+type Recording struct {
+	cs     *cloneState
+	record time.Duration
+}
+
+// Record records the object graph of srcPtr, with saveCtx, as Save would
+// encode it, for Copy.
+func Record(saveCtx context.Context, srcPtr any, opts SaveOptions) (*Recording, error) {
+	src := reflect.ValueOf(srcPtr).Elem()
+	cs := &cloneState{
 		saveCtx:                   saveCtx,
-		loadCtx:                   loadCtx,
 		zeroValues:                make(map[reflect.Type]*objectEncodeState),
 		structs:                   make(map[uintptr]*structRecord),
 		types:                     make(map[uintptr]*cloneTypeInfo),
@@ -57,22 +71,45 @@ func Clone(saveCtx, loadCtx context.Context, srcPtr, dstPtr any, opts SaveOption
 		rootType:                  src.Type(),
 		rejectMultipleRootObjects: opts.RejectMultipleRootObjects,
 	}
+	start := time.Now()
+	if err := safely(func() { cs.record(src.Addr()) }); err != nil {
+		return nil, err
+	}
+	// Recording's own state goes with the recording: copies need none of
+	// it.
+	cs.recorders, cs.recordSlab, cs.slotSlab, cs.oesSlab, cs.cloneSlab = nil, nil, nil, nil, nil
+	return &Recording{cs: cs, record: time.Since(start)}, nil
+}
+
+// Copy makes the object graph of dstPtr a copy of the recording, with
+// loadCtx, as Load of what Save encoded would.
+func (r *Recording) Copy(loadCtx context.Context, dstPtr any) (CloneStats, error) {
+	return r.copy(loadCtx, dstPtr, false /* adopt */)
+}
+
+// copy makes dstPtr's object graph a copy of the recording. If adopt is
+// set, no other copy is made of the recording, and the copy may take the
+// recording's snapshots of objects that refer to nothing as its own.
+func (r *Recording) copy(loadCtx context.Context, dstPtr any, adopt bool) (stats CloneStats, err error) {
+	cs := r.cs
+	dst := reflect.ValueOf(dstPtr).Elem()
+	if dst.Type() != cs.rootType {
+		return stats, fmt.Errorf("copying a %v into a %v", cs.rootType, dst.Type())
+	}
+	run := &copyRun{cs: cs, ctx: loadCtx, adopt: adopt, objects: make([]copyObject, len(cs.objects))}
+	start := time.Now()
 	err = safely(func() {
-		start := time.Now()
-		cs.record(src.Addr())
-		recorded := time.Now()
-		stats.Record = recorded.Sub(start)
-		stats.Objects = cs.copyGraph(dst)
-		stats.Copy = time.Since(recorded)
+		stats.Objects = run.copyGraph(dst)
 	})
+	stats.Record = r.record
+	stats.Copy = time.Since(start)
 	stats.Structs = len(cs.structs)
 	return stats, err
 }
 
-// cloneState is the state of a Clone.
+// cloneState is the state of a Clone: what it recorded.
 type cloneState struct {
 	saveCtx context.Context
-	loadCtx context.Context
 
 	// lastID is the last object ID allocated. The root is object 1.
 	lastID objectID
@@ -93,17 +130,18 @@ type cloneState struct {
 	structs map[uintptr]*structRecord
 
 	// types caches what the clone needs to know of types, by rtypeOf.
-	types map[uintptr]*cloneTypeInfo
+	// Copies, which may run at once, add to it, under typesMu.
+	typesMu sync.RWMutex
+	types   map[uintptr]*cloneTypeInfo
 
 	// ifaceCopies are addressable copies of the structs and arrays that
 	// interfaces hold, by the addresses of the interfaces' recorded
 	// values.
 	ifaceCopies map[uintptr]reflect.Value
 
-	// recorders and loaders are reused by the depth of structs' StateSave
-	// and StateLoad methods' calls.
+	// recorders are reused by the depth of structs' StateSave methods'
+	// calls.
 	recorders []*cloneRecorder
-	loaders   []*cloneLoader
 
 	// recordSlab and slotSlab allocate structs' records in chunks.
 	recordSlab []structRecord
@@ -183,11 +221,25 @@ type slotType struct {
 // typeInfo returns what the clone knows of typ.
 func (cs *cloneState) typeInfo(typ reflect.Type) *cloneTypeInfo {
 	tid := rtypeOf(typ)
-	if ti, ok := cs.types[tid]; ok {
+	cs.typesMu.RLock()
+	ti, ok := cs.types[tid]
+	cs.typesMu.RUnlock()
+	if ok {
 		return ti
 	}
-	ti := &cloneTypeInfo{size: typ.Size()}
+	ti = cs.newTypeInfo(typ)
+	cs.typesMu.Lock()
+	defer cs.typesMu.Unlock()
+	if other, ok := cs.types[tid]; ok {
+		return other
+	}
 	cs.types[tid] = ti
+	return ti
+}
+
+// newTypeInfo returns what the clone needs to know of typ.
+func (cs *cloneState) newTypeInfo(typ reflect.Type) *cloneTypeInfo {
+	ti := &cloneTypeInfo{size: typ.Size()}
 	switch k := typ.Kind(); k {
 	case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
 		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
@@ -216,14 +268,31 @@ func (cs *cloneState) typeInfo(typ reflect.Type) *cloneTypeInfo {
 	return ti
 }
 
-// cloneObject is the copy of an object of the source's graph.
+// cloneObject is what the clone recorded of an object of the source's
+// graph that its structs' records do not hold.
 type cloneObject struct {
 	// snapshot is a copy of an object that holds no structs, as it was when
 	// the clone recorded it.
 	snapshot reflect.Value
 	// keys and values are a map's entries, addressable copies.
 	keys, values []reflect.Value
+}
 
+// copyRun is a copy of a recording.
+type copyRun struct {
+	cs  *cloneState
+	ctx context.Context
+	// adopt is whether the copy may take the recording's snapshots of
+	// objects that refer to nothing as its own.
+	adopt bool
+	// objects are the copies of the recording's objects, by ID.
+	objects []copyObject
+	// loaders are reused by the depth of structs' StateLoad methods' calls.
+	loaders []*cloneLoader
+}
+
+// copyObject is the copy of an object of the recording.
+type copyObject struct {
 	// clone is the copy: an addressable value of the object's type, or,
 	// for a map, the new map.
 	clone reflect.Value
@@ -236,6 +305,11 @@ type cloneObject struct {
 	blockedBy int
 	callbacks []cloneCallback
 	done      bool
+}
+
+// object returns the copy of object oes.
+func (r *copyRun) object(oes *objectEncodeState) *copyObject {
+	return &r.objects[oes.id-1]
 }
 
 // cloneCallback runs fn, or unblocks waiter.
@@ -597,71 +671,71 @@ func (cr *cloneRecorder) save(slot int, obj reflect.Value) {
 
 // copyGraph creates the copies of the recorded objects, dst the root's, and
 // fills them. It returns the number of objects.
-func (cs *cloneState) copyGraph(dst reflect.Value) int {
+func (r *copyRun) copyGraph(dst reflect.Value) int {
+	cs := r.cs
 	objects := make([]*objectEncodeState, 0, len(cs.objects))
 	for _, oes := range cs.objects {
 		if oes == nil {
 			continue
 		}
 		objects = append(objects, oes)
-		cl := oes.clone
+		rec, co := oes.clone, r.object(oes)
 		switch {
 		case oes.id == 1:
-			cl.clone = dst
-			cl.base = unsafe.Pointer(dst.UnsafeAddr())
+			co.clone = dst
+			co.base = unsafe.Pointer(dst.UnsafeAddr())
 		case oes.how == encodeMapAsValue:
-			cl.clone = reflect.MakeMapWithSize(oes.obj.Type(), len(cl.keys))
-		case cl.snapshot.IsValid() && !cs.typeInfo(oes.obj.Type()).refs:
+			co.clone = reflect.MakeMapWithSize(oes.obj.Type(), len(rec.keys))
+		case r.adopt && rec.snapshot.IsValid() && !cs.typeInfo(oes.obj.Type()).refs:
 			// The snapshot, which refers to nothing, is the copy.
-			cl.clone = cl.snapshot
-			cl.base = unsafe.Pointer(cl.clone.UnsafeAddr())
+			co.clone = rec.snapshot
+			co.base = unsafe.Pointer(co.clone.UnsafeAddr())
 		default:
-			cl.clone = reflect.New(oes.obj.Type()).Elem()
-			cl.base = unsafe.Pointer(cl.clone.UnsafeAddr())
+			co.clone = reflect.New(oes.obj.Type()).Elem()
+			co.base = unsafe.Pointer(co.clone.UnsafeAddr())
 		}
 	}
 	for _, oes := range objects {
-		cl := oes.clone
+		rec, co := oes.clone, r.object(oes)
 		switch {
 		case oes.how == encodeMapAsValue:
 			typ := oes.obj.Type()
-			for i := range cl.keys {
+			for i := range rec.keys {
 				k := reflect.New(typ.Key()).Elem()
 				v := reflect.New(typ.Elem()).Elem()
-				cs.copyValue(oes, k, cl.keys[i], true, nil)
-				cs.copyValue(oes, v, cl.values[i], true, nil)
-				cl.clone.SetMapIndex(k, v)
+				r.copyValue(oes, k, rec.keys[i], true, nil)
+				r.copyValue(oes, v, rec.values[i], true, nil)
+				co.clone.SetMapIndex(k, v)
 			}
-			cl.keys, cl.values = nil, nil
-		case cl.snapshot.IsValid():
-			if cl.clone.UnsafeAddr() != cl.snapshot.UnsafeAddr() {
-				cs.copyValue(oes, cl.clone, cl.snapshot, false, nil)
+		case rec.snapshot.IsValid():
+			if co.clone.UnsafeAddr() != rec.snapshot.UnsafeAddr() {
+				r.copyValue(oes, co.clone, rec.snapshot, false, nil)
 			}
 		default:
-			cs.copyValue(oes, cl.clone, oes.obj, false, nil)
+			r.copyValue(oes, co.clone, oes.obj, false, nil)
 		}
 	}
-	cs.complete(objects)
+	r.complete(objects)
 	return len(objects)
 }
 
 // complete runs the copies' callbacks, each object's once those of the
 // objects that it waits for ran, as decodeState.Load does.
-func (cs *cloneState) complete(objects []*objectEncodeState) {
+func (r *copyRun) complete(objects []*objectEncodeState) {
 	leaves := make([]*objectEncodeState, 0, len(objects))
 	for _, oes := range objects {
-		if oes.clone.blockedBy == 0 {
+		if r.object(oes).blockedBy == 0 {
 			leaves = append(leaves, oes)
 		}
 	}
 	for i := 0; i < len(leaves); i++ {
-		cl := leaves[i].clone
-		for _, cb := range cl.callbacks {
+		co := r.object(leaves[i])
+		for _, cb := range co.callbacks {
 			if cb.waiter == nil {
 				cb.fn()
 				continue
 			}
-			w := cb.waiter.clone
+			w := r.object(cb.waiter)
 			w.blockedBy--
 			if w.blockedBy == 0 {
 				leaves = append(leaves, cb.waiter)
@@ -669,11 +743,11 @@ func (cs *cloneState) complete(objects []*objectEncodeState) {
 				Failf("object %d has negative blockedBy: %d", cb.waiter.id, w.blockedBy)
 			}
 		}
-		cl.callbacks = nil
-		cl.done = true
+		co.callbacks = nil
+		co.done = true
 	}
 	for _, oes := range objects {
-		if !oes.clone.done {
+		if !r.object(oes).done {
 			Failf("incomplete graph: dependency cycle: object %d (%v) and others never complete", oes.id, oes.obj.Type())
 		}
 	}
@@ -681,7 +755,8 @@ func (cs *cloneState) complete(objects []*objectEncodeState) {
 
 // lookup returns the object that holds what ptr, a pointer, points to, and
 // the address of its copy.
-func (cs *cloneState) lookup(ptr reflect.Value) (*objectEncodeState, unsafe.Pointer) {
+func (r *copyRun) lookup(ptr reflect.Value) (*objectEncodeState, unsafe.Pointer) {
+	cs := r.cs
 	addr := ptr.Pointer()
 	typ := ptr.Type().Elem()
 	if typ.Size() == 0 && addr == dummyAddr {
@@ -689,30 +764,31 @@ func (cs *cloneState) lookup(ptr reflect.Value) (*objectEncodeState, unsafe.Poin
 		if oes == nil {
 			Failf("no object for zero-sized %v", typ)
 		}
-		return oes, oes.clone.base
+		return oes, r.object(oes).base
 	}
 	seg := cs.values.FindSegment(addr)
 	if !seg.Ok() {
 		Failf("no object holds %v at %#x", typ, addr)
 	}
 	oes := seg.Value()
-	return oes, unsafe.Add(oes.clone.base, addr-seg.Start())
+	return oes, unsafe.Add(r.object(oes).base, addr-seg.Start())
 }
 
 // wait makes waiter's copy wait for target's to complete, and runs fn once
 // it does, as decodeState.wait does.
-func (cs *cloneState) wait(waiter, target *objectEncodeState, fn func()) {
+func (r *copyRun) wait(waiter, target *objectEncodeState, fn func()) {
 	if target == waiter || target.id == 1 {
 		if fn != nil {
 			fn()
 		}
 		return
 	}
-	waiter.clone.blockedBy++
+	r.object(waiter).blockedBy++
+	t := r.object(target)
 	if fn != nil {
-		target.clone.callbacks = append(target.clone.callbacks, cloneCallback{fn: fn})
+		t.callbacks = append(t.callbacks, cloneCallback{fn: fn})
 	}
-	target.clone.callbacks = append(target.clone.callbacks, cloneCallback{waiter: waiter})
+	t.callbacks = append(t.callbacks, cloneCallback{waiter: waiter})
 }
 
 // setConverted sets dst to v, of the same underlying type.
@@ -727,16 +803,17 @@ func setConverted(dst, v reflect.Value) {
 // a recorded value. If wait is set, the copy waits for the objects that src
 // refers to, and fn runs once they are complete, as decodeState.waitObject
 // does.
-func (cs *cloneState) copyValue(oes *objectEncodeState, dst, src reflect.Value, wait bool, fn func()) {
+func (r *copyRun) copyValue(oes *objectEncodeState, dst, src reflect.Value, wait bool, fn func()) {
+	cs := r.cs
 	switch src.Kind() {
 	case reflect.Ptr:
 		if src.IsNil() {
 			break
 		}
-		target, p := cs.lookup(src)
+		target, p := r.lookup(src)
 		setConverted(dst, reflect.NewAt(src.Type().Elem(), p))
 		if wait {
-			cs.wait(oes, target, fn)
+			r.wait(oes, target, fn)
 			return
 		}
 	case reflect.Map:
@@ -748,9 +825,9 @@ func (cs *cloneState) copyValue(oes *objectEncodeState, dst, src reflect.Value, 
 			Failf("no map object at %#x", src.Pointer())
 		}
 		target := seg.Value()
-		setConverted(dst, target.clone.clone)
+		setConverted(dst, r.object(target).clone)
 		if wait {
-			cs.wait(oes, target, fn)
+			r.wait(oes, target, fn)
 			return
 		}
 	case reflect.Slice:
@@ -762,11 +839,11 @@ func (cs *cloneState) copyValue(oes *objectEncodeState, dst, src reflect.Value, 
 			break
 		}
 		arrayPtr := arrayFromSlice(src)
-		target, p := cs.lookup(arrayPtr)
+		target, p := r.lookup(arrayPtr)
 		array := reflect.NewAt(arrayPtr.Type().Elem(), p).Elem()
 		setConverted(dst, reflectValueRWSlice3(array, 0, src.Len(), src.Cap()))
 		if wait {
-			cs.wait(oes, target, fn)
+			r.wait(oes, target, fn)
 			return
 		}
 	case reflect.Interface:
@@ -782,7 +859,7 @@ func (cs *cloneState) copyValue(oes *objectEncodeState, dst, src reflect.Value, 
 			e = c
 		}
 		v := reflect.New(e.Type()).Elem()
-		cs.copyValue(oes, v, e, wait, fn)
+		r.copyValue(oes, v, e, wait, fn)
 		dst.Set(v)
 		return
 	case reflect.Struct:
@@ -792,10 +869,10 @@ func (cs *cloneState) copyValue(oes *objectEncodeState, dst, src reflect.Value, 
 		}
 		if !rec.empty {
 			if sl, ok := dst.Addr().Interface().(SaverLoader); ok {
-				cl := cs.pushLoader()
+				cl := r.pushLoader()
 				cl.oes, cl.rec = oes, rec
-				sl.StateLoad(cs.loadCtx, Source{internal: objectDecoder{cl: cl}})
-				cs.popLoader(cl)
+				sl.StateLoad(r.ctx, Source{internal: objectDecoder{cl: cl}})
+				r.popLoader(cl)
 			}
 		}
 	case reflect.Array:
@@ -808,7 +885,7 @@ func (cs *cloneState) copyValue(oes *objectEncodeState, dst, src reflect.Value, 
 		}
 		for i := 0; i < src.Len(); i++ {
 			// The decoder waits for what each element refers to.
-			cs.copyValue(oes, dst.Index(i), src.Index(i), true, nil)
+			r.copyValue(oes, dst.Index(i), src.Index(i), true, nil)
 		}
 	case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
 		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
@@ -825,25 +902,25 @@ func (cs *cloneState) copyValue(oes *objectEncodeState, dst, src reflect.Value, 
 
 // pushLoader returns a loader for a struct's StateLoad method, which
 // popLoader releases.
-func (cs *cloneState) pushLoader() *cloneLoader {
-	for _, l := range cs.loaders {
+func (r *copyRun) pushLoader() *cloneLoader {
+	for _, l := range r.loaders {
 		if l.rec == nil {
 			return l
 		}
 	}
-	l := &cloneLoader{cs: cs}
-	cs.loaders = append(cs.loaders, l)
+	l := &cloneLoader{r: r}
+	r.loaders = append(r.loaders, l)
 	return l
 }
 
-func (cs *cloneState) popLoader(l *cloneLoader) {
+func (r *copyRun) popLoader(l *cloneLoader) {
 	l.oes, l.rec = nil, nil
 }
 
 // cloneLoader gives a copy's StateLoad method what the source's StateSave
 // method saved, for Source.
 type cloneLoader struct {
-	cs  *cloneState
+	r   *copyRun
 	oes *objectEncodeState
 	rec *structRecord
 }
@@ -855,7 +932,7 @@ func (cl *cloneLoader) load(slot int, dst reflect.Value, wait bool, fn func()) {
 	if slot < len(cl.rec.slots) {
 		src = cl.rec.slots[slot]
 	}
-	if !src.IsValid() || cl.cs.isZeroPrimitive(src) {
+	if !src.IsValid() || cl.r.cs.isZeroPrimitive(src) {
 		// The encoder encodes nothing for a zero value, and the decoder
 		// leaves the destination as it is.
 		if wait && fn != nil {
@@ -863,12 +940,13 @@ func (cl *cloneLoader) load(slot int, dst reflect.Value, wait bool, fn func()) {
 		}
 		return
 	}
-	cl.cs.copyValue(cl.oes, dst, src, wait, fn)
+	cl.r.copyValue(cl.oes, dst, src, wait, fn)
 }
 
 // afterLoad queues fn to run once the copy of the object is complete.
 func (cl *cloneLoader) afterLoad(fn func()) {
-	cl.oes.clone.callbacks = append(cl.oes.clone.callbacks, cloneCallback{fn: fn})
+	co := cl.r.object(cl.oes)
+	co.callbacks = append(co.callbacks, cloneCallback{fn: fn})
 }
 
 // isZeroPrimitive reports whether src, an addressable value, is a zero

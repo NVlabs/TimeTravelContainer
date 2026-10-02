@@ -5606,42 +5606,47 @@ func (s selector) String() string {
 
 // Branch is stable branch metadata returned by ttc ls --json.
 type Branch struct {
-	ID                        string    `json:"id"`
-	Quarantined               bool      `json:"quarantined,omitempty"`
-	NodeID                    string    `json:"node_id,omitempty"`
-	ParentID                  string    `json:"parent,omitempty"`
-	State                     string    `json:"state"`
-	ExitStatus                *int      `json:"exit_status,omitempty"`
-	StorageState              string    `json:"storage_state"`
-	PublicationID             string    `json:"publication_id,omitempty"`
-	StorageError              string    `json:"storage_error,omitempty"`
-	StorageManifest           string    `json:"storage_manifest,omitempty"`
-	StorageRetryAt            time.Time `json:"storage_retry_at,omitempty"`
-	SnapshotID                uint64    `json:"snapshot_id,omitempty"`
-	MemoryRoots               []string  `json:"memory_roots,omitempty"`
-	MemoryRootObjects         []string  `json:"memory_root_objects,omitempty"`
-	ControlRoot               string    `json:"control_root,omitempty"`
-	ControlRootObject         string    `json:"control_root_object,omitempty"`
-	SourceNode                string    `json:"source_node,omitempty"`
-	DependentMemoryBytes      uint64    `json:"dependent_memory_bytes,omitempty"`
-	DependentFilesystemBytes  uint64    `json:"dependent_filesystem_bytes,omitempty"`
-	ForkTotalNS               int64     `json:"fork_total_ns,omitempty"`
-	SourceDowntimeNS          int64     `json:"source_downtime_ns,omitempty"`
-	KernelForkNS              int64     `json:"kernel_fork_ns,omitempty"`
-	ForkValidationNS          int64     `json:"fork_validation_ns,omitempty"`
-	ForkSharedMemoryNS        int64     `json:"fork_shared_memory_ns,omitempty"`
-	ForkMappingInvalidationNS int64     `json:"fork_mapping_invalidation_ns,omitempty"`
-	ForkVFSPreparationNS      int64     `json:"fork_vfs_preparation_ns,omitempty"`
-	ForkMemoryPreparationNS   int64     `json:"fork_memory_preparation_ns,omitempty"`
-	ForkMetadataStreamNS      int64     `json:"fork_metadata_stream_ns,omitempty"`
-	ForkMetadataBytes         int64     `json:"fork_metadata_bytes,omitempty"`
-	ForkMetadataRecordNS      int64     `json:"fork_metadata_record_ns,omitempty"`
-	ForkMetadataObjects       int64     `json:"fork_metadata_objects,omitempty"`
-	ForkChildRestoreNS        int64     `json:"fork_child_restore_ns,omitempty"`
-	CreatedAt                 time.Time `json:"created_at"`
-	InitPID                   int32     `json:"init_pid,omitempty"`
-	InitState                 string    `json:"init_state,omitempty"`
-	MemorySharing             string    `json:"memory_sharing,omitempty"`
+	ID                          string    `json:"id"`
+	Quarantined                 bool      `json:"quarantined,omitempty"`
+	NodeID                      string    `json:"node_id,omitempty"`
+	ParentID                    string    `json:"parent,omitempty"`
+	State                       string    `json:"state"`
+	ExitStatus                  *int      `json:"exit_status,omitempty"`
+	StorageState                string    `json:"storage_state"`
+	PublicationID               string    `json:"publication_id,omitempty"`
+	StorageError                string    `json:"storage_error,omitempty"`
+	StorageManifest             string    `json:"storage_manifest,omitempty"`
+	StorageRetryAt              time.Time `json:"storage_retry_at,omitempty"`
+	SnapshotID                  uint64    `json:"snapshot_id,omitempty"`
+	MemoryRoots                 []string  `json:"memory_roots,omitempty"`
+	MemoryRootObjects           []string  `json:"memory_root_objects,omitempty"`
+	ControlRoot                 string    `json:"control_root,omitempty"`
+	ControlRootObject           string    `json:"control_root_object,omitempty"`
+	SourceNode                  string    `json:"source_node,omitempty"`
+	DependentMemoryBytes        uint64    `json:"dependent_memory_bytes,omitempty"`
+	DependentFilesystemBytes    uint64    `json:"dependent_filesystem_bytes,omitempty"`
+	ForkTotalNS                 int64     `json:"fork_total_ns,omitempty"`
+	SourceDowntimeNS            int64     `json:"source_downtime_ns,omitempty"`
+	KernelForkNS                int64     `json:"kernel_fork_ns,omitempty"`
+	ForkValidationNS            int64     `json:"fork_validation_ns,omitempty"`
+	ForkSharedMemoryNS          int64     `json:"fork_shared_memory_ns,omitempty"`
+	ForkMappingInvalidationNS   int64     `json:"fork_mapping_invalidation_ns,omitempty"`
+	ForkVFSPreparationNS        int64     `json:"fork_vfs_preparation_ns,omitempty"`
+	ForkDevicePreparationNS     int64     `json:"fork_device_preparation_ns,omitempty"`
+	ForkFSMetadataFlushNS       int64     `json:"fork_fs_metadata_flush_ns,omitempty"`
+	ForkFSRuntimeInvalidationNS int64     `json:"fork_fs_runtime_invalidation_ns,omitempty"`
+	ForkFSBranchSealNS          int64     `json:"fork_fs_branch_seal_ns,omitempty"`
+	ForkFSNamespacePruneNS      int64     `json:"fork_fs_namespace_prune_ns,omitempty"`
+	ForkMemoryPreparationNS     int64     `json:"fork_memory_preparation_ns,omitempty"`
+	ForkMetadataStreamNS        int64     `json:"fork_metadata_stream_ns,omitempty"`
+	ForkMetadataBytes           int64     `json:"fork_metadata_bytes,omitempty"`
+	ForkMetadataRecordNS        int64     `json:"fork_metadata_record_ns,omitempty"`
+	ForkMetadataObjects         int64     `json:"fork_metadata_objects,omitempty"`
+	ForkChildRestoreNS          int64     `json:"fork_child_restore_ns,omitempty"`
+	CreatedAt                   time.Time `json:"created_at"`
+	InitPID                     int32     `json:"init_pid,omitempty"`
+	InitState                   string    `json:"init_state,omitempty"`
+	MemorySharing               string    `json:"memory_sharing,omitempty"`
 }
 
 // Family is stable family metadata returned by ttc ls --json.
@@ -12734,17 +12739,22 @@ type runscBranchInfo struct {
 	ForkMetrics      struct {
 		SourceDowntime time.Duration `json:"SourceDowntime"`
 		Kernel         struct {
-			Validation              time.Duration `json:"Validation"`
-			SharedMemoryPreparation time.Duration `json:"SharedMemoryPreparation"`
-			MappingInvalidation     time.Duration `json:"MappingInvalidation"`
-			VFSPreparation          time.Duration `json:"VFSPreparation"`
-			MemoryPreparation       time.Duration `json:"MemoryPreparation"`
-			MetadataStream          time.Duration `json:"MetadataStream"`
-			MetadataBytes           int64         `json:"MetadataBytes"`
-			MetadataRecord          time.Duration `json:"MetadataRecord"`
-			MetadataObjects         int64         `json:"MetadataObjects"`
-			ChildRestore            time.Duration `json:"ChildRestore"`
-			Total                   time.Duration `json:"Total"`
+			Validation                    time.Duration `json:"Validation"`
+			SharedMemoryPreparation       time.Duration `json:"SharedMemoryPreparation"`
+			MappingInvalidation           time.Duration `json:"MappingInvalidation"`
+			VFSPreparation                time.Duration `json:"VFSPreparation"`
+			DevicePreparation             time.Duration `json:"DevicePreparation"`
+			FilesystemMetadataFlush       time.Duration `json:"FilesystemMetadataFlush"`
+			FilesystemRuntimeInvalidation time.Duration `json:"FilesystemRuntimeInvalidation"`
+			FilesystemBranchSeal          time.Duration `json:"FilesystemBranchSeal"`
+			FilesystemNamespacePrune      time.Duration `json:"FilesystemNamespacePrune"`
+			MemoryPreparation             time.Duration `json:"MemoryPreparation"`
+			MetadataStream                time.Duration `json:"MetadataStream"`
+			MetadataBytes                 int64         `json:"MetadataBytes"`
+			MetadataRecord                time.Duration `json:"MetadataRecord"`
+			MetadataObjects               int64         `json:"MetadataObjects"`
+			ChildRestore                  time.Duration `json:"ChildRestore"`
+			Total                         time.Duration `json:"Total"`
 		} `json:"Kernel"`
 		Total time.Duration `json:"Total"`
 	} `json:"ForkMetrics"`
@@ -12775,6 +12785,11 @@ func persistentBranchView(info ttcbundle.BranchInfo) Branch {
 		ForkMemoryPreparationNS: info.ForkMemoryPreparationNS, ForkMetadataStreamNS: info.ForkMetadataStreamNS,
 		ForkMetadataBytes: info.ForkMetadataBytes, ForkChildRestoreNS: info.ForkChildRestoreNS,
 		ForkMetadataRecordNS: info.ForkMetadataRecordNS, ForkMetadataObjects: info.ForkMetadataObjects,
+		ForkDevicePreparationNS:     info.ForkDevicePreparationNS,
+		ForkFSMetadataFlushNS:       info.ForkFSMetadataFlushNS,
+		ForkFSRuntimeInvalidationNS: info.ForkFSRuntimeInvalidationNS,
+		ForkFSBranchSealNS:          info.ForkFSBranchSealNS,
+		ForkFSNamespacePruneNS:      info.ForkFSNamespacePruneNS,
 	}
 }
 
@@ -12956,27 +12971,32 @@ func memorySharingMode(shared bool) string {
 
 func branchView(info runscBranchInfo) Branch {
 	return Branch{
-		ID:                        info.ID,
-		ParentID:                  info.ParentID,
-		Quarantined:               info.Quarantined,
-		State:                     normalizeLifecycleState(info.State),
-		CreatedAt:                 info.CreatedAt,
-		InitPID:                   info.InitPID,
-		InitState:                 info.InitState,
-		MemorySharing:             memorySharingMode(info.SharesMemory),
-		ForkTotalNS:               info.ForkMetrics.Total.Nanoseconds(),
-		SourceDowntimeNS:          info.ForkMetrics.SourceDowntime.Nanoseconds(),
-		KernelForkNS:              info.ForkMetrics.Kernel.Total.Nanoseconds(),
-		ForkValidationNS:          info.ForkMetrics.Kernel.Validation.Nanoseconds(),
-		ForkSharedMemoryNS:        info.ForkMetrics.Kernel.SharedMemoryPreparation.Nanoseconds(),
-		ForkMappingInvalidationNS: info.ForkMetrics.Kernel.MappingInvalidation.Nanoseconds(),
-		ForkVFSPreparationNS:      info.ForkMetrics.Kernel.VFSPreparation.Nanoseconds(),
-		ForkMemoryPreparationNS:   info.ForkMetrics.Kernel.MemoryPreparation.Nanoseconds(),
-		ForkMetadataStreamNS:      info.ForkMetrics.Kernel.MetadataStream.Nanoseconds(),
-		ForkMetadataBytes:         info.ForkMetrics.Kernel.MetadataBytes,
-		ForkMetadataRecordNS:      info.ForkMetrics.Kernel.MetadataRecord.Nanoseconds(),
-		ForkMetadataObjects:       info.ForkMetrics.Kernel.MetadataObjects,
-		ForkChildRestoreNS:        info.ForkMetrics.Kernel.ChildRestore.Nanoseconds(),
+		ID:                          info.ID,
+		ParentID:                    info.ParentID,
+		Quarantined:                 info.Quarantined,
+		State:                       normalizeLifecycleState(info.State),
+		CreatedAt:                   info.CreatedAt,
+		InitPID:                     info.InitPID,
+		InitState:                   info.InitState,
+		MemorySharing:               memorySharingMode(info.SharesMemory),
+		ForkTotalNS:                 info.ForkMetrics.Total.Nanoseconds(),
+		SourceDowntimeNS:            info.ForkMetrics.SourceDowntime.Nanoseconds(),
+		KernelForkNS:                info.ForkMetrics.Kernel.Total.Nanoseconds(),
+		ForkValidationNS:            info.ForkMetrics.Kernel.Validation.Nanoseconds(),
+		ForkSharedMemoryNS:          info.ForkMetrics.Kernel.SharedMemoryPreparation.Nanoseconds(),
+		ForkMappingInvalidationNS:   info.ForkMetrics.Kernel.MappingInvalidation.Nanoseconds(),
+		ForkVFSPreparationNS:        info.ForkMetrics.Kernel.VFSPreparation.Nanoseconds(),
+		ForkDevicePreparationNS:     info.ForkMetrics.Kernel.DevicePreparation.Nanoseconds(),
+		ForkFSMetadataFlushNS:       info.ForkMetrics.Kernel.FilesystemMetadataFlush.Nanoseconds(),
+		ForkFSRuntimeInvalidationNS: info.ForkMetrics.Kernel.FilesystemRuntimeInvalidation.Nanoseconds(),
+		ForkFSBranchSealNS:          info.ForkMetrics.Kernel.FilesystemBranchSeal.Nanoseconds(),
+		ForkFSNamespacePruneNS:      info.ForkMetrics.Kernel.FilesystemNamespacePrune.Nanoseconds(),
+		ForkMemoryPreparationNS:     info.ForkMetrics.Kernel.MemoryPreparation.Nanoseconds(),
+		ForkMetadataStreamNS:        info.ForkMetrics.Kernel.MetadataStream.Nanoseconds(),
+		ForkMetadataBytes:           info.ForkMetrics.Kernel.MetadataBytes,
+		ForkMetadataRecordNS:        info.ForkMetrics.Kernel.MetadataRecord.Nanoseconds(),
+		ForkMetadataObjects:         info.ForkMetrics.Kernel.MetadataObjects,
+		ForkChildRestoreNS:          info.ForkMetrics.Kernel.ChildRestore.Nanoseconds(),
 	}
 }
 
@@ -13135,6 +13155,11 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 				ForkMemoryPreparationNS: branch.ForkMemoryPreparationNS, ForkMetadataStreamNS: branch.ForkMetadataStreamNS,
 				ForkMetadataBytes: branch.ForkMetadataBytes, ForkChildRestoreNS: branch.ForkChildRestoreNS,
 				ForkMetadataRecordNS: branch.ForkMetadataRecordNS, ForkMetadataObjects: branch.ForkMetadataObjects,
+				ForkDevicePreparationNS:     branch.ForkDevicePreparationNS,
+				ForkFSMetadataFlushNS:       branch.ForkFSMetadataFlushNS,
+				ForkFSRuntimeInvalidationNS: branch.ForkFSRuntimeInvalidationNS,
+				ForkFSBranchSealNS:          branch.ForkFSBranchSealNS,
+				ForkFSNamespacePruneNS:      branch.ForkFSNamespacePruneNS,
 			}
 			if referenceOperations[i] != "" {
 				if referenceTransaction != "" {

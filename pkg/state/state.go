@@ -279,7 +279,7 @@ func (s Source) AfterLoad(fn func()) {
 // Context returns the context object provided at load time.
 func (s Source) Context() context.Context {
 	if s.internal.cl != nil {
-		return s.internal.cl.cs.loadCtx
+		return s.internal.cl.r.ctx
 	}
 	return s.internal.ds.ctx
 }

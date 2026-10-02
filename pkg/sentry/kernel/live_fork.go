@@ -18,8 +18,6 @@
 package kernel
 
 import (
-	"bufio"
-	"bytes"
 	"errors"
 	"fmt"
 	"sort"
@@ -130,12 +128,16 @@ type LiveForkMetrics struct {
 	FilesystemBranchSeal          time.Duration
 	FilesystemNamespacePrune      time.Duration
 	FilesystemNamespaceCandidates int64
-	MemoryPreparation             time.Duration
-	MetadataStream                time.Duration
-	MetadataBytes                 int64
-	// MetadataRecord is how much of MetadataStream an in-memory copy of
-	// the metadata took to record the source's, and MetadataObjects the
-	// number of objects that it copied.
+	// DevicePreparation is how much of VFSPreparation devices took, such
+	// as a GPU to take its snapshot.
+	DevicePreparation time.Duration
+	MemoryPreparation time.Duration
+	MetadataStream    time.Duration
+	MetadataBytes     int64
+	// MetadataRecord is how long recording the source's metadata, for
+	// in-memory copies, took: part of MetadataStream for a child of
+	// LiveFork, and before it for the siblings of LiveForkMany, which copy
+	// one recording. MetadataObjects is the number of objects copied.
 	MetadataRecord  time.Duration
 	MetadataObjects int64
 	ChildRestore    time.Duration
@@ -357,6 +359,7 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			opts.Metrics.FilesystemBranchSeal = fsPreparationMetrics.BranchSeal
 			opts.Metrics.FilesystemNamespacePrune = fsPreparationMetrics.NamespacePrune
 			opts.Metrics.FilesystemNamespaceCandidates = fsPreparationMetrics.NamespaceCandidates
+			opts.Metrics.DevicePreparation = fsPreparationMetrics.Devices
 		}
 		defer k.vfs.BeforeResume(saveCtx)
 		if err := injectLiveForkFailure(opts, LiveForkStageVFSPrepared); err != nil {
@@ -532,9 +535,9 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 
 // LiveForkMany creates multiple sibling Kernels from one paused source
 // snapshot. The first child is loaded while the source is paused, which pins
-// all shared MemoryFile ranges. sourceReady is then called, and the paused
-// first child is captured as the reusable snapshot from which the remaining
-// children are loaded concurrently.
+// all shared MemoryFile ranges. The paused first child is then recorded, and
+// sourceReady is called; the remaining children are copies of the recording,
+// made concurrently.
 //
 // All options must name distinct non-empty ChildBranchIDs and use compatible
 // resource-policy settings. The returned children correspond to opts by index.
@@ -614,7 +617,7 @@ func (k *Kernel) LiveForkMany(ctx context.Context, opts []LiveForkOptions, sourc
 		}
 	}
 	// The primary child is already the requested result for a one-child fork.
-	// Capturing it again exists only to amortize metadata serialization across
+	// Recording it exists only to amortize metadata recording across
 	// additional siblings.
 	if len(opts) == 1 {
 		if sourceReady != nil {
@@ -627,23 +630,21 @@ func (k *Kernel) LiveForkMany(ctx context.Context, opts []LiveForkOptions, sourc
 	}
 	// captureLiveForkMetadata uses process-wide quiescence mechanisms such as
 	// fdnotifier.Pause. Finish the reusable child capture before sourceReady
-	// resumes another Kernel in this Sentry. Only decoding the additional
-	// children is safe to overlap with source execution.
+	// resumes another Kernel in this Sentry. Only copying the additional
+	// children is safe to overlap with source execution: copies read only
+	// what the recording took.
 	if err := forkPreparedFilesystemBranches(fsResources, ids[0], ids[1:], opts[0].FilesystemOrigins); err != nil {
 		cleanup()
 		return nil, err
 	}
-	// The siblings load what the capture saved once the capture ends: what
-	// the primary's devices keep for them lasts until the loads end.
+	// The siblings copy what the capture recorded once the capture ends:
+	// what the primary's devices keep for them lasts until the copies end.
 	loads := &vfs.LiveForkLoads{}
-	serialized, pmaSnapshots, err := primary.captureLiveForkMetadata(fsResources, loads)
+	recording, pmaSnapshots, err := primary.captureLiveForkMetadata(fsResources, loads)
 	if err != nil {
 		loads.Done()
 		cleanup()
 		return nil, fmt.Errorf("capturing primary live-fork child: %w", err)
-	}
-	if opts[0].Metrics != nil {
-		opts[0].Metrics.MetadataBytes = int64(len(serialized))
 	}
 	if sourceReady != nil {
 		if err := sourceReady(); err != nil {
@@ -665,7 +666,7 @@ func (k *Kernel) LiveForkMany(ctx context.Context, opts []LiveForkOptions, sourc
 			defer wg.Done()
 			child, err := k.loadCapturedLiveForkChild(
 				ctx,
-				serialized,
+				recording,
 				fsResources,
 				pmaSnapshots,
 				networkConfigSource,
@@ -720,14 +721,15 @@ func forkPreparedFilesystemBranches(resources vfs.LiveForkFilesystemResources, p
 }
 
 // captureLiveForkMetadata prepares paused child k as an additional live-fork
-// source and serializes its metadata in memory. Persistent filesystem branches
-// were created before this pass, so it only establishes CoW for in-memory
-// filesystem data. The siblings that load the metadata end loads.
-func (k *Kernel) captureLiveForkMetadata(fsResources vfs.LiveForkFilesystemResources, loads *vfs.LiveForkLoads) ([]byte, mm.LiveForkPMASnapshots, error) {
+// source and records its metadata in memory, for copies. Persistent
+// filesystem branches were created before this pass, so it only establishes
+// CoW for in-memory filesystem data. The siblings that copy the recording end
+// loads.
+func (k *Kernel) captureLiveForkMetadata(fsResources vfs.LiveForkFilesystemResources, loads *vfs.LiveForkLoads) (*state.Recording, mm.LiveForkPMASnapshots, error) {
 	if !k.IsPaused() {
 		return nil, nil, fmt.Errorf("capturing live-fork metadata requires a paused kernel")
 	}
-	var metadata bytes.Buffer
+	var recording *state.Recording
 	var snapshots mm.LiveForkPMASnapshots
 	err := k.quiescePausedAnd(k.SupervisorContext(), func() error {
 		if err := k.flushPlatformForStateCapture(k.SupervisorContext()); err != nil {
@@ -766,27 +768,24 @@ func (k *Kernel) captureLiveForkMetadata(fsResources vfs.LiveForkFilesystemResou
 		defer clearSnapshots()
 		k.mf.MarkSavable()
 
-		buffered := bufio.NewWriterSize(&metadata, 64<<10)
-		if _, err := k.saveStateGraph(saveCtx, buffered); err != nil {
-			return fmt.Errorf("saving live-fork metadata: %w", err)
-		}
-		if err := buffered.Flush(); err != nil {
-			return fmt.Errorf("flushing live-fork metadata: %w", err)
+		if recording, err = k.recordStateGraph(saveCtx); err != nil {
+			return fmt.Errorf("recording live-fork metadata: %w", err)
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, nil, err
 	}
-	return metadata.Bytes(), snapshots, nil
+	return recording, snapshots, nil
 }
 
-// loadCapturedLiveForkChild reconstructs one sibling from metadata captured by
-// LiveForkMany. The primary child remains paused and owns references to every
-// shared MemoryFile range, so the source may run concurrently with this load.
+// loadCapturedLiveForkChild reconstructs one sibling, a copy of the metadata
+// that LiveForkMany recorded. The primary child remains paused and owns
+// references to every shared MemoryFile range, so the source may run
+// concurrently with this load.
 func (k *Kernel) loadCapturedLiveForkChild(
 	ctx context.Context,
-	metadata []byte,
+	recording *state.Recording,
 	fsResources vfs.LiveForkFilesystemResources,
 	pmaSnapshots mm.LiveForkPMASnapshots,
 	networkConfigSource inet.Stack,
@@ -824,13 +823,15 @@ func (k *Kernel) loadCapturedLiveForkChild(
 		mm.CtxLiveForkPMASnapshots:         pmaSnapshots,
 	})
 	metadataStarted := time.Now()
-	if _, err := state.Load(loadCtx, bufio.NewReaderSize(bytes.NewReader(metadata), 64<<10), child); err != nil {
-		return nil, fmt.Errorf("loading live-fork metadata: %w", err)
+	stats, err := recording.Copy(loadCtx, child)
+	if err != nil {
+		return nil, fmt.Errorf("copying live-fork metadata: %w", err)
 	}
 	childLoaded = true
 	if opts.Metrics != nil {
 		opts.Metrics.MetadataStream = time.Since(metadataStarted)
-		opts.Metrics.MetadataBytes = int64(len(metadata))
+		opts.Metrics.MetadataRecord = stats.Record
+		opts.Metrics.MetadataObjects = int64(stats.Objects)
 	}
 
 	restoreStarted := time.Now()

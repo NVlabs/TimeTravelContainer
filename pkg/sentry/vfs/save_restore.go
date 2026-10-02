@@ -24,6 +24,7 @@ import (
 	"slices"
 	"sort"
 	"sync/atomic"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/refs"
@@ -271,6 +272,7 @@ func (vfs *VirtualFilesystem) PrepareSave(ctx context.Context) error {
 	// Devices prepare last: what they prepare, such as a GPU's snapshot, is
 	// wasted if a filesystem fails.
 	devices := vfs.saveRestoreDevices()
+	started := time.Now()
 	for i, dev := range devices {
 		if err := dev.PrepareSave(ctx); err != nil {
 			for _, prepared := range devices[:i] {
@@ -278,6 +280,9 @@ func (vfs *VirtualFilesystem) PrepareSave(ctx context.Context) error {
 			}
 			return err
 		}
+	}
+	if metrics := LiveForkPreparationMetricsFromContext(ctx); metrics != nil {
+		metrics.Devices += time.Since(started)
 	}
 	return nil
 }
