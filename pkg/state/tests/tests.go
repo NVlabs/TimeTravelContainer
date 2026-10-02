@@ -84,7 +84,7 @@ func runTestCases(t *testing.T, shouldFail bool, prefix string, objects []any) {
 			// objects that the encoder refuses, so that a case that
 			// should fail may clone.
 			cloneObjectPtr := reflect.New(reflect.TypeOf(root))
-			cloneErr := state.Clone(context.Background(), context.Background(), saveObjectPtr.Interface(), cloneObjectPtr.Interface(), state.SaveOptions{})
+			_, cloneErr := state.Clone(context.Background(), context.Background(), saveObjectPtr.Interface(), cloneObjectPtr.Interface(), state.SaveOptions{})
 			if !shouldFail {
 				if cloneErr != nil {
 					t.Fatalf("Clone failed unexpectedly: %v", cloneErr)

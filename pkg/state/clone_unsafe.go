@@ -7,8 +7,21 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"time"
 	"unsafe"
 )
+
+// CloneStats is what a Clone did.
+type CloneStats struct {
+	// Objects and Structs are the numbers of objects and structs that the
+	// clone copied.
+	Objects int
+	Structs int
+	// Record is how long the clone took to record the source's graph, and
+	// Copy how long to copy it, its callbacks included.
+	Record time.Duration
+	Copy   time.Duration
+}
 
 // Clone makes the object graph of dstPtr a copy of that of srcPtr, as Save
 // of srcPtr with saveCtx and then Load into dstPtr with loadCtx would, with
@@ -27,27 +40,33 @@ import (
 //
 // The source must not change during the call but for what its StateSave
 // methods change.
-func Clone(saveCtx, loadCtx context.Context, srcPtr, dstPtr any, opts SaveOptions) (err error) {
+func Clone(saveCtx, loadCtx context.Context, srcPtr, dstPtr any, opts SaveOptions) (stats CloneStats, err error) {
 	src := reflect.ValueOf(srcPtr).Elem()
 	dst := reflect.ValueOf(dstPtr).Elem()
 	if src.Type() != dst.Type() {
-		return fmt.Errorf("cloning a %v into a %v", src.Type(), dst.Type())
+		return stats, fmt.Errorf("cloning a %v into a %v", src.Type(), dst.Type())
 	}
 	cs := cloneState{
 		saveCtx:                   saveCtx,
 		loadCtx:                   loadCtx,
 		zeroValues:                make(map[reflect.Type]*objectEncodeState),
-		structs:                   make(map[structKey]*structRecord),
-		types:                     make(map[reflect.Type]*cloneTypeInfo),
+		structs:                   make(map[uintptr]*structRecord),
+		types:                     make(map[uintptr]*cloneTypeInfo),
 		ifaceCopies:               make(map[uintptr]reflect.Value),
 		rootAddr:                  src.Addr().Pointer(),
 		rootType:                  src.Type(),
 		rejectMultipleRootObjects: opts.RejectMultipleRootObjects,
 	}
-	return safely(func() {
+	err = safely(func() {
+		start := time.Now()
 		cs.record(src.Addr())
-		cs.copyGraph(dst)
+		recorded := time.Now()
+		stats.Record = recorded.Sub(start)
+		stats.Objects = cs.copyGraph(dst)
+		stats.Copy = time.Since(recorded)
 	})
+	stats.Structs = len(cs.structs)
+	return stats, err
 }
 
 // cloneState is the state of a Clone.
@@ -69,12 +88,12 @@ type cloneState struct {
 	// a containing object replaced is nil.
 	objects []*objectEncodeState
 
-	// structs are the source's structs, by their addresses and types, and
-	// what their StateSave methods saved.
-	structs map[structKey]*structRecord
+	// structs are what the StateSave methods of the source's structs saved,
+	// by the structs' addresses, of structs of different types each.
+	structs map[uintptr]*structRecord
 
-	// types caches what the clone needs to know of types.
-	types map[reflect.Type]*cloneTypeInfo
+	// types caches what the clone needs to know of types, by rtypeOf.
+	types map[uintptr]*cloneTypeInfo
 
 	// ifaceCopies are addressable copies of the structs and arrays that
 	// interfaces hold, by the addresses of the interfaces' recorded
@@ -99,18 +118,36 @@ type cloneState struct {
 	rejectMultipleRootObjects bool
 }
 
-// structKey identifies a struct: a struct and its first field share an
-// address.
-type structKey struct {
-	addr uintptr
-	typ  reflect.Type
-}
-
 // structRecord is what a struct's StateSave method saved, by slot: values
 // as they were when it saved them, or structs that hold structs, whose own
 // records are what they saved.
 type structRecord struct {
 	slots []reflect.Value
+	// typ is the struct's type's rtypeOf. A struct and its first field,
+	// a struct of another type, share an address: next is the record of
+	// another struct at the same address.
+	typ  uintptr
+	next *structRecord
+	// empty is whether the struct is an anonymous empty struct, which
+	// saves nothing.
+	empty bool
+}
+
+// rtypeOf identifies a type as reflect.Type does, without comparing
+// interfaces: the type's runtime type.
+func rtypeOf(t reflect.Type) uintptr {
+	return (*[2]uintptr)(unsafe.Pointer(&t))[1]
+}
+
+// lookupStruct returns the record of the struct at addr of the type of
+// rtypeOf tid, if the clone recorded it.
+func (cs *cloneState) lookupStruct(addr, tid uintptr) *structRecord {
+	for r := cs.structs[addr]; r != nil; r = r.next {
+		if r.typ == tid {
+			return r
+		}
+	}
+	return nil
 }
 
 // cloneTypeInfo is what the clone knows of a type.
@@ -125,24 +162,44 @@ type cloneTypeInfo struct {
 	// fields its number of fields.
 	registered bool
 	fields     int
+	// primitiveZero is isPrimitiveZero of the type, and plain whether its
+	// values are primitives that hold no pointers, which the clone copies
+	// as bytes.
+	primitiveZero bool
+	plain         bool
+	size          uintptr
 	// slots caches what the clone knows of the types of the values that a
 	// struct type's StateSave method saves, by slot.
 	slots []slotType
 }
 
-// slotType is what the clone knows of the type of a slot's value.
+// slotType is what the clone knows of the type of a slot's value, of
+// rtypeOf typ.
 type slotType struct {
-	typ reflect.Type
+	typ uintptr
 	ti  *cloneTypeInfo
 }
 
 // typeInfo returns what the clone knows of typ.
 func (cs *cloneState) typeInfo(typ reflect.Type) *cloneTypeInfo {
-	if ti, ok := cs.types[typ]; ok {
+	tid := rtypeOf(typ)
+	if ti, ok := cs.types[tid]; ok {
 		return ti
 	}
-	ti := &cloneTypeInfo{}
-	cs.types[typ] = ti
+	ti := &cloneTypeInfo{size: typ.Size()}
+	cs.types[tid] = ti
+	switch k := typ.Kind(); k {
+	case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64, reflect.Complex64, reflect.Complex128:
+		ti.plain = true
+	}
+	switch k := typ.Kind(); k {
+	case reflect.Func, reflect.Chan, reflect.UnsafePointer:
+		// isPrimitiveZero fails on these, as the encoder does.
+	default:
+		ti.primitiveZero = isPrimitiveZero(typ)
+	}
 	switch typ.Kind() {
 	case reflect.Ptr, reflect.Slice, reflect.Map, reflect.Interface:
 		ti.refs = true
@@ -410,22 +467,28 @@ func (cs *cloneState) visit(obj reflect.Value) {
 
 // visitStruct records what a struct's StateSave method saves, once.
 func (cs *cloneState) visitStruct(obj reflect.Value) {
-	key := structKey{obj.UnsafeAddr(), obj.Type()}
-	if _, ok := cs.structs[key]; ok {
+	addr, typ := obj.UnsafeAddr(), obj.Type()
+	tid := rtypeOf(typ)
+	if cs.lookupStruct(addr, tid) != nil {
 		return
 	}
-	ti := cs.typeInfo(obj.Type())
+	ti := cs.typeInfo(typ)
 	sl, ok := obj.Addr().Interface().(SaverLoader)
 	if !ok || !ti.registered {
 		if obj.NumField() == 0 {
 			// An anonymous empty struct, as the encoder allows.
-			cs.structs[key] = nil
+			rec := cs.newStructRecord(0)
+			rec.typ, rec.empty = tid, true
+			rec.next = cs.structs[addr]
+			cs.structs[addr] = rec
 			return
 		}
 		Failf("struct %T does not implement SaverLoader", obj.Interface())
 	}
 	rec := cs.newStructRecord(ti.fields)
-	cs.structs[key] = rec
+	rec.typ = tid
+	rec.next = cs.structs[addr]
+	cs.structs[addr] = rec
 	cr := cs.pushRecorder()
 	cr.rec = rec
 	cr.ti = ti
@@ -494,13 +557,14 @@ func (cr *cloneRecorder) save(slot int, obj reflect.Value) {
 		cr.rec.slots = append(cr.rec.slots, reflect.Value{})
 	}
 	typ := obj.Type()
+	tid := rtypeOf(typ)
 	var ti *cloneTypeInfo
-	if slots := cr.ti.slots; slot < len(slots) && slots[slot].typ == typ {
+	if slots := cr.ti.slots; slot < len(slots) && slots[slot].typ == tid {
 		ti = slots[slot].ti
 	} else {
 		ti = cs.typeInfo(typ)
 		if slot < len(slots) {
-			slots[slot] = slotType{typ, ti}
+			slots[slot] = slotType{tid, ti}
 		}
 	}
 	if ti.structs {
@@ -532,8 +596,8 @@ func (cr *cloneRecorder) save(slot int, obj reflect.Value) {
 }
 
 // copyGraph creates the copies of the recorded objects, dst the root's, and
-// fills them.
-func (cs *cloneState) copyGraph(dst reflect.Value) {
+// fills them. It returns the number of objects.
+func (cs *cloneState) copyGraph(dst reflect.Value) int {
 	objects := make([]*objectEncodeState, 0, len(cs.objects))
 	for _, oes := range cs.objects {
 		if oes == nil {
@@ -546,7 +610,7 @@ func (cs *cloneState) copyGraph(dst reflect.Value) {
 			cl.clone = dst
 			cl.base = unsafe.Pointer(dst.UnsafeAddr())
 		case oes.how == encodeMapAsValue:
-			cl.clone = reflect.MakeMap(oes.obj.Type())
+			cl.clone = reflect.MakeMapWithSize(oes.obj.Type(), len(cl.keys))
 		case cl.snapshot.IsValid() && !cs.typeInfo(oes.obj.Type()).refs:
 			// The snapshot, which refers to nothing, is the copy.
 			cl.clone = cl.snapshot
@@ -578,6 +642,7 @@ func (cs *cloneState) copyGraph(dst reflect.Value) {
 		}
 	}
 	cs.complete(objects)
+	return len(objects)
 }
 
 // complete runs the copies' callbacks, each object's once those of the
@@ -652,7 +717,7 @@ func (cs *cloneState) wait(waiter, target *objectEncodeState, fn func()) {
 
 // setConverted sets dst to v, of the same underlying type.
 func setConverted(dst, v reflect.Value) {
-	if v.Type() != dst.Type() {
+	if rtypeOf(v.Type()) != rtypeOf(dst.Type()) {
 		v = v.Convert(dst.Type())
 	}
 	dst.Set(v)
@@ -721,11 +786,11 @@ func (cs *cloneState) copyValue(oes *objectEncodeState, dst, src reflect.Value, 
 		dst.Set(v)
 		return
 	case reflect.Struct:
-		rec, ok := cs.structs[structKey{src.UnsafeAddr(), src.Type()}]
-		if !ok {
+		rec := cs.lookupStruct(src.UnsafeAddr(), rtypeOf(src.Type()))
+		if rec == nil {
 			Failf("struct %v at %#x was not recorded", src.Type(), src.UnsafeAddr())
 		}
-		if rec != nil {
+		if !rec.empty {
 			if sl, ok := dst.Addr().Interface().(SaverLoader); ok {
 				cl := cs.pushLoader()
 				cl.oes, cl.rec = oes, rec
@@ -748,7 +813,7 @@ func (cs *cloneState) copyValue(oes *objectEncodeState, dst, src reflect.Value, 
 	case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
 		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
 		reflect.Float32, reflect.Float64, reflect.Complex64, reflect.Complex128, reflect.String:
-		copyPrimitive(dst, src)
+		cs.copyPrimitive(dst, src)
 	default:
 		Failf("unknown object %#v", src.Interface())
 	}
@@ -790,7 +855,7 @@ func (cl *cloneLoader) load(slot int, dst reflect.Value, wait bool, fn func()) {
 	if slot < len(cl.rec.slots) {
 		src = cl.rec.slots[slot]
 	}
-	if !src.IsValid() || (isPrimitiveZero(src.Type()) && src.IsZero()) {
+	if !src.IsValid() || cl.cs.isZeroPrimitive(src) {
 		// The encoder encodes nothing for a zero value, and the decoder
 		// leaves the destination as it is.
 		if wait && fn != nil {
@@ -806,10 +871,49 @@ func (cl *cloneLoader) afterLoad(fn func()) {
 	cl.oes.clone.callbacks = append(cl.oes.clone.callbacks, cloneCallback{fn: fn})
 }
 
+// isZeroPrimitive reports whether src, an addressable value, is a zero
+// value that the encoder would encode as nothing, as isPrimitiveZero and
+// reflect.Value.IsZero do.
+func (cs *cloneState) isZeroPrimitive(src reflect.Value) bool {
+	ti := cs.typeInfo(src.Type())
+	if !ti.primitiveZero {
+		return false
+	}
+	if ti.plain && src.CanAddr() {
+		return isZeroBytes(unsafe.Pointer(src.UnsafeAddr()), ti.size)
+	}
+	return src.IsZero()
+}
+
+// isZeroBytes reports whether the size bytes at p are zero.
+func isZeroBytes(p unsafe.Pointer, size uintptr) bool {
+	switch size {
+	case 1:
+		return *(*uint8)(p) == 0
+	case 2:
+		return *(*uint16)(p) == 0
+	case 4:
+		return *(*uint32)(p) == 0
+	case 8:
+		return *(*uint64)(p) == 0
+	}
+	for _, b := range unsafe.Slice((*byte)(p), size) {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // copyPrimitive sets dst to src, primitives, as the decoder sets a value of
 // one type to what the encoder encoded of another, of the same kind.
-func copyPrimitive(dst, src reflect.Value) {
-	if src.Type() == dst.Type() {
+// Primitives of one type that hold no pointers are bytes to copy.
+func (cs *cloneState) copyPrimitive(dst, src reflect.Value) {
+	if st, dt := src.Type(), dst.Type(); rtypeOf(st) == rtypeOf(dt) {
+		if ti := cs.typeInfo(st); ti.plain && dst.CanAddr() && src.CanAddr() {
+			copy(unsafe.Slice((*byte)(unsafe.Pointer(dst.UnsafeAddr())), ti.size), unsafe.Slice((*byte)(unsafe.Pointer(src.UnsafeAddr())), ti.size))
+			return
+		}
 		dst.Set(src)
 		return
 	}

@@ -5635,6 +5635,8 @@ type Branch struct {
 	ForkMemoryPreparationNS   int64     `json:"fork_memory_preparation_ns,omitempty"`
 	ForkMetadataStreamNS      int64     `json:"fork_metadata_stream_ns,omitempty"`
 	ForkMetadataBytes         int64     `json:"fork_metadata_bytes,omitempty"`
+	ForkMetadataRecordNS      int64     `json:"fork_metadata_record_ns,omitempty"`
+	ForkMetadataObjects       int64     `json:"fork_metadata_objects,omitempty"`
 	ForkChildRestoreNS        int64     `json:"fork_child_restore_ns,omitempty"`
 	CreatedAt                 time.Time `json:"created_at"`
 	InitPID                   int32     `json:"init_pid,omitempty"`
@@ -12739,6 +12741,8 @@ type runscBranchInfo struct {
 			MemoryPreparation       time.Duration `json:"MemoryPreparation"`
 			MetadataStream          time.Duration `json:"MetadataStream"`
 			MetadataBytes           int64         `json:"MetadataBytes"`
+			MetadataRecord          time.Duration `json:"MetadataRecord"`
+			MetadataObjects         int64         `json:"MetadataObjects"`
 			ChildRestore            time.Duration `json:"ChildRestore"`
 			Total                   time.Duration `json:"Total"`
 		} `json:"Kernel"`
@@ -12770,6 +12774,7 @@ func persistentBranchView(info ttcbundle.BranchInfo) Branch {
 		ForkMappingInvalidationNS: info.ForkMappingInvalidationNS, ForkVFSPreparationNS: info.ForkVFSPreparationNS,
 		ForkMemoryPreparationNS: info.ForkMemoryPreparationNS, ForkMetadataStreamNS: info.ForkMetadataStreamNS,
 		ForkMetadataBytes: info.ForkMetadataBytes, ForkChildRestoreNS: info.ForkChildRestoreNS,
+		ForkMetadataRecordNS: info.ForkMetadataRecordNS, ForkMetadataObjects: info.ForkMetadataObjects,
 	}
 }
 
@@ -12969,6 +12974,8 @@ func branchView(info runscBranchInfo) Branch {
 		ForkMemoryPreparationNS:   info.ForkMetrics.Kernel.MemoryPreparation.Nanoseconds(),
 		ForkMetadataStreamNS:      info.ForkMetrics.Kernel.MetadataStream.Nanoseconds(),
 		ForkMetadataBytes:         info.ForkMetrics.Kernel.MetadataBytes,
+		ForkMetadataRecordNS:      info.ForkMetrics.Kernel.MetadataRecord.Nanoseconds(),
+		ForkMetadataObjects:       info.ForkMetrics.Kernel.MetadataObjects,
 		ForkChildRestoreNS:        info.ForkMetrics.Kernel.ChildRestore.Nanoseconds(),
 	}
 }
@@ -13127,6 +13134,7 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 				ForkMappingInvalidationNS: branch.ForkMappingInvalidationNS, ForkVFSPreparationNS: branch.ForkVFSPreparationNS,
 				ForkMemoryPreparationNS: branch.ForkMemoryPreparationNS, ForkMetadataStreamNS: branch.ForkMetadataStreamNS,
 				ForkMetadataBytes: branch.ForkMetadataBytes, ForkChildRestoreNS: branch.ForkChildRestoreNS,
+				ForkMetadataRecordNS: branch.ForkMetadataRecordNS, ForkMetadataObjects: branch.ForkMetadataObjects,
 			}
 			if referenceOperations[i] != "" {
 				if referenceTransaction != "" {

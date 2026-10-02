@@ -133,8 +133,13 @@ type LiveForkMetrics struct {
 	MemoryPreparation             time.Duration
 	MetadataStream                time.Duration
 	MetadataBytes                 int64
-	ChildRestore                  time.Duration
-	Total                         time.Duration
+	// MetadataRecord is how much of MetadataStream an in-memory copy of
+	// the metadata took to record the source's, and MetadataObjects the
+	// number of objects that it copied.
+	MetadataRecord  time.Duration
+	MetadataObjects int64
+	ChildRestore    time.Duration
+	Total           time.Duration
 }
 
 // LiveForkStage identifies a completed live-fork transaction stage.
@@ -455,7 +460,7 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			mm.CtxLiveForkPMASnapshots:           pmaSnapshots,
 		})
 		metadataStarted := time.Now()
-		if err := streamLiveForkState(saveCtx, loadCtx, k, child); err != nil {
+		if err := streamLiveForkState(saveCtx, loadCtx, k, child, opts.Metrics); err != nil {
 			return err
 		}
 		if remotePageLoad != nil {
@@ -1494,9 +1499,14 @@ func (k *Kernel) captureFileDescriptionMemory(capture *pgalloc.MemoryRangeCaptur
 
 // streamLiveForkState makes child a copy of parent's state, in memory: the
 // child is in the same process, so that its state need not be encoded.
-func streamLiveForkState(saveCtx, loadCtx context.Context, parent, child *Kernel) error {
-	if err := parent.cloneStateGraph(saveCtx, loadCtx, child); err != nil {
+func streamLiveForkState(saveCtx, loadCtx context.Context, parent, child *Kernel, metrics *LiveForkMetrics) error {
+	stats, err := parent.cloneStateGraph(saveCtx, loadCtx, child)
+	if err != nil {
 		return fmt.Errorf("cloning live-fork metadata: %w", err)
+	}
+	if metrics != nil {
+		metrics.MetadataRecord = stats.Record
+		metrics.MetadataObjects = int64(stats.Objects)
 	}
 	return nil
 }

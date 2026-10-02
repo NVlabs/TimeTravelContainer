@@ -702,6 +702,8 @@ type BranchInfo struct {
 	ForkMemoryPreparationNS   int64     `json:"fork_memory_preparation_ns,omitempty"`
 	ForkMetadataStreamNS      int64     `json:"fork_metadata_stream_ns,omitempty"`
 	ForkMetadataBytes         int64     `json:"fork_metadata_bytes,omitempty"`
+	ForkMetadataRecordNS      int64     `json:"fork_metadata_record_ns,omitempty"`
+	ForkMetadataObjects       int64     `json:"fork_metadata_objects,omitempty"`
 	ForkChildRestoreNS        int64     `json:"fork_child_restore_ns,omitempty"`
 	CreatedAt                 time.Time `json:"created_at"`
 }

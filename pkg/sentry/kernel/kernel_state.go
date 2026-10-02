@@ -51,7 +51,7 @@ func (k *Kernel) saveStateGraph(ctx context.Context, w io.Writer) (state.Stats, 
 // as saveStateGraph and a load of what it saved would.
 //
 // Preconditions: k.extMu must be locked.
-func (k *Kernel) cloneStateGraph(saveCtx, loadCtx context.Context, child *Kernel) error {
+func (k *Kernel) cloneStateGraph(saveCtx, loadCtx context.Context, child *Kernel) (state.CloneStats, error) {
 	k.filteringBranchDanglingEndpoints = true
 	defer func() {
 		k.filteringBranchDanglingEndpoints = false

@@ -38,7 +38,7 @@ func TestCloneAliases(t *testing.T) {
 	r.inner = cloneValue{x: 9, p: &r.arr[0]}
 
 	var c cloneRoot
-	if err := state.Clone(context.Background(), context.Background(), r, &c, state.SaveOptions{}); err != nil {
+	if _, err := state.Clone(context.Background(), context.Background(), r, &c, state.SaveOptions{}); err != nil {
 		t.Fatalf("Clone: %v", err)
 	}
 	if c.a == a || c.b == b || c.a == nil || c.b == nil {
@@ -100,7 +100,7 @@ func TestCloneRejectsSecondRoot(t *testing.T) {
 	other := &cloneRoot{}
 	r := &cloneRoot{a: &cloneNode{any: other}}
 	var c cloneRoot
-	if err := state.Clone(context.Background(), context.Background(), r, &c, state.SaveOptions{RejectMultipleRootObjects: true}); err == nil {
+	if _, err := state.Clone(context.Background(), context.Background(), r, &c, state.SaveOptions{RejectMultipleRootObjects: true}); err == nil {
 		t.Errorf("Clone reached a second root")
 	}
 }
@@ -115,7 +115,7 @@ func BenchmarkClone(b *testing.B) {
 			for i := 0; i < n; i++ {
 				// v points to the object.
 				dst := reflect.New(reflect.TypeOf(v).Elem())
-				if err := state.Clone(context.Background(), context.Background(), v, dst.Interface(), state.SaveOptions{}); err != nil {
+				if _, err := state.Clone(context.Background(), context.Background(), v, dst.Interface(), state.SaveOptions{}); err != nil {
 					b.Errorf("clone failed: %v", err)
 				}
 			}
@@ -168,7 +168,7 @@ func BenchmarkRich(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			dst := reflect.New(reflect.TypeOf(v).Elem())
-			if err := state.Clone(context.Background(), context.Background(), v, dst.Interface(), state.SaveOptions{}); err != nil {
+			if _, err := state.Clone(context.Background(), context.Background(), v, dst.Interface(), state.SaveOptions{}); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -188,7 +188,7 @@ func TestCloneTakesValuesWhenSaved(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 	var cloned cloneRegistryRoot
-	if err := state.Clone(context.Background(), context.Background(), newCloneRegistryRoot(), &cloned, state.SaveOptions{}); err != nil {
+	if _, err := state.Clone(context.Background(), context.Background(), newCloneRegistryRoot(), &cloned, state.SaveOptions{}); err != nil {
 		t.Fatalf("Clone: %v", err)
 	}
 	if !reflect.DeepEqual(loaded, cloned) {
