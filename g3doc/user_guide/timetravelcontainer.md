@@ -595,6 +595,12 @@ configured memory targets and branch CoW accounting. Starting `ttcd` with
 `--cluster-auto-rebalance` runs this operation automatically when the node
 crosses its target, with a 10% low-water mark and cooldown to avoid oscillation.
 
+A node's memory, which its target bounds and `ttc node ls` shows, is what its
+daemon and runtimes hold, on every platform: the daemon's resident memory, the
+runtimes' own, and their guests' memory, each page once. A rebalance counts a
+family's runtime as freed when the last of the family's branches leaves the
+node, and as spent again on a node that runs none of them.
+
 If a drain or pressure rebalance has no feasible destination, TTC writes one
 durable request per source node to:
 

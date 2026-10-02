@@ -337,6 +337,40 @@ func currentNodeMemoryBytes(localRoot string) (uint64, error) {
 	return total, nil
 }
 
+// runtimeMemoryBytes returns, by runtime, the resident memory of the
+// processes of each of runtimes, container IDs, on the node with local root
+// localRoot, as currentNodeMemoryBytes counts it: those whose argv names both
+// the root and the runtime.
+func runtimeMemoryBytes(localRoot string, runtimes []string) (map[string]uint64, error) {
+	output, err := exec.Command("/bin/ps", "-axww", "-o", "pid=,rss=,command=").Output()
+	if err != nil {
+		return nil, fmt.Errorf("listing host processes: %w", err)
+	}
+	localRoot = filepath.Clean(localRoot)
+	held := make(map[string]uint64, len(runtimes))
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		residentKiB, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		command := strings.Join(fields[2:], " ")
+		if !strings.Contains(command, localRoot) {
+			continue
+		}
+		for _, runtime := range runtimes {
+			if runtime != "" && strings.Contains(command, runtime) {
+				held[runtime] += residentKiB << 10
+				break
+			}
+		}
+	}
+	return held, nil
+}
+
 // cloexecStreamSocketpair creates a close-on-exec AF_UNIX stream pair. Darwin
 // has no SOCK_CLOEXEC; ForkLock keeps a concurrent exec from inheriting the
 // descriptors before they are marked, as os.Pipe does here.

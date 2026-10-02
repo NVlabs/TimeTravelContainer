@@ -20,6 +20,19 @@ type PlannerSnapshot struct {
 	Branches      []PlannerBranchSnapshot `json:"branches"`
 	VersionRuns   []PlannerVersionRun     `json:"version_runs,omitempty"`
 	VersionChunks []PlannerVersionChunk   `json:"version_chunks,omitempty"`
+	Runtimes      []PlannerRuntime        `json:"runtimes,omitempty"`
+}
+
+// PlannerRuntime accounts a runtime on a node, which some of the node's
+// branches of one family share: its Sentry and the processes beside it.
+// Bytes is the memory it holds beyond its branches' own, which the node frees
+// once the last of Branches leaves, and which another node that runs none of
+// the family's branches spends to run the first that arrives.
+type PlannerRuntime struct {
+	ID       string   `json:"id"`
+	Family   string   `json:"family"`
+	Bytes    uint64   `json:"bytes"`
+	Branches []string `json:"branches"`
 }
 
 // PlannerBranchSnapshot accounts one active branch on a node.
@@ -261,6 +274,55 @@ func BuildFixedTerminalProblem(mode PlacementMode, source string, nodes []NodeRe
 		problem.Shared = append(problem.Shared, SharedResource{
 			ID: fmt.Sprintf("resident-version-%04d", index), Bytes: entry.bytes,
 			Branches: entry.branches, FixedNodes: entry.fixed,
+		})
+	}
+	// A runtime on the source is freed once the last of its branches leaves
+	// it, and is spent again on a node that runs none of its family's
+	// branches when the first arrives there.
+	familyNodes := make(map[string]map[string]bool)
+	addFamily := func(family, node string) {
+		if family == "" {
+			return
+		}
+		if familyNodes[family] == nil {
+			familyNodes[family] = make(map[string]bool)
+		}
+		familyNodes[family][node] = true
+	}
+	var runtimes []PlannerRuntime
+	for _, snapshot := range snapshots {
+		if snapshot.NodeID == source {
+			runtimes = snapshot.Runtimes
+			continue
+		}
+		for _, runtime := range snapshot.Runtimes {
+			addFamily(runtime.Family, snapshot.NodeID)
+		}
+		for _, branch := range snapshot.Branches {
+			if family, _, ok := strings.Cut(branch.ID, "@"); ok {
+				addFamily(family, snapshot.NodeID)
+			}
+		}
+	}
+	seenRuntimes := make(map[string]bool, len(runtimes))
+	for _, runtime := range runtimes {
+		if runtime.ID == "" || seenRuntimes[runtime.ID] {
+			return FixedTerminalProblem{}, fmt.Errorf("invalid or duplicate runtime %q on node %q", runtime.ID, source)
+		}
+		seenRuntimes[runtime.ID] = true
+		branches := make(map[string]bool, len(runtime.Branches))
+		for _, branch := range runtime.Branches {
+			if _, ok := movable[branch]; !ok {
+				return FixedTerminalProblem{}, fmt.Errorf("runtime %q on node %q has unknown branch %q", runtime.ID, source, branch)
+			}
+			branches[branch] = true
+		}
+		if runtime.Bytes == 0 || len(branches) == 0 {
+			continue
+		}
+		problem.Shared = append(problem.Shared, SharedResource{
+			ID: "runtime-" + runtime.ID, Bytes: runtime.Bytes,
+			Branches: sortedBoolKeys(branches), FixedNodes: sortedBoolKeys(familyNodes[runtime.Family]),
 		})
 	}
 	branchIDs := make([]string, 0, len(movable))

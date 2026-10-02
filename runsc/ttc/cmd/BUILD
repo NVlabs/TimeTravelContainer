@@ -121,6 +121,7 @@ go_test(
         "idempotency_test.go",
         "long_operations_test.go",
         "net_raw_test.go",
+        "node_memory_test.go",
         "nvproxy_test.go",
         "runtime_command_test.go",
     ],

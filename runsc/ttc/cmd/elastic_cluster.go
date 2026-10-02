@@ -5123,6 +5123,13 @@ func (b *runtimeBackend) localPlannerSnapshot() (cluster.PlannerSnapshot, error)
 		physicalIDs = append(physicalIDs, physical)
 	}
 	sort.Strings(physicalIDs)
+	// What each runtime holds beyond its branches' memory, which the node
+	// counts in its own, is the planner's to free with the runtime's last
+	// branch. Unmeasured, the planner counts none.
+	held, err := runtimeMemoryBytes(b.activeDataRoot(), physicalIDs)
+	if err != nil {
+		held = nil
+	}
 	for _, physical := range physicalIDs {
 		local := byPhysical[physical]
 		sort.Slice(local, func(i, j int) bool { return local[i].BranchID < local[j].BranchID })
@@ -5143,6 +5150,7 @@ func (b *runtimeBackend) localPlannerSnapshot() (cluster.PlannerSnapshot, error)
 			byID[memory.ID] = memory
 		}
 		localIDs := make(map[string]string, len(local))
+		runtime := cluster.PlannerRuntime{ID: physical}
 		for _, record := range local {
 			physicalBranch := record.PhysicalBranch
 			if physicalBranch == "" {
@@ -5159,6 +5167,12 @@ func (b *runtimeBackend) localPlannerSnapshot() (cluster.PlannerSnapshot, error)
 			id := selector{container: name, branch: record.BranchID}.String()
 			localIDs[physicalBranch] = id
 			snapshot.Branches = append(snapshot.Branches, cluster.PlannerBranchSnapshot{ID: id, TotalBytes: memory.TotalBytes})
+			runtime.Family = name
+			runtime.Branches = append(runtime.Branches, id)
+		}
+		if total := held[physical]; total > resident.UniqueBytes {
+			runtime.Bytes = total - resident.UniqueBytes
+			snapshot.Runtimes = append(snapshot.Runtimes, runtime)
 		}
 		for _, run := range resident.VersionRuns {
 			id, ok := localIDs[run.Branch]

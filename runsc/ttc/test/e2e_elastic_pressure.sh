@@ -20,7 +20,7 @@ PID_B=
 PID_C=
 CLEANED=
 FAMILIES="pressure-a-$$ pressure-b-$$"
-SOURCE_TARGET=${TTC_ELASTIC_PRESSURE_SOURCE_TARGET:-768MiB}
+SOURCE_TARGET=${TTC_ELASTIC_PRESSURE_SOURCE_TARGET:-512MiB}
 BRANCH_BYTES=${TTC_ELASTIC_PRESSURE_BRANCH_BYTES:-67108864}
 
 socket() { printf '%s/local-%s/ttcd.sock' "$ROOT" "$1"; }
@@ -96,7 +96,8 @@ start_node() {
 # its local root. Do not derive this threshold from the caller's cgroup: build
 # workers and unrelated jobs can disappear after this test starts and make the
 # supposedly pressured node fall below a stale, inflated target. Eight branches
-# independently dirty BRANCH_BYTES below, crossing this fixed node-local target.
+# independently dirty BRANCH_BYTES below, as much as this fixed node-local
+# target, which the node's daemon and runtimes cross.
 # Planner estimates include conservative shared-memory exposure, so peers keep
 # ample accepting capacity to exercise placement rather than provisioning.
 source_target=$SOURCE_TARGET
@@ -191,6 +192,14 @@ echo "TTC high-fanout pressure rebalance passed with $(printf '%s' "$plan" | jq 
 # of MiB of authoritative memory chunks after every visible family was gone.
 for family in $FAMILIES; do
 	client a rm -f "$family" >/dev/null
+done
+# A node keeps the chunks of origins it does not hold as its own as a cache,
+# until it finds them retired, which it asks again a minute after it last
+# found them alive: the running nodes release the families' chunks within two
+# minutes.
+for attempt in $(seq 1 240); do
+	find "$ROOT" -path '*/objects/memory-chunks/*' -type f -print -quit | grep -q . || break
+	sleep 0.5
 done
 for node in c b a; do
 	client "$node" node stop "node-$node" --stop-all >/dev/null

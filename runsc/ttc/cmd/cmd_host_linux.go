@@ -287,6 +287,16 @@ func legacyPortLockHolder(lockPath, container, branch, endpoint string) (int, er
 // could not relieve. Sentries are daemon siblings, but every runtime and
 // helper created for this node carries its node-local root in argv. Scan those
 // process leaders and add the daemon itself explicitly.
+//
+// The node holds the daemon's resident memory, the anonymous memory of those
+// processes, and the pages of the memory files that they hold open, each
+// file's once. Their resident memory would count a guest's memory, a memory
+// file's pages, once in every process that maps them, and not at all where
+// those are not the node's by their argv: on KVM the Sentry maps all of it,
+// on systrap the stub processes do, whose argv is empty, and the Sentry only
+// what it copies to and from. And it would count the pages of the binary
+// that the daemon, every runtime and every helper run, once in each; they
+// are counted in the daemon's.
 func currentNodeMemoryBytes(localRoot string) (uint64, error) {
 	self := os.Getpid()
 	total, err := processResidentMemoryBytes(self)
@@ -303,15 +313,19 @@ func currentNodeMemoryBytes(localRoot string) (uint64, error) {
 	}
 	// Which processes are the node's is read from their command lines, which
 	// a host runs many of, once, and again every nodeProcessRereads
-	// measurements, for one read between its fork and its exec.
+	// measurements, for one read between its fork and its exec; which of
+	// their descriptors are memory files, too.
 	value, _ := nodeProcessesByRoot.LoadOrStore(localRoot, &nodeProcesses{})
 	known := value.(*nodeProcesses)
 	known.mu.Lock()
 	defer known.mu.Unlock()
 	if known.measurements++; known.measurements%nodeProcessRereads == 0 {
 		known.ours = nil
+		known.descriptors = nil
 	}
 	present := make(map[int]bool, len(known.ours))
+	descriptors := make(map[int]map[string]bool, len(known.descriptors))
+	memoryFiles := make(map[memoryFileKey]uint64)
 	for _, entry := range entries {
 		pid, err := strconv.Atoi(entry.Name())
 		if err != nil || pid == self {
@@ -329,23 +343,77 @@ func currentNodeMemoryBytes(localRoot string) (uint64, error) {
 		if !ours {
 			continue
 		}
-		resident, err := processResidentMemoryBytes(pid)
+		anonymous, err := processAnonymousMemoryBytes(pid)
 		if err != nil {
 			// Processes naturally race the scan by exiting. An unreadable entry
 			// no longer contributes to current resident usage.
 			continue
 		}
-		total += resident
+		total += anonymous
+		descriptors[pid] = addMemoryFiles(pid, known.descriptors[pid], memoryFiles)
 	}
 	known.ours = present
+	known.descriptors = descriptors
+	for _, allocated := range memoryFiles {
+		total += allocated
+	}
 	return total, nil
 }
 
+// runtimeMemoryBytes returns, by runtime, what the processes of each of
+// runtimes, container IDs, hold on the node with local root localRoot, as
+// currentNodeMemoryBytes counts it: their anonymous memory and the pages of
+// their memory files. A runtime's processes are those whose argv names both
+// the root and the runtime.
+func runtimeMemoryBytes(localRoot string, runtimes []string) (map[string]uint64, error) {
+	localRoot = filepath.Clean(localRoot)
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil, err
+	}
+	self := os.Getpid()
+	held := make(map[string]uint64, len(runtimes))
+	memoryFiles := make(map[string]map[memoryFileKey]uint64, len(runtimes))
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid == self {
+			continue
+		}
+		cmdline, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+		if err != nil || !bytes.Contains(cmdline, []byte(localRoot)) {
+			continue
+		}
+		for _, runtime := range runtimes {
+			if runtime == "" || !bytes.Contains(cmdline, []byte(runtime)) {
+				continue
+			}
+			anonymous, err := processAnonymousMemoryBytes(pid)
+			if err != nil {
+				break
+			}
+			held[runtime] += anonymous
+			if memoryFiles[runtime] == nil {
+				memoryFiles[runtime] = make(map[memoryFileKey]uint64)
+			}
+			addMemoryFiles(pid, nil, memoryFiles[runtime])
+			break
+		}
+	}
+	for runtime, files := range memoryFiles {
+		for _, allocated := range files {
+			held[runtime] += allocated
+		}
+	}
+	return held, nil
+}
+
 // nodeProcesses remembers, by PID, whether a process on the host is one of a
-// node's; see currentNodeMemoryBytes.
+// node's, and which of a node process's descriptors are memory files; see
+// currentNodeMemoryBytes.
 type nodeProcesses struct {
 	mu           sync.Mutex
 	ours         map[int]bool
+	descriptors  map[int]map[string]bool
 	measurements int
 }
 
@@ -356,23 +424,92 @@ const nodeProcessRereads = 12
 // nodeProcessesByRoot has the nodeProcesses of each node's local root.
 var nodeProcessesByRoot sync.Map
 
+// memoryFileKey identifies a memory file that several processes, or several
+// descriptors, may hold.
+type memoryFileKey struct {
+	dev, ino uint64
+}
+
+// addMemoryFiles adds to files the bytes allocated to each memory file that
+// process pid holds open, and returns which of its descriptors, by name, are
+// memory files. kinds is what the last call returned for the process: a
+// descriptor that was not a memory file then is not looked at again while it
+// is open, nor one that was closed and opened on a memory file in between,
+// until the descriptors are read again (nodeProcessRereads).
+func addMemoryFiles(pid int, kinds map[string]bool, files map[memoryFileKey]uint64) map[string]bool {
+	dir := "/proc/" + strconv.Itoa(pid) + "/fd"
+	f, err := os.Open(dir)
+	if err != nil {
+		return nil
+	}
+	names, err := f.Readdirnames(-1)
+	f.Close()
+	if err != nil {
+		return nil
+	}
+	now := make(map[string]bool, len(names))
+	for _, name := range names {
+		path := dir + "/" + name
+		memoryFile, seen := kinds[name]
+		if !seen || memoryFile {
+			target, err := os.Readlink(path)
+			if err != nil {
+				continue
+			}
+			memoryFile = strings.HasPrefix(target, "/memfd:")
+		}
+		now[name] = memoryFile
+		if !memoryFile {
+			continue
+		}
+		var stat unix.Stat_t
+		if err := unix.Stat(path, &stat); err != nil || stat.Blocks <= 0 {
+			continue
+		}
+		files[memoryFileKey{dev: uint64(stat.Dev), ino: stat.Ino}] = uint64(stat.Blocks) * 512
+	}
+	return now
+}
+
 // processResidentMemoryBytes returns the resident bytes charged to one host
 // process. /proc contains process leaders, rather than every thread, so this
 // does not multiply the Sentry's shared address space by its systrap threads.
 func processResidentMemoryBytes(pid int) (uint64, error) {
-	statm, err := os.ReadFile(fmt.Sprintf("/proc/%d/statm", pid))
-	if err != nil {
+	resident, _, err := processStatm(pid)
+	return resident, err
+}
+
+// processAnonymousMemoryBytes returns the resident bytes of one host process
+// that are neither a file's nor shared memory's.
+func processAnonymousMemoryBytes(pid int) (uint64, error) {
+	resident, shared, err := processStatm(pid)
+	if err != nil || shared > resident {
 		return 0, err
 	}
+	return resident - shared, nil
+}
+
+// processStatm returns a process's resident bytes and, of those, the bytes of
+// files and of shared memory.
+func processStatm(pid int) (resident, shared uint64, err error) {
+	statm, err := os.ReadFile(fmt.Sprintf("/proc/%d/statm", pid))
+	if err != nil {
+		return 0, 0, err
+	}
 	fields := strings.Fields(string(statm))
-	if len(fields) < 2 {
-		return 0, errors.New("/proc/self/statm has no resident page count")
+	if len(fields) < 3 {
+		return 0, 0, fmt.Errorf("/proc/%d/statm has no resident and shared page counts", pid)
 	}
 	residentPages, err := strconv.ParseUint(fields[1], 10, 64)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	return residentPages * uint64(os.Getpagesize()), nil
+	sharedPages, err := strconv.ParseUint(fields[2], 10, 64)
+	if err != nil {
+		return 0, 0, err
+	}
+	pageSize := uint64(os.Getpagesize())
+	return residentPages * pageSize, sharedPages * pageSize, nil
 }
 
 // cloexecStreamSocketpair creates a close-on-exec AF_UNIX stream pair.
