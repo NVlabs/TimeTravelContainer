@@ -103,10 +103,23 @@ func Openat(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr,
 
 const openHowSize = 24
 
+// resolveFlags are the path-resolution restrictions that openat2(2) knows:
+// RESOLVE_NO_XDEV, RESOLVE_NO_MAGICLINKS, RESOLVE_NO_SYMLINKS,
+// RESOLVE_BENEATH, RESOLVE_IN_ROOT and RESOLVE_CACHED.
+const (
+	resolveBeneath = 0x08
+	resolveInRoot  = 0x10
+	resolveFlags   = 0x3f
+)
+
 // Openat2 implements Linux syscall openat2(2). Path-resolution restrictions
 // are security properties and must not be silently ignored, so this initial
-// implementation accepts only resolve=0. This still covers callers that use
-// openat2 as an extensible openat, including GNU tar's directory traversal.
+// implementation accepts only resolve=0, which covers callers that use
+// openat2 as an extensible openat. It refuses the restrictions as a kernel
+// that has no openat2 does, with ENOSYS, on which the callers that ask for
+// them, as GNU tar does through gnulib for every file it extracts, resolve
+// the path themselves: EINVAL, a kernel's answer to flags it does not know,
+// failed them.
 func Openat2(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	dirfd := args[0].Int()
 	addr := args[1].Pointer()
@@ -147,11 +160,17 @@ func parseOpenHow(buf []byte) (uint32, uint, error) {
 		linux.O_DIRECT | linux.O_LARGEFILE | linux.O_DIRECTORY | linux.O_NOFOLLOW |
 		linux.O_NOATIME | linux.O_CLOEXEC | linux.O_SYNC | linux.O_PATH | linux.O_TMPFILE)
 	validMode := uint64(0777 | linux.S_ISUID | linux.S_ISGID | linux.S_ISVTX)
-	if flags > uint64(^uint32(0)) || flags&^validFlags != 0 || mode&^validMode != 0 || resolve != 0 {
+	if flags > uint64(^uint32(0)) || flags&^validFlags != 0 || mode&^validMode != 0 || resolve&^resolveFlags != 0 {
+		return 0, 0, linuxerr.EINVAL
+	}
+	if resolve&(resolveBeneath|resolveInRoot) == resolveBeneath|resolveInRoot {
 		return 0, 0, linuxerr.EINVAL
 	}
 	if mode != 0 && flags&uint64(linux.O_CREAT|linux.O_TMPFILE) == 0 {
 		return 0, 0, linuxerr.EINVAL
+	}
+	if resolve != 0 {
+		return 0, 0, linuxerr.ENOSYS
 	}
 	return uint32(flags), uint(mode), nil
 }

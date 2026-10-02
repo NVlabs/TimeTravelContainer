@@ -27,6 +27,15 @@ func TestParseOpenHow(t *testing.T) {
 func TestParseOpenHowRejectsUnsupportedOrMalformedExtensions(t *testing.T) {
 	resolve := make([]byte, openHowSize)
 	hostarch.ByteOrder.PutUint64(resolve[16:24], 1)
+	// What GNU tar asks, through gnulib, to open each directory it extracts
+	// into.
+	beneath := make([]byte, openHowSize)
+	hostarch.ByteOrder.PutUint64(beneath[0:8], abi.O_RDONLY|abi.O_NOFOLLOW|abi.O_CLOEXEC|abi.O_PATH|abi.O_DIRECTORY)
+	hostarch.ByteOrder.PutUint64(beneath[16:24], resolveBeneath)
+	unknownResolve := make([]byte, openHowSize)
+	hostarch.ByteOrder.PutUint64(unknownResolve[16:24], resolveFlags+1)
+	beneathInRoot := make([]byte, openHowSize)
+	hostarch.ByteOrder.PutUint64(beneathInRoot[16:24], resolveBeneath|resolveInRoot)
 	unknownFlags := make([]byte, openHowSize)
 	hostarch.ByteOrder.PutUint64(unknownFlags[0:8], 1<<63)
 	modeWithoutCreate := make([]byte, openHowSize)
@@ -41,7 +50,10 @@ func TestParseOpenHowRejectsUnsupportedOrMalformedExtensions(t *testing.T) {
 	}{
 		{name: "short", buf: make([]byte, openHowSize-1), want: linuxerr.EINVAL},
 		{name: "nonzero extension", buf: append(make([]byte, openHowSize), 1), want: linuxerr.E2BIG},
-		{name: "resolve restriction", buf: resolve, want: linuxerr.EINVAL},
+		{name: "resolve restriction", buf: resolve, want: linuxerr.ENOSYS},
+		{name: "resolve beneath", buf: beneath, want: linuxerr.ENOSYS},
+		{name: "unknown resolve flag", buf: unknownResolve, want: linuxerr.EINVAL},
+		{name: "beneath and in root", buf: beneathInRoot, want: linuxerr.EINVAL},
 		{name: "unknown flags", buf: unknownFlags, want: linuxerr.EINVAL},
 		{name: "mode without create", buf: modeWithoutCreate, want: linuxerr.EINVAL},
 		{name: "invalid mode", buf: invalidMode, want: linuxerr.EINVAL},
