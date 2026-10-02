@@ -4888,8 +4888,13 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 	// though /proc/cpuinfo shows the restricted profile. Moving such a process
 	// to a host with a different XCR0/XSAVE layout can corrupt its userspace
 	// XSAVE buffers. Refuse cluster membership before creating any runtime.
-	if err := validateClusterCPUEnforcement(runtimePlatform, hostSupportsCPUIDFaulting()); err != nil {
-		return nil, err
+	// A control holder creates none, and runs no guest on the cluster's CPU
+	// profile: whatever platform it names, it holds a cluster of KVM nodes on
+	// a host without CPUID faulting, or with a profile only KVM provides.
+	if !opts.ControlHolder {
+		if err := validateClusterCPUEnforcement(runtimePlatform, hostSupportsCPUIDFaulting()); err != nil {
+			return nil, err
+		}
 	}
 	if opts.LeaseDuration == 0 {
 		opts.LeaseDuration = defaultClusterLeaseDuration
@@ -4907,8 +4912,10 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 	if err != nil {
 		return nil, err
 	}
-	if err := validateDaemonCPUProfile(opts.ResolvedCPU, runtimePlatform); err != nil {
-		return nil, fmt.Errorf("validating cluster CPU profile: %w", err)
+	if !opts.ControlHolder {
+		if err := validateDaemonCPUProfile(opts.ResolvedCPU, runtimePlatform); err != nil {
+			return nil, fmt.Errorf("validating cluster CPU profile: %w", err)
+		}
 	}
 	clusterID, err := prepareClusterIdentity(dataRoot, localRoot, opts.RepositoryID, opts.NodeID)
 	if err != nil {
