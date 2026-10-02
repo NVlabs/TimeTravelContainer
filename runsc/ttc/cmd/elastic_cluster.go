@@ -5001,17 +5001,24 @@ func nodeLoadLess(left, right cluster.NodeRecord) bool {
 	return left.NodeID < right.NodeID
 }
 
+// nodeAdmissionRefusal returns why a node does not accept new work by its
+// record, or nil: its state, or its memory at its target.
+func nodeAdmissionRefusal(record cluster.NodeRecord, now time.Time) error {
+	if !record.AcceptsPlacement(now) {
+		return fmt.Errorf("cluster node %q is not accepting new work (state=%s)", record.NodeID, record.State)
+	}
+	if record.MemoryTargetBytes != 0 && (record.IncomingReservedBytes >= record.MemoryTargetBytes || record.MemoryCurrentBytes >= record.MemoryTargetBytes-record.IncomingReservedBytes) {
+		return fmt.Errorf("cluster node %q is at its memory target", record.NodeID)
+	}
+	return nil
+}
+
 func selectAdmissionNode(records []cluster.NodeRecord, local cluster.Capabilities, now time.Time) (cluster.NodeRecord, error) {
 	var candidates []cluster.NodeRecord
 	var incompatibilities error
 	for _, record := range records {
-		if !record.AcceptsPlacement(now) {
+		if nodeAdmissionRefusal(record, now) != nil {
 			continue
-		}
-		if record.MemoryTargetBytes != 0 {
-			if record.IncomingReservedBytes >= record.MemoryTargetBytes || record.MemoryCurrentBytes >= record.MemoryTargetBytes-record.IncomingReservedBytes {
-				continue
-			}
 		}
 		if record.NodeID != local.NodeID {
 			if _, err := cluster.Negotiate(local, record.Capabilities); err != nil {

@@ -196,6 +196,8 @@ type daemonRequest struct {
 	// DistributedLeaf marks a coordinator-generated owner-local command. It
 	// prevents a family mutation from being expanded again on the destination.
 	DistributedLeaf bool `json:"distributed_leaf,omitempty"`
+	// AutomaticPlacement says the entry daemon chose PlacementNode itself.
+	AutomaticPlacement bool `json:"automatic_placement,omitempty"`
 }
 
 func (r daemonRequest) streamsClientFrames() bool {
@@ -7390,6 +7392,34 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		if owner == "" && daemonCommandNeedsPlacementAdmission(request.Args) {
 			if request.PlacementNode != "" {
 				owner = request.PlacementNode
+				if request.AutomaticPlacement && owner == s.clusterCapabilities.NodeID {
+					// The entry daemon chose this node by the records of the nodes
+					// it last read. If this node has stopped accepting work since,
+					// its memory having passed its target, say, another that
+					// accepts it takes the command, as the entry daemon would have
+					// chosen it.
+					if local, lookupErr := s.clusterDirectory.Lookup(owner); lookupErr == nil {
+						if refusal := nodeAdmissionRefusal(*local, time.Now()); refusal != nil {
+							failedAdmissionNodes[owner] = struct{}{}
+							for _, node := range request.Route {
+								failedAdmissionNodes[node] = struct{}{}
+							}
+							records, listErr := s.clusterDirectory.List()
+							if listErr != nil {
+								writeError(fmt.Errorf("%w; reselecting cluster placement: %w", refusal, listErr))
+								return
+							}
+							selected, selectErr := selectAdmissionNodeExcluding(records, *s.clusterCapabilities, time.Now(), failedAdmissionNodes)
+							if selectErr != nil {
+								writeError(fmt.Errorf("%w; reselecting cluster placement: %w", refusal, selectErr))
+								return
+							}
+							owner = selected.NodeID
+							request.PlacementNode = owner
+							automaticPlacement = true
+						}
+					}
+				}
 			} else {
 				records, listErr := s.clusterDirectory.List()
 				if listErr != nil {
@@ -7403,6 +7433,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 				}
 				owner = selected.NodeID
 				request.PlacementNode = owner
+				request.AutomaticPlacement = true
 				automaticPlacement = true
 			}
 		}

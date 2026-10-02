@@ -7329,6 +7329,22 @@ func TestSelectAdmissionNodeUsesCompatibleLeastLoadedCapacity(t *testing.T) {
 	if selected.NodeID != "node-b" {
 		t.Fatalf("selected excluded node %q, want node-b", selected.NodeID)
 	}
+	// A node judges by its own record whether it still accepts what an entry
+	// daemon chose it for, as selection judged it.
+	if err := nodeAdmissionRefusal(record("node-a", 1<<30, 8<<30, 0), now); err != nil {
+		t.Fatalf("a ready node below its target refused: %v", err)
+	}
+	pressured := record("node-a", 1<<30, 8<<30, 0)
+	pressured.State = cluster.NodePressured
+	if err := nodeAdmissionRefusal(pressured, now); err == nil || !strings.Contains(err.Error(), "state=pressured") {
+		t.Fatalf("a pressured node: %v", err)
+	}
+	if err := nodeAdmissionRefusal(record("node-a", 7<<30, 8<<30, 1<<30), now); err == nil || !strings.Contains(err.Error(), "memory target") {
+		t.Fatalf("a node at its target with what it reserved: %v", err)
+	}
+	if err := nodeAdmissionRefusal(record("node-a", 1<<30, 8<<30, 0), now.Add(2*time.Minute)); err == nil {
+		t.Fatal("a node whose lease expired accepted")
+	}
 }
 
 func TestParseDistributedFamilyMutation(t *testing.T) {
