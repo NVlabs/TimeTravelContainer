@@ -3634,16 +3634,18 @@ func TestGraphReopenKeepsIndexes(t *testing.T) {
 	defer third.Close()
 	third.mu.Lock()
 	defer third.mu.Unlock()
-	taken := graphIndexes{third.deferredObjects, third.memoryPages, third.memoryTables, third.memoryTableSeed}
+	taken := graphIndexes{third.deferredObjects, nil, third.memoryTables, third.memoryTableSeed}
+	takenPages := memoryPageIndexContents(third.memoryPages)
 	third.rebuildDeferredObjectsLocked()
 	third.rebuildMemoryIndexesLocked()
-	rebuilt := graphIndexes{third.deferredObjects, third.memoryPages, third.memoryTables, third.memoryTableSeed}
-	if !reflect.DeepEqual(taken, rebuilt) {
-		t.Fatalf("taken indexes\n%+v\nrebuilt\n%+v", taken, rebuilt)
+	rebuilt := graphIndexes{third.deferredObjects, nil, third.memoryTables, third.memoryTableSeed}
+	rebuiltPages := memoryPageIndexContents(third.memoryPages)
+	if !reflect.DeepEqual(taken, rebuilt) || !reflect.DeepEqual(takenPages, rebuiltPages) {
+		t.Fatalf("taken indexes\n%+v %+v\nrebuilt\n%+v %+v", taken, takenPages, rebuilt, rebuiltPages)
 	}
 	pages := 0
-	for _, block := range rebuilt.memoryPages.blocks {
-		pages += len(block.records)
+	for _, records := range rebuiltPages {
+		pages += len(records)
 	}
 	if len(rebuilt.deferredObjects) != 2 || pages != 2 {
 		t.Fatalf("indexes of %d deferred objects and %d pages, want 2 and 2", len(rebuilt.deferredObjects), pages)
@@ -3772,11 +3774,11 @@ func TestMemoryPageIndexCompacts(t *testing.T) {
 			// Here and there.
 			want = 2
 		}
-		if len(holdings) != want || holdings[0].holding.location != here || holdings[0].holding.holders != 1 {
+		if len(holdings) != want || index.location(&holdings[0]) != here || holdings[0].holders != 1 {
 			t.Fatalf("page %d is held %+v after compaction", i, holdings)
 		}
 	}
-	if holdings := index.holdings(identity(0)); holdings[1].holding.location != there || holdings[1].holding.holders != 1 {
+	if holdings := index.holdings(identity(0)); index.location(&holdings[1]) != there || holdings[1].holders != 1 {
 		t.Fatalf("page 0 is held %+v after compaction", holdings)
 	}
 	// Fewer released blocks than those left make no copy.
@@ -3784,6 +3786,115 @@ func TestMemoryPageIndexCompacts(t *testing.T) {
 	index.release(identity(1), here)
 	if reflect.ValueOf(index.blocks).Pointer() != after {
 		t.Fatal("the page index was made anew after one block left it")
+	}
+}
+
+// memoryPageIndexHolding is a record of a page index, its interned values
+// resolved.
+type memoryPageIndexHolding struct {
+	slot             uint8
+	versionAllocator [16]byte
+	versionSequence  uint64
+	references       uint64
+	location         MemoryPageLocation
+	holders          uint32
+}
+
+// memoryPageIndexContents is what index holds: two indexes alike in content
+// compare equal, however they interned their values.
+func memoryPageIndexContents(index *memoryPageIndex) map[memoryPageBlockKey][]memoryPageIndexHolding {
+	contents := make(map[memoryPageBlockKey][]memoryPageIndexHolding, len(index.blocks))
+	for key, block := range index.blocks {
+		for i := range block.records {
+			record := &block.records[i]
+			contents[key] = append(contents[key], memoryPageIndexHolding{
+				slot: record.slot, versionAllocator: index.allocators.values[record.allocator],
+				versionSequence: record.versionSequence, references: record.references,
+				location: index.location(record), holders: record.holders,
+			})
+		}
+	}
+	return contents
+}
+
+// The page index answers as a map of each page and place to its holders
+// does, through any holds and releases, giving a page's places in order, and
+// lets go of the allocators and chunks no record names.
+func TestMemoryPageIndexMatchesAMap(t *testing.T) {
+	type key struct {
+		identity MemoryPageIdentity
+		location MemoryPageLocation
+	}
+	type held struct {
+		location MemoryPageLocation
+		holders  uint32
+	}
+	rng := rand.New(rand.NewSource(1))
+	identities := make([]MemoryPageIdentity, 64)
+	for i := range identities {
+		identities[i] = MemoryPageIdentity{
+			LogicalAllocator: [16]byte{byte(1 + i%2)}, LogicalSequence: uint64(rng.Intn(600)),
+			VersionAllocator: [16]byte{byte(1 + rng.Intn(3))}, VersionSequence: uint64(rng.Intn(4)), References: uint64(1 + rng.Intn(2)),
+		}
+	}
+	locations := make([]MemoryPageLocation, 12)
+	for i := range locations {
+		locations[i] = MemoryPageLocation{Chunk: ObjectID{Snapshot: SnapshotID(1 + rng.Intn(3)), Kind: ObjectKindMemoryChunk, Ordinal: uint64(1 + rng.Intn(4))}, Page: uint8(rng.Intn(3))}
+	}
+	// The place with no chunk, which a page may have too.
+	locations[0] = MemoryPageLocation{}
+	index := newMemoryPageIndex()
+	model := make(map[key]uint32)
+	check := func(step int) {
+		for i := range identities {
+			var want []held
+			for k, holders := range model {
+				if k.identity == identities[i] {
+					want = append(want, held{k.location, holders})
+				}
+			}
+			sort.Slice(want, func(a, b int) bool {
+				if c := compareObjectIDs(want[a].location.Chunk, want[b].location.Chunk); c != 0 {
+					return c < 0
+				}
+				return want[a].location.Page < want[b].location.Page
+			})
+			records := index.holdings(&identities[i])
+			got := make([]held, 0, len(records))
+			for r := range records {
+				got = append(got, held{index.location(&records[r]), records[r].holders})
+			}
+			if len(want) == 0 && len(got) == 0 {
+				continue
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("step %d: page %+v is held %+v, want %+v", step, identities[i], got, want)
+			}
+		}
+	}
+	for step := 0; step < 20000; step++ {
+		k := key{identities[rng.Intn(len(identities))], locations[rng.Intn(len(locations))]}
+		if rng.Intn(2) == 0 {
+			index.hold(&k.identity, k.location)
+			model[k]++
+		} else if model[k] != 0 {
+			index.release(&k.identity, k.location)
+			if model[k]--; model[k] == 0 {
+				delete(model, k)
+			}
+		}
+		if step%97 == 0 {
+			check(step)
+		}
+	}
+	check(20000)
+	for k, holders := range model {
+		for ; holders != 0; holders-- {
+			index.release(&k.identity, k.location)
+		}
+	}
+	if len(index.blocks) != 0 || len(index.allocators.indexes) != 0 || len(index.chunks.indexes) != 0 {
+		t.Fatalf("emptied, the index holds %d blocks, %d allocators and %d chunks", len(index.blocks), len(index.allocators.indexes), len(index.chunks.indexes))
 	}
 }
 

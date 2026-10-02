@@ -382,13 +382,6 @@ func (s *Store) lookupObjectLocked(id ObjectID) (Object, bool) {
 	return object, ok
 }
 
-// memoryPageHolding is a place the graph holds a page, and how many live
-// tables and pages map it there.
-type memoryPageHolding struct {
-	location MemoryPageLocation
-	holders  uint32
-}
-
 // memoryPageIndex is where the graph holds each page, by the stable
 // logical/version identity the guest's memory manager gave it: see
 // Store.memoryPages. It keeps the pages of each 256 logical pages of an
@@ -396,11 +389,19 @@ type memoryPageHolding struct {
 // time, which then share one lookup of their block, and a search of it;
 // a map of every page sent each lookup to its own place among tens of
 // megabytes, which the processor's caches missed.
+//
+// A record names the version allocator of its page, and the chunk of its
+// place, by their indexes among those the index interns, which the records of
+// thousands of pages share. A record is 32 bytes: it was 80, and the index of
+// a dehydrated branch's pages took 22 MB a GiB of its memory, which the
+// daemon kept as long as the branch stayed dehydrated.
 type memoryPageIndex struct {
 	blocks map[memoryPageBlockKey]*memoryPageBlock
 	// released is how many blocks have left blocks since it was made: see
 	// compact.
-	released int
+	released   int
+	allocators memoryInterned[[16]byte]
+	chunks     memoryInterned[ObjectID]
 }
 
 // memoryPageBlockKey names a block: its allocator and the sequence of its
@@ -422,57 +423,142 @@ type memoryPageBlock struct {
 
 // memoryPageRecord is a place the graph holds a page of a block.
 type memoryPageRecord struct {
+	slot uint8
+	// page is the page of the chunk the place is.
+	page uint8
+	// allocator is the page's version allocator, and chunk the chunk of the
+	// place, as the index interns them.
+	allocator, chunk uint32
+	// holders counts the live tables and pages that map the page there.
+	holders         uint32
+	versionSequence uint64
+	references      uint64
+}
+
+// memoryPageProbe is a page, and a place of it, as the records of a block
+// are searched for them.
+type memoryPageProbe struct {
 	slot             uint8
 	versionAllocator [16]byte
 	versionSequence  uint64
 	references       uint64
-	holding          memoryPageHolding
+	location         MemoryPageLocation
+}
+
+// memoryInterned interns the values records name, each by its index while a
+// record names it. Index 0 is the zero value's, always.
+type memoryInterned[T comparable] struct {
+	values []T
+	// uses counts the records that name each value.
+	uses    []uint32
+	indexes map[T]uint32
+	// free are the indexes no record names.
+	free []uint32
+	// last is the index interned last, which the next most often is.
+	last uint32
+}
+
+func newMemoryInterned[T comparable]() memoryInterned[T] {
+	var zero T
+	return memoryInterned[T]{values: []T{zero}, uses: []uint32{0}, indexes: make(map[T]uint32)}
+}
+
+// memoryIntern returns the index of value in t, which one more record names.
+// (A function: stateify takes no generic receiver.)
+func memoryIntern[T comparable](t *memoryInterned[T], value T) uint32 {
+	var zero T
+	if value == zero {
+		return 0
+	}
+	index := t.last
+	if index == 0 || t.values[index] != value {
+		var ok bool
+		if index, ok = t.indexes[value]; !ok {
+			if n := len(t.free); n != 0 {
+				index, t.free = t.free[n-1], t.free[:n-1]
+				t.values[index] = value
+			} else {
+				index = uint32(len(t.values))
+				t.values = append(t.values, value)
+				t.uses = append(t.uses, 0)
+			}
+			t.indexes[value] = index
+		}
+		t.last = index
+	}
+	t.uses[index]++
+	return index
+}
+
+// memoryRelease records that one fewer record names the value of index in t.
+func memoryRelease[T comparable](t *memoryInterned[T], index uint32) {
+	if index == 0 {
+		return
+	}
+	if t.uses[index]--; t.uses[index] == 0 {
+		var zero T
+		delete(t.indexes, t.values[index])
+		t.values[index] = zero
+		t.free = append(t.free, index)
+		if t.last == index {
+			t.last = 0
+		}
+	}
 }
 
 func newMemoryPageIndex() *memoryPageIndex {
-	return &memoryPageIndex{blocks: make(map[memoryPageBlockKey]*memoryPageBlock)}
+	return &memoryPageIndex{
+		blocks:     make(map[memoryPageBlockKey]*memoryPageBlock),
+		allocators: newMemoryInterned[[16]byte](),
+		chunks:     newMemoryInterned[ObjectID](),
+	}
 }
 
-// memoryPageRecordOf returns the block of the page with identity, and its
-// record at location, which holds nothing.
-func memoryPageRecordOf(identity *MemoryPageIdentity, location MemoryPageLocation) (memoryPageBlockKey, memoryPageRecord) {
+// memoryPageProbeOf returns the block of the page with identity, and the
+// probe of it at location.
+func memoryPageProbeOf(identity *MemoryPageIdentity, location MemoryPageLocation) (memoryPageBlockKey, memoryPageProbe) {
 	return memoryPageBlockKey{allocator: identity.LogicalAllocator, block: identity.LogicalSequence / memoryPageBlockPages},
-		memoryPageRecord{
+		memoryPageProbe{
 			slot: uint8(identity.LogicalSequence % memoryPageBlockPages), versionAllocator: identity.VersionAllocator,
-			versionSequence: identity.VersionSequence, references: identity.References, holding: memoryPageHolding{location: location},
+			versionSequence: identity.VersionSequence, references: identity.References, location: location,
 		}
 }
 
-// comparePage orders records by their pages.
-func (r *memoryPageRecord) comparePage(other *memoryPageRecord) int {
-	if c := cmp.Compare(r.slot, other.slot); c != 0 {
-		return c
-	}
-	if c := bytes.Compare(r.versionAllocator[:], other.versionAllocator[:]); c != 0 {
-		return c
-	}
-	if c := cmp.Compare(r.versionSequence, other.versionSequence); c != 0 {
-		return c
-	}
-	return cmp.Compare(r.references, other.references)
+// location returns the place of record.
+func (index *memoryPageIndex) location(record *memoryPageRecord) MemoryPageLocation {
+	return MemoryPageLocation{Chunk: index.chunks.values[record.chunk], Page: record.page}
 }
 
-// compare orders records as a block holds them: a page's by place, the
-// place with no chunk first.
-func (r *memoryPageRecord) compare(other *memoryPageRecord) int {
-	if c := r.comparePage(other); c != 0 {
+// comparePage orders record against probe by their pages.
+func (index *memoryPageIndex) comparePage(record *memoryPageRecord, probe *memoryPageProbe) int {
+	if c := cmp.Compare(record.slot, probe.slot); c != 0 {
 		return c
 	}
-	if c := compareObjectIDs(r.holding.location.Chunk, other.holding.location.Chunk); c != 0 {
+	if allocator := &index.allocators.values[record.allocator]; *allocator != probe.versionAllocator {
+		return bytes.Compare(allocator[:], probe.versionAllocator[:])
+	}
+	if c := cmp.Compare(record.versionSequence, probe.versionSequence); c != 0 {
 		return c
 	}
-	return cmp.Compare(r.holding.location.Page, other.holding.location.Page)
+	return cmp.Compare(record.references, probe.references)
 }
 
-// samePage reports whether records are of one page.
-func (r *memoryPageRecord) samePage(other *memoryPageRecord) bool {
-	return r.slot == other.slot && r.versionSequence == other.versionSequence && r.references == other.references &&
-		r.versionAllocator == other.versionAllocator
+// compare orders record against probe as a block holds records: a page's by
+// place, the place with no chunk first.
+func (index *memoryPageIndex) compare(record *memoryPageRecord, probe *memoryPageProbe) int {
+	if c := index.comparePage(record, probe); c != 0 {
+		return c
+	}
+	if c := compareObjectIDs(index.chunks.values[record.chunk], probe.location.Chunk); c != 0 {
+		return c
+	}
+	return cmp.Compare(record.page, probe.location.Page)
+}
+
+// samePage reports whether record is of probe's page.
+func (index *memoryPageIndex) samePage(record *memoryPageRecord, probe *memoryPageProbe) bool {
+	return record.slot == probe.slot && record.versionSequence == probe.versionSequence && record.references == probe.references &&
+		index.allocators.values[record.allocator] == probe.versionAllocator
 }
 
 // slot returns the records of slot, from begin to end.
@@ -491,17 +577,16 @@ func (block *memoryPageBlock) slot(slot uint8) (begin, end int) {
 	return begin, end
 }
 
-// search returns where record goes in block, and whether block has it
-// there.
-func (block *memoryPageBlock) search(record *memoryPageRecord) (int, bool) {
+// search returns where probe goes in block, and whether block has it there.
+func (index *memoryPageIndex) search(block *memoryPageBlock, probe *memoryPageProbe) (int, bool) {
 	records := block.records
 	// Tables list most pages in slot order: they go last.
-	if n := len(records); n == 0 || records[n-1].compare(record) < 0 {
+	if n := len(records); n == 0 || index.compare(&records[n-1], probe) < 0 {
 		return n, false
 	}
-	begin, end := block.slot(record.slot)
+	begin, end := block.slot(probe.slot)
 	for at := begin; at < end; at++ {
-		if c := records[at].compare(record); c >= 0 {
+		if c := index.compare(&records[at], probe); c >= 0 {
 			return at, c == 0
 		}
 	}
@@ -511,37 +596,43 @@ func (block *memoryPageBlock) search(record *memoryPageRecord) (int, bool) {
 // hold records that one more live table or page maps the page with identity
 // at location.
 func (index *memoryPageIndex) hold(identity *MemoryPageIdentity, location MemoryPageLocation) {
-	key, record := memoryPageRecordOf(identity, location)
+	key, probe := memoryPageProbeOf(identity, location)
 	block := index.blocks[key]
 	if block == nil {
 		block = &memoryPageBlock{}
 		index.blocks[key] = block
 	}
-	at, found := block.search(&record)
+	at, found := index.search(block, &probe)
 	if found {
-		block.records[at].holding.holders++
+		block.records[at].holders++
 		return
 	}
-	record.holding.holders = 1
-	block.records = slices.Insert(block.records, at, record)
+	block.records = slices.Insert(block.records, at, memoryPageRecord{
+		slot: probe.slot, page: location.Page,
+		allocator: memoryIntern(&index.allocators, probe.versionAllocator), chunk: memoryIntern(&index.chunks, location.Chunk),
+		holders: 1, versionSequence: probe.versionSequence, references: probe.references,
+	})
 }
 
 // release records that one fewer live table or page maps the page with
 // identity at location.
 func (index *memoryPageIndex) release(identity *MemoryPageIdentity, location MemoryPageLocation) {
-	key, record := memoryPageRecordOf(identity, location)
+	key, probe := memoryPageProbeOf(identity, location)
 	block := index.blocks[key]
 	if block == nil {
 		return
 	}
-	at, found := block.search(&record)
+	at, found := index.search(block, &probe)
 	if !found {
 		return
 	}
-	if block.records[at].holding.holders > 1 {
-		block.records[at].holding.holders--
+	record := &block.records[at]
+	if record.holders > 1 {
+		record.holders--
 		return
 	}
+	memoryRelease(&index.allocators, record.allocator)
+	memoryRelease(&index.chunks, record.chunk)
 	block.records = slices.Delete(block.records, at, at+1)
 	if len(block.records) == 0 {
 		delete(index.blocks, key)
@@ -551,19 +642,19 @@ func (index *memoryPageIndex) release(identity *MemoryPageIdentity, location Mem
 }
 
 // holdings returns the records of the places the graph holds the page with
-// identity, in order.
+// identity, in order; location gives each place.
 func (index *memoryPageIndex) holdings(identity *MemoryPageIdentity) []memoryPageRecord {
-	key, probe := memoryPageRecordOf(identity, MemoryPageLocation{})
+	key, probe := memoryPageProbeOf(identity, MemoryPageLocation{})
 	block := index.blocks[key]
 	if block == nil {
 		return nil
 	}
 	begin, end := block.slot(probe.slot)
-	for begin < end && !block.records[begin].samePage(&probe) {
+	for begin < end && !index.samePage(&block.records[begin], &probe) {
 		begin++
 	}
 	last := begin
-	for last < end && block.records[last].samePage(&probe) {
+	for last < end && index.samePage(&block.records[last], &probe) {
 		last++
 	}
 	return block.records[begin:last]
@@ -680,17 +771,19 @@ func (s *Store) rebuildMemoryIndexesLocked() {
 // identity in an origin reuse allows, choosing the least chunk when there are
 // several.
 func (s *Store) memoryPageLocationLocked(identity MemoryPageIdentity, reuse reuseFilter, origins map[SnapshotID]bool) (MemoryPageLocation, bool) {
-	for _, record := range s.memoryPages.holdings(&identity) {
+	holdings := s.memoryPages.holdings(&identity)
+	for index := range holdings {
+		location := s.memoryPages.location(&holdings[index])
 		// An origin's state is found by a formatted key: remember it for
 		// the many pages a capture looks up in the same few origins.
-		origin := record.holding.location.Chunk.Snapshot
+		origin := location.Chunk.Snapshot
 		permitted, known := origins[origin]
 		if !known {
 			permitted = s.originAllowedLocked(origin, reuse)
 			origins[origin] = permitted
 		}
 		if permitted {
-			return record.holding.location, true
+			return location, true
 		}
 	}
 	return MemoryPageLocation{}, false
