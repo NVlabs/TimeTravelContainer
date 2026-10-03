@@ -1825,8 +1825,19 @@ func (f *MemoryFile) releaserMain() {
 			continue
 		}
 		f.haveWaste = false
+		f.mu.Unlock()
+		time.Sleep(releaserPause)
+		f.mu.Lock()
 	}
 }
+
+// releaserPause is how long the releaser waits, once it has released all
+// waste, before it waits for more. Pages freed meanwhile wake no goroutine,
+// and allocations may recycle them before the releaser looks again. Woken at
+// each free instead, the releaser cost a build on KVM, where waking a
+// goroutine is a futex() call that leaves the guest, more of the Sentry's
+// time than anything else.
+const releaserPause = 10 * time.Millisecond
 
 // nextReleaseLocked takes the range of waste that the releaser releases next
 // out of the waste sets, and returns it and whether it is hugepage-backed. ok
