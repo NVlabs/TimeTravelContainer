@@ -224,6 +224,22 @@ type containerIdentity struct {
 
 const maxContainerNameHints = 1 << 16
 
+// generatedContainerID reports whether identifier has the form of an ID TTC
+// gives a container: a family's hexadecimal digits, or a distributed target's,
+// which its transaction's ID names, "fork-" and hexadecimal digits.
+func generatedContainerID(identifier string) bool {
+	digits := strings.TrimPrefix(identifier, "fork-")
+	if digits == identifier && len(digits) != 2*containerIDBytes || digits == "" {
+		return false
+	}
+	for _, c := range []byte(digits) {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 func containerNameHint(key string) (string, bool) {
 	containerNameHints.mu.Lock()
 	defer containerNameHints.mu.Unlock()
@@ -3224,6 +3240,23 @@ func (s Store) loadContainer(identifier string, hidden bool) (ContainerInfo, err
 	if err := validateName(identifier); err != nil {
 		return ContainerInfo{}, err
 	}
+	// An exact ID comes before a name, but an identifier no ID TTC makes can
+	// be is a name: its hint comes first, and no record is looked for under
+	// it, which would take a round trip of a shared root to find nothing.
+	name := !generatedContainerID(identifier)
+	byHint := func() (ContainerInfo, bool) {
+		if id, ok := containerNameHint(s.Root + "\x00" + identifier); ok {
+			if info, err := s.loadContainerKey(id); err == nil && info.Name == identifier && !info.DistributedForkHidden && !info.IsDistributedPhysicalRuntime() {
+				return info, true
+			}
+		}
+		return ContainerInfo{}, false
+	}
+	if name {
+		if info, ok := byHint(); ok {
+			return info, nil
+		}
+	}
 	if info, err := s.loadContainerKey(identifier); err == nil {
 		if hidden || !info.DistributedForkHidden {
 			return info, nil
@@ -3231,8 +3264,8 @@ func (s Store) loadContainer(identifier string, hidden bool) (ContainerInfo, err
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return ContainerInfo{}, err
 	}
-	if id, ok := containerNameHint(s.Root + "\x00" + identifier); ok {
-		if info, err := s.loadContainerKey(id); err == nil && info.Name == identifier && !info.DistributedForkHidden && !info.IsDistributedPhysicalRuntime() {
+	if !name {
+		if info, ok := byHint(); ok {
 			return info, nil
 		}
 	}

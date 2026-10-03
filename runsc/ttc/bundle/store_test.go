@@ -790,6 +790,55 @@ func TestLoadContainerByNameFollowsRemovalAndReuse(t *testing.T) {
 	}
 }
 
+// A name that resolved once resolves by its hint without a look for a record
+// under it, which no ID TTC makes can be; an identifier of an ID's form is
+// looked for as an ID first.
+func TestLoadContainerByHintedNameLooksForNoRecordUnderIt(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	write := func(id, name string) {
+		t.Helper()
+		containerDir := filepath.Join(root, "containers", id)
+		bundleDir := filepath.Join(containerDir, "bundle")
+		if err := os.MkdirAll(bundleDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &ContainerInfo{ID: id, Name: name, BundleDir: bundleDir}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := func(identifier, id string) {
+		t.Helper()
+		if info, err := store.LoadContainer(identifier); err != nil || info.ID != id {
+			t.Fatalf("LoadContainer(%q) = (%q, %v), want %q", identifier, info.ID, err, id)
+		}
+	}
+	family, other := strings.Repeat("a", 2*containerIDBytes), strings.Repeat("b", 2*containerIDBytes)
+	write(family, "web")
+	want("web", family)
+	if err := os.MkdirAll(filepath.Join(root, "containers", "web"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "containers", "web", "container.json"), []byte("not a record"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	want("web", family)
+	// A container named as another's ID: the ID comes first.
+	write(other, family)
+	want(family, family)
+	for identifier, generated := range map[string]bool{
+		family: true, "fork-0123456789abcdef0123456789abcdef": true, "fork-": false, family[1:]: false,
+		strings.ToUpper(family): false, "web": false, "id-one": false,
+	} {
+		if got := generatedContainerID(identifier); got != generated {
+			t.Errorf("generatedContainerID(%q) = %t, want %t", identifier, got, generated)
+		}
+	}
+}
+
 // A container removed after it was listed holds no repository an inventory
 // must keep; one still present whose spec cannot be read fails the inventory.
 func TestRepositoryInventoryPassesOverAContainerRemovedSinceListing(t *testing.T) {
