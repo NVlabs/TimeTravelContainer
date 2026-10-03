@@ -3687,7 +3687,7 @@ func (b *runtimeBackend) stopMigrationBranchSidecars(target selector, info ttcbu
 		return nil, fmt.Errorf("listing migration exec sessions: %w", err)
 	}
 	store := b.containerStore()
-	paths, err := store.BranchConsolePaths(info.ID, target.branch)
+	paths, err := store.BranchConsolePathsIn(info, target.branch)
 	if err != nil {
 		return nil, err
 	}
@@ -3695,7 +3695,7 @@ func (b *runtimeBackend) stopMigrationBranchSidecars(target selector, info ttcbu
 		return nil, fmt.Errorf("stopping migration init console follower: %w", err)
 	}
 	for _, session := range sessions {
-		paths, pathErr := store.ExecConsolePaths(info.ID, target.branch, session.ID)
+		paths, pathErr := store.ExecConsolePathsIn(info, target.branch, session.ID)
 		if pathErr != nil {
 			return sessions, pathErr
 		}

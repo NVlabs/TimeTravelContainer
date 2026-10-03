@@ -6465,7 +6465,7 @@ func (b *runtimeBackend) beginExplicitInitStop(target selector) (func(bool), err
 	if err != nil {
 		return nil, err
 	}
-	paths, err := b.containerStore().BranchConsolePaths(info.ID, resolved.branch)
+	paths, err := b.containerStore().BranchConsolePathsIn(info, resolved.branch)
 	if err != nil {
 		return nil, err
 	}
@@ -8451,7 +8451,7 @@ func (b *runtimeBackend) startFreshBranchBesidePeers(info ttcbundle.ContainerInf
 			_ = b.containerStore().UpdateBranchSnapshotGraph(info.ID, target.branch, 0, nil, nil, "", "", "")
 		}
 	}()
-	consolePaths, err := b.containerStore().BranchConsolePaths(info.ID, target.branch)
+	consolePaths, err := b.containerStore().BranchConsolePathsIn(info, target.branch)
 	if err != nil {
 		return fmt.Errorf("resolving console state for fresh branch %s: %w", target, err)
 	}
@@ -13077,7 +13077,12 @@ func (b *runtimeBackend) execSessions(target selector) ([]runscExecSession, erro
 	if err != nil {
 		return nil, err
 	}
-	target = resolved
+	return b.execSessionsOf(resolved)
+}
+
+// execSessionsOf is execSessions of a branch whose physical runtime and branch
+// target names already.
+func (b *runtimeBackend) execSessionsOf(target selector) ([]runscExecSession, error) {
 	output, err := b.command("timetravel", target.container, "exec-list", target.branch)
 	if err != nil {
 		return nil, err
@@ -15262,7 +15267,7 @@ func (b *runtimeBackend) discard(target selector) error {
 		return fmt.Errorf("materializing remote state before discarding %s: %w", target, err)
 	}
 	store := b.containerStore()
-	if paths, pathErr := store.BranchConsolePaths(info.ID, target.branch); pathErr == nil {
+	if paths, pathErr := store.BranchConsolePathsIn(info, target.branch); pathErr == nil {
 		if err := b.stopConsoleDrain(paths); err != nil {
 			return fmt.Errorf("stopping console follower for %s: %w", target, err)
 		}
@@ -15280,9 +15285,9 @@ func (b *runtimeBackend) discard(target selector) error {
 			return fmt.Errorf("checking wait status for %s: %w", target, err)
 		}
 	}
-	if sessions, sessionsErr := b.execSessions(target); sessionsErr == nil {
+	if sessions, sessionsErr := b.execSessionsOf(target); sessionsErr == nil {
 		for _, session := range sessions {
-			if paths, pathErr := store.ExecConsolePaths(info.ID, target.branch, session.ID); pathErr == nil {
+			if paths, pathErr := store.ExecConsolePathsIn(info, target.branch, session.ID); pathErr == nil {
 				if err := b.stopConsoleDrain(paths); err != nil {
 					return fmt.Errorf("stopping exec console follower %q for %s: %w", session.ID, target, err)
 				}
@@ -15940,8 +15945,8 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		return fmt.Errorf("materializing remote memory before dehydrating %s: %w", target, err)
 	}
 	store := b.containerStore()
-	initConsolePaths, _ := store.BranchConsolePaths(info.ID, target.branch)
-	execSessions, _ := b.execSessions(target)
+	initConsolePaths, _ := store.BranchConsolePathsIn(info, target.branch)
+	execSessions, _ := b.execSessionsOf(target)
 	dehydrated := false
 	originalState := normalizeLifecycleState(persistentBranch.State)
 	transitionPublished := false
@@ -15976,7 +15981,7 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		return fmt.Errorf("stopping init console follower before dehydration: %w", err)
 	}
 	for _, session := range execSessions {
-		if paths, pathErr := store.ExecConsolePaths(info.ID, target.branch, session.ID); pathErr == nil {
+		if paths, pathErr := store.ExecConsolePathsIn(info, target.branch, session.ID); pathErr == nil {
 			if err := b.stopConsoleDrain(paths); err != nil {
 				return fmt.Errorf("stopping exec console follower %q before dehydration: %w", session.ID, err)
 			}
@@ -16004,7 +16009,7 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		}
 	}
 	for _, session := range execSessions {
-		if paths, pathErr := store.ExecConsolePaths(info.ID, target.branch, session.ID); pathErr == nil {
+		if paths, pathErr := store.ExecConsolePathsIn(info, target.branch, session.ID); pathErr == nil {
 			_ = os.Remove(paths.WaitStatus)
 			_ = os.Remove(paths.PID)
 		}
@@ -17502,7 +17507,15 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 			return fmt.Errorf("loading branch authority for %s: %w", requested, authorityErr)
 		}
 	}
-	resolved, info, err := b.resolveSelector(target)
+	// The family as resolved above, as resolveSelector would resolve it again.
+	if waited, err := b.waitBusy(logicalInfo.ID); err != nil {
+		return err
+	} else if waited {
+		if logicalInfo, err = b.resolveContainer(requested.container); err != nil {
+			return err
+		}
+	}
+	resolved, info, err := b.resolveSelectorIn(logicalInfo, target, nil)
 	if err != nil {
 		return err
 	}
@@ -17574,7 +17587,7 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 	}
 	defer releaseClients()
 	store := b.containerStore()
-	if paths, pathErr := store.BranchConsolePaths(info.ID, target.branch); pathErr == nil {
+	if paths, pathErr := store.BranchConsolePathsIn(info, target.branch); pathErr == nil {
 		if err := b.stopConsoleDrain(paths); err != nil {
 			return fmt.Errorf("stopping console follower for %s: %w", target, err)
 		}
@@ -17601,9 +17614,9 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 		}
 	}
 	if runtimeFamily == nil || runtimeBranchState == "running" || runtimeBranchState == "paused" {
-		if sessions, sessionsErr := b.execSessions(target); sessionsErr == nil {
+		if sessions, sessionsErr := b.execSessionsOf(target); sessionsErr == nil {
 			for _, session := range sessions {
-				paths, pathErr := store.ExecConsolePaths(info.ID, target.branch, session.ID)
+				paths, pathErr := store.ExecConsolePathsIn(info, target.branch, session.ID)
 				if pathErr == nil {
 					if err := b.stopConsoleDrain(paths); err != nil {
 						return fmt.Errorf("stopping exec console follower %q for %s: %w", session.ID, target, err)
@@ -18343,7 +18356,7 @@ func (b *runtimeBackend) completeWaitedInitExit(target selector, status uint32) 
 	if err != nil {
 		return err
 	}
-	paths, err := b.containerStore().BranchConsolePaths(info.ID, target.branch)
+	paths, err := b.containerStore().BranchConsolePathsIn(info, target.branch)
 	if err != nil {
 		return err
 	}
@@ -18402,7 +18415,7 @@ func (b *runtimeBackend) finalizeObservedInitExit(target selector) (bool, error)
 	if branch.PublicationID != "" || branch.StorageState == "publishing" || branch.StorageState == "shared" {
 		return false, nil
 	}
-	paths, err := b.containerStore().BranchConsolePaths(info.ID, target.branch)
+	paths, err := b.containerStore().BranchConsolePathsIn(info, target.branch)
 	if err != nil {
 		return false, err
 	}

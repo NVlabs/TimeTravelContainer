@@ -6610,9 +6610,18 @@ func (s Store) BranchConsolePaths(container, branch string) (ConsolePaths, error
 	if err != nil {
 		return ConsolePaths{}, err
 	}
+	return s.BranchConsolePathsIn(info, branch)
+}
+
+// BranchConsolePathsIn is BranchConsolePaths of the container whose record,
+// info, the caller has: it reads no record.
+func (s Store) BranchConsolePathsIn(info ContainerInfo, branch string) (ConsolePaths, error) {
+	if err := validateObjectName("branch", branch); err != nil {
+		return ConsolePaths{}, err
+	}
 	paths := s.BranchConsolePathsOf(info.ID, branch)
 	if err := os.MkdirAll(paths.FamilyDir, 0700); err != nil {
-		return ConsolePaths{}, fmt.Errorf("creating console state for %q: %w", container, err)
+		return ConsolePaths{}, fmt.Errorf("creating console state for %q: %w", info.ID, err)
 	}
 	return paths, nil
 }
@@ -6651,9 +6660,21 @@ func (s Store) ExecConsolePaths(container, branch, execID string) (ConsolePaths,
 	if err != nil {
 		return ConsolePaths{}, err
 	}
+	return s.ExecConsolePathsIn(info, branch, execID)
+}
+
+// ExecConsolePathsIn is ExecConsolePaths of the container whose record, info,
+// the caller has: it reads no record.
+func (s Store) ExecConsolePathsIn(info ContainerInfo, branch, execID string) (ConsolePaths, error) {
+	if err := validateObjectName("branch", branch); err != nil {
+		return ConsolePaths{}, err
+	}
+	if err := validateObjectName("exec session", execID); err != nil {
+		return ConsolePaths{}, err
+	}
 	paths := s.ExecConsolePathsOf(info.ID, branch, execID)
 	if err := os.MkdirAll(filepath.Dir(paths.Log), 0700); err != nil {
-		return ConsolePaths{}, fmt.Errorf("creating exec console state for %q: %w", container, err)
+		return ConsolePaths{}, fmt.Errorf("creating exec console state for %q: %w", info.ID, err)
 	}
 	return paths, nil
 }
