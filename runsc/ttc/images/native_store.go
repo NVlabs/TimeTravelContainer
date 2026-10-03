@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 
 	"github.com/containerd/containerd/v2/core/content"
@@ -61,12 +62,16 @@ func openNativeStore(root string) (*nativeStore, error) {
 		return nil, fmt.Errorf("locking native image store: %w", err)
 	}
 	contentRoot := filepath.Join(storeRoot, "content")
-	if err := os.MkdirAll(filepath.Join(contentRoot, "blobs"), 0700); err != nil {
-		_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
-		lock.Close()
-		return nil, fmt.Errorf("creating native content store: %w", err)
+	// A content store makes its ingest directory once, so a root made again
+	// under a store kept for it, which its inode may reuse, needs it made here.
+	for _, dir := range []string{"blobs", "ingest"} {
+		if err := os.MkdirAll(filepath.Join(contentRoot, dir), 0700); err != nil {
+			_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+			lock.Close()
+			return nil, fmt.Errorf("creating native content store: %w", err)
+		}
 	}
-	contentStore, err := contentlocal.NewStore(contentRoot)
+	contentStore, err := openContentStore(contentRoot)
 	if err != nil {
 		_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 		lock.Close()
@@ -77,6 +82,49 @@ func openNativeStore(root string) (*nativeStore, error) {
 		store.close()
 		return nil, err
 	}
+	return store, nil
+}
+
+// contentStores keeps the content store of each content root the process has
+// opened. containerd's NewStore probes the root's file system for fs-verity
+// each time, making and removing a directory and a file in it: nine requests
+// of a shared root over NFS, four times in a cluster's run. A store holds no
+// more than its root, the probe's answer, and the locks of the ingests it is
+// writing, which the root's users share as they share the image store's lock.
+var contentStores struct {
+	mu     sync.Mutex
+	byRoot map[string]contentStoreOf
+}
+
+// contentStoreOf is the content store of the directory info describes.
+type contentStoreOf struct {
+	info  os.FileInfo
+	store content.Store
+}
+
+// newContentStore makes a content store of a root.
+var newContentStore = contentlocal.NewStore
+
+// openContentStore returns the content store of root, kept from an earlier
+// open of the same directory.
+func openContentStore(root string) (content.Store, error) {
+	info, err := os.Stat(root)
+	if err != nil {
+		return nil, err
+	}
+	contentStores.mu.Lock()
+	defer contentStores.mu.Unlock()
+	if kept, ok := contentStores.byRoot[root]; ok && os.SameFile(kept.info, info) {
+		return kept.store, nil
+	}
+	store, err := newContentStore(root)
+	if err != nil {
+		return nil, err
+	}
+	if contentStores.byRoot == nil {
+		contentStores.byRoot = make(map[string]contentStoreOf)
+	}
+	contentStores.byRoot[root] = contentStoreOf{info: info, store: store}
 	return store, nil
 }
 

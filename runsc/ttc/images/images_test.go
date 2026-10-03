@@ -704,3 +704,39 @@ func TestPruneEmptyNativeIngestDirectories(t *testing.T) {
 		t.Fatalf("nonempty ingest transaction was modified: %v", err)
 	}
 }
+
+func TestNativeStoreKeepsOneContentStorePerRoot(t *testing.T) {
+	made := 0
+	saved := newContentStore
+	t.Cleanup(func() { newContentStore = saved })
+	newContentStore = func(root string) (content.Store, error) {
+		made++
+		return saved(root)
+	}
+	root := t.TempDir()
+	write := func(data string) {
+		t.Helper()
+		store, err := openNativeStore(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.close()
+		algorithm := ocispec.Descriptor{Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}.Digest.Algorithm()
+		desc := ocispec.Descriptor{MediaType: "application/octet-stream", Digest: algorithm.FromString(data), Size: int64(len(data))}
+		if err := content.WriteBlob(context.Background(), store.content, data, strings.NewReader(data), desc); err != nil {
+			t.Fatalf("writing a blob: %v", err)
+		}
+	}
+	for _, data := range []string{"a", "b", "c"} {
+		write(data)
+	}
+	if made != 1 {
+		t.Errorf("three opens of a store made %d content stores, want 1", made)
+	}
+	// A store made again, whose content store may be kept if its root reuses
+	// the inode, is written as one made first.
+	if err := os.RemoveAll(filepath.Join(root, "image-store")); err != nil {
+		t.Fatal(err)
+	}
+	write("d")
+}
