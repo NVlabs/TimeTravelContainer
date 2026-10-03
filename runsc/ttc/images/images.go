@@ -1058,12 +1058,16 @@ func DeleteContentLease(ctx context.Context, opts ContentLeaseOptions) error {
 		return err
 	}
 	defer store.close()
-	if _, exists := store.catalog.Leases[opts.LeaseID]; !exists {
+	lease, exists := store.catalog.Leases[opts.LeaseID]
+	if !exists {
 		return nil
 	}
 	delete(store.catalog.Leases, opts.LeaseID)
 	if err := store.saveCatalog(); err != nil {
 		return fmt.Errorf("deleting content lease %q: %w", opts.LeaseID, err)
+	}
+	if store.keeps(lease.Target) {
+		return nil
 	}
 	return store.garbageCollect(ctx)
 }
@@ -1085,6 +1089,9 @@ func Delete(ctx context.Context, opts DeleteOptions) error {
 	delete(store.catalog.Images, opts.Reference)
 	if err := store.saveCatalog(); err != nil {
 		return fmt.Errorf("deleting image %q: %w", opts.Reference, err)
+	}
+	if store.keeps(record.Target) {
+		return nil
 	}
 	return store.garbageCollect(ctx)
 }

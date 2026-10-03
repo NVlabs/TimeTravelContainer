@@ -740,3 +740,59 @@ func TestNativeStoreKeepsOneContentStorePerRoot(t *testing.T) {
 	}
 	write("d")
 }
+
+func TestRemovingARootWhoseTargetIsKeptCollectsNothing(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	algorithm := ocispec.Descriptor{Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}.Digest.Algorithm()
+	blob := func(data string) ocispec.Descriptor {
+		return ocispec.Descriptor{MediaType: ocispec.MediaTypeImageConfig, Digest: algorithm.FromString(data), Size: int64(len(data))}
+	}
+	target, orphan := blob("config"), blob("orphan")
+	store, err := openNativeStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for data, desc := range map[string]ocispec.Descriptor{"config": target, "orphan": orphan} {
+		if err := content.WriteBlob(ctx, store.content, data, strings.NewReader(data), desc); err != nil {
+			store.close()
+			t.Fatal(err)
+		}
+	}
+	reference := "docker.io/library/test:latest"
+	store.catalog.Images[reference] = imageRecord{Info: Info{Reference: reference, Digest: target.Digest.String()}, Target: target}
+	if err := store.saveCatalog(); err != nil {
+		store.close()
+		t.Fatal(err)
+	}
+	store.close()
+	leaseID := ContainerLeaseID("family")
+	if err := CreateContentLease(ctx, ContentLeaseOptions{Root: root, LeaseID: leaseID, Digest: target.Digest.String()}); err != nil {
+		t.Fatal(err)
+	}
+	present := func(desc ocispec.Descriptor) bool {
+		t.Helper()
+		store, err := openNativeStore(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.close()
+		_, err = store.content.Info(ctx, desc.Digest)
+		return err == nil
+	}
+	// The image keeps what the lease did: nothing is collected, not even
+	// content no root reaches.
+	if err := DeleteContentLease(ctx, ContentLeaseOptions{Root: root, LeaseID: leaseID}); err != nil {
+		t.Fatal(err)
+	}
+	if !present(target) || !present(orphan) {
+		t.Fatalf("removing a lease whose target an image keeps collected content: target %t, orphan %t", present(target), present(orphan))
+	}
+	// The last root of the target goes: everything unreachable is collected.
+	if err := Delete(ctx, DeleteOptions{Root: root, Reference: reference, Digest: target.Digest.String()}); err != nil {
+		t.Fatal(err)
+	}
+	if present(target) || present(orphan) {
+		t.Fatalf("removing the last root left content: target %t, orphan %t", present(target), present(orphan))
+	}
+}

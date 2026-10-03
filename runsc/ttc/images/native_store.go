@@ -244,6 +244,31 @@ func (s *nativeStore) saveCatalog() error {
 	return dir.Sync()
 }
 
+// keeps reports whether an image or lease of the catalog has target as its
+// target. What a target reaches is a function of it, so a root removed whose
+// target another keeps leaves no content unreachable: a family removed while
+// its image is still tagged, the common case, collects nothing, and need not
+// read every image's manifests to find that out.
+func (s *nativeStore) keeps(target ocispec.Descriptor) bool {
+	if target.Digest == "" {
+		return false
+	}
+	same := func(other ocispec.Descriptor) bool {
+		return other.Digest == target.Digest && other.MediaType == target.MediaType
+	}
+	for _, image := range s.catalog.Images {
+		if same(image.Target) {
+			return true
+		}
+	}
+	for _, lease := range s.catalog.Leases {
+		if same(lease.Target) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *nativeStore) garbageCollect(ctx context.Context) error {
 	reachable := make(map[string]bool)
 	var mark func(ocispec.Descriptor) error
