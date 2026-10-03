@@ -181,25 +181,47 @@ func (s *daemonServer) recordEvent(dataRoot string, event DaemonEvent) {
 	event.Time = time.Now().UTC()
 	event.ID = fmt.Sprintf("%d-%d-%d", event.Time.UnixNano(), os.Getpid(), s.eventSeq)
 	path := s.eventLogPath(dataRoot)
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return
-	}
 	data, err := json.Marshal(event)
 	if err != nil {
 		return
 	}
 	data = append(data, '\n')
-	if err := rotateDaemonEventLog(path, int64(len(data)), daemonEventMaxBytes, daemonEventFiles); err != nil {
-		return
-	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	// The log rotates by the size of the file opened, which a stat of its
+	// directory and of it by name before the open would each have taken a
+	// round trip of a shared root to tell, on the way to every reply.
+	file, err := openDaemonEventLog(path)
 	if err != nil {
 		return
+	}
+	if info, err := file.Stat(); err != nil {
+		_ = file.Close()
+		return
+	} else if info.Size() != 0 && info.Size()+int64(len(data)) > daemonEventMaxBytes {
+		_ = file.Close()
+		if err := rotateDaemonEventLog(path, int64(len(data)), daemonEventMaxBytes, daemonEventFiles); err != nil {
+			return
+		}
+		if file, err = openDaemonEventLog(path); err != nil {
+			return
+		}
 	}
 	if writeDaemonBytes(file, data) == nil {
 		s.eventSyncs.syncSoon(path)
 	}
 	_ = file.Close()
+}
+
+// openDaemonEventLog opens the event log at path to append to it, making its
+// directory if it has none.
+func openDaemonEventLog(path string) (*os.File, error) {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			return nil, err
+		}
+		file, err = os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	}
+	return file, err
 }
 
 // eventLogSyncer syncs event logs to disk on a goroutine of its own, so that

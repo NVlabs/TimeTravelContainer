@@ -188,6 +188,26 @@ func TestDaemonEventLogRotationIsBounded(t *testing.T) {
 	}
 }
 
+func TestRecordedEventMakesTheLogsDirectoryAndRotatesAFullLog(t *testing.T) {
+	root := t.TempDir()
+	server := &daemonServer{}
+	path := server.eventLogPath(root)
+	server.recordEvent(root, DaemonEvent{Type: "container", Action: "start", Subject: "first"})
+	if data, err := os.ReadFile(path); err != nil || !strings.Contains(string(data), `"subject":"first"`) {
+		t.Fatalf("the first event in a root without a log: %q, %v", data, err)
+	}
+	if err := os.Truncate(path, daemonEventMaxBytes); err != nil {
+		t.Fatal(err)
+	}
+	server.recordEvent(root, DaemonEvent{Type: "container", Action: "start", Subject: "second"})
+	if info, err := os.Stat(daemonEventLogPath(path, 1)); err != nil || info.Size() != daemonEventMaxBytes {
+		t.Fatalf("a full log was not rotated: %v, %v", info, err)
+	}
+	if data, err := os.ReadFile(path); err != nil || !strings.Contains(string(data), `"subject":"second"`) || strings.Contains(string(data), `"subject":"first"`) {
+		t.Fatalf("the log after a rotation: %q, %v", data, err)
+	}
+}
+
 func TestEventLogSyncerSyncsEveryLogAndStops(t *testing.T) {
 	dir := t.TempDir()
 	written := filepath.Join(dir, "events.jsonl")
