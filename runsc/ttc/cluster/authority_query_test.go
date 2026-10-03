@@ -145,6 +145,26 @@ func TestFamilySnapshotResolvesBranchesAsTheCatalogDoes(t *testing.T) {
 		if !reflect.DeepEqual(gotBranch, wantBranch) || !errors.Is(gotErr, wantErr) {
 			t.Errorf("%s: snapshot branch %+v, %v; the branch's own %+v, %v", branch, gotBranch, gotErr, wantBranch, wantErr)
 		}
+		// A resolution's read of a physical runtime of the family, whose
+		// branch authority is not the family's, as of the family itself.
+		for _, family := range []string{"fam-a", "phys"} {
+			resolution, err := fsm.query(ResolutionQuery(family, "fam-a", branch))
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, wantErr := one.PlacementOf("fam-a", branch)
+			if got, err := resolution.PlacementOf("fam-a", branch); !reflect.DeepEqual(got, want) || !errors.Is(err, wantErr) {
+				t.Errorf("%s of %s: resolved placement %+v, %v; the branch's own %+v, %v", branch, family, got, err, want, wantErr)
+			}
+			own, err := fsm.query(AuthorityQuery{Branches: Only(logicalBranchKey(family, branch))})
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantBranch, wantErr := own.BranchOf(family, branch)
+			if got, err := resolution.BranchOf(family, branch); !reflect.DeepEqual(got, wantBranch) || !errors.Is(err, wantErr) {
+				t.Errorf("%s of %s: resolved branch %+v, %v; the branch's own %+v, %v", branch, family, got, err, wantBranch, wantErr)
+			}
+		}
 	}
 	if placement, err := snapshot.PlacementOf("fam-a", "bad"); err != nil || placement.State != PlacementCorrupted ||
 		placement.OwnerNode != "" || placement.PhysicalContainer != "" || placement.OperationID != "" || placement.TargetNode != "" {

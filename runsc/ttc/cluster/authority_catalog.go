@@ -839,6 +839,17 @@ func (s *AuthorityState) PlacementOf(family, branch string) (*PlacementRecord, e
 	return &record, nil
 }
 
+// ResolutionQuery is the query of what resolving a branch of a container
+// reads: the branch's placement in its logical family, and its authority in
+// the container's family and in the logical one, whose PlacementOf and
+// BranchOf are LookupPlacement and Branch of each.
+func ResolutionQuery(family, logical, branch string) AuthorityQuery {
+	return AuthorityQuery{
+		Placements: Only(logicalBranchKey(logical, branch)),
+		Branches:   Only(logicalBranchKey(family, branch), logicalBranchKey(logical, branch)),
+	}
+}
+
 // BranchOf is Branch of family's branch in s, which must hold the branch's
 // authority if the authority has it: a query of the family's branches does.
 func (s *AuthorityState) BranchOf(family, branch string) (*BranchAuthority, error) {

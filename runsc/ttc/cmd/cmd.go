@@ -7202,13 +7202,20 @@ func (b *runtimeBackend) resolveSelector(target selector) (selector, ttcbundle.C
 // of querying the authority for the branch's.
 func (b *runtimeBackend) resolveSelectorIn(info ttcbundle.ContainerInfo, target selector, state *cluster.AuthorityState) (selector, ttcbundle.ContainerInfo, error) {
 	if b.nodeID != "" {
+		logicalFamily := info.ID
+		if info.DistributedFamilyID != "" {
+			logicalFamily = info.DistributedFamilyID
+		}
 		var publicationID string
 		if b.distributedSource != nil && b.distributedSource.authority != nil {
-			branchAuthority := b.distributedSource.authority.Branch
-			if state != nil {
-				branchAuthority = state.BranchOf
+			if state == nil {
+				// The branch's authority and placement, in one read.
+				var err error
+				if state, err = b.distributedSource.authority.AuthorityStateOf(cluster.ResolutionQuery(info.ID, logicalFamily, target.branch)); err != nil {
+					return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("resolving authority for %s: %w", target, err)
+				}
 			}
-			if authority, authorityErr := branchAuthority(info.ID, target.branch); authorityErr == nil && authority.Corrupted {
+			if authority, authorityErr := state.BranchOf(info.ID, target.branch); authorityErr == nil && authority.Corrupted {
 				// Corruption clears physical placement because no node may execute
 				// the branch, but its last materialization may still contain graph,
 				// filesystem, and console objects that rm must reclaim. Resolve that
@@ -7233,10 +7240,6 @@ func (b *runtimeBackend) resolveSelectorIn(info ttcbundle.ContainerInfo, target 
 			}
 		}
 		if placements, placementErr := b.placementCatalog(); placementErr == nil {
-			logicalFamily := info.ID
-			if info.DistributedFamilyID != "" {
-				logicalFamily = info.DistributedFamilyID
-			}
 			lookup := placements.Lookup
 			if state != nil {
 				lookup = state.PlacementOf
