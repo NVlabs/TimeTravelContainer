@@ -4,7 +4,10 @@
 package cluster
 
 import (
+	"errors"
 	"maps"
+	"os"
+	"reflect"
 	"slices"
 	"testing"
 )
@@ -105,5 +108,52 @@ func TestAuthorityQueryOwnerKeepsTheNodesPlacements(t *testing.T) {
 	}
 	if len(got.Placements) != 1 || got.Placements[theirs].OwnerNode != "node-b" {
 		t.Fatalf("a revoked grant reads placements %v", got.Placements)
+	}
+}
+
+func TestFamilySnapshotResolvesBranchesAsTheCatalogDoes(t *testing.T) {
+	state := NewAuthorityState()
+	for _, branch := range []string{"main", "bad"} {
+		key := logicalBranchKey("fam-a", branch)
+		state.Placements[key] = PlacementRecord{
+			FamilyID: "fam-a", BranchID: branch, State: PlacementRunning, OwnerNode: "node-a", OwnerIncarnation: "inc-a",
+			PhysicalContainer: "phys-" + branch, PhysicalBranch: "tx-" + branch, OperationID: "op", TargetNode: "node-b",
+		}
+		state.Branches[key] = BranchAuthority{FamilyID: "fam-a", BranchID: branch, Generation: 1, Corrupted: branch == "bad"}
+	}
+	state.Placements[logicalBranchKey("fam-b", "main")] = PlacementRecord{FamilyID: "fam-b", BranchID: "main"}
+	fsm := &AuthorityFSM{state: state}
+	query := PlacementsWithOwners
+	query.Family = "fam-a"
+	snapshot, err := fsm.query(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, branch := range []string{"main", "bad", "gone"} {
+		key := logicalBranchKey("fam-a", branch)
+		one, err := fsm.query(AuthorityQuery{Placements: Only(key), Branches: Only(key)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, wantErr := one.PlacementOf("fam-a", branch)
+		got, gotErr := snapshot.PlacementOf("fam-a", branch)
+		if !reflect.DeepEqual(got, want) || !errors.Is(gotErr, wantErr) {
+			t.Errorf("%s: snapshot placement %+v, %v; the branch's own %+v, %v", branch, got, gotErr, want, wantErr)
+		}
+		wantBranch, wantErr := one.BranchOf("fam-a", branch)
+		gotBranch, gotErr := snapshot.BranchOf("fam-a", branch)
+		if !reflect.DeepEqual(gotBranch, wantBranch) || !errors.Is(gotErr, wantErr) {
+			t.Errorf("%s: snapshot branch %+v, %v; the branch's own %+v, %v", branch, gotBranch, gotErr, wantBranch, wantErr)
+		}
+	}
+	if placement, err := snapshot.PlacementOf("fam-a", "bad"); err != nil || placement.State != PlacementCorrupted ||
+		placement.OwnerNode != "" || placement.PhysicalContainer != "" || placement.OperationID != "" || placement.TargetNode != "" {
+		t.Errorf("a corrupted branch's placement %+v, %v: not fenced", placement, err)
+	}
+	if placement, err := snapshot.PlacementOf("fam-a", "main"); err != nil || placement.PhysicalContainer != "phys-main" || placement.OwnerNode != "node-a" {
+		t.Errorf("main's placement %+v, %v", placement, err)
+	}
+	if _, err := snapshot.PlacementOf("fam-b", "main"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("another family's placement: %v, want not exist", err)
 	}
 }

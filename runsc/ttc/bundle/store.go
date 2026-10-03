@@ -3506,6 +3506,12 @@ func (s Store) LoadSpec(name string) (*specs.Spec, error) {
 	return s.loadSpecOf(info, name)
 }
 
+// LoadSpecOf is LoadSpec of the container whose record, info, the caller has
+// loaded already.
+func (s Store) LoadSpecOf(info ContainerInfo) (*specs.Spec, error) {
+	return s.loadSpecOf(info, info.ID)
+}
+
 // loadSpecOf is LoadSpec of the container whose record is info, which name
 // named.
 func (s Store) loadSpecOf(info ContainerInfo, name string) (*specs.Spec, error) {
@@ -6649,13 +6655,23 @@ func (s Store) ListExecConsoleRetentionStats(container, branch string) (map[stri
 	if err != nil {
 		return nil, err
 	}
-	dir := filepath.Join(s.activeRoot(), "containers", info.ID, "console", "exec", branch)
+	return s.ListExecConsoleRetentionStatsOf(info.ID, branch)
+}
+
+// ListExecConsoleRetentionStatsOf is ListExecConsoleRetentionStats of the
+// container with the exact ID id, for a caller that has its record: it reads
+// no record.
+func (s Store) ListExecConsoleRetentionStatsOf(id, branch string) (map[string]ttcconsole.RetentionStats, error) {
+	if err := validateObjectName("branch", branch); err != nil {
+		return nil, err
+	}
+	dir := filepath.Join(s.activeRoot(), "containers", id, "console", "exec", branch)
 	entries, err := readDirWithStaleRetry(dir)
 	if os.IsNotExist(err) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("listing exec console retention for %q: %w", container, err)
+		return nil, fmt.Errorf("listing exec console retention for %q: %w", id, err)
 	}
 	const suffix = ".log.retention.json"
 	statsByExec := make(map[string]ttcconsole.RetentionStats)

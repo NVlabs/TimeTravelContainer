@@ -7191,10 +7191,22 @@ func (b *runtimeBackend) resolveSelector(target selector) (selector, ttcbundle.C
 			return selector{}, ttcbundle.ContainerInfo{}, err
 		}
 	}
+	return b.resolveSelectorIn(info, target, nil)
+}
+
+// resolveSelectorIn is resolveSelector of target, whose container resolved to
+// info, without waiting for the family. state, if not nil, is a snapshot of the
+// placements and branch authorities of info's family, which it reads instead
+// of querying the authority for the branch's.
+func (b *runtimeBackend) resolveSelectorIn(info ttcbundle.ContainerInfo, target selector, state *cluster.AuthorityState) (selector, ttcbundle.ContainerInfo, error) {
 	if b.nodeID != "" {
 		var publicationID string
 		if b.distributedSource != nil && b.distributedSource.authority != nil {
-			if authority, authorityErr := b.distributedSource.authority.Branch(info.ID, target.branch); authorityErr == nil && authority.Corrupted {
+			branchAuthority := b.distributedSource.authority.Branch
+			if state != nil {
+				branchAuthority = state.BranchOf
+			}
+			if authority, authorityErr := branchAuthority(info.ID, target.branch); authorityErr == nil && authority.Corrupted {
 				// Corruption clears physical placement because no node may execute
 				// the branch, but its last materialization may still contain graph,
 				// filesystem, and console objects that rm must reclaim. Resolve that
@@ -7223,7 +7235,11 @@ func (b *runtimeBackend) resolveSelector(target selector) (selector, ttcbundle.C
 			if info.DistributedFamilyID != "" {
 				logicalFamily = info.DistributedFamilyID
 			}
-			if placement, lookupErr := placements.Lookup(logicalFamily, target.branch); lookupErr == nil {
+			lookup := placements.Lookup
+			if state != nil {
+				lookup = state.PlacementOf
+			}
+			if placement, lookupErr := lookup(logicalFamily, target.branch); lookupErr == nil {
 				if placement.OwnerNode != "" && placement.OwnerNode != b.nodeID {
 					return selector{}, ttcbundle.ContainerInfo{}, &remoteBranchOwnershipError{target: target, owner: placement.OwnerNode}
 				}
@@ -10414,7 +10430,8 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 	if containerInfo.IsDistributedPhysicalRuntime() {
 		return InspectInfo{}, fmt.Errorf("container %q does not exist: %w", name, os.ErrNotExist)
 	}
-	spec, err := store.LoadSpec(containerInfo.ID)
+	b.resolvedFamilies.resolved(name, containerInfo)
+	spec, err := store.LoadSpecOf(containerInfo)
 	if err != nil {
 		return InspectInfo{}, err
 	}
@@ -10427,12 +10444,18 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 	if refreshed, err := store.LoadContainer(containerInfo.ID); err == nil {
 		containerInfo = refreshed
 	}
+	// Each branch below resolves in the record as loaded, which the authority's
+	// projection of its branches would mislead, and in the family's placements
+	// and branch authorities, if the authority could be read.
+	record := containerInfo
+	var authority *cluster.AuthorityState
 	if b.nodeID != "" {
 		if b.distributedSource != nil && b.distributedSource.authority != nil {
 			// The family's placements, not the cluster's.
 			query := cluster.PlacementsWithOwners
 			query.Family = containerInfo.ID
 			if snapshot, readErr := b.distributedSource.authority.AuthorityStateOf(query); readErr == nil {
+				authority = snapshot
 				containerInfo.Branches = logicalPersistentBranchInfos(containerInfo.Branches, snapshot.PlacementList(), snapshot.OfflineNodes(), containerInfo.ID)
 			}
 		} else if placements, openErr := b.placementCatalog(); openErr == nil {
@@ -10459,23 +10482,24 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 	}
 	for i := range result.TTC.Branches {
 		branch := &result.TTC.Branches[i]
-		physicalContainer, physicalBranch := containerInfo.ID, branch.Metadata.ID
-		if resolved, physical, resolveErr := b.resolveSelector(selector{container: containerInfo.ID, branch: branch.Metadata.ID}); resolveErr == nil {
-			physicalContainer, physicalBranch = physical.ID, resolved.branch
-		}
-		paths, retentionErr := b.containerStore().BranchConsolePaths(physicalContainer, physicalBranch)
-		if retentionErr == nil {
-			stats, statsErr := ttcconsole.ReadRetentionStats(paths.RetentionStats)
-			if statsErr != nil {
-				retentionErr = statsErr
-			} else if stats.EvictedGenerations != 0 || stats.EvictedBytes != 0 {
-				branch.OutputRetention = &stats
+		// A standalone daemon's branches run in the family's own runtime,
+		// whose record is loaded already; a cluster's may have moved to a
+		// physical runtime of their own.
+		physical := selector{container: containerInfo.ID, branch: branch.Metadata.ID}
+		var resolveErr error
+		if b.nodeID != "" {
+			var resolved selector
+			if resolved, _, resolveErr = b.resolveSelectorIn(record, physical, authority); resolveErr == nil {
+				physical = resolved
 			}
 		}
-		if retentionErr != nil {
-			branch.OutputRetentionError = retentionErr.Error()
+		paths := b.containerStore().BranchConsolePathsOf(physical.container, physical.branch)
+		if stats, statsErr := ttcconsole.ReadRetentionStats(paths.RetentionStats); statsErr != nil {
+			branch.OutputRetentionError = statsErr.Error()
+		} else if stats.EvictedGenerations != 0 || stats.EvictedBytes != 0 {
+			branch.OutputRetention = &stats
 		}
-		execStats, execRetentionErr := b.containerStore().ListExecConsoleRetentionStats(physicalContainer, physicalBranch)
+		execStats, execRetentionErr := b.containerStore().ListExecConsoleRetentionStatsOf(physical.container, physical.branch)
 		if execRetentionErr != nil {
 			branch.ExecOutputRetentionError = execRetentionErr.Error()
 		} else {
@@ -10484,7 +10508,12 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 		if branch.Metadata.State != "running" && branch.Metadata.State != "paused" {
 			continue
 		}
-		processes, err := b.processes(selector{container: containerInfo.ID, branch: branch.Metadata.ID})
+		if resolveErr != nil {
+			// Another node's, say.
+			branch.ProcessError = resolveErr.Error()
+			continue
+		}
+		processes, err := b.processesOf(physical)
 		if err != nil {
 			branch.ProcessError = err.Error()
 			continue
@@ -17586,7 +17615,12 @@ func (b *runtimeBackend) processes(target selector) ([]ProcessInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	target = resolved
+	return b.processesOf(resolved)
+}
+
+// processesOf is processes of a branch whose physical runtime and branch
+// target names already.
+func (b *runtimeBackend) processesOf(target selector) ([]ProcessInfo, error) {
 	output, err := b.command("timetravel", target.container, "ps", target.branch)
 	if err != nil {
 		return nil, err

@@ -819,15 +819,32 @@ func (c *AuthorityCatalog) LookupPlacement(family, branch string) (*PlacementRec
 	if err != nil {
 		return nil, err
 	}
-	record, ok := state.Placements[logicalBranchKey(family, branch)]
+	return state.PlacementOf(family, branch)
+}
+
+// PlacementOf is LookupPlacement of family's branch in s, which must hold the
+// branch's placement and authority if the authority has them: a query of the
+// family's placements and branches does.
+func (s *AuthorityState) PlacementOf(family, branch string) (*PlacementRecord, error) {
+	record, ok := s.Placements[logicalBranchKey(family, branch)]
 	if !ok {
 		return nil, os.ErrNotExist
 	}
-	if authority, ok := state.Branches[logicalBranchKey(family, branch)]; ok && authority.Corrupted {
+	if authority, ok := s.Branches[logicalBranchKey(family, branch)]; ok && authority.Corrupted {
 		record.State = PlacementCorrupted
 		record.OwnerNode, record.OwnerIncarnation = "", ""
 		record.PhysicalContainer, record.PhysicalBranch = "", ""
 		record.OperationID, record.TargetNode, record.ResumeState = "", "", ""
+	}
+	return &record, nil
+}
+
+// BranchOf is Branch of family's branch in s, which must hold the branch's
+// authority if the authority has it: a query of the family's branches does.
+func (s *AuthorityState) BranchOf(family, branch string) (*BranchAuthority, error) {
+	record, ok := s.Branches[logicalBranchKey(family, branch)]
+	if !ok {
+		return nil, os.ErrNotExist
 	}
 	return &record, nil
 }
