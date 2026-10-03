@@ -28,13 +28,6 @@ declare_mutex(
     prefix = "apfs",
 )
 
-declare_mutex(
-    name = "memory_file_mutex",
-    out = "memory_file_mutex.go",
-    package = "pgalloc",
-    prefix = "memoryFile",
-)
-
 go_template_instance(
     name = "amfl_list",
     out = "amfl_list.go",
