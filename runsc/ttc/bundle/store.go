@@ -1786,6 +1786,9 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if err := s.publishContainerDir(id, containerDir); err != nil {
 		return Prepared{}, fmt.Errorf("publishing container metadata: %w", err)
 	}
+	// The commands that follow name it: the node that made it looks for it
+	// by name without a search.
+	setContainerNameHint(s.Root+"\x00"+metadata.Name, id)
 	keep = true
 	keepManagedVolumeSnapshots = true
 	return Prepared{BundleDir: metadata.BundleDir, RootFS: rootfs, Image: imageInfo, Container: metadata}, nil
@@ -2078,6 +2081,7 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 	if err := s.publishContainerDir(id, containerDir); err != nil {
 		return Prepared{}, fmt.Errorf("publishing restored container metadata: %w", err)
 	}
+	setContainerNameHint(s.Root+"\x00"+metadata.Name, id)
 	keep = true
 	return Prepared{BundleDir: metadata.BundleDir, RootFS: rootfs, Image: imageInfo, Container: metadata}, nil
 }
