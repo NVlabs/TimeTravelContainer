@@ -9603,6 +9603,13 @@ func (b *runtimeBackend) consoleRetention(container string) (int64, int, error) 
 	if err != nil {
 		return 0, 0, fmt.Errorf("loading console retention for %s: %w", container, err)
 	}
+	maxBytes, maxFiles := consoleRetentionOf(info)
+	return maxBytes, maxFiles, nil
+}
+
+// consoleRetentionOf is consoleRetention of the container whose record is
+// info: its log options, which its creation fixed.
+func consoleRetentionOf(info ttcbundle.ContainerInfo) (int64, int) {
 	maxBytes := info.ConsoleLogMaxBytes
 	if maxBytes <= 0 {
 		maxBytes = defaultConsoleLogMax
@@ -9611,7 +9618,18 @@ func (b *runtimeBackend) consoleRetention(container string) (int64, int, error) 
 	if maxFiles < 1 {
 		maxFiles = defaultConsoleLogFiles
 	}
-	return maxBytes, maxFiles, nil
+	return maxBytes, maxFiles
+}
+
+// ensureConsoleDrainIn is ensureConsoleDrain, which resets the console, of
+// a branch of the container whose record, info, the caller has: it reads no
+// record.
+func (b *runtimeBackend) ensureConsoleDrainIn(info ttcbundle.ContainerInfo, target selector) (ttcbundle.ConsolePaths, error) {
+	paths, err := b.containerStore().BranchConsolePathsIn(info, target.branch)
+	if err != nil {
+		return ttcbundle.ConsolePaths{}, err
+	}
+	return b.ensureConsoleDrainPaths(target, "", "init", paths, true, &info)
 }
 
 func (b *runtimeBackend) ensureConsoleDrain(target selector, reset bool) (ttcbundle.ConsolePaths, error) {
@@ -9637,7 +9655,7 @@ func (b *runtimeBackend) ensureConsoleDrain(target selector, reset bool) (ttcbun
 			}
 		}
 	}
-	return b.ensureConsoleDrainPaths(target, "", "init", paths, reset)
+	return b.ensureConsoleDrainPaths(target, "", "init", paths, reset, nil)
 }
 
 // ensureExecConsoleDrain makes sure session, as the caller has just listed
@@ -9659,7 +9677,18 @@ func (b *runtimeBackend) ensureExecConsoleDrain(target selector, session runscEx
 		}
 		return paths, nil
 	}
-	return b.ensureConsoleDrainPaths(target, session.ID, session.ConsoleID, paths, reset)
+	return b.ensureConsoleDrainPaths(target, session.ID, session.ConsoleID, paths, reset, nil)
+}
+
+// ensureExecConsoleDrainIn is ensureExecConsoleDrain, which resets the
+// console, of a branch of the container whose record, info, the caller has:
+// it reads no record.
+func (b *runtimeBackend) ensureExecConsoleDrainIn(info ttcbundle.ContainerInfo, target selector, session runscExecSession) (ttcbundle.ConsolePaths, error) {
+	paths, err := b.containerStore().ExecConsolePathsIn(info, target.branch, session.ID)
+	if err != nil {
+		return ttcbundle.ConsolePaths{}, err
+	}
+	return b.ensureConsoleDrainPaths(target, session.ID, session.ConsoleID, paths, true, &info)
 }
 
 // refreshExecSessions returns sessions as target lists them now, or as they
@@ -9724,7 +9753,10 @@ func installRetainedConsoleWaitStatus(paths ttcbundle.ConsolePaths, status uint3
 	return nil
 }
 
-func (b *runtimeBackend) ensureConsoleDrainPaths(target selector, execID, consoleID string, paths ttcbundle.ConsolePaths, reset bool) (ttcbundle.ConsolePaths, error) {
+// ensureConsoleDrainPaths starts a drain of the console at paths. The log
+// options of the container that info records, if it is not nil, bound the
+// console's log; else those of target's container, read.
+func (b *runtimeBackend) ensureConsoleDrainPaths(target selector, execID, consoleID string, paths ttcbundle.ConsolePaths, reset bool, info *ttcbundle.ContainerInfo) (ttcbundle.ConsolePaths, error) {
 	lockFile, err := os.OpenFile(paths.Lock, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return ttcbundle.ConsolePaths{}, fmt.Errorf("opening console drain lock: %w", err)
@@ -9754,8 +9786,11 @@ func (b *runtimeBackend) ensureConsoleDrainPaths(target selector, execID, consol
 			return ttcbundle.ConsolePaths{}, fmt.Errorf("checking console wait status: %w", err)
 		}
 	}
-	maxBytes, maxFiles, err := b.consoleRetention(target.container)
-	if err != nil {
+	var maxBytes int64
+	var maxFiles int
+	if info != nil {
+		maxBytes, maxFiles = consoleRetentionOf(*info)
+	} else if maxBytes, maxFiles, err = b.consoleRetention(target.container); err != nil {
 		return ttcbundle.ConsolePaths{}, err
 	}
 	if reset {
@@ -13711,15 +13746,17 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 			return nil, fmt.Errorf("registering batch fork placements: %w; batch branches were destroyed", err)
 		}
 	}
+	// The branches are the source's runtime's, under the names given: the
+	// source's record, resolved, is theirs.
 	for _, destination := range destinations {
 		target := selector{container: source.container, branch: destination}
-		if _, err := b.ensureConsoleDrain(target, true); err != nil {
+		if _, err := b.ensureConsoleDrainIn(containerInfo, target); err != nil {
 			for _, cleanupDestination := range destinations {
 				_ = b.destroy(selector{container: source.container, branch: cleanupDestination}, true)
 			}
 			return nil, fmt.Errorf("starting console drain after batch fork: %w; batch branches were destroyed", err)
 		}
-		sessions, err := b.execSessions(target)
+		sessions, err := b.execSessionsOf(target)
 		if err != nil {
 			for _, cleanupDestination := range destinations {
 				_ = b.destroy(selector{container: source.container, branch: cleanupDestination}, true)
@@ -13730,7 +13767,7 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 			if session.State != "running" {
 				continue
 			}
-			if _, err := b.ensureExecConsoleDrain(target, session, true); err != nil {
+			if _, err := b.ensureExecConsoleDrainIn(containerInfo, target, session); err != nil {
 				for _, cleanupDestination := range destinations {
 					_ = b.destroy(selector{container: source.container, branch: cleanupDestination}, true)
 				}
