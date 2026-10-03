@@ -82,15 +82,18 @@ type regularFile struct {
 	data fsutil.FileRangeSet
 
 	// cow contains logical file ranges whose data ranges are also owned by at
-	// least one sibling live-fork branch. It does not own MemoryFile refs.
+	// least one sibling live-fork branch. It does not own MemoryFile refs. It
+	// is nil when it would be empty, as it is for most files: only a live
+	// fork of a file that has data in memory fills it.
 	// Protected by dataMu.
-	cow fsutil.FileRangeSet
+	cow *fsutil.FileRangeSet
 
 	// forkCopies maps, while a live fork's children load, logical file
 	// ranges whose data devices' DMA uses, which the file keeps, to copies,
-	// which the children take instead. It owns a reference on each copy.
+	// which the children take instead. It owns a reference on each copy. It
+	// is nil when it would be empty.
 	// Protected by dataMu.
-	forkCopies fsutil.FileRangeSet
+	forkCopies *fsutil.FileRangeSet
 
 	// seals represents file seals on this inode.
 	//
@@ -212,19 +215,23 @@ func (rf *regularFile) afterLoad(ctx goContext.Context) {
 	if err := fsutil.RelocateFileRangeSet(ctx, rf.inode.fs.mf, &rf.data); err != nil {
 		panic(fmt.Sprintf("relocating tmpfs file data: %v", err))
 	}
-	if err := fsutil.RelocateFileRangeSet(ctx, rf.inode.fs.mf, &rf.cow); err != nil {
-		panic(fmt.Sprintf("relocating tmpfs file CoW metadata: %v", err))
+	if rf.cow != nil {
+		if err := fsutil.RelocateFileRangeSet(ctx, rf.inode.fs.mf, rf.cow); err != nil {
+			panic(fmt.Sprintf("relocating tmpfs file CoW metadata: %v", err))
+		}
 	}
 	// A live fork's child takes copies of the pages that devices' DMA uses
 	// in its source, which keeps them (see prepareLiveFork).
-	for seg := rf.forkCopies.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
-		dataSeg := rf.data.FindSegment(seg.Start())
-		if !dataSeg.Ok() || !dataSeg.Range().IsSupersetOf(seg.Range()) {
-			panic(fmt.Sprintf("tmpfs live-fork copy of %v has no data segment", seg.Range()))
+	if rf.forkCopies != nil {
+		for seg := rf.forkCopies.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+			dataSeg := rf.data.FindSegment(seg.Start())
+			if !dataSeg.Ok() || !dataSeg.Range().IsSupersetOf(seg.Range()) {
+				panic(fmt.Sprintf("tmpfs live-fork copy of %v has no data segment", seg.Range()))
+			}
+			rf.data.Isolate(dataSeg, seg.Range()).SetValue(seg.Value())
 		}
-		rf.data.Isolate(dataSeg, seg.Range()).SetValue(seg.Value())
+		rf.forkCopies = nil
 	}
-	rf.forkCopies.RemoveAll()
 	if rf.inode.fs.diskVolume != nil {
 		rf.diskMap = nil
 		rf.diskObject = ""
@@ -300,7 +307,7 @@ func (rf *regularFile) prepareLiveFork(share bool) (bool, error) {
 	rf.mappings.InvalidateAll(memmap.InvalidateOpts{})
 	rf.dataMu.Lock()
 	defer rf.dataMu.Unlock()
-	rf.cow.RemoveAll()
+	rf.cow = nil
 	mf := rf.inode.fs.mf
 	dmaPinned := mf.AnyDMAPinned()
 	for seg := rf.data.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
@@ -313,9 +320,15 @@ func (rf *regularFile) prepareLiveFork(share bool) (bool, error) {
 				if err != nil {
 					return false, fmt.Errorf("copying %d bytes that a device's DMA uses for a live fork: %w", seg.Range().Length(), err)
 				}
+				if rf.forkCopies == nil {
+					rf.forkCopies = &fsutil.FileRangeSet{}
+				}
 				rf.forkCopies.Insert(rf.forkCopies.FindGap(seg.Start()), seg.Range(), copied.Start)
 			}
 			continue
+		}
+		if rf.cow == nil {
+			rf.cow = &fsutil.FileRangeSet{}
 		}
 		rf.cow.Insert(rf.cow.FindGap(seg.Start()), seg.Range(), seg.Value())
 	}
@@ -362,10 +375,13 @@ func (rf *regularFile) copyForLiveForkLocked(fr memmap.FileRange) (memmap.FileRa
 func (rf *regularFile) releaseLiveForkCopies() {
 	rf.dataMu.Lock()
 	defer rf.dataMu.Unlock()
+	if rf.forkCopies == nil {
+		return
+	}
 	for seg := rf.forkCopies.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
 		rf.inode.fs.mf.DecRef(seg.FileRange())
 	}
-	rf.forkCopies.RemoveAll()
+	rf.forkCopies = nil
 }
 
 // diskTranslationLocked returns the mapping of the file's volume object that
@@ -589,6 +605,9 @@ func (rf *regularFile) flushDiskMetadataRaw() error {
 //   - rf.dataMu is locked for writing.
 //   - mr is page-aligned.
 func (rf *regularFile) copyOnWriteLocked(ctx context.Context, mr memmap.MappableRange) error {
+	if rf.cow == nil {
+		return nil
+	}
 	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
 	for cowSeg := rf.cow.LowerBoundSegment(mr.Start); cowSeg.Ok() && cowSeg.Start() < mr.End; {
 		// LowerBoundSegment may return the segment immediately preceding mr
@@ -646,6 +665,9 @@ func (rf *regularFile) copyOnWriteLocked(ctx context.Context, mr memmap.Mappable
 			break
 		}
 		cowSeg = gap.NextSegment()
+	}
+	if rf.cow.IsEmpty() {
+		rf.cow = nil
 	}
 	return nil
 }
@@ -830,7 +852,12 @@ func (rf *regularFile) truncateNoTimeUpdateLocked(newSize uint64) error {
 	// We are now guaranteed that there are no translations of truncated pages,
 	// and can remove them.
 	rf.dataMu.Lock()
-	rf.cow.RemoveRange(memmap.MappableRange{newpgend, oldpgend})
+	if rf.cow != nil {
+		rf.cow.RemoveRange(memmap.MappableRange{newpgend, oldpgend})
+		if rf.cow.IsEmpty() {
+			rf.cow = nil
+		}
+	}
 	decPages := rf.data.Truncate(newSize, rf.inode.fs.mf)
 	rf.dataMu.Unlock()
 	rf.inode.fs.unaccountPages(decPages)
@@ -1033,7 +1060,7 @@ func (rf *regularFile) Translate(ctx context.Context, required, optional memmap.
 	// /dev/shm segments.
 	const maxTranslateBytes = 2 << 20 // 2 MiB
 	translateRange := maxOptionalRange(required, optional, maxTranslateBytes)
-	if !rf.cow.IsEmpty() {
+	if rf.cow != nil {
 		// Do not speculatively translate pages that have not detached yet.
 		translateRange = required
 	}
@@ -1509,7 +1536,7 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 	pageEnd, _ := hostarch.Addr(end).RoundUp()
 	writeRange := memmap.MappableRange{Start: uint64(hostarch.Addr(offset).RoundDown()), End: uint64(pageEnd)}
 	f.dataMu.RLock()
-	shared := !f.cow.IsEmptyRange(writeRange)
+	shared := f.cow != nil && !f.cow.IsEmptyRange(writeRange)
 	f.dataMu.RUnlock()
 	var n int64
 	if shared {
@@ -1730,7 +1757,7 @@ func (rw *regularFileReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64,
 	initialRange := memmap.MappableRange{uint64(hostarch.Addr(rw.off).RoundDown()), uint64(initialPageEnd)}
 	rw.file.mapsMu.Lock()
 	rw.file.dataMu.RLock()
-	shared := !rw.file.cow.IsEmptyRange(initialRange)
+	shared := rw.file.cow != nil && !rw.file.cow.IsEmptyRange(initialRange)
 	rw.file.dataMu.RUnlock()
 	if shared {
 		rw.file.mappings.Invalidate(initialRange, memmap.InvalidateOpts{InvalidatePrivate: true})

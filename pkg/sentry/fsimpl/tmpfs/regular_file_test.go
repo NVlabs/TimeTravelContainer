@@ -268,7 +268,7 @@ func TestLiveForkCopyOnWriteRemovesFinalRange(t *testing.T) {
 
 	rf.dataMu.Lock()
 	err = rf.copyOnWriteLocked(ctx, memmap.MappableRange{Start: 0, End: hostarch.PageSize})
-	empty := rf.cow.IsEmpty()
+	empty := rf.cow == nil
 	rf.dataMu.Unlock()
 	if err != nil {
 		t.Fatalf("copyOnWriteLocked for final CoW range: %v", err)
