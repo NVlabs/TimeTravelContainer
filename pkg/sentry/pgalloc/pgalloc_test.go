@@ -20,11 +20,14 @@
 package pgalloc
 
 import (
+	"bytes"
 	"reflect"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/usage"
 )
 
 const (
@@ -478,6 +481,88 @@ func TestAdoptCOWIdentitiesPreservesPageAndChangesVersion(t *testing.T) {
 	f.DecRef(source)
 }
 
+// An allocation whose caller may commit only some of its pages recycles waste
+// pages if it is small, zeroing what their last user left in them, and takes
+// free pages otherwise.
+func TestAllocateUncommittedRecyclesSmallWaste(t *testing.T) {
+	for _, test := range []struct {
+		length  uint64
+		recycle bool
+	}{
+		{length: 2 * page, recycle: true},
+		{length: maxRecycledUncommittedBytes, recycle: true},
+		{length: maxRecycledUncommittedBytes + page, recycle: false},
+	} {
+		f := newEmptyRemoteTestMemoryFile(t)
+		// Keep the releaser from releasing the waste before it can be recycled.
+		f.mu.Lock()
+		f.holdReleaserLocked()
+		f.mu.Unlock()
+		used, err := f.Allocate(test.length, AllocOpts{Kind: usage.Anonymous, Mode: AllocateAndWritePopulate})
+		if err != nil {
+			t.Fatal(err)
+		}
+		dsts, err := f.MapInternal(used, hostarch.Write)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := safemem.CopySeq(dsts, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(bytes.Repeat([]byte{0x5a}, int(test.length))))); err != nil {
+			t.Fatal(err)
+		}
+		f.DecRef(used)
+		got, err := f.Allocate(test.length, AllocOpts{Kind: usage.Anonymous, Mode: AllocateUncommitted})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if recycled := got == used; recycled != test.recycle {
+			t.Errorf("allocation of %d bytes: got %v from waste %v, recycled=%t, want %t", test.length, got, used, recycled, test.recycle)
+		}
+		srcs, err := f.MapInternal(got, hostarch.Read)
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, test.length)
+		if _, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buf)), srcs); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(buf, make([]byte, test.length)) {
+			t.Errorf("allocation of %d bytes holds data its pages had as waste", test.length)
+		}
+		f.DecRef(got)
+		f.mu.Lock()
+		f.unholdReleaserLocked()
+		f.mu.Unlock()
+		f.Destroy()
+	}
+}
+
+// The releaser releases runs of waste of a huge page or more before smaller
+// ones, and, among either, higher ones first.
+func TestReleaserReleasesLargeRunsFirst(t *testing.T) {
+	f := newLogicalPageTestMemoryFile()
+	for _, fr := range []memmap.FileRange{
+		{0, hugepage},
+		{hugepage + page, hugepage + 2*page},
+		{2 * hugepage, 3*hugepage + page},
+		{chunkSize - page, chunkSize},
+	} {
+		f.unwasteSmall.RemoveRange(fr)
+	}
+	for _, want := range []memmap.FileRange{
+		{2 * hugepage, 3*hugepage + page},
+		{0, hugepage},
+		{chunkSize - page, chunkSize},
+		{hugepage + page, hugepage + 2*page},
+	} {
+		if fr, huge, ok := f.nextReleaseLocked(); !ok || huge || fr != want {
+			t.Fatalf("nextReleaseLocked() = %v, %t, %t, want %v, false, true", fr, huge, ok, want)
+		}
+	}
+	if fr, _, ok := f.nextReleaseLocked(); ok {
+		t.Fatalf("nextReleaseLocked() = %v with no waste left", fr)
+	}
+}
+
 func TestFindAllocatable(t *testing.T) {
 	for _, test := range []struct {
 		name string
@@ -784,20 +869,39 @@ func TestFindAllocatable(t *testing.T) {
 			name:      "non-recycling bottom-up small allocation skips waste pages",
 			chunkHuge: []bool{false},
 			existing: []existingSegment{
-				{0, page, existingWaste},
+				{0, maxRecycledUncommittedBytes + page, existingWaste},
 			},
-			length: page,
-			want:   page,
+			length: maxRecycledUncommittedBytes + page,
+			want:   maxRecycledUncommittedBytes + page,
 		},
 		{
 			name:      "non-recycling top-down small allocation skips waste pages",
+			chunkHuge: []bool{false},
+			existing: []existingSegment{
+				{chunkSize - (maxRecycledUncommittedBytes + page), chunkSize, existingWaste},
+			},
+			length: maxRecycledUncommittedBytes + page,
+			dir:    TopDown,
+			want:   chunkSize - 2*(maxRecycledUncommittedBytes+page),
+		},
+		{
+			name:      "uncommitted bottom-up allocation of few small pages recycles waste pages",
+			chunkHuge: []bool{false},
+			existing: []existingSegment{
+				{0, page, existingWaste},
+			},
+			length: page,
+			want:   0,
+		},
+		{
+			name:      "uncommitted top-down allocation of few small pages recycles waste pages",
 			chunkHuge: []bool{false},
 			existing: []existingSegment{
 				{chunkSize - page, chunkSize, existingWaste},
 			},
 			length: page,
 			dir:    TopDown,
-			want:   chunkSize - 2*page,
+			want:   chunkSize - page,
 		},
 		{
 			name:      "non-recycling bottom-up huge allocation skips waste pages",

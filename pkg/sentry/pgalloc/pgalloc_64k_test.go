@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //go:build arm64 && pagesize_64k
 
 package pgalloc
@@ -277,20 +280,39 @@ func TestFindAllocatable64K(t *testing.T) {
 			name:      "non-recycling bottom-up small allocation skips waste pages",
 			chunkHuge: []bool{false},
 			existing: []existingSegment{
-				{0, page, existingWaste},
+				{0, maxRecycledUncommittedBytes + page, existingWaste},
 			},
-			length: page,
-			want:   page,
+			length: maxRecycledUncommittedBytes + page,
+			want:   maxRecycledUncommittedBytes + page,
 		},
 		{
 			name:      "non-recycling top-down small allocation skips waste pages",
+			chunkHuge: []bool{false},
+			existing: []existingSegment{
+				{chunkSize - (maxRecycledUncommittedBytes + page), chunkSize, existingWaste},
+			},
+			length: maxRecycledUncommittedBytes + page,
+			dir:    TopDown,
+			want:   chunkSize - 2*(maxRecycledUncommittedBytes+page),
+		},
+		{
+			name:      "uncommitted bottom-up allocation of few small pages recycles waste pages",
+			chunkHuge: []bool{false},
+			existing: []existingSegment{
+				{0, page, existingWaste},
+			},
+			length: page,
+			want:   0,
+		},
+		{
+			name:      "uncommitted top-down allocation of few small pages recycles waste pages",
 			chunkHuge: []bool{false},
 			existing: []existingSegment{
 				{chunkSize - page, chunkSize, existingWaste},
 			},
 			length: page,
 			dir:    TopDown,
-			want:   chunkSize - 2*page,
+			want:   chunkSize - page,
 		},
 		{
 			name:      "non-recycling bottom-up huge allocation skips waste pages",

@@ -87,8 +87,9 @@ type MemoryFile struct {
 	// reallocated since their commitment state and content is unknown. Waste
 	// pages may be uncommitted or committed, but cannot transition between the
 	// two. MemoryFile's releaser goroutine transitions pages from waste to
-	// releasing. Allocations that may return committed pages can transition
-	// pages from waste to used (referred to as "recycling").
+	// releasing. Allocations that may return committed pages, and small
+	// allocations that zero the waste pages they take, can transition pages
+	// from waste to used (referred to as "recycling").
 	//
 	// - Releasing: Releasing pages are waste pages that the releaser goroutine
 	// has removed from waste-tracking, making them ineligible for recycling.
@@ -1035,8 +1036,11 @@ func (d Direction) String() string {
 type AllocationMode int
 
 const (
-	// AllocateUncommitted indicates that MemoryFile.Allocate() must return
-	// uncommitted pages.
+	// AllocateUncommitted indicates that the caller of MemoryFile.Allocate()
+	// may commit only some of the allocated pages. Thus, Allocate() returns
+	// uncommitted pages, but for an allocation of at most
+	// maxRecycledUncommittedBytes, which may recycle waste pages and zero
+	// them.
 	AllocateUncommitted AllocationMode = iota
 
 	// AllocateCallerIndirectCommit indicates that the caller of
@@ -1056,6 +1060,18 @@ const (
 	// mappings of those pages returned by MapInternal().
 	AllocateAndWritePopulate
 )
+
+// maxRecycledUncommittedBytes is the largest AllocateUncommitted allocation
+// that may recycle waste pages. Such allocations are mostly page faults
+// refilling the holes that applications free in their heaps, the size of the
+// waste those frees left. Zeroing that waste costs less than releasing it and
+// committing new pages in its place; and releases can fall so far behind
+// frees, where the releaser shares a few CPUs with the vCPUs that run
+// applications, that waste fills a container's memory limit. But zeroing
+// also commits any waste pages that were never committed, so larger
+// allocations, that applications are likelier to touch sparsely, take free
+// pages.
+const maxRecycledUncommittedBytes = 64 << 10 // 64 KB
 
 // allocState holds the state of a call to MemoryFile.Allocate().
 type allocState struct {
@@ -1101,6 +1117,20 @@ func (f *MemoryFile) Allocate(length uint64, opts AllocOpts) (memmap.FileRange, 
 			mappingLease.Release()
 		}
 	}()
+	if alloc.recycled && !alloc.willCommit {
+		// The contents of recycled waste pages are initially unknown, so we
+		// need to zero them. They were mostly committed as waste, and there
+		// are few of them, so they need not be populated first.
+		dsts, mappingLease, err = f.MapInternalWithLease(fr, hostarch.Write)
+		if err != nil {
+			f.DecRef(fr)
+			return memmap.FileRange{}, err
+		}
+		if _, err := safemem.ZeroSeq(dsts); err != nil {
+			f.DecRef(fr)
+			return memmap.FileRange{}, err
+		}
+	}
 	if alloc.willCommit {
 		needHugeTouch := false
 		if alloc.recycled {
@@ -1253,7 +1283,7 @@ func (f *MemoryFile) findAllocatableAndMarkUsed(alloc *allocState) (fr memmap.Fi
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	if alloc.willCommit {
+	if alloc.willCommit || alloc.length <= maxRecycledUncommittedBytes {
 		// Try to recycle waste pages, since this avoids the overhead of
 		// decommitting and then committing them again.
 		var uwgap unwasteGapIterator
@@ -1764,7 +1794,6 @@ func (f *MemoryFile) DecRef(fr memmap.FileRange) {
 // releaserMain implements the releaser goroutine.
 func (f *MemoryFile) releaserMain() {
 	f.mu.Lock()
-MainLoop:
 	for {
 		for {
 			if f.destroyed {
@@ -1788,32 +1817,54 @@ MainLoop:
 			}
 			f.releaseCond.Wait() // releases f.mu while waiting
 		}
-		// Huge pages are relatively rare and expensive due to fragmentation
-		// and the cost of compaction. Fragmentation is expected to increase
-		// over time. Most allocations are done upwards, with the main
-		// exception being thread stacks. So we expect lower offsets to weakly
-		// correlate with older allocations, which are more likely to actually
-		// be hugepage-backed. Thus, release from unwasteSmall before
-		// unwasteHuge, and higher offsets before lower ones.
+		if fr, huge, ok := f.nextReleaseLocked(); ok {
+			f.releasing = true
+			f.releaseLocked(fr, huge)
+			f.releasing = false
+			f.releaserIdle.Broadcast()
+			continue
+		}
+		f.haveWaste = false
+	}
+}
+
+// nextReleaseLocked takes the range of waste that the releaser releases next
+// out of the waste sets, and returns it and whether it is hugepage-backed. ok
+// is false if there is no waste.
+//
+// Preconditions: f.mu must be locked.
+func (f *MemoryFile) nextReleaseLocked() (fr memmap.FileRange, huge, ok bool) {
+	// Huge pages are relatively rare and expensive due to fragmentation and
+	// the cost of compaction. Fragmentation is expected to increase over
+	// time. Most allocations are done upwards, with the main exception being
+	// thread stacks. So we expect lower offsets to weakly correlate with older
+	// allocations, which are more likely to actually be hugepage-backed.
+	// Thus, release from unwasteSmall before unwasteHuge, and higher offsets
+	// before lower ones.
+	//
+	// But release runs of a huge page or more, of both, before smaller ones.
+	// A release costs much the same whatever its size, and most where the
+	// releaser shares a few CPUs with the vCPUs that run applications: 0.1 to
+	// 0.3 ms on KVM on a large arm64 machine, of which fallocate() takes
+	// 0.03. Users that free small runs faster than they can be released
+	// would otherwise keep the large runs, the bulk of the waste, from being
+	// released at all.
+	for _, minLength := range []uint64{hostarch.HugePageSize, 1} {
 		for i, unwaste := range []*unwasteSet{&f.unwasteSmall, &f.unwasteHuge} {
-			if uwgap := unwaste.LastLargeEnoughGap(1); uwgap.Ok() {
+			if uwgap := unwaste.LastLargeEnoughGap(minLength); uwgap.Ok() {
 				fr := uwgap.Range()
-				// Linux serializes fallocate()s on shmem files, so limit the amount we
-				// release at once to avoid starving Decommit().
+				// Linux serializes fallocate()s on shmem files, so limit the
+				// amount we release at once to avoid starving Decommit().
 				const maxReleasingBytes = 128 << 20 // 128 MB
 				if fr.Length() > maxReleasingBytes {
 					fr.Start = fr.End - maxReleasingBytes
 				}
 				unwaste.Insert(uwgap, fr, unwasteInfo{})
-				f.releasing = true
-				f.releaseLocked(fr, i == 1)
-				f.releasing = false
-				f.releaserIdle.Broadcast()
-				continue MainLoop
+				return fr, i == 1, true
 			}
 		}
-		f.haveWaste = false
 	}
+	return memmap.FileRange{}, false, false
 }
 
 // holdReleaserLocked keeps the releaser from starting a release until
