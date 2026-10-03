@@ -926,3 +926,47 @@ func TestDiskChildOfADirectoryItMadeIsNotLookedUp(t *testing.T) {
 		t.Fatalf("a directory the filesystem did not make found (%v, %v), want the volume's file", child, err)
 	}
 }
+
+// A file whose volume data ensureDiskData has found local is not looked up in
+// its branch again; here, its branch goes missing, which a lookup would fail
+// on, and the file's data is still ensured.
+func TestDiskDataFoundLocalIsNotLookedUpAgain(t *testing.T) {
+	manager, err := ttcvolume.OpenManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenManager: %v", err)
+	}
+	repository, err := manager.Create("local-data-test")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer repository.Close()
+	ino, err := repository.CreateRegular(ttcvolume.MainBranch, ttcvolume.RootInode, "local", 0644, 0, 0)
+	if err != nil {
+		t.Fatalf("CreateRegular: %v", err)
+	}
+	data := []byte("local data")
+	if _, _, err := repository.WriteAt(ttcvolume.MainBranch, ino, data, 0); err != nil {
+		t.Fatalf("WriteAt: %v", err)
+	}
+	fs := &filesystem{diskVolume: &diskVolumeState{Repository: repository, Branch: ttcvolume.MainBranch}}
+	newFile := func() *regularFile {
+		file := &regularFile{}
+		file.inode.fs = fs
+		file.inode.impl = file
+		file.inode.ino = ino
+		file.inode.mode.Store(uint32(linux.S_IFREG | 0644))
+		file.size.Store(uint64(len(data)))
+		return file
+	}
+	file := newFile()
+	if err := file.ensureDiskData(); err != nil || !file.diskDataLocal.Load() {
+		t.Fatalf("ensureDiskData: %v, local=%t", err, file.diskDataLocal.Load())
+	}
+	fs.diskVolume.Branch = "missing"
+	if err := newFile().ensureDiskData(); err == nil {
+		t.Fatal("a file not yet found local was ensured without its branch")
+	}
+	if err := file.ensureDiskData(); err != nil {
+		t.Fatalf("a file found local was looked up again: %v", err)
+	}
+}

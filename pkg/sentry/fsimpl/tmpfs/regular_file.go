@@ -120,6 +120,13 @@ type regularFile struct {
 	// I/O cache must open it anew.
 	diskIOStale atomicbitops.Bool `state:"nosave"`
 
+	// diskDataLocal is set once ensureDiskData has found all of the file's
+	// volume data local, which it then stays: a volume materializes remote
+	// data, and never makes local data remote, while the Sentry holds the
+	// file. Until it is set, every read, write, translation and resize of
+	// the file looks its object up in the branch, a host stat() among it.
+	diskDataLocal atomicbitops.Bool `state:"nosave"`
+
 	// diskIOFile caches the host object used by read(2)/write(2). Without this
 	// cache, every 64 KiB operation reopens the branch, traverses the immutable
 	// metadata layer chain, and reopens the same data object. diskIOMu is held
@@ -536,12 +543,16 @@ func (rf *regularFile) invalidateDiskIO() {
 // deliberately outside mapsMu and diskIOMu: repository callbacks acquire
 // those locks to invalidate caches in every branch sharing the repository.
 func (rf *regularFile) ensureDiskData() error {
-	if rf.inode.fs.diskVolume == nil {
+	if rf.inode.fs.diskVolume == nil || rf.diskDataLocal.Load() {
 		return nil
 	}
 	size := int64(rf.size.Load())
-	return diskVolumeError("materialize file", rf.inode.fs.diskVolume.Repository.EnsureDataRange(
-		rf.inode.fs.diskVolume.Branch, rf.inode.ino, 0, size))
+	if err := diskVolumeError("materialize file", rf.inode.fs.diskVolume.Repository.EnsureDataRange(
+		rf.inode.fs.diskVolume.Branch, rf.inode.ino, 0, size)); err != nil {
+		return err
+	}
+	rf.diskDataLocal.Store(true)
+	return nil
 }
 
 // markDiskMetadataDirty defers repository metadata publication. The flag is
