@@ -3294,6 +3294,104 @@ func TestFilesystemSnapshotOriginsIncludesNamedAndPrivateRepositories(t *testing
 	}
 }
 
+// A container's repositories, which its spec fixes when it is made, are read
+// once: its record and spec are not read again, its repository map is.
+func TestFilesystemSnapshotOriginsReadsAContainersSpecOnce(t *testing.T) {
+	sharedRoot := t.TempDir()
+	localRoot := t.TempDir()
+	manager, err := ttcvolume.OpenManager(localRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := Store{Root: sharedRoot, ActiveRoot: localRoot}
+	// container makes a container whose rootfs upper is a repository of
+	// origin, and returns its ID.
+	container := func(digit string, origin ttcsnapshot.SnapshotID) string {
+		t.Helper()
+		id := strings.Repeat(digit, 64)
+		path := filepath.Join(localRoot, "containers", id, rootfsUpperRepositoryDir)
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		repository, err := manager.CreatePrivateWithOrigin(path, "rootfs", origin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := repository.Close(); err != nil {
+			t.Fatal(err)
+		}
+		bundleDir := filepath.Join(sharedRoot, "containers", id, "bundle")
+		if err := os.MkdirAll(bundleDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		repositories, err := json.Marshal([]specutils.TTCVolumeRepository{{
+			Source: specutils.TTCRootfsUpperSource, Path: "/elsewhere", Branch: ttcvolume.MainBranch,
+			CopyMode: string(ttcvolume.CopyModeFull), Private: true,
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := writeJSON(filepath.Join(bundleDir, "config.json"), &specs.Spec{Annotations: map[string]string{
+			specutils.AnnotationTTCVolumeRepositories: string(repositories),
+		}}); err != nil {
+			t.Fatal(err)
+		}
+		info := ContainerInfo{ID: id, Name: "c" + digit, BundleDir: bundleDir, Branches: []BranchInfo{{ID: "main"}}}
+		if err := writeCurrentContainerFixture(filepath.Join(sharedRoot, "containers", id, "container.json"), &info); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	want := func(listed ...ttcsnapshot.SnapshotID) {
+		t.Helper()
+		origins, err := store.FilesystemSnapshotOrigins()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(origins) != len(listed) {
+			t.Fatalf("origins %v, want %v", origins, listed)
+		}
+		for _, origin := range listed {
+			if _, ok := origins[origin]; !ok {
+				t.Fatalf("origins %v, want %v", origins, listed)
+			}
+		}
+	}
+	first := container("c", 51)
+	want(51)
+	// Neither the record nor the spec is read again, and the repositories
+	// are those of the node-local state, while it is there.
+	if err := os.WriteFile(filepath.Join(sharedRoot, "containers", first, "bundle", "config.json"), []byte("not a spec"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(sharedRoot, "containers", first, "container.json")); err != nil {
+		t.Fatal(err)
+	}
+	want(51)
+	// The repository map is read each time.
+	mapped := filepath.Join(localRoot, "containers", first, "restored")
+	repository, err := manager.CreatePrivateWithOrigin(mapped, "rootfs", 52)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(localRoot, "containers", first, "repository-map.json"), map[string]activeRepositoryMapping{
+		specutils.TTCRootfsUpperSource: {Path: mapped},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want(52)
+	// A container made since is read; one whose state is gone is not listed.
+	container("d", 53)
+	want(52, 53)
+	if err := os.RemoveAll(filepath.Join(localRoot, "containers", first)); err != nil {
+		t.Fatal(err)
+	}
+	want(53)
+}
+
 func TestFrozenFilesystemOriginsListsEveryRepositorysFreezes(t *testing.T) {
 	localRoot := t.TempDir()
 	manager, err := ttcvolume.OpenManager(localRoot)

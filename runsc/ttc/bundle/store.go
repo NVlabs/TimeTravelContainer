@@ -3600,96 +3600,90 @@ func (s Store) loadSpecOf(info ContainerInfo, name string) (*specs.Spec, error) 
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return nil, fmt.Errorf("checking node-local TTC internal mounts: %w", err)
 		}
-		repositories, err := specutils.TTCVolumeRepositories(&spec)
-		if err != nil {
-			return nil, err
-		}
-		changed := false
-		activeMappings := make(map[string]activeRepositoryMapping)
-		if mappingData, err := readFileWithStaleRetry(filepath.Join(s.activeContainerDir(info.ID), "repository-map.json")); err == nil {
-			if err := json.Unmarshal(mappingData, &activeMappings); err != nil {
-				return nil, fmt.Errorf("decoding active repository map: %w", err)
-			}
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return nil, err
-		}
-		for i := range repositories {
-			if mapping, ok := activeMappings[repositories[i].Source]; ok {
-				repositories[i].Path = mapping.Path
-				repositories[i].RestoreID = mapping.RestoreID
-				if mapping.CopyMode != "" {
-					repositories[i].CopyMode = mapping.CopyMode
-				}
-				changed = true
-				continue
-			}
-			// Canonical specs are shared by every node. Their repository paths
-			// may name the node that originally created the family and must
-			// never become authoritative merely because that path happens to be
-			// visible (for example two daemons running on one host, or a local
-			// scratch tree accidentally exported over NFS). Resolve every known
-			// TTC repository source into this node's active root.
-			switch {
-			case repositories[i].Source == specutils.TTCRootfsUpperSource:
-				repositories[i].Path = filepath.Join(s.activeContainerDir(info.ID), rootfsUpperRepositoryDir)
-			case strings.HasPrefix(repositories[i].Source, "/run/ttc/volumes/"):
-				repositories[i].Path = filepath.Join(s.activeRoot(), "filesystems", "volumes", filepath.Base(repositories[i].Source))
-			case repositories[i].Private:
-				repositories[i].Path = filepath.Join(s.activeContainerDir(info.ID), hostMountRepositoryDir, filepath.Base(repositories[i].Path))
-			default:
-				continue
-			}
-			changed = true
-		}
-		if changed {
-			encoded, err := json.Marshal(repositories)
-			if err != nil {
-				return nil, err
-			}
-			if spec.Annotations == nil {
-				spec.Annotations = make(map[string]string)
-			}
-			spec.Annotations[specutils.AnnotationTTCVolumeRepositories] = string(encoded)
-		}
 	}
-	// Restore aliases are one-shot resource keys and are recorded separately
-	// from the canonical OCI spec. Consult the map even in standalone mode so
-	// checkpoint restores can advance from a captured repository identity to
-	// the identity of the newly installed local repository.
-	if mappingData, err := readFileWithStaleRetry(filepath.Join(s.activeContainerDir(info.ID), "repository-map.json")); err == nil {
-		activeMappings := make(map[string]activeRepositoryMapping)
-		if err := json.Unmarshal(mappingData, &activeMappings); err != nil {
-			return nil, fmt.Errorf("decoding active repository map: %w", err)
-		}
-		repositories, err := specutils.TTCVolumeRepositories(&spec)
-		if err != nil {
-			return nil, err
-		}
-		changed := false
-		for i := range repositories {
-			if mapping, ok := activeMappings[repositories[i].Source]; ok {
-				repositories[i].Path = mapping.Path
-				repositories[i].RestoreID = mapping.RestoreID
-				if mapping.CopyMode != "" {
-					repositories[i].CopyMode = mapping.CopyMode
-				}
-				changed = true
-			}
-		}
-		if changed {
-			encoded, err := json.Marshal(repositories)
-			if err != nil {
-				return nil, err
-			}
-			if spec.Annotations == nil {
-				spec.Annotations = make(map[string]string)
-			}
-			spec.Annotations[specutils.AnnotationTTCVolumeRepositories] = string(encoded)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
+	mappings, err := s.activeRepositoryMappings(info.ID)
+	if err != nil {
 		return nil, err
 	}
+	if s.activeRoot() == s.Root && mappings == nil {
+		return &spec, nil
+	}
+	repositories, err := specutils.TTCVolumeRepositories(&spec)
+	if err != nil {
+		return nil, err
+	}
+	if s.activeRepositories(info.ID, repositories, mappings) {
+		encoded, err := json.Marshal(repositories)
+		if err != nil {
+			return nil, err
+		}
+		if spec.Annotations == nil {
+			spec.Annotations = make(map[string]string)
+		}
+		spec.Annotations[specutils.AnnotationTTCVolumeRepositories] = string(encoded)
+	}
 	return &spec, nil
+}
+
+// activeRepositoryMappings returns the repository map of the container with
+// the exact ID id on this node, nil if it has none. Restore aliases are
+// one-shot resource keys and are recorded separately from the canonical OCI
+// spec: the map lets a checkpoint's restore, on a standalone daemon too,
+// advance from a captured repository identity to that of the newly
+// installed local repository.
+func (s Store) activeRepositoryMappings(id string) (map[string]activeRepositoryMapping, error) {
+	data, err := readFileWithStaleRetry(filepath.Join(s.activeContainerDir(id), "repository-map.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	mappings := make(map[string]activeRepositoryMapping)
+	if err := json.Unmarshal(data, &mappings); err != nil {
+		return nil, fmt.Errorf("decoding active repository map: %w", err)
+	}
+	return mappings, nil
+}
+
+// activeRepositories makes repositories, those a spec of the container with
+// the exact ID id names, the repositories this node has: as its repository
+// map, mappings, installed them, or, on a cluster node, in its active root.
+// It reports whether it changed any.
+func (s Store) activeRepositories(id string, repositories []specutils.TTCVolumeRepository, mappings map[string]activeRepositoryMapping) bool {
+	changed := false
+	for i := range repositories {
+		if mapping, ok := mappings[repositories[i].Source]; ok {
+			repositories[i].Path = mapping.Path
+			repositories[i].RestoreID = mapping.RestoreID
+			if mapping.CopyMode != "" {
+				repositories[i].CopyMode = mapping.CopyMode
+			}
+			changed = true
+			continue
+		}
+		if s.activeRoot() == s.Root {
+			continue
+		}
+		// Canonical specs are shared by every node. Their repository paths
+		// may name the node that originally created the family and must
+		// never become authoritative merely because that path happens to be
+		// visible (for example two daemons running on one host, or a local
+		// scratch tree accidentally exported over NFS). Resolve every known
+		// TTC repository source into this node's active root.
+		switch {
+		case repositories[i].Source == specutils.TTCRootfsUpperSource:
+			repositories[i].Path = filepath.Join(s.activeContainerDir(id), rootfsUpperRepositoryDir)
+		case strings.HasPrefix(repositories[i].Source, "/run/ttc/volumes/"):
+			repositories[i].Path = filepath.Join(s.activeRoot(), "filesystems", "volumes", filepath.Base(repositories[i].Source))
+		case repositories[i].Private:
+			repositories[i].Path = filepath.Join(s.activeContainerDir(id), hostMountRepositoryDir, filepath.Base(repositories[i].Path))
+		default:
+			continue
+		}
+		changed = true
+	}
+	return changed
 }
 
 // rewriteImageRoot makes every path-bearing immutable-image annotation agree
@@ -5633,7 +5627,7 @@ func (s Store) FilesystemSnapshotOrigins() (map[ttcsnapshot.SnapshotID]struct{},
 	if err != nil {
 		return nil, err
 	}
-	paths, err := s.repositoryPaths(manager)
+	paths, err := s.originRepositoryPaths(manager)
 	if err != nil {
 		return nil, err
 	}
@@ -5811,6 +5805,111 @@ func (s Store) repositoryPaths(manager *ttcvolume.Manager) (map[string]struct{},
 	}
 	if err := s.addContainerRepositoryPaths(paths, containers); err != nil {
 		return nil, err
+	}
+	return paths, nil
+}
+
+// canonicalRepositories keeps, for each data root and container ID, the
+// repositories the container's canonical spec names, which are fixed when it
+// is made: a cluster node took an inventory of its repositories' snapshot
+// origins twice after each removal of a branch, and read each of its
+// families' records and specs from the shared root for it, 12 ms a family
+// on the simulated NFS mount.
+var canonicalRepositories sync.Map
+
+// originRepositoryPaths is repositoryPaths for an inventory of the snapshot
+// origins repositories hold, which reads the record and spec of a container
+// it has listed before no more: where the node-local state of a container
+// removed since is still there, it lists that container's repositories too,
+// whose origins are then live a while longer, until the state is reclaimed.
+func (s Store) originRepositoryPaths(manager *ttcvolume.Manager) (map[string]struct{}, error) {
+	paths := make(map[string]struct{})
+	volumes, err := manager.List()
+	if err != nil {
+		return nil, err
+	}
+	for _, volume := range volumes {
+		paths[filepath.Join(s.activeRoot(), "filesystems", "volumes", volume.ID)] = struct{}{}
+	}
+	entries, err := os.ReadDir(filepath.Join(s.activeRoot(), "containers"))
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("listing active container state: %w", err)
+	}
+	prefix := s.Root + "\x00" + s.activeRoot() + "\x00"
+	listed := make(map[string]struct{}, len(entries))
+	var unknown []fs.DirEntry
+	addRepositories := func(id string, canonical []specutils.TTCVolumeRepository) error {
+		mappings, err := s.activeRepositoryMappings(id)
+		if err != nil {
+			return err
+		}
+		repositories := slices.Clone(canonical)
+		s.activeRepositories(id, repositories, mappings)
+		for _, repository := range repositories {
+			paths[filepath.Clean(repository.Path)] = struct{}{}
+		}
+		return nil
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		listed[prefix+entry.Name()] = struct{}{}
+		if kept, ok := canonicalRepositories.Load(prefix + entry.Name()); ok {
+			if err := addRepositories(entry.Name(), kept.([]specutils.TTCVolumeRepository)); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		unknown = append(unknown, entry)
+	}
+	canonicalRepositories.Range(func(key, _ any) bool {
+		if name := key.(string); strings.HasPrefix(name, prefix) {
+			if _, ok := listed[name]; !ok {
+				canonicalRepositories.Delete(name)
+			}
+		}
+		return true
+	})
+	loaded := s.loadContainerKeys(unknown)
+	for i, entry := range unknown {
+		info, err := loaded[i].info, loaded[i].err
+		if err != nil {
+			containerDir := filepath.Join(s.Root, "containers", entry.Name())
+			if _, markerErr := os.Stat(filepath.Join(containerDir, containerCreationMarker)); markerErr == nil {
+				continue
+			}
+			if sharedPathGone(containerDir) {
+				continue
+			}
+			// Published since it was read: see ContainersWithActiveState.
+			if info, err = s.loadContainerKey(entry.Name()); err != nil {
+				return nil, err
+			}
+		}
+		data, err := readFileWithStaleRetry(filepath.Join(info.BundleDir, "config.json"))
+		if err != nil {
+			// Removed since it was listed: see addContainerRepositoryPaths.
+			if sharedPathGone(filepath.Join(s.Root, "containers", info.ID)) {
+				continue
+			}
+			if _, statErr := os.Lstat(s.activeContainerDir(info.ID)); errors.Is(statErr, fs.ErrNotExist) {
+				continue
+			}
+			return nil, fmt.Errorf("reading OCI config for container %q: %w", info.ID, err)
+		}
+		var spec specs.Spec
+		if err := json.Unmarshal(data, &spec); err != nil {
+			return nil, fmt.Errorf("decoding OCI config for container %q: %w", info.ID, err)
+		}
+		canonical, err := specutils.TTCVolumeRepositories(&spec)
+		if err != nil {
+			return nil, err
+		}
+		canonicalRepositories.Store(prefix+info.ID, canonical)
+		if err := addRepositories(info.ID, canonical); err != nil {
+			return nil, err
+		}
 	}
 	return paths, nil
 }
