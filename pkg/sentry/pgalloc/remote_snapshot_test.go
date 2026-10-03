@@ -156,6 +156,76 @@ func TestRemoteAllocatorMetadataWaitsForEvictableCache(t *testing.T) {
 	}
 }
 
+// An export takes waste pages as they are, rather than waiting for the
+// releaser to release them while other users may go on freeing pages; the
+// import releases them.
+func TestRemoteAllocatorMetadataExportsWaste(t *testing.T) {
+	source, fr := newRemoteTestMemoryFile(t, 1)
+	waste, err := source.Allocate(2*hostarch.PageSize, AllocOpts{
+		Kind: usage.Anonymous,
+		Mode: AllocateAndWritePopulate,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A releaser that never catches up with the users' frees.
+	source.mu.Lock()
+	source.holdReleaserLocked()
+	source.mu.Unlock()
+	source.DecRef(waste)
+
+	type export struct {
+		metadata []byte
+		err      error
+	}
+	done := make(chan export, 1)
+	go func() {
+		metadata, _, _, err := ExportMemoryFileMetadataForRemote(context.Background(), source)
+		done <- export{metadata, err}
+	}()
+	var metadata []byte
+	select {
+	case e := <-done:
+		if e.err != nil {
+			t.Fatal(e.err)
+		}
+		metadata = e.metadata
+	case <-time.After(5 * time.Second):
+		t.Fatal("remote export waited for the releaser to release waste")
+	}
+	source.mu.Lock()
+	source.unholdReleaserLocked()
+	source.mu.Unlock()
+
+	target := newEmptyRemoteTestMemoryFile(t)
+	defer target.Destroy()
+	if err := ImportMemoryFileMetadataForRemote(context.Background(), target, metadata); err != nil {
+		t.Fatal(err)
+	}
+	defer target.DecRef(fr)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		target.mu.Lock()
+		haveWaste := target.haveWaste
+		target.mu.Unlock()
+		if !haveWaste {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the imported waste was never released")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	target.mu.Lock()
+	defer target.mu.Unlock()
+	if target.unwasteSmall.FirstLargeEnoughGap(1).Ok() || target.unwasteHuge.FirstLargeEnoughGap(1).Ok() {
+		t.Fatal("waste remains after the target's releaser finished")
+	}
+	if seg := target.unfreeSmall.FindSegment(waste.Start); seg.Ok() && seg.ValuePtr().refs == 0 {
+		t.Fatalf("released waste %v is still unfree", waste)
+	}
+}
+
 func TestRemoteSnapshotPageRelease(t *testing.T) {
 	mf, fr := newRemoteTestMemoryFile(t, 4)
 	snapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 10, File: mf, Range: fr}})

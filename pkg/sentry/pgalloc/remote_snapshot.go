@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"runtime"
 	"slices"
 	"sort"
 	"sync"
@@ -490,27 +489,29 @@ func exportMemoryFileMetadataForRemote(ctx context.Context, source *MemoryFile, 
 	// sharing this family MemoryFile may register a new evictable range while
 	// an earlier eviction is completing. Observing an empty registry while
 	// holding source.mu closes that race with MarkEvictable.
-	for {
-		source.mu.Lock()
-		if source.haveWaste {
-			source.mu.Unlock()
-			if err := ctx.Err(); err != nil {
-				return nil, nil, nil, nil, err
-			}
-			runtime.Gosched()
-			continue
-		}
-		if len(source.evictable) == 0 {
-			break
-		}
+	//
+	// Waste pages are exported as waste, and the import releases them. The
+	// export waited for the releaser to release them all, while other Kernels
+	// sharing the file went on freeing pages: where releases are slow, as on
+	// KVM, whose VM unmaps each, the wait lasted seconds. Holding the releaser
+	// keeps it from leaving a range half released meanwhile.
+	source.mu.Lock()
+	source.holdReleaserLocked()
+	for len(source.evictable) != 0 {
 		source.startEvictionsLocked()
 		source.mu.Unlock()
 		source.WaitForEvictions()
+		source.mu.Lock()
 		if err := ctx.Err(); err != nil {
+			source.unholdReleaserLocked()
+			source.mu.Unlock()
 			return nil, nil, nil, nil, err
 		}
 	}
-	defer source.mu.Unlock()
+	defer func() {
+		source.unholdReleaserLocked()
+		source.mu.Unlock()
+	}()
 	collectUsed := func(set *unfreeSet) {
 		for seg := set.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
 			if seg.ValuePtr().refs != 0 {
@@ -721,6 +722,12 @@ func ImportMemoryFileMetadataForRemote(ctx context.Context, target *MemoryFile, 
 	target.memAcct.MoveFrom(saved.memAcct)
 	target.knownCommittedBytes = knownCommitted
 	target.chunks.Store(&chunks)
+	// The source's waste pages, which the export took as they were, are waste
+	// here too, for the releaser to release.
+	if target.unwasteSmall.FirstLargeEnoughGap(1).Ok() || target.unwasteHuge.FirstLargeEnoughGap(1).Ok() {
+		target.haveWaste = true
+		target.releaseCond.Signal()
+	}
 	target.mu.Unlock()
 	if !target.opts.DisableMemoryAccounting {
 		for seg := target.memAcct.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {

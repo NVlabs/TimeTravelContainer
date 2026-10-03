@@ -131,8 +131,24 @@ type MemoryFile struct {
 	haveWaste bool
 
 	// releaseCond is signaled (with mu locked) when haveWaste or destroyed
-	// transitions from false to true.
+	// transitions from false to true, or releaserHolds to zero.
 	releaseCond sync.Cond
+
+	// releasing is true while the releaser releases a range, with mu unlocked:
+	// the range is out of the waste sets, and still in the unfree sets.
+	//
+	// releasing is protected by mu.
+	releasing bool
+
+	// releaserHolds is the number of holdReleaserLocked calls that keep the
+	// releaser from starting a release.
+	//
+	// releaserHolds is protected by mu.
+	releaserHolds int
+
+	// releaserIdle is broadcast (with mu locked) when releasing becomes false,
+	// or destroyed true.
+	releaserIdle sync.Cond
 
 	// unfreeSmall and unfreeHuge track information for non-free ranges backed
 	// by small/huge pages respectively. Each unfreeSet also contains segments
@@ -226,8 +242,9 @@ type MemoryFile struct {
 	opts MemoryFileOpts
 
 	// savable is true if this MemoryFile will be saved via SaveTo() during
-	// the kernel's SaveTo operation. savable is protected by mu.
-	savable bool
+	// the kernel's SaveTo operation. It is set once, and read without mu by
+	// every pma that a save of an address space encodes.
+	savable atomic.Bool
 
 	// destroyed is set by Destroy to instruct the releaser goroutine to
 	// release all MemoryFile resources and exit. destroyed is protected by mu.
@@ -833,6 +850,7 @@ func (f *MemoryFile) initFields() {
 	f.unwasteSmall.InsertRange(fullFR, unwasteInfo{})
 	f.unwasteHuge.InsertRange(fullFR, unwasteInfo{})
 	f.releaseCond.L = &f.mu
+	f.releaserIdle.L = &f.mu
 	f.unfreeSmall.InsertRange(fullFR, unfreeInfo{})
 	f.unfreeHuge.InsertRange(fullFR, unfreeInfo{})
 	f.subreleased = make(map[uint64]uint64)
@@ -914,6 +932,7 @@ func (f *MemoryFile) Destroy() {
 	}
 	f.destroyed = true
 	f.releaseCond.Signal()
+	f.releaserIdle.Broadcast()
 }
 
 // Preconditions: f.mu must be locked.
@@ -1759,9 +1778,10 @@ MainLoop:
 				return
 			}
 			if f.haveWaste {
-				break
-			}
-			if f.opts.DelayedEviction == DelayedEvictionEnabled && !f.opts.UseHostMemcgPressure {
+				if f.releaserHolds == 0 {
+					break
+				}
+			} else if f.opts.DelayedEviction == DelayedEvictionEnabled && !f.opts.UseHostMemcgPressure {
 				// No work to do. Evict any pending evictable allocations to
 				// get more waste pages before going to sleep.
 				f.startEvictionsLocked()
@@ -1785,11 +1805,37 @@ MainLoop:
 					fr.Start = fr.End - maxReleasingBytes
 				}
 				unwaste.Insert(uwgap, fr, unwasteInfo{})
+				f.releasing = true
 				f.releaseLocked(fr, i == 1)
+				f.releasing = false
+				f.releaserIdle.Broadcast()
 				continue MainLoop
 			}
 		}
 		f.haveWaste = false
+	}
+}
+
+// holdReleaserLocked keeps the releaser from starting a release until
+// unholdReleaserLocked, and waits for a release in progress to end: while the
+// caller holds f.mu, every waste page is then in the waste sets, however many
+// pages users go on freeing.
+//
+// Preconditions: f.mu must be locked; it may be unlocked and reacquired.
+func (f *MemoryFile) holdReleaserLocked() {
+	f.releaserHolds++
+	for f.releasing && !f.destroyed {
+		f.releaserIdle.Wait()
+	}
+}
+
+// unholdReleaserLocked undoes holdReleaserLocked.
+//
+// Preconditions: f.mu must be locked.
+func (f *MemoryFile) unholdReleaserLocked() {
+	f.releaserHolds--
+	if f.releaserHolds == 0 && f.haveWaste {
+		f.releaseCond.Signal()
 	}
 }
 
