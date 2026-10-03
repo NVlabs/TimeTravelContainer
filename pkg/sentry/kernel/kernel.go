@@ -1031,30 +1031,27 @@ func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata
 
 // Preconditions: The kernel must be paused.
 func (k *Kernel) invalidateUnsavableMappings(ctx context.Context) error {
-	invalidated := make(map[*mm.MemoryManager]struct{})
+	// Each Mappable any task maps, once: see mm.AddUnsavableMappables.
+	listed := make(map[*mm.MemoryManager]struct{})
+	mappables := make(mm.UnsavableMappables)
 	k.tasks.mu.RLock()
-	defer k.tasks.mu.RUnlock()
-	if k.tasks.Root == nil {
-		return nil
-	}
-	for t := range k.tasks.Root.tids {
-		// We can skip locking Task.mu here since the kernel is paused.
-		if memMgr := t.image.MemoryManager; memMgr != nil {
-			if _, ok := invalidated[memMgr]; !ok {
-				if err := memMgr.InvalidateUnsavable(ctx); err != nil {
-					return err
+	if k.tasks.Root != nil {
+		for t := range k.tasks.Root.tids {
+			// We can skip locking Task.mu here since the kernel is paused.
+			if memMgr := t.image.MemoryManager; memMgr != nil {
+				if _, ok := listed[memMgr]; !ok {
+					memMgr.AddUnsavableMappables(mappables)
+					listed[memMgr] = struct{}{}
 				}
-				invalidated[memMgr] = struct{}{}
 			}
-		}
-		// I really wish we just had a sync.Map of all MMs...
-		if r, ok := t.runState.(*runExecveAfterSiblingExitStop); ok {
-			if err := r.image.MemoryManager.InvalidateUnsavable(ctx); err != nil {
-				return err
+			// I really wish we just had a sync.Map of all MMs...
+			if r, ok := t.runState.(*runExecveAfterSiblingExitStop); ok {
+				r.image.MemoryManager.AddUnsavableMappables(mappables)
 			}
 		}
 	}
-	return nil
+	k.tasks.mu.RUnlock()
+	return mappables.Invalidate(ctx)
 }
 
 // DropInternalMappingsForCompaction drains task activity and discards every

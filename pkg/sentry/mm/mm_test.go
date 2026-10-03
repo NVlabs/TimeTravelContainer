@@ -150,6 +150,64 @@ func TestCaptureMemoryFileRangesIncludesUnfaultedAliasedMappableOwnerOnce(t *tes
 	}
 }
 
+// countingMappable counts the calls of its InvalidateUnsavable.
+type countingMappable struct {
+	*SpecialMappable
+	invalidated int
+}
+
+// InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.
+func (m *countingMappable) InvalidateUnsavable(ctx context.Context) error {
+	m.invalidated++
+	return m.SpecialMappable.InvalidateUnsavable(ctx)
+}
+
+func TestUnsavableMappablesInvalidatesEachMappableOnce(t *testing.T) {
+	ctx := contexttest.Context(t)
+	first := testMemoryManager(ctx, t)
+	defer first.DecUsers(ctx)
+	second := testMemoryManager(ctx, t)
+	defer second.DecUsers(ctx)
+	mappable := func(name string) *countingMappable {
+		fr, err := first.mf.Allocate(hostarch.PageSize, pgalloc.AllocOpts{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &countingMappable{SpecialMappable: NewSpecialMappable(name, first.mf, fr)}
+	}
+	shared, own := mappable("[shared]"), mappable("[own]")
+	defer shared.DecRef(ctx)
+	defer own.DecRef(ctx)
+	mapIn := func(memMgr *MemoryManager, m *countingMappable, times int) {
+		for i := 0; i < times; i++ {
+			if _, err := memMgr.MMap(ctx, memmap.MMapOpts{
+				Length: hostarch.PageSize, MappingIdentity: m.SpecialMappable, Mappable: m,
+				Perms: hostarch.Read, MaxPerms: hostarch.Read,
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// The shared mappable is mapped three times in one and twice in the
+	// other, as a binary is by each process that runs it.
+	mapIn(first, shared, 3)
+	mapIn(second, shared, 2)
+	mapIn(second, own, 1)
+	refs := shared.ReadRefs()
+	mappables := make(UnsavableMappables)
+	first.AddUnsavableMappables(mappables)
+	second.AddUnsavableMappables(mappables)
+	if err := mappables.Invalidate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if shared.invalidated != 1 || own.invalidated != 1 {
+		t.Errorf("invalidated the shared mappable %d times and the other %d, want once each", shared.invalidated, own.invalidated)
+	}
+	if got := shared.ReadRefs(); got != refs {
+		t.Errorf("the shared mappable has %d references after the invalidation, against %d before", got, refs)
+	}
+}
+
 func TestInvalidateMappingsForReboundSpecialMappable(t *testing.T) {
 	ctx := contexttest.Context(t)
 	memMgr := testMemoryManager(ctx, t)

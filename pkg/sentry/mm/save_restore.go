@@ -82,16 +82,52 @@ func (mm *MemoryManager) ValidateLiveForkMappings() []LiveForkMappingIssue {
 // InvalidateUnsavable invokes memmap.Mappable.InvalidateUnsavable on all
 // Mappables mapped by mm.
 func (mm *MemoryManager) InvalidateUnsavable(ctx context.Context) error {
+	mappables := make(UnsavableMappables)
+	mm.AddUnsavableMappables(mappables)
+	return mappables.Invalidate(ctx)
+}
+
+// UnsavableMappables is a set of Mappables whose unsavable translations are
+// to be invalidated, each with a reference on an identity that keeps it.
+type UnsavableMappables map[memmap.Mappable]memmap.MappingIdentity
+
+// AddUnsavableMappables adds the Mappables mm maps to mappables. A Mappable's
+// InvalidateUnsavable invalidates its translations in every MemoryManager,
+// so a file that every process maps, such as a shell's binary, is
+// invalidated once, not once for each of its mappings in each process: a
+// live fork of a branch was quadratic in its processes.
+func (mm *MemoryManager) AddUnsavableMappables(mappables UnsavableMappables) {
 	mm.mappingMu.RLock()
 	defer mm.mappingMu.RUnlock()
 	for vseg := mm.vmas.FirstSegment(); vseg.Ok(); vseg = vseg.NextSegment() {
-		if vma := vseg.ValuePtr(); vma.mappable != nil {
-			if err := vma.mappable.InvalidateUnsavable(ctx); err != nil {
-				return err
-			}
+		vma := vseg.ValuePtr()
+		if vma.mappable == nil {
+			continue
 		}
+		if _, ok := mappables[vma.mappable]; ok {
+			continue
+		}
+		if vma.id != nil {
+			vma.id.IncRef()
+		}
+		mappables[vma.mappable] = vma.id
 	}
-	return nil
+}
+
+// Invalidate invokes memmap.Mappable.InvalidateUnsavable on each of
+// mappables, and drops the references mappables holds.
+func (mappables UnsavableMappables) Invalidate(ctx context.Context) error {
+	var err error
+	for mappable, id := range mappables {
+		if err == nil {
+			err = mappable.InvalidateUnsavable(ctx)
+		}
+		if id != nil {
+			id.DecRef(ctx)
+		}
+		delete(mappables, mappable)
+	}
+	return err
 }
 
 // afterLoad is invoked by stateify.
