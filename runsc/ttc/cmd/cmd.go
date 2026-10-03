@@ -548,9 +548,9 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 	case "rename":
 		err = runRename(args[1:], stdout, backend)
 	case "pause":
-		err = runPauseResume(args[1:], stdout, backend, true)
+		err = runPauseResume(args[1:], stdout, stderr, backend, true)
 	case "resume", "unpause":
-		err = runPauseResume(args[1:], stdout, backend, false)
+		err = runPauseResume(args[1:], stdout, stderr, backend, false)
 	case "quarantine":
 		err = runQuarantine(args[1:], stdout, backend, true)
 	case "unquarantine":
@@ -800,9 +800,9 @@ func runContainerNamespace(args []string, stdout, stderr io.Writer, backend back
 	case "top":
 		return runTop(args[1:], stdout, stderr, backend)
 	case "pause":
-		return runPauseResume(args[1:], stdout, backend, true)
+		return runPauseResume(args[1:], stdout, stderr, backend, true)
 	case "unpause":
-		return runPauseResume(args[1:], stdout, backend, false)
+		return runPauseResume(args[1:], stdout, stderr, backend, false)
 	case "kill":
 		return runKill(args[1:], stdout, stderr, backend)
 	case "stop":
@@ -1867,6 +1867,32 @@ type exitStatus struct{ code int }
 
 func (e exitStatus) Error() string { return fmt.Sprintf("container exited with status %d", e.code) }
 
+// eachTarget runs op on each of targets in turn, as docker's commands of
+// several containers do: one that fails does not keep the rest from being
+// tried. It writes each failure but the last to stderr as it happens and
+// returns the last, so that the command fails once all are tried.
+func eachTarget(targets []string, stderr io.Writer, op func(string) error) error {
+	var last error
+	for _, target := range targets {
+		if err := op(target); err != nil {
+			if last != nil {
+				reportTargetError(stderr, last)
+			}
+			last = err
+		}
+	}
+	return last
+}
+
+// reportTargetError writes err to stderr as runCommand would, a failure of one
+// of several targets that is not the command's error.
+func reportTargetError(stderr io.Writer, err error) {
+	var status exitStatus
+	if !errors.As(err, &status) {
+		fmt.Fprintf(stderr, "ttc: %v\n", err)
+	}
+}
+
 func flagWasSet(fs *flag.FlagSet, name string) bool {
 	set := false
 	fs.Visit(func(f *flag.Flag) {
@@ -2459,7 +2485,7 @@ func runStart(args []string, stdout, stderr io.Writer, backend backend) error {
 	if *attach && fs.NArg() != 1 {
 		return errors.New("--attach supports exactly one container")
 	}
-	for _, value := range fs.Args() {
+	return eachTarget(fs.Args(), stderr, func(value string) error {
 		target, err := parseSelectorOrMain(value)
 		if err != nil {
 			return fmt.Errorf("invalid target %q: %w", value, err)
@@ -2476,8 +2502,8 @@ func runStart(args []string, stdout, stderr io.Writer, backend backend) error {
 			// operand while retaining the explicit branch for TTC callers.
 			fmt.Fprintln(stdout, value)
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 func parseDetachKeys(value string) ([]byte, error) {
@@ -3248,7 +3274,7 @@ func runRemove(args []string, stdout, stderr io.Writer, backend backend) error {
 	}
 	// removeAll removes the targets, but for those removed already.
 	removeAll := func(removed map[selector]bool) error {
-		for _, value := range fs.Args() {
+		return eachTarget(fs.Args(), stderr, func(value string) error {
 			if strings.Contains(value, "@") {
 				if *volumes {
 					return fmt.Errorf("--volumes applies only when removing a whole container family, not %q", value)
@@ -3263,14 +3289,14 @@ func runRemove(args []string, stdout, stderr io.Writer, backend backend) error {
 					}
 				}
 				fmt.Fprintln(stdout, target)
-				continue
+				return nil
 			}
 			if err := backend.remove(value, *force, *volumes); err != nil {
 				return err
 			}
 			fmt.Fprintln(stdout, value)
-		}
-		return nil
+			return nil
+		})
 	}
 	if runtime, ok := backend.(*runtimeBackend); ok && fs.NArg() > 1 {
 		return runtime.removingBranches(func() error {
@@ -3674,7 +3700,7 @@ func runImageRemove(args []string, stdout, stderr io.Writer, backend backend) er
 	if fs.NArg() == 0 {
 		return errors.New("usage: ttc image rm [--force] IMAGE [IMAGE...]")
 	}
-	for _, identifier := range fs.Args() {
+	return eachTarget(fs.Args(), stderr, func(identifier string) error {
 		result, err := backend.removeImage(identifier, *force)
 		if err != nil {
 			return err
@@ -3685,8 +3711,8 @@ func runImageRemove(args []string, stdout, stderr io.Writer, backend backend) er
 		if result.Deleted != "" {
 			fmt.Fprintf(stdout, "Deleted: %s\n", result.Deleted)
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 func displayImageID(digest string, noTrunc bool) string {
@@ -4774,14 +4800,14 @@ func branchOperationTargets(value string, backend backend, allowFamily bool) ([]
 	return targets, nil
 }
 
-func runPauseResume(args []string, stdout io.Writer, backend backend, pause bool) error {
+func runPauseResume(args []string, stdout, stderr io.Writer, backend backend, pause bool) error {
 	if len(args) == 0 {
 		if pause {
 			return errors.New("usage: ttc pause TARGET [TARGET...]")
 		}
 		return errors.New("usage: ttc resume TARGET [TARGET...]")
 	}
-	for _, arg := range args {
+	return eachTarget(args, stderr, func(arg string) error {
 		if !strings.Contains(arg, "@") {
 			// A family pauses its running branches and resumes its paused
 			// ones, and leaves the rest as they are.
@@ -4803,7 +4829,7 @@ func runPauseResume(args []string, stdout io.Writer, backend backend, pause bool
 				}
 			}
 			fmt.Fprintln(stdout, arg)
-			continue
+			return nil
 		}
 		target, err := parseSelector(arg)
 		if err != nil {
@@ -4818,8 +4844,8 @@ func runPauseResume(args []string, stdout io.Writer, backend backend, pause bool
 			return fmt.Errorf("updating %s: %w", target, err)
 		}
 		fmt.Fprintln(stdout, target)
-	}
-	return nil
+		return nil
+	})
 }
 
 func runQuarantine(args []string, stdout io.Writer, backend backend, enabled bool) error {
@@ -4927,7 +4953,7 @@ func runKill(args []string, stdout, stderr io.Writer, backend backend) error {
 	if err != nil {
 		return err
 	}
-	for _, arg := range targets {
+	return eachTarget(targets, stderr, func(arg string) error {
 		target, err := parseSelector(arg)
 		if err != nil {
 			return fmt.Errorf("invalid target %q: %w", arg, err)
@@ -4936,8 +4962,8 @@ func runKill(args []string, stdout, stderr io.Writer, backend backend) error {
 			return fmt.Errorf("signaling %s: %w", target, err)
 		}
 		fmt.Fprintln(stdout, target)
-	}
-	return nil
+		return nil
+	})
 }
 
 func runStop(args []string, stdout, stderr io.Writer, backend backend) error {
@@ -4959,8 +4985,8 @@ func runStop(args []string, stdout, stderr io.Writer, backend backend) error {
 	}
 	// Every target is resolved first: the running branches of all are sent
 	// their stop signals before any is waited for, as docker stop's
-	// containers stop together. A branch named twice is stopped once. The
-	// targets named before one that cannot be stopped are stopped still.
+	// containers stop together. A branch named twice is stopped once. A
+	// target that cannot be stopped does not keep the others from stopping.
 	var groups []stopGroup
 	named := make(map[selector]bool)
 	resolve := func(value string) (stopGroup, error) {
@@ -4991,16 +5017,18 @@ func runStop(args []string, stdout, stderr io.Writer, backend backend) error {
 		}
 		return group, nil
 	}
-	var resolveErr error
-	for _, value := range fs.Args() {
+	resolveErr := eachTarget(fs.Args(), stderr, func(value string) error {
 		group, err := resolve(value)
 		if err != nil {
-			resolveErr = err
-			break
+			return err
 		}
 		groups = append(groups, group)
-	}
+		return nil
+	})
 	if err := stopGroupsLifecycle(groups, backend); err != nil {
+		if resolveErr != nil {
+			reportTargetError(stderr, resolveErr)
+		}
 		return err
 	}
 	return resolveErr
@@ -5395,7 +5423,7 @@ func runRestart(args []string, stdout, stderr io.Writer, backend backend) error 
 	if timeoutSet && timeout < -1 {
 		return errors.New("restart timeout must be -1 or greater")
 	}
-	for _, value := range fs.Args() {
+	return eachTarget(fs.Args(), stderr, func(value string) error {
 		selected, err := parseSelectorOrMain(value)
 		if err != nil {
 			return fmt.Errorf("invalid target %q: %w", value, err)
@@ -5440,8 +5468,8 @@ func runRestart(args []string, stdout, stderr io.Writer, backend backend) error 
 			return exitStatus{code: status}
 		}
 		fmt.Fprintln(stdout, value)
-	}
-	return nil
+		return nil
+	})
 }
 
 type waitResult struct {

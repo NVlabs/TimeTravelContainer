@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -1488,6 +1489,82 @@ func TestRemoveAcceptsFamiliesAndQualifiedBranches(t *testing.T) {
 	}
 	if !b.removeForce || !b.removeVolumes {
 		t.Errorf("rm -fv parsed force=%t volumes=%t", b.removeForce, b.removeVolumes)
+	}
+}
+
+// missingTargetsBackend is a fakeBackend without the containers in missing.
+type missingTargetsBackend struct {
+	*fakeBackend
+	missing  map[string]bool
+	removed  []string
+	signaled []string
+}
+
+func (b *missingTargetsBackend) remove(name string, force, volumes bool) error {
+	if b.missing[name] {
+		return fmt.Errorf("container %q does not exist: %w", name, os.ErrNotExist)
+	}
+	b.removed = append(b.removed, name)
+	return nil
+}
+
+func (b *missingTargetsBackend) destroy(target selector, force bool) error {
+	if b.missing[target.container] {
+		return fmt.Errorf("container %q does not exist: %w", target.container, os.ErrNotExist)
+	}
+	b.removed = append(b.removed, target.String())
+	return nil
+}
+
+func (b *missingTargetsBackend) signal(target selector, signal int, all bool) error {
+	if b.missing[target.container] {
+		return fmt.Errorf("container %q does not exist: %w", target.container, os.ErrNotExist)
+	}
+	b.signaled = append(b.signaled, target.String())
+	return nil
+}
+
+// As docker's do, a command of several targets tries every one: a target that
+// does not exist neither keeps the others from being acted on nor goes
+// unreported, and the command fails.
+func TestCommandsOfSeveralTargetsTryEveryTarget(t *testing.T) {
+	for _, test := range []struct {
+		args []string
+		done func(*missingTargetsBackend) []string
+		want []string
+	}{
+		{
+			args: []string{"rm", "-f", "gone", "b1", "lost", "b2"},
+			done: func(b *missingTargetsBackend) []string { return b.removed },
+			want: []string{"b1", "b2"},
+		},
+		{
+			args: []string{"rm", "gone@main", "b1@main", "lost@child", "b2@child"},
+			done: func(b *missingTargetsBackend) []string { return b.removed },
+			want: []string{"b1@main", "b2@child"},
+		},
+		{
+			args: []string{"kill", "gone@main", "b1@main", "lost@main", "b2@main"},
+			done: func(b *missingTargetsBackend) []string { return b.signaled },
+			want: []string{"b1@main", "b2@main"},
+		},
+	} {
+		b := &missingTargetsBackend{fakeBackend: &fakeBackend{}, missing: map[string]bool{"gone": true, "lost": true}}
+		var stdout, stderr bytes.Buffer
+		if status := runCommand(test.args, &stdout, &stderr, b); status != 1 {
+			t.Errorf("%q: status=%d, want 1", test.args, status)
+		}
+		if got := test.done(b); !slices.Equal(got, test.want) {
+			t.Errorf("%q: acted on %q, want %q", test.args, got, test.want)
+		}
+		if got, want := stdout.String(), strings.Join(test.want, "\n")+"\n"; got != want {
+			t.Errorf("%q: stdout=%q, want %q", test.args, got, want)
+		}
+		for _, name := range []string{"gone", "lost"} {
+			if want := fmt.Sprintf("container %q does not exist", name); strings.Count(stderr.String(), want) != 1 {
+				t.Errorf("%q: stderr=%q, want one %s", test.args, stderr.String(), want)
+			}
+		}
 	}
 }
 

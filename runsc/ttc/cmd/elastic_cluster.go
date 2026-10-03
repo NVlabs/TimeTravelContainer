@@ -2811,6 +2811,11 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 	// abortedByBranch has, by family and branch, the migrations canceled
 	// once that branch is removed.
 	abortedByBranch := make(map[string][]string)
+	// As a standalone daemon's command of several targets does (eachTarget),
+	// a family or branch that does not exist is reported, and the others are
+	// mutated still.
+	var missing []error
+	present := make([]string, 0, len(mutation.targets))
 	for _, operand := range mutation.targets {
 		name := operand
 		branchID := ""
@@ -2828,9 +2833,14 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 		} else {
 			info, err = loadDistributedFamily(store, s.clusterPlacements, name)
 		}
+		if errors.Is(err, os.ErrNotExist) {
+			missing = append(missing, err)
+			continue
+		}
 		if err != nil {
 			return true, 1, nil, nil, err
 		}
+		present = append(present, operand)
 		settle := distributedMutationSourceTransactions(transactions, info, branchID, retiredNodes)
 		cancel := map[string]map[string]struct{}{}
 		discard := map[string]map[string]struct{}{}
@@ -3002,7 +3012,8 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 		queuedLocalCleanup[familyID] = struct{}{}
 		return nil
 	}
-	for _, operand := range mutation.targets {
+	mutated := make([]string, 0, len(present))
+	for _, operand := range present {
 		if strings.Contains(operand, "@") {
 			selected, err := parseSelector(operand)
 			if err != nil {
@@ -3013,9 +3024,14 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 				return true, 1, nil, nil, err
 			}
 			placement, placementErr := s.clusterPlacements.Lookup(info.ID, selected.branch)
+			if errors.Is(placementErr, os.ErrNotExist) {
+				missing = append(missing, fmt.Errorf("branch %s does not exist: %w", selected, placementErr))
+				continue
+			}
 			if placementErr != nil {
 				return true, 1, nil, nil, fmt.Errorf("resolving family mutation placement for %s: %w", selected, placementErr)
 			}
+			mutated = append(mutated, operand)
 			node := placement.OwnerNode
 			if node == "" {
 				node = s.clusterCapabilities.NodeID
@@ -3054,6 +3070,7 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 		if err != nil {
 			return true, 1, nil, nil, err
 		}
+		mutated = append(mutated, operand)
 		placements, err := logicalFamilyPlacements(s.clusterPlacements, info.ID)
 		if err != nil {
 			return true, 1, nil, nil, fmt.Errorf("listing logical branches for %q: %w", operand, err)
@@ -3199,8 +3216,15 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 		}
 	}
 	var output strings.Builder
-	for _, operand := range mutation.targets {
+	for _, operand := range mutated {
 		fmt.Fprintln(&output, operand)
+	}
+	if len(missing) != 0 {
+		var reported bytes.Buffer
+		for _, err := range missing {
+			fmt.Fprintf(&reported, "ttc: %v\n", err)
+		}
+		return true, 1, []byte(output.String()), append(reported.Bytes(), diagnostic.Bytes()...), nil
 	}
 	return true, 0, []byte(output.String()), diagnostic.Bytes(), nil
 }

@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -2419,6 +2420,37 @@ func TestLifecycleCommandOperandsSkipsOptions(t *testing.T) {
 
 // A family's removal merges the removals of branches on one node that share
 // their flags into one command.
+// In a cluster as on a standalone daemon, a removal of several targets
+// reports each that does not exist, and removes the others still: here, none
+// exists, and the removal fails having removed nothing.
+func TestDistributedFamilyMutationReportsMissingTargets(t *testing.T) {
+	root := t.TempDir()
+	placements, err := cluster.OpenPlacementStore(filepath.Join(root, "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transactions, err := cluster.OpenStore(filepath.Join(root, "transactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &daemonServer{
+		dataRoot: root, clusterPlacements: placements, clusterStore: transactions,
+		clusterCapabilities: &cluster.Capabilities{NodeID: "node-a"},
+	}
+	handled, status, stdout, stderr, err := server.executeDistributedFamilyMutation(daemonRequest{Args: []string{"rm", "-f", "gone", "lost@main"}})
+	if err != nil || !handled || status != 1 {
+		t.Fatalf("handled=%t status=%d err=%v, want a handled failure", handled, status, err)
+	}
+	if len(stdout) != 0 {
+		t.Errorf("stdout=%q, want nothing removed", stdout)
+	}
+	for _, name := range []string{"gone", "lost"} {
+		if want := fmt.Sprintf("container %q does not exist", name); strings.Count(string(stderr), want) != 1 {
+			t.Errorf("stderr=%q, want one %s", stderr, want)
+		}
+	}
+}
+
 func TestBranchRemovalParts(t *testing.T) {
 	for _, test := range []struct {
 		args           []string
