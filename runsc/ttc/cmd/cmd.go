@@ -402,6 +402,8 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runStats(args[1:], stdout, stderr, backend)
 	case "_stats-local":
 		err = runStats(args[1:], stdout, stderr, backend)
+	case "_processes-local":
+		err = runProcessesLocal(args[1:], stdout, backend)
 	case "inspect":
 		err = runInspect(args[1:], stdout, stderr, backend)
 	case "rm":
@@ -10480,6 +10482,9 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 			}
 		}
 	}
+	// The running branches of other nodes, by node.
+	var remoteNodes []string
+	remoteBranches := make(map[string][]int)
 	for i := range result.TTC.Branches {
 		branch := &result.TTC.Branches[i]
 		// A standalone daemon's branches run in the family's own runtime,
@@ -10509,8 +10514,15 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 			continue
 		}
 		if resolveErr != nil {
-			// Another node's, say.
 			branch.ProcessError = resolveErr.Error()
+			// Its node lists them below.
+			var remote *remoteBranchOwnershipError
+			if errors.As(resolveErr, &remote) {
+				if _, ok := remoteBranches[remote.owner]; !ok {
+					remoteNodes = append(remoteNodes, remote.owner)
+				}
+				remoteBranches[remote.owner] = append(remoteBranches[remote.owner], i)
+			}
 			continue
 		}
 		processes, err := b.processesOf(physical)
@@ -10520,7 +10532,123 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 		}
 		branch.Processes = processes
 	}
+	b.listRemoteProcesses(containerInfo.ID, result.TTC.Branches, remoteNodes, remoteBranches)
 	return result, nil
+}
+
+// remoteProcessesTimeout bounds how long inspect waits for another node to
+// list the processes of its branches.
+const remoteProcessesTimeout = 10 * time.Second
+
+// branchProcesses is the processes of a branch, or why they could not be
+// listed.
+type branchProcesses struct {
+	Processes []ProcessInfo `json:"processes,omitempty"`
+	Error     string        `json:"error,omitempty"`
+}
+
+// listRemoteProcesses lists the processes of the branches of family, of
+// branches, that run on other nodes: each node of nodes, at once, lists those
+// of its branches, whose indexes byNode has. A branch whose node does not list
+// them keeps its process error, and says why.
+func (b *runtimeBackend) listRemoteProcesses(family string, branches []InspectBranch, nodes []string, byNode map[string][]int) {
+	if len(nodes) == 0 || b.distributedSource == nil {
+		return
+	}
+	forEachConcurrently(len(nodes), len(nodes), func(n int) {
+		node, indexes := nodes[n], byNode[nodes[n]]
+		listed, err := b.remoteProcesses(node, family, branches, indexes)
+		for _, i := range indexes {
+			branch := &branches[i]
+			switch entry, ok := listed[branch.Metadata.ID]; {
+			case err != nil:
+				branch.ProcessError = fmt.Sprintf("%s; listing them there: %v", branch.ProcessError, err)
+			case !ok:
+			case entry.Error != "":
+				branch.ProcessError = entry.Error
+			default:
+				branch.Processes, branch.ProcessError = entry.Processes, ""
+			}
+		}
+	})
+}
+
+// remoteProcesses asks node for the processes of family's branches, of
+// branches, that indexes names.
+func (b *runtimeBackend) remoteProcesses(node, family string, branches []InspectBranch, indexes []int) (map[string]branchProcesses, error) {
+	peer, err := b.distributedSource.peer(node, false)
+	if err != nil {
+		return nil, err
+	}
+	args := []string{"_processes-local", family}
+	for _, i := range indexes {
+		args = append(args, branches[i].Metadata.ID)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), remoteProcessesTimeout)
+	defer cancel()
+	status, stdout, stderr, err := executeRemoteDaemonRequest(ctx, peer, daemonRequest{
+		Version: daemonAPIVersion, Action: "command", Args: args, DistributedLeaf: true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if status != 0 {
+		return nil, fmt.Errorf("status %d: %s", status, strings.TrimSpace(stderr))
+	}
+	var listed map[string]branchProcesses
+	if err := json.Unmarshal([]byte(stdout), &listed); err != nil {
+		return nil, fmt.Errorf("decoding the processes listed: %w", err)
+	}
+	return listed, nil
+}
+
+// runProcessesLocal lists, as JSON, the processes of branches of a family that
+// run on this node, for a node that inspects the family: each branch's, or why
+// they could not be listed.
+func runProcessesLocal(args []string, stdout io.Writer, backend backend) error {
+	if len(args) < 2 {
+		return errors.New("usage: ttc _processes-local CONTAINER BRANCH...")
+	}
+	lister, ok := backend.(interface {
+		processesOfBranches(container string, branches []string) map[string]branchProcesses
+	})
+	if !ok {
+		return errors.New("this backend does not list processes for another node")
+	}
+	return json.NewEncoder(stdout).Encode(lister.processesOfBranches(args[0], args[1:]))
+}
+
+// processesOfBranches is processes of each of container's branches, which it
+// resolves in one read of the family's record and, on a cluster node, of its
+// placements and branch authorities.
+func (b *runtimeBackend) processesOfBranches(container string, branches []string) map[string]branchProcesses {
+	listed := make(map[string]branchProcesses, len(branches))
+	info, err := b.resolveContainer(container)
+	if err != nil {
+		for _, branch := range branches {
+			listed[branch] = branchProcesses{Error: err.Error()}
+		}
+		return listed
+	}
+	var authority *cluster.AuthorityState
+	if b.nodeID != "" && b.distributedSource != nil && b.distributedSource.authority != nil {
+		query := cluster.PlacementsWithOwners
+		query.Family = info.ID
+		// Without it, each branch's are read.
+		authority, _ = b.distributedSource.authority.AuthorityStateOf(query)
+	}
+	for _, branch := range branches {
+		var entry branchProcesses
+		target, _, err := b.resolveSelectorIn(info, selector{container: container, branch: branch}, authority)
+		if err == nil {
+			entry.Processes, err = b.processesOf(target)
+		}
+		if err != nil {
+			entry.Error = err.Error()
+		}
+		listed[branch] = entry
+	}
+	return listed
 }
 
 // projectContainerAuthority removes stale ownership and lifecycle fields from

@@ -7982,7 +7982,7 @@ func daemonCommandListsInventory(args []string) bool {
 		return false
 	}
 	switch args[0] {
-	case "ls", "inspect", "top":
+	case "ls", "inspect", "top", "_processes-local":
 		return true
 	case "ps":
 		return !daemonCommandBoolFlag(args[1:], 's', "--size")
@@ -8006,7 +8006,7 @@ func daemonCommandReadsLifecycle(args []string) bool {
 		}
 	}
 	switch args[0] {
-	case "ps", "ls", "inspect", "top", "stats", "diff":
+	case "ps", "ls", "inspect", "top", "_processes-local", "stats", "diff":
 		return true
 	default:
 		return daemonCommandReleasesLifecycleAfterStart(args)
