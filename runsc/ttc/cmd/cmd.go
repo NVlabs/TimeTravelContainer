@@ -10435,28 +10435,28 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 	if err != nil {
 		return InspectInfo{}, err
 	}
-	families, err := b.listFamiliesOf(containerInfo.ID)
+	var reads familyReads
+	families, err := b.listFamiliesReading(containerInfo.ID, &reads)
 	if err != nil {
 		return buildInspectInfo(containerInfo, spec, nil, err.Error()), nil
 	}
 	// listFamilies may reconcile persistent state after an asynchronous sandbox
-	// exit. Reload so this inspect response reflects that update immediately.
-	if refreshed, err := store.LoadContainer(containerInfo.ID); err == nil {
+	// exit. Its last read of the record, or else a reload, reflects that
+	// update.
+	if reads.record != nil {
+		containerInfo = *reads.record
+	} else if refreshed, err := store.LoadContainer(containerInfo.ID); err == nil {
 		containerInfo = refreshed
 	}
 	// Each branch below resolves in the record as loaded, which the authority's
 	// projection of its branches would mislead, and in the family's placements
-	// and branch authorities, if the authority could be read.
+	// and branch authorities, which a cluster node's listing read.
 	record := containerInfo
-	var authority *cluster.AuthorityState
+	authority := reads.authority
 	if b.nodeID != "" {
 		if b.distributedSource != nil && b.distributedSource.authority != nil {
-			// The family's placements, not the cluster's.
-			query := cluster.PlacementsWithOwners
-			query.Family = containerInfo.ID
-			if snapshot, readErr := b.distributedSource.authority.AuthorityStateOf(query); readErr == nil {
-				authority = snapshot
-				containerInfo.Branches = logicalPersistentBranchInfos(containerInfo.Branches, snapshot.PlacementList(), snapshot.OfflineNodes(), containerInfo.ID)
+			if authority != nil {
+				containerInfo.Branches = logicalPersistentBranchInfos(containerInfo.Branches, authority.PlacementList(), authority.OfflineNodes(), containerInfo.ID)
 			}
 		} else if placements, openErr := b.placementCatalog(); openErr == nil {
 			if records, offlineOwners, listErr := placementsWithOfflineOwners(placements); listErr == nil {
@@ -12276,6 +12276,22 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 // runtime it lists; listing one family, it reads them first, to find which
 // physical runtimes of the family it has.
 func (b *runtimeBackend) listFamiliesOf(familyID string) ([]Family, error) {
+	return b.listFamiliesReading(familyID, nil)
+}
+
+// familyReads is what listing one family read of it that the lister may
+// use again.
+type familyReads struct {
+	// record is the family's record as the listing last read it, if it did.
+	record *ttcbundle.ContainerInfo
+	// authority is a cluster node's snapshot of the family's placements,
+	// branches and nodes.
+	authority *cluster.AuthorityState
+}
+
+// listFamiliesReading is listFamiliesOf, which, listing one family, keeps in
+// reads, if it is not nil, what it read of it.
+func (b *runtimeBackend) listFamiliesReading(familyID string, reads *familyReads) ([]Family, error) {
 	var snapshot *cluster.AuthorityState
 	var authorityErr error
 	var placementRecords []cluster.PlacementRecord
@@ -12334,6 +12350,9 @@ func (b *runtimeBackend) listFamiliesOf(familyID string) ([]Family, error) {
 	} else if info, err := store.LoadContainer(familyID); err == nil {
 		if !info.IsDistributedPhysicalRuntime() {
 			containers = []ttcbundle.ContainerInfo{info}
+			if reads != nil {
+				reads.record = &info
+			}
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
@@ -12557,7 +12576,13 @@ func (b *runtimeBackend) listFamiliesOf(familyID string) ([]Family, error) {
 			if err := b.recordLostRuntime(container); err != nil {
 				continue
 			}
+			if reads != nil && container.ID == familyID {
+				reads.record = nil
+			}
 			if reconciled, err := store.LoadContainer(container.ID); err == nil {
+				if reads != nil && container.ID == familyID {
+					reads.record = &reconciled
+				}
 				family := byID[displayID]
 				if family.ID == "" {
 					// A per-node physical runtime record is not itself a
@@ -12619,6 +12644,9 @@ func (b *runtimeBackend) listFamiliesOf(familyID string) ([]Family, error) {
 		return families[i].ID < families[j].ID
 	})
 	b.showLongOperations(families)
+	if reads != nil {
+		reads.authority = snapshot
+	}
 	return families, nil
 }
 
