@@ -8835,11 +8835,12 @@ func (b *runtimeBackend) exec(request execRequest) (retStatus int, retErr error)
 		return status, nil
 	}
 	if request.detach {
-		session, err := b.execSession(request.target, request.execID)
+		// The branch is the one resolved above, whose record info is.
+		session, err := b.execSessionOf(request.target, request.execID)
 		if err != nil {
 			return 1, err
 		}
-		if _, err := b.ensureExecConsoleDrain(request.target, session, true); err != nil {
+		if _, err := b.ensureExecConsoleDrainIn(info, request.target, session, true); err != nil {
 			cleanupErr := b.signalExecSession(request.target, request.execID, int(linux.SIGKILL))
 			if cleanupErr != nil {
 				return 1, fmt.Errorf("starting exec console drain: %w (session cleanup also failed: %v)", err, cleanupErr)
@@ -9623,8 +9624,11 @@ func consoleRetentionOf(info ttcbundle.ContainerInfo) (int64, int) {
 
 // ensureConsoleDrainIn is ensureConsoleDrain, which resets the console, of
 // a branch of the container whose record, info, the caller has: it reads no
-// record.
+// record, if info is target's container's.
 func (b *runtimeBackend) ensureConsoleDrainIn(info ttcbundle.ContainerInfo, target selector) (ttcbundle.ConsolePaths, error) {
+	if b.dataRoot == "" || info.ID != target.container {
+		return b.ensureConsoleDrain(target, true)
+	}
 	paths, err := b.containerStore().BranchConsolePathsIn(info, target.branch)
 	if err != nil {
 		return ttcbundle.ConsolePaths{}, err
@@ -9680,15 +9684,25 @@ func (b *runtimeBackend) ensureExecConsoleDrain(target selector, session runscEx
 	return b.ensureConsoleDrainPaths(target, session.ID, session.ConsoleID, paths, reset, nil)
 }
 
-// ensureExecConsoleDrainIn is ensureExecConsoleDrain, which resets the
-// console, of a branch of the container whose record, info, the caller has:
-// it reads no record.
-func (b *runtimeBackend) ensureExecConsoleDrainIn(info ttcbundle.ContainerInfo, target selector, session runscExecSession) (ttcbundle.ConsolePaths, error) {
+// ensureExecConsoleDrainIn is ensureExecConsoleDrain of a branch of the
+// container whose record, info, the caller has: it reads no record, if info
+// is target's container's.
+func (b *runtimeBackend) ensureExecConsoleDrainIn(info ttcbundle.ContainerInfo, target selector, session runscExecSession, reset bool) (ttcbundle.ConsolePaths, error) {
+	if b.dataRoot == "" || info.ID != target.container {
+		return b.ensureExecConsoleDrain(target, session, reset)
+	}
 	paths, err := b.containerStore().ExecConsolePathsIn(info, target.branch, session.ID)
 	if err != nil {
 		return ttcbundle.ConsolePaths{}, err
 	}
-	return b.ensureConsoleDrainPaths(target, session.ID, session.ConsoleID, paths, true, &info)
+	// As ensureExecConsoleDrain does.
+	if !reset && session.State == string(boot.ExecSessionExited) && session.ExitStatus != nil {
+		if err := installRetainedConsoleWaitStatus(paths, *session.ExitStatus); err != nil {
+			return ttcbundle.ConsolePaths{}, err
+		}
+		return paths, nil
+	}
+	return b.ensureConsoleDrainPaths(target, session.ID, session.ConsoleID, paths, reset, &info)
 }
 
 // refreshExecSessions returns sessions as target lists them now, or as they
@@ -13130,7 +13144,17 @@ func (b *runtimeBackend) execSessionsOf(target selector) ([]runscExecSession, er
 }
 
 func (b *runtimeBackend) execSession(target selector, execID string) (runscExecSession, error) {
-	sessions, err := b.execSessions(target)
+	resolved, _, err := b.resolveSelector(target)
+	if err != nil {
+		return runscExecSession{}, err
+	}
+	return b.execSessionOf(resolved, execID)
+}
+
+// execSessionOf is execSession of a branch whose physical runtime and
+// branch target names already.
+func (b *runtimeBackend) execSessionOf(target selector, execID string) (runscExecSession, error) {
+	sessions, err := b.execSessionsOf(target)
 	if err != nil {
 		return runscExecSession{}, err
 	}
@@ -13767,7 +13791,7 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 			if session.State != "running" {
 				continue
 			}
-			if _, err := b.ensureExecConsoleDrainIn(containerInfo, target, session); err != nil {
+			if _, err := b.ensureExecConsoleDrainIn(containerInfo, target, session, true); err != nil {
 				for _, cleanupDestination := range destinations {
 					_ = b.destroy(selector{container: source.container, branch: cleanupDestination}, true)
 				}
@@ -16701,13 +16725,13 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 				if _, err := b.ensureConsoleDrain(target, false); err != nil {
 					return fmt.Errorf("reattaching init console: %w", err)
 				}
-				sessions, err := b.execSessions(target)
+				sessions, err := b.execSessionsOf(target)
 				if err != nil {
 					return fmt.Errorf("listing rehydrated exec sessions: %w", err)
 				}
 				for _, session := range sessions {
 					if session.State == "running" {
-						if _, err := b.ensureExecConsoleDrain(target, session, false); err != nil {
+						if _, err := b.ensureExecConsoleDrainIn(info, target, session, false); err != nil {
 							return fmt.Errorf("reattaching exec console %q: %w", session.ID, err)
 						}
 					}
@@ -17127,13 +17151,13 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	if _, err := b.ensureConsoleDrain(target, false); err != nil {
 		return fmt.Errorf("reattaching init console: %w", err)
 	}
-	sessions, err := b.execSessions(target)
+	sessions, err := b.execSessionsOf(target)
 	if err != nil {
 		return fmt.Errorf("listing rehydrated exec sessions: %w", err)
 	}
 	for _, session := range sessions {
 		if session.State == "running" {
-			if _, err := b.ensureExecConsoleDrain(target, session, false); err != nil {
+			if _, err := b.ensureExecConsoleDrainIn(info, target, session, false); err != nil {
 				return fmt.Errorf("reattaching exec console %q: %w", session.ID, err)
 			}
 		}
@@ -17473,13 +17497,13 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	if _, err := b.ensureConsoleDrain(target, false); err != nil {
 		return fmt.Errorf("reattaching init console: %w", err)
 	}
-	sessions, err := b.execSessions(target)
+	sessions, err := b.execSessionsOf(target)
 	if err != nil {
 		return err
 	}
 	for _, session := range sessions {
 		if session.State == "running" {
-			if _, err := b.ensureExecConsoleDrain(target, session, false); err != nil {
+			if _, err := b.ensureExecConsoleDrainIn(info, target, session, false); err != nil {
 				return err
 			}
 		}
