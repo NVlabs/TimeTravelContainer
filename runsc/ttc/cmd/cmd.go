@@ -9116,7 +9116,8 @@ func readConsoleWaitStatus(path string) (uint32, bool, error) {
 }
 
 func (b *runtimeBackend) attach(request attachRequest) (status uint32, retErr error) {
-	target, _, err := b.resolveSelector(request.target)
+	// The branch's record, which resolving it read, has what attaching needs.
+	target, containerInfo, err := b.resolveSelector(request.target)
 	if err != nil {
 		return 0, err
 	}
@@ -9130,24 +9131,19 @@ func (b *runtimeBackend) attach(request attachRequest) (status uint32, retErr er
 	consoleID := "init"
 	terminal := false
 	if execID == "" {
-		paths, err = b.ensureConsoleDrain(target, false)
-		if err != nil {
-			return 0, err
-		}
-		store := b.containerStore()
-		containerInfo, err := store.LoadContainer(target.container)
+		paths, err = b.ensureConsoleDrainIn(containerInfo, target, false)
 		if err != nil {
 			return 0, err
 		}
 		terminal = containerInfo.Terminal
 	} else {
-		session, err := b.execSession(target, execID)
+		session, err := b.execSessionOf(target, execID)
 		if err != nil {
 			return 0, err
 		}
 		consoleID = session.ConsoleID
 		terminal = session.Terminal
-		paths, err = b.ensureExecConsoleDrain(target, session, false)
+		paths, err = b.ensureExecConsoleDrainIn(containerInfo, target, session, false)
 		if err != nil {
 			return 0, err
 		}
@@ -9159,10 +9155,7 @@ func (b *runtimeBackend) attach(request attachRequest) (status uint32, retErr er
 		stopResize := b.watchConsoleResize(target, consoleID)
 		defer stopResize()
 	}
-	_, maxFiles, err := b.consoleRetention(target.container)
-	if err != nil {
-		return 0, err
-	}
+	_, maxFiles := consoleRetentionOf(containerInfo)
 	if request.stdin {
 		inputLock, err := acquireConsoleStdin(paths.StdinLock, target)
 		if err != nil {
@@ -9509,7 +9502,8 @@ func writeLogData(output io.Writer, stream byte, data []byte) error {
 }
 
 func (b *runtimeBackend) logs(target selector, options logsOptions) error {
-	resolved, _, err := b.resolveSelector(target)
+	// The branch's record, which resolving it read, has what the logs need.
+	resolved, container, err := b.resolveSelector(target)
 	if err != nil {
 		return err
 	}
@@ -9519,30 +9513,23 @@ func (b *runtimeBackend) logs(target selector, options logsOptions) error {
 		return err
 	}
 	defer releaseClient()
-	container, err := b.containerStore().LoadContainer(target.container)
-	if err != nil {
-		return err
-	}
 	if container.LogDriver == "none" {
 		return fmt.Errorf("configured logging driver %q does not support reading", container.LogDriver)
 	}
 	var paths ttcbundle.ConsolePaths
 	if options.ExecID == "" {
-		paths, err = b.ensureConsoleDrain(target, false)
+		paths, err = b.ensureConsoleDrainIn(container, target, false)
 	} else {
-		session, sessionErr := b.execSession(target, options.ExecID)
+		session, sessionErr := b.execSessionOf(target, options.ExecID)
 		if sessionErr != nil {
 			return sessionErr
 		}
-		paths, err = b.ensureExecConsoleDrain(target, session, false)
+		paths, err = b.ensureExecConsoleDrainIn(container, target, session, false)
 	}
 	if err != nil {
 		return err
 	}
-	_, maxFiles, err := b.consoleRetention(target.container)
-	if err != nil {
-		return err
-	}
+	_, maxFiles := consoleRetentionOf(container)
 	follower, err := openConsoleLogFollower(paths.Log, maxFiles)
 	if err != nil {
 		return err
@@ -9622,18 +9609,27 @@ func consoleRetentionOf(info ttcbundle.ContainerInfo) (int64, int) {
 	return maxBytes, maxFiles
 }
 
-// ensureConsoleDrainIn is ensureConsoleDrain, which resets the console, of
-// a branch of the container whose record, info, the caller has: it reads no
-// record, if info is target's container's.
-func (b *runtimeBackend) ensureConsoleDrainIn(info ttcbundle.ContainerInfo, target selector) (ttcbundle.ConsolePaths, error) {
+// ensureConsoleDrainIn is ensureConsoleDrain of a branch of the container
+// whose record, info, the caller has: it reads no record, if info is target's
+// container's.
+func (b *runtimeBackend) ensureConsoleDrainIn(info ttcbundle.ContainerInfo, target selector, reset bool) (ttcbundle.ConsolePaths, error) {
 	if b.dataRoot == "" || info.ID != target.container {
-		return b.ensureConsoleDrain(target, true)
+		return b.ensureConsoleDrain(target, reset)
 	}
 	paths, err := b.containerStore().BranchConsolePathsIn(info, target.branch)
 	if err != nil {
 		return ttcbundle.ConsolePaths{}, err
 	}
-	return b.ensureConsoleDrainPaths(target, "", "init", paths, true, &info)
+	// As ensureConsoleDrain does, from info.
+	if !reset {
+		if branch, err := persistentBranchInfo(info, target.branch); err == nil && branch.State == "exited" && branch.ExitStatus != nil {
+			if err := installRetainedConsoleExitCode(paths, *branch.ExitStatus); err != nil {
+				return ttcbundle.ConsolePaths{}, err
+			}
+			return paths, nil
+		}
+	}
+	return b.ensureConsoleDrainPaths(target, "", "init", paths, reset, &info)
 }
 
 func (b *runtimeBackend) ensureConsoleDrain(target selector, reset bool) (ttcbundle.ConsolePaths, error) {
@@ -13774,7 +13770,7 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 	// source's record, resolved, is theirs.
 	for _, destination := range destinations {
 		target := selector{container: source.container, branch: destination}
-		if _, err := b.ensureConsoleDrainIn(containerInfo, target); err != nil {
+		if _, err := b.ensureConsoleDrainIn(containerInfo, target, true); err != nil {
 			for _, cleanupDestination := range destinations {
 				_ = b.destroy(selector{container: source.container, branch: cleanupDestination}, true)
 			}
