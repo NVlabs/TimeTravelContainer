@@ -1557,9 +1557,6 @@ func TestNonOwnedBranchCleanupLeavesABranchBeingMade(t *testing.T) {
 	}
 }
 
-// A rehydration makes its branch routable even while a long operation, a
-// remote fork's handoff for one, works on its family: the reconciliation
-// after the command passes over such a family.
 // countingNodes counts the heartbeats of a node directory: the renewals of
 // a node's execution lease.
 type countingNodes struct {
@@ -1637,6 +1634,9 @@ func TestStartRenewsItsLeaseOnlyToClaimAgain(t *testing.T) {
 	}
 }
 
+// A rehydration makes its branch routable even while a long operation, a
+// remote fork's handoff for one, works on its family: the reconciliation
+// after the command passes over such a family.
 func TestRehydrationActivatesItsPlacementInABusyFamily(t *testing.T) {
 	root := t.TempDir()
 	local := t.TempDir()
