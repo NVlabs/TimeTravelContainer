@@ -7211,7 +7211,7 @@ func (s Store) materializeSharedImagePack(key, destinationImageDir string) (imag
 		return images.RootFSInfo{}, false, err
 	}
 	rootfs := filepath.Join(destinationImageDir, "rootfs")
-	if _, err := ownership.Read(ownership.ManifestPath(rootfs)); err != nil {
+	if err := ownership.Validate(ownership.ManifestPath(rootfs)); err != nil {
 		return images.RootFSInfo{}, false, fmt.Errorf("materialized ownership manifest is invalid: %w", err)
 	}
 	if err := ttcpack.WriteLazyDescriptor(rootfs, s.sharedImagePackRoot(), pack, "rootfs"); err != nil {
@@ -7307,7 +7307,7 @@ func loadImageRoot(dir string) (images.RootFSInfo, error) {
 	if stat, err := os.Stat(rootfs); err != nil || !stat.IsDir() {
 		return images.RootFSInfo{}, fmt.Errorf("cached rootfs is missing")
 	}
-	if _, err := ownership.Read(ownership.ManifestPath(rootfs)); err != nil {
+	if err := ownership.Validate(ownership.ManifestPath(rootfs)); err != nil {
 		return images.RootFSInfo{}, fmt.Errorf("cached rootfs ownership is invalid: %w", err)
 	}
 	return info, nil

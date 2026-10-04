@@ -726,7 +726,7 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		resources.CPU = cpu
 	}
 	ownerManifest := ownership.ManifestPath(rootfs)
-	if _, err := ownership.Read(ownerManifest); err == nil {
+	if err := ownership.Validate(ownerManifest); err == nil {
 		annotations[ownership.Annotation] = ownerManifest
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("loading rootfs ownership: %w", err)

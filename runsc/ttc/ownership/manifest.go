@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 )
 
 const (
@@ -148,6 +149,56 @@ func Read(name string) (*Manifest, error) {
 	}
 	defer file.Close()
 	return ReadFrom(name, file)
+}
+
+// maxValidManifests bounds validManifests: once it holds that many, it is
+// forgotten, and each manifest is read again the next time it is validated.
+const maxValidManifests = 1024
+
+// validManifests maps the path of each manifest Validate found valid to the
+// file it found there.
+var validManifests struct {
+	mu    sync.Mutex
+	files map[string]os.FileInfo
+}
+
+// Validate returns the error Read would return for name, without the
+// manifest. A process reads each version of a manifest only once: Write
+// replaces the file, so a file Validate has found valid before, still the
+// same size and modification time, is valid. A manifest describes every file
+// of an image, and an image's is read each time a container is made of it:
+// the 0.5 MB one of a Python image took 8 ms to read.
+func Validate(name string) error {
+	info, err := os.Stat(name)
+	if err != nil {
+		return err
+	}
+	validManifests.mu.Lock()
+	known, ok := validManifests.files[name]
+	validManifests.mu.Unlock()
+	if ok && os.SameFile(known, info) && known.Size() == info.Size() && known.ModTime().Equal(info.ModTime()) {
+		return nil
+	}
+	file, err := os.Open(name)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	// What is read is the file opened, which may have replaced the one
+	// statted: remember that one.
+	if info, err = file.Stat(); err != nil {
+		return err
+	}
+	if _, err := ReadFrom(name, file); err != nil {
+		return err
+	}
+	validManifests.mu.Lock()
+	if validManifests.files == nil || len(validManifests.files) >= maxValidManifests {
+		validManifests.files = make(map[string]os.FileInfo)
+	}
+	validManifests.files[name] = info
+	validManifests.mu.Unlock()
+	return nil
 }
 
 // ReadFrom loads and validates a manifest from r. name identifies the source

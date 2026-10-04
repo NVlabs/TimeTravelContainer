@@ -4,6 +4,8 @@
 package ownership
 
 import (
+	"bytes"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -41,5 +43,52 @@ func TestCleanPathRejectsEscape(t *testing.T) {
 		if _, err := CleanPath(name); err == nil {
 			t.Errorf("CleanPath(%q) succeeded", name)
 		}
+	}
+}
+
+func TestValidateReadsEachVersionOfAManifestOnce(t *testing.T) {
+	name := filepath.Join(t.TempDir(), ManifestName)
+	if err := Validate(name); !os.IsNotExist(err) {
+		t.Fatalf("Validate of a missing manifest: %v, want one that does not exist", err)
+	}
+	manifest := NewManifest()
+	manifest.Entries["."] = Owner{}
+	if err := Write(name, manifest); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := Validate(name); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	// The version found valid is not read again: one changed in place,
+	// keeping its size and modification time, is still found valid.
+	info, err := os.Stat(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(name, bytes.Repeat([]byte("x"), int(info.Size())), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(name, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if err := Validate(name); err != nil {
+		t.Fatalf("Validate of the version found valid: %v", err)
+	}
+	// A manifest replaced, as Write replaces one, is read.
+	invalid := filepath.Join(filepath.Dir(name), "invalid")
+	if err := os.WriteFile(invalid, []byte(`{"version":1,"entries":{"a":{}}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(invalid, name); err != nil {
+		t.Fatal(err)
+	}
+	if err := Validate(name); err == nil {
+		t.Fatal("Validate of a manifest that does not describe the root succeeded")
+	}
+	if err := Write(name, manifest); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := Validate(name); err != nil {
+		t.Fatalf("Validate of a manifest written again: %v", err)
 	}
 }
