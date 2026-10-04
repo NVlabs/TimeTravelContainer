@@ -7682,6 +7682,62 @@ func TestDistributedMutationSourceTransactions(t *testing.T) {
 	}
 }
 
+// A remote fork's publication places its branch without naming the fork in
+// the placement. Removing the branch before the fork has finished cancels the
+// fork, which deletes the branch's runtime; the removal then removes the
+// branch from the authority only, if the fork's runtime still holds it.
+func TestUnfinishedRemoteForkHoldsThePlacementItPublished(t *testing.T) {
+	fork := cluster.Transaction{
+		Identity: cluster.ForkIdentity{
+			TransactionID: "fork-1", SourceNodeID: "node-a", SourceContainer: "family-id", SourceBranch: "main",
+			TargetNodeID: "node-b", TargetContainer: "family-id", TargetBranch: "fork-1", TargetVisibleBranch: "child",
+		},
+		State: cluster.TransactionPublished, SourceNeeded: true,
+	}
+	canceled := fork
+	canceled.State = cluster.TransactionCanceled
+	published := cluster.PlacementRecord{FamilyID: "family-id", BranchID: "child", PhysicalContainer: "fork-1", PhysicalBranch: "child", OwnerNode: "node-b"}
+	imported := published
+	imported.PhysicalContainer = "family-runtime"
+	migrating := published
+	migrating.OperationID = "migration"
+	migrated := published
+	migrated.OwnerNode, migrated.PhysicalContainer, migrated.LastOperationID = "node-c", "migration", "migration"
+	recovered := published
+	recovered.LastOperationID = "migration"
+	for _, test := range []struct {
+		name      string
+		tx        cluster.Transaction
+		placement cluster.PlacementRecord
+		want      bool
+	}{
+		{"in a runtime of its own", fork, published, true},
+		{"canceled, in a runtime of its own", canceled, published, true},
+		{"imported into the family's runtime", fork, imported, true},
+		{"canceled, a branch of its name in the family's runtime", canceled, imported, false},
+		{"migrating", fork, migrating, false},
+		{"migrated on", fork, migrated, false},
+		{"after a failed migration", fork, recovered, true},
+	} {
+		if got := transactionOwnsCurrentPlacement(test.tx, []cluster.PlacementRecord{test.placement}); got != test.want {
+			t.Errorf("%s: transactionOwnsCurrentPlacement = %t, want %t", test.name, got, test.want)
+		}
+	}
+	// Removing the whole family also removes a branch forked from the
+	// fork's target on its node, through the runtime they share, which
+	// canceling the fork would delete: the fork is finished instead.
+	info := ttcbundle.ContainerInfo{ID: "family-id"}
+	if _, cancel, _, _ := distributedRemovalSourceTransactions([]cluster.Transaction{fork}, []cluster.PlacementRecord{published}, info, ""); len(cancel["node-a"]) != 1 {
+		t.Fatalf("removing the family did not cancel its unfinished fork: %v", cancel)
+	}
+	descendant := published
+	descendant.BranchID, descendant.PhysicalBranch = "grandchild", "grandchild"
+	settle, cancel, _, _ := distributedRemovalSourceTransactions([]cluster.Transaction{fork}, []cluster.PlacementRecord{published, descendant}, info, "")
+	if _, ok := settle["node-a"]["fork-1"]; !ok || len(cancel) != 0 {
+		t.Fatalf("removing a family whose fork's runtime runs another branch: settle=%v cancel=%v, want the fork finished", settle, cancel)
+	}
+}
+
 func TestOrderFamilyRemovalPlacementsTreatsEmptyPhysicalContainerAsCanonical(t *testing.T) {
 	records := []cluster.PlacementRecord{
 		{FamilyID: "family", BranchID: "migrated", PhysicalContainer: "family", PhysicalBranch: "migration-private", State: cluster.PlacementRunning},

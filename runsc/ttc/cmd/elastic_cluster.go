@@ -2344,10 +2344,16 @@ func distributedRemovalSourceTransactions(transactions []cluster.Transaction, pl
 		// logical descendants share the transaction-private Sentry and its lazy
 		// MemoryFile. Canceling the original transaction would attempt to delete
 		// that whole physical runtime. Materialize the handoff instead whenever
-		// a branch outside this removal still lives in the same physical family;
-		// ordinary branch removal can then destroy only the selected branch.
-		hasSurvivingPhysicalPeer := remoteForkTargetHasSurvivingPhysicalPeer(tx, placements, branchID)
-		if !tx.Identity.Migration && removesTarget && !hasSurvivingPhysicalPeer {
+		// another branch lives in the same physical family; ordinary branch
+		// removal can then destroy only the selected branch. Removing the whole
+		// family removes that branch too, but through its runtime, which
+		// canceling would have deleted under it.
+		peerOf := branchID
+		if peerOf == "" {
+			peerOf = logicalBranch
+		}
+		hasPhysicalPeer := remoteForkTargetHasSurvivingPhysicalPeer(tx, placements, peerOf)
+		if !tx.Identity.Migration && removesTarget && !hasPhysicalPeer {
 			if cancel[node] == nil {
 				cancel[node] = make(map[string]struct{})
 			}
@@ -2384,12 +2390,27 @@ func distributedRemovalSourceTransactions(transactions []cluster.Transaction, pl
 	return settle, cancel, discard, abort
 }
 
+// transactionOwnsCurrentPlacement reports whether the runtime tx, a remote
+// fork, made still holds the placement of its branch: canceling tx destroys
+// that runtime. Publishing a fork names no operation in the placement it
+// makes. It places the branch in a runtime of its own, named by the
+// transaction, or in the family's runtime the node had, which only a fork not
+// yet finished is known to hold: a branch of the same name may have replaced
+// that of a fork canceled since. A migration names itself in the placement,
+// and moves the branch to another node or runtime.
 func transactionOwnsCurrentPlacement(tx cluster.Transaction, placements []cluster.PlacementRecord) bool {
 	for _, placement := range placements {
 		if placement.FamilyID != tx.Identity.TargetContainer {
 			continue
 		}
 		if placement.OperationID == tx.Identity.TransactionID || placement.LastOperationID == tx.Identity.TransactionID {
+			return true
+		}
+		if tx.Identity.Migration || placement.BranchID != tx.Identity.VisibleTargetBranch() ||
+			placement.OwnerNode != tx.Identity.TargetNodeID || placement.OperationID != "" {
+			continue
+		}
+		if placement.PhysicalContainer == tx.Identity.TransactionID || (!tx.Terminal() && placement.LastOperationID == "") {
 			return true
 		}
 	}
