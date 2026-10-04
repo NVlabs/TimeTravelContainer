@@ -11847,7 +11847,7 @@ func (b *runtimeBackend) launch(info ttcbundle.ContainerInfo, target selector, b
 		return 1, false, err
 	}
 	startDrain := func(phase string) error {
-		if _, err := b.ensureConsoleDrain(target, true); err != nil {
+		if _, err := b.ensureConsoleDrainIn(info, target, true); err != nil {
 			return fmt.Errorf("starting console drain %s container start: %w", phase, err)
 		}
 		return nil

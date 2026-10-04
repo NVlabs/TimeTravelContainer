@@ -3371,30 +3371,46 @@ func (s Store) LoadRuntimeContainer(identifier string) (ContainerInfo, error) {
 // foreground commands, background publication workers, and clustered daemons
 // sharing TTC_ROOT. The lock is deliberately separate from the JSON file so
 // atomic replacement of container.json does not replace the lock inode.
+//
+// An ID TTC makes is the key of its record, which loadContainer looks for
+// before anything else: such an identifier's record is read once, under the
+// lock, not first to resolve it, a round trip of a shared root.
 func (s Store) mutateContainer(identifier string, mutate func(*ContainerInfo) (bool, error)) error {
+	if generatedContainerID(identifier) {
+		if found, err := s.mutateContainerKey(identifier, mutate); found {
+			return err
+		}
+	}
 	resolved, err := s.loadRuntimeContainer(identifier)
 	if err != nil {
 		return err
 	}
-	directory := filepath.Join(s.Root, "containers", resolved.ID)
+	_, err = s.mutateContainerKey(resolved.ID, mutate)
+	return err
+}
+
+// mutateContainerKey is mutateContainer of the record whose key is id. found
+// is whether there is one.
+func (s Store) mutateContainerKey(id string, mutate func(*ContainerInfo) (bool, error)) (found bool, err error) {
+	directory := filepath.Join(s.Root, "containers", id)
 	lock, err := os.OpenFile(filepath.Join(directory, ".metadata.lock"), os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
-		return err
+		return !errors.Is(err, fs.ErrNotExist), err
 	}
 	defer lock.Close()
 	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
-		return err
+		return true, err
 	}
 	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
-	info, err := s.loadContainerKey(resolved.ID)
+	info, err := s.loadContainerKey(id)
 	if err != nil {
-		return err
+		return !errors.Is(err, fs.ErrNotExist), err
 	}
 	changed, err := mutate(&info)
 	if err != nil || !changed {
-		return err
+		return true, err
 	}
-	return writeJSON(filepath.Join(directory, "container.json"), &info)
+	return true, writeJSON(filepath.Join(directory, "container.json"), &info)
 }
 
 // LoadDistributedForkTarget resolves a hidden or published target by its

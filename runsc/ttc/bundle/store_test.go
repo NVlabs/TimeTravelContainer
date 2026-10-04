@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -869,5 +871,73 @@ func TestTTCNetworkInterface(t *testing.T) {
 	// that they were created with.
 	if got := (ContainerInfo{}).TTCNetworkInterface(); got != LegacyNetworkInterface {
 		t.Errorf("TTCNetworkInterface() of a legacy record=%q, want %q", got, LegacyNetworkInterface)
+	}
+}
+
+// A mutation names its container as loadContainer does: an ID TTC makes
+// by its record, read under the lock, and anything else, or an ID that is no
+// record's but a container's name, by resolving it. mutate runs once.
+func TestMutateContainerResolvesAsLoadingDoes(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	write := func(id, name string) {
+		t.Helper()
+		containerDir := filepath.Join(root, "containers", id)
+		bundleDir := filepath.Join(containerDir, "bundle")
+		if err := os.MkdirAll(bundleDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &ContainerInfo{ID: id, Name: name, BundleDir: bundleDir}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	family, named := strings.Repeat("a", 2*containerIDBytes), strings.Repeat("b", 2*containerIDBytes)
+	unrecorded := strings.Repeat("c", 2*containerIDBytes)
+	write(family, "web")
+	// Named as an ID no record has.
+	write(named, unrecorded)
+	mutated := func(identifier, wantID string) {
+		t.Helper()
+		calls := 0
+		err := store.mutateContainer(identifier, func(info *ContainerInfo) (bool, error) {
+			calls++
+			if info.ID != wantID {
+				return false, fmt.Errorf("mutating %q, not %q", info.ID, wantID)
+			}
+			info.ExitError = "mutated as " + identifier
+			return true, nil
+		})
+		if err != nil || calls != 1 {
+			t.Fatalf("mutateContainer(%q) = %v, mutate called %d times", identifier, err, calls)
+		}
+		info, err := store.loadContainerKey(wantID)
+		if err != nil || info.ExitError != "mutated as "+identifier {
+			t.Fatalf("record of %q after mutating it as %q: %q, %v", wantID, identifier, info.ExitError, err)
+		}
+	}
+	mutated(family, family)
+	mutated("web", family)
+	mutated(unrecorded, named)
+	// A directory without a record, as one being made has, is no container.
+	if err := os.MkdirAll(filepath.Join(root, "containers", strings.Repeat("d", 2*containerIDBytes)), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, identifier := range []string{strings.Repeat("d", 2*containerIDBytes), strings.Repeat("e", 2*containerIDBytes), "missing"} {
+		err := store.mutateContainer(identifier, func(*ContainerInfo) (bool, error) {
+			t.Fatalf("mutate ran for %q", identifier)
+			return false, nil
+		})
+		if !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("mutateContainer(%q) = %v, want one that does not exist", identifier, err)
+		}
+	}
+	// mutate's error is returned, mutate run once.
+	calls := 0
+	wantErr := errors.New("refused")
+	if err := store.mutateContainer(family, func(*ContainerInfo) (bool, error) { calls++; return false, wantErr }); err != wantErr || calls != 1 {
+		t.Errorf("mutateContainer with a failing mutate = %v, called %d times", err, calls)
 	}
 }
