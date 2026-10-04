@@ -326,6 +326,46 @@ func (p daemonClusterProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// placementReader is Lookup of a placement catalog that reads the placements
+// of a family it is to be asked about more than once in one listing of the
+// family's: a command naming many branches of one family, as a family's
+// removal does a node's, asked the authority about each, one request after
+// another.
+type placementReader struct {
+	catalog cluster.PlacementCatalog
+	// many has the families asked about more than once.
+	many   map[string]bool
+	listed map[string]map[string]cluster.PlacementRecord
+}
+
+func newPlacementReader(catalog cluster.PlacementCatalog) *placementReader {
+	return &placementReader{catalog: catalog, many: make(map[string]bool), listed: make(map[string]map[string]cluster.PlacementRecord)}
+}
+
+// Lookup is Lookup of the catalog.
+func (r *placementReader) Lookup(family, branch string) (*cluster.PlacementRecord, error) {
+	if !r.many[family] {
+		return r.catalog.Lookup(family, branch)
+	}
+	branches, ok := r.listed[family]
+	if !ok {
+		records, err := r.catalog.ListFamily(family)
+		if err != nil {
+			return nil, err
+		}
+		branches = make(map[string]cluster.PlacementRecord, len(records))
+		for _, record := range records {
+			branches[record.BranchID] = record
+		}
+		r.listed[family] = branches
+	}
+	record, ok := branches[branch]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	return &record, nil
+}
+
 func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.PlacementCatalog, args []string) (string, []daemonPlacementClaim, error) {
 	if dataRoot == "" {
 		return "", nil, nil
@@ -396,6 +436,8 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 		err  error
 	}
 	families := make(map[string]loaded)
+	selectors := make([]selector, 0, len(args)-1)
+	named := make(map[string]int)
 	for _, arg := range args[1:] {
 		candidate := arg
 		if colon := strings.IndexByte(candidate, ':'); colon >= 0 {
@@ -409,6 +451,11 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 		if err != nil {
 			continue
 		}
+		selectors = append(selectors, selected)
+		named[selected.container]++
+	}
+	reader := newPlacementReader(placements)
+	for _, selected := range selectors {
 		family, ok := families[selected.container]
 		if !ok {
 			family.info, family.err = store.LoadContainer(selected.container)
@@ -424,7 +471,10 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 		}
 		branchOwner := ""
 		claimMaterializing := allowMaterializing
-		placement, err := placements.Lookup(info.ID, selected.branch)
+		if named[selected.container] > 1 {
+			reader.many[info.ID] = true
+		}
+		placement, err := reader.Lookup(info.ID, selected.branch)
 		switch {
 		case err == nil:
 			if placement.State == cluster.PlacementCorrupted {
@@ -589,8 +639,16 @@ func validateDaemonPlacementClaimsWithCatalog(dataRoot, localNode string, args [
 	if placements == nil {
 		return errors.New("placement authority is unavailable")
 	}
+	reader := newPlacementReader(placements)
+	claimed := make(map[string]int)
 	for _, claim := range claims {
-		found, err := placements.Lookup(claim.FamilyID, claim.BranchID)
+		claimed[claim.FamilyID]++
+		if claimed[claim.FamilyID] > 1 {
+			reader.many[claim.FamilyID] = true
+		}
+	}
+	for _, claim := range claims {
+		found, err := reader.Lookup(claim.FamilyID, claim.BranchID)
 		if errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("validating placement %s@%s: %w", claim.FamilyID, claim.BranchID, os.ErrNotExist)
 		}

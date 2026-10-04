@@ -318,6 +318,86 @@ func TestDaemonCommandOwner(t *testing.T) {
 	}
 }
 
+// countingPlacements counts the requests a placement catalog is asked.
+type countingPlacements struct {
+	cluster.PlacementCatalog
+	lookups, listings int
+}
+
+func (c *countingPlacements) Lookup(family, branch string) (*cluster.PlacementRecord, error) {
+	c.lookups++
+	return c.PlacementCatalog.Lookup(family, branch)
+}
+
+func (c *countingPlacements) ListFamily(family string) ([]cluster.PlacementRecord, error) {
+	c.listings++
+	return c.PlacementCatalog.ListFamily(family)
+}
+
+// A command naming many branches of a family, as a family's removal does
+// the branches of a node, has their placements read in one listing of the
+// family's, to route it and to validate its claims, rather than one request
+// for each.
+func TestCommandOfManyBranchesReadsTheirPlacementsOnce(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "web")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{ID: "web", Name: "web", NodeID: "node-b", BundleDir: bundleDir}); err != nil {
+		t.Fatal(err)
+	}
+	store, err := cluster.OpenPlacementStore(filepath.Join(root, "cluster", "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, branch := range []string{"main", "a", "b"} {
+		if _, err := store.Create(cluster.PlacementRecord{
+			FamilyID: "web", BranchID: branch, PhysicalContainer: "web", PhysicalBranch: branch,
+			OwnerNode: "node-b", OwnerIncarnation: "boot-b", State: cluster.PlacementRunning,
+		}, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	placements := &countingPlacements{PlacementCatalog: store}
+	args := []string{"rm", "-f", "web@main", "web@a", "web@b"}
+	owner, claims, err := daemonCommandPlacementWithCatalog(root, placements, args)
+	if err != nil || owner != "node-b" || len(claims) != 3 {
+		t.Fatalf("daemonCommandPlacementWithCatalog(%v) = (%q, %+v, %v), want node-b's three claims", args, owner, claims, err)
+	}
+	if placements.lookups != 0 || placements.listings != 1 {
+		t.Errorf("routing three branches made %d lookups and %d listings, want one listing", placements.lookups, placements.listings)
+	}
+	placements.lookups, placements.listings = 0, 0
+	if err := validateDaemonPlacementClaimsWithCatalog(root, "node-b", args, claims, placements); err != nil {
+		t.Fatalf("validating the claims: %v", err)
+	}
+	if placements.lookups != 0 || placements.listings != 1 {
+		t.Errorf("validating three claims made %d lookups and %d listings, want one listing", placements.lookups, placements.listings)
+	}
+	stale := append([]daemonPlacementClaim(nil), claims...)
+	stale[1].Generation++
+	if err := validateDaemonPlacementClaimsWithCatalog(root, "node-b", args, stale, placements); err == nil {
+		t.Error("a claim of an older generation was valid")
+	}
+	gone := append([]daemonPlacementClaim(nil), claims...)
+	gone[2].BranchID = "gone"
+	if err := validateDaemonPlacementClaimsWithCatalog(root, "node-b", args, gone, placements); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a claim of a branch without placement: %v, want it not to exist", err)
+	}
+	placements.lookups, placements.listings = 0, 0
+	if _, claims, err := daemonCommandPlacementWithCatalog(root, placements, []string{"rm", "-f", "web@a"}); err != nil || len(claims) != 1 {
+		t.Fatalf("routing one branch = (%+v, %v)", claims, err)
+	}
+	if placements.lookups != 1 || placements.listings != 0 {
+		t.Errorf("routing one branch made %d lookups and %d listings, want one lookup", placements.lookups, placements.listings)
+	}
+}
+
 func TestDaemonCommandPlacementFencesCatalogGeneration(t *testing.T) {
 	root := t.TempDir()
 	containerDir := filepath.Join(root, "containers", "web")
