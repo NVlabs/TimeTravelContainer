@@ -33,14 +33,17 @@ var familyScopedCommands = map[string]bool{
 // clusterFamilyScopedCommands are the family-scoped commands that a cluster
 // node also runs at once on different families. They change the family's
 // runtime, record and placements alone, and reconcile only the family's
-// placements after (commandReconciledFamilies). The node's other commands
-// keep the lifecycle lock to themselves: the snapshot origins they allocate,
-// publish and abandon are inventoried node-wide, by reconciliations that a
-// command's lock keeps from seeing an origin of another's that is still
-// being made. With every command taking it alone, a node paused or resumed
-// its families 14 times a second however many clients asked.
+// placements after (commandReconciledFamilies). A snapshot origin one of
+// them allocates is building until it is installed, as a capture's is, and
+// so no reconciliation of another's takes it for a stale one. The node's
+// other commands keep the lifecycle lock to themselves: a fork, a
+// dehydration and a removal build and collect the node's memory graph,
+// whose reconciliations count on the lock to keep a graph builder out.
+// With every command taking it alone, a node paused or resumed its families
+// 14 times a second however many clients asked.
 var clusterFamilyScopedCommands = map[string]bool{
-	"pause": true, "resume": true, "unpause": true,
+	"pause": true, "resume": true, "unpause": true, "quarantine": true, "unquarantine": true,
+	"kill": true, "stop": true, "start": true, "restart": true,
 }
 
 // requestFamilies returns the IDs of the families whose locks the command in
