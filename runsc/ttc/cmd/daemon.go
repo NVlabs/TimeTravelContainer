@@ -7813,8 +7813,10 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 				if err := s.activateMaterializedLifecycleTargets(mutationBackend, request.Args); err != nil {
 					fmt.Fprintf(&mutationStderr, "ttcd: warning: activating materialized placement: %v\n", err)
 				}
-				if err := mutationBackend.reconcilePlacementCatalogOf(commandReconciledFamilies(request.Args, mutationBackend)...); err != nil {
-					fmt.Fprintf(&mutationStderr, "ttcd: warning: reconciling placement catalog: %v\n", err)
+				if families, reconcile := commandReconciledFamilies(request.Args, mutationBackend); reconcile {
+					if err := mutationBackend.reconcilePlacementCatalogOf(families...); err != nil {
+						fmt.Fprintf(&mutationStderr, "ttcd: warning: reconciling placement catalog: %v\n", err)
+					}
 				}
 			}
 		}
@@ -7860,8 +7862,10 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			if err := s.activateMaterializedLifecycleTargets(backend, request.Args); err != nil {
 				fmt.Fprintf(backend.stderr, "ttcd: warning: activating materialized placement: %v\n", err)
 			}
-			if err := backend.reconcilePlacementCatalogOf(commandReconciledFamilies(request.Args, backend)...); err != nil {
-				fmt.Fprintf(backend.stderr, "ttcd: warning: reconciling placement catalog: %v\n", err)
+			if families, reconcile := commandReconciledFamilies(request.Args, backend); reconcile {
+				if err := backend.reconcilePlacementCatalogOf(families...); err != nil {
+					fmt.Fprintf(backend.stderr, "ttcd: warning: reconciling placement catalog: %v\n", err)
+				}
 			}
 		}
 	}
@@ -7932,25 +7936,47 @@ func writeDaemonBufferedResult(conn net.Conn, writeMu *sync.Mutex, stdout, stder
 // commandReconciledFamilies returns the families whose placements the
 // reconciliation after a successful command must bring in line with this
 // node's runtimes: those the command resolved, if it changes only the
-// families it names, or, as run, the family it creates; or none, which
-// stands for every family.
-func commandReconciledFamilies(args []string, b *runtimeBackend) []string {
+// families it names, or, as run and restore, the family it creates; or none,
+// which stands for every family. It also reports whether the command calls
+// for a reconciliation at all: an image command changes no placement, and
+// every family's reconciliation read the record of each on the node.
+func commandReconciledFamilies(args []string, b *runtimeBackend) ([]string, bool) {
 	switch name := daemonCommandName(args); {
-	case familyScopedCommands[name], name == "migrate", name == "run", name == "create":
-		return b.resolvedFamilies.list()
+	case imageCommand(args):
+		return nil, false
+	case familyScopedCommands[name], name == "migrate", name == "run", name == "create", name == "restore":
+		return b.resolvedFamilies.list(), true
 	case name == "_auto-remove-now", name == "checkpoint", name == "commit":
 		// They change only the family whose branch they resolve, a run
 		// --rm's when its branch exits among them: every family's
 		// reconciliation read the record of each on the node.
-		return b.resolvedFamilies.list()
+		return b.resolvedFamilies.list(), true
 	case name == "_remove-family-record" && len(args) > 1:
 		// The family whose record it removed, which it names last: as a
 		// removal of the family's branches, it changed no other. Every
 		// family's reconciliation read the record of each on the node.
-		return args[len(args)-1:]
+		return args[len(args)-1:], true
 	default:
-		return nil
+		return nil, true
 	}
+}
+
+// imageCommand reports whether args are an image command's, which changes
+// the image store and no family.
+func imageCommand(args []string) bool {
+	if len(args) != 0 && args[0] == "container" {
+		args = args[1:]
+	}
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "pull", "load", "save", "rmi":
+		return true
+	case "image":
+		return len(args) > 1 && (args[1] == "pull" || args[1] == "load" || args[1] == "save" || args[1] == "rm" || args[1] == "remove")
+	}
+	return false
 }
 
 func daemonCommandNeedsMutationLock(args []string) bool {

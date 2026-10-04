@@ -2838,27 +2838,34 @@ func TestDecodeRuntimeStateStatusDistinguishesStoppedSandbox(t *testing.T) {
 
 // TestCommandReconciledFamilies checks which families a command's placement
 // reconciliation covers: those it resolved if it changes only them, the
-// family whose record it removed, or every family, nil, otherwise.
+// family whose record it removed, or every family, nil, otherwise; and that
+// an image command calls for none.
 func TestCommandReconciledFamilies(t *testing.T) {
 	resolved := &runtimeBackend{resolvedFamilies: &familySet{}}
 	resolved.resolvedFamilies.add("family-id")
 	for _, test := range []struct {
-		args []string
-		want []string
+		args      []string
+		want      []string
+		reconcile bool
 	}{
-		{[]string{"pause", "web@main"}, []string{"family-id"}},
-		{[]string{"rm", "-f", "web@main"}, []string{"family-id"}},
-		{[]string{"_auto-remove-now", "web@main"}, []string{"family-id"}},
-		{[]string{"checkpoint", "web@main", "/tmp/checkpoint"}, []string{"family-id"}},
-		{[]string{"commit", "web@main", "image:tag"}, []string{"family-id"}},
-		{[]string{"_remove-family-record", "removed-id"}, []string{"removed-id"}},
-		{[]string{"_remove-family-record", "--volumes", "removed-id"}, []string{"removed-id"}},
-		{[]string{"_remove-family-record"}, nil},
-		{[]string{"pull", "alpine"}, nil},
-		{[]string{"restore", "/tmp/checkpoint", "web2"}, nil},
+		{[]string{"pause", "web@main"}, []string{"family-id"}, true},
+		{[]string{"rm", "-f", "web@main"}, []string{"family-id"}, true},
+		{[]string{"_auto-remove-now", "web@main"}, []string{"family-id"}, true},
+		{[]string{"checkpoint", "web@main", "/tmp/checkpoint"}, []string{"family-id"}, true},
+		{[]string{"commit", "web@main", "image:tag"}, []string{"family-id"}, true},
+		{[]string{"restore", "/tmp/checkpoint", "web2"}, []string{"family-id"}, true},
+		{[]string{"_remove-family-record", "removed-id"}, []string{"removed-id"}, true},
+		{[]string{"_remove-family-record", "--volumes", "removed-id"}, []string{"removed-id"}, true},
+		{[]string{"_remove-family-record"}, nil, true},
+		{[]string{"node", "drain", "n1"}, nil, true},
+		{[]string{"pull", "alpine"}, nil, false},
+		{[]string{"load", "-i", "alpine.tar"}, nil, false},
+		{[]string{"rmi", "alpine"}, nil, false},
+		{[]string{"image", "rm", "alpine"}, nil, false},
 	} {
-		if got := commandReconciledFamilies(test.args, resolved); !slices.Equal(got, test.want) {
-			t.Errorf("commandReconciledFamilies(%q) = %q, want %q", test.args, got, test.want)
+		got, reconcile := commandReconciledFamilies(test.args, resolved)
+		if !slices.Equal(got, test.want) || reconcile != test.reconcile {
+			t.Errorf("commandReconciledFamilies(%q) = %q, %t, want %q, %t", test.args, got, reconcile, test.want, test.reconcile)
 		}
 	}
 }

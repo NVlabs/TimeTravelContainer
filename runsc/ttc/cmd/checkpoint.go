@@ -828,6 +828,9 @@ func (b *runtimeBackend) restoreCheckpoint(source, name string) (id string, retE
 	if err != nil {
 		return "", errors.Join(err, finishFilesystemOrigins(false))
 	}
+	// The family the restore makes is the one the reconciliation after it
+	// covers, as a run's is.
+	b.resolvedFamilies.resolved(prepared.Container.Name, prepared.Container)
 	if err := finishFilesystemOrigins(true); err != nil {
 		return "", errors.Join(err, b.containerStore().RemoveContainer(prepared.Container.ID))
 	}
