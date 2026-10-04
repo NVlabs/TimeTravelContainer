@@ -118,3 +118,35 @@ func newCloneRegistryRoot() *cloneRegistryRoot {
 	}
 	return root
 }
+
+// cloneShape is an interface with methods.
+type cloneShape interface {
+	area() int
+}
+
+// cloneSquare is a shape an interface holds by pointer.
+//
+// +stateify savable
+type cloneSquare struct {
+	side int
+	next *cloneSquare
+}
+
+func (s *cloneSquare) area() int { return s.side * s.side }
+
+// cloneCircle is a shape an interface holds by value.
+//
+// +stateify savable
+type cloneCircle struct {
+	r int
+}
+
+func (c cloneCircle) area() int { return 3 * c.r * c.r }
+
+// cloneShapes holds shapes in interfaces with methods.
+//
+// +stateify savable
+type cloneShapes struct {
+	square, circle, none cloneShape
+	sq                   *cloneSquare
+}

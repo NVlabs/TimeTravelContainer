@@ -262,3 +262,44 @@ func TestCloneTakesValuesWhenSaved(t *testing.T) {
 		t.Errorf("the clone's registry has %d entries, the load's %d", len(cloned.reg.entries), len(loaded.reg.entries))
 	}
 }
+
+// TestCloneInterfacesWithMethods checks that the copies of interfaces with
+// methods hold copies of what the source's hold, by pointer and by value,
+// and copies of a recording too.
+func TestCloneInterfacesWithMethods(t *testing.T) {
+	sq := &cloneSquare{side: 3}
+	sq.next = sq
+	src := &cloneShapes{square: sq, circle: cloneCircle{r: 2}, sq: sq}
+	check := func(c *cloneShapes) {
+		t.Helper()
+		square, ok := c.square.(*cloneSquare)
+		if !ok || square == sq || square != c.sq || square.next != square || c.square.area() != 9 {
+			t.Errorf("the square is %#v, want a copy of the source's that the clone points to", c.square)
+		}
+		if circle, ok := c.circle.(cloneCircle); !ok || circle.r != 2 || c.circle.area() != 12 {
+			t.Errorf("the circle is %#v, want cloneCircle{r: 2}", c.circle)
+		}
+		if c.none != nil {
+			t.Errorf("an interface that held nothing holds %#v", c.none)
+		}
+	}
+	var c cloneShapes
+	if _, err := state.Clone(context.Background(), context.Background(), src, &c, state.SaveOptions{}); err != nil {
+		t.Fatalf("Clone: %v", err)
+	}
+	check(&c)
+	rec, err := state.Record(context.Background(), src, state.SaveOptions{})
+	if err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	copies := make([]cloneShapes, 3)
+	for i := range copies {
+		if _, err := rec.Copy(context.Background(), &copies[i]); err != nil {
+			t.Fatalf("Copy %d: %v", i, err)
+		}
+		check(&copies[i])
+	}
+	if copies[0].sq == copies[1].sq {
+		t.Errorf("copies share a square")
+	}
+}

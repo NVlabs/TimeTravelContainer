@@ -78,6 +78,7 @@ func Record(saveCtx context.Context, srcPtr any, opts SaveOptions) (*Recording, 
 	// Recording's own state goes with the recording: copies need none of
 	// it.
 	cs.recorders, cs.recordSlab, cs.slotSlab, cs.oesSlab, cs.cloneSlab = nil, nil, nil, nil, nil
+	cs.recorded = true
 	return &Recording{cs: cs, record: time.Since(start)}, nil
 }
 
@@ -129,10 +130,15 @@ type cloneState struct {
 	// by the structs' addresses, of structs of different types each.
 	structs map[uintptr]*structRecord
 
-	// types caches what the clone needs to know of types, by rtypeOf.
-	// Copies, which may run at once, add to it, under typesMu.
-	typesMu sync.RWMutex
-	types   map[uintptr]*cloneTypeInfo
+	// types caches what the clone needs to know of types, by rtypeOf. Only
+	// the recording adds to it, before any copy reads it; copies, which may
+	// run at once, read it without a lock, and add the types it lacks to
+	// copyTypes, under copyTypesMu. Read under an RWMutex, it took an
+	// eighth of a small branch's fork, in the lock's atomics.
+	types       map[uintptr]*cloneTypeInfo
+	recorded    bool
+	copyTypesMu sync.Mutex
+	copyTypes   map[uintptr]*cloneTypeInfo
 
 	// ifaceCopies are addressable copies of the structs and arrays that
 	// interfaces hold, by the addresses of the interfaces' recorded
@@ -221,19 +227,30 @@ type slotType struct {
 // typeInfo returns what the clone knows of typ.
 func (cs *cloneState) typeInfo(typ reflect.Type) *cloneTypeInfo {
 	tid := rtypeOf(typ)
-	cs.typesMu.RLock()
-	ti, ok := cs.types[tid]
-	cs.typesMu.RUnlock()
+	if ti, ok := cs.types[tid]; ok {
+		return ti
+	}
+	if !cs.recorded {
+		ti := cs.newTypeInfo(typ)
+		cs.types[tid] = ti
+		return ti
+	}
+	cs.copyTypesMu.Lock()
+	ti, ok := cs.copyTypes[tid]
+	cs.copyTypesMu.Unlock()
 	if ok {
 		return ti
 	}
 	ti = cs.newTypeInfo(typ)
-	cs.typesMu.Lock()
-	defer cs.typesMu.Unlock()
-	if other, ok := cs.types[tid]; ok {
+	cs.copyTypesMu.Lock()
+	defer cs.copyTypesMu.Unlock()
+	if other, ok := cs.copyTypes[tid]; ok {
 		return other
 	}
-	cs.types[tid] = ti
+	if cs.copyTypes == nil {
+		cs.copyTypes = make(map[uintptr]*cloneTypeInfo)
+	}
+	cs.copyTypes[tid] = ti
 	return ti
 }
 
@@ -860,7 +877,7 @@ func (r *copyRun) copyValue(oes *objectEncodeState, dst, src reflect.Value, wait
 		}
 		v := reflect.New(e.Type()).Elem()
 		r.copyValue(oes, v, e, wait, fn)
-		dst.Set(v)
+		setInterface(dst, src, v)
 		return
 	case reflect.Struct:
 		rec := cs.lookupStruct(src.UnsafeAddr(), rtypeOf(src.Type()))
@@ -898,6 +915,22 @@ func (r *copyRun) copyValue(oes *objectEncodeState, dst, src reflect.Value, wait
 		// Nothing to wait for.
 		fn()
 	}
+}
+
+// setInterface sets dst, an interface, to v, a copy of what src, an
+// interface, holds. reflect.Value.Set looks for each of the interface's
+// methods in v's type, every time: an interface of the type of src, which
+// holds a value of v's type, has the type word dst needs, and v, as any
+// interface holds it, the data word.
+func setInterface(dst, src, v reflect.Value) {
+	if rtypeOf(dst.Type()) != rtypeOf(src.Type()) || !dst.CanAddr() || !src.CanAddr() || rtypeOf(src.Elem().Type()) != rtypeOf(v.Type()) {
+		dst.Set(v)
+		return
+	}
+	held := v.Interface()
+	words := (*[2]unsafe.Pointer)(unsafe.Pointer(dst.UnsafeAddr()))
+	words[0] = (*[2]unsafe.Pointer)(unsafe.Pointer(src.UnsafeAddr()))[0]
+	words[1] = (*[2]unsafe.Pointer)(unsafe.Pointer(&held))[1]
 }
 
 // pushLoader returns a loader for a struct's StateLoad method, which
