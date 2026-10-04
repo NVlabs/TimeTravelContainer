@@ -268,38 +268,48 @@ func (s Store) publishedContainerIdentities() (map[string]containerIdentity, err
 		return nil, fmt.Errorf("listing containers: %w", err)
 	}
 	identities := make(map[string]containerIdentity, len(entries))
+	var unknown []fs.DirEntry
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
 		id := entry.Name()
-		key := s.Root + "\x00" + id
 		containerNameHints.mu.Lock()
-		identity, known := containerNameHints.identities[key]
+		identity, known := containerNameHints.identities[s.Root+"\x00"+id]
 		containerNameHints.mu.Unlock()
 		if !known {
-			info, err := s.loadContainerKey(id)
-			if err != nil || info.DistributedForkHidden {
-				// Unpublished, removed since the directory was read, or
-				// unreadable, which a listing skips too; or a hidden target,
-				// whose publication is yet to come.
-				continue
-			}
-			identity = containerIdentity{family: info.ID}
-			if info.DistributedFamilyID != "" {
-				identity.family = info.DistributedFamilyID
-			}
-			if !info.IsDistributedPhysicalRuntime() {
-				identity.name = info.Name
-				setContainerNameHint(s.Root+"\x00"+info.Name, id)
-			}
-			containerNameHints.mu.Lock()
-			if containerNameHints.identities == nil || len(containerNameHints.identities) >= maxContainerNameHints {
-				containerNameHints.identities = make(map[string]containerIdentity)
-			}
-			containerNameHints.identities[key] = identity
-			containerNameHints.mu.Unlock()
+			unknown = append(unknown, entry)
+			continue
 		}
+		identities[id] = identity
+	}
+	// Several at once, as a listing reads them: one after another, the
+	// records of the families made elsewhere since were round trips of the
+	// shared root in turn.
+	loaded := s.loadContainerKeys(unknown)
+	for i, entry := range unknown {
+		id := entry.Name()
+		info, err := loaded[i].info, loaded[i].err
+		if err != nil || info.DistributedForkHidden {
+			// Unpublished, removed since the directory was read, or
+			// unreadable, which a listing skips too; or a hidden target,
+			// whose publication is yet to come.
+			continue
+		}
+		identity := containerIdentity{family: info.ID}
+		if info.DistributedFamilyID != "" {
+			identity.family = info.DistributedFamilyID
+		}
+		if !info.IsDistributedPhysicalRuntime() {
+			identity.name = info.Name
+			setContainerNameHint(s.Root+"\x00"+info.Name, id)
+		}
+		containerNameHints.mu.Lock()
+		if containerNameHints.identities == nil || len(containerNameHints.identities) >= maxContainerNameHints {
+			containerNameHints.identities = make(map[string]containerIdentity)
+		}
+		containerNameHints.identities[s.Root+"\x00"+id] = identity
+		containerNameHints.mu.Unlock()
 		identities[id] = identity
 	}
 	return identities, nil
@@ -4037,6 +4047,35 @@ type loadedContainer struct {
 // loadContainerKeys reads the records of the directories among entries, in
 // entries' order. Each read waits on the shared root's round trips, which on
 // a network mount make a listing's time: it reads several at once.
+// readContainerSpecs reads the OCI config of each of infos, listReadWorkers
+// at once.
+func readContainerSpecs(infos []ContainerInfo) []loadedSpec {
+	read := make([]loadedSpec, len(infos))
+	work := make(chan int)
+	var workers sync.WaitGroup
+	for range min(listReadWorkers, len(infos)) {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for i := range work {
+				read[i].data, read[i].err = readFileWithStaleRetry(filepath.Join(infos[i].BundleDir, "config.json"))
+			}
+		}()
+	}
+	for i := range infos {
+		work <- i
+	}
+	close(work)
+	workers.Wait()
+	return read
+}
+
+// loadedSpec is what readContainerSpecs read of a container's OCI config.
+type loadedSpec struct {
+	data []byte
+	err  error
+}
+
 func (s Store) loadContainerKeys(entries []fs.DirEntry) []loadedContainer {
 	loaded := make([]loadedContainer, len(entries))
 	work := make(chan int)
@@ -5929,6 +5968,7 @@ func (s Store) originRepositoryPaths(manager *ttcvolume.Manager) (map[string]str
 		return true
 	})
 	loaded := s.loadContainerKeys(unknown)
+	infos := make([]ContainerInfo, 0, len(unknown))
 	for i, entry := range unknown {
 		info, err := loaded[i].info, loaded[i].err
 		if err != nil {
@@ -5944,7 +5984,13 @@ func (s Store) originRepositoryPaths(manager *ttcvolume.Manager) (map[string]str
 				return nil, err
 			}
 		}
-		data, err := readFileWithStaleRetry(filepath.Join(info.BundleDir, "config.json"))
+		infos = append(infos, info)
+	}
+	// Their specs too are read several at once: one after another, after
+	// families were made, they were round trips of the shared root in turn.
+	configs := readContainerSpecs(infos)
+	for i, info := range infos {
+		data, err := configs[i].data, configs[i].err
 		if err != nil {
 			// Removed since it was listed: see addContainerRepositoryPaths.
 			if sharedPathGone(filepath.Join(s.Root, "containers", info.ID)) {
