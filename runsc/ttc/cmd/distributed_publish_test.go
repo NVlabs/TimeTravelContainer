@@ -418,6 +418,31 @@ func TestPublicationBridgeIntentRoundTrip(t *testing.T) {
 	}
 }
 
+// A bridge its owner removes after the shared GC listed the bridges, but
+// before the GC read it, is gone: the GC passes over it rather than failing.
+func TestPublicationBridgeIntentsPassOverOneRemovedSinceListed(t *testing.T) {
+	root := t.TempDir()
+	intent := sharedPublicationBridgeIntent{
+		Version: sharedPublicationBridgeIntentVersion, Snapshot: 23,
+		Kind: sharedPublicationBridgeTransaction, Transaction: "fork-kept", CreatedAt: time.Now().UTC(),
+	}
+	if err := persistSharedPublicationBridgeIntent(root, intent); err != nil {
+		t.Fatal(err)
+	}
+	// A name the directory lists that no longer opens, as one removed since.
+	removed := sharedPublicationBridgeIntentPath(root, ttcsnapshot.SnapshotID(42))
+	if err := os.Symlink(removed+".gone", removed); err != nil {
+		t.Fatal(err)
+	}
+	intents, err := loadSharedPublicationBridgeIntents(root)
+	if err != nil {
+		t.Fatalf("loading bridges with one removed since listed: %v", err)
+	}
+	if len(intents) != 1 || intents[0].Snapshot != intent.Snapshot {
+		t.Fatalf("loaded intents=%+v, want only snapshot %d's", intents, intent.Snapshot)
+	}
+}
+
 func TestPublicationBridgeIntentAdoptsTerminalTransaction(t *testing.T) {
 	root := t.TempDir()
 	old := sharedPublicationBridgeIntent{

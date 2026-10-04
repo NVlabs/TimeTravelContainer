@@ -193,6 +193,12 @@ func loadSharedPublicationBridgeIntents(sharedRoot string) ([]sharedPublicationB
 			continue
 		}
 		data, err := os.ReadFile(filepath.Join(directory, entry.Name()))
+		if errors.Is(err, os.ErrNotExist) {
+			// Its owner removed it since the directory was read, as a
+			// publication that completes does, without the directory's lock:
+			// it is gone, as a later reading would find.
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
