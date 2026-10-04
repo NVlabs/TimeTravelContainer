@@ -7750,6 +7750,27 @@ func TestOrderFamilyRemovalPlacementsTreatsEmptyPhysicalContainerAsCanonical(t *
 	}
 }
 
+// A family's removal removes the branches in its canonical container last,
+// one after another, so that their node removes them in one command, after
+// the branches of other containers.
+func TestOrderFamilyRemovalPlacementsRemovesTheCanonicalContainerTogether(t *testing.T) {
+	records := []cluster.PlacementRecord{
+		{FamilyID: "family", BranchID: "a", PhysicalContainer: "family", PhysicalBranch: "a", OwnerNode: "n2"},
+		{FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main", OwnerNode: "n2"},
+		{FamilyID: "family", BranchID: "remote", PhysicalContainer: "fork-runtime", PhysicalBranch: "remote", OwnerNode: "n3"},
+		{FamilyID: "family", BranchID: "z", PhysicalContainer: "family", PhysicalBranch: "z", OwnerNode: "n2"},
+		{FamilyID: "family", BranchID: "zremote", PhysicalContainer: "fork-runtime", PhysicalBranch: "zremote", OwnerNode: "n3"},
+	}
+	orderFamilyRemovalPlacements(records, "family")
+	var got []string
+	for _, record := range records {
+		got = append(got, record.BranchID)
+	}
+	if want := []string{"remote", "zremote", "main", "z", "a"}; !slices.Equal(got, want) {
+		t.Fatalf("removal order %v, want %v", got, want)
+	}
+}
+
 func TestFilesystemAccountingDefersZeroByteMetadataDependency(t *testing.T) {
 	branch := ttcbundle.BranchInfo{DistributedForkTransactionID: "fork-1"}
 	if !deferFilesystemAccounting(branch, map[string]bool{"fork-1": true}) {

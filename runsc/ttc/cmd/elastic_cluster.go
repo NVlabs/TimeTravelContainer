@@ -2594,15 +2594,22 @@ func logicalFamilyPlacements(catalog cluster.PlacementCatalog, familyID string) 
 // container until last. The final child is a family rm, so it must execute
 // where removing the canonical family record can also tear down its runtime.
 // Branches materialized in transaction-named physical containers are removed
-// individually first.
+// individually first, and the canonical container's other branches just
+// before its last: the removals of branches on one node that follow one
+// another are one command, which removes a container whose branches it names
+// all at once, rather than a branch at a time, each collecting its filesystem
+// in the runtime first.
 func orderFamilyRemovalPlacements(records []cluster.PlacementRecord, familyID string) {
+	canonical := func(record cluster.PlacementRecord) bool {
+		physicalContainer := record.PhysicalContainer
+		if physicalContainer == "" {
+			physicalContainer = record.FamilyID
+		}
+		return physicalContainer == familyID
+	}
 	final := -1
 	for i := range records {
-		physicalContainer := records[i].PhysicalContainer
-		if physicalContainer == "" {
-			physicalContainer = records[i].FamilyID
-		}
-		if physicalContainer != familyID {
+		if !canonical(records[i]) {
 			continue
 		}
 		physicalBranch := records[i].PhysicalBranch
@@ -2616,11 +2623,18 @@ func orderFamilyRemovalPlacements(records []cluster.PlacementRecord, familyID st
 			break
 		}
 	}
-	if final >= 0 && final != len(records)-1 {
-		selected := records[final]
-		copy(records[final:], records[final+1:])
-		records[len(records)-1] = selected
+	if final < 0 {
+		return
 	}
+	ordered := make([]cluster.PlacementRecord, 0, len(records))
+	for _, last := range []bool{false, true} {
+		for i := range records {
+			if i != final && canonical(records[i]) == last {
+				ordered = append(ordered, records[i])
+			}
+		}
+	}
+	copy(records, append(ordered, records[final]))
 }
 
 type distributedStatsPartition struct {
