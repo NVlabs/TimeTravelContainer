@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -939,5 +940,69 @@ func TestMutateContainerResolvesAsLoadingDoes(t *testing.T) {
 	wantErr := errors.New("refused")
 	if err := store.mutateContainer(family, func(*ContainerInfo) (bool, error) { calls++; return false, wantErr }); err != wantErr || calls != 1 {
 		t.Errorf("mutateContainer with a failing mutate = %v, called %d times", err, calls)
+	}
+}
+
+// A cluster node lists the images of its containers from each one's record
+// the first time it lists the container, and forgets a container whose
+// state is gone.
+func TestActiveContainerImagesReadsEachRecordOnce(t *testing.T) {
+	shared, local := t.TempDir(), t.TempDir()
+	store := Store{Root: shared, ActiveRoot: local}
+	write := func(id, digest string) {
+		t.Helper()
+		containerDir := filepath.Join(shared, "containers", id)
+		bundleDir := filepath.Join(containerDir, "bundle")
+		if err := os.MkdirAll(bundleDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &ContainerInfo{ID: id, Name: "name-" + id[:4], BundleDir: bundleDir, Digest: digest, Platform: "linux/amd64"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(local, "containers", id), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	images := func() map[string]string {
+		t.Helper()
+		containers, err := store.activeContainerImages()
+		if err != nil {
+			t.Fatalf("activeContainerImages: %v", err)
+		}
+		got := make(map[string]string)
+		for _, info := range containers {
+			got[info.ID] = info.Digest + " " + info.Platform + " " + info.Name
+		}
+		return got
+	}
+	first, second := strings.Repeat("a", 2*containerIDBytes), strings.Repeat("b", 2*containerIDBytes)
+	write(first, "sha256:one")
+	write(second, "sha256:two")
+	want := map[string]string{first: "sha256:one linux/amd64 name-aaaa", second: "sha256:two linux/amd64 name-bbbb"}
+	if got := images(); !maps.Equal(got, want) {
+		t.Fatalf("images = %v, want %v", got, want)
+	}
+	// Records listed before are not read again: a container's image never
+	// changes, so this one, written over, keeps the image first read.
+	write(first, "sha256:rewritten")
+	if got := images(); !maps.Equal(got, want) {
+		t.Fatalf("images after a record changed = %v, want %v", got, want)
+	}
+	// A container whose state left the node is forgotten: made again, its
+	// record is read again.
+	if err := os.RemoveAll(filepath.Join(local, "containers", first)); err != nil {
+		t.Fatal(err)
+	}
+	delete(want, first)
+	if got := images(); !maps.Equal(got, want) {
+		t.Fatalf("images after a container left = %v, want %v", got, want)
+	}
+	write(first, "sha256:again")
+	want[first] = "sha256:again linux/amd64 name-aaaa"
+	if got := images(); !maps.Equal(got, want) {
+		t.Fatalf("images after a container came back = %v, want %v", got, want)
 	}
 }

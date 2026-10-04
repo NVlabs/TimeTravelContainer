@@ -6550,6 +6550,18 @@ const nodeLocalImageCacheGrace = time.Minute
 // PruneImageRoots removes current-format materialized image roots that are no
 // longer usable by either the image catalog or a persistent container.
 func (s Store) PruneImageRoots(ctx context.Context) (int, error) {
+	if s.activeRoot() != s.Root {
+		// A node of a cluster keeps an image's root while a container with
+		// state on the node was made of the image, and for a grace period
+		// after; not because the shared store has the image. It lists no
+		// image, which took the store's lock and a stat of each image's
+		// content, and reads a container's record only the first time.
+		containers, err := s.activeContainerImages()
+		if err != nil {
+			return 0, fmt.Errorf("listing containers before pruning image roots: %w", err)
+		}
+		return s.pruneImageRoots(nil, containers)
+	}
 	stored, err := images.List(ctx, images.ListOptions{Root: s.Root})
 	if err != nil {
 		return 0, fmt.Errorf("listing images before pruning roots: %w", err)
@@ -6559,6 +6571,75 @@ func (s Store) PruneImageRoots(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("listing containers before pruning image roots: %w", err)
 	}
 	return s.pruneImageRoots(stored, containers)
+}
+
+// containerImages maps a data root, a node's active root and the ID of a
+// container with state on the node to the image the container was made of,
+// which never changes for an ID: its name, digest and platform.
+var containerImages sync.Map
+
+type containerImage struct {
+	name, digest, platform string
+}
+
+// activeContainerImages returns the containers with state on a cluster's node
+// as ContainersWithActiveState does, but with only their IDs, names and
+// images: it reads the record of a container only the first time it lists it,
+// where pruning the node's image roots after each family's removal read every
+// container's, round trips of the shared root in proportion to the families
+// on the node.
+func (s Store) activeContainerImages() ([]ContainerInfo, error) {
+	entries, err := os.ReadDir(filepath.Join(s.activeRoot(), "containers"))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("listing active container state: %w", err)
+	}
+	prefix := s.Root + "\x00" + s.activeRoot() + "\x00"
+	listed := make(map[string]struct{}, len(entries))
+	var containers []ContainerInfo
+	var unknown []fs.DirEntry
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		listed[prefix+entry.Name()] = struct{}{}
+		if kept, ok := containerImages.Load(prefix + entry.Name()); ok {
+			image := kept.(containerImage)
+			containers = append(containers, ContainerInfo{ID: entry.Name(), Name: image.name, Digest: image.digest, Platform: image.platform})
+			continue
+		}
+		unknown = append(unknown, entry)
+	}
+	containerImages.Range(func(key, _ any) bool {
+		if name := key.(string); strings.HasPrefix(name, prefix) {
+			if _, ok := listed[name]; !ok {
+				containerImages.Delete(name)
+			}
+		}
+		return true
+	})
+	loaded := s.loadContainerKeys(unknown)
+	for i, entry := range unknown {
+		info, err := loaded[i].info, loaded[i].err
+		if err != nil {
+			// As ContainersWithActiveState passes over it.
+			containerDir := filepath.Join(s.Root, "containers", entry.Name())
+			if _, markerErr := os.Stat(filepath.Join(containerDir, containerCreationMarker)); markerErr == nil {
+				continue
+			}
+			if sharedPathGone(containerDir) {
+				continue
+			}
+			if info, err = s.loadContainerKey(entry.Name()); err != nil {
+				return nil, err
+			}
+		}
+		containerImages.Store(prefix+entry.Name(), containerImage{name: info.Name, digest: info.Digest, platform: info.Platform})
+		containers = append(containers, ContainerInfo{ID: info.ID, Name: info.Name, Digest: info.Digest, Platform: info.Platform})
+	}
+	return containers, nil
 }
 
 func (s Store) pruneImageRoots(stored []images.Info, containers []ContainerInfo) (int, error) {
