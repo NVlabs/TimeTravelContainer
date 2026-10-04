@@ -1305,10 +1305,6 @@ func (b *runtimeBackend) registerLocalForkPlacements(info ttcbundle.ContainerInf
 	if b == nil || b.distributedSource == nil || b.distributedSource.authority == nil || b.nodeID == "" || len(branches) == 0 {
 		return nil
 	}
-	owner, err := b.renewDistributedExecutionAuthority()
-	if err != nil {
-		return fmt.Errorf("renewing fork placement authority: %w", err)
-	}
 	placements, err := b.placementCatalog()
 	if err != nil {
 		return err
@@ -1333,6 +1329,11 @@ func (b *runtimeBackend) registerLocalForkPlacements(info ttcbundle.ContainerInf
 		}
 		return errors.Join(cause, rollbackErr)
 	}
+	// As a run's placement is (reserveNewContainerPlacement), each is created
+	// for the node's incarnation, whose lease is renewed only if the
+	// authority refuses it for want of one.
+	incarnation := b.distributedSource.incarnation
+	renewed := false
 	now := time.Now()
 	for i := range branches {
 		branch := branches[i]
@@ -1340,14 +1341,26 @@ func (b *runtimeBackend) registerLocalForkPlacements(info ttcbundle.ContainerInf
 		if state != cluster.PlacementRunning && state != cluster.PlacementPaused {
 			return rollback(fmt.Errorf("forked branch %q has non-routable state %q", branch.ID, branch.State))
 		}
-		record, err := placements.Create(cluster.PlacementRecord{
+		placement := cluster.PlacementRecord{
 			FamilyID: logicalFamily, BranchID: branch.ID, PhysicalContainer: info.ID, PhysicalBranch: branch.ID,
-			OwnerNode: b.nodeID, OwnerIncarnation: owner.Incarnation, State: state,
+			OwnerNode: b.nodeID, OwnerIncarnation: incarnation, State: state,
 			FamilyName: display.Name, ImageReference: display.Reference, ImageDigest: display.Digest, ImageSize: display.ImageSize,
 			LiveForkEligible: display.LiveForkEligible, LiveForkWaiver: display.LiveForkWaiver,
 			FamilyCreatedAt: display.CreatedAt, ParentBranch: branch.ParentID, BranchCreatedAt: branch.CreatedAt,
 			Quarantined: branch.Quarantined,
-		}, now)
+		}
+		record, err := placements.Create(placement, now)
+		if cluster.IsNoExecutionLease(err) && !renewed {
+			owner, renewErr := b.renewDistributedExecutionAuthority()
+			if renewErr != nil {
+				return rollback(fmt.Errorf("renewing fork placement authority: %w", renewErr))
+			}
+			renewed = true
+			incarnation = owner.Incarnation
+			placement.OwnerIncarnation = incarnation
+			now = time.Now()
+			record, err = placements.Create(placement, now)
+		}
 		if err != nil {
 			return rollback(fmt.Errorf("registering fork placement for %s@%s: %w", logicalFamily, branch.ID, err))
 		}
