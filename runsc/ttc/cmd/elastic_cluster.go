@@ -1076,6 +1076,14 @@ func (b *runtimeBackend) reconcilePlacementCatalogOf(families ...string) error {
 				if current.State != cluster.NodeReady {
 					continue
 				}
+				// A branch a command is making is the command's to place: a
+				// fork records its new branches before it registers their
+				// placements, and one whose placement a reconciliation of its
+				// family created first, as another command on the node can
+				// run at once with it, failed and destroyed its branches.
+				if b.operations.beingMade(info.ID, branch.ID) {
+					continue
+				}
 				_, createErr := placements.Create(cluster.PlacementRecord{
 					FamilyID: placementFamily, BranchID: placementBranch, PhysicalContainer: info.ID, PhysicalBranch: branch.ID,
 					OwnerNode: b.nodeID, OwnerIncarnation: current.Incarnation, State: state,
