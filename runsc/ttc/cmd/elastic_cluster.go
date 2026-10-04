@@ -1129,10 +1129,6 @@ func (b *runtimeBackend) reserveNewContainerPlacement(info ttcbundle.ContainerIn
 	if b == nil || b.distributedSource == nil || b.distributedSource.authority == nil || b.nodeID == "" {
 		return newPlacementReservation{}, nil
 	}
-	owner, err := b.renewDistributedExecutionAuthority()
-	if err != nil {
-		return newPlacementReservation{}, fmt.Errorf("renewing new-container placement authority: %w", err)
-	}
 	placements, err := b.placementCatalog()
 	if err != nil {
 		return newPlacementReservation{}, err
@@ -1141,14 +1137,29 @@ func (b *runtimeBackend) reserveNewContainerPlacement(info ttcbundle.ContainerIn
 	if err != nil {
 		return newPlacementReservation{}, err
 	}
-	record, err := placements.Create(cluster.PlacementRecord{
-		FamilyID: info.ID, BranchID: branch.ID, PhysicalContainer: info.ID, PhysicalBranch: branch.ID,
-		OwnerNode: b.nodeID, OwnerIncarnation: owner.Incarnation, State: cluster.PlacementMaterializing,
-		FamilyName: info.Name, ImageReference: info.Reference, ImageDigest: info.Digest, ImageSize: info.ImageSize,
-		LiveForkEligible: info.LiveForkEligible, LiveForkWaiver: info.LiveForkWaiver,
-		FamilyCreatedAt: info.CreatedAt, ParentBranch: branch.ParentID, BranchCreatedAt: branch.CreatedAt,
-		Quarantined: branch.Quarantined,
-	}, time.Now())
+	reserve := func(incarnation string) (*cluster.PlacementRecord, error) {
+		return placements.Create(cluster.PlacementRecord{
+			FamilyID: info.ID, BranchID: branch.ID, PhysicalContainer: info.ID, PhysicalBranch: branch.ID,
+			OwnerNode: b.nodeID, OwnerIncarnation: incarnation, State: cluster.PlacementMaterializing,
+			FamilyName: info.Name, ImageReference: info.Reference, ImageDigest: info.Digest, ImageSize: info.ImageSize,
+			LiveForkEligible: info.LiveForkEligible, LiveForkWaiver: info.LiveForkWaiver,
+			FamilyCreatedAt: info.CreatedAt, ParentBranch: branch.ParentID, BranchCreatedAt: branch.CreatedAt,
+			Quarantined: branch.Quarantined,
+		}, time.Now())
+	}
+	// The authority creates the placement only for an owner whose execution
+	// lease is active in its term, and the node's heartbeat keeps the lease
+	// two thirds fresh: the lease is renewed only if the authority refuses
+	// it, as after a holder took over and before the next heartbeat.
+	// Renewed every time, it was a query and a proposal of each run.
+	record, err := reserve(b.distributedSource.incarnation)
+	if cluster.IsNoExecutionLease(err) {
+		owner, renewErr := b.renewDistributedExecutionAuthority()
+		if renewErr != nil {
+			return newPlacementReservation{}, fmt.Errorf("renewing new-container placement authority: %w", renewErr)
+		}
+		record, err = reserve(owner.Incarnation)
+	}
 	if err != nil {
 		return newPlacementReservation{}, fmt.Errorf("reserving placement for %s@%s: %w", info.Name, branch.ID, err)
 	}

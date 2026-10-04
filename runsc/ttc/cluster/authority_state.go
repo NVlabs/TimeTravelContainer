@@ -1753,10 +1753,21 @@ func (s *AuthorityState) applyPlacement(command AuthorityCommand) (json.RawMessa
 	return authorityValue(record)
 }
 
+// NoExecutionLease is the authority's refusal of a command for a node whose
+// incarnation has no active execution lease in the authority's term.
+const NoExecutionLease = "node incarnation has no active execution lease"
+
+// IsNoExecutionLease reports whether err is the authority's refusal of a
+// command for a node without an active execution lease: one the node may
+// remedy by renewing its lease.
+func IsNoExecutionLease(err error) bool {
+	return err != nil && strings.Contains(err.Error(), NoExecutionLease)
+}
+
 func (s *AuthorityState) requireNodeIncarnation(nodeID, incarnation string, at time.Time, term uint64, accepting bool) error {
 	node, ok := s.Nodes[nodeID]
 	if !ok || node.Incarnation != incarnation || node.LeaseEpoch != term || !node.LeaseActive(at) {
-		return errors.New("node incarnation has no active execution lease")
+		return errors.New(NoExecutionLease)
 	}
 	if accepting && !node.AcceptsPlacement(at) {
 		return errors.New("node is not accepting placement")

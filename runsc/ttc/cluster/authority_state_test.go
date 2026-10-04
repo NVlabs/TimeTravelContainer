@@ -1520,3 +1520,36 @@ func TestAuthoritySnapshotRejectsUnfencedPublication(t *testing.T) {
 		t.Fatal("snapshot restored a branch with a missing publication fence")
 	}
 }
+
+// TestAuthorityRefusesAPlacementOfANodeWithoutALease checks that a placement
+// whose owner has no active execution lease, of a stale incarnation or one
+// expired, is refused with the refusal IsNoExecutionLease recognizes, which
+// a node remedies by renewing, and that no other refusal is taken for it.
+func TestAuthorityRefusesAPlacementOfANodeWithoutALease(t *testing.T) {
+	at := time.Unix(3000, 0).UTC()
+	state := NewAuthorityState()
+	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at.Add(-time.Second))
+	create := func(id, branch, incarnation string, when time.Time) error {
+		t.Helper()
+		command, err := NewAuthorityCommand(id, when, AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
+			FamilyID: "family", BranchID: branch, PhysicalContainer: "family", PhysicalBranch: branch,
+			OwnerNode: "node-a", OwnerIncarnation: incarnation, State: PlacementMaterializing,
+		}})
+		if err != nil {
+			t.Fatalf("NewAuthorityCommand: %v", err)
+		}
+		return state.Apply(command).Err()
+	}
+	if err := create("stale", "main", "incarnation-old", at); !IsNoExecutionLease(err) {
+		t.Fatalf("placement of a stale incarnation: %v, want a refusal for its lease", err)
+	}
+	if err := create("expired", "main", "incarnation-a", at.Add(2*time.Hour)); !IsNoExecutionLease(err) {
+		t.Fatalf("placement after the lease expired: %v, want a refusal for its lease", err)
+	}
+	if err := create("place", "main", "incarnation-a", at); err != nil {
+		t.Fatalf("placement of the node's incarnation: %v", err)
+	}
+	if err := create("again", "main", "incarnation-a", at); err == nil || IsNoExecutionLease(err) {
+		t.Fatalf("placement of a branch placed already: %v, want a refusal other than for its lease", err)
+	}
+}
