@@ -214,3 +214,51 @@ func copyTree(t *testing.T, from, to string) {
 		t.Fatal(err)
 	}
 }
+
+// A name marked dirty while a full fence syncs those it found, as a reader
+// registering a deferred object marks its pending marker without the
+// repository's lock, stays dirty for the next fence, which syncs it.
+func TestFullSyncKeepsWhatWasMarkedDirtyMeanwhile(t *testing.T) {
+	manager := openTestManager(t)
+	repo, err := manager.Create("marked-meanwhile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	if err := repo.mkdirAll("remote/aa/bb", 0700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join("remote", "aa", "bb", "marker")
+	file, err := repo.openFile(marker, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	afterNamesSynced = func(r *Repository) {
+		if r == repo {
+			r.markDirtyFile(marker)
+		}
+	}
+	defer func() { afterNamesSynced = nil }()
+	if err := repo.SyncMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	afterNamesSynced = nil
+	repo.dirtyMu.Lock()
+	_, dirty := repo.dirtyFiles[marker]
+	repo.dirtyMu.Unlock()
+	if !dirty {
+		t.Fatal("a name marked dirty during a full fence was forgotten unsynced")
+	}
+	if err := repo.SyncMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	repo.dirtyMu.Lock()
+	_, dirty = repo.dirtyFiles[marker]
+	repo.dirtyMu.Unlock()
+	if dirty {
+		t.Fatal("the next full fence did not sync the name marked dirty")
+	}
+}

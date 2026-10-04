@@ -3500,6 +3500,10 @@ func (r *Repository) syncBranchMetadataLocked(branchID string) error {
 	return nil
 }
 
+// afterNamesSynced, if not nil, runs as a full sync has synced the names it
+// found dirty: a test's stand-in for what a reader does meanwhile.
+var afterNamesSynced func(*Repository)
+
 // syncedNames are the repository files and directories one sync made durable.
 type syncedNames struct {
 	files       []string
@@ -3625,9 +3629,14 @@ func (r *Repository) syncMetadataLocked() error {
 	// Persist directory entries only after the files they name. The graph WAL
 	// is the final reachability barrier, so every immutable object must already
 	// be openable if that WAL survives a crash.
+	var synced syncedNames
 	if syncing {
-		if _, err := r.syncNamesLocked(); err != nil {
+		var err error
+		if synced, err = r.syncNamesLocked(); err != nil {
 			return err
+		}
+		if afterNamesSynced != nil {
+			afterNamesSynced(r)
 		}
 	}
 	// The graph journal names the immutable metadata and data objects made
@@ -3703,11 +3712,28 @@ func (r *Repository) syncMetadataLocked() error {
 		}
 	}
 	r.dirtyMu.Lock()
-	for name := range r.dirtyFiles {
-		delete(r.dirtyFiles, name)
-	}
-	for name := range r.dirtyDirs {
-		delete(r.dirtyDirs, name)
+	if syncing {
+		// Only the names this made durable. A reader registering a deferred
+		// object marks its pending marker dirty without the repository's
+		// lock: a mark made since syncNamesLocked looked stays for the next
+		// fence, which the marker would otherwise never reach.
+		for _, name := range synced.files {
+			delete(r.dirtyFiles, name)
+		}
+		for _, name := range branchDirty {
+			delete(r.dirtyFiles, name)
+		}
+		for _, name := range synced.directories {
+			delete(r.dirtyDirs, name)
+		}
+	} else {
+		// createAt makes all of a repository being made durable at once.
+		for name := range r.dirtyFiles {
+			delete(r.dirtyFiles, name)
+		}
+		for name := range r.dirtyDirs {
+			delete(r.dirtyDirs, name)
+		}
 	}
 	for _, id := range dirtyBranches {
 		delete(r.dirtyBranches, id)
