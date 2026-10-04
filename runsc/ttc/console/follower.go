@@ -101,9 +101,8 @@ func WriteFollowerMessage(conn *net.UnixConn, message FollowerMessage, files ...
 // ReadFollowerMessage receives one message from conn, and the files sent with
 // it, which the caller owns. It returns io.EOF once the peer has closed.
 func ReadFollowerMessage(conn *net.UnixConn) (FollowerMessage, []*os.File, error) {
-	data := make([]byte, maxFollowerMessage)
 	rights := make([]byte, unix.CmsgSpace(4*maxFollowerFiles))
-	n, rightsn, flags, err := recvFollowerPacket(conn, data, rights)
+	data, n, rightsn, flags, err := recvFollowerPacket(conn, rights)
 	var files []*os.File
 	if rightsn != 0 {
 		controls, parseErr := unix.ParseSocketControlMessage(rights[:rightsn])

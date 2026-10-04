@@ -89,9 +89,9 @@ func sendFollowerPacket(conn *net.UnixConn, data, rights []byte) error {
 	return nil
 }
 
-// recvFollowerPacket reads one frame into data. Files may arrive with any
-// segment of the frame; they are collected into rights.
-func recvFollowerPacket(conn *net.UnixConn, data, rights []byte) (n, rightsn, flags int, err error) {
+// recvFollowerPacket reads one frame into a buffer of its length. Files may
+// arrive with any segment of the frame; they are collected into rights.
+func recvFollowerPacket(conn *net.UnixConn, rights []byte) (data []byte, n, rightsn, flags int, err error) {
 	var header [4]byte
 	readFull := func(buf []byte, atStart bool) error {
 		for read := 0; read < len(buf); {
@@ -115,14 +115,17 @@ func recvFollowerPacket(conn *net.UnixConn, data, rights []byte) (n, rightsn, fl
 		return nil
 	}
 	if err := readFull(header[:], true); err != nil {
-		return 0, rightsn, flags, err
+		return nil, 0, rightsn, flags, err
 	}
+	// The frame's length, read, sizes its buffer: a connection waiting for a
+	// frame holds none.
 	length := int(binary.BigEndian.Uint32(header[:]))
-	if length > len(data) {
-		return 0, rightsn, flags | unix.MSG_TRUNC, nil
+	if length > maxFollowerMessage {
+		return nil, 0, rightsn, flags | unix.MSG_TRUNC, nil
 	}
-	if err := readFull(data[:length], false); err != nil {
-		return 0, rightsn, flags, err
+	data = make([]byte, length)
+	if err := readFull(data, false); err != nil {
+		return nil, 0, rightsn, flags, err
 	}
-	return length, rightsn, flags, nil
+	return data, length, rightsn, flags, nil
 }
