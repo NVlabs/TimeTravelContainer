@@ -10921,6 +10921,7 @@ func (b *runtimeBackend) removeContainerPlacements(info ttcbundle.ContainerInfo)
 	for _, branch := range info.Branches {
 		physicalBranches[branch.ID] = struct{}{}
 	}
+	var removed []cluster.PlacementRecord
 	for _, record := range records {
 		if record.FamilyID != logicalFamily {
 			continue
@@ -10938,18 +10939,45 @@ func (b *runtimeBackend) removeContainerPlacements(info ttcbundle.ContainerInfo)
 		if record.OwnerNode != "" && record.OwnerNode != b.nodeID {
 			return fmt.Errorf("branch %s@%s is still owned by node %q", record.FamilyID, record.BranchID, record.OwnerNode)
 		}
-		if record.State == cluster.PlacementCorrupted && b.distributedSource != nil && b.distributedSource.authority != nil {
-			if err := b.distributedSource.authority.RemoveCorruptedBranch(record.FamilyID, record.BranchID); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return err
-			}
-		} else if err := placements.Remove(record.FamilyID, record.BranchID, record.Generation); err != nil {
-			return err
-		}
-		if err := b.retireTransactionsForRemovedPlacement(record); err != nil {
-			return err
-		}
+		removed = append(removed, record)
 	}
-	return nil
+	// Each removal is a proposal, and they are independent: they go at once,
+	// for the authority to commit together, rather than one after another,
+	// each listing every transaction.
+	work := make(chan cluster.PlacementRecord)
+	errs := make([]error, min(len(removed), staleOriginWorkers))
+	var doneMu sync.Mutex
+	var done []cluster.PlacementRecord
+	var workers sync.WaitGroup
+	for worker := range errs {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for record := range work {
+				var err error
+				if record.State == cluster.PlacementCorrupted && b.distributedSource != nil && b.distributedSource.authority != nil {
+					if err = b.distributedSource.authority.RemoveCorruptedBranch(record.FamilyID, record.BranchID); errors.Is(err, os.ErrNotExist) {
+						err = nil
+					}
+				} else {
+					err = placements.Remove(record.FamilyID, record.BranchID, record.Generation)
+				}
+				if err != nil {
+					errs[worker] = errors.Join(errs[worker], err)
+					continue
+				}
+				doneMu.Lock()
+				done = append(done, record)
+				doneMu.Unlock()
+			}
+		}()
+	}
+	for _, record := range removed {
+		work <- record
+	}
+	close(work)
+	workers.Wait()
+	return errors.Join(append(errs, b.retireTransactionsForRemovedPlacements(done))...)
 }
 
 // removeLogicalBranchPlacement commits deletion of one user-visible branch.

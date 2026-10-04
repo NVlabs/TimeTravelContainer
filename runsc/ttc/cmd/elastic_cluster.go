@@ -1622,6 +1622,15 @@ func sentryRuns(pid int, container, runtimeRoot string) bool {
 // checks, so a concurrent dependency or placement change fails closed and is
 // retried by a later reconciliation pass.
 func (b *runtimeBackend) retireTransactionsForRemovedPlacement(removed cluster.PlacementRecord) error {
+	return b.retireTransactionsForRemovedPlacements([]cluster.PlacementRecord{removed})
+}
+
+// retireTransactionsForRemovedPlacements is retireTransactionsForRemovedPlacement
+// of each of removed, which lists the transactions once.
+func (b *runtimeBackend) retireTransactionsForRemovedPlacements(removed []cluster.PlacementRecord) error {
+	if len(removed) == 0 {
+		return nil
+	}
 	transactions, err := b.transactionCatalog()
 	if err != nil {
 		return err
@@ -1633,7 +1642,9 @@ func (b *runtimeBackend) retireTransactionsForRemovedPlacement(removed cluster.P
 	var result error
 	for i := range records {
 		tx := &records[i]
-		if !tx.Terminal() || !transactionTargetsRemovedPlacement(*tx, removed) {
+		if !tx.Terminal() || !slices.ContainsFunc(removed, func(placement cluster.PlacementRecord) bool {
+			return transactionTargetsRemovedPlacement(*tx, placement)
+		}) {
 			continue
 		}
 		// An independent migration may still have a paused physical source and
@@ -2852,6 +2863,8 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 		node   string
 		args   []string
 		claims []daemonPlacementClaim
+		// concurrent children that follow one another run at once.
+		concurrent bool
 	}
 	// Settle every source transaction whose target is about to be mutated
 	// before issuing any destructive child command. The family mutation below
@@ -3090,7 +3103,8 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 				continue
 			}
 			args := append([]string{"_reclaim-removed-family-local", familyID}, physicalIDs...)
-			localCleanups = append(localCleanups, child{node: node.NodeID, args: args})
+			// Each node's cleanup is of its own state alone.
+			localCleanups = append(localCleanups, child{node: node.NodeID, args: args, concurrent: true})
 		}
 		queuedLocalCleanup[familyID] = struct{}{}
 		return nil
@@ -3263,8 +3277,12 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 	}
 	children = append(append(append(append(preflight, merged...), localCleanups...), finalizers...), postflight...)
 
-	var diagnostic bytes.Buffer
-	for i, child := range children {
+	type childOutcome struct {
+		status int
+		stderr string
+		err    error
+	}
+	execute := func(i int, child child) childOutcome {
 		// Clustered roots have exactly one placement authority: the
 		// authority catalog installed on the daemon. Do not reopen the retired
 		// shared-filesystem catalog here. In particular, a family operation
@@ -3273,7 +3291,7 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 		// legacy catalog at this point made rm/stop/dehydrate fail after an
 		// otherwise successful migration.
 		if owner, claims, err := daemonCommandPlacementWithCatalog(s.dataRoot, s.clusterPlacements, child.args); err != nil {
-			return true, 1, nil, diagnostic.Bytes(), err
+			return childOutcome{status: 1, err: err}
 		} else {
 			if owner != "" {
 				child.node = owner
@@ -3286,25 +3304,54 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 			DistributedLeaf: true, PlacementClaims: child.claims,
 		}
 		var status int
-		var stdout, stderr string
+		var stderr string
 		var err error
 		if child.node == s.clusterCapabilities.NodeID {
-			status, stdout, stderr, err = s.executeLocalDistributedCommand(childRequest)
+			// Child commands print branch-local selectors; the coordinator
+			// prints original operands.
+			status, _, stderr, err = s.executeLocalDistributedCommand(childRequest)
 		} else {
 			peer, peerErr := s.distributedSource.peer(child.node, false)
 			if peerErr != nil {
-				return true, 1, nil, diagnostic.Bytes(), peerErr
+				return childOutcome{status: 1, err: peerErr}
 			}
-			status, stdout, stderr, err = executeRemoteDaemonRequest(context.Background(), peer, childRequest)
+			status, _, stderr, err = executeRemoteDaemonRequest(context.Background(), peer, childRequest)
 		}
-		_ = stdout // Child commands print branch-local selectors; the coordinator prints original operands.
-		diagnostic.WriteString(stderr)
 		if err != nil {
-			return true, 1, nil, diagnostic.Bytes(), fmt.Errorf("executing family operation on node %q: %w", child.node, err)
+			return childOutcome{status: 1, stderr: stderr, err: fmt.Errorf("executing family operation on node %q: %w", child.node, err)}
 		}
-		if status != 0 {
-			return true, status, nil, diagnostic.Bytes(), nil
+		return childOutcome{status: status, stderr: stderr}
+	}
+	var diagnostic bytes.Buffer
+	for i := 0; i < len(children); {
+		next := i + 1
+		for children[i].concurrent && next < len(children) && children[next].concurrent {
+			next++
 		}
+		outcomes := make([]childOutcome, next-i)
+		if len(outcomes) == 1 {
+			outcomes[0] = execute(i, children[i])
+		} else {
+			var running sync.WaitGroup
+			for j := i; j < next; j++ {
+				running.Add(1)
+				go func() {
+					defer running.Done()
+					outcomes[j-i] = execute(j, children[j])
+				}()
+			}
+			running.Wait()
+		}
+		for _, outcome := range outcomes {
+			diagnostic.WriteString(outcome.stderr)
+			if outcome.err != nil {
+				return true, 1, nil, diagnostic.Bytes(), outcome.err
+			}
+			if outcome.status != 0 {
+				return true, outcome.status, nil, diagnostic.Bytes(), nil
+			}
+		}
+		i = next
 	}
 	var output strings.Builder
 	for _, operand := range mutated {
