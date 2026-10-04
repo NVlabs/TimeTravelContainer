@@ -4,6 +4,7 @@
 package cmd
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -283,17 +284,41 @@ func (p daemonClusterProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "cluster transport cannot clear daemon-stream write deadline: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// The local daemon takes the end of the stream for its client's going,
+	// and gives up a command it has queued behind another on its family
+	// then. The body of a request that carries no input ends with its header,
+	// which tells nothing of its client: its stream ends only when the
+	// request does. A command queued on a busy family, or behind another on
+	// a family whose commands run at once, was otherwise dropped unanswered.
+	body := bufio.NewReader(r.Body)
+	header, err := body.ReadBytes('\n')
+	if err != nil {
+		http.Error(w, "reading daemon request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	var request daemonRequest
+	streams := json.Unmarshal(header, &request) != nil || request.streamsClientFrames()
 	conn, err := net.Dial("unix", p.socket)
 	if err != nil {
 		http.Error(w, "connecting to local ttcd: "+err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 	defer conn.Close()
-	copyDone := make(chan struct{})
-	go func() {
-		_, _ = io.Copy(conn, r.Body)
+	closeWrite := func() {
 		if unix, ok := conn.(*net.UnixConn); ok {
 			_ = unix.CloseWrite()
+		}
+	}
+	copyDone := make(chan struct{})
+	go func() {
+		if _, err := conn.Write(header); err == nil {
+			_, _ = io.Copy(conn, body)
+		}
+		if streams {
+			closeWrite()
+		} else {
+			<-r.Context().Done()
+			closeWrite()
 		}
 		close(copyDone)
 	}()

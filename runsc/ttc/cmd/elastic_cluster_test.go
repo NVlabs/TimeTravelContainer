@@ -4,11 +4,15 @@
 package cmd
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -315,6 +319,69 @@ func TestDaemonCommandOwner(t *testing.T) {
 	}
 	if owner, claims, err := daemonCommandPlacementWithCatalog(root, nil, []string{"_remove-canceled-fork-placement", "web@child", "fork-one"}); err != nil || owner != "" || len(claims) != 0 {
 		t.Fatalf("canceled target cleanup placement=(%q, %+v, %v), want coordinator-selected node", owner, claims, err)
+	}
+}
+
+// A node's proxy of a daemon request ends the local daemon's stream, which
+// the daemon takes for its client's going, when the request's input does:
+// for a request that carries none, only when the request ends, not with its
+// header.
+func TestClusterProxyEndsTheStreamOfARequestWithoutInputWithIt(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		header string
+		want   string
+	}{
+		{"without input", `{"version":1,"action":"command","args":["pause","web@main"]}`, "open"},
+		{"with input", `{"version":1,"action":"command","args":["exec","-i","web@main","cat"],"stdin":true}`, "ended"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			socket := filepath.Join(t.TempDir(), "ttcd.sock")
+			listener, err := net.Listen("unix", socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			seen := make(chan string, 1)
+			go func() {
+				conn, err := listener.Accept()
+				if err != nil {
+					seen <- err.Error()
+					return
+				}
+				defer conn.Close()
+				reader := bufio.NewReader(conn)
+				if _, err := reader.ReadBytes('\n'); err != nil {
+					seen <- err.Error()
+					return
+				}
+				_ = conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+				_, err = reader.ReadByte()
+				switch {
+				case errors.Is(err, io.EOF):
+					seen <- "ended"
+				case errors.Is(err, os.ErrDeadlineExceeded):
+					seen <- "open"
+				default:
+					seen <- fmt.Sprintf("read %v", err)
+				}
+				_, _ = conn.Write([]byte("done"))
+			}()
+			server := httptest.NewServer(daemonClusterProxy{socket: socket})
+			defer server.Close()
+			response, err := http.Post(server.URL+"/v1/daemon", "application/vnd.ttc.daemon-stream", strings.NewReader(test.header+"\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := io.ReadAll(response.Body)
+			response.Body.Close()
+			if err != nil || string(body) != "done" {
+				t.Fatalf("response %q, %v, want done", body, err)
+			}
+			if got := <-seen; got != test.want {
+				t.Errorf("the local daemon found its stream %s during the request, want %s", got, test.want)
+			}
+		})
 	}
 }
 
