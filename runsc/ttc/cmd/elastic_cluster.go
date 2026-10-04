@@ -1003,7 +1003,7 @@ func (b *runtimeBackend) reconcilePlacementCatalogOf(families ...string) error {
 				}, now)
 				if createErr != nil && !errors.Is(createErr, os.ErrExist) {
 					result = errors.Join(result, fmt.Errorf("creating placement for %s@%s: %w", info.ID, branch.ID, createErr))
-				} else if createErr == nil && b.distributedSource.authority != nil {
+				} else if createErr == nil && b.distributedSource.authority != nil && branch.ParentID != "" {
 					if _, inheritErr := b.distributedSource.authority.InheritBranchDependencies(placementFamily, placementBranch, branch.ParentID); inheritErr != nil {
 						result = errors.Join(result, fmt.Errorf("recording dependencies for %s@%s: %w", placementFamily, placementBranch, inheritErr))
 					}
@@ -1038,7 +1038,11 @@ func (b *runtimeBackend) reconcilePlacementCatalogOf(families ...string) error {
 					result = errors.Join(result, fmt.Errorf("updating placement state for %s@%s: %w", info.ID, branch.ID, err))
 				}
 			}
-			if b.distributedSource.authority != nil && (!authorityKnown || !branchAuthority.DependenciesInherited) {
+			// A branch with no parent has no dependencies to inherit: the
+			// proposal would only mark them inherited, which nothing reads
+			// but this, a query and a proposal of the authority after every
+			// run.
+			if b.distributedSource.authority != nil && branch.ParentID != "" && (!authorityKnown || !branchAuthority.DependenciesInherited) {
 				if _, inheritErr := b.distributedSource.authority.InheritBranchDependencies(placementFamily, placementBranch, branch.ParentID); inheritErr != nil {
 					result = errors.Join(result, fmt.Errorf("recording dependencies for %s@%s: %w", placementFamily, placementBranch, inheritErr))
 				}
