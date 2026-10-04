@@ -1420,7 +1420,12 @@ func replacePortableInternalMount(path string, contents []byte, mode os.FileMode
 		return err
 	}
 	tempName := temp.Name()
-	defer os.Remove(tempName)
+	renamed := false
+	defer func() {
+		if !renamed {
+			os.Remove(tempName)
+		}
+	}()
 	if err := temp.Chmod(mode); err != nil {
 		temp.Close()
 		return err
@@ -1436,7 +1441,11 @@ func replacePortableInternalMount(path string, contents []byte, mode os.FileMode
 	if err := temp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tempName, path)
+	if err := os.Rename(tempName, path); err != nil {
+		return err
+	}
+	renamed = true
+	return nil
 }
 
 // ConsolePaths are persistent host-side files for one branch-local console.

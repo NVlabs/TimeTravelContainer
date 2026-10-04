@@ -217,7 +217,14 @@ func (s *nativeStore) saveCatalog() error {
 		return err
 	}
 	tempName := temp.Name()
-	defer os.Remove(tempName)
+	// Renamed, it is not there to remove: on a shared root, looking for it
+	// twice was two round trips.
+	renamed := false
+	defer func() {
+		if !renamed {
+			os.Remove(tempName)
+		}
+	}()
 	if err := temp.Chmod(0600); err != nil {
 		temp.Close()
 		return err
@@ -236,6 +243,7 @@ func (s *nativeStore) saveCatalog() error {
 	if err := os.Rename(tempName, filepath.Join(s.root, "catalog.json")); err != nil {
 		return err
 	}
+	renamed = true
 	dir, err := os.Open(s.root)
 	if err != nil {
 		return err

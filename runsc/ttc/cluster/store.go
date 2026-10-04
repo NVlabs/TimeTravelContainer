@@ -470,8 +470,8 @@ func (s *Store) replace(path string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	defer os.Remove(temp)
 	if err := os.Rename(temp, path); err != nil {
+		os.Remove(temp)
 		return fmt.Errorf("replacing transaction: %w", err)
 	}
 	return syncDirectory(s.dir)
