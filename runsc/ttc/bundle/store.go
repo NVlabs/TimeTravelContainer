@@ -5709,6 +5709,9 @@ func (s Store) GarbageCollectRepositories() (int, error) {
 		}
 		ran, gcErr := repository.GarbageCollectIdle()
 		closeErr := repository.Close()
+		if (gcErr != nil || closeErr != nil) && repositoryRemoved(path) {
+			continue
+		}
 		if gcErr != nil {
 			return collected, fmt.Errorf("collecting repository %q: %w", path, gcErr)
 		}
@@ -5723,6 +5726,20 @@ func (s Store) GarbageCollectRepositories() (int, error) {
 		collected++
 	}
 	return collected, nil
+}
+
+// afterOriginInventoryOpen, if set, is called by FilesystemSnapshotOrigins
+// with each repository it has opened, for tests.
+var afterOriginInventoryOpen func(path string)
+
+// repositoryRemoved reports whether the repository at path, which an
+// inventory opened and failed to close or collect, has been removed since:
+// the cleanup of a removed family's state on a node removes its repositories
+// without the lock of a command, and so while another command's inventory
+// has one open. Such a repository is gone, as a later inventory finds it.
+func repositoryRemoved(path string) bool {
+	_, err := os.Stat(path)
+	return errors.Is(err, fs.ErrNotExist)
 }
 
 // FilesystemSnapshotOrigins returns the origin IDs that still have local
@@ -5747,10 +5764,15 @@ func (s Store) FilesystemSnapshotOrigins() (map[ttcsnapshot.SnapshotID]struct{},
 		if err != nil {
 			return nil, fmt.Errorf("opening repository %q for origin inventory: %w", path, err)
 		}
+		if afterOriginInventoryOpen != nil {
+			afterOriginInventoryOpen(path)
+		}
 		for _, origin := range repository.SnapshotOrigins() {
 			origins[origin] = struct{}{}
 		}
-		if err := repository.Close(); err != nil {
+		// A repository removed since it was opened holds nothing now; that
+		// its origins count as held this once only puts off abandoning them.
+		if err := repository.Close(); err != nil && !repositoryRemoved(path) {
 			return nil, fmt.Errorf("closing repository %q after origin inventory: %w", path, err)
 		}
 	}
@@ -5778,7 +5800,7 @@ func (s Store) FrozenFilesystemOrigins() ([]ttcsnapshot.SnapshotID, error) {
 			return nil, fmt.Errorf("opening repository %q for frozen origin inventory: %w", path, err)
 		}
 		origins = append(origins, repository.FrozenOriginHandoffs()...)
-		if err := repository.Close(); err != nil {
+		if err := repository.Close(); err != nil && !repositoryRemoved(path) {
 			return nil, fmt.Errorf("closing repository %q after frozen origin inventory: %w", path, err)
 		}
 	}
@@ -5878,7 +5900,7 @@ func (s Store) WithFilesystemSnapshotOrigin(origin ttcsnapshot.SnapshotID, visit
 			}
 		}
 		if !contains {
-			if err := repository.Close(); err != nil {
+			if err := repository.Close(); err != nil && !repositoryRemoved(path) {
 				return found, fmt.Errorf("closing repository %q after origin lookup: %w", path, err)
 			}
 			continue

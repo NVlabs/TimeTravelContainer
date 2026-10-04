@@ -3146,6 +3146,34 @@ func TestStartingContainerKeepsTheNodesOldImageRoot(t *testing.T) {
 	}
 }
 
+// An inventory of a node's filesystem origins passes over a repository
+// removed while it had it open, as a removed family's cleanup on the node
+// removes its repositories, rather than failing the removal it is part of.
+func TestOriginInventoryPassesOverARepositoryRemovedMeanwhile(t *testing.T) {
+	local := t.TempDir()
+	store := Store{Root: t.TempDir(), ActiveRoot: local}
+	manager, err := ttcvolume.OpenManager(local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := manager.Create("removed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	afterOriginInventoryOpen = func(path string) {
+		if err := os.RemoveAll(path); err != nil {
+			t.Error(err)
+		}
+	}
+	defer func() { afterOriginInventoryOpen = nil }()
+	if _, err := store.FilesystemSnapshotOrigins(); err != nil {
+		t.Fatalf("inventory with a repository removed meanwhile: %v", err)
+	}
+}
+
 func TestPruneUnreferencedSharedImagePack(t *testing.T) {
 	shared := t.TempDir()
 	store := Store{Root: shared, ActiveRoot: t.TempDir()}
