@@ -10718,20 +10718,37 @@ func projectContainerAuthority(container *ttcbundle.ContainerInfo, family *Famil
 }
 
 func (b *runtimeBackend) remove(name string, force, volumes bool) error {
-	if b.distributedSource != nil && b.distributedSource.authority != nil && b.nodeID != "" {
+	return b.removeFamily(name, force, volumes, nil)
+}
+
+// removeFamily is remove of the family name. If known, the caller's record of
+// it, is name's, the caller has renewed the node's execution lease for its
+// command, as a command's removals do once (branchRemovals), and the record
+// is not read again.
+func (b *runtimeBackend) removeFamily(name string, force, volumes bool, known *ttcbundle.ContainerInfo) error {
+	if known != nil && known.ID != name {
+		known = nil
+	}
+	if known == nil && b.distributedSource != nil && b.distributedSource.authority != nil && b.nodeID != "" {
 		if _, err := b.renewDistributedExecutionAuthority(); err != nil {
 			return fmt.Errorf("renewing removal execution authority: %w", err)
 		}
 	}
 	store := b.containerStore()
-	info, err := store.LoadContainer(name)
-	if errors.Is(err, os.ErrNotExist) {
-		if found, err := b.removeRecordlessRuntime(name, force); found || err != nil {
+	var info ttcbundle.ContainerInfo
+	var err error
+	if known != nil {
+		info = *known
+	} else {
+		info, err = store.LoadContainer(name)
+		if errors.Is(err, os.ErrNotExist) {
+			if found, err := b.removeRecordlessRuntime(name, force); found || err != nil {
+				return err
+			}
+		}
+		if err != nil {
 			return err
 		}
-	}
-	if err != nil {
-		return err
 	}
 	if waited, err := b.waitBusy(info.ID); err != nil {
 		return err
@@ -10755,14 +10772,20 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 	// still intact. The authority atomically chooses cancellation or completed durable
 	// publication; either outcome is safe to remove after the queue drains.
 	if b.publicationQueue != nil {
+		canceled := 0
 		for _, branch := range info.Branches {
-			if err := b.publicationQueue.CancelBranch(info.ID, branch.ID); err != nil {
+			n, err := b.publicationQueue.CancelBranch(info.ID, branch.ID)
+			if err != nil {
 				return fmt.Errorf("canceling publications for %s@%s: %w", info.Name, branch.ID, err)
 			}
+			canceled += n
 		}
-		info, err = store.LoadContainer(info.ID)
-		if err != nil {
-			return err
+		// A publication under way may have changed the record.
+		if canceled != 0 {
+			info, err = store.LoadContainer(info.ID)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	releaseClients, err := b.quiesceConsoleClients(selector{container: info.ID})
@@ -17606,22 +17629,26 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 		return fmt.Errorf("branch %s is %s; use -f to force removal", target, normalizeLifecycleState(recorded.State))
 	}
 	if b.publicationQueue != nil {
-		if err := b.publicationQueue.CancelBranch(info.ID, recorded.ID); err != nil {
+		canceled, err := b.publicationQueue.CancelBranch(info.ID, recorded.ID)
+		if err != nil {
 			return fmt.Errorf("canceling pending publications for %s: %w", target, err)
 		}
-		info, err = b.containerStore().LoadContainer(info.ID)
-		if err != nil {
-			return err
-		}
-		recorded = nil
-		for i := range info.Branches {
-			if info.Branches[i].ID == target.branch {
-				recorded = &info.Branches[i]
-				break
+		// A publication under way may have changed the record.
+		if canceled != 0 {
+			info, err = b.containerStore().LoadContainer(info.ID)
+			if err != nil {
+				return err
 			}
-		}
-		if recorded == nil {
-			return fmt.Errorf("branch %q disappeared while fencing publication", target.branch)
+			recorded = nil
+			for i := range info.Branches {
+				if info.Branches[i].ID == target.branch {
+					recorded = &info.Branches[i]
+					break
+				}
+			}
+			if recorded == nil {
+				return fmt.Errorf("branch %q disappeared while fencing publication", target.branch)
+			}
 		}
 	}
 	remaining := len(info.Branches)
@@ -17637,7 +17664,7 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 		// Removing the family's final branch also removes the now-empty family.
 		// Named volumes remain independently managed, matching a normal rm
 		// without --volumes.
-		if err := b.remove(target.container, true, false); err != nil {
+		if err := b.removeFamily(target.container, true, false, &info); err != nil {
 			return err
 		}
 		return b.removeLogicalBranchPlacement(logicalFamily, requested.branch)

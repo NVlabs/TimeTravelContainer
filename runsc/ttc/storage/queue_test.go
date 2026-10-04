@@ -203,8 +203,8 @@ func TestCancelBranchRemovesSupersededPublications(t *testing.T) {
 	if err := queue.Enqueue(Intent{Container: "family", Branch: "peer", PublicationID: "publication-3", Kind: "stop", FilesystemBranch: "capture"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := queue.CancelBranch("family", "main"); err != nil {
-		t.Fatal(err)
+	if canceled, err := queue.CancelBranch("family", "main"); err != nil || canceled != 2 {
+		t.Fatalf("CancelBranch = %d, %v, want 2 publications canceled", canceled, err)
 	}
 	pending, err := queue.Pending()
 	if err != nil {

@@ -277,18 +277,22 @@ func (q *Queue) CancelPending(container, branch, publicationID string) error {
 // This is intentionally broader than the identity recorded in current branch
 // metadata: a previously failed publication must not keep daemon drain
 // alive after a later publication supersedes it or the branch is removed.
-func (q *Queue) CancelBranch(container, branch string) error {
+// It returns how many there were: with none, no publication of the branch
+// was under way to change its record.
+func (q *Queue) CancelBranch(container, branch string) (int, error) {
 	intents, err := q.Pending()
 	if err != nil {
-		return err
+		return 0, err
 	}
+	canceled := 0
 	var result error
 	for _, intent := range intents {
 		if intent.Container == container && intent.Branch == branch {
+			canceled++
 			result = errors.Join(result, q.Cancel(intent.Container, intent.Branch, intent.PublicationID))
 		}
 	}
-	return result
+	return canceled, result
 }
 
 // Close stops after the current publication boundary. Pending intents remain
