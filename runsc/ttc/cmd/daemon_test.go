@@ -2835,3 +2835,30 @@ func TestDecodeRuntimeStateStatusDistinguishesStoppedSandbox(t *testing.T) {
 		})
 	}
 }
+
+// TestCommandReconciledFamilies checks which families a command's placement
+// reconciliation covers: those it resolved if it changes only them, the
+// family whose record it removed, or every family, nil, otherwise.
+func TestCommandReconciledFamilies(t *testing.T) {
+	resolved := &runtimeBackend{resolvedFamilies: &familySet{}}
+	resolved.resolvedFamilies.add("family-id")
+	for _, test := range []struct {
+		args []string
+		want []string
+	}{
+		{[]string{"pause", "web@main"}, []string{"family-id"}},
+		{[]string{"rm", "-f", "web@main"}, []string{"family-id"}},
+		{[]string{"_auto-remove-now", "web@main"}, []string{"family-id"}},
+		{[]string{"checkpoint", "web@main", "/tmp/checkpoint"}, []string{"family-id"}},
+		{[]string{"commit", "web@main", "image:tag"}, []string{"family-id"}},
+		{[]string{"_remove-family-record", "removed-id"}, []string{"removed-id"}},
+		{[]string{"_remove-family-record", "--volumes", "removed-id"}, []string{"removed-id"}},
+		{[]string{"_remove-family-record"}, nil},
+		{[]string{"pull", "alpine"}, nil},
+		{[]string{"restore", "/tmp/checkpoint", "web2"}, nil},
+	} {
+		if got := commandReconciledFamilies(test.args, resolved); !slices.Equal(got, test.want) {
+			t.Errorf("commandReconciledFamilies(%q) = %q, want %q", test.args, got, test.want)
+		}
+	}
+}

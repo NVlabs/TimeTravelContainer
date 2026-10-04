@@ -7938,6 +7938,11 @@ func commandReconciledFamilies(args []string, b *runtimeBackend) []string {
 	switch name := daemonCommandName(args); {
 	case familyScopedCommands[name], name == "migrate", name == "run", name == "create":
 		return b.resolvedFamilies.list()
+	case name == "_auto-remove-now", name == "checkpoint", name == "commit":
+		// They change only the family whose branch they resolve, a run
+		// --rm's when its branch exits among them: every family's
+		// reconciliation read the record of each on the node.
+		return b.resolvedFamilies.list()
 	case name == "_remove-family-record" && len(args) > 1:
 		// The family whose record it removed, which it names last: as a
 		// removal of the family's branches, it changed no other. Every
