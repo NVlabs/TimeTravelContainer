@@ -16,8 +16,9 @@ import (
 // family's other commands queue behind it. The lifecycle lock of the data
 // root is taken after the families' locks: shared by a command that changes
 // only the family it names, and exclusively by any other command, which so
-// excludes every command on every family. A cluster node takes no family's
-// lock: its commands change catalogs that every family shares.
+// excludes every command on every family. A cluster node takes a family's
+// lock only for the commands of clusterFamilyScopedCommands: its other
+// commands change catalogs that every family shares.
 
 // familyScopedCommands change only the family they name. Removing a family
 // also prunes the image roots nothing uses, under the image roots' own lock:
@@ -29,12 +30,29 @@ var familyScopedCommands = map[string]bool{
 	"dehydrate": true, "rehydrate": true, "rm": true, "cp": true,
 }
 
+// clusterFamilyScopedCommands are the family-scoped commands that a cluster
+// node also runs at once on different families. They change the family's
+// runtime, record and placements alone, and reconcile only the family's
+// placements after (commandReconciledFamilies). The node's other commands
+// keep the lifecycle lock to themselves: the snapshot origins they allocate,
+// publish and abandon are inventoried node-wide, by reconciliations that a
+// command's lock keeps from seeing an origin of another's that is still
+// being made. With every command taking it alone, a node paused or resumed
+// its families 14 times a second however many clients asked.
+var clusterFamilyScopedCommands = map[string]bool{
+	"pause": true, "resume": true, "unpause": true,
+}
+
 // requestFamilies returns the IDs of the families whose locks the command in
 // args takes, in the order to take them, and whether it takes the lifecycle
 // lock shared. A daemon that has not yet reconciled its families after
 // starting takes the lifecycle lock exclusively for every command.
 func (s *daemonServer) requestFamilies(backend *runtimeBackend, args []string) ([]string, bool) {
-	if backend.lockFamily == nil || !s.reconciledRoots(backend) {
+	clustered := s.distributedSource != nil || s.clusterCapabilities != nil
+	if backend.lockFamily == nil && !(clustered && clusterFamilyScopedCommands[daemonCommandName(args)]) {
+		return nil, false
+	}
+	if !s.reconciledRoots(backend) {
 		return nil, false
 	}
 	names := daemonCommandFamilyTargets(args)
