@@ -108,6 +108,7 @@ go_test(
         "carried_test.go",
         "cmd_test.go",
         "cmd_host_darwin_test.go",
+        "cmd_host_linux_test.go",
         "console_followers_test.go",
         "cp_test.go",
         "daemon_statfs_test_darwin.go",

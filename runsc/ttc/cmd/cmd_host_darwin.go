@@ -392,3 +392,6 @@ func cloexecStreamSocketpair() ([2]int, error) {
 	unix.CloseOnExec(fds[1])
 	return fds, nil
 }
+
+// awaitExit returns at once: a Wait waits for the process.
+func awaitExit(int) {}

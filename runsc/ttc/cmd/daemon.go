@@ -2689,6 +2689,9 @@ func (s *daemonServer) ownSidecar(kind, key string, command *exec.Cmd, exited fu
 	s.sidecars[key] = command
 	s.sidecarMu.Unlock()
 	go func() {
+		// A family's console follower lives as long as the family: a Wait
+		// alone would hold a thread for it all that time.
+		awaitExit(command.Process.Pid)
 		_ = command.Wait()
 		s.sidecarMu.Lock()
 		if s.sidecars[key] == command {

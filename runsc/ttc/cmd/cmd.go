@@ -9900,8 +9900,12 @@ func (b *runtimeBackend) startFamilyConsoleFollower(container, dir string) error
 		return fail(err)
 	}
 	if b.consoleSidecars != nil {
-		// The daemon reaps it; it outlives the daemon otherwise.
-		go func() { _ = command.Wait() }()
+		// The daemon reaps it; it outlives the daemon otherwise. It lives as
+		// long as its family: a Wait alone would hold a thread all that time.
+		go func() {
+			awaitExit(command.Process.Pid)
+			_ = command.Wait()
+		}()
 		return nil
 	}
 	return command.Process.Release()

@@ -592,3 +592,27 @@ func memoryExecutable(name string, content []byte) (string, error) {
 func cloexecStreamSocketpair() ([2]int, error) {
 	return unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 }
+
+// awaitExit waits until the process pid, a child of this one that is yet to
+// be waited for, exits, in the runtime's poller, without holding a thread
+// as a Wait, which waitid() blocks in, does: a pidfd is readable once its
+// process has exited. It returns at once if it cannot poll for that, for a
+// Wait to wait.
+func awaitExit(pid int) {
+	fd, err := unix.PidfdOpen(pid, unix.PIDFD_NONBLOCK)
+	if err != nil {
+		return
+	}
+	pidfd := os.NewFile(uintptr(fd), "pidfd")
+	defer pidfd.Close()
+	conn, err := pidfd.SyscallConn()
+	if err != nil {
+		return
+	}
+	readable := false
+	_ = conn.Read(func(uintptr) bool {
+		exited := readable
+		readable = true
+		return exited
+	})
+}
