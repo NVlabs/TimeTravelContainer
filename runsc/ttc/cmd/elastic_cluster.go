@@ -2816,6 +2816,16 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 	// mutated still.
 	var missing []error
 	present := make([]string, 0, len(mutation.targets))
+	// planned has what this pass read of each family it names whole, which
+	// the pass that plans the children below uses: nothing runs between
+	// them, and reading it again was a round trip of the shared root and one
+	// of the authority for each.
+	type plannedFamily struct {
+		info       ttcbundle.ContainerInfo
+		placements []cluster.PlacementRecord
+		listed     bool
+	}
+	planned := make(map[string]plannedFamily)
 	for _, operand := range mutation.targets {
 		name := operand
 		branchID := ""
@@ -2853,6 +2863,9 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 				return true, 1, nil, nil, fmt.Errorf("listing logical branches for %q: %w", operand, placementErr)
 			}
 			settle, cancel, discard, abort = distributedRemovalSourceTransactions(transactions, placements, info, branchID)
+		}
+		if branchID == "" {
+			planned[operand] = plannedFamily{info: info, placements: placements, listed: request.Args[0] == "rm"}
 		}
 		for _, ids := range abort {
 			for transactionID := range ids {
@@ -3066,14 +3079,22 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 			}
 			continue
 		}
-		info, err := loadDistributedFamily(store, s.clusterPlacements, operand)
-		if err != nil {
-			return true, 1, nil, nil, err
+		family, ok := planned[operand]
+		if !ok {
+			info, err := loadDistributedFamily(store, s.clusterPlacements, operand)
+			if err != nil {
+				return true, 1, nil, nil, err
+			}
+			family = plannedFamily{info: info}
 		}
+		info := family.info
 		mutated = append(mutated, operand)
-		placements, err := logicalFamilyPlacements(s.clusterPlacements, info.ID)
-		if err != nil {
-			return true, 1, nil, nil, fmt.Errorf("listing logical branches for %q: %w", operand, err)
+		placements := family.placements
+		if !family.listed {
+			var err error
+			if placements, err = logicalFamilyPlacements(s.clusterPlacements, info.ID); err != nil {
+				return true, 1, nil, nil, fmt.Errorf("listing logical branches for %q: %w", operand, err)
+			}
 		}
 		if len(placements) == 0 {
 			if request.Args[0] != "rm" {
