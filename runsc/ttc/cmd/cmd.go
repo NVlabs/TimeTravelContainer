@@ -3351,6 +3351,9 @@ func (b *runtimeBackend) removeWholeContainers(targets []selector, force bool) (
 			info.IsDistributedPhysicalRuntime() || logicalFamilyID(info) != info.ID {
 			continue
 		}
+		// The command changes this family: a cluster node reconciles its
+		// placements after, and every family's if it resolved none.
+		b.resolvedFamilies.resolved(container, info)
 		named := true
 		for _, branch := range info.Branches {
 			if _, ok := branches[branch.ID]; !ok {
@@ -10749,6 +10752,7 @@ func (b *runtimeBackend) removeFamily(name string, force, volumes bool, known *t
 		if err != nil {
 			return err
 		}
+		b.resolvedFamilies.resolved(name, info)
 	}
 	if waited, err := b.waitBusy(info.ID); err != nil {
 		return err
