@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package config
 
 import (
@@ -130,6 +133,40 @@ func optionsToPrecompile() ([]Options, error) {
 			newOpts = append(newOpts, expanded...)
 		}
 		opts = newOpts
+	}
+	ttcOpts, err := ttcOptionsToPrecompile()
+	if err != nil {
+		return nil, err
+	}
+	return append(opts, ttcOpts...), nil
+}
+
+// ttcOptionsToPrecompile returns the options of the sandboxes TTC runs, which
+// those above do not include: no DirectFS and a TTC volume repository, with
+// or without TTC network NAT, the graphics device and NVProxy. A sandbox
+// whose program is not precompiled builds it as it starts, 20 ms of each run.
+func ttcOptionsToPrecompile() ([]Options, error) {
+	platforms, err := allPrecompiledPlatforms()
+	if err != nil {
+		return nil, err
+	}
+	nvProxyCaps := append([]nvconf.DriverCaps{0}, nvconf.PopularCapabilitySets()...)
+	var opts []Options
+	for _, platform := range platforms {
+		for _, nat := range []bool{false, true} {
+			for _, gfx := range []bool{false, true} {
+				for i, caps := range nvProxyCaps {
+					opts = append(opts, Options{
+						Platform:             platform,
+						TimeTravelNetworkNAT: nat,
+						TTCVolume:            true,
+						GFX:                  gfx,
+						NVProxy:              i != 0,
+						NVProxyCaps:          caps,
+					})
+				}
+			}
+		}
 	}
 	return opts, nil
 }
