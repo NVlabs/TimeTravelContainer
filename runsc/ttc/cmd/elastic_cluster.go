@@ -724,7 +724,19 @@ func (b *runtimeBackend) reconcilePlacementCatalogOf(families ...string) error {
 	// server. A lease fence deliberately SIGSTOPs Sentries during recovery, so a
 	// control RPC cannot be required before the new incarnation re-authorizes and
 	// resumes them. The host PID is the physical execution proof at this boundary.
-	liveSandboxes, err := b.liveRuntimeSandboxes()
+	// A family's reconciliation asks only whether the runtimes of its
+	// placements run.
+	var only map[string]struct{}
+	if scope != "" {
+		only = map[string]struct{}{scope: {}}
+		for _, record := range placementByBranch {
+			only[record.FamilyID] = struct{}{}
+			if record.PhysicalContainer != "" {
+				only[record.PhysicalContainer] = struct{}{}
+			}
+		}
+	}
+	liveSandboxes, err := b.liveRuntimeSandboxes(only)
 	if err != nil {
 		return fmt.Errorf("listing physical sandboxes for placement recovery: %w", err)
 	}
@@ -1463,8 +1475,11 @@ func (b *runtimeBackend) sandboxSentryRuns(id string) bool {
 // liveRuntimeSandboxes returns physical runsc container IDs whose Sentry host
 // process still exists. It intentionally does not contact the Sentry: a
 // correctly lease-fenced Sentry may be SIGSTOPped until placement recovery is
-// complete, but its PID remains valid execution state.
-func (b *runtimeBackend) liveRuntimeSandboxes() (map[string]struct{}, error) {
+// complete, but its PID remains valid execution state. If only is not nil,
+// the runtime's own sandboxes it does not name are passed over: loading a
+// sandbox's state takes its lock and decodes it, a quarter of a millisecond
+// that a family's reconciliation paid for every family on the node.
+func (b *runtimeBackend) liveRuntimeSandboxes(only map[string]struct{}) (map[string]struct{}, error) {
 	result := make(map[string]struct{})
 	if !embeddedRuntime(b.runsc) {
 		output, err := b.command("list", "--format=json", "--sandbox")
@@ -1503,6 +1518,11 @@ func (b *runtimeBackend) liveRuntimeSandboxes() (map[string]struct{}, error) {
 		return nil, fmt.Errorf("listing sandboxes: %w", err)
 	}
 	for _, id := range ids {
+		if only != nil {
+			if _, ok := only[id.SandboxID]; !ok {
+				continue
+			}
+		}
 		// Only the state file is read: loading a sandbox otherwise asks its
 		// Sentry whether it runs, which a Sentry restoring a branch answers
 		// once it is done, and a fenced one not at all.
