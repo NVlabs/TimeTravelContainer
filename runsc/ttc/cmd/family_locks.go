@@ -16,9 +16,17 @@ import (
 // family's other commands queue behind it. The lifecycle lock of the data
 // root is taken after the families' locks: shared by a command that changes
 // only the family it names, and exclusively by any other command, which so
-// excludes every command on every family. A cluster node takes a family's
-// lock only for the commands of clusterFamilyScopedCommands: its other
-// commands change catalogs that every family shares.
+// excludes every command on every family. A cluster node does as a
+// standalone daemon does. Each of its family-scoped commands changes its
+// family's runtime, record and placements alone, and reconciles only the
+// family's placements after (commandReconciledFamilies). A snapshot origin
+// that one allocates, for a capture or a repository, is building until the
+// capture is over or the repository installs it, and neither the
+// reconciliation of the node's origins nor the cleanup of its empty memory
+// origins that another runs takes it for a stale one meanwhile; a removal
+// rechecks the origins it would abandon with their locks held. With every
+// command taking the lifecycle lock alone, a cluster node paused or resumed
+// its families 14 times a second however many clients asked.
 
 // familyScopedCommands change only the family they name. Removing a family
 // also prunes the image roots nothing uses, under the image roots' own lock:
@@ -30,29 +38,13 @@ var familyScopedCommands = map[string]bool{
 	"dehydrate": true, "rehydrate": true, "rm": true, "cp": true,
 }
 
-// clusterFamilyScopedCommands are the family-scoped commands that a cluster
-// node also runs at once on different families. They change the family's
-// runtime, record and placements alone, and reconcile only the family's
-// placements after (commandReconciledFamilies). A snapshot origin one of
-// them allocates is building until it is installed, as a capture's is, and
-// so no reconciliation of another's takes it for a stale one. The node's
-// other commands keep the lifecycle lock to themselves: a fork, a
-// dehydration and a removal build and collect the node's memory graph,
-// whose reconciliations count on the lock to keep a graph builder out.
-// With every command taking it alone, a node paused or resumed its families
-// 14 times a second however many clients asked.
-var clusterFamilyScopedCommands = map[string]bool{
-	"pause": true, "resume": true, "unpause": true, "quarantine": true, "unquarantine": true,
-	"kill": true, "stop": true, "start": true, "restart": true,
-}
-
 // requestFamilies returns the IDs of the families whose locks the command in
 // args takes, in the order to take them, and whether it takes the lifecycle
 // lock shared. A daemon that has not yet reconciled its families after
 // starting takes the lifecycle lock exclusively for every command.
 func (s *daemonServer) requestFamilies(backend *runtimeBackend, args []string) ([]string, bool) {
 	clustered := s.distributedSource != nil || s.clusterCapabilities != nil
-	if backend.lockFamily == nil && !(clustered && clusterFamilyScopedCommands[daemonCommandName(args)]) {
+	if backend.lockFamily == nil && !clustered {
 		return nil, false
 	}
 	if !s.reconciledRoots(backend) {
