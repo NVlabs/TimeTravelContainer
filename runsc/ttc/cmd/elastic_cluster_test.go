@@ -5,6 +5,7 @@ package cmd
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -382,6 +384,62 @@ func TestClusterProxyEndsTheStreamOfARequestWithoutInputWithIt(t *testing.T) {
 				t.Errorf("the local daemon found its stream %s during the request, want %s", got, test.want)
 			}
 		})
+	}
+}
+
+// A copy upload's request stream, which the routing daemon writes itself,
+// stays open once the archive is sent, until the copy is answered: the owner's
+// daemon takes the end of the stream for its caller's going.
+func TestCopyUploadStreamOutlastsItsArchive(t *testing.T) {
+	seen := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		controller := http.NewResponseController(w)
+		if err := controller.EnableFullDuplex(); err != nil {
+			seen <- err.Error()
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_ = controller.Flush()
+		reader := bufio.NewReader(r.Body)
+		if _, err := reader.ReadBytes('\n'); err != nil {
+			seen <- err.Error()
+			return
+		}
+		for {
+			typ, _, err := readDaemonFrame(reader)
+			if err != nil {
+				seen <- "reading frames: " + err.Error()
+				return
+			}
+			if typ == daemonFrameEOF {
+				break
+			}
+		}
+		_ = controller.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		_, err := reader.ReadByte()
+		switch {
+		case errors.Is(err, io.EOF):
+			seen <- "ended"
+		case errors.Is(err, os.ErrDeadlineExceeded):
+			seen <- "open"
+		default:
+			seen <- fmt.Sprintf("read %v", err)
+		}
+	}))
+	defer server.Close()
+	peer, err := cluster.NewPlainClient(server.URL, "node-a", "token", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flow := newDaemonStdinFlow()
+	input := io.MultiReader(strings.NewReader("{}\n"), &daemonStdinFrameReader{raw: strings.NewReader("archive"), flow: flow})
+	var output bytes.Buffer
+	var outputMu sync.Mutex
+	if err := proxyDistributedCopyUpload(context.Background(), peer, input, flow, &output, &outputMu); err != nil {
+		t.Fatalf("proxyDistributedCopyUpload: %v", err)
+	}
+	if got := <-seen; got != "open" {
+		t.Errorf("the owner found the copy's stream %s once its archive was sent, want open", got)
 	}
 }
 

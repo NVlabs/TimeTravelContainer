@@ -177,6 +177,13 @@ func prepareDistributedCopyUpload(localRoot string, request daemonRequest, route
 // Consuming acknowledgements here also prevents a fast NFS/local read from
 // overrunning the remote daemon's bounded stdin queue.
 func proxyDistributedCopyUpload(ctx context.Context, peer *cluster.Client, input io.Reader, flow *daemonStdinFlow, output io.Writer, outputMu *sync.Mutex) error {
+	// The owner's daemon takes the end of the request's stream for its
+	// caller's going, and gives up the copy if it is queued then, behind
+	// another command on the family: the stream ends once the copy has been
+	// answered, not with the archive.
+	answered := make(chan struct{})
+	defer close(answered)
+	input = io.MultiReader(input, untilClosed(answered))
 	responseReader, responseWriter := io.Pipe()
 	responseDone := make(chan error, 1)
 	go func() {
@@ -214,6 +221,15 @@ func proxyDistributedCopyUpload(ctx context.Context, peer *cluster.Client, input
 	flow.close()
 	responseErr := <-responseDone
 	return errors.Join(proxyErr, responseErr)
+}
+
+// untilClosed is a reader with nothing to read, which ends when the channel
+// is closed.
+type untilClosed <-chan struct{}
+
+func (c untilClosed) Read([]byte) (int, error) {
+	<-c
+	return 0, io.EOF
 }
 
 // daemonCopyArchiveReader exposes only stdout frame payloads as one tar stream
