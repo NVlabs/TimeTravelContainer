@@ -1317,13 +1317,25 @@ func (m *Manager) createAt(path, name, id string, workingOrigin ttcsnapshot.Snap
 		_ = os.RemoveAll(path)
 		return nil, err
 	}
+	// The format marker commits the repository. It is written with the rest,
+	// under a temporary name, and named only once all of it is durable:
+	// written afterwards, its own sync was another 3 ms of a run.
+	format, err := writeTemp(filepath.Join(path, "staging"), []byte(strconv.Itoa(formatVersion)+"\n"), 0600)
+	if err != nil {
+		_ = os.RemoveAll(path)
+		return nil, err
+	}
 	if err := syncTree(path); err != nil {
 		_ = os.RemoveAll(path)
 		return nil, fmt.Errorf("syncing new volume repository: %w", err)
 	}
 	repo.graph.Synced()
 	repo.unsynced = false
-	if err := atomicWriteFile(filepath.Join(path, "staging"), filepath.Join(path, "format"), []byte(strconv.Itoa(formatVersion)+"\n"), 0600); err != nil {
+	if err := os.Rename(format, filepath.Join(path, "format")); err != nil {
+		_ = os.RemoveAll(path)
+		return nil, err
+	}
+	if err := syncDirectory(path); err != nil {
 		_ = os.RemoveAll(path)
 		return nil, err
 	}
@@ -3523,12 +3535,23 @@ func (r *Repository) syncNamesLocked() (syncedNames, error) {
 	if err != nil {
 		return syncedNames{}, err
 	}
+	root := false
+	for _, name := range synced.files {
+		root = root || filepath.Dir(name) == "."
+	}
 	for _, name := range synced.directories {
 		if name == "." {
+			root = true
 			continue
 		}
 		if err := r.syncDirectory(name); err != nil {
 			return syncedNames{}, fmt.Errorf("syncing dirty repository directory %q: %w", name, err)
+		}
+	}
+	// The root, which names the others, last.
+	if root {
+		if err := r.dir.Sync(); err != nil {
+			return syncedNames{}, fmt.Errorf("syncing repository directory: %w", err)
 		}
 	}
 	return synced, nil
@@ -3668,14 +3691,14 @@ func (r *Repository) syncMetadataLocked() error {
 	}
 	r.dirtyMu.Unlock()
 	sort.Strings(branchDirty)
-	if syncing {
+	// Only branches/ names the pointers; syncNamesLocked synced the root if
+	// anything it names changed. Synced every time, the two were 4 ms of
+	// closing a repository just made, which nothing had changed since.
+	if syncing && len(branchDirty) != 0 {
 		if err := r.syncRepositoryFiles(branchDirty); err != nil {
 			return err
 		}
 		if err := r.syncDirectory("branches"); err != nil {
-			return err
-		}
-		if err := r.dir.Sync(); err != nil {
 			return err
 		}
 	}
@@ -4563,13 +4586,8 @@ func writeJSONUnsynced(stagingDir, path string, value any) error {
 		return err
 	}
 	data = append(data, '\n')
-	file, err := os.CreateTemp(stagingDir, "publish-")
+	staging, err := writeTemp(stagingDir, data, 0600)
 	if err != nil {
-		return err
-	}
-	staging := file.Name()
-	if err := errors.Join(file.Chmod(0600), writeAll(file, data), file.Close()); err != nil {
-		_ = os.Remove(staging)
 		return err
 	}
 	if err := os.Rename(staging, path); err != nil {
@@ -4577,6 +4595,20 @@ func writeJSONUnsynced(stagingDir, path string, value any) error {
 		return err
 	}
 	return nil
+}
+
+// writeTemp writes data to a new file in dir, without syncing it, and
+// returns the file's name.
+func writeTemp(dir string, data []byte, mode fs.FileMode) (string, error) {
+	file, err := os.CreateTemp(dir, "publish-")
+	if err != nil {
+		return "", err
+	}
+	if err := errors.Join(file.Chmod(mode), writeAll(file, data), file.Close()); err != nil {
+		_ = os.Remove(file.Name())
+		return "", err
+	}
+	return file.Name(), nil
 }
 
 func atomicWriteFile(stagingDir, path string, data []byte, mode fs.FileMode) error {
