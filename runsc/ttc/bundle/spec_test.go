@@ -177,7 +177,7 @@ func TestInstallPortableInternalMountsPersistsNodeLocalSources(t *testing.T) {
 
 // A container's image root is ready on a node once it is unpacked there, and
 // preparing it leaves the container's records as they were.
-func TestContainerImageRootReadyOnceUnpacked(t *testing.T) {
+func TestContainerImageRootKeptOnceUnpacked(t *testing.T) {
 	root := t.TempDir()
 	store := Store{Root: root}
 	info := ContainerInfo{
@@ -196,8 +196,8 @@ func TestContainerImageRootReadyOnceUnpacked(t *testing.T) {
 	if err := writeCurrentContainerFixture(record, &info); err != nil {
 		t.Fatal(err)
 	}
-	if ready, err := store.ContainerImageRootReady(info.ID); err != nil || ready {
-		t.Fatalf("ContainerImageRootReady before the root is unpacked=(%t, %v)", ready, err)
+	if ready, err := store.KeepContainerImageRoot(info.ID); err != nil || ready {
+		t.Fatalf("KeepContainerImageRoot before the root is unpacked=(%t, %v)", ready, err)
 	}
 	if err := os.MkdirAll(info.RootFS, 0700); err != nil {
 		t.Fatal(err)
@@ -210,8 +210,8 @@ func TestContainerImageRootReadyOnceUnpacked(t *testing.T) {
 	if err := ownership.Write(ownership.ManifestPath(info.RootFS), manifest); err != nil {
 		t.Fatal(err)
 	}
-	if ready, err := store.ContainerImageRootReady(info.ID); err != nil || !ready {
-		t.Fatalf("ContainerImageRootReady once unpacked=(%t, %v)", ready, err)
+	if ready, err := store.KeepContainerImageRoot(info.ID); err != nil || !ready {
+		t.Fatalf("KeepContainerImageRoot once unpacked=(%t, %v)", ready, err)
 	}
 	before, err := os.ReadFile(record)
 	if err != nil {
@@ -3091,6 +3091,58 @@ func TestClusterImageCacheKeepsOnlyNodeLocalContainers(t *testing.T) {
 	containers = []ContainerInfo{{ID: "local", Digest: digest, Platform: platform}}
 	if removed, err := store.pruneImageRoots(nil, containers); err != nil || removed != 0 {
 		t.Fatalf("prune locally-used cache = (%d, %v), want (0, nil)", removed, err)
+	}
+}
+
+// A container about to start on a node from an image root the node unpacked
+// longer ago than the grace, which no container on the node runs from yet,
+// keeps it from the pruning that comes before the container has state there.
+func TestStartingContainerKeepsTheNodesOldImageRoot(t *testing.T) {
+	shared := t.TempDir()
+	store := Store{Root: shared, ActiveRoot: t.TempDir()}
+	info := ContainerInfo{
+		ID: "web-id", Name: "web", Digest: "sha256:" + strings.Repeat("a", 64), Platform: "linux/amd64",
+		BundleDir: filepath.Join(shared, "containers", "web-id", "bundle"),
+	}
+	if err := os.MkdirAll(info.BundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentContainerFixture(filepath.Join(shared, "containers", info.ID, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	imageRoot := filepath.Join(store.imageRootDir(), imageRootKey(info.Digest, info.Platform))
+	unpack := func() {
+		t.Helper()
+		rootfs := filepath.Join(imageRoot, "rootfs")
+		if err := os.MkdirAll(rootfs, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeJSON(filepath.Join(imageRoot, "image.json"), &ttcimages.RootFSInfo{ConfigDigest: info.Digest, Platform: info.Platform}); err != nil {
+			t.Fatal(err)
+		}
+		owners := ownership.NewManifest()
+		owners.Entries["."] = ownership.Owner{}
+		if err := ownership.Write(ownership.ManifestPath(rootfs), owners); err != nil {
+			t.Fatal(err)
+		}
+		old := time.Now().Add(-2 * nodeLocalImageCacheGrace)
+		if err := os.Chtimes(imageRoot, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	unpack()
+	if removed, err := store.PruneImageRoots(context.Background()); err != nil || removed != 1 {
+		t.Fatalf("PruneImageRoots of an old root no container runs from = (%d, %v), want (1, nil)", removed, err)
+	}
+	unpack()
+	if ready, err := store.KeepContainerImageRoot(info.ID); err != nil || !ready {
+		t.Fatalf("KeepContainerImageRoot = (%t, %v), want (true, nil)", ready, err)
+	}
+	if removed, err := store.PruneImageRoots(context.Background()); err != nil || removed != 0 {
+		t.Fatalf("PruneImageRoots of the root a container is starting from = (%d, %v), want (0, nil)", removed, err)
+	}
+	if _, err := loadImageRoot(imageRoot); err != nil {
+		t.Fatalf("the root a container is starting from: %v", err)
 	}
 }
 

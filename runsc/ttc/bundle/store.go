@@ -3826,15 +3826,20 @@ func (s Store) CommitActiveRepositoryRestoreIDs(name string) error {
 	return s.WriteActiveRepositoryMap(info.ID, repositories)
 }
 
-// ContainerImageRootReady reports whether the image root that the container
-// named name runs from is unpacked on this node.
-func (s Store) ContainerImageRootReady(name string) (bool, error) {
+// KeepContainerImageRoot reports whether the image root that the container
+// named name runs from is unpacked on this node, and if it is, keeps it for
+// the container (keepImageRoot).
+func (s Store) KeepContainerImageRoot(name string) (bool, error) {
 	info, err := s.loadRuntimeContainer(name)
 	if err != nil {
 		return false, err
 	}
-	_, err = loadImageRoot(filepath.Join(s.imageRootDir(), imageRootKey(info.Digest, info.Platform)))
-	return err == nil, nil
+	dir := filepath.Join(s.imageRootDir(), imageRootKey(info.Digest, info.Platform))
+	if s.activeRoot() == s.Root {
+		_, err = loadImageRoot(dir)
+		return err == nil, nil
+	}
+	return s.keepImageRoot(dir)
 }
 
 // PrepareContainerImageRoot unpacks on this node the image root that the
@@ -3869,7 +3874,13 @@ func (s Store) RefreshContainerImageRoot(ctx context.Context, name string) (Cont
 	}
 	want := filepath.Join(s.imageRootDir(), imageRootKey(info.Digest, info.Platform), "rootfs")
 	if info.RootFS == want {
-		if _, statErr := os.Stat(want); statErr == nil {
+		if s.activeRoot() != s.Root {
+			if kept, err := s.keepImageRoot(filepath.Dir(want)); err != nil {
+				return ContainerInfo{}, err
+			} else if kept {
+				return info, nil
+			}
+		} else if _, statErr := os.Stat(want); statErr == nil {
 			return info, nil
 		}
 	}
@@ -7168,6 +7179,11 @@ func (s Store) prepareImageRootLocked(ctx context.Context, pulled images.Info, p
 		return images.RootFSInfo{}, "", fmt.Errorf("cleaning stale image roots: %w", err)
 	}
 	if info, err := loadImageRoot(finalDir); err == nil {
+		if s.activeRoot() != s.Root {
+			if err := keepImageRootLocked(finalDir); err != nil {
+				return images.RootFSInfo{}, "", err
+			}
+		}
 		return info, filepath.Join(finalDir, "rootfs"), nil
 	}
 	tempDir, err := os.MkdirTemp(imagesDir, key+".tmp-")
@@ -7415,6 +7431,35 @@ func (s Store) withImageRootLock(fn func() error) error {
 	}
 	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
 	return fn()
+}
+
+// keepImageRoot reports whether the image root dir is unpacked on this node,
+// and if it is, keeps it for a container about to run from it: pruning a
+// node's image roots spares one no container with state on the node runs from
+// only while it is younger than nodeLocalImageCacheGrace, and the container
+// has no state on the node until it starts. A start on a node that had
+// unpacked the image more than a minute before found its root pruned, and its
+// sandbox failed to start.
+func (s Store) keepImageRoot(dir string) (bool, error) {
+	kept := false
+	err := s.withImageRootLock(func() error {
+		if _, err := loadImageRoot(dir); err != nil {
+			return nil
+		}
+		kept = true
+		return keepImageRootLocked(dir)
+	})
+	return kept, err
+}
+
+// keepImageRootLocked makes the image root dir young again, for keepImageRoot;
+// its caller holds withImageRootLock.
+func keepImageRootLocked(dir string) error {
+	now := time.Now()
+	if err := os.Chtimes(dir, now, now); err != nil {
+		return fmt.Errorf("keeping image root %q: %w", filepath.Base(dir), err)
+	}
+	return nil
 }
 
 func removeStaleImageRootTemps(imagesDir, key string) error {

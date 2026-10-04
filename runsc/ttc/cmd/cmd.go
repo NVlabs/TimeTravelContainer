@@ -8258,7 +8258,7 @@ func (b *runtimeBackend) prepareFreshStartStorage(info ttcbundle.ContainerInfo, 
 		return info, branch, nil
 	}
 	store := b.containerStore()
-	if ready, err := store.ContainerImageRootReady(info.ID); err != nil {
+	if ready, err := store.KeepContainerImageRoot(info.ID); err != nil {
 		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
 	} else if !ready {
 		// Unpacking the image on a node that has not run it yet takes time
