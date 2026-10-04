@@ -1969,9 +1969,13 @@ func (s *daemonServer) activateMaterializedLifecycleTargets(backend *runtimeBack
 		backend.distributedSource == nil || backend.distributedSource.directory == nil {
 		return nil
 	}
-	node, err := backend.distributedSource.directory.Lookup(backend.nodeID)
-	if err != nil {
-		return err
+	incarnation := backend.distributedSource.incarnation
+	if incarnation == "" {
+		node, err := backend.distributedSource.directory.Lookup(backend.nodeID)
+		if err != nil {
+			return err
+		}
+		incarnation = node.Incarnation
 	}
 	placements, err := backend.placementCatalog()
 	if err != nil {
@@ -1999,7 +2003,7 @@ func (s *daemonServer) activateMaterializedLifecycleTargets(backend *runtimeBack
 			result = errors.Join(result, err)
 			continue
 		}
-		if record.State != cluster.PlacementMaterializing || record.OwnerNode != backend.nodeID || record.OwnerIncarnation != node.Incarnation {
+		if record.State != cluster.PlacementMaterializing || record.OwnerNode != backend.nodeID || record.OwnerIncarnation != incarnation {
 			continue
 		}
 		physicalContainer, physicalBranch := record.PhysicalContainer, record.PhysicalBranch
@@ -2013,11 +2017,62 @@ func (s *daemonServer) activateMaterializedLifecycleTargets(backend *runtimeBack
 		if err != nil || (state != "running" && state != "paused") {
 			continue
 		}
-		if _, err := placements.UpdateStableState(record.FamilyID, record.BranchID, record.OwnerNode, record.OwnerIncarnation, record.Generation, cluster.PlacementState(state), time.Now()); err != nil {
+		_, err = placements.UpdateStableState(record.FamilyID, record.BranchID, record.OwnerNode, record.OwnerIncarnation, record.Generation, cluster.PlacementState(state), time.Now())
+		if cluster.IsNoExecutionLease(err) {
+			// The authority changed hands since the node last renewed its
+			// lease, which it renews now, not with each start.
+			if _, renewErr := backend.renewDistributedExecutionAuthority(); renewErr != nil {
+				err = errors.Join(err, renewErr)
+			} else {
+				_, err = placements.UpdateStableState(record.FamilyID, record.BranchID, record.OwnerNode, record.OwnerIncarnation, record.Generation, cluster.PlacementState(state), time.Now())
+			}
+		}
+		if err != nil {
 			result = errors.Join(result, fmt.Errorf("activating placement of %s: %w", target, err))
 		}
 	}
 	return result
+}
+
+// lifecycleTargetsHeld reports whether this node, in its incarnation, holds
+// the placement of every branch the lifecycle command args names, as
+// claimLifecycleTargets leaves them: none of them is to be claimed.
+func lifecycleTargetsHeld(backend *runtimeBackend, args []string) (bool, error) {
+	if backend.distributedSource == nil || backend.distributedSource.incarnation == "" {
+		return false, nil
+	}
+	placements, err := backend.placementCatalog()
+	if err != nil {
+		return false, err
+	}
+	operands, err := lifecycleCommandOperands(args)
+	if err != nil {
+		return false, err
+	}
+	for _, operand := range operands {
+		target, err := parseSelector(operand)
+		if err != nil {
+			return false, err
+		}
+		resolved, info, err := backend.resolveSelector(target)
+		if err != nil {
+			return false, err
+		}
+		branch, err := persistentBranchInfo(info, resolved.branch)
+		if err != nil {
+			return false, err
+		}
+		record, err := placements.Lookup(logicalFamilyID(info), target.branch)
+		if err != nil {
+			// claimLifecycleTargets reports it.
+			return false, nil
+		}
+		if record.State == cluster.PlacementUnplaced || branch.Unplaced ||
+			record.OwnerNode != backend.nodeID || record.OwnerIncarnation != backend.distributedSource.incarnation {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // claimUnplacedLifecycleTargets turns admission of a durable cold branch into
@@ -2045,6 +2100,15 @@ func (s *daemonServer) reclaimCompletedLifecycleTargets(backend *runtimeBackend,
 func (s *daemonServer) claimLifecycleTargets(backend *runtimeBackend, args []string, admit bool) error {
 	if s == nil || backend == nil || s.clusterDirectory == nil || s.clusterCapabilities == nil || !daemonCommandClaimsUnplaced(args) {
 		return nil
+	}
+	if !admit {
+		// Once the command has run, its branches are this node's, unless a
+		// publication unplaced one meanwhile: only then is one claimed again,
+		// and the node's lease renewed for the claim, a proposal of every
+		// start.
+		if held, err := lifecycleTargetsHeld(backend, args); err != nil || held {
+			return err
+		}
 	}
 	// takeovers of the authority invalidate execution grants from the preceding
 	// term. Renew synchronously at the admission boundary instead of depending

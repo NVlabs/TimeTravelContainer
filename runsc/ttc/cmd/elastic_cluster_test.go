@@ -1493,6 +1493,83 @@ func TestNonOwnedBranchCleanupLeavesABranchBeingMade(t *testing.T) {
 // A rehydration makes its branch routable even while a long operation, a
 // remote fork's handoff for one, works on its family: the reconciliation
 // after the command passes over such a family.
+// countingNodes counts the heartbeats of a node directory: the renewals of
+// a node's execution lease.
+type countingNodes struct {
+	cluster.NodeCatalog
+	heartbeats int
+}
+
+func (c *countingNodes) Heartbeat(nodeID, incarnation string, current uint64, now time.Time, lease time.Duration) (*cluster.NodeRecord, error) {
+	c.heartbeats++
+	return c.NodeCatalog.Heartbeat(nodeID, incarnation, current, now, lease)
+}
+
+// Once a start has run, its node renews its execution lease, a proposal to
+// the authority, only to claim a branch again, which a publication may have
+// unplaced meanwhile: not when it holds the branch's placement.
+func TestStartRenewsItsLeaseOnlyToClaimAgain(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "web")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	info := ttcbundle.ContainerInfo{
+		ID: "web", Name: "web", NodeID: "node-a", BundleDir: bundleDir,
+		Branches: []ttcbundle.BranchInfo{{ID: "main", NodeID: "node-a", State: "running", CreatedAt: time.Unix(1, 0).UTC()}},
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), info); err != nil {
+		t.Fatal(err)
+	}
+	placements, err := cluster.OpenPlacementStore(filepath.Join(root, "cluster", "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := cluster.OpenNodeDirectory(filepath.Join(root, "cluster", "nodes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	node, err := directory.Register(testElasticCapacityRecord("node-a", 0, 1<<60), now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node, err = directory.Transition(node.NodeID, node.Incarnation, cluster.NodeReady, now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := placements.Create(cluster.PlacementRecord{
+		FamilyID: "web", BranchID: "main", PhysicalContainer: "web", PhysicalBranch: "main",
+		OwnerNode: "node-a", OwnerIncarnation: node.Incarnation, State: cluster.PlacementMaterializing,
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+	nodes := &countingNodes{NodeCatalog: directory}
+	server := &daemonServer{clusterDirectory: nodes, clusterCapabilities: &node.Capabilities}
+	backend := &runtimeBackend{
+		dataRoot: root, localRoot: t.TempDir(), nodeID: "node-a", operations: &familyOperations{},
+		stdin: strings.NewReader(""), stdout: io.Discard, stderr: io.Discard,
+		distributedSource: &distributedSourceRuntime{directory: nodes, placements: placements, incarnation: node.Incarnation},
+	}
+	args := []string{"start", "web@main"}
+	if err := server.reclaimCompletedLifecycleTargets(backend, args); err != nil {
+		t.Fatalf("reclaiming a branch the node holds: %v", err)
+	}
+	if nodes.heartbeats != 0 {
+		t.Errorf("reclaiming a branch the node holds renewed its lease %d times", nodes.heartbeats)
+	}
+	// A placement that does not name this incarnation of the node is
+	// claimed the whole way, which renews the lease first.
+	backend.distributedSource.incarnation = "another-incarnation"
+	_ = server.reclaimCompletedLifecycleTargets(backend, args)
+	if nodes.heartbeats != 1 {
+		t.Errorf("claiming a branch again renewed the lease %d times, want once", nodes.heartbeats)
+	}
+}
+
 func TestRehydrationActivatesItsPlacementInABusyFamily(t *testing.T) {
 	root := t.TempDir()
 	local := t.TempDir()
