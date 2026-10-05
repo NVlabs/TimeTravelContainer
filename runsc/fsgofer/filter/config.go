@@ -77,6 +77,14 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 		seccomp.MaskedEqual(unix.AT_EMPTY_PATH, unix.AT_EMPTY_PATH),
 	},
 	unix.SYS_FSYNC: seccomp.MatchAll{},
+	// Used by ttcpack.LazyDirectory to start the writeback of each file it
+	// fetches, so that the sync of the first commits them all.
+	unix.SYS_SYNC_FILE_RANGE: seccomp.PerArg{
+		seccomp.NonNegativeFD{},
+		seccomp.EqualTo(0),
+		seccomp.EqualTo(0),
+		seccomp.EqualTo(unix.SYNC_FILE_RANGE_WRITE),
+	},
 	unix.SYS_FUTEX: seccomp.Or{
 		seccomp.PerArg{
 			seccomp.AnyValue{},

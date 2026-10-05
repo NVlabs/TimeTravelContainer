@@ -457,6 +457,146 @@ func TestLazyPrefetchRecordsItsCompletion(t *testing.T) {
 	prefetch()
 }
 
+// lazySkeleton makes a skeleton root of a pack of contents, by path, and
+// returns the root and its descriptor.
+func lazySkeleton(t *testing.T, contents map[string][]byte) (string, LazyDescriptor) {
+	t.Helper()
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	for name, data := range contents {
+		path := filepath.Join(source, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0444); err != nil {
+			t.Fatal(err)
+		}
+	}
+	repository := filepath.Join(root, "repository")
+	id, err := WriteDirectory(source, repository, IDForKey("test", t.Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootfs := filepath.Join(root, "cache", "rootfs")
+	if err := MaterializeSkeleton(repository, id, rootfs, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteLazyDescriptor(rootfs, repository, id, ""); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := ReadLazyDescriptor(rootfs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rootfs, descriptor
+}
+
+// lazyRecord returns the path of the completion record of the file name of
+// the skeleton root rootfs.
+func lazyRecord(rootfs, name string) string {
+	shard, file := lazyLockName(name)
+	return filepath.Join(filepath.Dir(rootfs), LazyStateDirectory, shard, file)
+}
+
+// A gofer remembers the files it found or made complete, as no eviction runs
+// while it has the image open: it looks at a file's record once, and at none
+// once it knows the image complete.
+func TestLazyDirectoryRemembersCompleteFiles(t *testing.T) {
+	rootfs, descriptor := lazySkeleton(t, map[string][]byte{"file": []byte("file")})
+	lazy, err := OpenLazyDirectory(rootfs, descriptor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A record removed behind its back stands for one looked at again:
+	// Ensure makes it anew whenever it looks.
+	record := lazyRecord(rootfs, "file")
+	for _, allComplete := range []bool{false, true} {
+		if err := lazy.Ensure("file"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(record); err != nil {
+			t.Fatal(err)
+		}
+		if allComplete {
+			if err := os.WriteFile(filepath.Join(filepath.Dir(rootfs), LazyStateDirectory, lazyAllComplete), nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+			lazy.completedMu.Lock()
+			lazy.completed = nil
+			lazy.completedMu.Unlock()
+			lazy.StartPrefetch()
+		}
+		if err := lazy.Ensure("file"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(record); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("the record of a file known complete was looked at again (image known complete: %t): %v", allComplete, err)
+		}
+		if err := os.WriteFile(record, []byte("complete\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := lazy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(filepath.Join(rootfs, "file")); err != nil || string(got) != "file" {
+		t.Errorf("file: %q, %v", got, err)
+	}
+}
+
+// A fetch makes complete the incomplete files after the one asked for, those
+// of its directory, which a guest opens next, reading their data from the
+// pack at once; it passes over one whose lock another fetch holds, and stops
+// at its bounds.
+func TestLazyFetchTakesTheFilesAfterIt(t *testing.T) {
+	contents := map[string][]byte{
+		"a/1":   []byte("one"),
+		"a/2":   bytes.Repeat([]byte("two"), 1000),
+		"a/3":   []byte("three"),
+		"a/4":   []byte("four"),
+		"b/big": bytes.Repeat([]byte{9}, lazyFetchBytes),
+		"b/end": []byte("end"),
+	}
+	rootfs, descriptor := lazySkeleton(t, contents)
+	lazy, err := OpenLazyDirectory(rootfs, descriptor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held, err := lazy.lock("a/3", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lazy.Ensure("a/1"); err != nil {
+		t.Fatal(err)
+	}
+	held.release()
+	for name, want := range map[string]bool{"a/1": true, "a/2": true, "a/3": false, "a/4": true, "b/big": false, "b/end": false} {
+		record, _ := os.ReadFile(lazyRecord(rootfs, name))
+		if complete := string(record) == "complete\n"; complete != want {
+			t.Errorf("after a fetch of a/1, %s complete: %t, want %t", name, complete, want)
+		}
+	}
+	for _, name := range []string{"a/3", "b/big", "b/end"} {
+		if err := lazy.Ensure(name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := lazy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for name, data := range contents {
+		if got, err := os.ReadFile(filepath.Join(rootfs, name)); err != nil || !bytes.Equal(got, data) {
+			t.Errorf("%s: length %d, %v", name, len(got), err)
+		}
+		if info, err := os.Stat(filepath.Join(rootfs, name)); err != nil || info.Mode().Perm() != 0444 {
+			t.Errorf("%s: %v, %v", name, info.Mode(), err)
+		}
+	}
+	if usage, err := InspectLazyCache(rootfs); err != nil || usage.CompleteFiles != uint64(len(contents)) {
+		t.Errorf("usage = %+v, %v", usage, err)
+	}
+}
+
 // A pack keeps small files back to back, with no header for each entry, so a
 // directory of many small files packs into little more than its size; a pack
 // of the padded format before is still read, eagerly and on demand.

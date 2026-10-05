@@ -20,6 +20,8 @@ go_library(
     name = "ttcpack",
     srcs = [
         "lazy.go",
+        "lazy_linux.go",
+        "lazy_other.go",
         "pack.go",
     ],
     visibility = ["//visibility:public"],

@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 )
@@ -162,6 +163,18 @@ type LazyDirectory struct {
 	closeOnce  sync.Once
 	prefetchWG sync.WaitGroup
 	stateLock  bool
+
+	// index is where each of paths is in it.
+	index map[string]int
+
+	// allComplete is set once every file is complete, and completed holds
+	// the files found or made complete before then. A file stays complete
+	// while the directory holds the state lock shared, as a gofer's does:
+	// eviction takes it alone. Each open of an image file looked at the
+	// file's completion record again, eight system calls.
+	allComplete atomic.Bool
+	completedMu sync.Mutex
+	completed   map[string]struct{}
 }
 
 // OpenLazyDirectory opens descriptor and the skeleton root. It reads only the
@@ -273,6 +286,10 @@ func openLazyDirectory(pack *os.File, rootFD, stateFD int, prefix string, lockSt
 		d.paths = append(d.paths, path)
 	}
 	sort.Strings(d.paths)
+	d.index = make(map[string]int, len(d.paths))
+	for i, path := range d.paths {
+		d.index[path] = i
+	}
 	return d, nil
 }
 
@@ -520,11 +537,23 @@ func EvictLazyCache(rootfs string, targetBytes uint64) (LazyCacheUsage, LazyCach
 	return usage, evicted, nil
 }
 
+// lazyFetchFiles and lazyFetchBytes bound a fetch: the files that it makes
+// complete together, whose data it reads from the pack at once, and makes
+// durable with one commit of the node's filesystem. Synced one by one, the
+// sync of each file was 3.2 ms of the 3.8 that a prefetched file took, and 4
+// of the 10 that a file fetched on demand did, on this host's disk.
+const (
+	lazyFetchFiles = 32
+	lazyFetchBytes = 1 << 20
+)
+
 // Ensure makes virtualPath complete before any guest descriptor can observe
-// it. The completion record is written only after file data and metadata have
-// been synced. A crash before then causes the next caller to rewrite the file;
-// so does one that loses the record, which is not synced: a sync of each
-// file's record was half of a prefetch's syncs.
+// it, and with it as many of the incomplete files after it in the pack as a
+// fetch takes: those of its directory, which a guest opens next. The
+// completion record is written only after file data and metadata have been
+// synced. A crash before then causes the next caller to rewrite the file; so
+// does one that loses the record, which is not synced: a sync of each file's
+// record was half of a prefetch's syncs.
 func (d *LazyDirectory) Ensure(virtualPath string) error {
 	if d == nil {
 		return nil
@@ -534,39 +563,195 @@ func (d *LazyDirectory) Ensure(virtualPath string) error {
 		return err
 	}
 	canonical, ok := d.canonical[path]
-	if !ok {
+	if !ok || d.knownComplete(canonical) {
 		return nil
 	}
+	return d.fetch(canonical)
+}
+
+// lazyFile is a file of the image whose lock a fetch holds.
+type lazyFile struct {
+	canonical string
+	entries   []Entry
+	lockFD    int
+	// targetFD is the file, open to write, once the fetch writes it.
+	targetFD int
+	// complete is whether its record says it is complete.
+	complete bool
+}
+
+// fetch makes the file canonical complete, waiting for its lock, and the
+// incomplete files after it in the pack whose locks are free, up to
+// lazyFetchFiles and lazyFetchBytes.
+func (d *LazyDirectory) fetch(canonical string) error {
+	first, err := d.lock(canonical, true)
+	if err != nil {
+		return err
+	}
+	if first.complete {
+		first.release()
+		d.knowComplete(canonical)
+		return nil
+	}
+	batch := []*lazyFile{first}
+	size := d.metadata[canonical].Size
+	if index, ok := d.index[canonical]; ok {
+		for _, next := range d.paths[index+1 : min(len(d.paths), index+1+lazyFetchFiles)] {
+			if len(batch) == lazyFetchFiles || size >= lazyFetchBytes {
+				break
+			}
+			if d.knownComplete(next) {
+				continue
+			}
+			if size+d.metadata[next].Size > lazyFetchBytes {
+				break
+			}
+			f, err := d.lock(next, false)
+			if err != nil || f == nil {
+				continue
+			}
+			if f.complete {
+				f.release()
+				d.knowComplete(next)
+				continue
+			}
+			batch = append(batch, f)
+			size += d.metadata[next].Size
+		}
+	}
+	return d.populate(batch)
+}
+
+// lock takes the lock of the file canonical, waiting for it if wait, and reads
+// its completion record. It returns nil if !wait and the lock is taken.
+func (d *LazyDirectory) lock(canonical string, wait bool) (*lazyFile, error) {
 	entries, ok := d.files[canonical]
 	if !ok {
-		return fmt.Errorf("lazy image file %q has no data records", canonical)
+		return nil, fmt.Errorf("lazy image file %q has no data records", canonical)
 	}
 	shard, name := lazyLockName(canonical)
 	if err := unix.Mkdirat(d.stateFD, shard, 0700); err != nil && !errors.Is(err, unix.EEXIST) {
-		return err
+		return nil, err
 	}
 	shardFD, err := unix.Openat(d.stateFD, shard, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer unix.Close(shardFD)
 	lockFD, err := unix.Openat(shardFD, name, unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC, 0600)
+	_ = unix.Close(shardFD)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer unix.Close(lockFD)
-	if err := unix.Flock(lockFD, unix.LOCK_EX); err != nil {
-		return err
+	how := unix.LOCK_EX
+	if !wait {
+		how |= unix.LOCK_NB
 	}
-	defer unix.Flock(lockFD, unix.LOCK_UN)
+	if err := unix.Flock(lockFD, how); err != nil {
+		_ = unix.Close(lockFD)
+		if !wait && errors.Is(err, unix.EWOULDBLOCK) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	f := &lazyFile{canonical: canonical, entries: entries, lockFD: lockFD, targetFD: -1}
 	marker := make([]byte, len("complete\n"))
 	if n, err := unix.Pread(lockFD, marker, 0); err == nil && n == len(marker) && string(marker) == "complete\n" {
+		f.complete = true
+	}
+	return f, nil
+}
+
+// release closes f's file and releases its lock.
+func (f *lazyFile) release() {
+	if f.targetFD >= 0 {
+		_ = unix.Close(f.targetFD)
+		f.targetFD = -1
+	}
+	_ = unix.Flock(f.lockFD, unix.LOCK_UN)
+	_ = unix.Close(f.lockFD)
+}
+
+// populate fetches the files of batch, whose locks it holds, from the pack,
+// and records each complete once it is durable: each file's writeback starts
+// as it is written, so that the sync of the first commits all of them. It
+// releases them. Its error is the first file's: a later one that fails is
+// left incomplete.
+func (d *LazyDirectory) populate(batch []*lazyFile) error {
+	defer func() {
+		for _, f := range batch {
+			f.release()
+		}
+	}()
+	span := d.readSpan(batch)
+	var err error
+	written := make([]*lazyFile, 0, len(batch))
+	for i, f := range batch {
+		if writeErr := d.write(f, span); writeErr != nil {
+			if i == 0 {
+				err = writeErr
+			}
+			continue
+		}
+		written = append(written, f)
+	}
+	for _, f := range written {
+		recordErr := unix.Fsync(f.targetFD)
+		if recordErr == nil {
+			recordErr = recordComplete(f.lockFD)
+		}
+		if recordErr != nil {
+			if f == batch[0] {
+				err = recordErr
+			}
+			continue
+		}
+		d.knowComplete(f.canonical)
+	}
+	return err
+}
+
+// lazySpan is data of the pack from offset.
+type lazySpan struct {
+	offset int64
+	data   []byte
+}
+
+// readSpan reads the data of the files of batch in one read of the pack, a
+// round trip of a network mount for each, if it spans little enough: they
+// lie together in the pack. It returns nil if not.
+func (d *LazyDirectory) readSpan(batch []*lazyFile) *lazySpan {
+	if len(batch) < 2 {
 		return nil
 	}
+	start, end := int64(-1), int64(0)
+	for _, f := range batch {
+		for _, entry := range f.entries {
+			if entry.Length <= 0 {
+				continue
+			}
+			if start < 0 || entry.dataOffset < start {
+				start = entry.dataOffset
+			}
+			end = max(end, entry.dataOffset+entry.Length)
+		}
+	}
+	if start < 0 || end-start > 2*lazyFetchBytes {
+		return nil
+	}
+	data := make([]byte, end-start)
+	if n, err := d.pack.ReadAt(data, start); err != nil && !(err == io.EOF && n == len(data)) {
+		return nil
+	}
+	return &lazySpan{offset: start, data: data}
+}
+
+// write writes f's data, from span where it holds it and from the pack where
+// not, to its file, and starts the file's writeback.
+func (d *LazyDirectory) write(f *lazyFile, span *lazySpan) error {
 	// Incomplete skeleton files are normally writable. Eviction deliberately
 	// leaves an immutable completed file at size zero, so restore owner-write
 	// permission before reopening it for replacement.
-	targetFD, err := unix.Openat(d.rootFD, canonical, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	targetFD, err := unix.Openat(d.rootFD, f.canonical, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return err
 	}
@@ -577,26 +762,31 @@ func (d *LazyDirectory) Ensure(virtualPath string) error {
 	if err := unix.Close(targetFD); err != nil {
 		return err
 	}
-	targetFD, err = unix.Openat(d.rootFD, canonical, unix.O_WRONLY|unix.O_TRUNC|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	f.targetFD, err = unix.Openat(d.rootFD, f.canonical, unix.O_WRONLY|unix.O_TRUNC|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
+		f.targetFD = -1
 		return err
 	}
-	defer unix.Close(targetFD)
-	buffer := make([]byte, MaxDataExtent)
 	var size int64
-	for _, entry := range entries {
-		if entry.Length < 0 || entry.Length > int64(len(buffer)) {
-			return fmt.Errorf("lazy image extent for %q has invalid length %d", canonical, entry.Length)
+	for _, entry := range f.entries {
+		if entry.Length < 0 || entry.Length > MaxDataExtent {
+			return fmt.Errorf("lazy image extent for %q has invalid length %d", f.canonical, entry.Length)
 		}
-		n, err := d.pack.ReadAt(buffer[:entry.Length], entry.dataOffset)
-		if err != nil && !(err == io.EOF && int64(n) == entry.Length) {
-			return err
+		var data []byte
+		if span != nil && entry.dataOffset >= span.offset && entry.dataOffset+entry.Length <= span.offset+int64(len(span.data)) {
+			data = span.data[entry.dataOffset-span.offset:][:entry.Length]
+		} else if entry.Length != 0 {
+			data = make([]byte, entry.Length)
+			n, err := d.pack.ReadAt(data, entry.dataOffset)
+			if err != nil && !(err == io.EOF && int64(n) == entry.Length) {
+				return err
+			}
+			if int64(n) != entry.Length {
+				return io.ErrUnexpectedEOF
+			}
 		}
-		if int64(n) != entry.Length {
-			return io.ErrUnexpectedEOF
-		}
-		if n != 0 {
-			if written, err := unix.Pwrite(targetFD, buffer[:n], entry.FileOffset); err != nil || written != n {
+		if len(data) != 0 {
+			if written, err := unix.Pwrite(f.targetFD, data, entry.FileOffset); err != nil || written != len(data) {
 				if err == nil {
 					err = io.ErrShortWrite
 				}
@@ -607,15 +797,18 @@ func (d *LazyDirectory) Ensure(virtualPath string) error {
 			size = end
 		}
 	}
-	if err := unix.Ftruncate(targetFD, size); err != nil {
+	if err := unix.Ftruncate(f.targetFD, size); err != nil {
 		return err
 	}
-	if err := unix.Fchmod(targetFD, entries[0].Mode&07777); err != nil {
+	if err := unix.Fchmod(f.targetFD, f.entries[0].Mode&07777); err != nil {
 		return err
 	}
-	if err := unix.Fsync(targetFD); err != nil {
-		return err
-	}
+	startWriteback(f.targetFD)
+	return nil
+}
+
+// recordComplete records the file whose lock is lockFD complete.
+func recordComplete(lockFD int) error {
 	if err := unix.Ftruncate(lockFD, 0); err != nil {
 		return err
 	}
@@ -626,6 +819,44 @@ func (d *LazyDirectory) Ensure(virtualPath string) error {
 		return err
 	}
 	return nil
+}
+
+// knownComplete reports whether the file canonical is known to be complete.
+func (d *LazyDirectory) knownComplete(canonical string) bool {
+	if !d.stateLock {
+		return false
+	}
+	if d.allComplete.Load() {
+		return true
+	}
+	d.completedMu.Lock()
+	defer d.completedMu.Unlock()
+	_, ok := d.completed[canonical]
+	return ok
+}
+
+// knowComplete records that the file canonical is complete.
+func (d *LazyDirectory) knowComplete(canonical string) {
+	if !d.stateLock || d.allComplete.Load() {
+		return
+	}
+	d.completedMu.Lock()
+	defer d.completedMu.Unlock()
+	if d.completed == nil {
+		d.completed = make(map[string]struct{})
+	}
+	d.completed[canonical] = struct{}{}
+}
+
+// knowAllComplete records that every file is complete.
+func (d *LazyDirectory) knowAllComplete() {
+	if !d.stateLock {
+		return
+	}
+	d.allComplete.Store(true)
+	d.completedMu.Lock()
+	d.completed = nil
+	d.completedMu.Unlock()
 }
 
 // StartPrefetch begins low-priority sequential whole-file population. Demand
@@ -639,6 +870,7 @@ func (d *LazyDirectory) StartPrefetch() {
 	}
 	var stat unix.Stat_t
 	if unix.Fstatat(d.stateFD, lazyAllComplete, &stat, unix.AT_SYMLINK_NOFOLLOW) == nil {
+		d.knowAllComplete()
 		return
 	}
 	d.prefetchWG.Add(1)
@@ -662,6 +894,7 @@ func (d *LazyDirectory) StartPrefetch() {
 			if fd, err := unix.Openat(d.stateFD, lazyAllComplete, unix.O_CREAT|unix.O_WRONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0600); err == nil {
 				_ = unix.Close(fd)
 			}
+			d.knowAllComplete()
 		}
 	}()
 }
