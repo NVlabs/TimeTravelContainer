@@ -7752,12 +7752,14 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		writeError(placementErr)
 		return
 	}
-	if err := validateDaemonPlacementClaimsWithCatalog(opts.dataRoot, backend.nodeID, request.Args, request.PlacementClaims, placements); err != nil {
+	claimed, err := s.validateRoutedClaims(opts.dataRoot, backend.nodeID, request.Args, request.PlacementClaims, placements)
+	if err != nil {
 		unlock()
 		stdinReader.Close()
 		writeError(err)
 		return
 	}
+	backend.claimedAuthority = claimed
 	if err := s.claimUnplacedLifecycleTargets(backend, request.Args); err != nil {
 		unlock()
 		stdinReader.Close()
@@ -7788,6 +7790,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		mutationBackend.archiveFile = backend.archiveFile
 		mutationBackend.heldFamilies = families
 		mutationBackend.resolvedFamilies = backend.resolvedFamilies
+		mutationBackend.claimedAuthority = backend.claimedAuthority
 		mutationBackend.mutating = backend.mutating
 		mutationBackend.commandName = backend.commandName
 		if !daemonCommandKeepsLifecycleLock(request.Args) {
@@ -7800,6 +7803,8 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		}
 		s.configureFamilyLocks(mutationBackend)
 		status := runCommand(request.Args, mutationBackend.stdout, mutationBackend.stderr, mutationBackend)
+		// What the command changed, it resolves anew after.
+		mutationBackend.claimedAuthority.discard()
 		s.recordCommandEvents(opts.dataRoot, request.Args, status, mutationBackend.resolvedFamilies)
 		if status == 0 {
 			// Publication runs outside the lifecycle lock. It may unplace a
@@ -7853,6 +7858,8 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	} else {
 		status = runCommand(request.Args, backend.stdout, backend.stderr, backend)
 	}
+	// What the command changed, it resolves anew after.
+	backend.claimedAuthority.discard()
 	s.recordCommandEvents(opts.dataRoot, request.Args, status, backend.resolvedFamilies)
 	if status == 0 {
 		if err := s.reclaimCompletedLifecycleTargets(backend, request.Args); err != nil {
@@ -7905,6 +7912,65 @@ func (s *daemonServer) runListing(dataRoot string, args []string, backend *runti
 	_, _ = backend.stdout.Write(stdout.Bytes())
 	_, _ = backend.stderr.Write(stderr.Bytes())
 	return status
+}
+
+// validateRoutedClaims validates the placement claims a command was routed
+// here with. A claim of one branch is validated against what the authority
+// says of the branch when it is resolved, which the command's resolution of
+// the branch then reads rather than asking again: one round trip to the
+// authority's holder fewer for each command routed to a branch, but for a
+// command that may claim the branch first.
+func (s *daemonServer) validateRoutedClaims(dataRoot, node string, args []string, claims []daemonPlacementClaim, placements cluster.PlacementCatalog) (*claimedBranchAuthority, error) {
+	if len(claims) != 1 || s.distributedSource == nil || s.distributedSource.authority == nil || daemonCommandClaimsUnplaced(args) {
+		return nil, validateDaemonPlacementClaimsWithCatalog(dataRoot, node, args, claims, placements)
+	}
+	claim := claims[0]
+	state, err := s.distributedSource.authority.AuthorityStateOf(cluster.ResolutionQuery(claim.FamilyID, claim.FamilyID, claim.BranchID))
+	if err != nil {
+		return nil, fmt.Errorf("loading placement authority: %w", err)
+	}
+	if err := validateDaemonPlacementClaimsWithCatalog(dataRoot, node, args, claims, authorityStatePlacements{state: state}); err != nil {
+		return nil, err
+	}
+	return &claimedBranchAuthority{family: claim.FamilyID, branch: claim.BranchID, state: state}, nil
+}
+
+// claimedBranchAuthority is what the authority said of a branch of a logical
+// family, the placement and authorities that resolving the branch reads, when
+// a claim of it was validated.
+type claimedBranchAuthority struct {
+	family, branch string
+	state          *cluster.AuthorityState
+	// used is set once a resolution has taken it, or none may.
+	used atomic.Bool
+}
+
+// take returns what the authority said of family's branch, if c is of that
+// branch and nothing has taken it, and leaves it to nothing after: the first
+// resolution of a command takes it, and any later one may follow what the
+// command changed.
+func (c *claimedBranchAuthority) take(family, branch string) *cluster.AuthorityState {
+	if c == nil || c.used.Swap(true) || c.family != family || c.branch != branch {
+		return nil
+	}
+	return c.state
+}
+
+// discard leaves c to nothing.
+func (c *claimedBranchAuthority) discard() {
+	if c != nil {
+		c.used.Store(true)
+	}
+}
+
+// authorityStatePlacements looks placements up in an authority state.
+type authorityStatePlacements struct {
+	cluster.PlacementCatalog
+	state *cluster.AuthorityState
+}
+
+func (p authorityStatePlacements) Lookup(family, branch string) (*cluster.PlacementRecord, error) {
+	return p.state.PlacementOf(family, branch)
 }
 
 // reconciledRoots reports whether reconcile has completed for backend's

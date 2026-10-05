@@ -2895,3 +2895,33 @@ func TestClaimedFamily(t *testing.T) {
 		}
 	}
 }
+
+// A routed command's first resolution takes what the authority said of the
+// branch its claim names, if it resolves that branch; nothing takes it after.
+func TestClaimedBranchAuthorityIsTakenOnce(t *testing.T) {
+	state := &cluster.AuthorityState{}
+	claimed := &claimedBranchAuthority{family: "web", branch: "main", state: state}
+	if got := claimed.take("web", "main"); got != state {
+		t.Fatalf("the first take of the claimed branch = %p, want %p", got, state)
+	}
+	if got := claimed.take("web", "main"); got != nil {
+		t.Errorf("a second take = %p, want none", got)
+	}
+	other := &claimedBranchAuthority{family: "web", branch: "main", state: state}
+	if got := other.take("web", "a"); got != nil {
+		t.Errorf("a take of another branch = %p, want none", got)
+	}
+	if got := other.take("web", "main"); got != nil {
+		t.Errorf("a take after another branch's = %p, want none", got)
+	}
+	discarded := &claimedBranchAuthority{family: "web", branch: "main", state: state}
+	discarded.discard()
+	if got := discarded.take("web", "main"); got != nil {
+		t.Errorf("a take after a discard = %p, want none", got)
+	}
+	var none *claimedBranchAuthority
+	none.discard()
+	if got := none.take("web", "main"); got != nil {
+		t.Errorf("a take of nothing = %p, want none", got)
+	}
+}

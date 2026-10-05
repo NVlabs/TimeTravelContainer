@@ -6689,6 +6689,10 @@ type runtimeBackend struct {
 	// only those families acts on, and the placement reconciliation after it
 	// covers.
 	resolvedFamilies *familySet
+	// claimedAuthority, if not nil, is what the authority said of the branch
+	// that the claim a command was routed with names, as the claim was
+	// validated: the command's first resolution, if of that branch, reads it.
+	claimedAuthority *claimedBranchAuthority
 	publicationQueue *ttcstorage.Queue
 	snapshotGraph    *ttcsnapshot.Store
 	snapshotData     *ttcsnapshot.LocalDataStore
@@ -7192,6 +7196,8 @@ func (b *runtimeBackend) resolveSelector(target selector) (selector, ttcbundle.C
 	if waited, err := b.waitBusy(info.ID); err != nil {
 		return selector{}, ttcbundle.ContainerInfo{}, err
 	} else if waited {
+		// What the claim was validated against may have changed meanwhile.
+		b.claimedAuthority.discard()
 		if info, err = b.resolveContainer(target.container); err != nil {
 			return selector{}, ttcbundle.ContainerInfo{}, err
 		}
@@ -7210,7 +7216,13 @@ func (b *runtimeBackend) resolveSelectorIn(info ttcbundle.ContainerInfo, target 
 			logicalFamily = info.DistributedFamilyID
 		}
 		var publicationID string
+		// A command's first resolution is of the branch its claim names,
+		// which the claim was validated against just before.
+		claimed := b.claimedAuthority.take(info.ID, target.branch)
 		if b.distributedSource != nil && b.distributedSource.authority != nil {
+			if state == nil && logicalFamily == info.ID {
+				state = claimed
+			}
 			if state == nil {
 				// The branch's authority and placement, in one read.
 				var err error
