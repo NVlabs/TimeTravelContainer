@@ -54,12 +54,16 @@ type Client struct {
 	sockMu   sync.Mutex
 	sockComm *sockCommunicator
 
-	// channelsMu protects channels and availableChannels.
+	// channelsMu protects channels, availableChannels, growing and full.
 	channelsMu sync.Mutex
 	// channels tracks all the channels.
 	channels []*channel
 	// availableChannels is a LIFO (stack) of channels available to be used.
 	availableChannels []*channel
+	// growing is whether a channel is being made for requests that found
+	// every channel in use, and full whether the server takes no more: see
+	// getChannel.
+	growing, full bool
 	// activeWg represents active channels.
 	activeWg sync.WaitGroup
 
@@ -120,49 +124,61 @@ func NewClient(sock *unet.Socket) (*Client, Inode, int, error) {
 	return c, mountResp.Root, mountHostFD[0], nil
 }
 
-// StartChannels starts maxChannels() channel communicators.
+// StartChannels starts a channel communicator, and getChannel more, up to
+// maxChannels(), as requests come at once: the server of each channel holds a
+// thread while it waits for a request, and a mount whose requests come one at
+// a time, as those of a container's files bound into it do, held as many
+// threads as the server takes channels.
 func (c *Client) StartChannels() error {
 	maxChans := maxChannels()
 	c.channelsMu.Lock()
 	c.channels = make([]*channel, 0, maxChans)
 	c.availableChannels = make([]*channel, 0, maxChans)
+	// The first channel's own creation finds none available: it is not one
+	// that calls for another.
+	c.growing = true
 	c.channelsMu.Unlock()
 
-	// Create channels parallelly so that channels can be used to create more
-	// channels and costly initialization like flipcall.Endpoint.Connect can
-	// proceed parallelly.
-	var channelsWg sync.WaitGroup
-	for i := 0; i < maxChans; i++ {
-		channelsWg.Add(1)
-		go func() {
-			defer channelsWg.Done()
-			ch, err := c.createChannel()
-			if err != nil {
-				if err == unix.ENOMEM {
-					log.Debugf("channel creation failed because server hit max channels limit")
-				} else {
-					log.Warningf("channel creation failed: %v", err)
-				}
-				return
-			}
-			c.channelsMu.Lock()
-			c.channels = append(c.channels, ch)
-			c.availableChannels = append(c.availableChannels, ch)
-			c.channelsMu.Unlock()
-		}()
-	}
-	channelsWg.Wait()
-
-	// Check that atleast 1 channel is created. This is not required by lisafs
-	// protocol. It exists to flag server side issues in channel creation.
+	ch, err := c.createChannel()
 	c.channelsMu.Lock()
-	numChannels := len(c.channels)
-	c.channelsMu.Unlock()
-	if maxChans > 0 && numChannels == 0 {
+	defer c.channelsMu.Unlock()
+	c.growing = false
+	if err != nil {
+		// This is not required by lisafs protocol. It exists to flag server
+		// side issues in channel creation.
+		log.Warningf("channel creation failed: %v", err)
 		log.Warningf("all channel RPCs failed")
 		return unix.ENOMEM
 	}
+	c.channels = append(c.channels, ch)
+	c.availableChannels = append(c.availableChannels, ch)
 	return nil
+}
+
+// growChannels makes a channel, and makes it available.
+func (c *Client) growChannels() {
+	ch, err := c.createChannel()
+	c.channelsMu.Lock()
+	defer c.channelsMu.Unlock()
+	c.growing = false
+	if err != nil {
+		// Requests that find every channel in use go over the socket, as
+		// they did while the channel was being made.
+		c.full = true
+		if err == unix.ENOMEM {
+			log.Debugf("channel creation failed because server hit max channels limit")
+		} else {
+			log.Warningf("channel creation failed: %v", err)
+		}
+		return
+	}
+	if c.availableChannels == nil {
+		// The client shut down meanwhile, and destroyed the channels it had.
+		ch.destroy()
+		return
+	}
+	c.channels = append(c.channels, ch)
+	c.availableChannels = append(c.availableChannels, ch)
 }
 
 func (c *Client) watchdog() {
@@ -470,11 +486,16 @@ func (c *Client) releaseCommunicator(comm Communicator) {
 }
 
 // getChannel pops a channel from the available channels stack. The caller must
-// release the channel after use.
+// release the channel after use. If every channel is in use, it returns nil,
+// and has one more made for the requests to come, up to maxChannels().
 func (c *Client) getChannel() *channel {
 	c.channelsMu.Lock()
 	defer c.channelsMu.Unlock()
 	if len(c.availableChannels) == 0 {
+		if c.availableChannels != nil && !c.growing && !c.full && len(c.channels) < maxChannels() {
+			c.growing = true
+			go c.growChannels()
+		}
 		return nil
 	}
 

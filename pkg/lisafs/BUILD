@@ -136,6 +136,18 @@ go_test(
 )
 
 go_test(
+    name = "channel_growth_test",
+    size = "small",
+    srcs = ["channel_growth_test.go"],
+    library = ":lisafs",
+    deps = [
+        "//pkg/abi/linux",
+        "//pkg/sync",
+        "//pkg/unet",
+    ],
+)
+
+go_test(
     name = "starved_test",
     size = "small",
     srcs = ["starved_test.go"],
