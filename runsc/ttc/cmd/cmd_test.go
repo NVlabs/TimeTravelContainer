@@ -8293,3 +8293,40 @@ func TestRetainedConsoleExitCodeMatchesItsWaitStatus(t *testing.T) {
 		}
 	}
 }
+
+// statesBackend is a fakeBackend whose inspection of states alone is
+// counted apart from its whole inspection.
+type statesBackend struct {
+	*fakeBackend
+	states int
+}
+
+func (b *statesBackend) inspectStates(name string) (InspectInfo, error) {
+	b.states++
+	return b.fakeBackend.inspect(name)
+}
+
+// A command resolves its targets, and a stop its policy, by the states of
+// its family's branches alone, where the backend can inspect them alone.
+func TestBranchOperationTargetsInspectStatesAlone(t *testing.T) {
+	inspected := InspectInfo{}
+	inspected.Config.StopSignal = "SIGINT"
+	inspected.TTC.Branches = []InspectBranch{
+		{Metadata: Branch{ID: "main", State: "running"}},
+		{Metadata: Branch{ID: "fork", State: "paused"}},
+	}
+	backend := &statesBackend{fakeBackend: &fakeBackend{inspectInfo: inspected}}
+	targets, info, err := inspectBranchOperationTargets("web", backend, true)
+	if err != nil || len(targets) != 2 || info.Config.StopSignal != "SIGINT" {
+		t.Fatalf("inspectBranchOperationTargets = (%+v, %+v, %v)", targets, info.Config, err)
+	}
+	if backend.states != 1 {
+		t.Errorf("the states were inspected %d times, want once", backend.states)
+	}
+	if targets, err := branchOperationTargets("web@fork", backend, false); err != nil || len(targets) != 1 || targets[0].state != "paused" {
+		t.Errorf("branchOperationTargets(web@fork) = (%+v, %v)", targets, err)
+	}
+	if backend.states != 2 {
+		t.Errorf("the states were inspected %d times, want twice", backend.states)
+	}
+}

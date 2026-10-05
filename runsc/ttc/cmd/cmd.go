@@ -4796,12 +4796,18 @@ func branchOperationTargets(value string, backend backend, allowFamily bool) ([]
 // all of an inspect's reads again, of its record, its runtime and the
 // processes of its branches.
 func inspectBranchOperationTargets(value string, backend backend, allowFamily bool) ([]branchOperationTarget, InspectInfo, error) {
+	inspect := backend.inspect
+	if states, ok := backend.(interface {
+		inspectStates(string) (InspectInfo, error)
+	}); ok {
+		inspect = states.inspectStates
+	}
 	if strings.Contains(value, "@") {
 		target, err := parseSelector(value)
 		if err != nil {
 			return nil, InspectInfo{}, err
 		}
-		info, err := backend.inspect(target.container)
+		info, err := inspect(target.container)
 		if err != nil {
 			return nil, InspectInfo{}, err
 		}
@@ -4815,7 +4821,7 @@ func inspectBranchOperationTargets(value string, backend backend, allowFamily bo
 	if !allowFamily {
 		return nil, InspectInfo{}, fmt.Errorf("branch selector %q must be CONTAINER@BRANCH", value)
 	}
-	info, err := backend.inspect(value)
+	info, err := inspect(value)
 	if err != nil {
 		return nil, InspectInfo{}, err
 	}
@@ -10524,6 +10530,20 @@ func buildInspectInfo(container ttcbundle.ContainerInfo, spec *specs.Spec, famil
 }
 
 func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
+	return b.inspectFamily(name, true)
+}
+
+// inspectStates is inspect of the family's configuration and the states of
+// its branches alone: a command that resolves its targets by them, as a stop
+// does, had every running branch's processes listed, on other nodes too, and
+// every branch's console output looked at.
+func (b *runtimeBackend) inspectStates(name string) (InspectInfo, error) {
+	return b.inspectFamily(name, false)
+}
+
+// inspectFamily is inspect, of the branches' processes and console output
+// too if all.
+func (b *runtimeBackend) inspectFamily(name string, all bool) (InspectInfo, error) {
 	store := ttcbundle.Store{Root: b.dataRoot}
 	containerInfo, err := store.LoadContainer(name)
 	if err != nil {
@@ -10575,6 +10595,9 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 	}
 	projectContainerAuthority(&containerInfo, runtimeFamily)
 	result := buildInspectInfo(containerInfo, spec, runtimeFamily, "")
+	if !all {
+		return result, nil
+	}
 	if transactionID := containerInfo.DistributedForkTransactionID; transactionID != "" {
 		if store, err := b.transactionCatalog(); err == nil {
 			if transaction, err := store.Load(transactionID); err == nil {
