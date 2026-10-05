@@ -18154,10 +18154,12 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 	branches := append([]ttcbundle.BranchInfo(nil), info.Branches...)
 	physicalToLogical := make(map[string]string)
 	if b.nodeID != "" {
+		// The family's placements alone: listing the cluster's grew with
+		// every family of it.
 		placements, placementErr := b.placementCatalog()
 		var records []cluster.PlacementRecord
 		if placementErr == nil {
-			records, placementErr = placements.List()
+			records, placementErr = placements.ListFamily(logicalFamilyID(info))
 		}
 		filtered := branches[:0]
 		for _, branch := range branches {
@@ -18197,10 +18199,16 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 	filesystemBranches := make(map[string]string, len(branches))
 	volatileTransactions := make(map[string]bool)
 	if b.nodeID != "" {
+		// The transactions of the branches' forks alone, as the cluster's
+		// placements.
 		if transactions, txErr := b.transactionCatalog(); txErr == nil {
-			if records, listErr := transactions.List(); listErr == nil {
-				for _, transaction := range records {
-					volatileTransactions[transaction.Identity.TransactionID] = transaction.SourceNeeded
+			for _, branch := range branches {
+				id := branch.DistributedForkTransactionID
+				if _, loaded := volatileTransactions[id]; id == "" || loaded {
+					continue
+				}
+				if transaction, loadErr := transactions.Load(id); loadErr == nil {
+					volatileTransactions[id] = transaction.SourceNeeded
 				}
 			}
 		}
