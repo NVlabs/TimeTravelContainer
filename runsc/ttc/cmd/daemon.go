@@ -1212,7 +1212,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 			Destination: mount.Destination, Contents: append([]byte(nil), mount.Contents...), Mode: os.FileMode(mount.Mode),
 		}
 	}
-	if err := r.backend.containerStore().InstallPortableInternalMounts(info.ID, portableMounts); err != nil {
+	if err := r.backend.containerStore().InstallPortableInternalMountsOf(info, portableMounts); err != nil {
 		return fmt.Errorf("installing target-local internal mounts: %w", err)
 	}
 	filesystemConnections, err := r.backend.materializeDistributedFilesystemRoots(info, targetBranch.FilesystemBranch, session.FilesystemRoots, peer, false)
@@ -1225,7 +1225,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 	aliasesPending := len(session.FilesystemRoots) != 0
 	defer func() {
 		if aliasesPending {
-			_ = r.backend.containerStore().CommitActiveRepositoryRestoreIDs(info.ID)
+			_ = r.backend.containerStore().CommitActiveRepositoryRestoreIDsOf(info)
 		}
 	}()
 	memoryDependencyBytes := session.StreamBytes
@@ -1525,7 +1525,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 				return fmt.Errorf("starting paused distributed target exited with status %d: %s", status, strings.TrimSpace(diagnostic.String()))
 			}
 		}
-		if err := r.backend.containerStore().CommitActiveRepositoryRestoreIDs(info.ID); err != nil {
+		if err := r.backend.containerStore().CommitActiveRepositoryRestoreIDsOf(info); err != nil {
 			return fmt.Errorf("committing distributed filesystem identities: %w", err)
 		}
 		aliasesPending = false

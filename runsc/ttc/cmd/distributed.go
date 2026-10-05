@@ -1977,7 +1977,7 @@ func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.Co
 	if installed != len(roots) {
 		return 0, fmt.Errorf("distributed filesystem installed %d roots, descriptor contains %d", installed, len(roots))
 	}
-	if err := store.WriteActiveRepositoryMap(info.ID, configs); err != nil {
+	if err := store.WriteActiveRepositoryMapOf(info.ID, configs); err != nil {
 		return 0, err
 	}
 	if err := finishOrigins(true); err != nil {

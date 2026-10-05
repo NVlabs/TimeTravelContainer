@@ -2232,7 +2232,7 @@ func (b *runtimeBackend) installColdInternalMounts(info ttcbundle.ContainerInfo,
 	if err := validateColdManifestIdentity(info, branch, manifest); err != nil {
 		return err
 	}
-	if err := b.containerStore().InstallPortableInternalMounts(info.ID, portableInternalMountsFromColdManifest(manifest)); err != nil {
+	if err := b.containerStore().InstallPortableInternalMountsOf(info, portableInternalMountsFromColdManifest(manifest)); err != nil {
 		return fmt.Errorf("materializing portable internal mounts: %w", err)
 	}
 	return nil
@@ -2460,7 +2460,7 @@ func (b *runtimeBackend) materializeColdFilesystem(info ttcbundle.ContainerInfo,
 	// volume graph. A cold branch may be inspected on any node, so materialize
 	// these small portable objects alongside the repository cache rather than
 	// leaving canonical paths that point into the former owner's scratch root.
-	if err := b.containerStore().InstallPortableInternalMounts(info.ID, portableInternalMountsFromColdManifest(manifest)); err != nil {
+	if err := b.containerStore().InstallPortableInternalMountsOf(info, portableInternalMountsFromColdManifest(manifest)); err != nil {
 		return fmt.Errorf("materializing portable internal mounts: %w", err)
 	}
 	if len(manifest.Filesystems) == 0 {

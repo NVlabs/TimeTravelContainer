@@ -8312,13 +8312,13 @@ func (b *runtimeBackend) prepareFreshStartStorage(info ttcbundle.ContainerInfo, 
 		return info, branch, nil
 	}
 	store := b.containerStore()
-	if ready, err := store.KeepContainerImageRoot(info.ID); err != nil {
+	if ready, err := store.KeepContainerImageRootOf(info); err != nil {
 		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
 	} else if !ready {
 		// Unpacking the image on a node that has not run it yet takes time
 		// in proportion to the image; other commands go on meanwhile.
 		if err := b.withoutLifecycleLock(info, longOperation{branch: target.branch, state: "starting"}, func() error {
-			return store.PrepareContainerImageRoot(context.Background(), info.ID)
+			return store.PrepareContainerImageRootOf(context.Background(), info)
 		}); err != nil {
 			return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
 		}
@@ -8347,7 +8347,7 @@ func (b *runtimeBackend) prepareFreshStartStorage(info ttcbundle.ContainerInfo, 
 	// constructed directly from the newly materialized local repository. Retire
 	// the one-shot source alias before this runtime can become a later migration
 	// source.
-	if err := store.CommitActiveRepositoryRestoreIDs(info.ID); err != nil {
+	if err := store.CommitActiveRepositoryRestoreIDsOf(info); err != nil {
 		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("canonicalizing fresh filesystem identities for %s: %w", target, err)
 	}
 	return info, branch, nil
@@ -17255,7 +17255,7 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	if status != 0 {
 		return fmt.Errorf("starting dehydration runtime exited with status %d", status)
 	}
-	if err := b.containerStore().CommitActiveRepositoryRestoreIDs(info.ID); err != nil {
+	if err := b.containerStore().CommitActiveRepositoryRestoreIDsOf(info); err != nil {
 		return fmt.Errorf("committing rehydrated filesystem identities: %w", err)
 	}
 	state := "paused"
@@ -17603,7 +17603,7 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	if err != nil {
 		return fmt.Errorf("installing dehydrated peer: %w", err)
 	}
-	if err := b.containerStore().CommitActiveRepositoryRestoreIDs(info.ID); err != nil {
+	if err := b.containerStore().CommitActiveRepositoryRestoreIDsOf(info); err != nil {
 		return fmt.Errorf("committing rehydrated peer filesystem identities: %w", err)
 	}
 	_ = metadata.Close()

@@ -1300,6 +1300,13 @@ func (s Store) InstallPortableInternalMounts(name string, mounts []PortableInter
 	if err != nil {
 		return err
 	}
+	return s.InstallPortableInternalMountsOf(info, mounts)
+}
+
+// InstallPortableInternalMountsOf is InstallPortableInternalMounts of the
+// container whose record, info, the caller has: what it reads of it, the
+// container's ID and bundle, never changes.
+func (s Store) InstallPortableInternalMountsOf(info ContainerInfo, mounts []PortableInternalMount) error {
 	configPath := filepath.Join(info.BundleDir, "config.json")
 	data, err := readFileWithStaleRetry(configPath)
 	if err != nil {
@@ -3802,12 +3809,12 @@ func (s Store) WriteActiveRepositoryMap(name string, repositories []specutils.TT
 	if err != nil {
 		return err
 	}
-	return s.writeActiveRepositoryMapOf(info.ID, repositories)
+	return s.WriteActiveRepositoryMapOf(info.ID, repositories)
 }
 
-// writeActiveRepositoryMapOf is WriteActiveRepositoryMap of the container with
-// the exact ID id.
-func (s Store) writeActiveRepositoryMapOf(id string, repositories []specutils.TTCVolumeRepository) error {
+// WriteActiveRepositoryMapOf is WriteActiveRepositoryMap of the container with
+// the exact ID id, which reads no record.
+func (s Store) WriteActiveRepositoryMapOf(id string, repositories []specutils.TTCVolumeRepository) error {
 	mappings := make(map[string]activeRepositoryMapping, len(repositories))
 	for _, repository := range repositories {
 		mappings[repository.Source] = activeRepositoryMapping{Path: repository.Path, RestoreID: repository.RestoreID, CopyMode: repository.CopyMode}
@@ -3827,8 +3834,13 @@ func (s Store) CommitActiveRepositoryRestoreIDs(name string) error {
 	if err != nil {
 		return err
 	}
-	// The record, read once: what the spec's reading takes of it never
-	// changes, and each reading of it was a round trip of a shared root.
+	return s.CommitActiveRepositoryRestoreIDsOf(info)
+}
+
+// CommitActiveRepositoryRestoreIDsOf is CommitActiveRepositoryRestoreIDs of
+// the container whose record, info, the caller has: what it reads of it
+// never changes, and each reading of it was a round trip of a shared root.
+func (s Store) CommitActiveRepositoryRestoreIDsOf(info ContainerInfo) error {
 	spec, err := s.LoadSpecOf(info)
 	if err != nil {
 		return err
@@ -3844,7 +3856,7 @@ func (s Store) CommitActiveRepositoryRestoreIDs(name string) error {
 		}
 		repositories[i].RestoreID = info.ID
 	}
-	return s.writeActiveRepositoryMapOf(info.ID, repositories)
+	return s.WriteActiveRepositoryMapOf(info.ID, repositories)
 }
 
 // KeepContainerImageRoot reports whether the image root that the container
@@ -3855,9 +3867,16 @@ func (s Store) KeepContainerImageRoot(name string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	return s.KeepContainerImageRootOf(info)
+}
+
+// KeepContainerImageRootOf is KeepContainerImageRoot of the container whose
+// record, info, the caller has: what it reads of it, the container's image,
+// never changes.
+func (s Store) KeepContainerImageRootOf(info ContainerInfo) (bool, error) {
 	dir := filepath.Join(s.imageRootDir(), imageRootKey(info.Digest, info.Platform))
 	if s.activeRoot() == s.Root {
-		_, err = loadImageRoot(dir)
+		_, err := loadImageRoot(dir)
 		return err == nil, nil
 	}
 	return s.keepImageRoot(dir)
@@ -3871,6 +3890,12 @@ func (s Store) PrepareContainerImageRoot(ctx context.Context, name string) error
 	if err != nil {
 		return err
 	}
+	return s.PrepareContainerImageRootOf(ctx, info)
+}
+
+// PrepareContainerImageRootOf is PrepareContainerImageRoot of the container
+// whose record, info, the caller has.
+func (s Store) PrepareContainerImageRootOf(ctx context.Context, info ContainerInfo) error {
 	if _, err := loadImageRoot(filepath.Join(s.imageRootDir(), imageRootKey(info.Digest, info.Platform))); err == nil {
 		return nil
 	}
