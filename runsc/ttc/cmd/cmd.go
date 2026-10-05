@@ -9576,7 +9576,23 @@ func (b *runtimeBackend) logs(target selector, options logsOptions) error {
 		return fmt.Errorf("configured logging driver %q does not support reading", container.LogDriver)
 	}
 	var paths ttcbundle.ConsolePaths
+	// A branch made and not started, or captured to be dehydrated, has no
+	// process whose console a follower could follow, and starting one failed
+	// the logs: what the branch wrote before is all there is.
+	followed, created := true, false
 	if options.ExecID == "" {
+		if branch, branchErr := persistentBranchInfo(container, target.branch); branchErr == nil {
+			switch normalizeLifecycleState(branch.State) {
+			case "created":
+				followed, created = false, true
+			case "dehydrating", "dehydrated":
+				followed = false
+			}
+		}
+	}
+	if !followed {
+		paths = b.containerStore().BranchConsolePathsOf(container.ID, target.branch)
+	} else if options.ExecID == "" {
 		paths, err = b.ensureConsoleDrainIn(container, target, false)
 	} else {
 		session, sessionErr := b.execSessionOf(target, options.ExecID)
@@ -9590,6 +9606,9 @@ func (b *runtimeBackend) logs(target selector, options logsOptions) error {
 	}
 	_, maxFiles := consoleRetentionOf(container)
 	follower, err := openConsoleLogFollower(paths.Log, maxFiles)
+	if created && errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -9619,7 +9638,7 @@ func (b *runtimeBackend) logs(target selector, options logsOptions) error {
 			return err
 		}
 		initial = false
-		if !options.Follow || (follower.stdoutEOF && follower.stderrEOF) {
+		if !options.Follow || !followed || (follower.stdoutEOF && follower.stderrEOF) {
 			return nil
 		}
 		if options.Until != nil && !time.Now().Before(*options.Until) {

@@ -2669,6 +2669,61 @@ func TestLogs(t *testing.T) {
 	}
 }
 
+// A family made and not started, being dehydrated or dehydrated has no
+// process whose console a follower could follow: its logs are what it wrote,
+// and following them ends there.
+func TestLogsOfABranchWithoutAProcess(t *testing.T) {
+	dir := t.TempDir()
+	runsc := filepath.Join(dir, "runsc")
+	if err := os.WriteFile(runsc, []byte("#!/bin/sh\necho \"unexpected command: $*\" >&2\nexit 2\n"), 0755); err != nil {
+		t.Fatalf("writing fake runsc: %v", err)
+	}
+	dataRoot := filepath.Join(dir, "data")
+	for name, state := range map[string]string{"made": "created", "going": "dehydrating", "cold": "dehydrated"} {
+		containerDir := filepath.Join(dataRoot, "containers", name)
+		bundleDir := filepath.Join(containerDir, "bundle")
+		if err := os.MkdirAll(bundleDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+			Name: name, BundleDir: bundleDir, State: state, CreatedAt: time.Now(),
+			Branches: []ttcbundle.BranchInfo{{ID: "main", State: state}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range []string{"going", "cold"} {
+		consoleDir := filepath.Join(dataRoot, "containers", name, "console")
+		if err := os.MkdirAll(consoleDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		log, err := os.Create(filepath.Join(consoleDir, "main.log"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ttcconsole.WriteFrame(log, ttcconsole.StreamStdout, []byte(name+"\n")); err != nil {
+			t.Fatal(err)
+		}
+		if err := log.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var stdout, stderr bytes.Buffer
+	b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: dataRoot, stdout: &stdout, stderr: &stderr}
+	if err := b.logs(selector{container: "made", branch: "main"}, logsOptions{Tail: -1}); err != nil || stdout.Len() != 0 {
+		t.Errorf("logs of a family made and not started: %v, %q; want none", err, stdout.String())
+	}
+	for _, name := range []string{"going", "cold"} {
+		stdout.Reset()
+		if err := b.logs(selector{container: name, branch: "main"}, logsOptions{Tail: -1, Follow: true}); err != nil || stdout.String() != name+"\n" {
+			t.Errorf("logs of family %s, followed: %v, %q; want %q", name, err, stdout.String(), name+"\n")
+		}
+	}
+}
+
 func TestParseLogTime(t *testing.T) {
 	now := time.Date(2026, 7, 17, 3, 0, 0, 0, time.UTC)
 	tests := map[string]time.Time{
