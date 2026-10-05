@@ -142,6 +142,15 @@ var embeddedBranchActions = map[string]func(c *container.Container, branch strin
 	"ps": func(c *container.Container, branch string) (any, error) {
 		return c.Sandbox.BranchProcesses(branch, c.ID)
 	},
+	// A stop waited for its branch's init in a process of ttcd's binary of
+	// its own, which took 7 ms to start.
+	"wait": func(c *container.Container, branch string) (any, error) {
+		status, err := c.Sandbox.WaitBranch(&boot.BranchWaitArgs{BranchID: branch, CID: c.ID})
+		if err != nil {
+			return nil, err
+		}
+		return map[string]uint32{"wait_status": status}, nil
+	},
 	"exec-list": func(c *container.Container, branch string) (any, error) {
 		return c.Sandbox.ExecSessions(&boot.ExecSessionsArgs{BranchID: branch, CID: c.ID})
 	},
