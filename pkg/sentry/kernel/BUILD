@@ -460,6 +460,7 @@ go_test(
     name = "kernel_test",
     size = "small",
     srcs = [
+        "distributed_fork_test.go",
         "fd_table_test.go",
         "syslog_test.go",
         "table_test.go",
@@ -477,6 +478,7 @@ go_test(
         "//pkg/sentry/kernel/sched",
         "//pkg/sentry/limits",
         "//pkg/sentry/pgalloc",
+        "//pkg/sentry/state/stateio",
         "//pkg/sentry/time",
         "//pkg/sentry/usage",
         "//pkg/sentry/vfs",

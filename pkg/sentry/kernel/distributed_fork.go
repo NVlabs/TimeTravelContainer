@@ -678,12 +678,25 @@ func (k *Kernel) HandoffDistributedForkMemoryGraph(data *ttcsnapshot.LocalDataSt
 		return err
 	}
 	reader := stateio.NewIOReader(packed, geometry.MaxReadBytes, geometry.MaxRanges, geometry.MaxParallel)
-	if err := k.remotePageLoad.SwitchReader(reader); err != nil {
-		_ = reader.Close()
+	if err := switchRemotePageReader(k.remotePageLoad, reader); err != nil {
 		return err
 	}
 	k.remoteHandoffSnapshot = uint64(snapshot)
 	return nil
+}
+
+// switchRemotePageReader hands load's unresolved pages to reader, which
+// SwitchReader owns even when it fails. A load that finished its last read
+// after its caller looked needs no new source.
+func switchRemotePageReader(load *pgalloc.AsyncPagesFileLoad, reader stateio.AsyncReader) error {
+	err := load.SwitchReader(reader)
+	if err == nil {
+		return nil
+	}
+	if stats := load.Stats(); stats.Done && stats.Error == "" {
+		return nil
+	}
+	return err
 }
 
 // SetDistributedForkPrefetchWindow changes the active remote-memory prefetch
