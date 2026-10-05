@@ -42,6 +42,10 @@ type LocalDataStore struct {
 	// subsequent physical sweep is deliberately outside the graph lock; two
 	// independent lifecycle completions may therefore reach it concurrently.
 	gcMu sync.RWMutex
+	// sharedHolders counts the graph mutations under way, which hold gcLock
+	// shared together, under sharedMu.
+	sharedMu      sync.Mutex
+	sharedHolders int
 	// unsyncedNames are objects installed without a durability barrier whose
 	// directory entries a later fence must make durable, keyed by object with
 	// a generation so a concurrent reinstall is not forgotten by a sync that
@@ -230,11 +234,38 @@ func (store *LocalDataStore) WithGraphMutation(mutate func() error) error {
 	}
 	store.gcMu.RLock()
 	defer store.gcMu.RUnlock()
-	if err := hostthread.Flock(int(store.gcLock.Fd()), syscall.LOCK_SH); err != nil {
+	if err := store.lockShared(); err != nil {
 		return err
 	}
-	defer syscall.Flock(int(store.gcLock.Fd()), syscall.LOCK_UN)
+	defer store.unlockShared()
 	return mutate()
+}
+
+// lockShared holds gcLock shared for one more graph mutation. flock(2) locks
+// the lock's open file description, which this store's mutations share, not
+// each of them: the first of them to unlock released it for the others, and
+// another process's sweep removed what they were still installing.
+func (store *LocalDataStore) lockShared() error {
+	store.sharedMu.Lock()
+	defer store.sharedMu.Unlock()
+	if store.sharedHolders == 0 {
+		if err := hostthread.Flock(int(store.gcLock.Fd()), syscall.LOCK_SH); err != nil {
+			return err
+		}
+	}
+	store.sharedHolders++
+	return nil
+}
+
+// unlockShared ends one graph mutation's hold of gcLock, and the last one's
+// the lock's.
+func (store *LocalDataStore) unlockShared() {
+	store.sharedMu.Lock()
+	defer store.sharedMu.Unlock()
+	store.sharedHolders--
+	if store.sharedHolders == 0 {
+		_ = syscall.Flock(int(store.gcLock.Fd()), syscall.LOCK_UN)
+	}
 }
 
 // OpenLocalDataStore opens a standalone bulk-object directory.

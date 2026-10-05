@@ -2264,6 +2264,90 @@ func TestLocalDataStoreReclaimWaitsForGraphCommit(t *testing.T) {
 	}
 }
 
+// A store's graph mutations hold its lock together: one that ends leaves it
+// held for those still under way, whose objects another process's sweep, as
+// collector's is, must not remove. Once the first to end released it for
+// all, a Sentry fetching chunks at once lost those it was installing.
+func TestLocalDataStoreReclaimWaitsForEveryGraphMutation(t *testing.T) {
+	directory := t.TempDir()
+	graph, err := Open(filepath.Join(directory, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := OpenLocalDataStore(filepath.Join(directory, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+	collector, err := OpenLocalDataStore(filepath.Join(directory, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer collector.Close()
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := graph.ReserveObject(origin, ObjectKindMemoryChunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstIn, firstOut := make(chan struct{}), make(chan struct{})
+	first := make(chan error, 1)
+	go func() {
+		first <- data.WithGraphMutation(func() error {
+			close(firstIn)
+			<-firstOut
+			return nil
+		})
+	}()
+	<-firstIn
+	installed, commit := make(chan struct{}), make(chan struct{})
+	second := make(chan error, 1)
+	go func() {
+		second <- data.WithGraphMutation(func() error {
+			if err := data.Install(id, strings.NewReader("data"), 4); err != nil {
+				return err
+			}
+			close(installed)
+			<-commit
+			return graph.CommitReservedObject(id, "build/object", 4, nil, nil)
+		})
+	}()
+	<-installed
+	close(firstOut)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+
+	reclaimDone := make(chan error, 1)
+	go func() {
+		_, _, err := collector.ReclaimUnreferenced(graph)
+		reclaimDone <- err
+	}()
+	select {
+	case err := <-reclaimDone:
+		t.Fatalf("reclamation crossed a graph mutation still under way once another ended: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(commit)
+	if err := <-second; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-reclaimDone; err != nil {
+		t.Fatal(err)
+	}
+	file, err := data.Open(id, 4)
+	if err != nil {
+		t.Fatalf("the object a mutation installed was reclaimed: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLocalDataStoreConcurrentReclaimIsIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	graph, err := Open(filepath.Join(dir, "graph"))
