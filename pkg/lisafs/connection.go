@@ -148,7 +148,10 @@ func (c *Connection) Run() {
 	defer c.close()
 
 	// Start handling requests on this connection.
+	requests := newRequestWaiter(c.sockComm.FD())
+	defer requests.close()
 	for {
+		requests.wait()
 		m, payloadLen, err := c.sockComm.rcvMsg(0 /* wantFDs */)
 		if err != nil {
 			log.Debugf("sock read failed, closing connection: %v", err)

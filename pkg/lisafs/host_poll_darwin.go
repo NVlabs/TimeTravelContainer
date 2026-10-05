@@ -32,3 +32,13 @@ func waitForHangup(fd int) error {
 		}
 	}
 }
+
+// requestWaiter is a no-op on Darwin: a connection's reads wait for its
+// requests themselves.
+type requestWaiter struct{}
+
+func newRequestWaiter(int) *requestWaiter { return &requestWaiter{} }
+
+func (*requestWaiter) wait() {}
+
+func (*requestWaiter) close() {}

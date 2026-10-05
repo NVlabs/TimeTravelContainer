@@ -33,7 +33,12 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 	unix.SYS_CLOCK_GETTIME: seccomp.MatchAll{},
 	unix.SYS_CLOSE:         seccomp.MatchAll{},
 	unix.SYS_DUP:           seccomp.MatchAll{},
-	unix.SYS_EPOLL_CTL:     seccomp.MatchAll{},
+	// fdnotifier's epoll, which a lisafs connection waits for its requests
+	// in, is made once the filters are installed.
+	unix.SYS_EPOLL_CREATE1: seccomp.PerArg{
+		seccomp.EqualTo(0),
+	},
+	unix.SYS_EPOLL_CTL: seccomp.MatchAll{},
 	unix.SYS_EPOLL_PWAIT: seccomp.PerArg{
 		seccomp.AnyValue{},
 		seccomp.AnyValue{},

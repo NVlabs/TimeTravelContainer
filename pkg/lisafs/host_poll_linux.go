@@ -66,3 +66,45 @@ func pollForHangup(fd int) error {
 		return nil
 	}
 }
+
+// requestEvents are the events of a request, or of its sender hanging up.
+const requestEvents = waiter.ReadableEvents | hangupEvents
+
+// requestWaiter waits for a connection's next request in the epoll of
+// fdnotifier, rather than in a poll of its own: a gofer's connection, one for
+// each mount of its family, held a thread waiting for requests for as long
+// as the mount lived.
+type requestWaiter struct {
+	fd    int32
+	queue waiter.Queue
+	entry waiter.Entry
+	ch    chan struct{}
+	// watched is set while fdnotifier watches fd; if it could not, the
+	// connection's reads wait as they did.
+	watched bool
+}
+
+func newRequestWaiter(fd int) *requestWaiter {
+	w := &requestWaiter{fd: int32(fd)}
+	w.entry, w.ch = waiter.NewChannelEntry(requestEvents)
+	w.queue.EventRegister(&w.entry)
+	w.watched = fdnotifier.AddFD(w.fd, &w.queue) == nil
+	return w
+}
+
+// wait returns once the connection has a request, or its sender hung up.
+func (w *requestWaiter) wait() {
+	if !w.watched {
+		return
+	}
+	for fdnotifier.NonBlockingPoll(w.fd, requestEvents) == 0 {
+		<-w.ch
+	}
+}
+
+func (w *requestWaiter) close() {
+	if w.watched {
+		fdnotifier.RemoveFD(w.fd)
+	}
+	w.queue.EventUnregister(&w.entry)
+}
