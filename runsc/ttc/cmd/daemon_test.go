@@ -2976,6 +2976,21 @@ func TestRoutedPeerChecksTheRecordReadWithThePlacement(t *testing.T) {
 // name, refusing one being made, and takes the new family's lock once it has
 // an ID; one that would change more than its family takes the lifecycle lock
 // alone.
+// stats and diff read one branch beside the commands on every other family:
+// they share the lifecycle lock, and take no family's lock.
+func TestBranchReadersShareTheLifecycleLock(t *testing.T) {
+	server := &daemonServer{}
+	backend := &runtimeBackend{lockFamily: func(string) func() { return func() {} }}
+	for _, args := range [][]string{{"stats", "demo@main"}, {"container", "stats", "--json", "demo@main"}, {"diff", "demo@b1"}} {
+		if families, shared := server.requestFamilies(backend, args, nil); len(families) != 0 || !shared {
+			t.Errorf("%q takes the locks of %q, the lifecycle lock shared %t: want none, and shared", args, families, shared)
+		}
+	}
+	if _, shared := server.requestFamilies(backend, []string{"ps", "--size"}, nil); shared {
+		t.Error("ps --size, which sizes every family, shares the lifecycle lock")
+	}
+}
+
 func TestFamilyMakingReservesItsNameAndClaimsItsLock(t *testing.T) {
 	server := &daemonServer{}
 	root := t.TempDir()

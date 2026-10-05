@@ -29,6 +29,12 @@ import (
 // command taking the lifecycle lock alone, a cluster node paused or resumed
 // its families 14 times a second however many clients asked.
 //
+// stats and diff, which read one branch, publishing the metadata of its live
+// filesystem first, take the lifecycle lock shared, and no family's lock: a
+// reader does not wait for a long operation on its family, other than its
+// removal (see waitBusy). Each took the lifecycle lock alone, and every
+// command on every other family waited for it.
+//
 // A command that makes a family, run or create, takes the lifecycle lock
 // shared too, and the new family's lock as soon as the family has an ID,
 // before anything can name it: see familyMaking. One that would change more
@@ -61,7 +67,7 @@ func (s *daemonServer) requestFamilies(backend *runtimeBackend, args []string, c
 	}
 	names := daemonCommandFamilyTargets(args)
 	if len(names) == 0 {
-		return nil, daemonCommandMakesFamily(args)
+		return nil, daemonCommandMakesFamily(args) || daemonCommandReadsBranch(args)
 	}
 	var ids []string
 	if family, ok := claimedFamily(names, claims); ok {
@@ -87,6 +93,16 @@ func (s *daemonServer) requestFamilies(backend *runtimeBackend, args []string, c
 func daemonCommandMakesFamily(args []string) bool {
 	switch daemonCommandName(args) {
 	case "run", "create":
+		return true
+	}
+	return false
+}
+
+// daemonCommandReadsBranch reports whether args read one branch, as stats and
+// diff do.
+func daemonCommandReadsBranch(args []string) bool {
+	switch daemonCommandName(args) {
+	case "stats", "diff":
 		return true
 	}
 	return false
