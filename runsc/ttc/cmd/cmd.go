@@ -13754,6 +13754,8 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 		var output []byte
 		if len(filesystemOrigins) == 0 {
 			output, err = b.command(args...)
+		} else if embeddedRuntime(b.runsc) {
+			output, err = embeddedFork(b.root, source.container, source.branch, destinations, paused, quarantine, filesystemOrigins)
 		} else {
 			originsReader, pipeErr := filesystemOriginAssignmentsPipe(filesystemOrigins)
 			if pipeErr != nil {

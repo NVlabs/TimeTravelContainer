@@ -350,6 +350,28 @@ func embeddedRuntimeCommand(root string, args []string) ([]byte, bool, error) {
 	return encoded, true, nil
 }
 
+// embeddedFork forks the branch source of the family whose sandbox's own
+// container is id as destinations, in ttcd's process, with the filesystem
+// snapshot origins the authority assigned the new branches, and returns what
+// runsc's fork prints. A copy of ttcd, which read them from a pipe, took
+// longer to start than the fork of a small branch takes its Sentry.
+func embeddedFork(root, id, source string, destinations []string, paused, quarantine bool, origins []boot.FilesystemOriginAssignment) ([]byte, error) {
+	c, err := loadEmbeddedContainer(root, id, container.LoadOpts{SkipCheck: true})
+	if err != nil {
+		return nil, fmt.Errorf("loading container: %v", err)
+	}
+	var output any
+	if len(destinations) == 1 {
+		output, err = c.Sandbox.ForkBranch(&boot.ForkBranchArgs{Source: source, ID: destinations[0], Paused: paused, Quarantine: quarantine, FilesystemOrigins: origins})
+	} else {
+		output, err = c.Sandbox.ForkBranches(&boot.ForkBranchesArgs{Source: source, IDs: destinations, Paused: paused, Quarantine: quarantine, FilesystemOrigins: origins})
+	}
+	if err != nil {
+		return nil, fmt.Errorf("timetravel fork failed: %v", err)
+	}
+	return json.Marshal(output)
+}
+
 // embeddedExec runs, in ttcd's process, the runsc exec that runtimeArgs, the
 // runtime's flags, and execArgs, the exec's, describe: one whose input, if
 // stdin is not nil, is read from stdin, and whose output is written to stdout
