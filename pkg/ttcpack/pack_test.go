@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -351,6 +352,109 @@ func TestLazyDirectoryCapacityEvictionFencesActiveGofer(t *testing.T) {
 	if got, err := os.ReadFile(filepath.Join(rootfs, "alias")); err != nil || !bytes.Equal(got, contents) {
 		t.Fatalf("refetched alias: len=%d err=%v", len(got), err)
 	}
+}
+
+// A prefetch that completes every file of an image records so, and a later
+// gofer's prefetch then looks at none of them; an eviction removes the record
+// before it makes any file incomplete, and the next prefetch completes the
+// image again.
+func TestLazyPrefetchRecordsItsCompletion(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := os.MkdirAll(filepath.Join(source, "lib"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	contents := map[string][]byte{
+		"large":       bytes.Repeat([]byte("prefetched-image-data"), 10000),
+		"lib/small":   []byte("small\n"),
+		"lib/another": bytes.Repeat([]byte{7}, 5000),
+	}
+	for name, data := range contents {
+		if err := os.WriteFile(filepath.Join(source, name), data, 0444); err != nil {
+			t.Fatal(err)
+		}
+	}
+	repository := filepath.Join(root, "repository")
+	id, err := WriteDirectory(source, repository, IDForKey("test", t.Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootfs := filepath.Join(root, "cache", "rootfs")
+	if err := MaterializeSkeleton(repository, id, rootfs, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteLazyDescriptor(rootfs, repository, id, ""); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := ReadLazyDescriptor(rootfs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(filepath.Dir(rootfs), LazyStateDirectory, lazyAllComplete)
+	prefetch := func() {
+		t.Helper()
+		lazy, err := OpenLazyDirectory(rootfs, descriptor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lazy.StartPrefetch()
+		for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+			if _, err := os.Stat(marker); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("the prefetch did not record its completion")
+			}
+		}
+		if usage := lazy.Usage(); usage.CompleteFiles != usage.TotalFiles || usage.TotalFiles != uint64(len(contents)) {
+			t.Errorf("usage once the prefetch completed = %+v", usage)
+		}
+		if err := lazy.Close(); err != nil {
+			t.Fatal(err)
+		}
+		for name, data := range contents {
+			if got, err := os.ReadFile(filepath.Join(rootfs, name)); err != nil || !bytes.Equal(got, data) {
+				t.Errorf("%s after the prefetch: length %d, %v", name, len(got), err)
+			}
+		}
+	}
+	prefetch()
+	// A later gofer's prefetch completes at once, fetching nothing: a file
+	// made incomplete behind the record is left to be fetched on demand.
+	lazy, err := OpenLazyDirectory(rootfs, descriptor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shard, name := lazyLockName("lib/small")
+	if err := os.Remove(filepath.Join(filepath.Dir(rootfs), LazyStateDirectory, shard, name)); err != nil {
+		t.Fatal(err)
+	}
+	lazy.StartPrefetch()
+	// Time enough for a prefetch to complete the file.
+	time.Sleep(200 * time.Millisecond)
+	if err := lazy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if usage, err := InspectLazyCache(rootfs); err != nil || usage.CompleteFiles != uint64(len(contents)-1) {
+		t.Fatalf("usage after a prefetch of a recorded image = %+v, %v; want one file incomplete", usage, err)
+	}
+	lazy, err = OpenLazyDirectory(rootfs, descriptor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lazy.Ensure("lib/small"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lazy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, evicted, err := EvictLazyCache(rootfs, 0); err != nil || evicted.Files != uint64(len(contents)) {
+		t.Fatalf("eviction = %+v, %v", evicted, err)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the completion record after an eviction: %v", err)
+	}
+	prefetch()
 }
 
 // A pack keeps small files back to back, with no header for each entry, so a

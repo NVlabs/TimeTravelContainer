@@ -28,6 +28,10 @@ const (
 	// LazyStateDirectory stores node-local completion records and locks.
 	LazyStateDirectory   = "image-pack-state"
 	lazyDescriptorFormat = 1
+	// lazyAllComplete, in the state directory, records that a prefetch found
+	// every file complete, and is removed before an eviction makes any
+	// incomplete again.
+	lazyAllComplete = "all-complete"
 )
 
 // LazyDescriptor identifies an immutable shared image pack backing a local
@@ -424,6 +428,10 @@ func EvictLazyCache(rootfs string, targetBytes uint64) (LazyCacheUsage, LazyCach
 	if usage.CompleteBytes <= targetBytes {
 		return usage, LazyCacheEviction{}, nil
 	}
+	// A file evicted is incomplete: the next gofer's prefetch completes it.
+	if err := unix.Unlinkat(stateFD, lazyAllComplete, 0); err != nil && !errors.Is(err, unix.ENOENT) {
+		return usage, LazyCacheEviction{}, err
+	}
 	var candidates []candidate
 	for _, path := range directory.paths {
 		shard, name := lazyLockName(path)
@@ -514,7 +522,9 @@ func EvictLazyCache(rootfs string, targetBytes uint64) (LazyCacheUsage, LazyCach
 
 // Ensure makes virtualPath complete before any guest descriptor can observe
 // it. The completion record is written only after file data and metadata have
-// been synced. A crash before then causes the next caller to rewrite the file.
+// been synced. A crash before then causes the next caller to rewrite the file;
+// so does one that loses the record, which is not synced: a sync of each
+// file's record was half of a prefetch's syncs.
 func (d *LazyDirectory) Ensure(virtualPath string) error {
 	if d == nil {
 		return nil
@@ -615,25 +625,43 @@ func (d *LazyDirectory) Ensure(virtualPath string) error {
 		}
 		return err
 	}
-	return unix.Fsync(lockFD)
+	return nil
 }
 
 // StartPrefetch begins low-priority sequential whole-file population. Demand
-// calls to Ensure share the same per-file locks and can safely race it.
+// calls to Ensure share the same per-file locks and can safely race it. A
+// prefetch that completes every file records so, and one started after does
+// nothing: each container's gofer looked at every file's completion record
+// again, five system calls a file of the image.
 func (d *LazyDirectory) StartPrefetch() {
 	if d == nil {
+		return
+	}
+	var stat unix.Stat_t
+	if unix.Fstatat(d.stateFD, lazyAllComplete, &stat, unix.AT_SYMLINK_NOFOLLOW) == nil {
 		return
 	}
 	d.prefetchWG.Add(1)
 	go func() {
 		defer d.prefetchWG.Done()
+		complete := true
 		for _, path := range d.paths {
 			select {
 			case <-d.stop:
 				return
 			default:
 			}
-			_ = d.Ensure(path)
+			if err := d.Ensure(path); err != nil {
+				complete = false
+			}
+		}
+		if complete {
+			// Every file's completion record is written: one lost to a
+			// crash with this kept only leaves its file to be fetched on
+			// demand.
+			if fd, err := unix.Openat(d.stateFD, lazyAllComplete, unix.O_CREAT|unix.O_WRONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0600); err == nil {
+				_ = unix.Close(fd)
+			}
 		}
 	}()
 }
