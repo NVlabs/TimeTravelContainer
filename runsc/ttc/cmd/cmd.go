@@ -4786,28 +4786,38 @@ type branchOperationTarget struct {
 }
 
 func branchOperationTargets(value string, backend backend, allowFamily bool) ([]branchOperationTarget, error) {
+	targets, _, err := inspectBranchOperationTargets(value, backend, allowFamily)
+	return targets, err
+}
+
+// inspectBranchOperationTargets is branchOperationTargets, with the
+// inspection of the family that it read the targets from: what else a
+// command needs of the family, as a stop its policy, inspecting it again was
+// all of an inspect's reads again, of its record, its runtime and the
+// processes of its branches.
+func inspectBranchOperationTargets(value string, backend backend, allowFamily bool) ([]branchOperationTarget, InspectInfo, error) {
 	if strings.Contains(value, "@") {
 		target, err := parseSelector(value)
 		if err != nil {
-			return nil, err
+			return nil, InspectInfo{}, err
 		}
 		info, err := backend.inspect(target.container)
 		if err != nil {
-			return nil, err
+			return nil, InspectInfo{}, err
 		}
 		for _, branch := range info.TTC.Branches {
 			if branch.Metadata.ID == target.branch {
-				return []branchOperationTarget{{selector: target, state: normalizeLifecycleState(branch.Metadata.State)}}, nil
+				return []branchOperationTarget{{selector: target, state: normalizeLifecycleState(branch.Metadata.State)}}, info, nil
 			}
 		}
-		return nil, fmt.Errorf("branch %q does not exist", target.branch)
+		return nil, InspectInfo{}, fmt.Errorf("branch %q does not exist", target.branch)
 	}
 	if !allowFamily {
-		return nil, fmt.Errorf("branch selector %q must be CONTAINER@BRANCH", value)
+		return nil, InspectInfo{}, fmt.Errorf("branch selector %q must be CONTAINER@BRANCH", value)
 	}
 	info, err := backend.inspect(value)
 	if err != nil {
-		return nil, err
+		return nil, InspectInfo{}, err
 	}
 	targets := make([]branchOperationTarget, 0, len(info.TTC.Branches))
 	for _, branch := range info.TTC.Branches {
@@ -4818,7 +4828,7 @@ func branchOperationTargets(value string, backend backend, allowFamily bool) ([]
 		})
 	}
 	sort.Slice(targets, func(i, j int) bool { return targets[i].selector.branch < targets[j].selector.branch })
-	return targets, nil
+	return targets, info, nil
 }
 
 func runPauseResume(args []string, stdout, stderr io.Writer, backend backend, pause bool) error {
@@ -5011,16 +5021,12 @@ func runStop(args []string, stdout, stderr io.Writer, backend backend) error {
 	var groups []stopGroup
 	named := make(map[selector]bool)
 	resolve := func(value string) (stopGroup, error) {
-		targets, err := branchOperationTargets(value, backend, true)
+		targets, info, err := inspectBranchOperationTargets(value, backend, true)
 		if err != nil {
 			return stopGroup{}, fmt.Errorf("invalid target %q: %w", value, err)
 		}
 		if len(targets) == 0 {
 			return stopGroup{}, fmt.Errorf("container %q has no branches", value)
-		}
-		info, err := backend.inspect(targets[0].selector.container)
-		if err != nil {
-			return stopGroup{}, fmt.Errorf("inspecting %s before stop: %w", value, err)
 		}
 		stopSignal, stopTimeout, err := stopPolicy(info)
 		if err != nil {
@@ -5449,15 +5455,11 @@ func runRestart(args []string, stdout, stderr io.Writer, backend backend) error 
 		if err != nil {
 			return fmt.Errorf("invalid target %q: %w", value, err)
 		}
-		targets, err := branchOperationTargets(selected.String(), backend, false)
+		targets, info, err := inspectBranchOperationTargets(selected.String(), backend, false)
 		if err != nil {
 			return fmt.Errorf("invalid target %q: %w", value, err)
 		}
 		target := targets[0]
-		info, err := backend.inspect(target.selector.container)
-		if err != nil {
-			return fmt.Errorf("inspecting %s before restart: %w", target.selector, err)
-		}
 		stopSignal, stopTimeout, err := stopPolicy(info)
 		if err != nil {
 			return err
