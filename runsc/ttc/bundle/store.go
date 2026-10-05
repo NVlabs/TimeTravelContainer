@@ -6791,25 +6791,36 @@ func (s Store) pruneImageRoots(stored []images.Info, containers []ContainerInfo)
 	return removed, nil
 }
 
+// sharedImagePackGrace is how long the manifest of a shared image pack is kept
+// for an image that no tag or container names, unless its image was removed:
+// a node that loads an archive publishes each image's pack as it unpacks the
+// image, before the load publishes the archive's tags, which unpacking the
+// archive's other images may put off for minutes. Pruned meanwhile, as every
+// node's first maintenance pass, a second after it starts, pruned a fresh
+// cluster's first load, the pack was gone, and every other node unpacked the
+// image itself rather than read its files from the pack.
+const sharedImagePackGrace = time.Hour
+
 // PruneSharedImagePacks removes manifests no longer referenced by an image tag
 // or container, then collects packs unreachable from the remaining manifests.
 // Publication and collection share an NFS-visible lock, so a completed pack
 // cannot be mistaken for garbage in the short interval before its manifest is
-// installed. This makes an explicit image removal reclaim storage immediately
-// instead of retaining every removed image for a one-hour crash grace.
-func (s Store) PruneSharedImagePacks(ctx context.Context) (removedManifests, removedPacks int, retErr error) {
+// installed. A manifest younger than sharedImagePackGrace is kept, but for an
+// image whose digest removed names: an explicit image removal reclaims
+// storage immediately.
+func (s Store) PruneSharedImagePacks(ctx context.Context, removed ...string) (removedManifests, removedPacks int, retErr error) {
 	if s.activeRoot() == s.Root {
 		return 0, 0, nil
 	}
 	err := s.withSharedImagePackLock(func() error {
 		var err error
-		removedManifests, removedPacks, err = s.pruneSharedImagePacksLocked(ctx)
+		removedManifests, removedPacks, err = s.pruneSharedImagePacksLocked(ctx, removed)
 		return err
 	})
 	return removedManifests, removedPacks, err
 }
 
-func (s Store) pruneSharedImagePacksLocked(ctx context.Context) (int, int, error) {
+func (s Store) pruneSharedImagePacksLocked(ctx context.Context, removed []string) (int, int, error) {
 	stored, err := images.List(ctx, images.ListOptions{Root: s.Root})
 	if err != nil {
 		return 0, 0, err
@@ -6836,6 +6847,7 @@ func (s Store) pruneSharedImagePacksLocked(ctx context.Context) (int, int, error
 		return 0, 0, err
 	}
 	removedManifests := 0
+	now := time.Now()
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
@@ -6846,6 +6858,13 @@ func (s Store) pruneSharedImagePacksLocked(ctx context.Context) (int, int, error
 		}
 		if _, ok := keepKeys[key]; ok {
 			continue
+		}
+		if !slices.ContainsFunc(removed, func(digest string) bool {
+			return strings.HasPrefix(key, imageRootKey(digest, ""))
+		}) {
+			if info, err := entry.Info(); err != nil || now.Sub(info.ModTime()) < sharedImagePackGrace {
+				continue
+			}
 		}
 		if err := os.Remove(filepath.Join(manifestsDir, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return removedManifests, 0, err

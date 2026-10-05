@@ -3200,12 +3200,40 @@ func TestPruneUnreferencedSharedImagePack(t *testing.T) {
 		t.Fatal(err)
 	}
 	id, _ := ttcpack.ParseID(manifest.Pack)
+	// No tag names the image yet, as when another node loads it and has yet
+	// to publish its tags: the pack is kept for a grace period.
 	manifests, packs, err := store.PruneSharedImagePacks(context.Background())
+	if err != nil || manifests != 0 || packs != 0 {
+		t.Fatalf("PruneSharedImagePacks of a young pack = (%d, %d, %v), want (0, 0, nil)", manifests, packs, err)
+	}
+	if _, err := os.Stat(ttcpack.Path(store.sharedImagePackRoot(), id)); err != nil {
+		t.Fatalf("a young pack after a prune: %v", err)
+	}
+	old := time.Now().Add(-2 * sharedImagePackGrace)
+	if err := os.Chtimes(store.sharedImagePackManifestPath(key), old, old); err != nil {
+		t.Fatal(err)
+	}
+	manifests, packs, err = store.PruneSharedImagePacks(context.Background())
 	if err != nil || manifests != 1 || packs != 1 {
-		t.Fatalf("PruneSharedImagePacks = (%d, %d, %v), want (1, 1, nil)", manifests, packs, err)
+		t.Fatalf("PruneSharedImagePacks of an old pack = (%d, %d, %v), want (1, 1, nil)", manifests, packs, err)
 	}
 	if _, err := os.Stat(ttcpack.Path(store.sharedImagePackRoot(), id)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("unreferenced pack remains after immediate prune: %v", err)
+		t.Fatalf("unreferenced old pack remains after a prune: %v", err)
+	}
+	// The removal of an image prunes its pack at once, however young.
+	if err := store.publishSharedImagePack(key, imageDir, info); err != nil {
+		t.Fatal(err)
+	}
+	manifests, packs, err = store.PruneSharedImagePacks(context.Background(), "sha256:"+strings.Repeat("2", 64))
+	if err != nil || manifests != 0 || packs != 0 {
+		t.Fatalf("PruneSharedImagePacks after another image's removal = (%d, %d, %v), want (0, 0, nil)", manifests, packs, err)
+	}
+	manifests, packs, err = store.PruneSharedImagePacks(context.Background(), "sha256:"+strings.Repeat("1", 64))
+	if err != nil || manifests != 1 || packs != 1 {
+		t.Fatalf("PruneSharedImagePacks after the image's removal = (%d, %d, %v), want (1, 1, nil)", manifests, packs, err)
+	}
+	if _, err := os.Stat(ttcpack.Path(store.sharedImagePackRoot(), id)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a removed image's pack remains after a prune: %v", err)
 	}
 }
 
