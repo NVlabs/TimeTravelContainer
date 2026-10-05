@@ -6834,7 +6834,40 @@ func (b *runtimeBackend) activeDataRoot() string {
 	return b.dataRoot
 }
 
+// queueBranchPublication is queueBranchPublicationOnce, run again while a
+// snapshot the branch's repositories share is frozen for an authority
+// handoff, as another branch's publication leaves it for a moment: waiting
+// without the lifecycle lock between tries, as a fork does. A refused try
+// changes nothing. A stop right after a dehydration of another branch of its
+// family failed so, once that dehydration's publication no longer waited
+// seconds for a shared reference coordinator.
 func (b *runtimeBackend) queueBranchPublication(target selector, kind string) error {
+	deadline := time.Now().Add(forkHandoffWait)
+	delay := 100 * time.Millisecond
+	for {
+		err := b.queueBranchPublicationOnce(target, kind)
+		if err == nil || !frozenForAuthorityHandoff(err) || time.Now().After(deadline) {
+			return err
+		}
+		info, loadErr := b.containerStore().LoadContainer(target.container)
+		if loadErr != nil {
+			return err
+		}
+		state := "stopping"
+		if kind == "dehydrate" {
+			state = "dehydrating"
+		}
+		if waitErr := b.withoutLifecycleLock(info, longOperation{branch: target.branch, state: state}, func() error {
+			time.Sleep(delay)
+			return nil
+		}); waitErr != nil {
+			return waitErr
+		}
+		delay = min(2*delay, 2*time.Second)
+	}
+}
+
+func (b *runtimeBackend) queueBranchPublicationOnce(target selector, kind string) error {
 	if b.publicationQueue == nil {
 		if kind == "dehydrate" && b.dataRoot != "" {
 			return b.containerStore().UpdateBranchState(target.container, target.branch, "dehydrated")
@@ -6935,6 +6968,26 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 	for _, assignment := range assignments {
 		originsByRepository[assignment.ResourceID.Path] = assignment.Origins
 	}
+	// Sealing adds references to the repositories' origins, as a capture
+	// does: it holds the snapshot handoff gate, as a capture does, until its
+	// forks are committed, so that no final switch of an origin's references
+	// to the shared ledger freezes the origin meanwhile. Without it, a stop
+	// right after another branch's dehydration was refused, its origin
+	// "frozen for authority handoff".
+	finishCapture := func() {}
+	if b.distributedSource != nil {
+		state := "stopping"
+		if kind == "dehydrate" {
+			state = "dehydrating"
+		}
+		finish, err := b.beginForegroundCapture(info, longOperation{branch: target.branch, state: state})
+		if err != nil {
+			return rollback(err)
+		}
+		var once sync.Once
+		finishCapture = func() { once.Do(finish) }
+		defer finishCapture()
+	}
 	seen := make(map[string]struct{})
 	for _, config := range configs {
 		path := filepath.Clean(config.Path)
@@ -6987,6 +7040,7 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 	}
 	originsCommitted = true
 	captureComplete = true
+	finishCapture()
 	if _, err := store.BeginBranchPublicationIf(target.container, target.branch, previous.PublicationID, publicationID); err != nil {
 		return rollback(fmt.Errorf("installing captured publication: %w", err))
 	}
