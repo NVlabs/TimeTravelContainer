@@ -1805,12 +1805,9 @@ func (p *branchPublisher) publishSharedReferenceLedger(snapshot ttcsnapshot.Snap
 	if err := persistSharedPublicationBridgeIntentWithAuthority(p.sharedRoot, intent, state); err != nil {
 		return fmt.Errorf("persisting publication bridge intent: %w", err)
 	}
-	lease, err := p.authority.SharedGCLease()
+	lease, err := p.sharedCoordinatorLease()
 	if err != nil {
 		return err
-	}
-	if lease.Generation == 0 || !time.Now().Before(lease.ExpiresAt) {
-		return errors.New("shared reference coordinator has no active lease")
 	}
 	var importOrigin func(context.Context, uint64) error
 	var retainBridge func(context.Context, uint64, string, string, string) error
@@ -1934,6 +1931,38 @@ func publicationBridgeReferences(snapshot ttcsnapshot.SnapshotID, references map
 	return bridges
 }
 
+// sharedCoordinatorLease is the lease of the shared reference coordinator.
+// With no node holding it, as after the node that held it stopped, another
+// node looked for it only a third of the lease on: the branch's publication
+// failed meanwhile, and its retries waited longer still, 7 s in all. Its
+// node's election tries for it at once, and the lease is looked for a few
+// times, a twentieth of a second apart; once this node holds it, until its
+// ledger is open.
+func (p *branchPublisher) sharedCoordinatorLease() (cluster.SharedGCLease, error) {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		lease, err := p.authority.SharedGCLease()
+		if err != nil {
+			return lease, err
+		}
+		held := lease.Generation != 0 && time.Now().Before(lease.ExpiresAt)
+		ours := lease.NodeID == p.nodeID && lease.Incarnation == p.incarnation
+		if held && (!ours || p.sharedRefs.activeFor(lease)) {
+			return lease, nil
+		}
+		if !time.Now().Before(deadline) {
+			if held {
+				return lease, nil
+			}
+			return lease, errors.New("shared reference coordinator has no active lease")
+		}
+		if !held {
+			p.sharedRefs.electCoordinator()
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // releaseSharedPublicationBridge removes the temporary provider-to-shared
 // roots only after their replacement authority is durable. It is idempotent
 // across lost responses and coordinator turnover.
@@ -1945,12 +1974,9 @@ func (p *branchPublisher) releaseSharedPublicationBridge(snapshot ttcsnapshot.Sn
 	if err != nil {
 		return fmt.Errorf("reading publication bridge roots: %w", err)
 	}
-	lease, err := p.authority.SharedGCLease()
+	lease, err := p.sharedCoordinatorLease()
 	if err != nil {
 		return err
-	}
-	if lease.Generation == 0 || !time.Now().Before(lease.ExpiresAt) {
-		return errors.New("shared reference coordinator has no active lease")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

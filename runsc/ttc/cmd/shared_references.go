@@ -307,6 +307,43 @@ type sharedReferenceService struct {
 	// collection instead, and each one by scanning all the ledger's objects,
 	// took 1.9 s of a 100,000-file family's removal.
 	compactionExamined map[ttcsnapshot.SnapshotID]uint64
+	// elect asks the node's coordinator election to try for the lease at
+	// once; see electCoordinator.
+	elect chan struct{}
+}
+
+// electCoordinator asks this node's coordinator election to try for the
+// lease at once, as a publication that finds no coordinator does: a node
+// looks for one only a third of the lease after it last found another
+// holding it, and one that held it stopped since.
+func (s *sharedReferenceService) electCoordinator() {
+	if s == nil {
+		return
+	}
+	select {
+	case s.elect <- struct{}{}:
+	default:
+	}
+}
+
+// elections is what electCoordinator sends the node's election.
+func (s *sharedReferenceService) elections() <-chan struct{} {
+	if s == nil {
+		return nil
+	}
+	return s.elect
+}
+
+// activeFor reports whether the service's ledger is open under lease: whether
+// this node coordinates under it yet, which its election makes it once it
+// takes the lease.
+func (s *sharedReferenceService) activeFor(lease cluster.SharedGCLease) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.ledger != nil && s.lease.Generation == lease.Generation
 }
 
 // unexaminedOrigin is the compactionExamined count of an origin that a new
@@ -317,7 +354,7 @@ func newSharedReferenceService(sharedRoot, localRoot, nodeID, incarnation string
 	return &sharedReferenceService{
 		authority: authority, packs: packs, nodeID: nodeID, incarnation: incarnation,
 		directory: filepath.Join(localRoot, "snapshot-graph", "shared-reference-ledger"), localRoot: localRoot, sharedRoot: sharedRoot,
-		graph: graph, peers: peers,
+		graph: graph, peers: peers, elect: make(chan struct{}, 1),
 	}
 }
 

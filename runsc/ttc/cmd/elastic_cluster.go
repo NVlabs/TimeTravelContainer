@@ -7614,6 +7614,7 @@ func maintainSharedGCCoordinator(authority *cluster.AuthorityCatalog, packs *ttc
 	defer release()
 	for {
 		now := time.Now()
+		retryAcquisition := false
 		if held.Generation != 0 {
 			// Activation may retry more frequently while an expired execution
 			// incarnation is being fenced. Do not turn those retries into
@@ -7637,6 +7638,13 @@ func maintainSharedGCCoordinator(authority *cluster.AuthorityCatalog, packs *ttc
 			default:
 				if acquired, err := authority.AcquireSharedGCLease(nodeID, incarnation, duration); err == nil {
 					held = acquired
+				} else {
+					// The cluster has no coordinator, and this node was
+					// refused, as every node is while it joins, which a
+					// cluster's nodes all do as it starts: the next try in a
+					// third of the lease kept every publication waiting as
+					// long.
+					retryAcquisition = true
 				}
 			}
 		}
@@ -7706,6 +7714,9 @@ func maintainSharedGCCoordinator(authority *cluster.AuthorityCatalog, packs *ttc
 			}
 		}
 		delay := duration / 3
+		if retryAcquisition {
+			delay = 250 * time.Millisecond
+		}
 		if retryActivation {
 			// An old provider can become fenced just after a failed rebuild.
 			// Waiting for the normal five-second maintenance tick unnecessarily
@@ -7718,6 +7729,8 @@ func maintainSharedGCCoordinator(authority *cluster.AuthorityCatalog, packs *ttc
 		case <-done:
 			timer.Stop()
 			return
+		case <-references.elections():
+			timer.Stop()
 		case <-timer.C:
 		}
 	}

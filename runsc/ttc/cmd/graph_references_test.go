@@ -471,6 +471,34 @@ func TestSharedReferenceCoordinatorTransitionClassification(t *testing.T) {
 	}
 }
 
+// A publication asks its node's coordinator election to try for the lease at
+// once without waiting on it, however often it asks; the election hears it
+// once, and a node without a service is asked nothing.
+func TestCoordinatorElectionIsAskedWithoutWaiting(t *testing.T) {
+	s := newSharedReferenceService(t.TempDir(), t.TempDir(), "node-a", "incarnation-a", nil, nil, nil, nil)
+	for i := 0; i < 3; i++ {
+		s.electCoordinator()
+	}
+	select {
+	case <-s.elections():
+	default:
+		t.Fatal("the election was not asked")
+	}
+	select {
+	case <-s.elections():
+		t.Fatal("asked three times at once, the election heard it twice")
+	default:
+	}
+	if s.activeFor(cluster.SharedGCLease{Generation: 1}) {
+		t.Error("a service whose ledger is not open is active")
+	}
+	var none *sharedReferenceService
+	none.electCoordinator()
+	if none.elections() != nil || none.activeFor(cluster.SharedGCLease{Generation: 1}) {
+		t.Error("no service has an election or an open ledger")
+	}
+}
+
 func TestSharedRootReleaseSurvivesCoordinatorReceiptLoss(t *testing.T) {
 	ledger := ttcsnapshot.NewReferenceLedger()
 	origin := ttcsnapshot.SnapshotID(17)
