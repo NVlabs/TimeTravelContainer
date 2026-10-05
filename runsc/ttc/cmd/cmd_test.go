@@ -5157,6 +5157,59 @@ exit 2
 	}
 }
 
+// A removal that destroyed its branch in the Sentry and failed after leaves
+// the branch recorded running; its retry must not ask the Sentry to prepare a
+// branch it no longer has.
+func TestRemovalRetryOfABranchItsSentryNoLongerHas(t *testing.T) {
+	dir := t.TempDir()
+	runsc := filepath.Join(dir, "runsc")
+	script := `#!/bin/sh
+if [ "$1" != "--root" ] || [ "$2" != "/runtime" ]; then
+	echo "unexpected globals: $*" >&2
+	exit 2
+fi
+if [ "$3" = "list" ]; then
+	printf '[{"id":"web","pid":%s,"status":"running"}]\n' "$PPID"
+	exit 0
+fi
+if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "branches" ]; then
+	echo '[{"ID":"main","ParentID":"","State":"running","ForkMetrics":{"SourceDowntime":0,"Kernel":{"Total":0},"Total":0}}]'
+	exit 0
+fi
+echo "unexpected command: $*" >&2
+exit 2
+`
+	if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
+		t.Fatalf("writing fake runsc: %v", err)
+	}
+	dataRoot := filepath.Join(dir, "data")
+	containerDir := filepath.Join(dataRoot, "containers", "web")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatalf("creating bundle: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+		Name: "web", BundleDir: bundleDir, State: "running", CreatedAt: time.Now(),
+		Branches: []ttcbundle.BranchInfo{{ID: "main", State: "running"}, {ID: "child", ParentID: "main", State: "running"}},
+	}); err != nil {
+		t.Fatalf("writing metadata: %v", err)
+	}
+	b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: dataRoot}
+	if err := b.destroy(selector{container: "web", branch: "child"}, true); err != nil {
+		t.Fatalf("retrying the removal of a branch the Sentry no longer has: %v", err)
+	}
+	info, err := ttcbundle.Store{Root: dataRoot}.LoadContainer("web")
+	if err != nil {
+		t.Fatalf("LoadContainer: %v", err)
+	}
+	if len(info.Branches) != 1 || info.Branches[0].ID != "main" {
+		t.Errorf("branches after the removal: %+v, want main alone", info.Branches)
+	}
+}
+
 // interruptedDehydrationFixture is a standalone family, web, whose branch main
 // is recorded as dehydrating while its Sentry holds a capture that was never
 // made durable: what ttcd leaves if it dies in the middle of a dehydration.

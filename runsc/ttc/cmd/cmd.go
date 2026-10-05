@@ -17888,8 +17888,14 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 	// torn down, and it exits. Which made removing a family's first branch —
 	// exactly what promoting another one has to do — quietly kill the sessions
 	// in the branch being promoted.
+	// A branch its Sentry no longer has is past preparing: a removal that
+	// destroyed it, and failed after, leaves it recorded as it was, and its
+	// retry must go on, as destroyRuntime does below.
 	switch normalizeLifecycleState(recorded.State) {
 	case "running", "restarting":
+		if runtimeFamily != nil && runtimeBranchState == "" {
+			break
+		}
 		if _, err := b.command("timetravel", target.container, "prepare-stop", target.branch); err != nil {
 			return fmt.Errorf("preparing %s for removal: %w", target, err)
 		}
