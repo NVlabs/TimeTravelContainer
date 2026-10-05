@@ -212,7 +212,7 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest, output io.Writer)
 		}
 		return fmt.Errorf("branch %s is %s, cannot checkpoint", target, sourceState)
 	}
-	spec, err := b.containerStore().LoadSpec(info.ID)
+	spec, err := b.containerStore().LoadSpecOf(info)
 	if err != nil {
 		return err
 	}

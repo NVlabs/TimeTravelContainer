@@ -107,7 +107,7 @@ func (b *runtimeBackend) portableDistributedInternalMounts(container string) ([]
 }
 
 func (b *runtimeBackend) portableDistributedFamily(info ttcbundle.ContainerInfo) (cluster.RemoteFamilyDescriptor, error) {
-	spec, err := b.containerStore().LoadSpec(info.ID)
+	spec, err := b.containerStore().LoadSpecOf(info)
 	if err != nil {
 		return cluster.RemoteFamilyDescriptor{}, fmt.Errorf("loading distributed family specification: %w", err)
 	}
@@ -1780,7 +1780,7 @@ func (b *runtimeBackend) prepareDistributedFilesystem(info ttcbundle.ContainerIn
 	if filesystemBranch == "" {
 		return nil, 0, errors.New("distributed capture omitted its filesystem generation")
 	}
-	spec, err := b.containerStore().LoadSpec(info.ID)
+	spec, err := b.containerStore().LoadSpecOf(info)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1888,7 +1888,7 @@ func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.Co
 		bySource[root.Source] = root
 	}
 	store := b.containerStore()
-	spec, err := store.LoadSpec(info.ID)
+	spec, err := store.LoadSpecOf(info)
 	if err != nil {
 		return 0, err
 	}

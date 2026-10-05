@@ -590,7 +590,7 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 			Mode:        uint32(mount.Mode.Perm()),
 		}
 	}
-	spec, err := store.LoadSpec(info.ID)
+	spec, err := store.LoadSpecOf(info)
 	if err != nil {
 		return ttcstorage.Result{}, err
 	}
@@ -894,7 +894,7 @@ func (p *branchPublisher) CaptureAvailable(intent ttcstorage.Intent) (bool, erro
 	if branch.PublicationID != intent.PublicationID {
 		return false, nil
 	}
-	spec, err := store.LoadSpec(info.ID)
+	spec, err := store.LoadSpecOf(info)
 	if err != nil {
 		return false, err
 	}
@@ -1009,7 +1009,7 @@ func (p *branchPublisher) Cleanup(intent ttcstorage.Intent) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("reading canceled publication manifest: %w", err)
 	}
-	spec, err := store.LoadSpec(info.ID)
+	spec, err := store.LoadSpecOf(info)
 	if err != nil {
 		return err
 	}
@@ -1578,7 +1578,7 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 				handoffOrigins = append(handoffOrigins, branch.SnapshotID)
 			}
 		}
-		spec, err := store.LoadSpec(info.ID)
+		spec, err := store.LoadSpecOf(info)
 		if err != nil {
 			return err
 		}
@@ -2370,7 +2370,7 @@ func (b *runtimeBackend) ensureLocalColdFilesystem(info ttcbundle.ContainerInfo,
 // ran and was captured elsewhere since would come back to its older files.
 // A branch last committed here, or imported from roots, is kept.
 func (b *runtimeBackend) discardSupersededBranchFilesystems(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, roots []cluster.FilesystemRootDescriptor) error {
-	spec, err := b.containerStore().LoadSpec(info.ID)
+	spec, err := b.containerStore().LoadSpecOf(info)
 	if err != nil {
 		return err
 	}
@@ -2538,7 +2538,7 @@ func (b *runtimeBackend) prepareColdFilesystemRelays(info ttcbundle.ContainerInf
 		return nil, err
 	}
 	store := b.containerStore()
-	spec, err := store.LoadSpec(info.ID)
+	spec, err := store.LoadSpecOf(info)
 	if err != nil {
 		return nil, err
 	}
@@ -2601,7 +2601,7 @@ func (b *runtimeBackend) prepareColdDirectFilesystemSources(info ttcbundle.Conta
 	if err != nil {
 		return nil, nil, err
 	}
-	spec, err := b.containerStore().LoadSpec(info.ID)
+	spec, err := b.containerStore().LoadSpecOf(info)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -2681,7 +2681,7 @@ func (b *runtimeBackend) prepareColdDirectFilesystemSources(info ttcbundle.Conta
 // immutable object until the remote transaction becomes independent, so no
 // shared manifest or bulk upload is required on the fork critical path.
 func (b *runtimeBackend) prepareLocalDirectFilesystemSources(info ttcbundle.ContainerInfo, filesystemBranch string) ([]ttcvolume.RemoteObjectSource, func(), error) {
-	spec, err := b.containerStore().LoadSpec(info.ID)
+	spec, err := b.containerStore().LoadSpecOf(info)
 	if err != nil {
 		return nil, nil, err
 	}

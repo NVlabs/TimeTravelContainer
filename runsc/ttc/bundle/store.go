@@ -439,7 +439,7 @@ func (s Store) prepareBranchBundle(name, branchID, filesystemBranch string, dist
 	if err != nil {
 		return "", nil, err
 	}
-	spec, err := s.LoadSpec(info.ID)
+	spec, err := s.LoadSpecOf(info)
 	if err != nil {
 		return "", nil, err
 	}
@@ -1252,7 +1252,7 @@ func (s Store) PortableInternalMounts(name string) ([]PortableInternalMount, err
 	if err != nil {
 		return nil, err
 	}
-	spec, err := s.LoadSpec(info.ID)
+	spec, err := s.LoadSpecOf(info)
 	if err != nil {
 		return nil, err
 	}
@@ -3802,11 +3802,17 @@ func (s Store) WriteActiveRepositoryMap(name string, repositories []specutils.TT
 	if err != nil {
 		return err
 	}
+	return s.writeActiveRepositoryMapOf(info.ID, repositories)
+}
+
+// writeActiveRepositoryMapOf is WriteActiveRepositoryMap of the container with
+// the exact ID id.
+func (s Store) writeActiveRepositoryMapOf(id string, repositories []specutils.TTCVolumeRepository) error {
 	mappings := make(map[string]activeRepositoryMapping, len(repositories))
 	for _, repository := range repositories {
 		mappings[repository.Source] = activeRepositoryMapping{Path: repository.Path, RestoreID: repository.RestoreID, CopyMode: repository.CopyMode}
 	}
-	return writeJSON(filepath.Join(s.activeContainerDir(info.ID), "repository-map.json"), mappings)
+	return writeJSON(filepath.Join(s.activeContainerDir(id), "repository-map.json"), mappings)
 }
 
 // CommitActiveRepositoryRestoreIDs replaces one-shot restore aliases with the
@@ -3821,7 +3827,9 @@ func (s Store) CommitActiveRepositoryRestoreIDs(name string) error {
 	if err != nil {
 		return err
 	}
-	spec, err := s.LoadSpec(info.ID)
+	// The record, read once: what the spec's reading takes of it never
+	// changes, and each reading of it was a round trip of a shared root.
+	spec, err := s.LoadSpecOf(info)
 	if err != nil {
 		return err
 	}
@@ -3836,7 +3844,7 @@ func (s Store) CommitActiveRepositoryRestoreIDs(name string) error {
 		}
 		repositories[i].RestoreID = info.ID
 	}
-	return s.WriteActiveRepositoryMap(info.ID, repositories)
+	return s.writeActiveRepositoryMapOf(info.ID, repositories)
 }
 
 // KeepContainerImageRoot reports whether the image root that the container
@@ -3917,7 +3925,7 @@ func (s Store) RefreshContainerImageRoot(ctx context.Context, name string) (Cont
 		info.RootFS = rootfs
 		return info, nil
 	}
-	spec, err := s.LoadSpec(info.ID)
+	spec, err := s.LoadSpecOf(info)
 	if err != nil {
 		return ContainerInfo{}, err
 	}
@@ -5553,7 +5561,7 @@ func (s Store) RemoveBranchFilesystems(name string, branch BranchInfo) error {
 	if err != nil {
 		return err
 	}
-	spec, err := s.LoadSpec(info.ID)
+	spec, err := s.LoadSpecOf(info)
 	if err != nil {
 		return err
 	}

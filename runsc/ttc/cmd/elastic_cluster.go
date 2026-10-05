@@ -942,10 +942,12 @@ func (b *runtimeBackend) reconcilePlacementCatalogOf(families ...string) error {
 			// publication yet. Preserve this placement through the early recovery
 			// pass; reconcileObservedInitExits consumes it immediately after the
 			// incarnation becomes Ready.
-			if paths, pathErr := b.containerStore().BranchConsolePaths(physicalContainer, physicalBranch); pathErr == nil {
-				if _, completed, statusErr := readConsoleWaitStatus(paths.WaitStatus); statusErr == nil && completed {
-					continue
-				}
+			// The physical container is named by its exact ID: its record,
+			// read again only to find the ID, was a round trip of the shared
+			// root.
+			paths := b.containerStore().BranchConsolePathsOf(physicalContainer, physicalBranch)
+			if _, completed, statusErr := readConsoleWaitStatus(paths.WaitStatus); statusErr == nil && completed {
+				continue
 			}
 			// Stop and dehydration deliberately release the physical runtime
 			// before their immutable capture has finished publishing. The authority's

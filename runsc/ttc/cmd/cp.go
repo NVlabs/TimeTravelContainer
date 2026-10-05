@@ -647,7 +647,7 @@ func (b *runtimeBackend) runOfflineCopyHelper(resolved selector, info ttcbundle.
 			return fmt.Errorf("materializing filesystem for durable branch %q: %w", resolved.branch, err)
 		}
 	}
-	original, err := b.containerStore().LoadSpec(info.ID)
+	original, err := b.containerStore().LoadSpecOf(info)
 	if err != nil {
 		return err
 	}

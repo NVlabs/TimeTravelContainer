@@ -6918,7 +6918,7 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 	if filesystemBranch == "" {
 		filesystemBranch = offlineCopyBranch(info, branch.ID)
 	}
-	spec, err := store.LoadSpec(info.ID)
+	spec, err := store.LoadSpecOf(info)
 	if err != nil {
 		return rollback(err)
 	}
@@ -7443,7 +7443,7 @@ func (b *runtimeBackend) commit(target selector, reference string, options image
 	if filesystemBranch == "" {
 		filesystemBranch = offlineCopyBranch(info, resolved.branch)
 	}
-	spec, err := b.containerStore().LoadSpec(info.ID)
+	spec, err := b.containerStore().LoadSpecOf(info)
 	if err != nil {
 		return ttcimages.Info{}, err
 	}
@@ -14508,7 +14508,7 @@ func (b *runtimeBackend) preparePausedStop(target selector) (retErr error) {
 	if err := b.ensureDistributedTargetMemoryIndependent(info, branch); err != nil {
 		return fmt.Errorf("materializing remote state before stopping %s: %w", resolved, err)
 	}
-	spec, err := b.containerStore().LoadSpec(info.ID)
+	spec, err := b.containerStore().LoadSpecOf(info)
 	if err != nil {
 		return err
 	}
@@ -15882,7 +15882,7 @@ func (b *runtimeBackend) ensureClusterFilesystemWorkingOrigins(info ttcbundle.Co
 	if filesystemBranch == "" {
 		return errors.New("cluster filesystem branch is empty")
 	}
-	spec, err := b.containerStore().LoadSpec(info.ID)
+	spec, err := b.containerStore().LoadSpecOf(info)
 	if err != nil {
 		return err
 	}
@@ -17273,7 +17273,9 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	runtimeCreated = false
 	b.releaseConsumedStandaloneMemoryBacking(target, branch)
 	b.retainRehydrationPageSource(info.ID, branch, imageDir)
-	if _, err := b.ensureConsoleDrain(target, false); err != nil {
+	// The branch was dehydrated, not exited, in info: what else the drain
+	// reads of the record, its log options, never changes.
+	if _, err := b.ensureConsoleDrainIn(info, target, false); err != nil {
 		return fmt.Errorf("reattaching init console: %w", err)
 	}
 	sessions, err := b.execSessionsOf(target)
@@ -17619,7 +17621,7 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	// readers reachable and do not roll the peer back for artifact bookkeeping.
 	b.releaseConsumedStandaloneMemoryBacking(target, branch)
 	b.retainRehydrationPageSource(info.ID, branch, sourceDir)
-	if _, err := b.ensureConsoleDrain(target, false); err != nil {
+	if _, err := b.ensureConsoleDrainIn(info, target, false); err != nil {
 		return fmt.Errorf("reattaching init console: %w", err)
 	}
 	sessions, err := b.execSessionsOf(target)
@@ -18051,7 +18053,7 @@ func (b *runtimeBackend) diff(target selector) ([]BranchPathChange, error) {
 	if filesystemBranch == "" {
 		filesystemBranch = offlineCopyBranch(info, resolved.branch)
 	}
-	spec, err := b.containerStore().LoadSpec(info.ID)
+	spec, err := b.containerStore().LoadSpecOf(info)
 	if err != nil {
 		return nil, err
 	}
@@ -18255,7 +18257,7 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 		}
 	}
 
-	spec, err := b.containerStore().LoadSpec(info.ID)
+	spec, err := b.containerStore().LoadSpecOf(info)
 	if err != nil {
 		return FamilyResourceStats{}, err
 	}

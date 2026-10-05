@@ -43,7 +43,7 @@ func (b *runtimeBackend) claimForkCatalogs(info ttcbundle.ContainerInfo, filesys
 	if b.distributedSource == nil || b.distributedSource.authority == nil || b.sharedReferences == nil {
 		return nil
 	}
-	spec, err := b.containerStore().LoadSpec(info.ID)
+	spec, err := b.containerStore().LoadSpecOf(info)
 	if err != nil {
 		return err
 	}
@@ -201,7 +201,7 @@ func (b *runtimeBackend) catalogClaimNeeded(intent graphReferenceIntent) (bool, 
 	if err != nil {
 		return false, err
 	}
-	spec, err := b.containerStore().LoadSpec(info.ID)
+	spec, err := b.containerStore().LoadSpecOf(info)
 	if err != nil {
 		return false, err
 	}
