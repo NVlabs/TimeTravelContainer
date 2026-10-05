@@ -486,9 +486,20 @@ func (k *Kernel) ReadInternalConsole(ctx context.Context, id string, stream Inte
 	default:
 		return nil, false, false, fmt.Errorf("invalid internal console stream %d", stream)
 	}
+	// A push drains its streams whenever it wakes, so most reads find
+	// nothing: they allocate no buffer, and one that finds only the end, as
+	// its writers are gone, a byte's.
+	ready := file.Readiness(waiter.ReadableEvents | waiter.EventHUp)
+	if ready == 0 {
+		return nil, false, true, nil
+	}
+	start := min(maxBytes, internalConsoleReadStart)
+	if ready&waiter.ReadableEvents == 0 {
+		start = 1
+	}
 	// Most reads find little: one that fills a buffer of a few pages reads
 	// on, into one of what it may return.
-	buf := make([]byte, min(maxBytes, internalConsoleReadStart))
+	buf := make([]byte, start)
 	n, err := file.Read(ctx, usermem.BytesIOSequence(buf), vfs.ReadOptions{})
 	if err == nil && n == int64(len(buf)) && len(buf) < maxBytes {
 		more := make([]byte, maxBytes)
