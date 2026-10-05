@@ -274,15 +274,40 @@ func (cs *cloneState) newTypeInfo(typ reflect.Type) *cloneTypeInfo {
 		ti.refs = true
 	case reflect.Struct:
 		ti.structs = true
-		_, fields, ok := lookupNameFields(typ)
-		ti.registered = ok
-		ti.fields = len(fields)
-		ti.slots = make([]slotType, len(fields))
+		fields := cloneStructFieldsOf(typ)
+		ti.registered = fields.registered
+		ti.fields = fields.n
+		ti.slots = make([]slotType, fields.n)
 	case reflect.Array:
 		elem := cs.typeInfo(typ.Elem())
 		ti.structs, ti.refs = elem.structs, elem.refs
 	}
 	return ti
+}
+
+// cloneStructFields holds, by rtypeOf, the cloneStructFieldsOf each struct
+// type that a clone met. Each clone learns its types anew, and
+// lookupNameFields, which copies a type's fields' names and sorts them to
+// check them, was half of that, a twentieth of a small branch's fork.
+var cloneStructFields sync.Map
+
+// cloneStructFieldsOf returns whether typ, a struct type, has state type
+// information, and its number of fields.
+func cloneStructFieldsOf(typ reflect.Type) cloneStructInfo {
+	tid := rtypeOf(typ)
+	if info, ok := cloneStructFields.Load(tid); ok {
+		return info.(cloneStructInfo)
+	}
+	_, fields, ok := lookupNameFields(typ)
+	info := cloneStructInfo{registered: ok, n: len(fields)}
+	cloneStructFields.Store(tid, info)
+	return info
+}
+
+// cloneStructInfo is what cloneStructFieldsOf returns.
+type cloneStructInfo struct {
+	registered bool
+	n          int
 }
 
 // cloneObject is what the clone recorded of an object of the source's
