@@ -324,6 +324,81 @@ func TestAuthorityLinearizableApply(t *testing.T) {
 	}
 }
 
+// A command the authority refuses for its node's lease renews the lease, once
+// for the commands refused at once, and is proposed again; one refused for
+// another reason is not.
+func TestAuthorityCatalogRenewsTheLeaseACommandWasRefusedFor(t *testing.T) {
+	holder := newTestHolder(t)
+	registerReadyNode(t, holder.node, "node-b", "incarnation-b")
+	catalog, err := NewAuthorityCatalog(holder.node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lapse := func() {
+		t.Helper()
+		if _, err := catalog.Heartbeat("node-b", "incarnation-b", 0, time.Now(), time.Millisecond); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	place := func(branch string) error {
+		_, err := catalog.Create(PlacementRecord{
+			FamilyID: "family", BranchID: branch, PhysicalContainer: "family", PhysicalBranch: branch,
+			OwnerNode: "node-b", OwnerIncarnation: "incarnation-b", State: PlacementMaterializing,
+		}, time.Now())
+		return err
+	}
+	lapse()
+	if err := place("refused"); !IsNoExecutionLease(err) {
+		t.Fatalf("a placement on a lapsed lease, renewing none: %v, want a refusal for the lease", err)
+	}
+	var mu sync.Mutex
+	renewals := 0
+	catalog.SetLeaseRenewal(func() error {
+		mu.Lock()
+		renewals++
+		mu.Unlock()
+		_, err := catalog.Heartbeat("node-b", "incarnation-b", 0, time.Now(), time.Hour)
+		return err
+	})
+	count := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return renewals
+	}
+	if err := place("main"); err != nil {
+		t.Fatalf("a placement on a lapsed lease: %v", err)
+	}
+	if n := count(); n != 1 {
+		t.Errorf("%d renewals, want 1", n)
+	}
+	if err := place("main"); err == nil || IsNoExecutionLease(err) {
+		t.Fatalf("a placement of a branch placed already: %v, want a refusal other than for the lease", err)
+	}
+	if n := count(); n != 1 {
+		t.Errorf("a refusal for another reason renewed the lease: %d renewals, want 1", n)
+	}
+	lapse()
+	errs := make([]error, 8)
+	var wg sync.WaitGroup
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = place(fmt.Sprintf("b%d", i))
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("placement b%d, one of 8 at once on a lapsed lease: %v", i, err)
+		}
+	}
+	if n := count(); n != 2 {
+		t.Errorf("%d renewals after 8 commands at once on a lapsed lease, want 2", n)
+	}
+}
+
 // A publication's capture is made ready by the command that queues it and by
 // the queue's worker, at once: both succeed.
 func TestAuthorityCatalogEnsurePublicationReadyConcurrently(t *testing.T) {

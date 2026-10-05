@@ -796,7 +796,13 @@ func (b *runtimeBackend) renewDistributedExecutionAuthority() (*cluster.NodeReco
 	if b == nil || b.distributedSource == nil || b.distributedSource.directory == nil || b.nodeID == "" {
 		return nil, errors.New("distributed execution authority is unavailable")
 	}
-	record, err := b.distributedSource.directory.Lookup(b.nodeID)
+	return renewExecutionLease(b.distributedSource.directory, b.nodeID)
+}
+
+// renewExecutionLease renews node's execution lease, for as long as its
+// record says it lasts, in the term of the authority's holder.
+func renewExecutionLease(directory cluster.NodeCatalog, node string) (*cluster.NodeRecord, error) {
+	record, err := directory.Lookup(node)
 	if err != nil {
 		return nil, err
 	}
@@ -809,7 +815,7 @@ func (b *runtimeBackend) renewDistributedExecutionAuthority() (*cluster.NodeReco
 	}
 	// The node's memory is what its last heartbeat measured, a few seconds
 	// ago at most: this renewal is for the lease.
-	renewed, err := b.distributedSource.directory.Heartbeat(record.NodeID, record.Incarnation, record.MemoryCurrentBytes, time.Now(), lease)
+	renewed, err := directory.Heartbeat(record.NodeID, record.Incarnation, record.MemoryCurrentBytes, time.Now(), lease)
 	if err != nil {
 		return nil, err
 	}

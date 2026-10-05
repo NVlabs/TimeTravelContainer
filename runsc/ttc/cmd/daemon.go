@@ -5205,6 +5205,10 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 		actual, _ := holderClients.LoadOrStore(record.ControlURL, client)
 		return actual.(*cluster.Client), nil
 	})
+	catalog.SetLeaseRenewal(func() error {
+		_, err := renewExecutionLease(catalog, opts.NodeID)
+		return err
+	})
 	closeAuthority = false
 	closeListener = false
 	closeHeartbeat = false

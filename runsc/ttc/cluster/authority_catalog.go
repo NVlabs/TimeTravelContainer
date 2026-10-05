@@ -11,6 +11,7 @@ import (
 	"errors"
 	"os"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -22,6 +23,13 @@ type AuthorityCatalog struct {
 	// holderClient returns the client of the authority's holder; retry is
 	// set once a request sent to it failed.
 	holderClient func(retry bool) (*Client, error)
+	// renewLease renews the execution lease of the catalog's node; see
+	// SetLeaseRenewal.
+	renewLease func() error
+	// renewing is held while the lease is renewed; renewedAt is when the
+	// last renewal ended.
+	renewing  sync.Mutex
+	renewedAt time.Time
 }
 
 func NewAuthorityCatalog(node *AuthorityNode) (*AuthorityCatalog, error) {
@@ -37,6 +45,47 @@ func NewAuthorityCatalog(node *AuthorityNode) (*AuthorityCatalog, error) {
 // longer holds the authority.
 func (c *AuthorityCatalog) SetHolderClientResolver(resolve func(retry bool) (*Client, error)) {
 	c.holderClient = resolve
+}
+
+// SetLeaseRenewal lets the catalog renew its node's execution lease with
+// renew when the authority refuses a command for it, and propose the command
+// again. The authority takes a lease only in the term it was renewed in, and
+// a node's heartbeat renews it every sixth of the lease: after another node
+// took the authority over, every command of the node that needed its lease
+// was refused until then, as every run on the other nodes was, for 4.4 s,
+// after the holder stopped.
+func (c *AuthorityCatalog) SetLeaseRenewal(renew func() error) {
+	c.renewLease = renew
+}
+
+// proposeRenewing proposes a command, and again, once, if the authority
+// refused it for the node's lease and the lease is renewed: by this command,
+// or by another refused as it was, since it was first proposed.
+func (c *AuthorityCatalog) proposeRenewing(kind AuthorityCommandKind, payload any) (AuthorityResult, error) {
+	id, err := newAuthorityRequestID()
+	if err != nil {
+		return AuthorityResult{}, err
+	}
+	proposed := time.Now()
+	result, err := c.propose(context.Background(), id, kind, payload)
+	if err != nil || c.renewLease == nil || kind == AuthorityNodeRenew || !IsNoExecutionLease(result.Err()) {
+		return result, err
+	}
+	c.renewing.Lock()
+	renewErr := error(nil)
+	if !c.renewedAt.After(proposed) {
+		if renewErr = c.renewLease(); renewErr == nil {
+			c.renewedAt = time.Now()
+		}
+	}
+	c.renewing.Unlock()
+	if renewErr != nil {
+		return result, nil
+	}
+	if id, err = newAuthorityRequestID(); err != nil {
+		return AuthorityResult{}, err
+	}
+	return c.propose(context.Background(), id, kind, payload)
 }
 
 func (c *AuthorityCatalog) propose(ctx context.Context, requestID string, kind AuthorityCommandKind, payload any) (AuthorityResult, error) {
@@ -186,11 +235,7 @@ func newAuthorityRequestID() (string, error) {
 }
 
 func applyAuthorityValue[T any](catalog *AuthorityCatalog, _ time.Time, kind AuthorityCommandKind, payload any) (*T, error) {
-	id, err := newAuthorityRequestID()
-	if err != nil {
-		return nil, err
-	}
-	result, err := catalog.propose(context.Background(), id, kind, payload)
+	result, err := catalog.proposeRenewing(kind, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -205,11 +250,7 @@ func applyAuthorityValue[T any](catalog *AuthorityCatalog, _ time.Time, kind Aut
 }
 
 func applyAuthorityNoValue(catalog *AuthorityCatalog, _ time.Time, kind AuthorityCommandKind, payload any) error {
-	id, err := newAuthorityRequestID()
-	if err != nil {
-		return err
-	}
-	result, err := catalog.propose(context.Background(), id, kind, payload)
+	result, err := catalog.proposeRenewing(kind, payload)
 	if err != nil {
 		return err
 	}
