@@ -363,6 +363,7 @@ type daemonServer struct {
 
 	eventMu    sync.Mutex
 	eventSeq   uint64
+	eventLog   openEventLog
 	eventSyncs eventLogSyncer
 
 	stdinMu     sync.Mutex

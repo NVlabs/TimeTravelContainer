@@ -199,6 +199,9 @@ func TestRecordedEventMakesTheLogsDirectoryAndRotatesAFullLog(t *testing.T) {
 	if err := os.Truncate(path, daemonEventMaxBytes); err != nil {
 		t.Fatal(err)
 	}
+	// The daemon, its log's only writer, keeps the log open and its size
+	// as it writes; one that opens it again finds what grew it meanwhile.
+	server.eventLog.close()
 	server.recordEvent(root, DaemonEvent{Type: "container", Action: "start", Subject: "second"})
 	if info, err := os.Stat(daemonEventLogPath(path, 1)); err != nil || info.Size() != daemonEventMaxBytes {
 		t.Fatalf("a full log was not rotated: %v, %v", info, err)
@@ -375,11 +378,49 @@ func TestDaemonEventsMergeNodeLogs(t *testing.T) {
 	if err := rotateDaemonEventLog(n2.eventLogPath(root), 1<<30, 1, daemonEventFiles); err != nil {
 		t.Fatal(err)
 	}
+	// A daemon rotates its own log as it appends to it, and opens it anew.
+	n2.eventLog.close()
 	n2.recordEvent(root, DaemonEvent{Type: "container", Action: "start", Subject: "after"})
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
 	if got := output.String(); !strings.Contains(got, `"subject":"before"`) || !strings.Contains(got, `"subject":"after"`) {
 		t.Fatalf("followed %q across a rotation, want both events", got)
+	}
+}
+
+// The daemon keeps its event log open from one event to the next, rotates it
+// by the size it has written, and opens it again once rotated.
+func TestEventLogStaysOpenAndRotatesByWhatItWrote(t *testing.T) {
+	root := t.TempDir()
+	server := &daemonServer{}
+	path := server.eventLogPath(root)
+	server.recordEvent(root, DaemonEvent{Type: "container", Action: "start", Subject: "first"})
+	opened := server.eventLog.file
+	if opened == nil {
+		t.Fatal("the event log was not kept open")
+	}
+	server.recordEvent(root, DaemonEvent{Type: "container", Action: "start", Subject: "second"})
+	if server.eventLog.file != opened {
+		t.Fatal("the event log was opened again for the next event")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(data), `"subject":"first"`) || !strings.Contains(string(data), `"subject":"second"`) {
+		t.Fatalf("the log after two events: %q, %v", data, err)
+	}
+	if server.eventLog.size != int64(len(data)) {
+		t.Errorf("the size kept is %d, the log's %d", server.eventLog.size, len(data))
+	}
+	// As if the daemon had written the log full.
+	if err := os.Truncate(path, daemonEventMaxBytes); err != nil {
+		t.Fatal(err)
+	}
+	server.eventLog.size = daemonEventMaxBytes
+	server.recordEvent(root, DaemonEvent{Type: "container", Action: "start", Subject: "third"})
+	if server.eventLog.file == opened {
+		t.Error("a full log was not opened again")
+	}
+	if data, err := os.ReadFile(path); err != nil || strings.Contains(string(data), `"subject":"first"`) {
+		t.Errorf("the log after it was full: %q, %v; want it rotated", data, err)
 	}
 }

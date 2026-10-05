@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sys/unix"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
 )
@@ -186,29 +187,84 @@ func (s *daemonServer) recordEvent(dataRoot string, event DaemonEvent) {
 		return
 	}
 	data = append(data, '\n')
-	// The log rotates by the size of the file opened, which a stat of its
-	// directory and of it by name before the open would each have taken a
-	// round trip of a shared root to tell, on the way to every reply.
-	file, err := openDaemonEventLog(path)
+	log, err := s.eventLog.open(path, int64(len(data)))
 	if err != nil {
 		return
 	}
-	if info, err := file.Stat(); err != nil {
-		_ = file.Close()
+	if err := writeDaemonBytes(log.file, data); err != nil {
+		s.eventLog.close()
 		return
-	} else if info.Size() != 0 && info.Size()+int64(len(data)) > daemonEventMaxBytes {
+	}
+	log.size += int64(len(data))
+	// The event is in the log, where another node's follower reads it,
+	// once it is flushed, which closing a descriptor of the log does on a
+	// network filesystem: a duplicate's, so that the log stays open.
+	if duplicate, err := unix.Dup(int(log.file.Fd())); err == nil {
+		_ = unix.Close(duplicate)
+	}
+	s.eventSyncs.syncSoon(path)
+}
+
+// openEventLog is the event log a daemon appends to, kept open from one
+// event to the next: opening it for each was a round trip of a cluster's
+// shared root on the way to every reply. The caller holds eventMu.
+type openEventLog struct {
+	path string
+	file *os.File
+	// size is the size of the file, which only the daemon appends to.
+	size   int64
+	opened time.Time
+}
+
+// eventLogReopen is how long the daemon appends to the event log it opened
+// before it opens it again by name, in case the file was removed meanwhile.
+const eventLogReopen = 10 * time.Second
+
+// open returns the event log at path, open to append incoming bytes to,
+// rotated first if they would take it past daemonEventMaxBytes. The log
+// rotates by the size of the file opened, which a stat of its directory
+// and of it by name before the open would each have taken a round trip of a
+// shared root to tell.
+func (l *openEventLog) open(path string, incoming int64) (*openEventLog, error) {
+	if l.file != nil && (l.path != path || time.Since(l.opened) > eventLogReopen) {
+		l.close()
+	}
+	if l.file != nil && l.size != 0 && l.size+incoming > daemonEventMaxBytes {
+		l.close()
+	}
+	if l.file != nil {
+		return l, nil
+	}
+	file, err := openDaemonEventLog(path)
+	if err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err != nil {
 		_ = file.Close()
-		if err := rotateDaemonEventLog(path, int64(len(data)), daemonEventMaxBytes, daemonEventFiles); err != nil {
-			return
+		return nil, err
+	}
+	size := info.Size()
+	if size != 0 && size+incoming > daemonEventMaxBytes {
+		_ = file.Close()
+		if err := rotateDaemonEventLog(path, incoming, daemonEventMaxBytes, daemonEventFiles); err != nil {
+			return nil, err
 		}
 		if file, err = openDaemonEventLog(path); err != nil {
-			return
+			return nil, err
 		}
+		size = 0
 	}
-	if writeDaemonBytes(file, data) == nil {
-		s.eventSyncs.syncSoon(path)
+	*l = openEventLog{path: path, file: file, size: size, opened: time.Now()}
+	return l, nil
+}
+
+// close closes the log, if open.
+func (l *openEventLog) close() {
+	if l.file != nil {
+		_ = l.file.Close()
 	}
-	_ = file.Close()
+	*l = openEventLog{}
 }
 
 // openDaemonEventLog opens the event log at path to append to it, making its
