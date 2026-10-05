@@ -2700,8 +2700,6 @@ func TestLifecycleCommandOperandsSkipsOptions(t *testing.T) {
 	}
 }
 
-// A family's removal merges the removals of branches on one node that share
-// their flags into one command.
 // In a cluster as on a standalone daemon, a removal of several targets
 // reports each that does not exist, and removes the others still: here, none
 // exists, and the removal fails having removed nothing.
@@ -2733,6 +2731,57 @@ func TestDistributedFamilyMutationReportsMissingTargets(t *testing.T) {
 	}
 }
 
+// A removal of a branch reads its family's placements once, to plan it and to
+// find the branch, which here does not exist.
+func TestDistributedBranchRemovalListsItsFamilyOnce(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "web")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{ID: "web", Name: "web", NodeID: "node-b", BundleDir: bundleDir}); err != nil {
+		t.Fatal(err)
+	}
+	store, err := cluster.OpenPlacementStore(filepath.Join(root, "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create(cluster.PlacementRecord{
+		FamilyID: "web", BranchID: "main", PhysicalContainer: "web", PhysicalBranch: "main",
+		OwnerNode: "node-b", OwnerIncarnation: "boot-b", State: cluster.PlacementRunning,
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	transactions, err := cluster.OpenStore(filepath.Join(root, "transactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	placements := &countingPlacements{PlacementCatalog: store}
+	server := &daemonServer{
+		dataRoot: root, clusterPlacements: placements, clusterStore: transactions,
+		clusterCapabilities: &cluster.Capabilities{NodeID: "node-a"},
+	}
+	handled, status, stdout, stderr, err := server.executeDistributedFamilyMutation(daemonRequest{Args: []string{"rm", "-f", "web@gone"}})
+	if err != nil || !handled || status != 1 {
+		t.Fatalf("handled=%t status=%d err=%v, want a handled failure", handled, status, err)
+	}
+	if len(stdout) != 0 {
+		t.Errorf("stdout=%q, want nothing removed", stdout)
+	}
+	if want := "branch web@gone does not exist"; !strings.Contains(string(stderr), want) {
+		t.Errorf("stderr=%q, want %s", stderr, want)
+	}
+	if placements.lookups != 0 || placements.listings != 1 {
+		t.Errorf("the removal made %d lookups and %d listings, want one listing", placements.lookups, placements.listings)
+	}
+}
+
+// A family's removal merges the removals of branches on one node that share
+// their flags into one command.
 func TestBranchRemovalParts(t *testing.T) {
 	for _, test := range []struct {
 		args           []string

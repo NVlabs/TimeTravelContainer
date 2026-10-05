@@ -3017,6 +3017,32 @@ func (s *daemonServer) executeDistributedStats(request daemonRequest) (bool, int
 	return true, 0, output.Bytes(), diagnostic.Bytes(), nil
 }
 
+// familyMutationTransactions returns the cluster's transactions, in the order
+// of their IDs, and its retired nodes, which a family mutation's coordinator
+// settles the mutation's sources against: one query of the authority, where
+// each was one, a round trip to its holder.
+func (s *daemonServer) familyMutationTransactions() ([]cluster.Transaction, map[string]string, error) {
+	if s.distributedSource == nil || s.distributedSource.authority == nil {
+		transactions, err := s.clusterStore.List()
+		if err != nil {
+			return nil, nil, fmt.Errorf("listing distributed transactions before family mutation: %w", err)
+		}
+		return transactions, nil, nil
+	}
+	state, err := s.distributedSource.authority.AuthorityStateOf(cluster.AuthorityQuery{Transactions: cluster.All[string](), RetiredNodes: true})
+	if err != nil {
+		return nil, nil, fmt.Errorf("reading distributed transactions before family mutation: %w", err)
+	}
+	transactions := make([]cluster.Transaction, 0, len(state.Transactions))
+	for _, tx := range state.Transactions {
+		transactions = append(transactions, tx)
+	}
+	sort.Slice(transactions, func(i, j int) bool {
+		return transactions[i].Identity.TransactionID < transactions[j].Identity.TransactionID
+	})
+	return transactions, state.RetiredNodes, nil
+}
+
 // executeDistributedFamilyMutation coordinates destructive family- and
 // branch-scoped lifecycle changes before any daemon takes its process-local
 // lifecycle lock. This is necessary once one logical family can have physical
@@ -3039,21 +3065,13 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 	// is sequential but spans independently locked daemons; a target deleted
 	// first cannot subsequently acknowledge its source's retained pages.
 	var preflight []child
-	transactions, err := s.clusterStore.List()
+	transactions, retiredNodes, err := s.familyMutationTransactions()
 	if err != nil {
-		return true, 1, nil, nil, fmt.Errorf("listing distributed transactions before family mutation: %w", err)
+		return true, 1, nil, nil, err
 	}
 	transactionsByID := make(map[string]*cluster.Transaction, len(transactions))
 	for i := range transactions {
 		transactionsByID[transactions[i].Identity.TransactionID] = &transactions[i]
-	}
-	var retiredNodes map[string]string
-	if s.distributedSource != nil && s.distributedSource.authority != nil {
-		authority, authorityErr := s.distributedSource.authority.AuthorityStateOf(cluster.AuthorityQuery{RetiredNodes: true})
-		if authorityErr != nil {
-			return true, 1, nil, nil, fmt.Errorf("reading retired node authority before family mutation: %w", authorityErr)
-		}
-		retiredNodes = authority.RetiredNodes
 	}
 	settleByNode := make(map[string]map[string]struct{})
 	cancelByNode := make(map[string]map[string]struct{})
@@ -3067,10 +3085,10 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 	// mutated still.
 	var missing []error
 	present := make([]string, 0, len(mutation.targets))
-	// planned has what this pass read of each family it names whole, which
+	// planned has what this pass read of the family of each operand, which
 	// the pass that plans the children below uses: nothing runs between
 	// them, and reading it again was a round trip of the shared root and one
-	// of the authority for each.
+	// or two of the authority for each.
 	type plannedFamily struct {
 		info       ttcbundle.ContainerInfo
 		placements []cluster.PlacementRecord
@@ -3115,9 +3133,7 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 			}
 			settle, cancel, discard, abort = distributedRemovalSourceTransactions(transactions, placements, info, branchID)
 		}
-		if branchID == "" {
-			planned[operand] = plannedFamily{info: info, placements: placements, listed: request.Args[0] == "rm"}
-		}
+		planned[operand] = plannedFamily{info: info, placements: placements, listed: request.Args[0] == "rm"}
 		for _, ids := range abort {
 			for transactionID := range ids {
 				if tx := transactionsByID[transactionID]; tx != nil {
@@ -3284,11 +3300,21 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 			if err != nil {
 				return true, 1, nil, nil, fmt.Errorf("invalid target %q: %w", operand, err)
 			}
-			info, err := loadDistributedFamilyIdentity(store, s.clusterPlacements, selected.container)
-			if err != nil {
-				return true, 1, nil, nil, err
+			family := planned[operand]
+			info := family.info
+			var placement *cluster.PlacementRecord
+			var placementErr error
+			if family.listed {
+				placementErr = os.ErrNotExist
+				for i := range family.placements {
+					if family.placements[i].BranchID == selected.branch {
+						placement, placementErr = &family.placements[i], nil
+						break
+					}
+				}
+			} else {
+				placement, placementErr = s.clusterPlacements.Lookup(info.ID, selected.branch)
 			}
-			placement, placementErr := s.clusterPlacements.Lookup(info.ID, selected.branch)
 			if errors.Is(placementErr, os.ErrNotExist) {
 				missing = append(missing, fmt.Errorf("branch %s does not exist: %w", selected, placementErr))
 				continue
@@ -3314,11 +3340,8 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 			}
 			children = append(children, followUps...)
 			if request.Args[0] == "rm" {
-				familyPlacements, err := logicalFamilyPlacements(s.clusterPlacements, info.ID)
-				if err != nil {
-					return true, 1, nil, nil, fmt.Errorf("listing logical branches for %q: %w", operand, err)
-				}
-				if len(familyPlacements) == 1 && familyPlacements[0].BranchID == selected.branch {
+				// A removal listed the family's placements above.
+				if familyPlacements := family.placements; len(familyPlacements) == 1 && familyPlacements[0].BranchID == selected.branch {
 					// Branch-qualified removal of the final logical branch has the
 					// same empty-family result as standalone TTC. The physical target
 					// may be a migration wrapper, so it cannot remove the canonical
