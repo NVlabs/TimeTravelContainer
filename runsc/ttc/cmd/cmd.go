@@ -6465,6 +6465,7 @@ type consoleSidecarOwner interface {
 	FollowFamilyConsole(dir string, start func() error, follow ttcconsole.Follow, lock *os.File, target selector, observeInitExit bool) error
 	ObserveFamilyConsole(dir, key string, target selector, observeInitExit bool) bool
 	StopFamilyConsole(dir, key string) (bool, error)
+	RetireFamilyConsoles(dir string) (bool, error)
 	OwnConsoleSidecar(key string, command *exec.Cmd, target selector, observeInitExit bool) error
 	ObserveInheritedConsoleSidecar(key string, target selector, observeInitExit bool)
 	SuppressConsoleExitOnce(key string) func(bool)
@@ -6594,13 +6595,15 @@ func clearConsoleIncarnationStatus(paths ttcbundle.ConsolePaths) error {
 	return result
 }
 
+// stopContainerConsoleDrains stops following the consoles of the family
+// containerID, whose runtime is gone, and has its follower exit.
 func (b *runtimeBackend) stopContainerConsoleDrains(containerID string) error {
 	consoleDir := filepath.Join(b.activeDataRoot(), "containers", containerID, "console")
 	var result error
 	if b.consoleSidecars != nil {
-		_, result = b.consoleSidecars.StopFamilyConsole(consoleDir, "")
+		_, result = b.consoleSidecars.RetireFamilyConsoles(consoleDir)
 	} else {
-		result = stopFamilyConsoleOnce(consoleDir, "")
+		result = retireFamilyConsolesOnce(consoleDir)
 	}
 	err := filepath.WalkDir(consoleDir, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -10079,6 +10082,17 @@ func stopFamilyConsoleOnce(dir, key string) error {
 		return err
 	}
 	return nil
+}
+
+// retireFamilyConsolesOnce is RetireFamilyConsoles for a ttc that owns no
+// followers.
+func retireFamilyConsolesOnce(dir string) error {
+	client, err := dialFamilyFollower(dir, nil, nil)
+	if err != nil {
+		return nil
+	}
+	defer client.conn.Close()
+	return retireFamilyFollower(client)
 }
 
 func consoleDrainActive(lockPath string) (bool, error) {

@@ -42,6 +42,11 @@ const (
 	// FollowerObserve asks for a Done message once the console whose lock is
 	// Lock is no longer followed, at once if it is not.
 	FollowerObserve = "observe"
+	// FollowerRetire stops following every console, as FollowerStop with no
+	// Lock does, and has the follower exit once it has replied: its family's
+	// runtime is gone, and the follower can follow only that runtime's
+	// consoles.
+	FollowerRetire = "retire"
 )
 
 // Follow describes a console to follow and the files it goes to.

@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,7 +19,8 @@ import (
 // A family's console follower keeps the logs of the family's followed
 // consoles: see ttcconsole.FollowerSocketName. ttcd starts one when it
 // follows a console of a family that has none, and it exits a while after
-// it follows none; it outlives ttcd, as its consoles do.
+// it follows none, or once the family's runtime is gone; it outlives ttcd, as
+// its consoles do.
 
 // followerCallTimeout bounds a request to a follower, which asks at most one
 // thing of its Sentry.
@@ -278,6 +280,31 @@ func (s *daemonServer) StopFamilyConsole(dir, key string) (bool, error) {
 		return true, err
 	}
 	return true, nil
+}
+
+// RetireFamilyConsoles stops following every console of the family whose
+// console directory is dir, and has its follower exit, if the family has one:
+// its runtime is gone. It reports whether it had one.
+func (s *daemonServer) RetireFamilyConsoles(dir string) (bool, error) {
+	client, err := s.familyFollower(dir, nil)
+	if err != nil {
+		return false, nil
+	}
+	return true, retireFamilyFollower(client)
+}
+
+// retireFamilyFollower has client's follower stop following every console and
+// exit. One of an older ttcd, which does not know how, stops following them,
+// and exits once it has idled for familyFollowerIdle.
+func retireFamilyFollower(client *familyFollowerClient) error {
+	err := client.call(ttcconsole.FollowerMessage{Op: ttcconsole.FollowerRetire})
+	if err != nil && strings.HasPrefix(err.Error(), "unknown console follower operation") {
+		err = client.call(ttcconsole.FollowerMessage{Op: ttcconsole.FollowerStop})
+	}
+	if err != nil && !errors.Is(err, errFollowerGone) {
+		return err
+	}
+	return nil
 }
 
 func (s *daemonServer) observeFamilyConsole(key string, console daemonFollowedConsole) {

@@ -162,3 +162,13 @@ go_test(
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )
+
+# The family console follower's own tests, apart from cmd_test, whose
+# TestMain runs it as root in a user namespace.
+go_test(
+    name = "console_follower_test",
+    size = "small",
+    srcs = ["console_follower_test.go"],
+    library = ":cmd",
+    deps = ["//runsc/ttc/console"],
+)

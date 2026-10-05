@@ -168,12 +168,16 @@ func (f *familyFollower) serve(conn *net.UnixConn) {
 			return
 		}
 		var result error
+		retire := false
 		switch message.Op {
 		case ttcconsole.FollowerFollow:
 			result = f.follow(message.Follow, files)
 			files = nil
 		case ttcconsole.FollowerStop:
 			f.stop(message.Lock)
+		case ttcconsole.FollowerRetire:
+			f.stop("")
+			retire = true
 		case ttcconsole.FollowerObserve:
 			f.mu.Lock()
 			_, followed := f.consoles[message.Lock]
@@ -192,6 +196,11 @@ func (f *familyFollower) serve(conn *net.UnixConn) {
 			reply.Error = result.Error()
 		}
 		if err := ttcconsole.WriteFollowerMessage(conn, reply); err != nil {
+			return
+		}
+		if retire {
+			// A follower idling out lived 10 s more for each family removed.
+			f.exitIfIdle()
 			return
 		}
 	}
