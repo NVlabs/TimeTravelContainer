@@ -286,26 +286,85 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 func cpuDir(ctx context.Context, fs *filesystem, creds *auth.Credentials) kernfs.Inode {
 	k := kernel.KernelFromContext(ctx)
 	maxCPUCores := k.ApplicationCores()
+	d := &cpusDir{fs: fs, owner: creds, cores: maxCPUCores}
 	children := map[string]kernfs.Inode{
 		"online":   fs.newCPUFile(ctx, creds, maxCPUCores, defaultSysMode),
 		"possible": fs.newCPUFile(ctx, creds, maxCPUCores, defaultSysMode),
 		"present":  fs.newCPUFile(ctx, creds, maxCPUCores, defaultSysMode),
 	}
+	// Nothing else numbers this filesystem's inodes while it is made: the
+	// CPUs' are consecutive.
+	d.firstIno = fs.NextIno()
+	for i := uint(1); i < cpuInos*maxCPUCores; i++ {
+		fs.NextIno()
+	}
+	d.InodeAttrs.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0755)
+	d.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
+	d.InitRefs()
+	d.IncLinks(d.OrderedChildren.Populate(children) + uint32(maxCPUCores))
+	return d
+}
+
+// cpuInos is how many inodes a CPU's directory holds: itself, its topology,
+// and the topology's four files.
+const cpuInos = 6
+
+// cpusDir is /sys/devices/system/cpu. The directory of each CPU, with its
+// topology, is made as it is looked up and goes once unused: they were 12
+// objects a CPU, more on a host of a hundred than all else a kernel has, and
+// a fork copies every object of its source's kernel.
+//
+// +stateify savable
+type cpusDir struct {
+	dir
+
+	fs    *filesystem
+	owner *auth.Credentials
+	cores uint
+	// firstIno is the inode number of cpu0's directory, whose inodes and each
+	// next CPU's are numbered cpuInos on.
+	firstIno uint64
+}
+
+// Lookup implements kernfs.inodeDirectory.Lookup.
+func (d *cpusDir) Lookup(ctx context.Context, name string) (kernfs.Inode, error) {
+	if inode, err := d.dir.Lookup(ctx, name); !linuxerr.Equals(linuxerr.ENOENT, err) {
+		return inode, err
+	}
+	number, ok := strings.CutPrefix(name, "cpu")
+	cpu, err := strconv.ParseUint(number, 10, 32)
+	if !ok || err != nil || cpu >= uint64(d.cores) || strconv.FormatUint(cpu, 10) != number {
+		return nil, linuxerr.ENOENT
+	}
 	// For consistency with /proc/cpuinfo, pretend all CPUs are in the same
 	// socket and each CPU is a distinct core.
-	fullMask := fullCPUMask(maxCPUCores) + "\n"
-	for i := uint(0); i < maxCPUCores; i++ {
-		oneMask := oneCPUMask(i, maxCPUCores) + "\n"
-		children[fmt.Sprintf("cpu%d", i)] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-			"topology": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-				"core_cpus":       fs.newStaticFile(ctx, creds, defaultSysMode, oneMask),
-				"core_siblings":   fs.newStaticFile(ctx, creds, defaultSysMode, fullMask),
-				"package_cpus":    fs.newStaticFile(ctx, creds, defaultSysMode, fullMask),
-				"thread_siblings": fs.newStaticFile(ctx, creds, defaultSysMode, oneMask),
-			}),
-		})
+	ino := d.firstIno + cpu*cpuInos
+	oneMask := oneCPUMask(uint(cpu), d.cores) + "\n"
+	fullMask := fullCPUMask(d.cores) + "\n"
+	return d.fs.newDirWithIno(ctx, d.owner, ino, map[string]kernfs.Inode{
+		"topology": d.fs.newDirWithIno(ctx, d.owner, ino+1, map[string]kernfs.Inode{
+			"core_cpus":       d.fs.newStaticFileWithIno(ctx, d.owner, ino+2, defaultSysMode, oneMask),
+			"core_siblings":   d.fs.newStaticFileWithIno(ctx, d.owner, ino+3, defaultSysMode, fullMask),
+			"package_cpus":    d.fs.newStaticFileWithIno(ctx, d.owner, ino+4, defaultSysMode, fullMask),
+			"thread_siblings": d.fs.newStaticFileWithIno(ctx, d.owner, ino+5, defaultSysMode, oneMask),
+		}),
+	}), nil
+}
+
+// IterDirents implements kernfs.inodeDirectory.IterDirents.
+func (d *cpusDir) IterDirents(ctx context.Context, mnt *vfs.Mount, cb vfs.IterDirentsCallback, offset, relOffset int64) (int64, error) {
+	for cpu := max(relOffset, 0); cpu < int64(d.cores); cpu++ {
+		if err := cb.Handle(vfs.Dirent{
+			Name:    "cpu" + strconv.FormatInt(cpu, 10),
+			Type:    linux.DT_DIR,
+			Ino:     d.firstIno + uint64(cpu)*cpuInos,
+			NextOff: offset + 1,
+		}); err != nil {
+			return offset, err
+		}
+		offset++
 	}
-	return fs.newDir(ctx, creds, defaultSysDirMode, children)
+	return offset, nil
 }
 
 // fullCPUMask returns a "hex format ASCII string", consistent with Linux's
@@ -454,8 +513,12 @@ type dir struct {
 }
 
 func (fs *filesystem) newDir(ctx context.Context, creds *auth.Credentials, mode linux.FileMode, contents map[string]kernfs.Inode) kernfs.Inode {
+	return fs.newDirWithIno(ctx, creds, fs.NextIno(), contents)
+}
+
+func (fs *filesystem) newDirWithIno(ctx context.Context, creds *auth.Credentials, ino uint64, contents map[string]kernfs.Inode) kernfs.Inode {
 	d := &dir{}
-	d.InodeAttrs.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0755)
+	d.InodeAttrs.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeDirectory|0755)
 	d.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
 	d.InitRefs()
 	d.IncLinks(d.OrderedChildren.Populate(contents))
@@ -548,8 +611,12 @@ type staticFile struct {
 }
 
 func (fs *filesystem) newStaticFile(ctx context.Context, creds *auth.Credentials, mode linux.FileMode, data string) kernfs.Inode {
+	return fs.newStaticFileWithIno(ctx, creds, fs.NextIno(), mode, data)
+}
+
+func (fs *filesystem) newStaticFileWithIno(ctx context.Context, creds *auth.Credentials, ino uint64, mode linux.FileMode, data string) kernfs.Inode {
 	s := &staticFile{StaticData: vfs.StaticData{Data: data}}
-	s.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), s, mode)
+	s.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, ino, s, mode)
 	return s
 }
 

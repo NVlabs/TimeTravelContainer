@@ -102,6 +102,63 @@ func TestReadCPUFile(t *testing.T) {
 	}
 }
 
+// Each CPU's directory is made as it is looked up, numbered as the listing
+// numbers it, and counted in its parent's links.
+func TestCPUDirectories(t *testing.T) {
+	s := newTestSystem(t, "" /*pciTestDir*/)
+	defer s.Destroy()
+	cores := kernel.KernelFromContext(s.Ctx).ApplicationCores()
+	want := map[string]testutil.DirentType{
+		"online":   linux.DT_REG,
+		"possible": linux.DT_REG,
+		"present":  linux.DT_REG,
+	}
+	for cpu := uint(0); cpu < cores; cpu++ {
+		want[fmt.Sprintf("cpu%d", cpu)] = linux.DT_DIR
+	}
+	listing := s.ListDirents(s.PathOpAtRoot("devices/system/cpu"))
+	s.AssertAllDirentTypes(listing, want)
+	stat := func(p string) linux.Statx {
+		t.Helper()
+		stat, err := s.VFS.StatAt(s.Ctx, s.Creds, s.PathOpAtRoot(p), &vfs.StatOptions{Mask: linux.STATX_INO | linux.STATX_NLINK})
+		if err != nil {
+			t.Fatalf("stat %q: %v", p, err)
+		}
+		return stat
+	}
+	if got := stat("devices/system/cpu").Nlink; got != uint32(2+cores) {
+		t.Errorf("devices/system/cpu has %d links, want %d", got, 2+cores)
+	}
+	last := fmt.Sprintf("devices/system/cpu/cpu%d", cores-1)
+	if ino := stat(last).Ino; ino != listing.Dirents()[path.Base(last)].Ino || ino != stat(last).Ino {
+		t.Errorf("%s is numbered %d, then %d, and listed as %d", last, ino, stat(last).Ino, listing.Dirents()[path.Base(last)].Ino)
+	}
+	if got := stat(last).Nlink; got != 3 {
+		t.Errorf("%s has %d links, want 3", last, got)
+	}
+	if cores <= 32 {
+		for name, want := range map[string]string{
+			"core_cpus":       fmt.Sprintf("%x\n", uint64(1)<<(cores-1)),
+			"thread_siblings": fmt.Sprintf("%x\n", uint64(1)<<(cores-1)),
+			"core_siblings":   fmt.Sprintf("%x\n", uint64(1)<<cores-1),
+			"package_cpus":    fmt.Sprintf("%x\n", uint64(1)<<cores-1),
+		} {
+			got, err := readTestFile(s, last+"/topology/"+name)
+			if err != nil {
+				t.Fatalf("reading %s: %v", name, err)
+			}
+			if got != want {
+				t.Errorf("%s/topology/%s = %q, want %q", last, name, got, want)
+			}
+		}
+	}
+	for _, name := range []string{fmt.Sprintf("cpu%d", cores), "cpu01", "cpu", "cpu-1"} {
+		if _, err := s.VFS.StatAt(s.Ctx, s.Creds, s.PathOpAtRoot("devices/system/cpu/"+name), &vfs.StatOptions{}); err == nil {
+			t.Errorf("devices/system/cpu/%s exists", name)
+		}
+	}
+}
+
 func TestSysRootContainsExpectedEntries(t *testing.T) {
 	s := newTestSystem(t, "" /*pciTestDir*/)
 	defer s.Destroy()
