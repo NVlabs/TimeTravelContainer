@@ -6894,12 +6894,20 @@ func (b *runtimeBackend) queueBranchPublicationOnce(target selector, kind string
 	}
 	authorityContainer, authorityBranch := logicalFamilyID(container), target.branch
 	if b.distributedSource != nil && b.distributedSource.authority != nil {
-		state, err := b.distributedSource.authority.AuthorityStateOf(cluster.AuthorityQuery{Placements: cluster.All[string]()})
-		if err != nil {
-			return fmt.Errorf("resolving publication authority: %w", err)
-		}
+		// The branch's placement is one of its logical family's, which the
+		// record names: those are read, and the cluster's every placement only
+		// if none of them is the branch's. Every stop and dehydration read
+		// every placement of the cluster.
 		var found bool
-		authorityContainer, authorityBranch, found = logicalPlacementForPhysicalRuntime(state, container.ID, target.branch)
+		for _, family := range []string{logicalFamilyID(container), ""} {
+			state, err := b.distributedSource.authority.AuthorityStateOf(cluster.AuthorityQuery{Placements: cluster.All[string](), Family: family})
+			if err != nil {
+				return fmt.Errorf("resolving publication authority: %w", err)
+			}
+			if authorityContainer, authorityBranch, found = logicalPlacementForPhysicalRuntime(state, container.ID, target.branch); found {
+				break
+			}
+		}
 		if !found {
 			return fmt.Errorf("physical branch %s has no unique logical authority placement", target)
 		}
