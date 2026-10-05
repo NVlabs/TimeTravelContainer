@@ -86,10 +86,7 @@ func rotateDaemonEventLog(path string, incoming, maxBytes int64, files int) erro
 	if info.Size() == 0 || info.Size()+incoming <= maxBytes {
 		return nil
 	}
-	// The log's syncer syncs it by name, which it is about to lose.
-	if err := syncFileAt(path); err != nil {
-		return err
-	}
+	// The log's syncer syncs it through a descriptor, whatever its name.
 	if err := os.Remove(daemonEventLogPath(path, files-1)); err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -202,7 +199,7 @@ func (s *daemonServer) recordEvent(dataRoot string, event DaemonEvent) {
 	if duplicate, err := unix.Dup(int(log.file.Fd())); err == nil {
 		_ = unix.Close(duplicate)
 	}
-	s.eventSyncs.syncSoon(path)
+	s.eventSyncs.syncSoon(log.file)
 }
 
 // openEventLog is the event log a daemon appends to, kept open from one
@@ -283,22 +280,35 @@ func openDaemonEventLog(path string) (*os.File, error) {
 // eventLogSyncer syncs event logs to disk on a goroutine of its own, so that
 // a request that records an event does not wait for the disk: the event is in
 // the log, where followers read it, before the request is answered, and on
-// disk a sync later. Events recorded while a sync runs share the next.
+// disk a sync later. Events recorded while a sync runs share the next. It
+// syncs a log through a duplicate of the descriptor that wrote it: opening the
+// log by name for each sync, and closing it, were two more round trips of a
+// cluster's shared root.
 type eventLogSyncer struct {
 	mu sync.Mutex
-	// pending are the logs written since their last sync began.
-	pending map[string]struct{}
+	// pending are the descriptors that wrote logs since their last sync
+	// began, each a duplicate, by the daemon's descriptor it duplicates.
+	pending map[*os.File]*os.File
 	running bool
 }
 
-// syncSoon has the log at path synced.
-func (y *eventLogSyncer) syncSoon(path string) {
+// syncSoon has what file, the daemon's descriptor of a log, which the caller
+// keeps open until syncSoon returns, wrote synced.
+func (y *eventLogSyncer) syncSoon(file *os.File) {
 	y.mu.Lock()
 	defer y.mu.Unlock()
-	if y.pending == nil {
-		y.pending = make(map[string]struct{})
+	if _, ok := y.pending[file]; ok {
+		// The sync to come syncs this write too.
+		return
 	}
-	y.pending[path] = struct{}{}
+	duplicate, err := unix.FcntlInt(file.Fd(), unix.F_DUPFD_CLOEXEC, 0)
+	if err != nil {
+		return
+	}
+	if y.pending == nil {
+		y.pending = make(map[*os.File]*os.File)
+	}
+	y.pending[file] = os.NewFile(uintptr(duplicate), file.Name())
 	if !y.running {
 		y.running = true
 		go y.run()
@@ -308,35 +318,19 @@ func (y *eventLogSyncer) syncSoon(path string) {
 func (y *eventLogSyncer) run() {
 	for {
 		y.mu.Lock()
-		paths := y.pending
+		files := y.pending
 		y.pending = nil
-		if len(paths) == 0 {
+		if len(files) == 0 {
 			y.running = false
 			y.mu.Unlock()
 			return
 		}
 		y.mu.Unlock()
-		for path := range paths {
-			_ = syncFileAt(path)
+		for _, file := range files {
+			_ = file.Sync()
+			_ = file.Close()
 		}
 	}
-}
-
-// syncFileAt syncs the file at path, if there is one, whichever descriptor
-// wrote it.
-func syncFileAt(path string) error {
-	file, err := os.OpenFile(path, os.O_WRONLY, 0)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	err = file.Sync()
-	if closeErr := file.Close(); err == nil {
-		err = closeErr
-	}
-	return err
 }
 
 func commandEvents(args []string, status int) []DaemonEvent {

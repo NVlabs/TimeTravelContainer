@@ -213,35 +213,55 @@ func TestRecordedEventMakesTheLogsDirectoryAndRotatesAFullLog(t *testing.T) {
 
 func TestEventLogSyncerSyncsEveryLogAndStops(t *testing.T) {
 	dir := t.TempDir()
-	written := filepath.Join(dir, "events.jsonl")
-	if err := os.WriteFile(written, []byte("{}\n"), 0600); err != nil {
+	var logs []*os.File
+	for _, name := range []string{"events.jsonl", "events.jsonl.1"} {
+		file, err := os.OpenFile(filepath.Join(dir, name), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		logs = append(logs, file)
+	}
+	// A log removed once written is synced through its descriptor still.
+	if err := os.Remove(logs[1].Name()); err != nil {
 		t.Fatal(err)
 	}
 	var syncer eventLogSyncer
-	// A log that is gone by the time it is synced is skipped.
-	for _, path := range []string{written, filepath.Join(dir, "gone.jsonl"), written} {
-		syncer.syncSoon(path)
+	idle := func() bool {
+		syncer.mu.Lock()
+		defer syncer.mu.Unlock()
+		return !syncer.running && len(syncer.pending) == 0
+	}
+	for _, file := range []*os.File{logs[0], logs[1], logs[0]} {
+		if _, err := file.Write([]byte("{}\n")); err != nil {
+			t.Fatal(err)
+		}
+		syncer.syncSoon(file)
 	}
 	deadline := time.Now().Add(10 * time.Second)
-	for {
-		syncer.mu.Lock()
-		idle := !syncer.running && len(syncer.pending) == 0
-		syncer.mu.Unlock()
-		if idle {
-			break
-		}
+	for !idle() {
 		if time.Now().After(deadline) {
 			t.Fatal("the syncer did not finish")
 		}
 		time.Sleep(time.Millisecond)
 	}
-	// It starts again for the next write.
-	syncer.syncSoon(written)
+	// The daemon's descriptors stay open, and a write to one starts the
+	// syncer again.
+	if _, err := logs[0].Write([]byte("{}\n")); err != nil {
+		t.Fatalf("the daemon's descriptor after a sync: %v", err)
+	}
+	syncer.syncSoon(logs[0])
 	syncer.mu.Lock()
 	running := syncer.running
 	syncer.mu.Unlock()
 	if !running {
 		t.Error("the syncer did not start again")
+	}
+	for !idle() {
+		if time.Now().After(deadline) {
+			t.Fatal("the syncer did not finish again")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
