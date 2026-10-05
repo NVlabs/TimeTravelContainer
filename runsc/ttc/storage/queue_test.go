@@ -553,3 +553,93 @@ func TestCancelOfACompletionWaitingForItsGate(t *testing.T) {
 	default:
 	}
 }
+
+// removedPublisher's captures will never be ready: their branch was removed.
+type removedPublisher struct {
+	supersededPublisher
+}
+
+func (p *removedPublisher) CaptureAvailable(Intent) (bool, error) {
+	return false, fmt.Errorf("%w: the branch was removed", ErrPublicationSuperseded)
+}
+
+// A capture whose branch is gone is cleaned and dropped, not retried for good:
+// every drain of the queue, as a node's stop, waited for it.
+func TestACaptureThatWillNeverBeReadyIsDropped(t *testing.T) {
+	publisher := &removedPublisher{supersededPublisher{
+		testPublisher: testPublisher{completed: make(chan Intent, 1)},
+		cleaned:       make(chan Intent, 1), failed: make(chan error, 1),
+	}}
+	queue, err := Open(t.TempDir(), publisher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+	if err := queue.Enqueue(Intent{Container: "family", Branch: "main", PublicationID: "publication-1", Kind: "stop", FilesystemBranch: "capture"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.Activate("family", "main", "publication-1"); !errors.Is(err, ErrPublicationSuperseded) {
+		t.Fatalf("activating a capture of a removed branch: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := queue.Drain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-publisher.cleaned:
+	default:
+		t.Error("the capture was not cleaned")
+	}
+	select {
+	case err := <-publisher.failed:
+		t.Errorf("a capture that will never be ready reported a retryable failure: %v", err)
+	default:
+	}
+}
+
+// A drain retries a failed publication at once, not when its backoff, which
+// grows to minutes, ends.
+func TestDrainRetriesAtOnce(t *testing.T) {
+	publisher := &testPublisher{failed: true, completed: make(chan Intent, 1)}
+	queue, err := Open(t.TempDir(), publisher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+	if err := queue.Enqueue(Intent{Container: "family", Branch: "main", PublicationID: "publication-1", Kind: "stop", FilesystemBranch: "capture"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.Activate("family", "main", "publication-1"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		pending, err := queue.Pending()
+		if err == nil && len(pending) == 1 && pending[0].Attempts == 1 {
+			// Its next attempt is ten minutes off.
+			queue.mu.Lock()
+			pending[0].RetryAt = time.Now().Add(10 * time.Minute)
+			err = writeJSONAtomic(queue.path("pending", pending[0].ID), pending[0])
+			queue.mu.Unlock()
+			if err != nil {
+				t.Fatal(err)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the failure was not persisted: %+v, %v", pending, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := queue.Drain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-publisher.completed:
+	default:
+		t.Error("the drained publication did not complete")
+	}
+}

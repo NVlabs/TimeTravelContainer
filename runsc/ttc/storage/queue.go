@@ -302,8 +302,10 @@ func (q *Queue) Close() {
 }
 
 // Drain waits until every durable intent has either committed or been
-// canceled. Retryable errors remain visible and continue to be retried.
+// canceled. Retryable errors remain visible and continue to be retried: each
+// at once first, rather than when its backoff, which grows to minutes, ends.
 func (q *Queue) Drain(ctx context.Context) error {
+	q.retryNow()
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -333,6 +335,28 @@ func (q *Queue) Drain(ctx context.Context) error {
 			return fmt.Errorf("%d publications remain pending: %s: %w", len(pending), strings.Join(details, "; "), ctx.Err())
 		case <-ticker.C:
 		}
+	}
+}
+
+// retryNow makes every pending intent that waits to be retried due now.
+func (q *Queue) retryNow() {
+	intents, err := q.Pending()
+	if err != nil {
+		return
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for _, intent := range intents {
+		if _, active := q.inFlight[intent.ID]; active || intent.RetryAt.IsZero() {
+			continue
+		}
+		// The worker writes an intent under the lock: read it again under it.
+		current, err := q.read(intent.ID + ".json")
+		if err != nil || current.RetryAt.IsZero() {
+			continue
+		}
+		current.RetryAt = time.Time{}
+		_ = writeJSONAtomic(q.path("pending", current.ID), current)
 	}
 }
 
@@ -428,6 +452,16 @@ func (q *Queue) process() time.Duration {
 			q.inFlight[intent.ID] = struct{}{}
 			q.mu.Unlock()
 			ready, readyErr := q.publisher.CaptureAvailable(intent)
+			if errors.Is(readyErr, ErrPublicationSuperseded) {
+				// It will never be ready: as a superseded publication below.
+				if readyErr = q.publisher.Cleanup(intent); readyErr == nil {
+					q.mu.Lock()
+					_ = os.Remove(q.path("pending", intent.ID))
+					delete(q.inFlight, intent.ID)
+					q.mu.Unlock()
+					continue
+				}
+			}
 			q.mu.Lock()
 			if readyErr == nil && ready {
 				intent.CaptureReady = true

@@ -498,9 +498,35 @@ func (p *branchPublisher) FenceCancellation(intent ttcstorage.Intent) error {
 	return p.authority.CancelPublication(family, branch, intent.PublicationID)
 }
 
+// branchRemoved reports whether the branch intent publishes was removed:
+// err, reading its container's record, finds the record gone, and the
+// authority, which drops a branch's publications as it removes the branch,
+// holds no branch of the name. Its publication can never complete then, and
+// nothing of it is left to cancel: a removal elsewhere than the node that
+// captured the branch canceled nothing in this node's queue, whose intent was
+// retried, failing, for good, and every drain of the queue, as a node's stop,
+// waited for it.
+func (p *branchPublisher) branchRemoved(intent ttcstorage.Intent, err error) bool {
+	if !errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	if p.authority == nil {
+		return true
+	}
+	family, branch := intent.AuthorityContainer, intent.AuthorityBranch
+	if family == "" || branch == "" {
+		family, branch = intent.Container, intent.Branch
+	}
+	_, err = p.authority.Branch(family, branch)
+	return errors.Is(err, os.ErrNotExist)
+}
+
 func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (ttcstorage.Result, error) {
 	store := ttcbundle.Store{Root: p.sharedRoot, ActiveRoot: p.localRoot}
 	info, err := store.LoadContainer(intent.Container)
+	if p.branchRemoved(intent, err) {
+		return ttcstorage.Result{}, fmt.Errorf("%w: the branch was removed: %v", ttcstorage.ErrPublicationSuperseded, err)
+	}
 	if err != nil {
 		return ttcstorage.Result{}, err
 	}
@@ -881,6 +907,9 @@ func installColdExecConsolePack(activeRoot string, info ttcbundle.ContainerInfo,
 func (p *branchPublisher) CaptureAvailable(intent ttcstorage.Intent) (bool, error) {
 	store := ttcbundle.Store{Root: p.sharedRoot, ActiveRoot: p.localRoot}
 	info, err := store.LoadContainer(intent.Container)
+	if p.branchRemoved(intent, err) {
+		return false, fmt.Errorf("%w: the branch was removed: %v", ttcstorage.ErrPublicationSuperseded, err)
+	}
 	if err != nil {
 		return false, err
 	}
@@ -986,6 +1015,9 @@ func (p *branchPublisher) CaptureAvailable(intent ttcstorage.Intent) (bool, erro
 func (p *branchPublisher) Cleanup(intent ttcstorage.Intent) error {
 	store := ttcbundle.Store{Root: p.sharedRoot, ActiveRoot: p.localRoot}
 	info, err := store.LoadContainer(intent.Container)
+	if p.branchRemoved(intent, err) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
