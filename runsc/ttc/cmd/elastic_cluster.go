@@ -7724,12 +7724,18 @@ func maintainSharedGCCoordinator(authority *cluster.AuthorityCatalog, packs *ttc
 			// forks. Retrying reads is cheap; lease renewal above remains bounded.
 			delay = time.Second
 		}
+		// A publication finding no coordinator wakes the election; one
+		// refused tries again only as often as it would anyway.
+		elections := references.elections()
+		if retryAcquisition {
+			elections = nil
+		}
 		timer := time.NewTimer(delay)
 		select {
 		case <-done:
 			timer.Stop()
 			return
-		case <-references.elections():
+		case <-elections:
 			timer.Stop()
 		case <-timer.C:
 		}
