@@ -7642,7 +7642,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	var families []string
 	shared := false
 	if !listing {
-		families, shared = s.requestFamilies(backend, request.Args)
+		families, shared = s.requestFamilies(backend, request.Args, request.PlacementClaims)
 	}
 	lockLifecycle := func() func() { return s.lockDataRoot(opts.dataRoot) }
 	if shared {

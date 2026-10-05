@@ -42,7 +42,7 @@ var familyScopedCommands = map[string]bool{
 // args takes, in the order to take them, and whether it takes the lifecycle
 // lock shared. A daemon that has not yet reconciled its families after
 // starting takes the lifecycle lock exclusively for every command.
-func (s *daemonServer) requestFamilies(backend *runtimeBackend, args []string) ([]string, bool) {
+func (s *daemonServer) requestFamilies(backend *runtimeBackend, args []string, claims []daemonPlacementClaim) ([]string, bool) {
 	clustered := s.distributedSource != nil || s.clusterCapabilities != nil
 	if backend.lockFamily == nil && !clustered {
 		return nil, false
@@ -54,16 +54,37 @@ func (s *daemonServer) requestFamilies(backend *runtimeBackend, args []string) (
 	if len(names) == 0 {
 		return nil, false
 	}
-	// A name may be a flag's value, which names no family.
-	store := backend.containerStore()
 	var ids []string
-	for _, name := range names {
-		if info, err := store.LoadContainer(name); err == nil && !slices.Contains(ids, info.ID) {
-			ids = append(ids, info.ID)
+	if family, ok := claimedFamily(names, claims); ok {
+		// A command routed here names its family's ID in its claims, which
+		// the node it came through read the family's record for: reading
+		// it again was a round trip of the cluster's shared root.
+		ids = []string{family}
+	} else {
+		// A name may be a flag's value, which names no family.
+		store := backend.containerStore()
+		for _, name := range names {
+			if info, err := store.LoadContainer(name); err == nil && !slices.Contains(ids, info.ID) {
+				ids = append(ids, info.ID)
+			}
+		}
+		sort.Strings(ids)
+	}
+	return ids, len(ids) == 1 && familyScopedCommands[daemonCommandName(args)]
+}
+
+// claimedFamily returns the family that the claims of a command naming one
+// family, names, all name.
+func claimedFamily(names []string, claims []daemonPlacementClaim) (string, bool) {
+	if len(claims) == 0 || slices.ContainsFunc(names, func(name string) bool { return name != names[0] }) {
+		return "", false
+	}
+	for _, claim := range claims {
+		if claim.FamilyID == "" || claim.FamilyID != claims[0].FamilyID {
+			return "", false
 		}
 	}
-	sort.Strings(ids)
-	return ids, len(ids) == 1 && familyScopedCommands[daemonCommandName(args)]
+	return claims[0].FamilyID, true
 }
 
 func dataRootKey(dataRoot string) string {

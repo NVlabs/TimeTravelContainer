@@ -2869,3 +2869,29 @@ func TestCommandReconciledFamilies(t *testing.T) {
 		}
 	}
 }
+
+// A command routed to a cluster node is locked by the family its claims
+// name, read from the family's record by the node it came through, when it
+// names one family; otherwise the node reads the records itself.
+func TestClaimedFamily(t *testing.T) {
+	claim := func(family, branch string) daemonPlacementClaim {
+		return daemonPlacementClaim{FamilyID: family, BranchID: branch}
+	}
+	for _, test := range []struct {
+		names  []string
+		claims []daemonPlacementClaim
+		want   string
+		ok     bool
+	}{
+		{[]string{"web"}, []daemonPlacementClaim{claim("id-1", "main")}, "id-1", true},
+		{[]string{"web", "web"}, []daemonPlacementClaim{claim("id-1", "a"), claim("id-1", "b")}, "id-1", true},
+		{[]string{"web"}, nil, "", false},
+		{[]string{"web", "db"}, []daemonPlacementClaim{claim("id-1", "main")}, "", false},
+		{[]string{"web"}, []daemonPlacementClaim{claim("id-1", "a"), claim("id-2", "b")}, "", false},
+		{[]string{"web"}, []daemonPlacementClaim{claim("", "main")}, "", false},
+	} {
+		if got, ok := claimedFamily(test.names, test.claims); got != test.want || ok != test.ok {
+			t.Errorf("claimedFamily(%q, %+v) = (%q, %t), want (%q, %t)", test.names, test.claims, got, ok, test.want, test.ok)
+		}
+	}
+}
