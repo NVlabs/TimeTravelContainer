@@ -2925,3 +2925,49 @@ func TestClaimedBranchAuthorityIsTakenOnce(t *testing.T) {
 		t.Errorf("a take of nothing = %p, want none", got)
 	}
 }
+
+// A command routed by a placement read with its owner's node record is sent
+// to the peer made from that record, which is checked as a lookup of it alone
+// is; with no record read, the owner is looked up.
+func TestRoutedPeerChecksTheRecordReadWithThePlacement(t *testing.T) {
+	source := &distributedSourceRuntime{
+		capabilities: cluster.Capabilities{NodeID: "n1", RepositoryID: "repository", BuildID: "build"},
+		dynamicPeers: make(map[string]dynamicClusterPeer),
+	}
+	server := &daemonServer{distributedSource: source}
+	live := cluster.NodeRecord{
+		NodeID: "n2", Incarnation: "i2", State: cluster.NodeReady, ControlURL: "http://127.0.0.1:1",
+		Capabilities:   cluster.Capabilities{NodeID: "n2", RepositoryID: "repository", BuildID: "build"},
+		LeaseExpiresAt: time.Now().Add(time.Minute),
+	}
+	routing := &routingPlacements{server: server, nodes: map[string]cluster.NodeRecord{"n2": live}}
+	if peer, err := server.routedPeer("n2", routing); err != nil || peer == nil {
+		t.Fatalf("routedPeer of a live owner = %v, %v", peer, err)
+	}
+	expired := live
+	expired.LeaseExpiresAt = time.Now().Add(-time.Second)
+	routing.nodes["n2"] = expired
+	if _, err := server.routedPeer("n2", routing); err == nil {
+		t.Error("a command was routed to an owner whose lease expired")
+	}
+	other := live
+	other.Capabilities.BuildID = "another build"
+	routing.nodes["n2"] = other
+	if _, err := server.routedPeer("n2", routing); err == nil {
+		t.Error("a command was routed to an owner of another build")
+	}
+	if _, err := server.routedPeer("n3", routing); err == nil {
+		t.Error("a command was routed to an owner neither read nor looked up")
+	}
+	var hints routeHints
+	hints.set("family", "n2")
+	if got := hints.get("family"); got != "n2" {
+		t.Errorf("hint = %q, want n2", got)
+	}
+	for i := 0; i < maxRouteHints; i++ {
+		hints.set(fmt.Sprint(i), "n3")
+	}
+	if len(hints.owner) > maxRouteHints {
+		t.Errorf("%d hints kept, want at most %d", len(hints.owner), maxRouteHints)
+	}
+}

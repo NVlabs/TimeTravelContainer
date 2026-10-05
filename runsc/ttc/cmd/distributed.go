@@ -853,6 +853,20 @@ func (r *distributedSourceRuntime) peer(nodeID string, forPlacement bool) (*clus
 		}
 		return nil, fmt.Errorf("discovering cluster target node %q: %w", nodeID, err)
 	}
+	return r.peerOfRecord(*record, forPlacement)
+}
+
+// peerOfRecord is peer of the node whose record, as the authority holds it,
+// the caller read along with something else it needed: reading it alone was a
+// round trip to the authority's holder.
+func (r *distributedSourceRuntime) peerOfRecord(record cluster.NodeRecord, forPlacement bool) (*cluster.Client, error) {
+	nodeID := record.NodeID
+	if nodeID == r.capabilities.NodeID {
+		return nil, fmt.Errorf("cluster target node %q is the local node", nodeID)
+	}
+	if peer := r.peers[nodeID]; peer != nil {
+		return peer, nil
+	}
 	now := time.Now()
 	if !record.LeaseActive(now) {
 		return nil, fmt.Errorf("cluster target node %q is %s or its lease has expired", nodeID, record.State)
@@ -866,7 +880,7 @@ func (r *distributedSourceRuntime) peer(nodeID string, forPlacement bool) (*clus
 	if record.Capabilities.BuildID != r.capabilities.BuildID {
 		return nil, fmt.Errorf("cluster target node %q uses TTC build %q, want exact build %q", nodeID, record.Capabilities.BuildID, r.capabilities.BuildID)
 	}
-	return r.peerForRecord(*record)
+	return r.peerForRecord(record)
 }
 
 // peerForRecord constructs a control-plane client from an already-authorized

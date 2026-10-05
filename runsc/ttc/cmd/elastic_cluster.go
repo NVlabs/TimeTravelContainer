@@ -3481,7 +3481,12 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 		// preceding child may have changed metadata; consulting the empty
 		// legacy catalog at this point made rm/stop/dehydrate fail after an
 		// otherwise successful migration.
-		if owner, claims, err := daemonCommandPlacementWithCatalog(s.dataRoot, s.clusterPlacements, child.args); err != nil {
+		routing := s.routingPlacements()
+		placements := cluster.PlacementCatalog(s.clusterPlacements)
+		if routing != nil {
+			placements = routing
+		}
+		if owner, claims, err := daemonCommandPlacementWithCatalog(s.dataRoot, placements, child.args); err != nil {
 			return childOutcome{status: 1, err: err}
 		} else {
 			if owner != "" {
@@ -3502,7 +3507,7 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 			// prints original operands.
 			status, _, stderr, err = s.executeLocalDistributedCommand(childRequest)
 		} else {
-			peer, peerErr := s.distributedSource.peer(child.node, false)
+			peer, peerErr := s.routedPeer(child.node, routing)
 			if peerErr != nil {
 				return childOutcome{status: 1, err: peerErr}
 			}

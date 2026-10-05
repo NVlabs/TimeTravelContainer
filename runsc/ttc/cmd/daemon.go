@@ -336,6 +336,9 @@ type daemonServer struct {
 	sharedReferences      *sharedReferenceService
 	portIngress           *portIngressManager
 	stderr                io.Writer
+	// routeHints has the node of each family that a command was last routed
+	// to: see routingPlacements.
+	routeHints routeHints
 
 	stopOnce   sync.Once
 	cleanStop  atomic.Bool
@@ -7338,8 +7341,13 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		automaticPlacement := false
 		failedAdmissionNodes := make(map[string]struct{})
 		var err error
+		routing := s.routingPlacements()
 		if len(request.PlacementClaims) == 0 {
-			owner, request.PlacementClaims, err = daemonCommandPlacementWithCatalog(s.dataRoot, s.clusterPlacements, request.Args)
+			placements := cluster.PlacementCatalog(s.clusterPlacements)
+			if routing != nil {
+				placements = routing
+			}
+			owner, request.PlacementClaims, err = daemonCommandPlacementWithCatalog(s.dataRoot, placements, request.Args)
 		} else {
 			for _, claim := range request.PlacementClaims {
 				if owner != "" && owner != claim.OwnerNode {
@@ -7470,7 +7478,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 				writeError(fmt.Errorf("cluster command routing loop through %v to node %q", request.Route, owner))
 				return
 			}
-			peer, err := s.distributedSource.peer(owner, false)
+			peer, err := s.routedPeer(owner, routing)
 			if err != nil {
 				writeError(err)
 				return
@@ -7971,6 +7979,89 @@ type authorityStatePlacements struct {
 
 func (p authorityStatePlacements) Lookup(family, branch string) (*cluster.PlacementRecord, error) {
 	return p.state.PlacementOf(family, branch)
+}
+
+// routingPlacements is the placement catalog a command is routed to its
+// branch's owner by. A lookup of the branch's placement reads with it the node
+// record of the node that owned the family's branch the command before was
+// routed to, which the peer the command is sent to is made from if it is the
+// owner still: reading the owner's record after was another round trip to the
+// authority's holder. Every node's record would be as many more bytes of each
+// read as the cluster has nodes.
+type routingPlacements struct {
+	cluster.PlacementCatalog
+	server *daemonServer
+	nodes  map[string]cluster.NodeRecord
+}
+
+// routeHints has, by family, the node the last command routed to a branch of
+// it went to.
+type routeHints struct {
+	mu    sync.Mutex
+	owner map[string]string
+}
+
+// maxRouteHints bounds routeHints: once it holds that many, it is forgotten.
+const maxRouteHints = 4096
+
+func (h *routeHints) get(family string) string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.owner[family]
+}
+
+func (h *routeHints) set(family, owner string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.owner == nil || len(h.owner) >= maxRouteHints {
+		h.owner = make(map[string]string)
+	}
+	h.owner[family] = owner
+}
+
+// routingPlacements returns the catalog to route a command by, or nil on a
+// node whose placements are not the authority's.
+func (s *daemonServer) routingPlacements() *routingPlacements {
+	if s.distributedSource == nil || s.distributedSource.authority == nil || s.clusterPlacements == nil {
+		return nil
+	}
+	return &routingPlacements{PlacementCatalog: s.clusterPlacements, server: s}
+}
+
+func (p *routingPlacements) Lookup(family, branch string) (*cluster.PlacementRecord, error) {
+	query := cluster.ResolutionQuery(family, family, branch)
+	if hint := p.server.routeHints.get(family); hint != "" {
+		query.Nodes = cluster.Only(hint)
+	}
+	state, err := p.server.distributedSource.authority.AuthorityStateOf(query)
+	if err != nil {
+		return nil, err
+	}
+	record, err := state.PlacementOf(family, branch)
+	if err != nil {
+		return nil, err
+	}
+	if record.OwnerNode != "" {
+		p.server.routeHints.set(family, record.OwnerNode)
+	}
+	for id, node := range state.Nodes {
+		if p.nodes == nil {
+			p.nodes = make(map[string]cluster.NodeRecord)
+		}
+		p.nodes[id] = node
+	}
+	return record, nil
+}
+
+// routedPeer returns the peer to send a command routed by routing, if not
+// nil, to owner.
+func (s *daemonServer) routedPeer(owner string, routing *routingPlacements) (*cluster.Client, error) {
+	if routing != nil {
+		if record, ok := routing.nodes[owner]; ok {
+			return s.distributedSource.peerOfRecord(record, false)
+		}
+	}
+	return s.distributedSource.peer(owner, false)
 }
 
 // reconciledRoots reports whether reconcile has completed for backend's
