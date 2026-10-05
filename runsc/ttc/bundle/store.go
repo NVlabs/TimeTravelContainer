@@ -3994,6 +3994,28 @@ func (s Store) ListContainers() ([]ContainerInfo, error) {
 	return s.listContainersWithPolicy(false, false, true)
 }
 
+// ListContainersOf is ListContainers of the containers with the exact IDs ids
+// alone: a listing that has what it shows of the others from elsewhere reads
+// only these records, each a round trip of a shared root.
+func (s Store) ListContainersOf(ids []string) ([]ContainerInfo, error) {
+	containersDir := filepath.Join(s.Root, "containers")
+	entries := make([]fs.DirEntry, 0, len(ids))
+	for _, id := range ids {
+		if validateName(id) == nil {
+			entries = append(entries, idEntry(id))
+		}
+	}
+	return s.listLoadedContainers(containersDir, entries, false, false, true)
+}
+
+// idEntry is a directory entry of containers/ named by a container's ID.
+type idEntry string
+
+func (e idEntry) Name() string               { return string(e) }
+func (e idEntry) IsDir() bool                { return true }
+func (e idEntry) Type() fs.FileMode          { return fs.ModeDir }
+func (e idEntry) Info() (fs.FileInfo, error) { return nil, fs.ErrNotExist }
+
 // ListContainersForPlacement returns every published runtime-bearing
 // container, including the physical containers that back distributed logical
 // branches. Unlike ListContainers, this is an authority view rather than a
@@ -4049,6 +4071,12 @@ func (s Store) listContainersWithPolicy(includeHidden, includePhysical, tolerate
 		}
 		return nil, fmt.Errorf("listing containers: %w", err)
 	}
+	return s.listLoadedContainers(containersDir, entries, includeHidden, includePhysical, tolerateUnreadable)
+}
+
+// listLoadedContainers is listContainersWithPolicy of the containers among
+// entries, of containersDir.
+func (s Store) listLoadedContainers(containersDir string, entries []fs.DirEntry, includeHidden, includePhysical, tolerateUnreadable bool) ([]ContainerInfo, error) {
 	loaded := s.loadContainerKeys(entries)
 	containers := make([]ContainerInfo, 0, len(entries))
 	for i, entry := range entries {

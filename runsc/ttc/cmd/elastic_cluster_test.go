@@ -605,6 +605,41 @@ func TestPlacementClaimOfABranchUnplacedSinceRoutingAdmitsAClaimingCommand(t *te
 	}
 }
 
+// A cluster node's listing reads the record of a family only if its
+// placements cannot show it: a branch neither running nor paused, a placement
+// that does not name the family, or a branch of the node's own whose Sentry
+// does not run.
+func TestListingReadsTheRecordsOfFamiliesPlacementsCannotShow(t *testing.T) {
+	created := time.Unix(1, 0).UTC()
+	placement := func(family, branch, owner string, state cluster.PlacementState) cluster.PlacementRecord {
+		return cluster.PlacementRecord{
+			FamilyID: family, FamilyName: family + "-name", FamilyCreatedAt: created, BranchID: branch,
+			PhysicalContainer: family, PhysicalBranch: branch, OwnerNode: owner, State: state,
+		}
+	}
+	unnamed := placement("unnamed", "main", "n2", cluster.PlacementRunning)
+	unnamed.FamilyName = ""
+	placements := []cluster.PlacementRecord{
+		placement("remote", "main", "n2", cluster.PlacementRunning),
+		placement("remote", "b1", "n3", cluster.PlacementPaused),
+		placement("cold", "main", "", cluster.PlacementUnplaced),
+		unnamed,
+		placement("live", "main", "n1", cluster.PlacementRunning),
+		placement("lost", "main", "n1", cluster.PlacementRunning),
+		placement("exited", "main", "n2", cluster.PlacementRunning),
+	}
+	snapshot := &cluster.AuthorityState{Branches: map[string]cluster.BranchAuthority{
+		"remote/main": {FamilyID: "remote", BranchID: "main", Lifecycle: "running"},
+		"remote/b1":   {FamilyID: "remote", BranchID: "b1", Lifecycle: "paused"},
+		"exited/b2":   {FamilyID: "exited", BranchID: "b2", Lifecycle: "exited"},
+	}}
+	runtimes := []Family{{ID: "live"}}
+	got := familiesShownFromRecords("n1", snapshot, placements, runtimes)
+	if want := []string{"cold", "exited", "lost", "unnamed"}; !slices.Equal(got, want) {
+		t.Errorf("records read: %q, want %q", got, want)
+	}
+}
+
 // unlistedPlacements is a placement catalog that lists no placements: a
 // family's resolution through them all shows as a failure.
 type unlistedPlacements struct {

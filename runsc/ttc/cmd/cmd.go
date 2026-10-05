@@ -12647,7 +12647,19 @@ func (b *runtimeBackend) listFamiliesReading(familyID string, reads *familyReads
 	var containers []ttcbundle.ContainerInfo
 	if familyID == "" {
 		var storeErr error
-		if containers, storeErr = store.ListContainers(); storeErr != nil {
+		if b.inventoryReadOnly && b.nodeID != "" && b.distributedSource != nil && b.distributedSource.authority != nil {
+			// A cluster node's listing that repairs nothing shows most
+			// families from the authority's placements: reading the record of
+			// every family of the cluster from the shared root made its time.
+			readPlacements()
+			if authorityErr != nil {
+				return nil, fmt.Errorf("reading cluster branch authority: %w", authorityErr)
+			}
+			containers, storeErr = store.ListContainersOf(familiesShownFromRecords(b.nodeID, snapshot, placementRecords, runtimeFamilies))
+		} else {
+			containers, storeErr = store.ListContainers()
+		}
+		if storeErr != nil {
 			return nil, storeErr
 		}
 	} else if info, err := store.LoadContainer(familyID); err == nil {
@@ -12778,9 +12790,10 @@ func (b *runtimeBackend) listFamiliesReading(familyID string, reads *familyReads
 		}
 		runtimeIDs := make(map[string]struct{}, len(runtimeFamilies))
 		for _, family := range runtimeFamilies {
-			// A listed container is no physical runtime.
+			// A listed container is no physical runtime, and one placed
+			// needs no telling.
 			physicalRuntime := false
-			if _, ok := listed[family.ID]; !ok {
+			if _, ok := listed[family.ID]; !ok && len(physicalPlacements[family.ID]) == 0 {
 				runtimeInfo, runtimeInfoErr := store.LoadRuntimeContainer(family.ID)
 				physicalRuntime = runtimeInfoErr == nil && runtimeInfo.IsDistributedPhysicalRuntime()
 			}
@@ -12951,6 +12964,52 @@ func (b *runtimeBackend) listFamiliesReading(familyID string, reads *familyReads
 		reads.authority = snapshot
 	}
 	return families, nil
+}
+
+// familiesShownFromRecords returns the IDs of the families whose records a
+// listing on node reads, of those the authority's snapshot names: those with
+// a branch neither running nor paused, whose exit and storage the record
+// has; those whose placements do not name the family, its image and its
+// creation, as an older authority's do not; and the node's own families whose
+// Sentry it does not see run, which it checks for a runtime lost. It shows the
+// others from their placements.
+func familiesShownFromRecords(node string, snapshot *cluster.AuthorityState, placements []cluster.PlacementRecord, runtimeFamilies []Family) []string {
+	live := make(map[string]bool, len(runtimeFamilies))
+	for _, family := range runtimeFamilies {
+		if !runtimeFamilyUnavailable(family) {
+			live[family.ID] = true
+		}
+	}
+	read := make(map[string]bool)
+	for _, placement := range placements {
+		switch {
+		case placement.FamilyName == "" || placement.FamilyCreatedAt.IsZero():
+			read[placement.FamilyID] = true
+		case placement.State != cluster.PlacementRunning && placement.State != cluster.PlacementPaused:
+			read[placement.FamilyID] = true
+		case placement.OwnerNode == node:
+			physical := placement.PhysicalContainer
+			if physical == "" {
+				physical = placement.FamilyID
+			}
+			if !live[physical] {
+				read[placement.FamilyID] = true
+			}
+		}
+	}
+	if snapshot != nil {
+		for _, authority := range snapshot.BranchList() {
+			if state := normalizeLifecycleState(authority.Lifecycle); state != "running" && state != "paused" {
+				read[authority.FamilyID] = true
+			}
+		}
+	}
+	ids := make([]string, 0, len(read))
+	for id := range read {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 func branchesInPlacementSnapshot(branches []Branch, placements []cluster.PlacementRecord) []Branch {
