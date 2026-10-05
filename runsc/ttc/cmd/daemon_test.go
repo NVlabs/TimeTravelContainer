@@ -2972,6 +2972,28 @@ func TestRoutedPeerChecksTheRecordReadWithThePlacement(t *testing.T) {
 	}
 }
 
+// Routing by the authority's placements asks the authority of a branch being
+// made whether a command may take it, as routing by the catalog does: a
+// family whose rehydration failed is removed so.
+func TestRoutingPlacementsKeepTheBranchAuthority(t *testing.T) {
+	catalog := branchAwarePlacementCatalog{branches: map[string]cluster.BranchAuthority{
+		"family\x00main": {FamilyID: "family", BranchID: "main", Lifecycle: "materializing"},
+	}}
+	var placements cluster.PlacementCatalog = &routingPlacements{PlacementCatalog: catalog}
+	authority, ok := placements.(interface {
+		Branch(family, branch string) (*cluster.BranchAuthority, error)
+	})
+	if !ok {
+		t.Fatal("routing placements have no branch authorities")
+	}
+	if branch, err := authority.Branch("family", "main"); err != nil || branch.Lifecycle != "materializing" {
+		t.Errorf("Branch = %+v, %v; want the catalog's, materializing", branch, err)
+	}
+	if _, err := (&routingPlacements{}).Branch("family", "main"); !errors.Is(err, errors.ErrUnsupported) {
+		t.Errorf("Branch of placements without authorities: %v, want %v", err, errors.ErrUnsupported)
+	}
+}
+
 // A request that makes a family beside other commands reserves the family's
 // name, refusing one being made, and takes the new family's lock once it has
 // an ID; one that would change more than its family takes the lifecycle lock

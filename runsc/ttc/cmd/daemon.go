@@ -8071,6 +8071,21 @@ func (p *routingPlacements) Lookup(family, branch string) (*cluster.PlacementRec
 	return record, nil
 }
 
+// Branch is the catalog's authority of family's branch, which routing asks
+// whether a command may take a branch being made: a created one, or one whose
+// rehydration failed, which rm may. Without it, as the catalog it wraps
+// offers it but an embedded interface does not, every such command was
+// refused, and a family whose rehydration failed could not be removed.
+func (p *routingPlacements) Branch(family, branch string) (*cluster.BranchAuthority, error) {
+	authority, ok := p.PlacementCatalog.(interface {
+		Branch(family, branch string) (*cluster.BranchAuthority, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("placements without branch authorities: %w", errors.ErrUnsupported)
+	}
+	return authority.Branch(family, branch)
+}
+
 // routedPeer returns the peer to send a command routed by routing, if not
 // nil, to owner.
 func (s *daemonServer) routedPeer(owner string, routing *routingPlacements) (*cluster.Client, error) {
