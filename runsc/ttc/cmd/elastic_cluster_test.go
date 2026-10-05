@@ -605,6 +605,72 @@ func TestPlacementClaimOfABranchUnplacedSinceRoutingAdmitsAClaimingCommand(t *te
 	}
 }
 
+// unlistedPlacements is a placement catalog that lists no placements: a
+// family's resolution through them all shows as a failure.
+type unlistedPlacements struct {
+	cluster.PlacementCatalog
+}
+
+func (unlistedPlacements) List() ([]cluster.PlacementRecord, error) {
+	return nil, errors.New("listed every placement")
+}
+
+// A routed command finds its family by the hint of its name, which the
+// placement of its branch confirms, without reading the family's record; a
+// hint that no placement confirms is not taken.
+func TestRoutingFindsAFamilyByAConfirmedNameHint(t *testing.T) {
+	root := t.TempDir()
+	id := strings.Repeat("ab", 32)
+	containerDir := filepath.Join(root, "containers", id)
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	info := ttcbundle.ContainerInfo{
+		ID: id, Name: "web", NodeID: "node-b", BundleDir: bundleDir,
+		Branches: []ttcbundle.BranchInfo{{ID: "main", NodeID: "node-b", State: "running", CreatedAt: time.Unix(1, 0).UTC()}},
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), info); err != nil {
+		t.Fatal(err)
+	}
+	placements, err := cluster.OpenPlacementStore(filepath.Join(root, "cluster", "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := placements.Create(cluster.PlacementRecord{
+		FamilyID: id, FamilyName: "web", BranchID: "main", PhysicalContainer: id, PhysicalBranch: "main",
+		OwnerNode: "node-b", OwnerIncarnation: "boot-b", State: cluster.PlacementRunning,
+	}, time.Unix(2, 0).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first routing reads the record, finding it by name, which leaves
+	// the name's hint.
+	if owner, _, err := daemonCommandPlacementWithCatalog(root, placements, []string{"exec", "web@main", "true"}); err != nil || owner != "node-b" {
+		t.Fatalf("first routing: %q, %v", owner, err)
+	}
+	if err := os.Rename(filepath.Join(containerDir, "container.json"), filepath.Join(root, "record")); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"web", id} {
+		owner, claims, err := daemonCommandPlacementWithCatalog(root, unlistedPlacements{placements}, []string{"exec", name + "@main", "true"})
+		if err != nil || owner != "node-b" || len(claims) != 1 || claims[0].FamilyID != id {
+			t.Errorf("routing %s@main without its record: %q, %+v, %v", name, owner, claims, err)
+		}
+	}
+	// Once the family's placement is gone, the hint is stale, and the
+	// family is looked for as before: its record is gone too.
+	if err := placements.Remove(id, "main", created.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if owner, claims, err := daemonCommandPlacementWithCatalog(root, unlistedPlacements{placements}, []string{"exec", "web@main", "true"}); err != nil || owner != "" || len(claims) != 0 {
+		t.Errorf("routing by a stale hint: %q, %+v, %v", owner, claims, err)
+	}
+}
+
 func TestDaemonCommandPlacementRejectsMissingCurrentPlacement(t *testing.T) {
 	root := t.TempDir()
 	containerDir := filepath.Join(root, "containers", "web")

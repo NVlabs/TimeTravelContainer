@@ -456,11 +456,7 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 	seen := make(map[string]struct{})
 	// A command may name many branches of one family, as a family's removal
 	// does one node's branches: its record is read once.
-	type loaded struct {
-		info ttcbundle.ContainerInfo
-		err  error
-	}
-	families := make(map[string]loaded)
+	families := make(map[string]routedFamily)
 	selectors := make([]selector, 0, len(args)-1)
 	named := make(map[string]int)
 	for _, arg := range args[1:] {
@@ -482,8 +478,9 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 	reader := newPlacementReader(placements)
 	for _, selected := range selectors {
 		family, ok := families[selected.container]
+		var placement *cluster.PlacementRecord
 		if !ok {
-			family.info, family.err = store.LoadContainer(selected.container)
+			family, placement = findRoutedFamily(store, reader, selected, named[selected.container] > 1)
 			families[selected.container] = family
 		}
 		info, err := family.info, family.err
@@ -499,7 +496,9 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 		if named[selected.container] > 1 {
 			reader.many[info.ID] = true
 		}
-		placement, err := reader.Lookup(info.ID, selected.branch)
+		if placement == nil {
+			placement, err = reader.Lookup(info.ID, selected.branch)
+		}
 		switch {
 		case err == nil:
 			if placement.State == cluster.PlacementCorrupted {
@@ -561,6 +560,36 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 		owner = branchOwner
 	}
 	return owner, claims, nil
+}
+
+// routedFamily is the family a selector of a routed command names, as its
+// record, or the error reading it.
+type routedFamily struct {
+	info ttcbundle.ContainerInfo
+	err  error
+}
+
+// findRoutedFamily returns the family that selected names, and the placement of
+// its branch, if finding the family read it. A family that the hint of its
+// name, or its exact ID, names, and whose branch's placement names it so, is
+// found without reading its record, a round trip of the shared root on the
+// way to every routed command: a family is never renamed, and names are
+// unique, so a hint is stale only if its family is gone, and its placements
+// are gone before its record. many is whether the command names more than one
+// branch of the family.
+func findRoutedFamily(store ttcbundle.Store, reader *placementReader, selected selector, many bool) (routedFamily, *cluster.PlacementRecord) {
+	if id, ok := store.HintedContainerID(selected.container); ok {
+		if many {
+			reader.many[id] = true
+		}
+		placement, err := reader.Lookup(id, selected.branch)
+		if err == nil && placement.FamilyID == id && (id == selected.container || placement.FamilyName == selected.container) {
+			return routedFamily{info: ttcbundle.ContainerInfo{ID: id, Name: placement.FamilyName}}, placement
+		}
+	}
+	var family routedFamily
+	family.info, family.err = store.LoadContainer(selected.container)
+	return family, nil
 }
 
 // resolvePlacementFamily resolves the same useful subset of container naming

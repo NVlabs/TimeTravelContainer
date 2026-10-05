@@ -240,6 +240,18 @@ func generatedContainerID(identifier string) bool {
 	return true
 }
 
+// HintedContainerID returns the ID of the container identifier names, if it is
+// the container's exact ID, or the ID its name last resolved to in this
+// process, without reading a record: the caller must check that the
+// container it finds with the ID is the one named. A name's hint is stale only
+// if its container is gone, and another made under the name.
+func (s Store) HintedContainerID(identifier string) (string, bool) {
+	if generatedContainerID(identifier) {
+		return identifier, true
+	}
+	return containerNameHint(s.Root + "\x00" + identifier)
+}
+
 func containerNameHint(key string) (string, bool) {
 	containerNameHints.mu.Lock()
 	defer containerNameHints.mu.Unlock()
