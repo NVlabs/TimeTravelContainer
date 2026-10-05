@@ -23,9 +23,34 @@ import (
 	"fmt"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/fdnotifier"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
+// hangupEvents are the events of a peer hanging up.
+const hangupEvents = waiter.EventHUp | waiter.EventRdHUp | waiter.EventErr
+
+// waitForHangup waits until fd's peer hangs up, in the epoll of fdnotifier,
+// in which every other descriptor the process watches waits too. Waiting in
+// a poll of its own, a client, of each mount of each branch, held a thread
+// for as long as its mount lived.
 func waitForHangup(fd int) error {
+	var queue waiter.Queue
+	entry, ch := waiter.NewChannelEntry(hangupEvents)
+	queue.EventRegister(&entry)
+	defer queue.EventUnregister(&entry)
+	if err := fdnotifier.AddFD(int32(fd), &queue); err != nil {
+		return pollForHangup(fd)
+	}
+	defer fdnotifier.RemoveFD(int32(fd))
+	for fdnotifier.NonBlockingPoll(int32(fd), hangupEvents) == 0 {
+		<-ch
+	}
+	return nil
+}
+
+// pollForHangup is waitForHangup in a poll of its own.
+func pollForHangup(fd int) error {
 	events := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLHUP | unix.POLLRDHUP}}
 	for {
 		n, err := unix.Ppoll(events, nil, nil)

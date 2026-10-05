@@ -113,6 +113,7 @@ go_library(
         "//pkg/errors",
         "//pkg/errors/linuxerr",
         "//pkg/fdchannel",
+        "//pkg/fdnotifier",
         "//pkg/flipcall",
         "//pkg/fspath",
         "//pkg/hostarch",
@@ -123,6 +124,7 @@ go_library(
         "//pkg/sync",
         "//pkg/syserr",
         "//pkg/unet",
+        "//pkg/waiter",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )
