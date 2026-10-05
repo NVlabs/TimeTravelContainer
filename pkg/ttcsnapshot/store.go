@@ -475,11 +475,13 @@ func preflightGraphDirectory(dir string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	hasHead := false
+	hasHead, hasLock := false, false
 	for _, entry := range entries {
-		if entry.Name() == headFileName {
+		switch entry.Name() {
+		case headFileName:
 			hasHead = true
-			break
+		case "graph.lock":
+			hasLock = true
 		}
 	}
 	if !hasHead {
@@ -491,7 +493,14 @@ func preflightGraphDirectory(dir string) (bool, error) {
 		return false, nil
 	}
 	headInfo, err := os.Lstat(filepath.Join(dir, headFileName))
-	if err != nil || !headInfo.Mode().IsRegular() {
+	if err != nil {
+		// Listed, and gone since: the graph was moved away with its
+		// repository, as the removal of a family's state on a node does while
+		// another command takes inventory of the node's repositories. It is
+		// not-exist, which that inventory takes for a repository gone.
+		return false, err
+	}
+	if !headInfo.Mode().IsRegular() {
 		return false, errors.New("TTC snapshot graph head is not a regular file")
 	}
 	data, err := os.ReadFile(filepath.Join(dir, headFileName))
@@ -511,6 +520,10 @@ func preflightGraphDirectory(dir string) (bool, error) {
 		}
 	}
 	lockInfo, err := os.Lstat(filepath.Join(dir, "graph.lock"))
+	if err != nil && hasLock {
+		// Listed, and gone since: as the head above.
+		return false, err
+	}
 	if err != nil || !lockInfo.Mode().IsRegular() {
 		return false, errors.New("marked TTC snapshot graph has no regular graph.lock")
 	}

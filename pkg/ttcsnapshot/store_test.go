@@ -82,6 +82,48 @@ func TestSnapshotIDsNeverReuse(t *testing.T) {
 	}
 }
 
+// A graph whose directory a removal renames away while its preflight looks at
+// it is not-exist to the preflight, as it is to everything after: the
+// inventory of a node's repositories, which a removal of one family's state
+// races, takes that for a repository gone, where "the graph head is not a
+// regular file" failed it, and the command it was taken for.
+func TestPreflightOfAGraphRenamedAwayIsNotExist(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "graph")
+	away := filepath.Join(root, "away")
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	var renames sync.WaitGroup
+	renames.Add(1)
+	go func() {
+		defer renames.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = os.Rename(dir, away)
+			_ = os.Rename(away, dir)
+		}
+	}()
+	for deadline := time.Now().Add(300 * time.Millisecond); time.Now().Before(deadline); {
+		if _, err := preflightGraphDirectory(dir); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			close(stop)
+			renames.Wait()
+			t.Fatalf("preflight of a graph renamed away meanwhile: %v", err)
+		}
+	}
+	close(stop)
+	renames.Wait()
+}
+
 func TestOpenRejectsUnmarkedLegacyGraphWithoutModification(t *testing.T) {
 	dir := t.TempDir()
 	legacy := filepath.Join(dir, "graph.journal")
