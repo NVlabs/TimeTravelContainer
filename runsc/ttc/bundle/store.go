@@ -7587,10 +7587,16 @@ func stageJSON(path string, value any) (*stagedFile, error) {
 		return nil, err
 	}
 	staged := &stagedFile{temp: temp.Name(), path: path}
-	if err := temp.Chmod(0600); err != nil {
-		temp.Close()
-		staged.discard()
-		return nil, err
+	// CreateTemp makes the file 0600, but for what the umask takes off, and
+	// the attributes of a file just made are known without asking: a chmod
+	// regardless was a round trip of a cluster's shared root in every write
+	// of a record.
+	if info, err := temp.Stat(); err != nil || info.Mode().Perm() != 0600 {
+		if err := temp.Chmod(0600); err != nil {
+			temp.Close()
+			staged.discard()
+			return nil, err
+		}
 	}
 	if _, err := temp.Write(data); err != nil {
 		temp.Close()
