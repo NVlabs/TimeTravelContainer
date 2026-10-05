@@ -153,7 +153,10 @@ func (m *familyMaking) claim(b *runtimeBackend, id string) error {
 	default:
 		return fmt.Errorf("the lock of family %s, being made, is held", id)
 	}
-	m.holding(func() { <-lock })
+	// The request releases its locks once its family runs, if it attaches
+	// to it, and again once it is done.
+	var once sync.Once
+	m.holding(func() { once.Do(func() { <-lock }) })
 	b.heldFamilies = append(append([]string(nil), b.heldFamilies...), id)
 	return nil
 }

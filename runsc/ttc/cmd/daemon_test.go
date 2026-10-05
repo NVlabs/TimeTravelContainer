@@ -2991,6 +2991,9 @@ func TestFamilyMakingReservesItsNameAndClaimsItsLock(t *testing.T) {
 		},
 		holding: func(release func()) {
 			released = append(released, "family")
+			// An attached run releases its locks twice: once its family
+			// runs, and once it is done.
+			release()
 			release()
 		},
 	}
