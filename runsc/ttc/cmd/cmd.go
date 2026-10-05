@@ -13290,6 +13290,13 @@ func (b *runtimeBackend) listRuntimeFamiliesOf(ids ...string) ([]Family, error) 
 	return families, nil
 }
 
+// branchesUnknown reports whether f is the family of a live runtime that
+// could not list its branches: runtimeFamily gives it its main branch alone,
+// as a stopped runtime's are, but it may run any.
+func (f Family) branchesUnknown() bool {
+	return f.Error != "" && (f.State == "running" || f.State == "paused")
+}
+
 // runtimeFamily is the family of the sandbox in state, of the branches its
 // runtime listed in output, or of its main branch alone if the runtime could
 // not list them, err saying why.
@@ -17879,6 +17886,13 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 			if family.ID != target.container {
 				continue
 			}
+			// What it runs is unknown, as if it could not be listed: taken
+			// for main's alone, a removal took the branch for gone, and
+			// removed its record without destroying it.
+			if family.branchesUnknown() {
+				runtimeFamily = nil
+				break
+			}
 			*runtimeFamily = family
 			for _, branch := range family.Branches {
 				if branch.ID == target.branch {
@@ -17942,7 +17956,7 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 		// separately below only for the selected branch.
 		if families, listErr := b.listRuntimeFamiliesOf(target.container); listErr == nil {
 			for _, family := range families {
-				if family.ID != target.container || len(family.Branches) != 1 || family.Branches[0].ID != target.branch {
+				if family.ID != target.container || family.branchesUnknown() || len(family.Branches) != 1 || family.Branches[0].ID != target.branch {
 					continue
 				}
 				if _, err := b.command("delete", "--force", target.container); err != nil {
@@ -17962,6 +17976,9 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 			for _, family := range families {
 				if family.ID != target.container {
 					continue
+				}
+				if family.branchesUnknown() {
+					return destroyErr
 				}
 				found := false
 				for _, branch := range family.Branches {

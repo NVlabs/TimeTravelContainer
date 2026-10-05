@@ -5265,6 +5265,79 @@ exit 2
 	}
 }
 
+// A live runtime that cannot list its branches may still run the one being
+// removed: its removal fails, keeping its record, rather than take it for
+// gone. A stopped runtime runs none, and its branch is removed.
+func TestRemovalOfABranchOfARuntimeThatCannotListItsBranches(t *testing.T) {
+	dir := t.TempDir()
+	runsc := filepath.Join(dir, "runsc")
+	script := `#!/bin/sh
+if [ "$1" != "--root" ] || [ "$2" != "/runtime" ]; then
+	echo "unexpected globals: $*" >&2
+	exit 2
+fi
+if [ "$3" = "list" ]; then
+	printf '[{"id":"web","pid":%s,"status":"%s"}]\n' "$PPID" "$(cat "$0.status")"
+	exit 0
+fi
+if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "branches" ]; then
+	echo "control server did not answer" >&2
+	exit 1
+fi
+echo "unexpected command: $*" >&2
+exit 2
+`
+	if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
+		t.Fatalf("writing fake runsc: %v", err)
+	}
+	dataRoot := filepath.Join(dir, "data")
+	containerDir := filepath.Join(dataRoot, "containers", "web")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatalf("creating bundle: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+		Name: "web", BundleDir: bundleDir, State: "running", CreatedAt: time.Now(),
+		Branches: []ttcbundle.BranchInfo{{ID: "main", State: "running"}, {ID: "child", ParentID: "main", State: "running"}},
+	}); err != nil {
+		t.Fatalf("writing metadata: %v", err)
+	}
+	b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: dataRoot}
+	branches := func() []string {
+		t.Helper()
+		info, err := ttcbundle.Store{Root: dataRoot}.LoadContainer("web")
+		if err != nil {
+			t.Fatalf("LoadContainer: %v", err)
+		}
+		var ids []string
+		for _, branch := range info.Branches {
+			ids = append(ids, branch.ID)
+		}
+		return ids
+	}
+	if err := os.WriteFile(runsc+".status", []byte("running"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.destroy(selector{container: "web", branch: "child"}, true); err == nil {
+		t.Error("removed a branch of a live runtime that could not list its branches")
+	}
+	if got := branches(); !slices.Equal(got, []string{"main", "child"}) {
+		t.Fatalf("branches after the failed removal: %v, want main and child", got)
+	}
+	if err := os.WriteFile(runsc+".status", []byte("stopped"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.destroy(selector{container: "web", branch: "child"}, true); err != nil {
+		t.Errorf("removing a branch of a stopped runtime: %v", err)
+	}
+	if got := branches(); !slices.Equal(got, []string{"main"}) {
+		t.Errorf("branches after the removal: %v, want main", got)
+	}
+}
+
 // interruptedDehydrationFixture is a standalone family, web, whose branch main
 // is recorded as dehydrating while its Sentry holds a capture that was never
 // made durable: what ttcd leaves if it dies in the middle of a dehydration.
