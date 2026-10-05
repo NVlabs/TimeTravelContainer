@@ -11416,7 +11416,11 @@ func (b *runtimeBackend) removeOrphanRuntime(containerID string) error {
 	}
 	var localErr error
 	if deleteErr == nil {
-		localErr = os.RemoveAll(filepath.Join(b.activeDataRoot(), "containers", containerID))
+		// Moved aside before it is deleted, as any family's node-local state
+		// is: a repository of it that an inventory of the node's opened
+		// meanwhile made a file in the directory being deleted, and the
+		// removal failed, "directory not empty".
+		localErr = b.containerStore().RemoveActiveContainerState(containerID)
 	}
 	return errors.Join(consoleErr, deleteErr, localErr)
 }

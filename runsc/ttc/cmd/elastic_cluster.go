@@ -4346,7 +4346,7 @@ func (b *runtimeBackend) removeUnrecordedMigratedSourceRuntime(containerID, bran
 			}
 			return nil
 		}
-		return os.RemoveAll(filepath.Join(b.activeDataRoot(), "containers", containerID))
+		return b.containerStore().RemoveActiveContainerState(containerID)
 	}
 
 	// A physical Sentry may still host a different locally-active branch. In
@@ -4390,7 +4390,7 @@ func (b *runtimeBackend) removeUnrecordedMigratedSourceRuntime(containerID, bran
 	// A previous attempt may have removed runsc state but lost its response.
 	// The remaining active-tier directory is non-authoritative and safe to
 	// discard once no physical sandbox bears this exact ID.
-	return os.RemoveAll(filepath.Join(b.activeDataRoot(), "containers", containerID))
+	return b.containerStore().RemoveActiveContainerState(containerID)
 }
 
 // removeMigratedSourceMetadata drops the retired physical incarnation after
