@@ -6,9 +6,10 @@ package proc
 import (
 	"bytes"
 	"fmt"
+	"slices"
+	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
@@ -129,22 +130,55 @@ var neighDefaults = map[string]int32{
 	"unres_qlen_bytes":       212992,
 }
 
+// netConfKind is the kind of settings a netConfSet holds.
+type netConfKind uint8
+
+const (
+	netConfIPv4 netConfKind = iota
+	netConfIPv6
+	netConfNeigh
+)
+
+// netConfDefaults are the settings of each kind, and netConfNames their
+// names, in order.
+var (
+	netConfDefaults = [...]map[string]int32{
+		netConfIPv4:  ipv4ConfDefaults,
+		netConfIPv6:  ipv6ConfDefaults,
+		netConfNeigh: neighDefaults,
+	}
+	netConfNames = [...][]string{
+		netConfIPv4:  sortedNetConfNames(ipv4ConfDefaults),
+		netConfIPv6:  sortedNetConfNames(ipv6ConfDefaults),
+		netConfNeigh: sortedNetConfNames(neighDefaults),
+	}
+)
+
+func sortedNetConfNames(defaults map[string]int32) []string {
+	names := make([]string, 0, len(defaults))
+	for name := range defaults {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names
+}
+
 // newNetConfDirs returns the conf and neigh directories of /proc/sys/net/ipv4
 // or, given ipv6, of /proc/sys/net/ipv6: settings for all interfaces, the
 // defaults of new ones, and those of each interface of stack. The sentry
 // keeps the settings without effect. Android's netd and IpClient, for two,
 // write them, and fail to bring a network up when they cannot.
 func (fs *filesystem) newNetConfDirs(ctx context.Context, root *auth.Credentials, stack inet.Stack, ipv6 bool) (conf, neigh kernfs.Inode) {
-	confDefaults := ipv4ConfDefaults
+	kind := netConfIPv4
 	if ipv6 {
-		confDefaults = ipv6ConfDefaults
+		kind = netConfIPv6
 	}
 	confDirs := map[string]kernfs.Inode{
-		"all":     fs.newNetConfSet(ctx, root, confDefaults, nil),
-		"default": fs.newNetConfSet(ctx, root, confDefaults, nil),
+		"all":     fs.newNetConfSet(ctx, root, kind, nil),
+		"default": fs.newNetConfSet(ctx, root, kind, nil),
 	}
 	neighDirs := map[string]kernfs.Inode{
-		"default": fs.newNetConfSet(ctx, root, neighDefaults, nil),
+		"default": fs.newNetConfSet(ctx, root, netConfNeigh, nil),
 	}
 	for _, iface := range stack.Interfaces() {
 		var overrides map[string]int32
@@ -154,43 +188,103 @@ func (fs *filesystem) newNetConfDirs(ctx context.Context, root *auth.Credentials
 				overrides["use_tempaddr"] = -1
 			}
 		}
-		confDirs[iface.Name] = fs.newNetConfSet(ctx, root, confDefaults, overrides)
-		neighDirs[iface.Name] = fs.newNetConfSet(ctx, root, neighDefaults, nil)
+		confDirs[iface.Name] = fs.newNetConfSet(ctx, root, kind, overrides)
+		neighDirs[iface.Name] = fs.newNetConfSet(ctx, root, netConfNeigh, nil)
 	}
 	return fs.newStaticDir(ctx, root, confDirs), fs.newStaticDir(ctx, root, neighDirs)
 }
 
-func (fs *filesystem) newNetConfSet(ctx context.Context, root *auth.Credentials, defaults, overrides map[string]int32) kernfs.Inode {
-	files := make(map[string]kernfs.Inode, len(defaults))
-	for key, val := range defaults {
-		if v, ok := overrides[key]; ok {
-			val = v
-		}
-		f := &netConfFile{}
-		f.val.Store(val)
-		mode := linux.FileMode(0644)
-		if key == "mc_forwarding" {
-			mode = 0444
-		}
-		files[key] = fs.newInode(ctx, root, mode, f)
-	}
-	return fs.newStaticDir(ctx, root, files)
+// netConfSet is a directory of settings: an interface's, all interfaces', or
+// the defaults of new ones. It keeps the settings, and makes the file of one
+// as it is looked up, which goes once unused: little reads them, and a fork
+// copies every inode the kernel has.
+//
+// +stateify savable
+type netConfSet struct {
+	kernfs.StaticDirectory
+
+	fs    *filesystem
+	owner *auth.Credentials
+	kind  netConfKind
+	// inos are the inode numbers of the settings' files, and vals the
+	// settings, in the order of netConfNames[kind]. vals are accessed
+	// atomically.
+	inos []uint64
+	vals []int32
 }
 
-// netConfFile is a setting of an interface.
+func (fs *filesystem) newNetConfSet(ctx context.Context, root *auth.Credentials, kind netConfKind, overrides map[string]int32) kernfs.Inode {
+	names := netConfNames[kind]
+	set := &netConfSet{
+		fs:    fs,
+		owner: root,
+		kind:  kind,
+		inos:  make([]uint64, len(names)),
+		vals:  make([]int32, len(names)),
+	}
+	for i, name := range names {
+		val := netConfDefaults[kind][name]
+		if v, ok := overrides[name]; ok {
+			val = v
+		}
+		set.vals[i] = val
+		set.inos[i] = fs.NextIno()
+	}
+	set.StaticDirectory.Init(ctx, root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), 0555, kernfs.GenericDirectoryFDOptions{
+		SeekEnd: kernfs.SeekEndZero,
+	})
+	set.InitRefs()
+	set.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
+	return set
+}
+
+// Lookup implements kernfs.inodeDirectory.Lookup.
+func (s *netConfSet) Lookup(ctx context.Context, name string) (kernfs.Inode, error) {
+	i, ok := slices.BinarySearch(netConfNames[s.kind], name)
+	if !ok {
+		return nil, linuxerr.ENOENT
+	}
+	mode := linux.FileMode(0644)
+	if name == "mc_forwarding" {
+		mode = 0444
+	}
+	f := &netConfFile{set: s, index: i}
+	f.Init(ctx, s.owner, linux.UNNAMED_MAJOR, s.fs.devMinor, s.inos[i], f, mode)
+	return f, nil
+}
+
+// IterDirents implements kernfs.inodeDirectory.IterDirents.
+func (s *netConfSet) IterDirents(ctx context.Context, mnt *vfs.Mount, cb vfs.IterDirentsCallback, offset, relOffset int64) (int64, error) {
+	names := netConfNames[s.kind]
+	for i := max(relOffset, 0); i < int64(len(names)); i++ {
+		if err := cb.Handle(vfs.Dirent{
+			Name:    names[i],
+			Type:    linux.DT_REG,
+			Ino:     s.inos[i],
+			NextOff: offset + 1,
+		}); err != nil {
+			return offset, err
+		}
+		offset++
+	}
+	return offset, nil
+}
+
+// netConfFile is the file of a setting of a netConfSet.
 //
 // +stateify savable
 type netConfFile struct {
 	kernfs.DynamicBytesFile
 
-	val atomicbitops.Int32
+	set   *netConfSet
+	index int
 }
 
 var _ vfs.WritableDynamicBytesSource = (*netConfFile)(nil)
 
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (f *netConfFile) Generate(ctx context.Context, buf *bytes.Buffer) error {
-	_, err := fmt.Fprintf(buf, "%d\n", f.val.Load())
+	_, err := fmt.Fprintf(buf, "%d\n", atomic.LoadInt32(&f.set.vals[f.index]))
 	return err
 }
 
@@ -205,6 +299,6 @@ func (f *netConfFile) Write(ctx context.Context, _ *vfs.FileDescription, src use
 	if err != nil || n == 0 {
 		return 0, err
 	}
-	f.val.Store(buf[0])
+	atomic.StoreInt32(&f.set.vals[f.index], buf[0])
 	return n, nil
 }
