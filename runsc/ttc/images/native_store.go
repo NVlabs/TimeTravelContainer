@@ -225,9 +225,14 @@ func (s *nativeStore) saveCatalog() error {
 			os.Remove(tempName)
 		}
 	}()
-	if err := temp.Chmod(0600); err != nil {
-		temp.Close()
-		return err
+	// CreateTemp makes the file 0600, but for what the umask takes off: a
+	// chmod regardless was a round trip of a cluster's shared root at every
+	// run, which takes a lease of its image.
+	if info, err := temp.Stat(); err != nil || info.Mode().Perm() != 0600 {
+		if err := temp.Chmod(0600); err != nil {
+			temp.Close()
+			return err
+		}
 	}
 	if _, err := temp.Write(data); err != nil {
 		temp.Close()

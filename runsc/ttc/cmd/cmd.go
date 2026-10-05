@@ -7910,19 +7910,22 @@ func (b *runtimeBackend) snapshotManagedVolume(ownerContainer, ownerBranch, volu
 // pull policy asks for that, and unpacks its root on this node, without the
 // lifecycle lock: both take time in proportion to the image, and other
 // commands go on meanwhile. It returns the pull policy that preparing the
-// family should then apply.
-func (b *runtimeBackend) prepareImageForFamily(reference, pullPolicy string) (string, error) {
+// family should then apply, and the image, if it was ready, for preparing
+// the family to take.
+func (b *runtimeBackend) prepareImageForFamily(reference, pullPolicy string) (string, *ttcimages.Info, error) {
 	store := b.containerStore()
-	if ready, err := store.ImageReady(context.Background(), reference, "", pullPolicy); err != nil || ready {
-		return pullPolicy, err
+	if image, ready, err := store.ImageReady(context.Background(), reference, "", pullPolicy); err != nil {
+		return pullPolicy, nil, err
+	} else if ready {
+		return pullPolicy, &image, nil
 	}
 	if err := b.withoutLifecycleLock(b.imageOperation(), longOperation{state: "pulling"}, func() error {
 		return store.PrepareImage(context.Background(), reference, "", pullPolicy, b.imageProgress())
 	}); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	// The image is here now, and preparing the family must not pull it again.
-	return "missing", nil
+	return "missing", nil, nil
 }
 
 func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
@@ -7936,7 +7939,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 		return containerRunResult{}, err
 	}
 	store := b.containerStore()
-	pullPolicy, err := b.prepareImageForFamily(request.reference, request.pullPolicy)
+	pullPolicy, image, err := b.prepareImageForFamily(request.reference, request.pullPolicy)
 	if err != nil {
 		return containerRunResult{}, err
 	}
@@ -7993,6 +7996,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 			ManagedVolumes:   request.managedVolumes,
 		},
 		Reference:               request.reference,
+		Image:                   image,
 		PullPolicy:              pullPolicy,
 		LogDriver:               request.logDriver,
 		LogOptions:              request.logOptions,
@@ -8101,7 +8105,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 		return "", err
 	}
 	store := b.containerStore()
-	pullPolicy, err := b.prepareImageForFamily(request.reference, request.pullPolicy)
+	pullPolicy, image, err := b.prepareImageForFamily(request.reference, request.pullPolicy)
 	if err != nil {
 		return "", err
 	}
@@ -8153,6 +8157,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 			ManagedVolumes:   request.managedVolumes,
 		},
 		Reference:          request.reference,
+		Image:              image,
 		PullPolicy:         pullPolicy,
 		LogDriver:          request.logDriver,
 		LogOptions:         request.logOptions,

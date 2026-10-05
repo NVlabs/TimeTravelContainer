@@ -599,6 +599,12 @@ type PrepareOptions struct {
 	// it has one, before anything can name the container: a daemon making
 	// it beside other commands takes the new family's lock.
 	ClaimID func(id string) error
+	// Image, if not nil, is the stored image that Reference names for
+	// Platform, as ImageReady found it: Prepare takes it rather than listing
+	// the image store again, which read the catalog of every image and
+	// family of a cluster from its shared root. The content lease Prepare
+	// takes on the image still finds the image in the catalog.
+	Image *images.Info
 }
 
 func allocateRepositoryOrigins(opts *PrepareOptions, count uint32) ([]ttcsnapshot.SnapshotID, error) {
@@ -1644,8 +1650,10 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if err := s.checkContainerNameUnused(opts.Name); err != nil {
 		return Prepared{}, err
 	}
-	pulled, err := s.resolveImage(ctx, opts.Reference, opts.Platform, opts.PullPolicy, opts.Progress)
-	if err != nil {
+	var pulled images.Info
+	if opts.Image != nil {
+		pulled = *opts.Image
+	} else if pulled, err = s.resolveImage(ctx, opts.Reference, opts.Platform, opts.PullPolicy, opts.Progress); err != nil {
 		return Prepared{}, err
 	}
 	imageInfo, rootfs, releaseImageRoot, err := s.prepareHeldImageRoot(ctx, pulled, opts.Platform, opts.Progress)
@@ -7189,32 +7197,35 @@ func normalizePullPolicy(policy string) (string, error) {
 
 // ImageReady reports whether preparing a container from reference under the
 // pull policy would find the image, and its root on this node, ready: neither
-// pull it nor unpack it.
-func (s Store) ImageReady(ctx context.Context, reference, platform, policy string) (bool, error) {
+// pull it nor unpack it. It returns the image if so, which preparing the
+// container may take (see PrepareOptions.Image).
+func (s Store) ImageReady(ctx context.Context, reference, platform, policy string) (images.Info, bool, error) {
 	policy, err := normalizePullPolicy(policy)
 	if err != nil || policy == "always" {
-		return false, err
+		return images.Info{}, false, err
 	}
 	stored, err := images.List(ctx, images.ListOptions{Root: s.Root})
 	if err != nil {
-		return false, err
+		return images.Info{}, false, err
 	}
 	return s.imageReadyAmong(stored, reference, platform)
 }
 
 // imageReadyAmong reports whether reference is one of the stored images and
-// its root is unpacked on this node.
-func (s Store) imageReadyAmong(stored []images.Info, reference, platform string) (bool, error) {
+// its root is unpacked on this node, and returns the image if so.
+func (s Store) imageReadyAmong(stored []images.Info, reference, platform string) (images.Info, bool, error) {
 	match, found, err := selectStoredImage(stored, reference, platform)
 	if err != nil || !found {
-		return false, err
+		return images.Info{}, false, err
 	}
 	selectedPlatform := platform
 	if selectedPlatform == "" {
 		selectedPlatform = match.Platform
 	}
-	_, err = loadImageRoot(filepath.Join(s.imageRootDir(), imageRootKey(match.Digest, selectedPlatform)))
-	return err == nil, nil
+	if _, err := loadImageRoot(filepath.Join(s.imageRootDir(), imageRootKey(match.Digest, selectedPlatform))); err != nil {
+		return images.Info{}, false, nil
+	}
+	return match, true, nil
 }
 
 // PrepareImage pulls reference if the pull policy asks for it and prepares its

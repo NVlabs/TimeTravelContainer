@@ -1833,9 +1833,12 @@ func TestImageReadyNeedsTheImageAndItsRoot(t *testing.T) {
 	stored := []ttcimages.Info{{Reference: "docker.io/library/alpine:3.20", Digest: digest, Platform: "linux/amd64"}}
 	ready := func(reference, platform string) bool {
 		t.Helper()
-		got, err := store.imageReadyAmong(stored, reference, platform)
+		image, got, err := store.imageReadyAmong(stored, reference, platform)
 		if err != nil {
 			t.Fatalf("imageReadyAmong(%q, %q): %v", reference, platform, err)
+		}
+		if got != (image.Digest == digest) {
+			t.Fatalf("imageReadyAmong(%q, %q) = %+v, %t: a ready image is the one stored, and only it", reference, platform, image, got)
 		}
 		return got
 	}
@@ -1863,7 +1866,7 @@ func TestImageReadyNeedsTheImageAndItsRoot(t *testing.T) {
 	if ready("busybox:latest", "") {
 		t.Error("an image that is not stored is ready")
 	}
-	if got, err := store.ImageReady(context.Background(), "alpine:3.20", "", "always"); err != nil || got {
+	if _, got, err := store.ImageReady(context.Background(), "alpine:3.20", "", "always"); err != nil || got {
 		t.Errorf("ImageReady under the pull policy always=(%t, %v), want a pull", got, err)
 	}
 }
