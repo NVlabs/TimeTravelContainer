@@ -2971,3 +2971,80 @@ func TestRoutedPeerChecksTheRecordReadWithThePlacement(t *testing.T) {
 		t.Errorf("%d hints kept, want at most %d", len(hints.owner), maxRouteHints)
 	}
 }
+
+// A request that makes a family beside other commands reserves the family's
+// name, refusing one being made, and takes the new family's lock once it has
+// an ID; one that would change more than its family takes the lifecycle lock
+// alone.
+func TestFamilyMakingReservesItsNameAndClaimsItsLock(t *testing.T) {
+	server := &daemonServer{}
+	root := t.TempDir()
+	var released []string
+	shared := server.lockDataRootShared(root)
+	hold := &lifecycleHold{acquire: func() func() { return server.lockDataRootShared(root) }, release: shared}
+	exclusive := 0
+	making := &familyMaking{
+		server: server, dataRoot: root, hold: hold,
+		exclusive: func() func() {
+			exclusive++
+			return server.lockDataRoot(root)
+		},
+		holding: func(release func()) {
+			released = append(released, "family")
+			release()
+		},
+	}
+	done, err := making.begin(runRequest{name: "web"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := making.begin(runRequest{name: "web"}); err == nil {
+		t.Error("a second family named web was made at once")
+	}
+	if other, err := making.begin(runRequest{name: "db"}); err != nil {
+		t.Errorf("a family of another name: %v", err)
+	} else {
+		other()
+	}
+	done()
+	if again, err := making.begin(runRequest{name: "web"}); err != nil {
+		t.Errorf("web once made: %v", err)
+	} else {
+		again()
+	}
+	b := &runtimeBackend{}
+	if err := making.claim(b, "id-1"); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(b.heldFamilies, "id-1") || len(released) != 1 {
+		t.Errorf("claim held %v, released %v", b.heldFamilies, released)
+	}
+	lock := server.familyLock(root, "id-1")
+	select {
+	case lock <- struct{}{}:
+		<-lock
+	default:
+		t.Error("the claimed family's lock was not given back")
+	}
+	if exclusive != 0 {
+		t.Fatalf("a family changing only itself took the lifecycle lock alone")
+	}
+	if _, err := making.begin(runRequest{name: "vol", managedVolumes: []ttcbundle.ManagedVolume{{Name: "data", Destination: "/data"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if exclusive != 1 {
+		t.Errorf("a family attaching a named volume took the lifecycle lock alone %d times, want once", exclusive)
+	}
+	hold.unlock()
+	for _, request := range []runRequest{
+		{publishedPorts: []ttcbundle.PortBinding{{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}}},
+		{gpu: ttcbundle.GPUOptions{NVProxy: true}},
+	} {
+		if request.makesOnlyItsFamily() {
+			t.Errorf("%+v makes only its family", request)
+		}
+	}
+	if !(runRequest{managedVolumes: []ttcbundle.ManagedVolume{{Destination: "/anonymous"}}}).makesOnlyItsFamily() {
+		t.Error("an anonymous volume is more than the family's own")
+	}
+}

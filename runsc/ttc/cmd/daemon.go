@@ -356,6 +356,9 @@ type daemonServer struct {
 	mutationMu    sync.Mutex
 	mutationLocks map[string]*sync.RWMutex
 	familyLocks   map[string]chan struct{}
+	// namesTaken has, by data root, the names of the families being made
+	// beside other commands: see familyMaking.
+	namesTaken    map[string]struct{}
 	mutationCount atomic.Uint64
 
 	eventMu    sync.Mutex
@@ -7694,6 +7697,19 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		hold.unlock()
 		releaseFamilies()
 	}
+	if shared && len(families) == 0 && daemonCommandMakesFamily(request.Args) {
+		backend.makingFamily = &familyMaking{
+			server: s, dataRoot: opts.dataRoot, hold: hold,
+			exclusive: func() func() { return s.lockDataRoot(opts.dataRoot) },
+			holding: func(release func()) {
+				previous := releaseFamilies
+				releaseFamilies = func() {
+					previous()
+					release()
+				}
+			},
+		}
+	}
 	if daemonCommandReleasesLifecycleAfterStart(request.Args) {
 		backend.lifecycleReady = unlock
 	}
@@ -7799,6 +7815,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		mutationBackend.heldFamilies = families
 		mutationBackend.resolvedFamilies = backend.resolvedFamilies
 		mutationBackend.claimedAuthority = backend.claimedAuthority
+		mutationBackend.makingFamily = backend.makingFamily
 		mutationBackend.mutating = backend.mutating
 		mutationBackend.commandName = backend.commandName
 		if !daemonCommandKeepsLifecycleLock(request.Args) {

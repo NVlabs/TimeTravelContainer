@@ -4119,3 +4119,30 @@ func TestAddDefaultEnv(t *testing.T) {
 		t.Errorf("addDefaultEnv without defaults = %q", got)
 	}
 }
+
+// A root that a container is being made of is not pruned though no image or
+// container record names it yet.
+func TestPruneImageRootsPassesOverARootInUse(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	name := imageRootKey("sha256:"+strings.Repeat("d", 64), "linux/amd64")
+	dir := filepath.Join(root, "images", name)
+	if err := os.MkdirAll(filepath.Join(dir, "rootfs"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	imageRootsInUse.mu.Lock()
+	if imageRootsInUse.count == nil {
+		imageRootsInUse.count = make(map[string]int)
+	}
+	imageRootsInUse.count[dir]++
+	imageRootsInUse.mu.Unlock()
+	if removed, err := store.pruneImageRoots(nil, nil); err != nil || removed != 0 {
+		t.Fatalf("pruneImageRoots with the root in use = (%d, %v), want (0, nil)", removed, err)
+	}
+	imageRootsInUse.mu.Lock()
+	delete(imageRootsInUse.count, dir)
+	imageRootsInUse.mu.Unlock()
+	if removed, err := store.pruneImageRoots(nil, nil); err != nil || removed != 1 {
+		t.Fatalf("pruneImageRoots once the root is not in use = (%d, %v), want (1, nil)", removed, err)
+	}
+}

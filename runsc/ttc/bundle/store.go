@@ -583,6 +583,10 @@ type PrepareOptions struct {
 	// Sentry. This preserves bounded process-local metadata batching and mmap
 	// CoW correctness when a second family attaches read-only.
 	SnapshotManagedVolume func(ownerContainer, ownerBranch, volumeID, childBranch string, sourceWorking, childWorking ttcsnapshot.SnapshotID) error
+	// ClaimID, if not nil, is called with the new container's ID as soon as
+	// it has one, before anything can name the container: a daemon making
+	// it beside other commands takes the new family's lock.
+	ClaimID func(id string) error
 }
 
 func allocateRepositoryOrigins(opts *PrepareOptions, count uint32) ([]ttcsnapshot.SnapshotID, error) {
@@ -1625,10 +1629,13 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if err != nil {
 		return Prepared{}, err
 	}
-	imageInfo, rootfs, err := s.prepareImageRoot(ctx, pulled, opts.Platform, opts.Progress)
+	imageInfo, rootfs, releaseImageRoot, err := s.prepareHeldImageRoot(ctx, pulled, opts.Platform, opts.Progress)
 	if err != nil {
 		return Prepared{}, err
 	}
+	// The root is the container's once its record names it, when Prepare
+	// returns.
+	defer releaseImageRoot()
 	var cleanupManagedVolumeSnapshots func()
 	opts.ManagedVolumes, cleanupManagedVolumeSnapshots, err = s.resolveManagedVolumes(imageInfo.Image, rootfs, opts)
 	if err != nil {
@@ -1643,6 +1650,12 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	id, containerDir, err := s.createContainerDir()
 	if err != nil {
 		return Prepared{}, err
+	}
+	if opts.ClaimID != nil {
+		if err := opts.ClaimID(id); err != nil {
+			s.discardIncompleteContainer(id)
+			return Prepared{}, err
+		}
 	}
 	activeContainerDir := s.activeContainerDir(id)
 	if err := os.MkdirAll(activeContainerDir, 0700); err != nil {
@@ -6769,6 +6782,9 @@ func (s Store) pruneImageRoots(stored []images.Info, containers []ContainerInfo)
 			if _, referenced := keep[entry.Name()]; referenced && !strings.Contains(entry.Name(), ".tmp-") {
 				continue
 			}
+			if imageRootInUse(filepath.Join(imagesDir, entry.Name())) {
+				continue
+			}
 			if s.activeRoot() != s.Root {
 				info, err := entry.Info()
 				if err != nil {
@@ -7194,6 +7210,52 @@ func (s Store) prepareImageRoot(ctx context.Context, pulled images.Info, platfor
 		return err
 	})
 	return info, rootfs, err
+}
+
+// imageRootsInUse counts, by directory, the containers this process is
+// making of each image root. Pruning passes over a root in use, as over one
+// a container's record names, which a container being made has yet to have:
+// a daemon makes families beside commands that prune the roots of the
+// families they remove.
+var imageRootsInUse struct {
+	mu    sync.Mutex
+	count map[string]int
+}
+
+// prepareHeldImageRoot is prepareImageRoot of a root that a container is
+// being made of, which pruning passes over until the returned release.
+func (s Store) prepareHeldImageRoot(ctx context.Context, pulled images.Info, platform string, progress images.ProgressFunc) (info images.RootFSInfo, rootfs string, release func(), retErr error) {
+	release = func() {}
+	err := s.withImageRootLock(func() error {
+		var err error
+		if info, rootfs, err = s.prepareImageRootLocked(ctx, pulled, platform, progress, nil); err != nil {
+			return err
+		}
+		dir := filepath.Dir(rootfs)
+		imageRootsInUse.mu.Lock()
+		if imageRootsInUse.count == nil {
+			imageRootsInUse.count = make(map[string]int)
+		}
+		imageRootsInUse.count[dir]++
+		imageRootsInUse.mu.Unlock()
+		release = func() {
+			imageRootsInUse.mu.Lock()
+			if imageRootsInUse.count[dir]--; imageRootsInUse.count[dir] <= 0 {
+				delete(imageRootsInUse.count, dir)
+			}
+			imageRootsInUse.mu.Unlock()
+		}
+		return nil
+	})
+	return info, rootfs, release, err
+}
+
+// imageRootInUse reports whether this process is making a container of the
+// image root at dir.
+func imageRootInUse(dir string) bool {
+	imageRootsInUse.mu.Lock()
+	defer imageRootsInUse.mu.Unlock()
+	return imageRootsInUse.count[dir] > 0
 }
 
 func (s Store) prepareImportedImageRoot(ctx context.Context, imported images.ImportedImage, platform string, progress images.ProgressFunc) (info images.RootFSInfo, rootfs string, retErr error) {

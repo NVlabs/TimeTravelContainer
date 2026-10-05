@@ -4,6 +4,7 @@
 package cmd
 
 import (
+	"fmt"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -27,11 +28,19 @@ import (
 // rechecks the origins it would abandon with their locks held. With every
 // command taking the lifecycle lock alone, a cluster node paused or resumed
 // its families 14 times a second however many clients asked.
+//
+// A command that makes a family, run or create, takes the lifecycle lock
+// shared too, and the new family's lock as soon as the family has an ID,
+// before anything can name it: see familyMaking. One that would change more
+// than the family it makes takes the lifecycle lock alone, as it did, once it
+// knows: a daemon made one family at a time, 9 a second on this host's disk
+// and 3 a second on a cluster node over the simulated NFS mount, however many
+// clients asked, and every command on another family waited for each.
 
 // familyScopedCommands change only the family they name. Removing a family
 // also prunes the image roots nothing uses, under the image roots' own lock:
-// only commands that create a family add references to them, and those take
-// the lifecycle lock exclusively.
+// a command that makes a family and finds its image's root makes the root
+// young again under that lock, and a root is pruned only once old.
 var familyScopedCommands = map[string]bool{
 	"pause": true, "resume": true, "unpause": true, "quarantine": true, "unquarantine": true,
 	"kill": true, "stop": true, "start": true, "restart": true, "fork": true,
@@ -52,7 +61,7 @@ func (s *daemonServer) requestFamilies(backend *runtimeBackend, args []string, c
 	}
 	names := daemonCommandFamilyTargets(args)
 	if len(names) == 0 {
-		return nil, false
+		return nil, daemonCommandMakesFamily(args)
 	}
 	var ids []string
 	if family, ok := claimedFamily(names, claims); ok {
@@ -71,6 +80,91 @@ func (s *daemonServer) requestFamilies(backend *runtimeBackend, args []string, c
 		sort.Strings(ids)
 	}
 	return ids, len(ids) == 1 && familyScopedCommands[daemonCommandName(args)]
+}
+
+// daemonCommandMakesFamily reports whether args make a family, as run and
+// create do.
+func daemonCommandMakesFamily(args []string) bool {
+	switch daemonCommandName(args) {
+	case "run", "create":
+		return true
+	}
+	return false
+}
+
+// familyMaking is how a request that makes a family, holding the lifecycle
+// lock shared, makes it beside the commands on other families. Only the
+// family's name is another command's to take until the family has an ID,
+// which nothing else knows: the name is reserved until the request is done,
+// and the family's lock taken once it has the ID, which the request then
+// holds as it holds the locks of the families it names.
+type familyMaking struct {
+	server   *daemonServer
+	dataRoot string
+	hold     *lifecycleHold
+	// exclusive takes the lifecycle lock alone.
+	exclusive func() func()
+	// holding adds a lock the request takes to those it releases when done.
+	holding func(release func())
+}
+
+// begin readies the making of the family request asks for. A family that
+// changes nothing beside itself - no named volume, published port or device -
+// is made under its name's reservation, which begin returns the release of;
+// for any other, the request takes the lifecycle lock alone.
+func (m *familyMaking) begin(request runRequest) (func(), error) {
+	if m == nil {
+		return func() {}, nil
+	}
+	if !request.makesOnlyItsFamily() {
+		m.hold.exclusive(m.exclusive)
+		return func() {}, nil
+	}
+	if request.name == "" {
+		return func() {}, nil
+	}
+	key := dataRootKey(m.dataRoot) + "\x00" + request.name
+	s := m.server
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	if _, taken := s.namesTaken[key]; taken {
+		return nil, fmt.Errorf("container name %q is already in use by a container being made", request.name)
+	}
+	if s.namesTaken == nil {
+		s.namesTaken = make(map[string]struct{})
+	}
+	s.namesTaken[key] = struct{}{}
+	return func() {
+		s.mutationMu.Lock()
+		delete(s.namesTaken, key)
+		s.mutationMu.Unlock()
+	}, nil
+}
+
+// claim takes the lock of the family with this ID, which b makes, as soon as
+// it has the ID. Nothing else knows the ID yet, so nothing holds the lock.
+func (m *familyMaking) claim(b *runtimeBackend, id string) error {
+	if m == nil {
+		return nil
+	}
+	lock := m.server.familyLock(m.dataRoot, id)
+	select {
+	case lock <- struct{}{}:
+	default:
+		return fmt.Errorf("the lock of family %s, being made, is held", id)
+	}
+	m.holding(func() { <-lock })
+	b.heldFamilies = append(append([]string(nil), b.heldFamilies...), id)
+	return nil
+}
+
+// claimer returns the ID claim that b's making of a family passes to the
+// store, or nil.
+func (m *familyMaking) claimer(b *runtimeBackend) func(string) error {
+	if m == nil {
+		return nil
+	}
+	return func(id string) error { return m.claim(b, id) }
 }
 
 // claimedFamily returns the family that the claims of a command naming one

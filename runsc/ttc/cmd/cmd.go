@@ -1835,6 +1835,22 @@ type runRequest struct {
 	terminal           bool
 }
 
+// makesOnlyItsFamily reports whether making the family r asks for changes
+// nothing on its node beside the family: a named volume it would make or
+// attach, a port it would publish and a device it would take are shared with
+// other families. An anonymous volume is the family's own.
+func (r runRequest) makesOnlyItsFamily() bool {
+	if len(r.publishedPorts) != 0 || r.gpu.GFX || r.gpu.NVProxy {
+		return false
+	}
+	for _, volume := range r.managedVolumes {
+		if volume.Name != "" {
+			return false
+		}
+	}
+	return true
+}
+
 type attachRequest struct {
 	target     selector
 	execID     string
@@ -6693,6 +6709,9 @@ type runtimeBackend struct {
 	// that the claim a command was routed with names, as the claim was
 	// validated: the command's first resolution, if of that branch, reads it.
 	claimedAuthority *claimedBranchAuthority
+	// makingFamily, if not nil, is how a request that makes a family, holding
+	// the lifecycle lock shared, makes it beside other commands.
+	makingFamily     *familyMaking
 	publicationQueue *ttcstorage.Queue
 	snapshotGraph    *ttcsnapshot.Store
 	snapshotData     *ttcsnapshot.LocalDataStore
@@ -7899,6 +7918,11 @@ func (b *runtimeBackend) prepareImageForFamily(reference, pullPolicy string) (st
 }
 
 func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
+	made, err := b.makingFamily.begin(request)
+	if err != nil {
+		return containerRunResult{}, err
+	}
+	defer made()
 	consoleSize, err := b.initialConsoleSize(request.terminal)
 	if err != nil {
 		return containerRunResult{}, err
@@ -7985,6 +8009,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 		NodeID:                  b.nodeID,
 		AllocateSnapshotOrigins: filesystemOrigins,
 		SnapshotManagedVolume:   b.snapshotManagedVolume,
+		ClaimID:                 b.makingFamily.claimer(b),
 	})
 	if err != nil {
 		return containerRunResult{}, errors.Join(err, finishFilesystemOrigins(false))
@@ -8058,6 +8083,11 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 }
 
 func (b *runtimeBackend) create(request runRequest) (string, error) {
+	made, err := b.makingFamily.begin(request)
+	if err != nil {
+		return "", err
+	}
+	defer made()
 	consoleSize, err := b.initialConsoleSize(request.terminal)
 	if err != nil {
 		return "", err
@@ -8142,6 +8172,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 		NodeID:                  createdNodeID,
 		AllocateSnapshotOrigins: filesystemOrigins,
 		SnapshotManagedVolume:   b.snapshotManagedVolume,
+		ClaimID:                 b.makingFamily.claimer(b),
 	})
 	if err != nil {
 		return "", errors.Join(err, finishFilesystemOrigins(false))

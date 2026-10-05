@@ -47,6 +47,20 @@ func (h *lifecycleHold) unlock() {
 	}
 }
 
+// exclusive has the request hold the lock alone from now on, with acquire,
+// as one that took it shared finds it must: it gives the lock up, and takes
+// it back alone.
+func (h *lifecycleHold) exclusive(acquire func() func()) {
+	h.mu.Lock()
+	release := h.release
+	h.release, h.acquire = nil, acquire
+	h.mu.Unlock()
+	if release != nil {
+		release()
+		h.relock()
+	}
+}
+
 // relock takes the lock back if the request gave it up.
 func (h *lifecycleHold) relock() {
 	h.mu.Lock()
