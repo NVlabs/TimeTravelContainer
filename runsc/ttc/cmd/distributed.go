@@ -1604,17 +1604,25 @@ func applyColdFilesystemRestoreIDs(roots []cluster.FilesystemRootDescriptor, fil
 }
 
 // applyDehydratedFilesystemRestoreIDs binds a materialized cold cache back to
-// the repository identities serialized in its kernel snapshot. A freshly
-// dehydrated branch that is still publishing has no shared manifest yet and
-// still uses the exact repositories from which it was captured; in that case
-// prepareDistributedFilesystem has already recorded the correct identities.
-func applyDehydratedFilesystemRestoreIDs(roots []cluster.FilesystemRootDescriptor, manifestPath string) error {
+// the repository identities serialized in its kernel snapshot, capture
+// snapshot. A freshly dehydrated branch that is still publishing still uses
+// the exact repositories from which it was captured, which
+// prepareDistributedFilesystem has already recorded, and has no manifest of
+// its capture yet: it has none at all, or names an earlier publication's,
+// which describes another capture and other repositories, until its own
+// commits. A remote fork of such a branch was refused restoring, "TTC volume
+// restore resource ... was not provided", as dehydrationRestoreIDs no longer
+// lets a local one be.
+func applyDehydratedFilesystemRestoreIDs(roots []cluster.FilesystemRootDescriptor, manifestPath string, snapshot uint64) error {
 	if manifestPath == "" {
 		return nil
 	}
 	manifest, err := readColdBranchManifest(manifestPath)
 	if err != nil {
 		return err
+	}
+	if manifest.MemorySnapshot != snapshot {
+		return nil
 	}
 	return applyColdFilesystemRestoreIDs(roots, manifest.Filesystems)
 }
@@ -3316,7 +3324,7 @@ func (b *runtimeBackend) forkRemoteDehydrated(source, logicalSource selector, so
 	if err != nil {
 		return selector{}, fmt.Errorf("preparing dehydrated filesystem objects: %w", err)
 	}
-	if err := applyDehydratedFilesystemRestoreIDs(filesystemRoots, sourceBranch.StorageManifest); err != nil {
+	if err := applyDehydratedFilesystemRestoreIDs(filesystemRoots, sourceBranch.StorageManifest, capture.SnapshotID); err != nil {
 		return selector{}, fmt.Errorf("reading dehydrated filesystem identities: %w", err)
 	}
 	internalMounts, err := b.portableDistributedInternalMounts(sourceInfo.ID)

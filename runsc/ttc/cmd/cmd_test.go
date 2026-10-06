@@ -238,11 +238,41 @@ func TestApplyDehydratedFilesystemRestoreIDsAllowsPendingPublication(t *testing.
 	roots := []cluster.FilesystemRootDescriptor{{
 		Source: "/run/ttc/rootfs-upper", RepositoryID: "local-rootfs", RestoreID: "local-rootfs",
 	}}
-	if err := applyDehydratedFilesystemRestoreIDs(roots, ""); err != nil {
+	if err := applyDehydratedFilesystemRestoreIDs(roots, "", 8); err != nil {
 		t.Fatal(err)
 	}
 	if got, want := roots[0].RestoreID, "local-rootfs"; got != want {
 		t.Fatalf("pending-publication restore ID=%q, want %q", got, want)
+	}
+	// A branch dehydrated again names its earlier publication's manifest,
+	// of another capture, until its own publication commits.
+	manifestPath := filepath.Join(t.TempDir(), "manifest.json")
+	data, err := json.Marshal(coldBranchManifest{
+		Version: 5, Container: "web", Branch: "main", PublicationID: "publication-earlier", Kind: "dehydrate",
+		MemorySnapshot: 5, ControlRoot: ttcsnapshot.ObjectID{Snapshot: 5, Ordinal: 2, Kind: ttcsnapshot.ObjectKindMetadata}.String(),
+		Filesystems: []coldFilesystemSnapshot{{Root: cluster.FilesystemRootDescriptor{
+			Source: "/run/ttc/rootfs-upper", RepositoryID: "0123456789abcdef0123456789abcdef", RestoreID: "earlier-rootfs",
+			BranchID: "main", Root: ttcsnapshot.ObjectID{Snapshot: 5, Ordinal: 1, Kind: ttcsnapshot.ObjectKindMetadata}.String(), NextInode: 2,
+		}, Origins: []uint64{5}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyDehydratedFilesystemRestoreIDs(roots, manifestPath, 8); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := roots[0].RestoreID, "local-rootfs"; got != want {
+		t.Fatalf("restore ID beside an earlier publication's manifest=%q, want %q", got, want)
+	}
+	// The manifest of the capture itself names its identities.
+	if err := applyDehydratedFilesystemRestoreIDs(roots, manifestPath, 5); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := roots[0].RestoreID, "earlier-rootfs"; got != want {
+		t.Fatalf("restore ID from the capture's own manifest=%q, want %q", got, want)
 	}
 }
 
