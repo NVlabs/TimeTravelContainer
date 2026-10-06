@@ -7098,6 +7098,12 @@ func TestLocalColdBranchKeepsItsCaptureOverAnAncestorManifest(t *testing.T) {
 	if err := b.ensureLocalColdBranch(info, branch); err != nil {
 		t.Fatalf("restoring a canceled publication's capture: %v", err)
 	}
+	// Nor while the capture's own publication is under way, which the
+	// record names, and the manifest not yet.
+	branch.PublicationID, branch.StorageState = "publication-new", "publishing"
+	if err := b.ensureLocalColdBranch(info, branch); err != nil {
+		t.Fatalf("forking a branch whose publication is under way: %v", err)
+	}
 	// A shared branch's manifest is its state, and must be its publication's.
 	branch.State, branch.StorageState = "dehydrated", "shared"
 	if err := b.ensureLocalColdBranch(info, branch); err == nil || !strings.Contains(err.Error(), "publication-ancestor") {

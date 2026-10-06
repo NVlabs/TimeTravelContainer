@@ -2512,8 +2512,12 @@ func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, bra
 	// mounts and exec output this node keeps: a manifest it names is an older
 	// ancestor, as when a rehydration canceled the publication of the
 	// capture. Installing from it would put back older files, and refused a
-	// branch that the ancestor's publication no longer describes.
-	if localCurrent && branch.StorageState == "local" {
+	// branch that the ancestor's publication no longer describes. So is a
+	// publishing branch's, which its publication is made from: its record
+	// names the publication under way and its manifest the last one, and a
+	// fork of the branch just dehydrated was refused, "cold manifest
+	// publication is ..., branch publication is ...".
+	if localCurrent && (branch.StorageState == "local" || branch.StorageState == "publishing") {
 		return nil
 	}
 	// Portable internal mounts are not part of a TTC volume repository. Restore
