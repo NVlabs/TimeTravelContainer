@@ -5450,8 +5450,14 @@ func (s Store) StopBranch(name, branchID string, exitStatus int) error {
 			// the same metadata transaction so a worker that already passed its
 			// queue cancellation check cannot replay the preceding lifecycle after
 			// execution state and memory roots have been discarded. The immutable
-			// StorageManifest remains the branch's filesystem ancestor.
-			branch.PublicationID = ""
+			// StorageManifest remains the branch's filesystem ancestor. A branch
+			// already exited has no process snapshot: its publication is its
+			// stop's, of its filesystem, which the authority keeps. Retired, the
+			// record named none, and every later command failed repairing it to
+			// the committed one.
+			if !alreadyExited {
+				branch.PublicationID = ""
+			}
 			found = true
 			break
 		}

@@ -517,6 +517,50 @@ func TestRuntimeLossRecordsHowEachBranchEnded(t *testing.T) {
 	}
 }
 
+// A stop consumes a dehydrated branch's process snapshot, and retires its
+// publication with it; a branch already exited has none, and its
+// publication, its stop's of its filesystem, is the one the authority keeps.
+func TestStopBranchKeepsAnExitedBranchsPublication(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "example")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	info := ContainerInfo{
+		ID: "example", Name: "example", BundleDir: bundleDir, State: "exited",
+		Branches: []BranchInfo{
+			{ID: "exited", State: "exited", StorageState: "shared", PublicationID: "publication-stop", StorageManifest: "stop.json"},
+			{ID: "dehydrated", State: "dehydrated", StorageState: "shared", PublicationID: "publication-dehydrate", StorageManifest: "dehydrate.json"},
+		},
+	}
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	store := Store{Root: root}
+	for _, id := range []string{"exited", "dehydrated"} {
+		if err := store.StopBranch("example", id, 137); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := store.LoadContainer("example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, branch := range got.Branches {
+		want := ""
+		if branch.ID == "exited" {
+			want = "publication-stop"
+		}
+		if branch.PublicationID != want || branch.State != "exited" {
+			t.Errorf("stopped %s branch: %s with publication %q, want exited with %q", branch.ID, branch.State, branch.PublicationID, want)
+		}
+	}
+}
+
 // A resident dehydration's capture lives only in its family's runtime: made
 // durable it is an ordinary dehydrated branch, stopped it gives the capture up,
 // and a runtime that disappears takes it the way it takes a running branch.
