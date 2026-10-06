@@ -1972,7 +1972,32 @@ func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease clu
 // the last guaranteed maintenance opportunity: relying on the periodic pass
 // leaves dead snapshot packs behind when a family removal is followed
 // immediately by cluster shutdown.
+//
+// The coordinator's lease may move on while the node drains, as one renewed
+// on a slow shared root expires: a node with a successor leaves the rest to
+// it, and the cluster's last node takes the lease again. A node's stop failed
+// instead, "collecting terminal shared snapshot graph: shared reference lease
+// is stale", its branches dehydrated and its work done.
 func (s *sharedReferenceService) drainBeforeShutdown(ctx context.Context, requireOwnership bool) error {
+	for {
+		err := s.drainBeforeShutdownOnce(ctx, requireOwnership)
+		if err == nil || ctx.Err() != nil || !isSharedReferenceCoordinatorTransition(err) {
+			return err
+		}
+		if !requireOwnership {
+			return nil
+		}
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (s *sharedReferenceService) drainBeforeShutdownOnce(ctx context.Context, requireOwnership bool) error {
 	if s == nil || s.authority == nil {
 		return nil
 	}
