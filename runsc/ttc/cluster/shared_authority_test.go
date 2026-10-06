@@ -44,6 +44,46 @@ func TestSharedBlockRoundTripAndTornBlock(t *testing.T) {
 	}
 }
 
+// A claim is read whole or not at all: a daemon starting beside another that
+// claimed the first epoch read the claim empty, and failed to start.
+func TestClaimEpochIsReadWhole(t *testing.T) {
+	shared := NewSharedCluster(t.TempDir())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for epoch := uint64(1); epoch <= 200; epoch++ {
+			if won, err := shared.ClaimEpoch(AuthorityRecord{Epoch: epoch, NodeID: "node-a"}); err != nil || !won {
+				t.Errorf("ClaimEpoch(%d) = %t, %v", epoch, won, err)
+				return
+			}
+		}
+	}()
+	for {
+		select {
+		case <-done:
+			entries, err := os.ReadDir(shared.claimsDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 200 {
+				t.Fatalf("the claims directory holds %d entries, want the 200 claims alone", len(entries))
+			}
+			return
+		default:
+		}
+		latest, err := shared.LatestClaim()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if latest == 0 {
+			continue
+		}
+		if _, err := shared.ReadClaim(latest); err != nil {
+			t.Fatalf("ReadClaim(%d) while claims are made: %v", latest, err)
+		}
+	}
+}
+
 func TestClaimEpochIsExclusive(t *testing.T) {
 	shared := NewSharedCluster(t.TempDir())
 	if latest, err := shared.LatestClaim(); err != nil || latest != 0 {

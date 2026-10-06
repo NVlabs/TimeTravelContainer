@@ -268,13 +268,17 @@ func (c SharedCluster) ClaimEpoch(record AuthorityRecord) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	file, err := os.OpenFile(c.claimPath(record.Epoch), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-	if errors.Is(err, fs.ErrExist) {
-		return false, nil
-	}
+	// The claim is written whole before it is published, by a link that
+	// fails if another node claimed the epoch first. A claim made empty and
+	// written after was read in between by a daemon starting beside it,
+	// which failed to start, "decoding the claim of epoch 1: unexpected end
+	// of JSON input". A temporary name is no epoch's, which LatestClaim
+	// passes over.
+	file, err := os.CreateTemp(c.claimsDir(), ".claim-*")
 	if err != nil {
 		return false, fmt.Errorf("claiming epoch %d of the cluster authority: %w", record.Epoch, err)
 	}
+	defer os.Remove(file.Name())
 	_, err = file.Write(append(data, '\n'))
 	if err == nil {
 		err = file.Sync()
@@ -283,7 +287,13 @@ func (c SharedCluster) ClaimEpoch(record AuthorityRecord) (bool, error) {
 		err = closeErr
 	}
 	if err != nil {
-		return true, fmt.Errorf("recording the claim of epoch %d: %w", record.Epoch, err)
+		return false, fmt.Errorf("recording the claim of epoch %d: %w", record.Epoch, err)
+	}
+	if err := os.Link(file.Name(), c.claimPath(record.Epoch)); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("claiming epoch %d of the cluster authority: %w", record.Epoch, err)
 	}
 	return true, syncDir(c.claimsDir())
 }
