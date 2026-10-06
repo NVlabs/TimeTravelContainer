@@ -1133,6 +1133,9 @@ func (p *branchPublisher) Cleanup(intent ttcstorage.Intent) error {
 			return errors.Join(removeErr, gcErr, closeErr)
 		}
 	}
+	// The capture's branch took a working origin of its own, which no
+	// repository holds now.
+	p.peers.requestOriginReconcile()
 	for encodedOrigin, empty := range emptyFilesystemOrigins {
 		if !canceled {
 			break
@@ -2547,6 +2550,7 @@ func (b *runtimeBackend) discardSupersededBranchFilesystems(info ttcbundle.Conta
 	if err := b.containerStore().RemoveBranchFilesystems(info.ID, branch); err != nil {
 		return fmt.Errorf("discarding superseded local filesystems of %s@%s: %w", info.Name, branch.ID, err)
 	}
+	b.distributedSource.requestOriginReconcile()
 	return nil
 }
 

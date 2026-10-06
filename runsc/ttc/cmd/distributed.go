@@ -290,8 +290,12 @@ type distributedSourceRuntime struct {
 	// family deleting its private repository can otherwise race another
 	// family's global inventory opening that same repository.
 	reclamationMu sync.Mutex
-	pageListen    string
-	pageAdvertise string
+	// reconcileOrigins asks the node's local cache cleanup to reconcile its
+	// volatile origins: a publication's cleanup or a superseded branch's
+	// removal left repositories holding fewer than the authority names.
+	reconcileOrigins atomic.Bool
+	pageListen       string
+	pageAdvertise    string
 	// exports has, by transaction, a function that stops the transaction's
 	// live graph export: one that no target will read.
 	exports sync.Map
@@ -400,6 +404,16 @@ func (r *distributedSourceRuntime) lockReclamation() func() {
 	}
 	r.reclamationMu.Lock()
 	return r.reclamationMu.Unlock
+}
+
+// requestOriginReconcile asks the node's local cache cleanup to abandon the
+// volatile origins that its repositories no longer hold. A reconciliation
+// inventories every repository of the node, which a command should not wait
+// for; the cleanup runs one at most once a pass.
+func (r *distributedSourceRuntime) requestOriginReconcile() {
+	if r != nil {
+		r.reconcileOrigins.Store(true)
+	}
 }
 
 // buildOrigin marks origin as one a capture builds, until the returned

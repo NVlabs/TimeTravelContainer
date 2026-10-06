@@ -4875,29 +4875,31 @@ func (b *runtimeBackend) reclaimRetiringNodeRuntimes() error {
 // Shared catalog records are intentionally insufficient to retain a cache:
 // they describe cluster-visible identity, not node-local ownership. This
 // closes the race where a node is joining or temporarily unreachable while a
-// family-wide rm broadcasts its eager cache cleanup.
-func (b *runtimeBackend) reclaimOrphanLocalContainerDirs(state *cluster.AuthorityState) error {
+// family-wide rm broadcasts its eager cache cleanup. It returns how many it
+// removed.
+func (b *runtimeBackend) reclaimOrphanLocalContainerDirs(state *cluster.AuthorityState) (int, error) {
 	if b.localRoot == "" || b.dataRoot == "" || state == nil {
-		return nil
+		return 0, nil
 	}
 	entries, err := os.ReadDir(filepath.Join(b.localRoot, "containers"))
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return 0, nil
 	}
 	if err != nil {
-		return err
+		return 0, err
 	}
 	liveIDs, err := b.runtimeSandboxIDs()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	var publicationIntents []ttcstorage.Intent
 	if b.publicationQueue != nil {
 		publicationIntents, err = b.publicationQueue.Pending()
 		if err != nil {
-			return fmt.Errorf("reading publication pins before local cleanup: %w", err)
+			return 0, fmt.Errorf("reading publication pins before local cleanup: %w", err)
 		}
 	}
+	removed := 0
 	var result error
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -4947,9 +4949,11 @@ func (b *runtimeBackend) reclaimOrphanLocalContainerDirs(state *cluster.Authorit
 		}
 		if err := b.containerStore().RemoveActiveContainerState(id); err != nil {
 			result = errors.Join(result, fmt.Errorf("removing orphan local container %q: %w", id, err))
+			continue
 		}
+		removed++
 	}
-	return result
+	return removed, result
 }
 
 // dropSupersededCaptures destroys the captures this node's runtimes keep of
@@ -7417,6 +7421,11 @@ func maintainOrphanLocalCacheCleanup(authority *cluster.AuthorityCatalog, backen
 		defer timer.Stop()
 		var lastFingerprint uint64
 		initialized := false
+		// The volatile origins of the repositories a reclamation removed are
+		// no node's now, and only a reconciliation abandons them: the
+		// authority kept three for each node a branch left, for good. One
+		// that fails, as while the node joins, is tried again each pass.
+		reconcileOrigins, warnedReconcile := false, false
 		for {
 			select {
 			case <-done:
@@ -7425,7 +7434,10 @@ func maintainOrphanLocalCacheCleanup(authority *cluster.AuthorityCatalog, backen
 			}
 
 			query := cluster.AuthorityQuery{Placements: cluster.All[string](), Transactions: cluster.All[string]()}
-			if initialized {
+			if backend.distributedSource != nil && backend.distributedSource.reconcileOrigins.Swap(false) {
+				reconcileOrigins = true
+			}
+			if initialized && !reconcileOrigins {
 				// A pass finds nothing to do unless the state changed since the
 				// last; that takes no lock. Only a changed state is read again
 				// with the lock held, as a reclamation needs.
@@ -7440,7 +7452,8 @@ func maintainOrphanLocalCacheCleanup(authority *cluster.AuthorityCatalog, backen
 			if err == nil {
 				fingerprint := localCleanupAuthorityFingerprint(currentState)
 				if !initialized || fingerprint != lastFingerprint {
-					cleanupErr := backend.reclaimOrphanLocalContainerDirs(currentState)
+					reclaimed, cleanupErr := backend.reclaimOrphanLocalContainerDirs(currentState)
+					reconcileOrigins = reconcileOrigins || reclaimed != 0
 					cleanupErr = errors.Join(cleanupErr, backend.dropSupersededCaptures(currentState))
 					if cleanupErr != nil {
 						if stderr != nil {
@@ -7449,6 +7462,19 @@ func maintainOrphanLocalCacheCleanup(authority *cluster.AuthorityCatalog, backen
 					} else {
 						lastFingerprint = fingerprint
 						initialized = true
+					}
+				}
+				if reconcileOrigins {
+					unlockReclamation := backend.distributedSource.lockReclamation()
+					_, err := backend.reconcileVolatileSnapshotOrigins()
+					unlockReclamation()
+					if err != nil {
+						if stderr != nil && !warnedReconcile {
+							fmt.Fprintf(stderr, "ttcd: warning: reconciling volatile snapshot origins after local cache reclamation: %v\n", err)
+						}
+						warnedReconcile = true
+					} else {
+						reconcileOrigins, warnedReconcile = false, false
 					}
 				}
 				unlock()
