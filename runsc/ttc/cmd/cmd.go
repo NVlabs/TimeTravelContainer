@@ -7313,7 +7313,35 @@ func (b *runtimeBackend) resolveSelector(target selector) (selector, ttcbundle.C
 			return selector{}, ttcbundle.ContainerInfo{}, err
 		}
 	}
-	return b.resolveSelectorIn(info, target, nil)
+	return b.resolveSelectorWaiting(info, target)
+}
+
+// resolveSelectorWaiting is resolveSelectorIn of target in info, waiting, as
+// resolveSelector waits for the family's, for a long operation on the physical
+// runtime the branch resolves to: a remote fork's or a migration's container
+// is apart from its logical family, whose wait does not see the operations on
+// it. A removal of a branch that a fork there was copying, its lifecycle lock
+// given up, destroyed the runtime under the fork, which failed, "urpc method
+// "containerManager.ForkBranch" failed: EOF".
+func (b *runtimeBackend) resolveSelectorWaiting(info ttcbundle.ContainerInfo, target selector) (selector, ttcbundle.ContainerInfo, error) {
+	for {
+		resolved, physical, err := b.resolveSelectorIn(info, target, nil)
+		if err != nil || physical.ID == "" || physical.ID == info.ID {
+			return resolved, physical, err
+		}
+		waited, err := b.waitBusy(physical.ID)
+		if err != nil {
+			return selector{}, ttcbundle.ContainerInfo{}, err
+		}
+		if !waited {
+			return resolved, physical, nil
+		}
+		// What the claim was validated against may have changed meanwhile.
+		b.claimedAuthority.discard()
+		if info, err = b.resolveContainer(target.container); err != nil {
+			return selector{}, ttcbundle.ContainerInfo{}, err
+		}
+	}
 }
 
 // resolveSelectorIn is resolveSelector of target, whose container resolved to
@@ -18376,7 +18404,7 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 			return err
 		}
 	}
-	resolved, info, err := b.resolveSelectorIn(logicalInfo, target, nil)
+	resolved, info, err := b.resolveSelectorWaiting(logicalInfo, target)
 	if err != nil {
 		return err
 	}
