@@ -7702,7 +7702,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 				if routing != nil {
 					placements = routing
 				}
-				rerouted, claims, routeErr := daemonCommandPlacementWithCatalog(s.dataRoot, placements, request.Args)
+				rerouted, claims, routeErr := placementAfterClaims(s.dataRoot, placements, request.Args)
 				if routeErr == nil && (rerouted != "" || !daemonCommandNeedsPlacementAdmission(request.Args)) && staleRouteRetry(&stale) {
 					owner, request.PlacementClaims = rerouted, claims
 					continue

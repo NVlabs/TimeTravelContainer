@@ -3597,7 +3597,11 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 		if routing != nil {
 			placements = routing
 		}
-		if owner, claims, err := daemonCommandPlacementWithCatalog(s.dataRoot, placements, child.args); err != nil {
+		// A child waits for a start or a rehydration claiming its branch, as
+		// a command routed alone does: a dehydration of a branch that a start
+		// had just claimed was refused, "only lifecycle recovery may retry
+		// it".
+		if owner, claims, err := placementAfterClaims(s.dataRoot, placements, child.args); err != nil {
 			return childOutcome{status: 1, err: err}
 		} else {
 			if owner != "" {
