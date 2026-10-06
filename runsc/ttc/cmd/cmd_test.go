@@ -7349,6 +7349,35 @@ func TestCanceledPublicationKeepsAHandoffItMaySend(t *testing.T) {
 	}
 }
 
+// A fork's memory roots retain what the source's do, which a snapshot frozen
+// for a handoff refuses: the fork waits the handoff out before it forks the
+// runtime, rather than fork, fail and destroy its children.
+func TestGraphMemoryRootsFrozen(t *testing.T) {
+	graph, err := ttcsnapshot.Open(filepath.Join(t.TempDir(), "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := &runtimeBackend{snapshotGraph: graph}
+	object := ttcsnapshot.ObjectID{Snapshot: origin, Ordinal: 1, Kind: ttcsnapshot.ObjectKindMetadata}.String()
+	if err := b.graphMemoryRootsFrozen([]string{object}); err != nil {
+		t.Fatalf("roots of a snapshot not frozen: %v", err)
+	}
+	if err := graph.Seal(origin, ttcsnapshot.SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.FreezeSnapshotLedgerHandoff(origin); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.graphMemoryRootsFrozen([]string{object}); !frozenForAuthorityHandoff(err) {
+		t.Fatalf("roots of a frozen snapshot: %v, want a handoff's refusal", err)
+	}
+}
+
 func TestColdExecConsolePackRoundTrip(t *testing.T) {
 	shared, active := t.TempDir(), t.TempDir()
 	info := ttcbundle.ContainerInfo{ID: "physical", ConsoleLogMaxFiles: 3}

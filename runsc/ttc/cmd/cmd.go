@@ -13965,6 +13965,13 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 	args = append(args, source.container, "fork")
 	args = append(args, destinations...)
 	fork := func() ([]byte, func(bool) error, error) {
+		// The children's memory roots retain what the source's do, which a
+		// snapshot frozen for a handoff refuses once the runtime has forked:
+		// the fork destroyed its children and failed. It waits the handoff
+		// out first, as for its filesystems, before it allocates anything.
+		if err := b.graphMemoryRootsFrozen(sourceRecord.MemoryRootObjects); err != nil {
+			return nil, nil, err
+		}
 		filesystemOrigins, finishFilesystemOrigins, err := b.allocateFilesystemForkOrigins(containerInfo.ID, len(destinations))
 		if err != nil {
 			return nil, nil, err
@@ -15037,6 +15044,25 @@ func (b *runtimeBackend) graphMemoryRootsLocal(roots []string) (bool, error) {
 
 // cloneGraphMemoryRootsMany commits all roots for a batch fork in one graph
 // transaction, so no sibling can be left partially rooted after a crash.
+// graphMemoryRootsFrozen returns an error that frozenForAuthorityHandoff
+// knows if a snapshot that one of objects, a branch's memory root objects,
+// belongs to is frozen on this node for an authority handoff.
+func (b *runtimeBackend) graphMemoryRootsFrozen(objects []string) error {
+	if b.snapshotGraph == nil {
+		return nil
+	}
+	for _, encoded := range objects {
+		id, err := ttcsnapshot.ParseObjectID(encoded)
+		if err != nil {
+			continue
+		}
+		if b.snapshotGraph.SnapshotLedgerFrozen(id.Snapshot) {
+			return fmt.Errorf("snapshot %d references are frozen for authority handoff: %w", id.Snapshot, ttcsnapshot.ErrSnapshotLedgerFrozen)
+		}
+	}
+	return nil
+}
+
 func (b *runtimeBackend) cloneGraphMemoryRootsMany(sourceRoots, sourceObjects []string, snapshotID uint64, branches []ttcbundle.BranchInfo) (map[string][]string, error) {
 	result := make(map[string][]string, len(branches))
 	if len(sourceRoots) == 0 {
