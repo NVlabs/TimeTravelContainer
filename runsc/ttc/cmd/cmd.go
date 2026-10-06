@@ -14258,20 +14258,21 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 	return branches, nil
 }
 
-// forkRuntimePeerWait bounds how long a fork waits for a live Sentry that
-// could not list its branches to answer.
-var forkRuntimePeerWait = 5 * time.Second
+// durableRestorePeerWait bounds how long a restore waits for a live Sentry
+// that could not list its branches to answer.
+var durableRestorePeerWait = 5 * time.Second
 
-// forkRuntimePeer reports whether the children of a fork of a dehydrated
-// branch go into the family's Sentry on this node, which then runs: the
-// children are imported beside its branches, rather than made a runtime of
-// their own. A fully cold family may leave an OCI shell whose Sentry has
-// exited; it holds no state, and is deleted, so that it does not keep the
-// first child's runtime from being made. A Sentry that runs but could not
-// list its branches, as a loaded one may not at once, runs them still: it was
-// taken for such a shell and deleted, with every branch it ran.
-func (b *runtimeBackend) forkRuntimePeer(containerID string) (bool, error) {
-	deadline := time.Now().Add(forkRuntimePeerWait)
+// durableRestorePeer reports whether a branch made from a durable image, a
+// fork of a dehydrated branch or a rehydration, goes into the family's Sentry
+// on this node, which then runs: the branch is imported beside its branches,
+// rather than made a runtime of its own. A fully cold family may leave an OCI
+// shell whose Sentry has exited; it holds no state, and is deleted, so that it
+// does not keep the branch's runtime from being made. A Sentry that runs but
+// could not list its branches, as a loaded one may not at once, runs them
+// still: a fork took it for such a shell and deleted it, with every branch it
+// ran.
+func (b *runtimeBackend) durableRestorePeer(containerID string) (bool, error) {
+	deadline := time.Now().Add(durableRestorePeerWait)
 	for {
 		runtimes, err := b.listRuntimeFamiliesOf(containerID)
 		if err != nil {
@@ -14481,7 +14482,7 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, logicalParent strin
 		}
 	}
 
-	peer, err := b.forkRuntimePeer(info.ID)
+	peer, err := b.durableRestorePeer(info.ID)
 	if err != nil {
 		return nil, fmt.Errorf("checking the runtime of %s before forking: %w", source, err)
 	}
@@ -15900,6 +15901,16 @@ func (b *runtimeBackend) discard(target selector) error {
 		if family.ID != info.ID {
 			continue
 		}
+		if runtimeFamilyUnavailable(family) {
+			// The Sentry exited with the branch, its last, before it could
+			// be asked: the shell it left, a state whose process is gone,
+			// refused every later rehydration of the family's branches on the
+			// node, "connecting to control server ...: connection refused".
+			if _, err := b.command("delete", "--force", info.ID); err != nil {
+				return fmt.Errorf("releasing the exited runtime of %s: %w", target, err)
+			}
+			break
+		}
 		present, onlyBranch := runtimeFamilyBranchDisposition(family, target.branch)
 		if !present {
 			break
@@ -17272,19 +17283,20 @@ func (b *runtimeBackend) rehydrate(target selector) (retErr error) {
 			// A fully dehydrated family has no live Sentry. runsc may briefly
 			// retain a stopped OCI record after the last branch releases it;
 			// state then succeeds even though its control server is gone. Remove
-			// that stale shell and rebuild directly from the durable image.
-			allCold := true
-			for _, branch := range info.Branches {
-				if branch.State != "dehydrated" && branch.State != "exited" && branch.State != "stopped" {
-					allCold = false
-					break
-				}
+			// that stale shell and rebuild directly from the durable image. A
+			// shell is one whose Sentry is gone: one the family's record named a
+			// live branch of, on any node, refused the rehydration for good, and
+			// one it named none of was deleted, whether its Sentry ran or not.
+			live, err := b.durableRestorePeer(info.ID)
+			if err != nil {
+				return err
 			}
-			if !allCold {
+			if !live {
+				return rehydrateCold(false)
+			}
+			if output, branchesErr = b.command("timetravel", info.ID, "branches"); branchesErr != nil {
 				return branchesErr
 			}
-			_, _ = b.command("delete", "--force", info.ID)
-			return rehydrateCold(false)
 		}
 		var runtimeBranches []runscBranchInfo
 		if err := json.Unmarshal(output, &runtimeBranches); err != nil {

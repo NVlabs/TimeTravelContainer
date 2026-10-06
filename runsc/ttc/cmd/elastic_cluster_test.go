@@ -3195,15 +3195,15 @@ func TestReleaseCanceledImportTakesOnlyItsBranch(t *testing.T) {
 	}
 }
 
-// A fork of a dehydrated branch goes into its family's Sentry on the node if
-// one runs there. A Sentry that runs but could not list its branches, as a
+// A fork of a dehydrated branch, or a rehydration, goes into its family's
+// Sentry on the node if one runs there. A Sentry that runs but could not list its branches, as a
 // loaded one may not at once, was taken for an exited one's shell and
 // deleted, with every branch it ran.
-func TestForkRuntimePeerKeepsALiveSentry(t *testing.T) {
+func TestDurableRestorePeerKeepsALiveSentry(t *testing.T) {
 	runsc := fakeImportRuntime(t)
 	b := &runtimeBackend{root: "/runtime", runsc: runsc}
-	defer func(wait time.Duration) { forkRuntimePeerWait = wait }(forkRuntimePeerWait)
-	forkRuntimePeerWait = 300 * time.Millisecond
+	defer func(wait time.Duration) { durableRestorePeerWait = wait }(durableRestorePeerWait)
+	durableRestorePeerWait = 300 * time.Millisecond
 	for _, test := range []struct {
 		mode    string
 		peer    bool
@@ -3217,7 +3217,7 @@ func TestForkRuntimePeerKeepsALiveSentry(t *testing.T) {
 	} {
 		var peer bool
 		changes, err := fakeImportRuntimeChanges(t, runsc, test.mode, func() (err error) {
-			peer, err = b.forkRuntimePeer("family")
+			peer, err = b.durableRestorePeer("family")
 			return err
 		})
 		if test.failure == "" && (err != nil || peer != test.peer) {
