@@ -119,16 +119,38 @@ type familyOperations struct {
 	// branch, which never has one. Placement enforcement and the cleanup of
 	// branches this node does not own must leave them alone.
 	making map[string]int
+	// releasing counts, by runtime, the commands deleting a runtime they
+	// found running nothing they keep it for. A remote fork imports its
+	// branch into the family's Sentry on the node without the node's
+	// lifecycle lock, and a stop, discard or dehydration that found the
+	// Sentry running nothing deleted it under the import, which failed,
+	// "FetchSpec failed: loading container: file does not exist". A command
+	// making a branch in a runtime waits for its releases under way, and
+	// beginRelease leaves alone a runtime a command is making a branch in.
+	releasing map[string]int
+}
+
+// condLocked returns the condition broadcast when an operation ends, or a
+// runtime's making or release does.
+func (o *familyOperations) condLocked() *sync.Cond {
+	if o.ended == nil {
+		o.ended = sync.NewCond(&o.mu)
+	}
+	return o.ended
 }
 
 // beginMaking marks branches of runtime as being made until the returned
-// function is called.
+// function is called. It waits for the releases of runtime under way: the
+// command finds the runtime gone, rather than losing it later.
 func (o *familyOperations) beginMaking(runtime string, branches ...string) func() {
 	if o == nil || len(branches) == 0 {
 		return func() {}
 	}
 	keys := make([]string, len(branches))
 	o.mu.Lock()
+	for o.releasing[runtime] != 0 {
+		o.condLocked().Wait()
+	}
 	if o.making == nil {
 		o.making = make(map[string]int)
 	}
@@ -147,7 +169,60 @@ func (o *familyOperations) beginMaking(runtime string, branches ...string) func(
 					delete(o.making, key)
 				}
 			}
+			o.condLocked().Broadcast()
 		})
+	}
+}
+
+// makingInLocked reports whether a command is making a branch of runtime.
+func (o *familyOperations) makingInLocked(runtime string) bool {
+	prefix := runtime + "\x00"
+	for key := range o.making {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// beginRelease marks runtime as being released until the returned function is
+// called, unless a command is making a branch in it, when it reports false
+// and the runtime must be kept.
+func (o *familyOperations) beginRelease(runtime string) (func(), bool) {
+	if o == nil {
+		return func() {}, true
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.makingInLocked(runtime) {
+		return nil, false
+	}
+	if o.releasing == nil {
+		o.releasing = make(map[string]int)
+	}
+	o.releasing[runtime]++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			o.mu.Lock()
+			defer o.mu.Unlock()
+			if o.releasing[runtime]--; o.releasing[runtime] <= 0 {
+				delete(o.releasing, runtime)
+			}
+			o.condLocked().Broadcast()
+		})
+	}, true
+}
+
+// waitMadeIn blocks until no command is making a branch of runtime.
+func (o *familyOperations) waitMadeIn(runtime string) {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for o.makingInLocked(runtime) {
+		o.condLocked().Wait()
 	}
 }
 

@@ -8355,7 +8355,7 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 	if err != nil {
 		return 1, err
 	}
-	if len(preservedPeers) != 0 {
+	startBesidePeers := func() (int, error) {
 		info, branch, err = b.prepareFreshStartStorage(info, target, keepLocalFilesystem)
 		if err != nil {
 			return 1, err
@@ -8369,6 +8369,9 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 		}
 		return b.finishPreservedPeerStart(info, target, detach, interactive)
 	}
+	if len(preservedPeers) != 0 {
+		return startBesidePeers()
+	}
 	// Replacing the runtime would take every capture only its Sentry holds.
 	if err := b.persistResidentDehydrations(info, nil); err != nil {
 		return 1, err
@@ -8381,6 +8384,12 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 	// fail immediately.
 	waitForTeardown := true
 	if err := b.removeStoppedRuntime(info.ID, waitForTeardown); err != nil {
+		// The runtime runs a branch its record does not name as running, as
+		// one a remote fork imports into it: the start goes beside it.
+		var running *runtimeStillRunsError
+		if errors.As(err, &running) && running.branch != target.branch {
+			return startBesidePeers()
+		}
 		return 1, fmt.Errorf("preparing a fresh runtime for %s: %w", target, err)
 	}
 	info, branch, err = b.prepareFreshStartStorage(info, target, keepLocalFilesystem)
@@ -8843,6 +8852,16 @@ func (b *runtimeBackend) scheduleAutoRemove(target selector) error {
 	return nil
 }
 
+// runtimeStillRunsError is removeStoppedRuntime's refusal of a runtime that
+// still runs a branch other than main.
+type runtimeStillRunsError struct {
+	container, branch string
+}
+
+func (e *runtimeStillRunsError) Error() string {
+	return fmt.Sprintf("container %q still runs branch %q", e.container, e.branch)
+}
+
 func (b *runtimeBackend) removeStoppedRuntime(name string, waitForTeardown bool) error {
 	const (
 		teardownTimeout = 5 * time.Second
@@ -8850,40 +8869,54 @@ func (b *runtimeBackend) removeStoppedRuntime(name string, waitForTeardown bool)
 	)
 	deadline := time.Now().Add(teardownTimeout)
 	for {
-		families, err := b.listRuntimeFamiliesOf(name)
-		if err != nil {
-			return fmt.Errorf("checking runtime state before starting %q: %w", name, err)
+		done, ok := b.operations.beginRelease(name)
+		if !ok {
+			// A remote fork is importing a branch into the runtime; see
+			// familyOperations.releasing. Once listed, its branch keeps the
+			// runtime.
+			b.operations.waitMadeIn(name)
+			continue
 		}
-		found := false
-		for _, family := range families {
-			if family.ID != name {
-				continue
-			}
-			found = true
-			// The runtime's state is its loader branch's: it was "exited"
-			// while another branch of its ran, which went with it, and
-			// "dehydrated" while it ran none, and a start waited for it to stop
-			// and was refused. Its branches say whether it runs.
-			live := runtimeFamilyLiveBranch(family)
-			if live == "" || runtimeFamilyUnavailable(family) {
-				if _, err := b.command("delete", "--force", name); err != nil {
-					return fmt.Errorf("deleting unavailable runtime container %q: %w", name, err)
-				}
-				return nil
-			}
-			if !waitForTeardown || time.Now().After(deadline) {
-				if live == defaultBranchID || family.Error != "" {
-					return fmt.Errorf("container %q is already %s", name, family.State)
-				}
-				return fmt.Errorf("container %q still runs branch %q", name, live)
-			}
-			break
-		}
-		if !found {
-			return nil
+		finished, err := b.removeStoppedRuntimeOnce(name, waitForTeardown && !time.Now().After(deadline))
+		done()
+		if finished {
+			return err
 		}
 		time.Sleep(teardownPoll)
 	}
+}
+
+// removeStoppedRuntimeOnce is one look of removeStoppedRuntime, which reports
+// whether it is finished.
+func (b *runtimeBackend) removeStoppedRuntimeOnce(name string, wait bool) (bool, error) {
+	families, err := b.listRuntimeFamiliesOf(name)
+	if err != nil {
+		return true, fmt.Errorf("checking runtime state before starting %q: %w", name, err)
+	}
+	for _, family := range families {
+		if family.ID != name {
+			continue
+		}
+		// The runtime's state is its loader branch's: it was "exited"
+		// while another branch of its ran, which went with it, and
+		// "dehydrated" while it ran none, and a start waited for it to stop
+		// and was refused. Its branches say whether it runs.
+		live := runtimeFamilyLiveBranch(family)
+		if live == "" || runtimeFamilyUnavailable(family) {
+			if _, err := b.command("delete", "--force", name); err != nil {
+				return true, fmt.Errorf("deleting unavailable runtime container %q: %w", name, err)
+			}
+			return true, nil
+		}
+		if wait {
+			return false, nil
+		}
+		if live == defaultBranchID || family.Error != "" {
+			return true, fmt.Errorf("container %q is already %s", name, family.State)
+		}
+		return true, &runtimeStillRunsError{container: name, branch: live}
+	}
+	return true, nil
 }
 
 func (b *runtimeBackend) exec(request execRequest) (retStatus int, retErr error) {
@@ -13363,13 +13396,20 @@ func runtimeFamilyLiveBranch(family Family) string {
 		return defaultBranchID
 	}
 	for _, branch := range family.Branches {
-		switch normalizeLifecycleState(branch.State) {
-		case "exited", "dehydrated", "failed":
-		default:
+		if runtimeBranchLive(branch) {
 			return branch.ID
 		}
 	}
 	return ""
+}
+
+// runtimeBranchLive reports whether a branch its runtime lists may run.
+func runtimeBranchLive(branch Branch) bool {
+	switch normalizeLifecycleState(branch.State) {
+	case "exited", "dehydrated", "failed":
+		return false
+	}
+	return true
 }
 
 func persistentBranchRequiredRuntime(container ttcbundle.ContainerInfo, branchID string) bool {
@@ -16018,25 +16058,35 @@ func (b *runtimeBackend) deleteRuntimeIfProcessFree(info ttcbundle.ContainerInfo
 	if !persistentFamilyProcessFree(info) {
 		return nil
 	}
-	families, err := b.listRuntimeFamiliesOf(info.ID)
-	if err != nil {
-		return fmt.Errorf("checking process-free runtime %q: %w", info.Name, err)
-	}
-	for _, family := range families {
-		if family.ID != info.ID {
-			continue
+	return b.releaseRuntime(info.ID, func() error {
+		families, err := b.listRuntimeFamiliesOf(info.ID)
+		if err != nil {
+			return fmt.Errorf("checking process-free runtime %q: %w", info.Name, err)
 		}
-		// The last live branch is gone, and with the runtime would go every
-		// capture only its Sentry holds.
-		if err := b.persistResidentDehydrations(info, nil); err != nil {
-			return err
+		for _, family := range families {
+			if family.ID != info.ID {
+				continue
+			}
+			// A live branch the record does not name, as a remote fork's
+			// import, keeps the runtime.
+			if family.Error == "" && slices.ContainsFunc(family.Branches, func(branch Branch) bool {
+				return runtimeBranchLive(branch) &&
+					!slices.ContainsFunc(info.Branches, func(recorded ttcbundle.BranchInfo) bool { return recorded.ID == branch.ID })
+			}) {
+				return nil
+			}
+			// The last live branch is gone, and with the runtime would go every
+			// capture only its Sentry holds.
+			if err := b.persistResidentDehydrations(info, nil); err != nil {
+				return err
+			}
+			if _, err := b.command("delete", "--force", info.ID); err != nil {
+				return fmt.Errorf("deleting process-free runtime %q: %w", info.Name, err)
+			}
+			break
 		}
-		if _, err := b.command("delete", "--force", info.ID); err != nil {
-			return fmt.Errorf("deleting process-free runtime %q: %w", info.Name, err)
-		}
-		break
-	}
-	return nil
+		return nil
+	})
 }
 
 // allocateGraphSnapshotOrigin keeps the core graph independent of its ID
@@ -16682,12 +16732,20 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 			return loadErr
 		}
 		allCold, localBranches := allBranchesColdOnNode(latest, b.nodeID)
-		if allCold && localBranches != 0 && b.runtimeRunsNoBranch(info.ID) {
-			if err := b.persistResidentDehydrations(latest, &superseded); err != nil {
+		if allCold && localBranches != 0 {
+			if err := b.releaseRuntime(info.ID, func() error {
+				if !b.runtimeRunsNoBranch(info.ID) {
+					return nil
+				}
+				if err := b.persistResidentDehydrations(latest, &superseded); err != nil {
+					return err
+				}
+				if _, deleteErr := b.command("delete", "--force", info.ID); deleteErr != nil {
+					return fmt.Errorf("releasing fully dehydrated runtime: %w", deleteErr)
+				}
+				return nil
+			}); err != nil {
 				return err
-			}
-			if _, deleteErr := b.command("delete", "--force", info.ID); deleteErr != nil {
-				return fmt.Errorf("releasing fully dehydrated runtime: %w", deleteErr)
 			}
 		}
 	}
@@ -16728,6 +16786,41 @@ func (b *runtimeBackend) runtimeRunsNoBranch(id string) bool {
 	for _, family := range families {
 		if family.ID == id {
 			return runtimeFamilyLiveBranch(family) == "" || runtimeFamilyUnavailable(family)
+		}
+	}
+	return true
+}
+
+// releaseRuntime runs release, which deletes the runtime with this ID if it
+// finds the runtime running nothing it is kept for, unless a command is making
+// a branch in the runtime, which keeps it; see familyOperations.releasing.
+// release must decide from what the runtime lists once it runs: a branch
+// made before then is listed, and none is made until it returns.
+func (b *runtimeBackend) releaseRuntime(id string, release func() error) error {
+	done, ok := b.operations.beginRelease(id)
+	if !ok {
+		return nil
+	}
+	defer done()
+	return release()
+}
+
+// runtimeListsOnly reports whether the runtime with this ID lists no branch
+// but those in seen, or is gone: a command that decided from seen to delete
+// the runtime must keep it for any other, as a remote fork's import.
+func (b *runtimeBackend) runtimeListsOnly(id string, seen []Branch) bool {
+	families, err := b.listRuntimeFamiliesOf(id)
+	if err != nil {
+		return false
+	}
+	for _, family := range families {
+		if family.ID != id {
+			continue
+		}
+		for _, branch := range family.Branches {
+			if !slices.ContainsFunc(seen, func(known Branch) bool { return known.ID == branch.ID }) {
+				return false
+			}
 		}
 	}
 	return true

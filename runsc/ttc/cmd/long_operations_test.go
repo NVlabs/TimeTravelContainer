@@ -556,3 +556,55 @@ func TestCaptureWaitsForTheGateWithoutTheLifecycleLock(t *testing.T) {
 		t.Error("the capture did not take the lifecycle lock back")
 	}
 }
+
+// A runtime a command is making a branch in is not released, and a command
+// making a branch in a runtime being released waits for the release: a remote
+// fork imports its branch into the family's Sentry on the node without the
+// node's lifecycle lock.
+func TestReleaseAndMakingExcludeEachOther(t *testing.T) {
+	var operations familyOperations
+	made := operations.beginMaking("web", "b1")
+	if _, ok := operations.beginRelease("web"); ok {
+		t.Fatal("a runtime a command makes a branch in was released")
+	}
+	if release, ok := operations.beginRelease("other"); !ok {
+		t.Fatal("another runtime's release was refused")
+	} else {
+		release()
+	}
+	waited := make(chan struct{})
+	go func() {
+		operations.waitMadeIn("web")
+		close(waited)
+	}()
+	select {
+	case <-waited:
+		t.Fatal("waitMadeIn returned while a branch was being made")
+	case <-time.After(50 * time.Millisecond):
+	}
+	made()
+	select {
+	case <-waited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("waitMadeIn did not return once the branch was made")
+	}
+	release, ok := operations.beginRelease("web")
+	if !ok {
+		t.Fatal("a runtime no command makes a branch in was not released")
+	}
+	making := make(chan func(), 1)
+	go func() { making <- operations.beginMaking("web", "b2") }()
+	select {
+	case done := <-making:
+		done()
+		t.Fatal("a command made a branch in a runtime being released")
+	case <-time.After(50 * time.Millisecond):
+	}
+	release()
+	select {
+	case done := <-making:
+		done()
+	case <-time.After(5 * time.Second):
+		t.Fatal("making a branch did not go on once the release ended")
+	}
+}

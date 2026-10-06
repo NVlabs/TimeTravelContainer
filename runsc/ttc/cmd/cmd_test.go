@@ -5346,6 +5346,92 @@ exit 2
 		}
 		_ = os.Remove(runsc + ".deleted")
 	}
+
+	// A remote fork importing a branch into the runtime keeps it: the
+	// removal waits for the import, then finds its branch running, which a
+	// start goes beside.
+	b.operations = &familyOperations{}
+	if err := os.WriteFile(runsc+".mode", []byte("stopped\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	made := b.operations.beginMaking("web", "peer")
+	removed := make(chan error, 1)
+	go func() { removed <- b.removeStoppedRuntime("web", false) }()
+	select {
+	case err := <-removed:
+		t.Fatalf("removeStoppedRuntime went on during an import: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := os.WriteFile(runsc+".mode", []byte("loader-exited\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	made()
+	var running *runtimeStillRunsError
+	if err := <-removed; !errors.As(err, &running) || running.branch != "peer" {
+		t.Fatalf("removeStoppedRuntime after the import = %v, want the runtime still running the import's branch", err)
+	}
+	if _, err := os.Stat(runsc + ".deleted"); err == nil {
+		t.Fatal("the runtime was deleted under an import")
+	}
+}
+
+// A runtime its record says runs nothing is kept while it runs a branch the
+// record does not name, as one a remote fork imports into it.
+func TestProcessFreeRuntimeKeepsAnUnrecordedBranch(t *testing.T) {
+	dir := t.TempDir()
+	runsc := filepath.Join(dir, "runsc")
+	script := `#!/bin/sh
+if [ "$3" = "list" ]; then
+	printf '[{"id":"web","pid":%s,"status":"running"}]\n' "$PPID"
+	exit 0
+fi
+if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "branches" ]; then
+	case "$(cat "$0.mode")" in
+	import) echo '[{"ID":"main","State":"exited"},{"ID":"import","State":"paused"}]' ;;
+	recorded) echo '[{"ID":"main","State":"exited"}]' ;;
+	esac
+	exit 0
+fi
+if [ "$3" = "delete" ] && [ "$4" = "--force" ] && [ "$5" = "web" ]; then
+	touch "$0.deleted"
+	exit 0
+fi
+echo "unexpected command: $*" >&2
+exit 2
+`
+	if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	b := &runtimeBackend{root: "/runtime", runsc: runsc, operations: &familyOperations{}}
+	info := ttcbundle.ContainerInfo{ID: "web", Name: "web", Branches: []ttcbundle.BranchInfo{{ID: "main", State: "exited"}}}
+	for _, test := range []struct {
+		mode    string
+		deleted bool
+	}{
+		{mode: "import"},
+		{mode: "recorded", deleted: true},
+	} {
+		if err := os.WriteFile(runsc+".mode", []byte(test.mode+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.deleteRuntimeIfProcessFree(info); err != nil {
+			t.Fatalf("deleteRuntimeIfProcessFree(%s): %v", test.mode, err)
+		}
+		_, statErr := os.Stat(runsc + ".deleted")
+		if deleted := statErr == nil; deleted != test.deleted {
+			t.Errorf("deleteRuntimeIfProcessFree(%s) deleted the runtime: %t, want %t", test.mode, deleted, test.deleted)
+		}
+		_ = os.Remove(runsc + ".deleted")
+	}
+	// Nor is it released while a command makes a branch in it.
+	made := b.operations.beginMaking("web", "import")
+	defer made()
+	if err := b.deleteRuntimeIfProcessFree(info); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(runsc + ".deleted"); err == nil {
+		t.Error("the runtime was released while a command made a branch in it")
+	}
 }
 
 // A removal that destroyed its branch in the Sentry and failed after leaves

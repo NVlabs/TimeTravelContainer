@@ -4644,7 +4644,14 @@ func (b *runtimeBackend) cleanupNonOwnedRuntimeBranches() error {
 		}
 		if !physicalLocalOwned {
 			if !protectedMigration {
-				result = errors.Join(result, b.purgeRuntime(info.ID))
+				// Unless a remote fork imports a branch into it, which keeps it.
+				seen := runtimeFamily.Branches
+				result = errors.Join(result, b.releaseRuntime(info.ID, func() error {
+					if !b.runtimeListsOnly(info.ID, seen) {
+						return nil
+					}
+					return b.purgeRuntime(info.ID)
+				}))
 			}
 			// A family containing only a still-active migration source must be
 			// retained whole. Rechecking the transaction per branch creates a
@@ -5136,9 +5143,16 @@ func (b *runtimeBackend) dropSupersededCaptures(state *cluster.AuthorityState) e
 			continue
 		}
 		// A Sentry keeps its family's last branch: a runtime of nothing but
-		// superseded captures goes whole.
+		// superseded captures goes whole, unless a remote fork imports a
+		// branch into it, which keeps it.
 		if len(superseded) == len(family.Branches) {
-			result = errors.Join(result, b.purgeRuntime(family.ID))
+			id, seen := family.ID, family.Branches
+			result = errors.Join(result, b.releaseRuntime(id, func() error {
+				if !b.runtimeListsOnly(id, seen) {
+					return nil
+				}
+				return b.purgeRuntime(id)
+			}))
 			continue
 		}
 		for _, branch := range superseded {

@@ -1203,6 +1203,10 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 	if err != nil {
 		return err
 	}
+	// The import takes no lifecycle lock: keep a release of the runtime from
+	// deleting it from under the branch until the runtime lists the branch,
+	// once the restore below returns; see familyOperations.releasing.
+	defer r.backend.operations.beginMaking(info.ID, targetBranch.ID)()
 	info, err = r.backend.containerStore().RefreshContainerImageRoot(ctx, info.ID)
 	if err != nil {
 		return fmt.Errorf("materializing target image cache: %w", err)
