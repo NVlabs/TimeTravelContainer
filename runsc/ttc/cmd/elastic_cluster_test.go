@@ -3231,3 +3231,94 @@ func TestForkRuntimePeerKeepsALiveSentry(t *testing.T) {
 		}
 	}
 }
+
+// A removal claims an unplaced branch before it deletes any of it, and waits
+// for a claim another node made first. A removal that deleted the branch's
+// record first, and found the branch claimed by a start elsewhere after,
+// failed, and left a placement no command could load or remove.
+func TestRemovalClaimsAnUnplacedBranchFirst(t *testing.T) {
+	root := t.TempDir()
+	placements, err := cluster.OpenPlacementStore(filepath.Join(root, "cluster", "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := cluster.OpenNodeDirectory(filepath.Join(root, "cluster", "nodes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	node, err := directory.Register(testElasticCapacityRecord("node-a", 0, 1<<60), now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node, err = directory.Transition(node.NodeID, node.Incarnation, cluster.NodeReady, now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	backend := &runtimeBackend{dataRoot: root, nodeID: "node-a", distributedSource: &distributedSourceRuntime{directory: directory, placements: placements}}
+	create := func(branch, owner string, state cluster.PlacementState, at time.Time) *cluster.PlacementRecord {
+		t.Helper()
+		record := cluster.PlacementRecord{FamilyID: "web", BranchID: branch, State: state}
+		if owner != "" {
+			record.OwnerNode, record.OwnerIncarnation, record.PhysicalContainer, record.PhysicalBranch = owner, "boot-"+owner, "web", branch
+		}
+		created, err := placements.Create(record, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return created
+	}
+	claimedHere := func(branch string) {
+		t.Helper()
+		record, err := placements.Lookup("web", branch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if record.OwnerNode != "node-a" || record.OwnerIncarnation != node.Incarnation || record.State != cluster.PlacementMaterializing {
+			t.Fatalf("%s: placement %+v, want claimed by node-a", branch, record)
+		}
+	}
+
+	create("cold", "", cluster.PlacementUnplaced, now)
+	if err := backend.claimUnplacedForRemoval("web", "cold", "web", "cold"); err != nil {
+		t.Fatal(err)
+	}
+	claimedHere("cold")
+
+	// A start elsewhere claimed it first, and failed, giving it up.
+	failed := create("failed-start", "node-b", cluster.PlacementMaterializing, now)
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		_, _ = placements.Unplace("web", "failed-start", "node-b", "boot-node-b", failed.Generation, time.Now())
+	}()
+	if err := backend.claimUnplacedForRemoval("web", "failed-start", "web", "failed-start"); err != nil {
+		t.Fatal(err)
+	}
+	claimedHere("failed-start")
+
+	// A start elsewhere claimed it first, and ran it there.
+	started := create("started", "node-b", cluster.PlacementMaterializing, now)
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		_, _ = placements.UpdateStableState("web", "started", "node-b", "boot-node-b", started.Generation, cluster.PlacementRunning, time.Now())
+	}()
+	var elsewhere *remoteBranchOwnershipError
+	if err := backend.claimUnplacedForRemoval("web", "started", "web", "started"); !errors.As(err, &elsewhere) || elsewhere.owner != "node-b" {
+		t.Fatalf("removing a branch a start ran elsewhere meanwhile: %v, want it owned by node-b", err)
+	}
+
+	// A claim a failed start left long ago is lifecycle recovery's.
+	create("abandoned", "node-b", cluster.PlacementMaterializing, now.Add(-2*materializingClaimWait))
+	var abandoned *branchMaterializingError
+	if err := backend.claimUnplacedForRemoval("web", "abandoned", "web", "abandoned"); !errors.As(err, &abandoned) {
+		t.Fatalf("removing a branch a failed start left claimed: %v, want refused", err)
+	}
+
+	// A branch this node runs is the removal's as it is.
+	running := create("running", "node-a", cluster.PlacementRunning, now)
+	if err := backend.claimUnplacedForRemoval("web", "running", "web", "running"); err != nil {
+		t.Fatal(err)
+	}
+	if record, err := placements.Lookup("web", "running"); err != nil || record.Generation != running.Generation || record.State != cluster.PlacementRunning {
+		t.Fatalf("a branch this node runs: placement %+v, %v, want it as it was", record, err)
+	}
+}

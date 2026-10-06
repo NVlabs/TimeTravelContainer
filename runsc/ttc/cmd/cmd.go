@@ -11246,6 +11246,65 @@ func (b *runtimeBackend) removeLogicalBranchPlacement(familyID, branchID string)
 	return b.retireTransactionsForRemovedPlacement(*record)
 }
 
+// claimUnplacedForRemoval claims an unplaced branch, which any node may claim
+// to start or rehydrate it, for the removal under way on this node, before
+// the removal deletes any of it: a start elsewhere then waits for the removal
+// as for any claim, and a claim another node made first is waited for. A
+// removal that deleted the branch's record first, and then found the branch
+// claimed, failed, and left a placement that no command could load or
+// remove; a start that had read the record before could have run the branch
+// from the storage the removal deleted.
+func (b *runtimeBackend) claimUnplacedForRemoval(familyID, branchID, physicalContainer, physicalBranch string) error {
+	if b.nodeID == "" || b.distributedSource == nil || b.distributedSource.directory == nil {
+		return nil
+	}
+	placements, err := b.placementCatalog()
+	if err != nil {
+		return err
+	}
+	delay := 25 * time.Millisecond
+	for {
+		record, err := placements.Lookup(familyID, branchID)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		target := selector{container: familyID, branch: branchID}
+		switch {
+		case record.State == cluster.PlacementUnplaced:
+			node, err := b.renewDistributedExecutionAuthority()
+			if err != nil {
+				return fmt.Errorf("renewing placement authority to remove %s: %w", target, err)
+			}
+			_, claimErr := placements.ClaimUnplaced(familyID, branchID, node.NodeID, node.Incarnation, physicalContainer, physicalBranch, record.Generation, cluster.PlacementMaterializing, time.Now())
+			if claimErr == nil {
+				return nil
+			}
+			// Another node may have claimed it first; a claim that fails
+			// with the placement as it was fails for good.
+			current, lookupErr := placements.Lookup(familyID, branchID)
+			if lookupErr == nil && current.State == cluster.PlacementUnplaced && current.Generation == record.Generation {
+				return fmt.Errorf("claiming %s for removal: %w", target, claimErr)
+			}
+			continue
+		case record.State == cluster.PlacementMaterializing && record.OwnerNode != b.nodeID:
+			if time.Since(record.UpdatedAt) >= materializingClaimWait {
+				return &branchMaterializingError{branch: target, owner: record.OwnerNode, claimedAt: record.UpdatedAt}
+			}
+		case (record.State == cluster.PlacementRunning || record.State == cluster.PlacementPaused) && record.OwnerNode != b.nodeID:
+			// A start elsewhere ran it, having claimed it as the removal was
+			// routed here.
+			return &remoteBranchOwnershipError{target: target, owner: record.OwnerNode}
+		default:
+			return nil
+		}
+		time.Sleep(delay)
+		delay = min(2*delay, 500*time.Millisecond)
+	}
+}
+
 // distributedFamilyHasPeerPlacement reports whether a physical runtime's
 // final branch is only locally final, while another logical branch in the same
 // family still exists elsewhere in the cluster. Physical containers are an
@@ -18158,6 +18217,9 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 				return fmt.Errorf("branch %q disappeared while fencing publication", target.branch)
 			}
 		}
+	}
+	if err := b.claimUnplacedForRemoval(logicalFamily, requested.branch, info.ID, target.branch); err != nil {
+		return err
 	}
 	remaining := len(info.Branches)
 	logicalPeers, err := b.distributedFamilyHasPeerPlacement(logicalFamily, requested.branch)
