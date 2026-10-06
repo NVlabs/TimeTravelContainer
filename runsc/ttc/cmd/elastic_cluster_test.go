@@ -3345,3 +3345,30 @@ func TestRuntimeRunsNoBranch(t *testing.T) {
 		}
 	}
 }
+
+// A dehydration parks the roots it supersedes with its family while its
+// Sentry has other branches, which may still load pages of the image the
+// roots name.
+func TestRuntimeHasOtherBranches(t *testing.T) {
+	runsc := fakeImportRuntime(t)
+	b := &runtimeBackend{root: "/runtime", runsc: runsc}
+	for _, test := range []struct {
+		mode, branch string
+		want         bool
+	}{
+		{"beside", "fork-import", true},
+		{"alone", "fork-import", false},
+		{"elsewhere", "main", false},
+		{"elsewhere", "fork-import", true},
+		{"absent", "main", false},
+		{"dead", "main", false},
+		{"unknown", "main", true},
+	} {
+		if err := os.WriteFile(runsc+".mode", []byte(test.mode+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if got := b.runtimeHasOtherBranches("family", test.branch); got != test.want {
+			t.Errorf("%s, %s: runtimeHasOtherBranches = %t, want %t", test.mode, test.branch, got, test.want)
+		}
+	}
+}

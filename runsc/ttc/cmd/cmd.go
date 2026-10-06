@@ -16621,6 +16621,19 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 			return nil
 		}
 	}
+	// The Sentry's other branches may still load pages of the image this
+	// branch was restored from: its forks share its memory and its loaders,
+	// as imports do the units they reuse. The dehydration supersedes the
+	// branch's roots of that image, and releasing them let the image go while
+	// they loaded from it: the relay of its packs, retired, failed their
+	// loader, and every process they started crashed. The roots go to the
+	// family, as a stop's and a removal's do, which releases them once those
+	// loaders are done.
+	if b.dataRoot != "" && b.runtimeHasOtherBranches(target.container, target.branch) {
+		if info, persistentBranch, err = b.parkBranchMemoryGraph(info, persistentBranch); err != nil {
+			return err
+		}
+	}
 	// The family's resident dehydrations below share pages with the image
 	// this one supersedes; see persistResidentDehydrations.
 	var superseded []func()
@@ -16649,6 +16662,26 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		}
 	}
 	return nil
+}
+
+// runtimeHasOtherBranches reports whether the runtime with this ID has a branch
+// other than branchID, or may have: a live Sentry that cannot list its branches
+// may have any.
+func (b *runtimeBackend) runtimeHasOtherBranches(id, branchID string) bool {
+	families, err := b.listRuntimeFamiliesOf(id)
+	if err != nil {
+		return true
+	}
+	for _, family := range families {
+		if family.ID != id {
+			continue
+		}
+		if family.Error != "" {
+			return !runtimeFamilyUnavailable(family)
+		}
+		return slices.ContainsFunc(family.Branches, func(branch Branch) bool { return branch.ID != branchID })
+	}
+	return false
 }
 
 // runtimeRunsNoBranch reports whether the runtime with this ID runs no branch,
