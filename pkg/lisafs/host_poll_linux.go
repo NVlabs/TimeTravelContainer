@@ -85,10 +85,21 @@ type requestWaiter struct {
 }
 
 func newRequestWaiter(fd int) *requestWaiter {
-	w := &requestWaiter{fd: int32(fd)}
+	w := &requestWaiter{fd: -1}
 	w.entry, w.ch = waiter.NewChannelEntry(requestEvents)
 	w.queue.EventRegister(&w.entry)
-	w.watched = fdnotifier.AddFD(w.fd, &w.queue) == nil
+	// The epoll watches a descriptor of the waiter's own. Closing a socket's
+	// last descriptor takes it out of every epoll, with the hangup that its
+	// shutdown, as its owner closes it, had just raised: a connection whose
+	// socket its owner closed waited for the hangup for good, and its
+	// server's Wait with it.
+	if dup, err := unix.Dup(fd); err == nil {
+		if fdnotifier.AddFD(int32(dup), &w.queue) == nil {
+			w.fd, w.watched = int32(dup), true
+		} else {
+			_ = unix.Close(dup)
+		}
+	}
 	return w
 }
 
@@ -105,6 +116,7 @@ func (w *requestWaiter) wait() {
 func (w *requestWaiter) close() {
 	if w.watched {
 		fdnotifier.RemoveFD(w.fd)
+		_ = unix.Close(int(w.fd))
 	}
 	w.queue.EventUnregister(&w.entry)
 }
