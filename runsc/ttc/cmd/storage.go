@@ -1071,6 +1071,7 @@ func (p *branchPublisher) Cleanup(intent ttcstorage.Intent) error {
 		filesystemOrigins[filesystem.Root.Source] = append(filesystemOrigins[filesystem.Root.Source], filesystem.Origins...)
 	}
 	emptyFilesystemOrigins := make(map[uint64]bool)
+	keptHandoffs := make(map[uint64]bool)
 	for _, config := range repositories {
 		path := filepath.Clean(config.Path)
 		if _, ok := seen[path]; ok {
@@ -1109,6 +1110,18 @@ func (p *branchPublisher) Cleanup(intent ttcstorage.Intent) error {
 				return providerErr
 			}
 			if volatile && provider.NodeID == p.nodeID {
+				cancel, rollForward, err := p.canceledOriginHandoff(intent, origin)
+				if err != nil {
+					repository.Close()
+					return err
+				}
+				if !cancel {
+					keptHandoffs[encodedOrigin] = true
+					if rollForward {
+						defer p.rollForwardRepositoryOrigin(path, ttcvolume.CopyMode(config.CopyMode), origin)
+					}
+					continue
+				}
 				if err := repository.CancelOriginHandoff(origin); err != nil {
 					repository.Close()
 					return fmt.Errorf("canceling filesystem origin %d handoff: %w", origin, err)
@@ -1140,6 +1153,9 @@ func (p *branchPublisher) Cleanup(intent ttcstorage.Intent) error {
 		if !canceled {
 			break
 		}
+		if keptHandoffs[encodedOrigin] {
+			continue
+		}
 		provider, volatile, err := p.authority.SnapshotProvider(encodedOrigin)
 		if err != nil {
 			return err
@@ -1170,7 +1186,17 @@ func (p *branchPublisher) Cleanup(intent ttcstorage.Intent) error {
 		if err != nil {
 			return err
 		}
-		if volatile && provider.NodeID == p.nodeID {
+		cancel := volatile && provider.NodeID == p.nodeID
+		if cancel {
+			var rollForward bool
+			if cancel, rollForward, err = p.canceledOriginHandoff(intent, snapshot); err != nil {
+				return err
+			}
+			if rollForward {
+				p.rollForwardFrozenOrigin(snapshot)
+			}
+		}
+		if cancel {
 			if err := p.graph.UnfreezeSnapshotLedger(snapshot); err != nil {
 				return fmt.Errorf("canceling memory origin %d handoff: %w", snapshot, err)
 			}
@@ -1202,6 +1228,64 @@ func (p *branchPublisher) Cleanup(intent ttcstorage.Intent) error {
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+// canceledOriginHandoff says what a canceled publication's cleanup does with
+// its handoff of origin, frozen on this node, by the bridge recorded for
+// origin. A publication records its bridge before it first contacts the
+// shared coordinator. Without one, no coordinator holds anything of the
+// handoff, which is canceled. One of the publication's own may have reached
+// the coordinator, which then holds the handoff's baseline and its mutations
+// as numbered: the handoff goes on as the origin's own, as a roll-forward,
+// and the origin becomes shared. Canceled, its next handoff numbered its
+// mutations from one again, which the coordinator refused for good, "handoff
+// retry does not match mutation 1", and the origin stayed frozen: a fork of a
+// branch sharing it waited five minutes, and every command of the family
+// behind it. One of another operation's, which froze origin as well, is that
+// operation's to finish.
+func (p *branchPublisher) canceledOriginHandoff(intent ttcstorage.Intent, origin ttcsnapshot.SnapshotID) (cancel, rollForward bool, err error) {
+	cancel, adopt, err := canceledOriginHandoffBridge(p.sharedRoot, intent.PublicationID, origin)
+	if err != nil || !adopt {
+		return cancel, false, err
+	}
+	state, err := p.authority.AuthorityStateOf(cluster.AuthorityQuery{
+		Transactions: cluster.All[string](), Publications: cluster.All[string](),
+	})
+	if err != nil {
+		return false, false, fmt.Errorf("reading publication bridge authority: %w", err)
+	}
+	if err := adoptOriginHandoff(p.sharedRoot, origin, state); err != nil {
+		return false, false, err
+	}
+	return false, true, nil
+}
+
+// canceledOriginHandoffBridge reports, by the bridge recorded for origin,
+// whether the canceled publication publicationID cancels its handoff of
+// origin, or adopts it as the origin's own (see canceledOriginHandoff).
+func canceledOriginHandoffBridge(sharedRoot, publicationID string, origin ttcsnapshot.SnapshotID) (cancel, adopt bool, err error) {
+	bridge, found, err := loadSharedPublicationBridgeIntent(sharedRoot, origin)
+	if err != nil {
+		return false, false, err
+	}
+	if !found {
+		return true, false, nil
+	}
+	return false, bridge.Kind == sharedPublicationBridgePublication && bridge.PublicationID == publicationID, nil
+}
+
+// adoptOriginHandoff records the handoff of origin, which a publication that
+// state says has ended began, as the origin's own, which a roll-forward
+// completes.
+func adoptOriginHandoff(sharedRoot string, origin ttcsnapshot.SnapshotID, state *cluster.AuthorityState) error {
+	own := sharedPublicationBridgeIntent{
+		Version: sharedPublicationBridgeIntentVersion, Snapshot: uint64(origin),
+		Kind: sharedPublicationBridgeOrigin, CreatedAt: time.Now().UTC(),
+	}
+	if err := persistSharedPublicationBridgeIntentWithAuthority(sharedRoot, own, state); err != nil {
+		return fmt.Errorf("adopting snapshot origin %d handoff: %w", origin, err)
 	}
 	return nil
 }

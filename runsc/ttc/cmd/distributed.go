@@ -2583,71 +2583,135 @@ func (b *runtimeBackend) resumeFrozenFilesystemOrigin(origin ttcsnapshot.Snapsho
 	}
 	unlockOrigin := b.distributedSource.lockSnapshotOrigin(origin)
 	defer unlockOrigin()
-	// Only the exact retry of the operation that recorded a bridge may reuse
-	// it. Without one recorded yet, the handoff proceeds as the origin's own.
-	bridgeIntent, found, err := loadSharedPublicationBridgeIntent(b.dataRoot, origin)
-	if err != nil {
-		return err
-	}
-	if !found {
-		bridgeIntent = sharedPublicationBridgeIntent{Kind: sharedPublicationBridgeOrigin}
-	} else if bridgeIntent.Kind == sharedPublicationBridgePublication {
-		return errFrozenOriginOwned
-	}
-	provider, volatile, terminal, err := snapshotOriginAuthority(b.distributedSource.authority, origin)
-	if err != nil {
-		return err
-	}
 	publisher := &branchPublisher{
 		sharedRoot: b.dataRoot,
 		nodeID:     b.nodeID, incarnation: b.distributedSource.incarnation,
 		authority: b.distributedSource.authority, graphShared: b.snapshotShared,
 		sharedRefs: b.sharedReferences, peers: b.distributedSource,
 	}
+	handoff, err := publisher.frozenOriginHandoff(origin)
+	if err != nil {
+		return err
+	}
 	_, err = b.containerStore().WithFilesystemSnapshotOrigin(origin, func(repository *ttcvolume.Repository) error {
-		if !repository.OriginHandoffFrozen(origin) {
-			return nil
-		}
-		if terminal {
-			// The origin was abandoned or retired: no handoff of it
-			// completes, and no shared ledger counts its references any more.
-			return repository.CancelOriginHandoff(origin)
-		}
-		if volatile && provider.NodeID != b.nodeID {
-			return fmt.Errorf("filesystem origin %d is frozen here but provided by node %q", origin, provider.NodeID)
-		}
-		if err := b.snapshotShared.CheckManifest(origin); err != nil {
-			return fmt.Errorf("reading frozen filesystem origin %d manifest: %w", origin, err)
-		}
-		if volatile {
-			changes, err := repository.FreezeOriginHandoff(origin)
-			if err != nil {
-				return fmt.Errorf("reading filesystem origin %d reference handoff: %w", origin, err)
-			}
-			if err := publisher.publishSharedReferenceLedger(origin, changes, bridgeIntent); err != nil {
-				return fmt.Errorf("transferring filesystem origin %d reference authority: %w", origin, err)
-			}
-			references, _ := repository.OriginReferences(origin)
-			if err := publisher.keepProviderReferences(origin, repository.Path(), references); err != nil {
-				return err
-			}
-			if err := b.distributedSource.authority.PublishSnapshotOrigin(b.nodeID, b.distributedSource.incarnation, uint64(origin)); err != nil {
-				return fmt.Errorf("publishing filesystem origin %d authority: %w", origin, err)
-			}
-		}
-		if err := repository.CompleteOriginHandoff(origin); err != nil {
-			return fmt.Errorf("completing filesystem origin %d handoff: %w", origin, err)
-		}
-		// A graph handoff's bridge lasts until its transaction ends, when the
-		// shared coordinator releases it. The origin's own ends here.
-		if bridgeIntent.Kind == sharedPublicationBridgeOrigin {
-			if err := publisher.releaseSharedPublicationBridge(origin); err != nil {
-				return fmt.Errorf("releasing filesystem origin %d publication bridge: %w", origin, err)
-			}
-		}
-		return nil
+		return publisher.completeRepositoryOriginHandoff(repository, origin, handoff)
 	})
 	return err
+}
+
+// frozenOriginHandoff is what the roll-forward of origin's frozen handoff
+// goes on with: the operation whose bridge it continues, and what the
+// authority says of origin.
+type frozenOriginHandoff struct {
+	bridge   sharedPublicationBridgeIntent
+	provider cluster.SnapshotOriginProvider
+	volatile bool
+	terminal bool
+}
+
+// frozenOriginHandoff reads what a roll-forward of origin's frozen handoff
+// needs. Only the exact retry of the operation that recorded a bridge may
+// reuse it; without one recorded yet, the handoff proceeds as the origin's
+// own. A branch publication's the publication queue resumes.
+func (p *branchPublisher) frozenOriginHandoff(origin ttcsnapshot.SnapshotID) (frozenOriginHandoff, error) {
+	bridge, found, err := loadSharedPublicationBridgeIntent(p.sharedRoot, origin)
+	if err != nil {
+		return frozenOriginHandoff{}, err
+	}
+	if !found {
+		bridge = sharedPublicationBridgeIntent{Kind: sharedPublicationBridgeOrigin}
+	} else if bridge.Kind == sharedPublicationBridgePublication {
+		return frozenOriginHandoff{}, errFrozenOriginOwned
+	}
+	provider, volatile, terminal, err := snapshotOriginAuthority(p.authority, origin)
+	if err != nil {
+		return frozenOriginHandoff{}, err
+	}
+	return frozenOriginHandoff{bridge: bridge, provider: provider, volatile: volatile, terminal: terminal}, nil
+}
+
+// completeRepositoryOriginHandoff completes the frozen handoff of origin, a
+// filesystem origin of repository, as handoff describes it. The handoff's
+// pack exists, so it starts at the freeze: PublishOriginHandoff would first
+// sync metadata, which the freeze refuses.
+func (p *branchPublisher) completeRepositoryOriginHandoff(repository *ttcvolume.Repository, origin ttcsnapshot.SnapshotID, handoff frozenOriginHandoff) error {
+	if !repository.OriginHandoffFrozen(origin) {
+		return nil
+	}
+	if handoff.terminal {
+		// The origin was abandoned or retired: no handoff of it completes, and
+		// no shared ledger counts its references any more.
+		return repository.CancelOriginHandoff(origin)
+	}
+	if handoff.volatile && handoff.provider.NodeID != p.nodeID {
+		return fmt.Errorf("filesystem origin %d is frozen here but provided by node %q", origin, handoff.provider.NodeID)
+	}
+	if err := p.graphShared.CheckManifest(origin); err != nil {
+		return fmt.Errorf("reading frozen filesystem origin %d manifest: %w", origin, err)
+	}
+	if handoff.volatile {
+		changes, err := repository.FreezeOriginHandoff(origin)
+		if err != nil {
+			return fmt.Errorf("reading filesystem origin %d reference handoff: %w", origin, err)
+		}
+		if err := p.publishSharedReferenceLedger(origin, changes, handoff.bridge); err != nil {
+			return fmt.Errorf("transferring filesystem origin %d reference authority: %w", origin, err)
+		}
+		references, _ := repository.OriginReferences(origin)
+		if err := p.keepProviderReferences(origin, repository.Path(), references); err != nil {
+			return err
+		}
+		if err := p.authority.PublishSnapshotOrigin(p.nodeID, p.incarnation, uint64(origin)); err != nil {
+			return fmt.Errorf("publishing filesystem origin %d authority: %w", origin, err)
+		}
+	}
+	if err := repository.CompleteOriginHandoff(origin); err != nil {
+		return fmt.Errorf("completing filesystem origin %d handoff: %w", origin, err)
+	}
+	// A graph handoff's bridge lasts until its transaction ends, when the
+	// shared coordinator releases it. The origin's own ends here.
+	if handoff.bridge.Kind == sharedPublicationBridgeOrigin {
+		if err := p.releaseSharedPublicationBridge(origin); err != nil {
+			return fmt.Errorf("releasing filesystem origin %d publication bridge: %w", origin, err)
+		}
+	}
+	return nil
+}
+
+// rollForwardRepositoryOrigin completes, in the background, the frozen
+// handoff of origin, a filesystem origin of the repository at path, retrying
+// until it completes, as rollForwardFrozenFilesystemOrigin does an origin it
+// finds by its ID.
+func (p *branchPublisher) rollForwardRepositoryOrigin(path string, mode ttcvolume.CopyMode, origin ttcsnapshot.SnapshotID) {
+	if p == nil || p.peers == nil || origin == 0 {
+		return
+	}
+	if _, running := p.peers.rollingForward.LoadOrStore(origin, struct{}{}); running {
+		return
+	}
+	go func() {
+		defer p.peers.rollingForward.Delete(origin)
+		for delay := time.Second; ; delay = min(2*delay, 30*time.Second) {
+			err := func() error {
+				unlock := p.peers.lockSnapshotOrigin(origin)
+				defer unlock()
+				handoff, err := p.frozenOriginHandoff(origin)
+				if err != nil {
+					return err
+				}
+				repository, err := ttcvolume.OpenRepository(path, mode)
+				if err != nil {
+					return err
+				}
+				return errors.Join(p.completeRepositoryOriginHandoff(repository, origin, handoff), repository.Close())
+			}()
+			if err == nil || errors.Is(err, errFrozenOriginOwned) {
+				return
+			}
+			fmt.Fprintf(os.Stderr, "ttcd: completing the frozen handoff of filesystem origin %d: %v\n", origin, err)
+			time.Sleep(delay)
+		}
+	}()
 }
 
 // rollForwardFrozenFilesystemOrigin completes, in the background, the

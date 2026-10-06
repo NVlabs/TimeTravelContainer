@@ -7313,6 +7313,42 @@ func TestLifecycleStateRefusal(t *testing.T) {
 	}
 }
 
+// A canceled publication's cleanup canceled every handoff it began. One that
+// had reached the shared coordinator, which then held its baseline and its
+// mutations as numbered, began again from one, which the coordinator refused
+// for good, "handoff retry does not match mutation 1": the origin stayed
+// frozen, and every fork sharing it waited. A handoff whose bridge the
+// publication recorded, as it does before it contacts the coordinator, is
+// adopted as the origin's own and rolled forward; one another operation
+// recorded is that one's; one with no bridge is canceled.
+func TestCanceledPublicationKeepsAHandoffItMaySend(t *testing.T) {
+	root := t.TempDir()
+	const ours, theirs = "publication-ours", "publication-theirs"
+	for origin, intent := range map[ttcsnapshot.SnapshotID]sharedPublicationBridgeIntent{
+		2: {Kind: sharedPublicationBridgePublication, Family: "family", Branch: "main", PublicationID: ours},
+		3: {Kind: sharedPublicationBridgePublication, Family: "family", Branch: "other", PublicationID: theirs},
+		4: {Kind: sharedPublicationBridgeOrigin},
+	} {
+		intent.Version, intent.Snapshot, intent.CreatedAt = sharedPublicationBridgeIntentVersion, uint64(origin), time.Now().UTC()
+		if err := persistSharedPublicationBridgeIntent(root, intent); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for origin, want := range map[ttcsnapshot.SnapshotID][2]bool{1: {true, false}, 2: {false, true}, 3: {false, false}, 4: {false, false}} {
+		cancel, adopt, err := canceledOriginHandoffBridge(root, ours, origin)
+		if err != nil || cancel != want[0] || adopt != want[1] {
+			t.Errorf("origin %d: cancel %t, adopt %t, %v; want %t, %t", origin, cancel, adopt, err, want[0], want[1])
+		}
+	}
+	// The canceled publication is no longer live in the authority.
+	if err := adoptOriginHandoff(root, 2, &cluster.AuthorityState{}); err != nil {
+		t.Fatal(err)
+	}
+	if bridge, found, err := loadSharedPublicationBridgeIntent(root, 2); err != nil || !found || bridge.Kind != sharedPublicationBridgeOrigin {
+		t.Fatalf("adopted handoff's bridge: %+v, %t, %v; want the origin's own", bridge, found, err)
+	}
+}
+
 func TestColdExecConsolePackRoundTrip(t *testing.T) {
 	shared, active := t.TempDir(), t.TempDir()
 	info := ttcbundle.ContainerInfo{ID: "physical", ConsoleLogMaxFiles: 3}
