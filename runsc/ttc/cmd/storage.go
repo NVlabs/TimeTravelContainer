@@ -2899,12 +2899,15 @@ func (b *runtimeBackend) prepareColdFilesystemRelays(info ttcbundle.ContainerInf
 		relays.clients = append(relays.clients, client)
 		relays.done = append(relays.done, done)
 	}
-	if manifest.MemorySnapshot != 0 {
-		// Graph-native memory is resolved independently through the snapshot
-		// origin resolver.
-		return relays, nil
-	}
-	return fail(errors.New("new-format cold manifest omits graph-native memory snapshot"))
+	// Graph-native memory is resolved independently through the snapshot
+	// origin resolver, from the capture restored, which the manifest need
+	// not describe: a branch dehydrated again names its last publication's
+	// manifest, a stop's as well, until its new publication commits, and the
+	// files of its repository that the last publication left lazy still read
+	// through it. Refusing a manifest without memory failed the start of a
+	// fork of such a branch, "new-format cold manifest omits graph-native
+	// memory snapshot".
+	return relays, nil
 }
 
 // prepareColdDirectFilesystemSources opens the process-free equivalent of
