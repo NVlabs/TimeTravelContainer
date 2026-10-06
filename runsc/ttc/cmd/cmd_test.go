@@ -8293,6 +8293,31 @@ func TestOriginCleanupPassesOverALockedOrigin(t *testing.T) {
 	}
 }
 
+// A removal ends with the node's reconciliation of its volatile origins,
+// which reads every repository of the node. One the node could not read
+// failed the removal after its branch's memory and filesystems were gone,
+// and left the branch recorded without them. The removal finishes, and the
+// node's maintenance tries the reconciliation again.
+func TestRemovalLeavesAFailedOriginReconciliationToTheNode(t *testing.T) {
+	// No node catalog: renewing the node's authority, the reconciliation's
+	// first step, fails.
+	source := &distributedSourceRuntime{authority: &cluster.AuthorityCatalog{}, incarnation: "incarnation-1"}
+	var stderr bytes.Buffer
+	b := &runtimeBackend{nodeID: "n1", distributedSource: source, stderr: &stderr}
+	if err := b.removingBranches(func() error {
+		b.removals.originsDue = true
+		return nil
+	}); err != nil {
+		t.Fatalf("removal failed on the node's origin reconciliation: %v", err)
+	}
+	if !source.reconcileOrigins.Load() {
+		t.Fatal("the failed reconciliation was not left to the node's maintenance")
+	}
+	if !strings.Contains(stderr.String(), "reconciling snapshot providers") {
+		t.Fatalf("the removal did not warn of the failed reconciliation: %q", stderr.String())
+	}
+}
+
 // The origin reconciliation takes the locks of all the stale origins it
 // found before it looks at the repositories again: origins that share a lock
 // are all taken with it, once, and those whose lock is held are passed over.

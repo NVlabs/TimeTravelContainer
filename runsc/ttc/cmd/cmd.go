@@ -6759,10 +6759,24 @@ func (b *runtimeBackend) removingBranches(work func() error) error {
 	b.removals = nil
 	if removals.originsDue {
 		if _, reconcileErr := b.reconcileVolatileSnapshotOrigins(); reconcileErr != nil {
-			err = errors.Join(err, fmt.Errorf("reconciling snapshot providers: %w", reconcileErr))
+			b.deferOriginReconcile(reconcileErr)
 		}
 	}
 	return err
+}
+
+// deferOriginReconcile leaves to the node's maintenance the reconciliation of
+// its volatile origins that a removal could not finish, err why. The removed
+// branches are gone, and the reconciliation is the node's, of every
+// repository it has: one it could not read failed every removal on the node
+// after it had removed the branch's memory and filesystems, and the branch,
+// still recorded, was left running without a runtime, or dehydrated without
+// an image, until a retry of the removal, which failed the same way.
+func (b *runtimeBackend) deferOriginReconcile(err error) {
+	b.distributedSource.requestOriginReconcile()
+	if b.stderr != nil {
+		fmt.Fprintf(b.stderr, "ttc: warning: reconciling snapshot providers after a removal, which the node tries again: %v\n", err)
+	}
 }
 
 func (b *runtimeBackend) lockBackgroundLifecycle() func() {
@@ -15140,7 +15154,7 @@ func (b *runtimeBackend) reclaimBranchBacking(info ttcbundle.ContainerInfo, bran
 		return nil
 	}
 	if _, err := b.reconcileVolatileSnapshotOrigins(); err != nil {
-		return fmt.Errorf("reconciling snapshot providers: %w", err)
+		b.deferOriginReconcile(err)
 	}
 	return nil
 }
