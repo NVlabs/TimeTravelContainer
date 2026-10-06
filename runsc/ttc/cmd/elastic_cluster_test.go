@@ -3194,3 +3194,40 @@ func TestReleaseCanceledImportTakesOnlyItsBranch(t *testing.T) {
 		t.Errorf("alone: ran %q, %v; want the runtime made for the import deleted", changes, err)
 	}
 }
+
+// A fork of a dehydrated branch goes into its family's Sentry on the node if
+// one runs there. A Sentry that runs but could not list its branches, as a
+// loaded one may not at once, was taken for an exited one's shell and
+// deleted, with every branch it ran.
+func TestForkRuntimePeerKeepsALiveSentry(t *testing.T) {
+	runsc := fakeImportRuntime(t)
+	b := &runtimeBackend{root: "/runtime", runsc: runsc}
+	defer func(wait time.Duration) { forkRuntimePeerWait = wait }(forkRuntimePeerWait)
+	forkRuntimePeerWait = 300 * time.Millisecond
+	for _, test := range []struct {
+		mode    string
+		peer    bool
+		changes []string
+		failure string
+	}{
+		{mode: "beside", peer: true},
+		{mode: "absent"},
+		{mode: "dead", changes: []string{"delete --force family"}},
+		{mode: "unknown", failure: "cannot list its branches"},
+	} {
+		var peer bool
+		changes, err := fakeImportRuntimeChanges(t, runsc, test.mode, func() (err error) {
+			peer, err = b.forkRuntimePeer("family")
+			return err
+		})
+		if test.failure == "" && (err != nil || peer != test.peer) {
+			t.Errorf("%s: peer %t, %v; want %t", test.mode, peer, err, test.peer)
+		}
+		if test.failure != "" && (err == nil || !strings.Contains(err.Error(), test.failure)) {
+			t.Errorf("%s: %v, want %q", test.mode, err, test.failure)
+		}
+		if strings.Join(changes, "; ") != strings.Join(test.changes, "; ") {
+			t.Errorf("%s: ran %q, want %q", test.mode, changes, test.changes)
+		}
+	}
+}

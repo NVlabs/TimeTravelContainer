@@ -14199,6 +14199,47 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 	return branches, nil
 }
 
+// forkRuntimePeerWait bounds how long a fork waits for a live Sentry that
+// could not list its branches to answer.
+var forkRuntimePeerWait = 5 * time.Second
+
+// forkRuntimePeer reports whether the children of a fork of a dehydrated
+// branch go into the family's Sentry on this node, which then runs: the
+// children are imported beside its branches, rather than made a runtime of
+// their own. A fully cold family may leave an OCI shell whose Sentry has
+// exited; it holds no state, and is deleted, so that it does not keep the
+// first child's runtime from being made. A Sentry that runs but could not
+// list its branches, as a loaded one may not at once, runs them still: it was
+// taken for such a shell and deleted, with every branch it ran.
+func (b *runtimeBackend) forkRuntimePeer(containerID string) (bool, error) {
+	deadline := time.Now().Add(forkRuntimePeerWait)
+	for {
+		runtimes, err := b.listRuntimeFamiliesOf(containerID)
+		if err != nil {
+			return false, err
+		}
+		var runtime *Family
+		for i := range runtimes {
+			if runtimes[i].ID == containerID {
+				runtime = &runtimes[i]
+				break
+			}
+		}
+		switch {
+		case runtime == nil:
+			return false, nil
+		case runtime.Error == "":
+			return true, nil
+		case runtimeFamilyUnavailable(*runtime):
+			_, _ = b.command("delete", "--force", containerID)
+			return false, nil
+		case time.Now().After(deadline):
+			return false, fmt.Errorf("runtime %q runs but cannot list its branches: %s", containerID, runtime.Error)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // forkDehydratedMany creates local children directly from durable branch
 // state. The source remains process-free and its dehydration image is never
 // consumed. Filesystem metadata and graph roots are immutable, so preparing
@@ -14381,14 +14422,9 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, logicalParent strin
 		}
 	}
 
-	peer := false
-	if output, err := b.command("timetravel", info.ID, "branches"); err == nil && len(output) != 0 {
-		peer = true
-	} else {
-		// A fully cold family may leave an OCI shell whose control server has
-		// already exited. It has no state and must not block creation of the
-		// first child runtime.
-		_, _ = b.command("delete", "--force", info.ID)
+	peer, err := b.forkRuntimePeer(info.ID)
+	if err != nil {
+		return nil, fmt.Errorf("checking the runtime of %s before forking: %w", source, err)
 	}
 	result := make([]Branch, 0, len(children))
 	for _, child := range children {
