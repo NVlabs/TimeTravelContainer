@@ -1919,6 +1919,13 @@ func (r *Repository) withLock(fn func() error) (result error) {
 }
 
 func (r *Repository) readBranch(id string) (Branch, error) {
+	return r.readBranchRecord(id, true)
+}
+
+// readBranchRecord is readBranch, which, unless rooted, also returns a pointer
+// that names no root yet: a new repository writes its main branch's before
+// the first fence publishes the root.
+func (r *Repository) readBranchRecord(id string, rooted bool) (Branch, error) {
 	if err := validateName(id, "branch"); err != nil {
 		return Branch{}, err
 	}
@@ -1937,8 +1944,12 @@ func (r *Repository) readBranch(id string) (Branch, error) {
 	if err := r.readJSON(name, &branch); err != nil {
 		return Branch{}, err
 	}
-	if branch.ID != id || branch.Root == "" || branch.WorkingSnapshot == 0 || branch.Generation == 0 {
+	if branch.ID != id || branch.Root == "" && rooted || branch.WorkingSnapshot == 0 || branch.Generation == 0 {
 		return Branch{}, fmt.Errorf("invalid branch record for %q", id)
+	}
+	if branch.Root == "" {
+		// Not cached: readBranch must never be given it.
+		return branch, nil
 	}
 	if err := normalizeBranchLayers(&branch); err != nil {
 		return Branch{}, err
@@ -3565,6 +3576,11 @@ func (r *Repository) syncNamesLocked() (syncedNames, error) {
 func (r *Repository) syncRepositoryFiles(names []string) error {
 	for _, name := range names {
 		file, err := r.openFile(name, os.O_RDONLY, 0)
+		if errors.Is(err, os.ErrNotExist) && strings.HasPrefix(name, "branches/") {
+			// Another process removed the branch since this one wrote its
+			// pointer, and synced the removal: nothing is left to sync.
+			continue
+		}
 		if err != nil {
 			return fmt.Errorf("opening dirty repository file %q: %w", name, err)
 		}
@@ -3686,6 +3702,17 @@ func (r *Repository) syncMetadataLocked() error {
 		state.mu.RLock()
 		branch := state.branch
 		state.mu.RUnlock()
+		// The summary is this process's; the pointer may since be another
+		// process's, which forked or removed the branch. Written back, the
+		// summary put back a sealed working origin, or a removed branch
+		// whose graph roots are gone, and no process could open the
+		// repository again.
+		if superseded, err := r.branchSupersededLocked(id, branch); err != nil {
+			return err
+		} else if superseded {
+			r.forgetSupersededBranchLocked(id)
+			continue
+		}
 		if err := r.writeBranch(branch); err != nil {
 			return err
 		}

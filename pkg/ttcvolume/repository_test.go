@@ -2888,6 +2888,109 @@ func TestPublishMetadataMakesLiveTailVisibleToAnotherHandle(t *testing.T) {
 	t.Fatalf("published metadata is missing from second handle's diff: %+v", changes)
 }
 
+// A handle that made a branch's changes keeps their pointer summary, and
+// before a fence their batch, while another process, ttcd, removes the branch
+// as an rm does. The handle's next fence must not put either back: the
+// summary named a branch without graph roots, which no process could open
+// the repository with again, and the batch alone became the branch's root.
+func TestBranchRemovedByAnotherHandleStaysRemoved(t *testing.T) {
+	for _, published := range []bool{true, false} {
+		t.Run(fmt.Sprintf("published=%t", published), func(t *testing.T) {
+			manager := openTestManager(t)
+			sentry, err := manager.Create("removed-elsewhere")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sentry.Close()
+			if err := sentry.Fork(MainBranch, "child"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := sentry.CreateRegular("child", RootInode, "file", 0644, 0, 0); err != nil {
+				t.Fatal(err)
+			}
+			if published {
+				if err := sentry.PublishMetadata(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			daemon, err := manager.Open("removed-elsewhere")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer daemon.Close()
+			if err := daemon.RemoveBranch("child"); err != nil {
+				t.Fatal(err)
+			}
+			if err := sentry.SyncMetadata(); err != nil {
+				t.Fatalf("fence after another handle removed the branch: %v", err)
+			}
+			reopened, err := manager.Open("removed-elsewhere")
+			if err != nil {
+				t.Fatalf("reopening after another handle removed the branch: %v", err)
+			}
+			defer reopened.Close()
+			if _, err := reopened.Branch("child"); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("removed branch came back: %v", err)
+			}
+		})
+	}
+}
+
+// ttcd forks a branch whose Kernel is gone to publish it, which seals the
+// origin the Sentry's handle last wrote the branch at. The Sentry's summary
+// must not take the branch back to that origin, and a batch the Sentry still
+// had for it must not refuse every later fence of the repository.
+func TestBranchForkedByAnotherHandleKeepsItsPointer(t *testing.T) {
+	for _, published := range []bool{true, false} {
+		t.Run(fmt.Sprintf("published=%t", published), func(t *testing.T) {
+			manager := openTestManager(t)
+			sentry, err := manager.Create("forked-elsewhere")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sentry.Close()
+			if err := sentry.Fork(MainBranch, "child"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := sentry.CreateRegular("child", RootInode, "file", 0644, 0, 0); err != nil {
+				t.Fatal(err)
+			}
+			if published {
+				if err := sentry.PublishMetadata(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			daemon, err := manager.Open("forked-elsewhere")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer daemon.Close()
+			if err := daemon.Fork("child", "publication"); err != nil {
+				t.Fatal(err)
+			}
+			forked, err := daemon.Branch("child")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := sentry.SyncMetadata(); err != nil {
+				t.Fatalf("fence after another handle forked the branch: %v", err)
+			}
+			got, err := daemon.Branch("child")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Generation != forked.Generation || got.WorkingSnapshot != forked.WorkingSnapshot {
+				t.Fatalf("pointer went back to before another handle's fork: generation %d at origin %d, want %d at %d", got.Generation, got.WorkingSnapshot, forked.Generation, forked.WorkingSnapshot)
+			}
+			reopened, err := manager.Open("forked-elsewhere")
+			if err != nil {
+				t.Fatalf("reopening after another handle forked the branch: %v", err)
+			}
+			defer reopened.Close()
+		})
+	}
+}
+
 func TestDiffBaseIsAnAuthoritativeGraphRoot(t *testing.T) {
 	manager := openTestManager(t)
 	repository, err := manager.Create("diff-root-lifetime")

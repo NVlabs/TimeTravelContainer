@@ -402,6 +402,17 @@ func (r *Repository) flushMetadataBatchLocked(branchID string) error {
 	if batch == nil || batch.len() == 0 {
 		return nil
 	}
+	// Another process may have taken the branch over since the batch began:
+	// ttcd forks a branch whose Kernel is gone to publish it, and removes a
+	// deleted one. The batch's origin is then sealed, and refused every later
+	// fence of this repository, or the branch's roots are gone, and the batch
+	// alone became its root.
+	if superseded, err := r.branchSupersededLocked(branchID, batch.branch); err != nil {
+		return err
+	} else if superseded {
+		r.forgetSupersededBranchLocked(branchID)
+		return nil
+	}
 	// A filesystem transaction path-copies the branch's tree, and so changes
 	// the references of the snapshots it shares with other branches; while
 	// one of them is frozen for an authority handoff, the graph refuses it.
@@ -481,6 +492,51 @@ func (r *Repository) flushMetadataBatchLocked(branchID string) error {
 	}
 	r.dirtyMu.Unlock()
 	return nil
+}
+
+// branchSupersededLocked reports whether another process has removed branch
+// id, or forked it, since base, this process's view of its pointer, was read:
+// the pointer is gone, or has moved to another generation. A branch this
+// process is still making has no pointer yet, and was never read: base has no
+// root. The repository flock must be held by the caller.
+func (r *Repository) branchSupersededLocked(id string, base Branch) (bool, error) {
+	current, err := r.readBranchRecord(id, false)
+	if errors.Is(err, os.ErrNotExist) {
+		return base.Root != "", nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return current.Generation != base.Generation || current.WorkingSnapshot != base.WorkingSnapshot, nil
+}
+
+// forgetSupersededBranchLocked drops what this process has of branch id
+// that another process superseded (see branchSupersededLocked): its batch,
+// whose objects' construction pins the next open of the repository releases
+// as a crashed transaction's, its unpublished pointer summary, and its
+// metadata view, which the next access reads again from the graph.
+// Repository.operationMu must be held by the caller.
+func (r *Repository) forgetSupersededBranchLocked(id string) {
+	r.dirtyMu.Lock()
+	if batch := r.pendingMetadata[id]; batch != nil {
+		for pin := range batch.releasePins {
+			for name, object := range r.pendingBulk {
+				if object.Pin == pin {
+					delete(r.pendingBulk, name)
+				}
+			}
+		}
+		delete(r.reservedFileIDs, batch.branch.WorkingSnapshot)
+	}
+	delete(r.pendingMetadata, id)
+	delete(r.dirtyBranches, id)
+	r.dirtyMu.Unlock()
+	r.metadataMu.Lock()
+	delete(r.metadata, id)
+	r.metadataMu.Unlock()
+	r.branchMu.Lock()
+	delete(r.branchCache, id)
+	r.branchMu.Unlock()
 }
 
 func (r *Repository) flushAllMetadataBatchesLocked() error {
