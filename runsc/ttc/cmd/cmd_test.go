@@ -29,7 +29,9 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/ttcremote"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
+	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/specutils"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
@@ -241,6 +243,91 @@ func TestApplyDehydratedFilesystemRestoreIDsAllowsPendingPublication(t *testing.
 	}
 	if got, want := roots[0].RestoreID, "local-rootfs"; got != want {
 		t.Fatalf("pending-publication restore ID=%q, want %q", got, want)
+	}
+}
+
+// A restore of a dehydration capture, a dehydrated fork's child copying its
+// source's, maps this node's repositories to the identities the capture saved
+// its filesystems under, which the capture's publication recorded. The
+// node's repository map names one identity per repository, of the latest
+// restore here, which other restores rewrite: a child restored after its
+// source was materialized here found another restore's, and its filesystem
+// "was not provided". A capture made since its publication was made here, of
+// the repositories as the map has them.
+func TestDehydrationRestoreIDsAreTheCapturePublications(t *testing.T) {
+	dataRoot := t.TempDir()
+	manager, err := ttcvolume.OpenManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := manager.Create("family")
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, path := repository.Info().ID, repository.Path()
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	containerDir := filepath.Join(dataRoot, "containers", "family")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	const otherRestore = "fedcba9876543210fedcba9876543210"
+	repositories := fmt.Sprintf(`[{"source":"/upper","path":%q,"branch":"main","copy_mode":"full-copy","private":true,"restore_id":%q}]`, path, otherRestore)
+	config, err := json.Marshal(map[string]any{"annotations": map[string]string{specutils.AnnotationTTCVolumeRepositories: repositories}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), config, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+		ID: "family", Name: "family", BundleDir: bundleDir,
+		Branches: []ttcbundle.BranchInfo{{ID: "source", State: "dehydrated", StorageState: "shared"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	const captured = "0123456789abcdef0123456789abcdef"
+	root := ttcsnapshot.ObjectID{Snapshot: 3, Ordinal: 1, Kind: ttcsnapshot.ObjectKindMetadata}
+	manifest := coldBranchManifest{
+		Version: 5, Container: "family", Branch: "source", PublicationID: "publication-source", Kind: "dehydrate",
+		MemorySnapshot: 8, ControlRoot: ttcsnapshot.ObjectID{Snapshot: 8, Ordinal: 2, Kind: ttcsnapshot.ObjectKindMetadata}.String(),
+		Filesystems: []coldFilesystemSnapshot{{Root: cluster.FilesystemRootDescriptor{
+			Source: "/upper", RepositoryID: captured, RestoreID: captured,
+			BranchID: "main", Root: root.String(), NextInode: 2,
+		}, Origins: []uint64{3}}},
+	}
+	manifestPath := filepath.Join(dataRoot, "cold", "manifest.json")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	b := &runtimeBackend{dataRoot: dataRoot}
+	info, err := b.containerStore().LoadContainer("family")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := ttcbundle.BranchInfo{ID: "source", StorageManifest: manifestPath, SnapshotID: 8}
+	ids, err := b.dehydrationRestoreIDs(info, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ids[current]; got != captured {
+		t.Fatalf("a published capture restores repository %s as %q, want its publication's %q", current, got, captured)
+	}
+	source.SnapshotID = 9
+	if ids, err = b.dehydrationRestoreIDs(info, source); err != nil {
+		t.Fatal(err)
+	}
+	if got := ids[current]; got != otherRestore {
+		t.Fatalf("a capture made since its publication restores repository %s as %q, want the map's %q", current, got, otherRestore)
 	}
 }
 

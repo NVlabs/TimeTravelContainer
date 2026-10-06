@@ -8624,7 +8624,11 @@ func (b *runtimeBackend) startFreshBranchBesidePeers(info ttcbundle.ContainerInf
 		return fmt.Errorf("clearing prior console state for fresh branch %s: %w", target, err)
 	}
 	capture.Resume = true
-	if err := b.rehydrateColdPeer(target, info, branch, capture, stagingDir, metadata, nil); err != nil {
+	restoreIDs, err := b.filesystemRestoreIDs(info.ID)
+	if err != nil {
+		return err
+	}
+	if err := b.rehydrateColdPeer(target, info, branch, capture, stagingDir, metadata, nil, restoreIDs); err != nil {
 		return fmt.Errorf("installing fresh branch %s beside active peers: %w", target, err)
 	}
 	graphRecorded = true
@@ -17408,8 +17412,13 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	if relays != nil {
 		defer relays.close()
 	}
+	// A fork's child restores the capture its source made.
+	restoreIDs, err := b.dehydrationRestoreIDs(info, relaySource)
+	if err != nil {
+		return err
+	}
 	if peer {
-		return b.rehydrateColdPeer(target, info, branch, capture, imageDir, metadata, relays)
+		return b.rehydrateColdPeer(target, info, branch, capture, imageDir, metadata, relays, restoreIDs)
 	}
 	// The memory image is read while the sandbox is made.
 	type graphRestoreOpening struct {
@@ -17461,10 +17470,7 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	restoreArgs := boot.DurableDehydrationRestoreArgs{
 		ID: target.branch, ParentID: branch.ParentID, FilesystemBranch: capture.FilesystemBranch,
 		Resume: capture.Resume, ExecSessions: capture.ExecSessions, Quarantined: branch.Quarantined,
-	}
-	restoreArgs.FilesystemRestoreIDs, err = b.filesystemRestoreIDs(info.ID)
-	if err != nil {
-		return err
+		FilesystemRestoreIDs: restoreIDs,
 	}
 	if relays != nil {
 		restoreArgs.FilesystemConnections = len(relays.clients)
@@ -17781,7 +17787,7 @@ func (b *runtimeBackend) openGraphMemoryRestore(capture boot.BranchDehydrateInfo
 	return restore, nil
 }
 
-func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, capture boot.BranchDehydrateInfo, sourceDir string, metadata *os.File, relays *coldFilesystemRelays) error {
+func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, capture boot.BranchDehydrateInfo, sourceDir string, metadata *os.File, relays *coldFilesystemRelays, restoreIDs map[string]string) error {
 	var err error
 	targets := make([]*os.File, 0, len(capture.Memories))
 	defer func() {
@@ -17811,11 +17817,7 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	restoreArgs := boot.DurableDehydrationRestoreArgs{
 		ID: target.branch, ParentID: branch.ParentID, FilesystemBranch: capture.FilesystemBranch,
 		Resume: capture.Resume, ExecSessions: capture.ExecSessions, UseDonatedMemoryFiles: true,
-		ReusePeerApplicationMemoryFile: true, Quarantined: branch.Quarantined,
-	}
-	restoreArgs.FilesystemRestoreIDs, err = b.filesystemRestoreIDs(info.ID)
-	if err != nil {
-		return err
+		ReusePeerApplicationMemoryFile: true, Quarantined: branch.Quarantined, FilesystemRestoreIDs: restoreIDs,
 	}
 	if relays != nil {
 		restoreArgs.FilesystemConnections = len(relays.clients)

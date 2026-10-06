@@ -209,15 +209,25 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 		}
 		return nil, fmt.Errorf("dehydration target has %d unexpected private memory files", len(restoreMnts.mfmap))
 	}
+	// As a distributed restore's: the physical identity of each repository,
+	// the one the bundle carries as an alias, and those the daemon names for
+	// the capture restored, which saved its filesystems under the identities
+	// of the repositories its Sentry had.
 	resources := make(vfs.RestoreFilesystemResources, len(l.ttcVolumeRepositories))
 	for _, donated := range l.ttcVolumeRepositories {
 		info := donated.repository.Info()
-		restoreID := donated.config.RestoreID
-		if restoreID == "" {
-			restoreID = info.ID
+		resource := vfs.RestoreFilesystemResource{Resource: donated.repository, Branch: donated.config.Branch}
+		resources[checkpoint.ResourceID{ContainerName: "ttc-volume", Path: info.ID}] = resource
+		if restoreID := donated.config.RestoreID; restoreID != "" {
+			resources[checkpoint.ResourceID{ContainerName: "ttc-volume", Path: restoreID}] = resource
 		}
-		key := checkpoint.ResourceID{ContainerName: "ttc-volume", Path: restoreID}
-		resources[key] = vfs.RestoreFilesystemResource{Resource: donated.repository, Branch: donated.config.Branch}
+	}
+	resources, err = aliasRestoreFilesystemResources(resources, args.FilesystemRestoreIDs)
+	if err != nil {
+		for _, mf := range memoryFiles {
+			mf.Destroy()
+		}
+		return nil, err
 	}
 	loadOptions := kernel.DurableDehydrationLoadOptions{
 		Clocks: sentrytime.NewCalibratedClocks(), BranchID: args.FilesystemBranch,

@@ -2659,6 +2659,59 @@ func (b *runtimeBackend) filesystemRestoreIDs(container string) (map[string]stri
 	return ids, nil
 }
 
+// dehydrationRestoreIDs is filesystemRestoreIDs for a restore of the
+// dehydration capture that described made: the branch restored, or the source
+// whose capture a dehydrated fork's child copies. The publication of the
+// capture recorded the repository identities the capture names, those of the
+// repositories its Sentry had, and a restore of it maps this node's
+// repositories to them, whatever this node's repository map names by then.
+// The map keeps one identity per repository, written by each restore here and
+// replaced when one completes: a dehydrated fork's child, restored after its
+// source was materialized here, found the map rewritten by another restore
+// meanwhile, and the child's filesystem "was not provided". A capture made
+// since its branch's publication was made here, of this node's repositories,
+// and is restored as the map has it.
+func (b *runtimeBackend) dehydrationRestoreIDs(info ttcbundle.ContainerInfo, described ttcbundle.BranchInfo) (map[string]string, error) {
+	ids, err := b.filesystemRestoreIDs(info.ID)
+	if err != nil {
+		return nil, err
+	}
+	if described.StorageManifest == "" || described.SnapshotID == 0 {
+		return ids, nil
+	}
+	manifest, err := readColdBranchManifest(described.StorageManifest)
+	if err != nil {
+		return nil, err
+	}
+	if manifest.MemorySnapshot != described.SnapshotID {
+		return ids, nil
+	}
+	bySource := make(map[string]string, len(manifest.Filesystems))
+	for _, filesystem := range manifest.Filesystems {
+		bySource[filesystem.Root.Source] = filesystem.Root.RestoreID
+	}
+	spec, err := b.containerStore().LoadSpecOf(info)
+	if err != nil {
+		return nil, err
+	}
+	repositories, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return nil, err
+	}
+	for _, repository := range repositories {
+		restoreID := bySource[repository.Source]
+		if restoreID == "" {
+			continue
+		}
+		current, err := ttcvolume.ReadRepositoryInfo(repository.Path)
+		if err != nil {
+			return nil, fmt.Errorf("reading active repository %q: %w", repository.Source, err)
+		}
+		ids[current.ID] = restoreID
+	}
+	return ids, nil
+}
+
 // prepareColdFilesystemRelays exposes shared packs through the same fenced
 // 1 MiB range protocol used by cross-node forks. The donated client ends are
 // owned by the Sentry after a successful restore.
