@@ -8291,6 +8291,18 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 	if err != nil {
 		return 1, err
 	}
+	// A peer's long operation, as a dehydration, works without the lifecycle
+	// lock: the start waits for it, as for the lock. It was refused instead,
+	// "cannot start ... while peer ... is dehydrating", having claimed the
+	// branch for its node, which every later command of the branch then
+	// waited for and was refused, "only lifecycle recovery may retry it".
+	if waited, err := b.waitBusy(info.ID); err != nil {
+		return 1, err
+	} else if waited {
+		if resolved, info, err = b.resolveSelector(target); err != nil {
+			return 1, err
+		}
+	}
 	target = resolved
 	branch, err := persistentBranchInfo(info, target.branch)
 	if err != nil {
