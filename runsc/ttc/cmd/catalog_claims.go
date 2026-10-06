@@ -65,7 +65,8 @@ func (b *runtimeBackend) claimForkCatalogs(info ttcbundle.ContainerInfo, filesys
 		if err != nil {
 			return err
 		}
-		catalog := catalogs[repositoryPhysicalBranch(config, filesystemBranch)].RemoteCatalog
+		branch := catalogs[repositoryPhysicalBranch(config, filesystemBranch)]
+		catalog := branch.RemoteCatalog
 		if catalog == "" {
 			continue
 		}
@@ -74,12 +75,9 @@ func (b *runtimeBackend) claimForkCatalogs(info ttcbundle.ContainerInfo, filesys
 			return fmt.Errorf("repository %q names remote catalog %q: %w", config.Source, catalog, err)
 		}
 		_, volatile, err := b.distributedSource.authority.SnapshotProvider(uint64(root.Snapshot))
-		if err != nil {
+		if claim, err := forkCatalogClaimed(branch, volatile, err); err != nil {
 			return fmt.Errorf("finding the image that repository %q expands: %w", config.Source, err)
-		}
-		if volatile {
-			// The source of a remote fork or a migration, which its
-			// transaction keeps until the target no longer needs it.
+		} else if !claim {
 			continue
 		}
 		if err := b.claimCatalog(info.ID, path, catalog, root); err != nil {
@@ -87,6 +85,28 @@ func (b *runtimeBackend) claimForkCatalogs(info ttcbundle.ContainerInfo, filesys
 		}
 	}
 	return nil
+}
+
+// forkCatalogClaimed reports whether a fork of branch claims the image that
+// its remote catalog expands, from what the authority says of the image's
+// origin: whether it is volatile, or the error of the lookup.
+func forkCatalogClaimed(branch ttcvolume.Branch, volatile bool, err error) (bool, error) {
+	switch {
+	case errors.Is(err, os.ErrNotExist) && !branch.RemoteShared:
+		// The source of a remote fork or a migration whose transaction
+		// ended once the target no longer needed it, and retired the
+		// origin. The branch names the catalog until its next publication:
+		// a fork of a remote fork's target was refused, "finding the image
+		// that repository ... expands: file does not exist".
+		return false, nil
+	case err != nil:
+		return false, err
+	case volatile:
+		// The source of a remote fork or a migration, which its
+		// transaction keeps until the target no longer needs it.
+		return false, nil
+	}
+	return true, nil
 }
 
 // claimCatalog retains, at the shared ledger, the node's claim on root, the

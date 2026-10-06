@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
+	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/runsc/specutils"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
@@ -885,6 +886,32 @@ func TestCatalogClaim(t *testing.T) {
 	released, err := readGraphReferenceIntent(path)
 	if err != nil || released.State != "releasing" || !released.Groups[0].Retained {
 		t.Fatalf("an unneeded claim is %+v (%v), want it releasing", released, err)
+	}
+}
+
+// A fork claims the shared image its branch expands, but not a remote fork's
+// or migration's source, which the transaction keeps while the target needs
+// it and retires once it is over.
+func TestForkCatalogClaimed(t *testing.T) {
+	gone := fmt.Errorf("origins: %w", os.ErrNotExist)
+	for _, test := range []struct {
+		name     string
+		branch   ttcvolume.Branch
+		volatile bool
+		err      error
+		claim    bool
+		fails    bool
+	}{
+		{name: "shared image", branch: ttcvolume.Branch{RemoteShared: true}, claim: true},
+		{name: "transaction source", volatile: true},
+		{name: "ended transaction's source", err: gone},
+		{name: "retired shared image", branch: ttcvolume.Branch{RemoteShared: true}, err: gone, fails: true},
+		{name: "unreachable authority", err: errors.New("authority unavailable"), fails: true},
+	} {
+		claim, err := forkCatalogClaimed(test.branch, test.volatile, test.err)
+		if claim != test.claim || (err != nil) != test.fails {
+			t.Errorf("%s: claim=%t err=%v, want claim=%t failing=%t", test.name, claim, err, test.claim, test.fails)
+		}
 	}
 }
 
