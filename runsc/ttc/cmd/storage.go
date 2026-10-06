@@ -2570,7 +2570,7 @@ func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, bra
 	if err := b.discardSupersededBranchFilesystems(info, branch, coldFilesystemRoots(manifest)); err != nil {
 		return err
 	}
-	if _, err := b.materializeDistributedFilesystemRoots(info, branch.FilesystemBranch, coldFilesystemRoots(manifest), true, true); err != nil {
+	if _, _, err := b.materializeDistributedFilesystemRoots(info, branch.FilesystemBranch, coldFilesystemRoots(manifest), true, true); err != nil {
 		return err
 	}
 	if manifest.ControlRoot == "" {
@@ -2728,7 +2728,7 @@ func (b *runtimeBackend) materializeColdFilesystem(info ttcbundle.ContainerInfo,
 	if err := b.discardSupersededBranchFilesystems(info, branch, coldFilesystemRoots(manifest)); err != nil {
 		return err
 	}
-	if _, err := b.materializeDistributedFilesystemRoots(info, branch.FilesystemBranch, coldFilesystemRoots(manifest), true, true); err != nil {
+	if _, _, err := b.materializeDistributedFilesystemRoots(info, branch.FilesystemBranch, coldFilesystemRoots(manifest), true, true); err != nil {
 		return err
 	}
 	// An ordinary rehydrated Sentry receives shared-pack relay FDs and keeps

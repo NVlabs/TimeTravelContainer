@@ -1909,10 +1909,13 @@ func (b *runtimeBackend) prepareDistributedFilesystem(info ttcbundle.ContainerIn
 // the transaction-fenced Sentry relay. shared says the roots are images of the
 // shared store, as a durable publication's are, which a later publication of
 // the branches may refer to.
-func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.ContainerInfo, filesystemBranch string, roots []cluster.FilesystemRootDescriptor, peer, shared bool) (_ int, retErr error) {
+func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.ContainerInfo, filesystemBranch string, roots []cluster.FilesystemRootDescriptor, peer, shared bool) (_ int, _ map[string]string, retErr error) {
 	if len(roots) == 0 {
-		return 0, nil
+		return 0, nil, nil
 	}
+	// aliases maps each repository's own identity to the one the roots were
+	// captured under, as the restore that follows needs it.
+	aliases := make(map[string]string, len(roots))
 	allocateOrigins, finishOrigins := b.newFilesystemOriginScope()
 	originsCommitted := false
 	type importedFilesystem struct {
@@ -1942,22 +1945,22 @@ func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.Co
 	bySource := make(map[string]cluster.FilesystemRootDescriptor, len(roots))
 	for _, root := range roots {
 		if _, exists := bySource[root.Source]; exists {
-			return 0, fmt.Errorf("distributed filesystem repeats source %q", root.Source)
+			return 0, nil, fmt.Errorf("distributed filesystem repeats source %q", root.Source)
 		}
 		bySource[root.Source] = root
 	}
 	store := b.containerStore()
 	spec, err := store.LoadSpecOf(info)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	configs, err := specutils.TTCVolumeRepositories(spec)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	manager, err := ttcvolume.OpenManager(b.activeDataRoot())
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	seenPaths := make(map[string]struct{})
 	installed := 0
@@ -1970,18 +1973,18 @@ func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.Co
 		seenPaths[path] = struct{}{}
 		root, ok := bySource[config.Source]
 		if !ok {
-			return 0, fmt.Errorf("distributed filesystem omits repository %q", config.Source)
+			return 0, nil, fmt.Errorf("distributed filesystem omits repository %q", config.Source)
 		}
 		var origins []ttcsnapshot.SnapshotID
 		if allocateOrigins != nil {
 			origins, err = allocateOrigins(2)
 			if err != nil {
-				return 0, fmt.Errorf("allocating target filesystem origins for %q: %w", config.Source, err)
+				return 0, nil, fmt.Errorf("allocating target filesystem origins for %q: %w", config.Source, err)
 			}
 		}
 		descriptor, err := ttcvolume.NewRemoteSnapshotDescriptor(root.RepositoryID, root.BranchID, root.Root, root.BaseRoot, root.NextInode, root.LogicalBytes)
 		if err != nil {
-			return 0, fmt.Errorf("decoding repository %q graph root: %w", config.Source, err)
+			return 0, nil, fmt.Errorf("decoding repository %q graph root: %w", config.Source, err)
 		}
 		descriptor.Shared = shared
 		if peer {
@@ -1995,15 +1998,18 @@ func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.Co
 			if _, statErr := os.Stat(filepath.Join(repositoryPath, "volume.json")); errors.Is(statErr, os.ErrNotExist) {
 				repositoryPath = distributedRepositoryCachePath(b.activeDataRoot(), info.ID, config.Source)
 			} else if statErr != nil {
-				return 0, statErr
+				return 0, nil, statErr
 			}
 			repository, created, err := importRemoteRepositoryBranch(manager, repositoryPath, ttcvolume.CopyMode(config.CopyMode), "peer-"+fmt.Sprint(index), descriptor, filesystemBranch, origins)
 			if err != nil {
-				return 0, fmt.Errorf("importing peer repository %q metadata: %w", config.Source, err)
+				return 0, nil, fmt.Errorf("importing peer repository %q metadata: %w", config.Source, err)
 			}
 			if _, err := repository.Branch(filesystemBranch); err != nil {
 				_ = repository.Close()
-				return 0, fmt.Errorf("verifying imported peer repository %q branch %q: %w", config.Source, filesystemBranch, err)
+				return 0, nil, fmt.Errorf("verifying imported peer repository %q branch %q: %w", config.Source, filesystemBranch, err)
+			}
+			if root.RestoreID != "" {
+				aliases[repository.Info().ID] = root.RestoreID
 			}
 			config.Path = repositoryPath
 			config.Branch = filesystemBranch
@@ -2011,7 +2017,7 @@ func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.Co
 			config.RestoreID = root.RestoreID
 			config.Private = true
 			if err := repository.Close(); err != nil {
-				return 0, err
+				return 0, nil, err
 			}
 			imported = append(imported, importedFilesystem{path: repositoryPath, copyMode: ttcvolume.CopyMode(config.CopyMode), created: created})
 			installed++
@@ -2020,7 +2026,10 @@ func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.Co
 		destination := distributedRepositoryCachePath(b.activeDataRoot(), info.ID, config.Source)
 		repository, created, err := importRemoteRepositoryBranch(manager, destination, manager.Capability().Mode, "remote-"+fmt.Sprint(index), descriptor, filesystemBranch, origins)
 		if err != nil {
-			return 0, fmt.Errorf("importing remote repository %q metadata: %w", config.Source, err)
+			return 0, nil, fmt.Errorf("importing remote repository %q metadata: %w", config.Source, err)
+		}
+		if root.RestoreID != "" {
+			aliases[repository.Info().ID] = root.RestoreID
 		}
 		config.Path = destination
 		config.Branch = filesystemBranch
@@ -2028,22 +2037,22 @@ func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.Co
 		config.RestoreID = root.RestoreID
 		config.Private = true
 		if err := repository.Close(); err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 		imported = append(imported, importedFilesystem{path: destination, copyMode: manager.Capability().Mode, created: created})
 		installed++
 	}
 	if installed != len(roots) {
-		return 0, fmt.Errorf("distributed filesystem installed %d roots, descriptor contains %d", installed, len(roots))
+		return 0, nil, fmt.Errorf("distributed filesystem installed %d roots, descriptor contains %d", installed, len(roots))
 	}
 	if err := store.WriteActiveRepositoryMapOf(info.ID, configs); err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	if err := finishOrigins(true); err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	originsCommitted = true
-	return installed, nil
+	return installed, aliases, nil
 }
 
 // importRemoteRepositoryBranch imports descriptor as branch of the repository

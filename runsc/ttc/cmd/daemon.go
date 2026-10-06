@@ -1220,7 +1220,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 	if err := r.backend.containerStore().InstallPortableInternalMountsOf(info, portableMounts); err != nil {
 		return fmt.Errorf("installing target-local internal mounts: %w", err)
 	}
-	filesystemConnections, err := r.backend.materializeDistributedFilesystemRoots(info, targetBranch.FilesystemBranch, session.FilesystemRoots, peer, false)
+	filesystemConnections, filesystemAliases, err := r.backend.materializeDistributedFilesystemRoots(info, targetBranch.FilesystemBranch, session.FilesystemRoots, peer, false)
 	if err != nil {
 		return fmt.Errorf("materializing distributed filesystem metadata: %w", err)
 	}
@@ -1264,6 +1264,15 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 	restoreArgs.FilesystemRestoreIDs, err = r.backend.filesystemRestoreIDs(info.ID)
 	if err != nil {
 		return fmt.Errorf("resolving distributed filesystem identities: %w", err)
+	}
+	// The node's map of active repositories is the family's on the node, which
+	// a start or a cold restore there commits whole under the lifecycle lock
+	// this import does not hold: one that committed after the import wrote
+	// its identities took them back, and the restore found its repositories
+	// under none it knew, "TTC volume restore resource ... was not provided".
+	// The identities the import installed are its own to restore under.
+	for current, restoreID := range filesystemAliases {
+		restoreArgs.FilesystemRestoreIDs[current] = restoreID
 	}
 	hasGraphIdentity := session.GraphSnapshot != 0 || len(session.GraphRootObjects) != 0
 	if hasGraphIdentity {
