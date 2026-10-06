@@ -753,6 +753,68 @@ func TestSnapshotCapturesShareTheHandoffGate(t *testing.T) {
 	abandoned()
 }
 
+// A publication attempt that a cancellation waits for stops waiting for an
+// origin's lock, and for the snapshot handoff gate, once its context ends:
+// their holders may wait for what the cancellation's caller holds.
+func TestOriginPublicationGivesWayToItsCancellation(t *testing.T) {
+	runtime := &distributedSourceRuntime{}
+	// waits ends begin's context once begin has waited a while.
+	waits := func(what string, begin func(context.Context) (func(), error)) {
+		t.Helper()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		result := make(chan error, 1)
+		go func() {
+			finish, err := begin(ctx)
+			if err == nil {
+				finish()
+			}
+			result <- err
+		}()
+		select {
+		case err := <-result:
+			t.Fatalf("%s did not wait: %v", what, err)
+		case <-time.After(50 * time.Millisecond):
+		}
+		cancel()
+		select {
+		case err := <-result:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("%s ended with %v, want %v", what, err, context.Canceled)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s went on waiting once its context ended", what)
+		}
+	}
+	unlock := runtime.lockSnapshotOrigin(7)
+	waits("the origin's lock", func(ctx context.Context) (func(), error) {
+		return runtime.lockSnapshotOriginContext(ctx, 7)
+	})
+	unlock()
+	finishCapture := runtime.beginCapture()
+	waits("the final switch", runtime.beginFinalSnapshotSwitchContext)
+	// Not canceled, the switch takes the gate once the capture ends.
+	switched := make(chan error, 1)
+	ctx, end := context.WithCancel(context.Background())
+	defer end()
+	go func() {
+		finish, err := runtime.beginFinalSnapshotSwitchContext(ctx)
+		if err == nil {
+			finish()
+		}
+		switched <- err
+	}()
+	finishCapture()
+	select {
+	case err := <-switched:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the final switch did not take the gate once the capture ended")
+	}
+}
+
 func TestDistributedColdCollectionCoalescesRequests(t *testing.T) {
 	runtime := &distributedSourceRuntime{}
 	started := make(chan struct{}, 1)

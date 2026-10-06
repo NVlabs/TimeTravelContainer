@@ -554,6 +554,79 @@ func TestCancelOfACompletionWaitingForItsGate(t *testing.T) {
 	}
 }
 
+// waitingPublisher's publication waits until its context ends, as one waits
+// for a lock whose holder waits for what a cancellation's caller holds.
+type waitingPublisher struct {
+	testPublisher
+	started chan struct{}
+	release chan struct{}
+	ended   chan error
+	cleaned chan Intent
+}
+
+func (p *waitingPublisher) Publish(ctx context.Context, _ Intent) (Result, error) {
+	close(p.started)
+	select {
+	case <-ctx.Done():
+	case <-p.release:
+	}
+	p.ended <- ctx.Err()
+	return Result{}, errors.New("publication interrupted")
+}
+func (p *waitingPublisher) Cleanup(intent Intent) error { p.cleaned <- intent; return nil }
+
+// A removal cancels a publication and waits for its attempt under way, which
+// waits for what the removal holds: the cancellation ends the attempt's
+// context, rather than deadlock the two.
+func TestCancelEndsTheAttemptUnderWay(t *testing.T) {
+	publisher := &waitingPublisher{
+		testPublisher: testPublisher{completed: make(chan Intent, 1)},
+		started:       make(chan struct{}), release: make(chan struct{}),
+		ended: make(chan error, 1), cleaned: make(chan Intent, 2),
+	}
+	queue, err := Open(t.TempDir(), publisher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+	defer close(publisher.release)
+	if err := queue.Enqueue(Intent{Container: "family", Branch: "main", PublicationID: "publication-8", Kind: "dehydrate", FilesystemBranch: "capture"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.Activate("family", "main", "publication-8"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-publisher.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("publication did not start")
+	}
+	canceled := make(chan error, 1)
+	go func() { canceled <- queue.Cancel("family", "main", "publication-8") }()
+	select {
+	case err := <-canceled:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Cancel and the attempt it waits for deadlocked")
+	}
+	if err := <-publisher.ended; !errors.Is(err, context.Canceled) {
+		t.Fatalf("the attempt's context ended with %v, want %v", err, context.Canceled)
+	}
+	if pending, err := queue.Pending(); err != nil || len(pending) != 0 {
+		t.Fatalf("canceled intent remains: pending=%+v err=%v", pending, err)
+	}
+	if len(publisher.cleaned) != 1 {
+		t.Fatalf("canceled capture cleaned %d times, want 1", len(publisher.cleaned))
+	}
+	select {
+	case intent := <-publisher.completed:
+		t.Fatalf("canceled publication %s completed", intent.PublicationID)
+	default:
+	}
+}
+
 // removedPublisher's captures will never be ready: their branch was removed.
 type removedPublisher struct {
 	supersededPublisher

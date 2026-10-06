@@ -469,6 +469,24 @@ func (r *distributedSourceRuntime) tryLockSnapshotOrigin(origin ttcsnapshot.Snap
 	return lock.Unlock, true
 }
 
+// lockSnapshotOriginContext is lockSnapshotOrigin for a caller that stops
+// waiting once ctx is done, as a publication attempt that a cancellation
+// waits for, holding the lifecycle lock, does.
+func (r *distributedSourceRuntime) lockSnapshotOriginContext(ctx context.Context, origin ttcsnapshot.SnapshotID) (func(), error) {
+	if ctx.Done() == nil {
+		return r.lockSnapshotOrigin(origin), nil
+	}
+	for {
+		if unlock, ok := r.tryLockSnapshotOrigin(origin); ok {
+			return unlock, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // tryLockSnapshotOrigins is tryLockSnapshotOrigin of each of origins: it
 // returns, in order, the origins whose locks it took, and what releases them.
 // Origins share locks, and it takes each once.
@@ -673,6 +691,19 @@ func (r *distributedSourceRuntime) beginFinalSnapshotSwitchUnless(abandon func()
 		time.Sleep(5 * time.Millisecond)
 	}
 	return r.handoffGate.Unlock, true
+}
+
+// beginFinalSnapshotSwitchContext is beginFinalSnapshotSwitch for a switch
+// that stops waiting for the gate once ctx is done.
+func (r *distributedSourceRuntime) beginFinalSnapshotSwitchContext(ctx context.Context) (func(), error) {
+	if ctx.Done() == nil {
+		return r.beginFinalSnapshotSwitch(), nil
+	}
+	finish, ok := r.beginFinalSnapshotSwitchUnless(func() bool { return ctx.Err() != nil })
+	if !ok {
+		return nil, ctx.Err()
+	}
+	return finish, nil
 }
 
 // sourceTransactionTerminalAction resolves handoff liveness from the cluster

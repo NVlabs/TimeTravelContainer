@@ -521,7 +521,7 @@ func (p *branchPublisher) branchRemoved(intent ttcstorage.Intent, err error) boo
 	return errors.Is(err, os.ErrNotExist)
 }
 
-func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (ttcstorage.Result, error) {
+func (p *branchPublisher) Publish(ctx context.Context, intent ttcstorage.Intent) (ttcstorage.Result, error) {
 	store := ttcbundle.Store{Root: p.sharedRoot, ActiveRoot: p.localRoot}
 	info, err := store.LoadContainer(intent.Container)
 	if p.branchRemoved(intent, err) {
@@ -536,6 +536,17 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 	}
 	if branch.PublicationID != intent.PublicationID {
 		return ttcstorage.Result{}, fmt.Errorf("%w: branch now names %q", ttcstorage.ErrPublicationSuperseded, branch.PublicationID)
+	}
+	if p.authority != nil && intent.Kind == "dehydrate" && branch.SnapshotID != 0 && len(branch.MemoryRoots) != 0 {
+		// The older origins the capture reaches become shared here, without
+		// the snapshot handoff gate: Complete holds it alone, and an origin's
+		// own final switch takes it. A capture reaches a volatile origin of
+		// its node once its branch went on from a capture whose publication a
+		// rehydration canceled.
+		snapshot := ttcsnapshot.SnapshotID(branch.SnapshotID)
+		if err := p.publishGraphDependencies(ctx, snapshot); err != nil {
+			return ttcstorage.Result{}, fmt.Errorf("publishing durable memory dependencies for snapshot origin %d: %w", branch.SnapshotID, err)
+		}
 	}
 	path := coldManifestPath(p.sharedRoot, info.ID, branch.ID, intent.PublicationID)
 	if existing, err := readColdBranchManifest(path); err == nil {
@@ -1241,28 +1252,66 @@ func releasePublishedProviderGraphRoots(graph *ttcsnapshot.Store, data *ttcsnaps
 // the authority. Remote owners perform their own recursive publication through the
 // authenticated provider endpoint.
 func (p *branchPublisher) publishGraphDependencies(ctx context.Context, snapshot ttcsnapshot.SnapshotID) error {
+	dependencies, err := p.graphDependencies(snapshot)
+	if err != nil {
+		return err
+	}
+	for _, dependency := range dependencies {
+		if err := p.ensureGraphOriginShared(ctx, dependency); err != nil {
+			return fmt.Errorf("publishing backing snapshot origin %d for origin %d: %w", dependency, snapshot, err)
+		}
+	}
+	return nil
+}
+
+// requireGraphDependenciesShared checks, publishing none, that every older
+// origin snapshot reaches directly is shared. Its caller holds the snapshot
+// handoff gate alone, which an origin's publication takes itself.
+func (p *branchPublisher) requireGraphDependenciesShared(snapshot ttcsnapshot.SnapshotID) error {
+	dependencies, err := p.graphDependencies(snapshot)
+	if err != nil {
+		return err
+	}
+	for _, dependency := range dependencies {
+		_, volatile, err := p.authority.SnapshotProvider(uint64(dependency))
+		if err != nil {
+			return err
+		}
+		if volatile {
+			return fmt.Errorf("backing snapshot origin %d for origin %d is not shared yet", dependency, snapshot)
+		}
+		if err := p.graphShared.CheckManifest(dependency); err != nil {
+			return fmt.Errorf("backing snapshot origin %d for origin %d has shared authority without a manifest: %w", dependency, snapshot, err)
+		}
+	}
+	return nil
+}
+
+// graphDependencies returns, in order, the older origins that snapshot's
+// objects reach directly: none for a shared origin whose provider metadata a
+// concurrent publication has reclaimed.
+func (p *branchPublisher) graphDependencies(snapshot ttcsnapshot.SnapshotID) ([]ttcsnapshot.SnapshotID, error) {
 	if p == nil || p.graph == nil || p.authority == nil || p.graphShared == nil || snapshot == 0 {
-		return errors.New("distributed graph dependency publication is unavailable")
+		return nil, errors.New("distributed graph dependency publication is unavailable")
 	}
 	objects, err := p.graph.SnapshotObjects(snapshot)
 	if err != nil {
 		// A concurrent idempotent publisher may have completed and reclaimed the
 		// provider metadata after the initial authority read.
 		if _, volatile, authorityErr := p.authority.SnapshotProvider(uint64(snapshot)); authorityErr == nil && !volatile {
-			manifestErr := p.graphShared.CheckManifest(snapshot)
-			return manifestErr
+			return nil, p.graphShared.CheckManifest(snapshot)
 		}
-		return err
+		return nil, err
 	}
 	dependencies := make(map[ttcsnapshot.SnapshotID]struct{})
 	for _, object := range objects {
 		seen := make(map[ttcsnapshot.ObjectID]struct{})
 		for object.Deferred {
 			if object.SourceObject.IsZero() {
-				return fmt.Errorf("deferred object %s has no source identity", object.ID)
+				return nil, fmt.Errorf("deferred object %s has no source identity", object.ID)
 			}
 			if _, duplicate := seen[object.SourceObject]; duplicate {
-				return fmt.Errorf("deferred object %s has a source cycle through %s", object.ID, object.SourceObject)
+				return nil, fmt.Errorf("deferred object %s has a source cycle through %s", object.ID, object.SourceObject)
 			}
 			seen[object.SourceObject] = struct{}{}
 			if local, ok := p.graph.Object(object.SourceObject); ok {
@@ -1271,7 +1320,7 @@ func (p *branchPublisher) publishGraphDependencies(ctx context.Context, snapshot
 			}
 			shared, sharedErr := p.graphShared.Object(object.SourceObject)
 			if sharedErr != nil {
-				return fmt.Errorf("resolving deferred source %s for object %s: %w", object.SourceObject, object.ID, sharedErr)
+				return nil, fmt.Errorf("resolving deferred source %s for object %s: %w", object.SourceObject, object.ID, sharedErr)
 			}
 			object = shared
 		}
@@ -1286,12 +1335,7 @@ func (p *branchPublisher) publishGraphDependencies(ctx context.Context, snapshot
 		ordered = append(ordered, dependency)
 	}
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
-	for _, dependency := range ordered {
-		if err := p.ensureGraphOriginShared(ctx, dependency); err != nil {
-			return fmt.Errorf("publishing backing snapshot origin %d for origin %d: %w", dependency, snapshot, err)
-		}
-	}
-	return nil
+	return ordered, nil
 }
 
 func (p *branchPublisher) ensureGraphOriginShared(ctx context.Context, snapshot ttcsnapshot.SnapshotID) error {
@@ -1352,7 +1396,10 @@ func (p *branchPublisher) publishVolatileGraphOrigin(ctx context.Context, snapsh
 	if err := p.publishGraphDependencies(ctx, snapshot); err != nil {
 		return err
 	}
-	unlock := p.peers.lockSnapshotOrigin(snapshot)
+	unlock, err := p.peers.lockSnapshotOriginContext(ctx, snapshot)
+	if err != nil {
+		return err
+	}
 	defer unlock()
 	provider, volatile, err = p.authority.SnapshotProvider(uint64(snapshot))
 	if err != nil {
@@ -1375,7 +1422,10 @@ func (p *branchPublisher) publishVolatileGraphOrigin(ctx context.Context, snapsh
 		return fmt.Errorf("publishing snapshot origin %d: %w", snapshot, err)
 	}
 
-	finishHandoff := p.peers.beginFinalSnapshotSwitch()
+	finishHandoff, err := p.peers.beginFinalSnapshotSwitchContext(ctx)
+	if err != nil {
+		return err
+	}
 	defer finishHandoff()
 	ledgerFrozen := false
 	defer func() {
@@ -1579,8 +1629,9 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 		var handoffOrigins []uint64
 		if intent.Kind == "dehydrate" && branch.SnapshotID != 0 && len(branch.MemoryRoots) != 0 {
 			snapshot := ttcsnapshot.SnapshotID(branch.SnapshotID)
-			if err := p.publishGraphDependencies(context.Background(), snapshot); err != nil {
-				return fmt.Errorf("publishing durable memory dependencies for snapshot origin %d: %w", branch.SnapshotID, err)
+			// Publish made them shared, without the gate this holds.
+			if err := p.requireGraphDependenciesShared(snapshot); err != nil {
+				return fmt.Errorf("durable memory dependencies of snapshot origin %d: %w", branch.SnapshotID, err)
 			}
 			_, volatile, err := p.authority.SnapshotProvider(branch.SnapshotID)
 			if err != nil {

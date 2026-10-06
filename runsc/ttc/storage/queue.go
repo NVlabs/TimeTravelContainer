@@ -98,6 +98,11 @@ type Queue struct {
 	once      sync.Once
 	mu        sync.Mutex
 	inFlight  map[string]struct{}
+	// attempts ends the context of each publication attempt under way, once
+	// its publication is canceled: the cancellation waits for the attempt,
+	// which may wait for locks whose holders wait for the cancellation's
+	// caller.
+	attempts map[string]context.CancelFunc
 }
 
 // Open opens a node-local queue and starts its worker.
@@ -114,7 +119,7 @@ func Open(localRoot string, publisher Publisher) (*Queue, error) {
 	q := &Queue{
 		root: root, publisher: publisher, wake: make(chan struct{}, 1),
 		done: make(chan struct{}), stopped: make(chan struct{}),
-		inFlight: make(map[string]struct{}),
+		inFlight: make(map[string]struct{}), attempts: make(map[string]context.CancelFunc),
 	}
 	if err := q.recoverCaptures(); err != nil {
 		return nil, err
@@ -199,6 +204,9 @@ func (q *Queue) Cancel(container, branch, publicationID string) error {
 	}
 	q.mu.Lock()
 	_, inFlight := q.inFlight[id]
+	if endAttempt := q.attempts[id]; endAttempt != nil {
+		endAttempt()
+	}
 	q.mu.Unlock()
 	// The worker owns cleanup once publication has started. It observes the
 	// durable cancellation fence before completing or retrying the intent.
@@ -485,9 +493,15 @@ func (q *Queue) process() time.Duration {
 			continue
 		}
 		q.inFlight[intent.ID] = struct{}{}
+		ctx, endAttempt := context.WithCancel(context.Background())
+		q.attempts[intent.ID] = endAttempt
 		q.mu.Unlock()
 
-		result, publishErr := q.publisher.Publish(context.Background(), intent)
+		result, publishErr := q.publisher.Publish(ctx, intent)
+		q.mu.Lock()
+		delete(q.attempts, intent.ID)
+		q.mu.Unlock()
+		endAttempt()
 		endCompletion := func() {}
 		if gater, ok := q.publisher.(completionGater); ok && publishErr == nil {
 			// A removal canceling this publication waits for this attempt
