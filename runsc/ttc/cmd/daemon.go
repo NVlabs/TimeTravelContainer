@@ -6233,6 +6233,12 @@ func staleRouteRetry(retry *ownerLoss) bool {
 	return true
 }
 
+// staleRouteAnswer reports whether stderr, all a command's answer wrote
+// there, is its owner's refusal of a stale route and nothing else.
+func staleRouteAnswer(stderr string) bool {
+	return strings.HasPrefix(stderr, staleRouteRefusal) && strings.Count(stderr, "\n") == 1 && strings.HasSuffix(stderr, "\n")
+}
+
 // staleRouteFrames reports whether data, the start of a routed command's
 // answer, is the owner's refusal of a stale route and the status that ends
 // it, and whether it has enough of the answer to tell.
@@ -8888,6 +8894,7 @@ func runViaDaemon(opts options, args []string, stdin io.Reader, stdout, stderr i
 		attempts = 2
 	}
 	var lastErr error
+	var stale ownerLoss
 	for attempt := 0; attempt < attempts; attempt++ {
 		conn, err := connectRunningDaemon(opts.daemonSocket)
 		if err != nil {
@@ -8905,6 +8912,15 @@ func runViaDaemon(opts options, args []string, stdin io.Reader, stdout, stderr i
 			continue
 		}
 		if request.RequestID != "" {
+			// The node that owned the branch when the command was routed
+			// refused it, before it did anything or journaled it, as another
+			// command had moved, unplaced or claimed the branch: a node that
+			// routed it to itself has no hop to route it again. The command
+			// goes again, under its request ID, waiting out the other.
+			if status != 0 && bufferedStdout.Len() == 0 && staleRouteAnswer(bufferedStderr.String()) && staleRouteRetry(&stale) {
+				attempt--
+				continue
+			}
 			if _, err := stdout.Write(bufferedStdout.Bytes()); err != nil {
 				return 1, err
 			}
