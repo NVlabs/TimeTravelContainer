@@ -17094,7 +17094,14 @@ func (b *runtimeBackend) persistDehydration(target selector, info ttcbundle.Cont
 		graphCaptureActive = false
 	}
 	if _, err := os.Stat(finalDir); err == nil {
-		return fmt.Errorf("dehydration image already exists for branch %q", target.branch)
+		// A live branch keeps no capture on its node: one there is a cache of
+		// an earlier cold incarnation, as a fork of the branch materializes
+		// while the branch is dehydrated, which a stop on another node did not
+		// let go of before the branch ran here again. It refused every later
+		// dehydration of the branch, "dehydration image already exists".
+		if err := os.RemoveAll(finalDir); err != nil {
+			return fmt.Errorf("discarding the stale dehydration image of %s: %w", target, err)
+		}
 	} else if !os.IsNotExist(err) {
 		return err
 	}
