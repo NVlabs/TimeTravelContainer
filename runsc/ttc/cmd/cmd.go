@@ -17219,7 +17219,18 @@ func (b *runtimeBackend) rehydrate(target selector) (retErr error) {
 	if persistentBranch == nil {
 		return fmt.Errorf("branch %q is not recorded", target.branch)
 	}
-	if persistentBranch.State == "dehydrating" {
+	// A dehydrated branch whose publication is still under way is fenced as
+	// one still dehydrating is. Rehydrated in place from the capture its
+	// Sentry kept, its activation dropped the publication from its record
+	// while the worker committed it: the commit unplaced the branch, which
+	// the record that no longer named the publication could not be rolled
+	// forward to, and every later command of the branch failed, "repairing
+	// committed cold branch metadata: branch ... publication is "", worker
+	// has ...". A publication that committed first has, once the fence
+	// returns, completed the record the activation then goes on from.
+	pendingPublication := persistentBranch.State == "dehydrated" && b.publicationQueue != nil &&
+		persistentBranch.PublicationID != "" && persistentBranch.StorageState != "shared"
+	if persistentBranch.State == "dehydrating" || pendingPublication {
 		if b.publicationQueue == nil || persistentBranch.PublicationID == "" {
 			return fmt.Errorf("branch %s has not completed its local dehydration capture", target)
 		}
