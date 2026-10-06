@@ -905,8 +905,9 @@ func TestForkCatalogClaimed(t *testing.T) {
 		{name: "shared image", branch: ttcvolume.Branch{RemoteShared: true}, claim: true},
 		{name: "transaction source", volatile: true},
 		{name: "ended transaction's source", err: gone},
+		{name: "transaction source published since"},
 		{name: "retired shared image", branch: ttcvolume.Branch{RemoteShared: true}, err: gone, fails: true},
-		{name: "unreachable authority", err: errors.New("authority unavailable"), fails: true},
+		{name: "unreachable authority", branch: ttcvolume.Branch{RemoteShared: true}, err: errors.New("authority unavailable"), fails: true},
 	} {
 		claim, err := forkCatalogClaimed(test.branch, test.volatile, test.err)
 		if claim != test.claim || (err != nil) != test.fails {

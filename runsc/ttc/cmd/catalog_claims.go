@@ -74,6 +74,15 @@ func (b *runtimeBackend) claimForkCatalogs(info ttcbundle.ContainerInfo, filesys
 		if err != nil {
 			return fmt.Errorf("repository %q names remote catalog %q: %w", config.Source, catalog, err)
 		}
+		if !branch.RemoteShared {
+			// The source of a remote fork or a migration, which its
+			// transaction keeps while the target needs it, whatever its
+			// origin has become since: a publication of the source may have
+			// made the origin shared without the catalog's root, which the
+			// shared ledger then refused to retain, "owned object ... cannot
+			// be retained", and the fork with it.
+			continue
+		}
 		_, volatile, err := b.distributedSource.authority.SnapshotProvider(uint64(root.Snapshot))
 		if claim, err := forkCatalogClaimed(branch, volatile, err); err != nil {
 			return fmt.Errorf("finding the image that repository %q expands: %w", config.Source, err)
@@ -92,12 +101,13 @@ func (b *runtimeBackend) claimForkCatalogs(info ttcbundle.ContainerInfo, filesys
 // origin: whether it is volatile, or the error of the lookup.
 func forkCatalogClaimed(branch ttcvolume.Branch, volatile bool, err error) (bool, error) {
 	switch {
-	case errors.Is(err, os.ErrNotExist) && !branch.RemoteShared:
-		// The source of a remote fork or a migration whose transaction
-		// ended once the target no longer needed it, and retired the
-		// origin. The branch names the catalog until its next publication:
-		// a fork of a remote fork's target was refused, "finding the image
-		// that repository ... expands: file does not exist".
+	case !branch.RemoteShared:
+		// The source of a remote fork or a migration, which its transaction
+		// keeps while the target needs it. The branch names the catalog
+		// until its next publication, and the origin may be retired or
+		// published since: a fork of a remote fork's target was refused,
+		// "finding the image that repository ... expands: file does not
+		// exist".
 		return false, nil
 	case err != nil:
 		return false, err
