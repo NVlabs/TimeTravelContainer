@@ -433,6 +433,48 @@ func TestAuthorityCatalogEnsurePublicationReadyConcurrently(t *testing.T) {
 	}
 }
 
+// A cancellation of a publication that committed first reports the commit,
+// which it leaves; one of a publication that did not, cancels it.
+func TestAuthorityCatalogCancelUncommittedPublication(t *testing.T) {
+	node := newTestHolder(t).node
+	registerReadyNode(t, node, "node-a", "incarnation-a")
+	catalog, err := NewAuthorityCatalog(node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, branch := range []string{"main", "other"} {
+		if _, err := catalog.Create(PlacementRecord{
+			FamilyID: "family", BranchID: branch, PhysicalContainer: "family", PhysicalBranch: branch,
+			OwnerNode: "node-a", OwnerIncarnation: "incarnation-a", State: PlacementRunning,
+		}, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	roots := DurableRoots{FilesystemRoot: "cold/manifests/family/main/0000000000000001.json"}
+	if _, err := catalog.EnsurePublicationReady("family", "main", "publication-1", "exited", roots); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catalog.CommitPublication("family", "main", "publication-1", roots, "node-a", "incarnation-a", nil); err != nil {
+		t.Fatal(err)
+	}
+	if committed, err := catalog.CancelUncommittedPublication("family", "main", "publication-1"); err != nil || !committed {
+		t.Fatalf("canceling a committed publication = (%t, %v), want (true, nil)", committed, err)
+	}
+	if record, _, err := catalog.Publication("family", "main", "publication-1"); err != nil || record.State != PublicationCommitted {
+		t.Fatalf("the committed publication is %+v (%v) after the cancellation", record, err)
+	}
+	other := DurableRoots{FilesystemRoot: "cold/manifests/family/other/0000000000000002.json"}
+	if _, err := catalog.EnsurePublicationReady("family", "other", "publication-2", "exited", other); err != nil {
+		t.Fatal(err)
+	}
+	if committed, err := catalog.CancelUncommittedPublication("family", "other", "publication-2"); err != nil || committed {
+		t.Fatalf("canceling an uncommitted publication = (%t, %v), want (false, nil)", committed, err)
+	}
+	if record, _, err := catalog.Publication("family", "other", "publication-2"); err != nil || record.State != PublicationCanceled {
+		t.Fatalf("the canceled publication is %+v (%v)", record, err)
+	}
+}
+
 func TestAuthorityCatalogHeartbeatReturnsRenewedState(t *testing.T) {
 	node := newTestHolder(t).node
 	registerReadyNode(t, node, "node-a", "incarnation-a")

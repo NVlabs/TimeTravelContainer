@@ -2284,8 +2284,9 @@ func (s *daemonServer) claimLifecycleTargets(backend *runtimeBackend, args []str
 			// A branch created by `ttc create` has durable bundle/filesystem
 			// state but has never produced a cold publication. Claim its existing
 			// shared record directly. Every other unplaced lifecycle must pass the
-			// immutable publication fence before it can execute elsewhere.
-			if normalizeLifecycleState(branch.State) != "created" {
+			// immutable publication fence before it can execute elsewhere, but
+			// one that the command just activated here from the publication.
+			if normalizeLifecycleState(branch.State) != "created" && (admit || !activatedFromPublication(store, branch, *committed, node.NodeID)) {
 				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 				persistent, persistentBranch, waitErr := waitForCommittedColdBranchMetadata(ctx, store, info.ID, resolved.branch, *committed)
 				cancel()
@@ -2319,6 +2320,25 @@ func (s *daemonServer) claimLifecycleTargets(backend *runtimeBackend, args []str
 		}
 	}
 	return nil
+}
+
+// activatedFromPublication reports whether a command on node nodeID, a start
+// or rehydration that a publication of branch unplaced as it ran, went on
+// from that publication: the branch runs here from its manifest, and its
+// record no longer names the publication, which the activation consumed.
+// Waiting for the record to show the publication unplaced, as before a
+// command, would wait for good: the repair that rolls a record forward to a
+// committed publication refuses one that no longer names it.
+func activatedFromPublication(store ttcbundle.Store, branch ttcbundle.BranchInfo, committed cluster.BranchAuthority, nodeID string) bool {
+	if committed.Roots.FilesystemRoot == "" || branch.PublicationID != "" || branch.Unplaced || branch.NodeID != nodeID {
+		return false
+	}
+	switch normalizeLifecycleState(branch.State) {
+	case "running", "paused":
+	default:
+		return false
+	}
+	return filepath.Clean(branch.StorageManifest) == filepath.Join(store.Root, filepath.FromSlash(committed.Roots.FilesystemRoot))
 }
 
 // lifecycleCommandOperands applies the same option grammar as the command

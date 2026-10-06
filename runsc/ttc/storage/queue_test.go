@@ -627,6 +627,48 @@ func TestCancelEndsTheAttemptUnderWay(t *testing.T) {
 	}
 }
 
+// committedPublisher's publications committed before any cancellation.
+type committedPublisher struct {
+	testPublisher
+	cleaned chan Intent
+}
+
+func (p *committedPublisher) FenceCancellation(Intent) error { return ErrPublicationCommitted }
+func (p *committedPublisher) CaptureAvailable(Intent) (bool, error) {
+	return false, nil
+}
+func (p *committedPublisher) Cleanup(intent Intent) error { p.cleaned <- intent; return nil }
+
+// A cancellation of a publication that committed first reports it to a caller
+// that goes on from the capture, and Cancel's callers still see none.
+func TestCancelOfACommittedPublication(t *testing.T) {
+	publisher := &committedPublisher{
+		testPublisher: testPublisher{completed: make(chan Intent, 1)}, cleaned: make(chan Intent, 2),
+	}
+	queue, err := Open(t.TempDir(), publisher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+	for _, publication := range []string{"publication-10", "publication-11"} {
+		if err := queue.Enqueue(Intent{Container: "family", Branch: "main", PublicationID: publication, Kind: "stop", FilesystemBranch: "capture"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := queue.CancelUncommitted("family", "main", "publication-10"); !errors.Is(err, ErrPublicationCommitted) {
+		t.Fatalf("CancelUncommitted of a committed publication = %v, want %v", err, ErrPublicationCommitted)
+	}
+	if err := queue.Cancel("family", "main", "publication-11"); err != nil {
+		t.Fatalf("Cancel of a committed publication = %v", err)
+	}
+	if pending, err := queue.Pending(); err != nil || len(pending) != 0 {
+		t.Fatalf("intents remain: pending=%+v err=%v", pending, err)
+	}
+	if len(publisher.cleaned) != 2 {
+		t.Fatalf("%d captures cleaned, want 2", len(publisher.cleaned))
+	}
+}
+
 // removedPublisher's captures will never be ready: their branch was removed.
 type removedPublisher struct {
 	supersededPublisher

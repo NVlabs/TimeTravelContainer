@@ -45,6 +45,10 @@ type Intent struct {
 	RetryAt                 time.Time `json:"retry_at,omitempty"`
 }
 
+// ErrPublicationCommitted is what canceling a publication returns that
+// committed first: its capture is the branch's durable state.
+var ErrPublicationCommitted = errors.New("publication was committed")
+
 // ErrPublicationSuperseded means an immutable work item is no longer the
 // branch's current publication. It is terminal, not a transient storage
 // failure: the queue cleans its private capture and removes the intent.
@@ -82,7 +86,8 @@ type completionGater interface {
 // cancellationFencer is implemented by distributed publishers whose control
 // plane can reject an in-flight Complete before physical cleanup is safe. The
 // durable local tombstone is installed first; the authority then gives commit versus
-// cancel one total order.
+// cancel one total order. FenceCancellation returns ErrPublicationCommitted if
+// the commit came first.
 type cancellationFencer interface {
 	FenceCancellation(Intent) error
 }
@@ -184,21 +189,43 @@ func (q *Queue) Enqueue(intent Intent) error {
 	return nil
 }
 
-// Cancel fences one exact publication before removing its pending intent.
+// Cancel fences one exact publication before removing its pending intent. A
+// publication that committed first stays committed.
 func (q *Queue) Cancel(container, branch, publicationID string) error {
+	if err := q.CancelUncommitted(container, branch, publicationID); !errors.Is(err, ErrPublicationCommitted) {
+		return err
+	}
+	return nil
+}
+
+// CancelUncommitted is Cancel, for a caller that must not take a publication
+// that committed first for canceled, as one that goes on from the capture
+// does: it returns ErrPublicationCommitted then, once the attempt that
+// committed it has ended.
+func (q *Queue) CancelUncommitted(container, branch, publicationID string) error {
+	committed, err := q.cancel(container, branch, publicationID)
+	if committed {
+		return errors.Join(err, ErrPublicationCommitted)
+	}
+	return err
+}
+
+func (q *Queue) cancel(container, branch, publicationID string) (committed bool, _ error) {
 	id := intentID(container, branch, publicationID)
 	intent, readErr := q.read(id + ".json")
 	if errors.Is(readErr, os.ErrNotExist) {
 		readErr = nil
 	}
 	if err := writeJSONAtomic(q.path("canceled", id), map[string]any{"id": id, "canceled_at": time.Now().UTC()}); err != nil {
-		return err
+		return false, err
 	}
 	if readErr == nil && intent.ID != "" {
 		if fencer, ok := q.publisher.(cancellationFencer); ok {
-			if err := fencer.FenceCancellation(intent); err != nil {
+			if err := fencer.FenceCancellation(intent); errors.Is(err, ErrPublicationCommitted) {
+				committed = true
+			} else if err != nil {
 				q.signal()
-				return err
+				return false, err
 			}
 		}
 	}
@@ -252,20 +279,20 @@ func (q *Queue) Cancel(container, branch, publicationID string) error {
 		}()
 		pending, err := q.read(id + ".json")
 		if errors.Is(err, os.ErrNotExist) {
-			return readErr
+			return committed, readErr
 		}
 		if err != nil {
-			return errors.Join(readErr, err)
+			return committed, errors.Join(readErr, err)
 		}
 		if err := q.publisher.Cleanup(pending); err != nil {
 			pending.Attempts++
 			pending.LastError = err.Error()
 			pending.RetryAt = time.Now().Add(time.Second << min(pending.Attempts-1, 8)).UTC()
-			return errors.Join(readErr, err, writeJSONAtomic(q.path("pending", id), pending))
+			return committed, errors.Join(readErr, err, writeJSONAtomic(q.path("pending", id), pending))
 		}
-		return errors.Join(readErr, q.finishCancellation(id))
+		return committed, errors.Join(readErr, q.finishCancellation(id))
 	}
-	return readErr
+	return committed, readErr
 }
 
 // CancelPending cancels a publication only when it still has a durable pending

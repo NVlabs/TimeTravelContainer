@@ -484,7 +484,8 @@ func publicationAuthorityIdentity(info ttcbundle.ContainerInfo, intent ttcstorag
 }
 
 // FenceCancellation orders cancellation against the publication's one
-// irreversible authority command before waiting for data-plane cleanup.
+// irreversible authority command before waiting for data-plane cleanup. It
+// returns ttcstorage.ErrPublicationCommitted if that command came first.
 func (p *branchPublisher) FenceCancellation(intent ttcstorage.Intent) error {
 	if p.authority == nil {
 		return nil
@@ -495,7 +496,11 @@ func (p *branchPublisher) FenceCancellation(intent ttcstorage.Intent) error {
 		return err
 	}
 	family, branch := publicationAuthorityIdentity(info, intent)
-	return p.authority.CancelPublication(family, branch, intent.PublicationID)
+	committed, err := p.authority.CancelUncommittedPublication(family, branch, intent.PublicationID)
+	if err == nil && committed {
+		return ttcstorage.ErrPublicationCommitted
+	}
+	return err
 }
 
 // branchRemoved reports whether the branch intent publishes was removed:
@@ -2595,6 +2600,13 @@ func (b *runtimeBackend) materializeColdFilesystem(info ttcbundle.ContainerInfo,
 	// self-contained first. Whole-file materialization preserves repository
 	// identity and CoW metadata; only this explicit management path pays the
 	// recursive cost.
+	return b.materializeRemoteFilesystemObjects(info, branch)
+}
+
+// materializeRemoteFilesystemObjects makes this node's repositories of branch
+// self-contained: what they hold of the publication the branch's manifest
+// names only as lazy placeholders, they read from its shared packs.
+func (b *runtimeBackend) materializeRemoteFilesystemObjects(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) error {
 	sources, cleanup, err := b.prepareColdDirectFilesystemSources(info, branch, branch.FilesystemBranch)
 	if err != nil {
 		return err

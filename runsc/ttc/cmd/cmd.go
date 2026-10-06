@@ -7214,6 +7214,11 @@ func (b *runtimeBackend) resolveDistributedPersistentBranch(logical ttcbundle.Co
 	if publicationID != "" && b.distributedSource != nil && b.distributedSource.authority != nil {
 		if authority, err := b.distributedSource.authority.Branch(logicalID, branchID); err == nil &&
 			authority.PublicationID == publicationID && authority.Roots.FilesystemRoot != "" {
+			// A start or rehydration here that the publication unplaced the
+			// branch beneath went on from it, until it claims the branch again.
+			if branch, err := persistentBranchInfo(logical, branchID); err == nil && activatedFromPublication(b.containerStore(), branch, *authority, b.nodeID) {
+				return logical, branchID, nil
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 			physical, physicalBranch, waitErr := waitForCommittedColdBranchMetadata(ctx, b.containerStore(), logicalID, branchID, *authority)
 			cancel()
@@ -8288,18 +8293,29 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 	// is necessarily shared. Fence that exact capture before executing a fresh
 	// process incarnation. Otherwise its late completion could still release the
 	// placement or overwrite storage metadata belonging to the new runtime.
-	// A committed capture has a manifest and no active worker; materialize it
-	// below before changing the local storage view.
-	if branch.PublicationID != "" && branch.StorageManifest == "" {
+	// A committed capture is shared, with its manifest, and has no active
+	// worker; materialize it below before changing the local storage view.
+	// Until then, this node's filesystem of the branch is its latest, and a
+	// manifest the branch names is an older publication's, which the start
+	// must not put back: taking it for the capture's, a start right after a
+	// stop was refused.
+	// A publication that committed before the fence is the capture's, and is
+	// materialized below.
+	keepLocalFilesystem := false
+	if branch.PublicationID != "" && branch.StorageState != "shared" {
 		if b.publicationQueue == nil {
 			return 1, fmt.Errorf("branch %s has publication %q but no publication queue", target, branch.PublicationID)
 		}
-		if err := b.publicationQueue.Cancel(info.ID, target.branch, branch.PublicationID); err != nil {
-			return 1, fmt.Errorf("fencing stopped snapshot publication for %s: %w", target, err)
+		fenceErr := b.publicationQueue.CancelUncommitted(info.ID, target.branch, branch.PublicationID)
+		if fenceErr == nil {
+			fenceErr = b.containerStore().AbandonBranchPublication(info.ID, target.branch, branch.PublicationID)
+			if fenceErr != nil && !errors.Is(fenceErr, ttcbundle.ErrPublicationCommitted) {
+				return 1, fmt.Errorf("retiring stopped snapshot publication for %s: %w", target, fenceErr)
+			}
+		} else if !errors.Is(fenceErr, ttcstorage.ErrPublicationCommitted) {
+			return 1, fmt.Errorf("fencing stopped snapshot publication for %s: %w", target, fenceErr)
 		}
-		if err := b.containerStore().AbandonBranchPublication(info.ID, target.branch, branch.PublicationID); err != nil {
-			return 1, fmt.Errorf("retiring stopped snapshot publication for %s: %w", target, err)
-		}
+		keepLocalFilesystem = fenceErr == nil
 		info, err = b.containerStore().LoadContainer(info.ID)
 		if err != nil {
 			return 1, err
@@ -8314,7 +8330,7 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 		return 1, err
 	}
 	if len(preservedPeers) != 0 {
-		info, branch, err = b.prepareFreshStartStorage(info, target)
+		info, branch, err = b.prepareFreshStartStorage(info, target, keepLocalFilesystem)
 		if err != nil {
 			return 1, err
 		}
@@ -8341,7 +8357,7 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 	if err := b.removeStoppedRuntime(info.ID, waitForTeardown); err != nil {
 		return 1, fmt.Errorf("preparing a fresh runtime for %s: %w", target, err)
 	}
-	info, branch, err = b.prepareFreshStartStorage(info, target)
+	info, branch, err = b.prepareFreshStartStorage(info, target, keepLocalFilesystem)
 	if err != nil {
 		return 1, err
 	}
@@ -8373,7 +8389,10 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 // full-sandbox replacement and bootstrap-beside-peers: a cold branch may be
 // admitted on a node that has neither its image extraction nor its writable
 // repository yet.
-func (b *runtimeBackend) prepareFreshStartStorage(info ttcbundle.ContainerInfo, target selector) (ttcbundle.ContainerInfo, ttcbundle.BranchInfo, error) {
+// prepareFreshStartStorage makes ready the filesystem a fresh start of target
+// boots from: the branch's committed manifest's, unless keepLocal, when this
+// node's filesystem of the branch is its latest and is kept.
+func (b *runtimeBackend) prepareFreshStartStorage(info ttcbundle.ContainerInfo, target selector, keepLocal bool) (ttcbundle.ContainerInfo, ttcbundle.BranchInfo, error) {
 	branch, err := persistentBranchInfo(info, target.branch)
 	if err != nil {
 		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
@@ -8405,6 +8424,14 @@ func (b *runtimeBackend) prepareFreshStartStorage(info ttcbundle.ContainerInfo, 
 		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
 	}
 	if branch.StorageManifest == "" {
+		return info, branch, nil
+	}
+	if keepLocal {
+		// The branch may still read files of the older publication lazily,
+		// which a fresh start's Sentry has no relay for.
+		if err := b.materializeRemoteFilesystemObjects(info, branch); err != nil {
+			return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("materializing durable filesystem for %s: %w", target, err)
+		}
 		return info, branch, nil
 	}
 	if err := b.ensureLocalColdFilesystem(info, branch); err != nil {
@@ -16923,18 +16950,25 @@ func (b *runtimeBackend) rehydrate(target selector) (retErr error) {
 			return fmt.Errorf("branch %s has not completed its local dehydration capture", target)
 		}
 		publicationID := persistentBranch.PublicationID
-		if err := b.publicationQueue.Cancel(info.ID, target.branch, publicationID); err != nil {
-			return fmt.Errorf("fencing dehydration publication for %s: %w", target, err)
-		}
-		if err := b.containerStore().AbandonBranchPublication(info.ID, target.branch, publicationID); err != nil {
-			return fmt.Errorf("retiring dehydration publication for %s: %w", target, err)
-		}
-		snapshot := persistentBranch.SnapshotID
-		defer func() {
-			if retErr != nil {
-				retErr = errors.Join(retErr, b.republishAbandonedDehydration(target, snapshot))
+		fenceErr := b.publicationQueue.CancelUncommitted(info.ID, target.branch, publicationID)
+		if fenceErr == nil {
+			fenceErr = b.containerStore().AbandonBranchPublication(info.ID, target.branch, publicationID)
+			if fenceErr != nil && !errors.Is(fenceErr, ttcbundle.ErrPublicationCommitted) {
+				return fmt.Errorf("retiring dehydration publication for %s: %w", target, fenceErr)
 			}
-		}()
+		} else if !errors.Is(fenceErr, ttcstorage.ErrPublicationCommitted) {
+			return fmt.Errorf("fencing dehydration publication for %s: %w", target, fenceErr)
+		}
+		// A publication that committed before the fence made the branch
+		// durably dehydrated: it is rehydrated as such, from its record.
+		if fenceErr == nil {
+			snapshot := persistentBranch.SnapshotID
+			defer func() {
+				if retErr != nil {
+					retErr = errors.Join(retErr, b.republishAbandonedDehydration(target, snapshot))
+				}
+			}()
+		}
 		// AbandonBranchPublication clears the immutable publication fence. Reload
 		// so the cold restore cannot accidentally reuse the canceled identity.
 		info, err = b.containerStore().LoadContainer(info.ID)

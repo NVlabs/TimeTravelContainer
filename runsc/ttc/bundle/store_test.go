@@ -741,6 +741,49 @@ func TestBeginBranchPublicationIfDoesNotSupersedeChangedIdentity(t *testing.T) {
 	}
 }
 
+// A publication that committed is not abandoned: its worker finished before
+// the cancellation began, and a record that no longer named it could not be
+// repaired to what the authority holds.
+func TestAbandonBranchPublicationLeavesACommittedOne(t *testing.T) {
+	root := t.TempDir()
+	containerID := "container-id"
+	containerDir := filepath.Join(root, "containers", containerID)
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	info := ContainerInfo{ID: containerID, Name: "example", BundleDir: bundleDir, State: "exited", Branches: []BranchInfo{{
+		ID: "main", FilesystemBranch: "main", State: "exited", PublicationID: "publication-1",
+		StorageState: "publishing", StorageManifest: "older-manifest",
+	}}}
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	store := Store{Root: root}
+	if err := store.CompleteBranchPublication("example", "main", "publication-1", "manifest-1", "exited", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AbandonBranchPublication("example", "main", "publication-1"); !errors.Is(err, ErrPublicationCommitted) {
+		t.Fatalf("abandoning a committed publication = %v, want %v", err, ErrPublicationCommitted)
+	}
+	loaded, err := store.LoadContainer("example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if branch := loaded.Branches[0]; branch.PublicationID != "publication-1" || branch.StorageState != "shared" || branch.StorageManifest != "manifest-1" {
+		t.Fatalf("committed branch after the abandon = %+v", branch)
+	}
+	if _, err := store.BeginBranchPublicationIf("example", "main", "publication-1", "publication-2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AbandonBranchPublication("example", "main", "publication-2"); err != nil {
+		t.Fatalf("abandoning a pending publication: %v", err)
+	}
+}
+
 // A name that resolved once resolves again without a full listing, and still
 // follows the records when a family is renamed, removed, or its name reused.
 // A container's name never changes, but it can be removed, and its name taken

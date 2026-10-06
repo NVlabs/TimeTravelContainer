@@ -5194,10 +5194,18 @@ func (s Store) CompleteConsumedBranchPublication(name, branchID, manifest, lifec
 	})
 }
 
+// ErrPublicationCommitted is AbandonBranchPublication's refusal of a
+// publication that committed: the branch's record names its manifest, which
+// the authority holds for the branch's.
+var ErrPublicationCommitted = errors.New("publication is committed")
+
 // AbandonBranchPublication fences an asynchronous worker before a local
 // capture is consumed to make the branch active again. The old shared
 // manifest remains a valid immutable ancestor, but the active branch is no
-// longer represented by the publication being abandoned.
+// longer represented by the publication being abandoned. A publication that
+// committed is not abandoned: its worker may have finished before the
+// cancellation began, and a record that no longer named it could not be
+// repaired to what the authority holds.
 func (s Store) AbandonBranchPublication(name, branchID, publicationID string) error {
 	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
 		for i := range info.Branches {
@@ -5207,6 +5215,9 @@ func (s Store) AbandonBranchPublication(name, branchID, publicationID string) er
 			}
 			if branch.PublicationID != publicationID {
 				return false, fmt.Errorf("branch %q publication is %q, cancel has %q", branchID, branch.PublicationID, publicationID)
+			}
+			if branch.StorageState == "shared" {
+				return false, fmt.Errorf("branch %q publication %q: %w", branchID, publicationID, ErrPublicationCommitted)
 			}
 			branch.PublicationID = ""
 			branch.StorageState = "local"

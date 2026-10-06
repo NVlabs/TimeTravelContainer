@@ -2192,6 +2192,34 @@ func TestForkPlacementDestinationPreflight(t *testing.T) {
 	}
 }
 
+// A start or rehydration that a publication unplaced its branch beneath goes
+// on from that publication: the record it leaves, running on its node from
+// the publication's manifest, is the branch's, and not one to roll forward to
+// the publication.
+func TestActivatedFromPublication(t *testing.T) {
+	store := ttcbundle.Store{Root: "/shared"}
+	committed := cluster.BranchAuthority{PublicationID: "publication-1", Roots: cluster.DurableRoots{FilesystemRoot: "cold/manifests/family/main/publication-1.json"}}
+	activated := ttcbundle.BranchInfo{ID: "main", State: "running", NodeID: "node-a", StorageState: "local", StorageManifest: "/shared/cold/manifests/family/main/publication-1.json"}
+	if !activatedFromPublication(store, activated, committed, "node-a") {
+		t.Fatal("a branch running here from the publication was not taken for activated")
+	}
+	for name, change := range map[string]func(*ttcbundle.BranchInfo){
+		"its record names the publication": func(b *ttcbundle.BranchInfo) { b.PublicationID = "publication-1" },
+		"it runs on another node":          func(b *ttcbundle.BranchInfo) { b.NodeID = "node-b" },
+		"it is unplaced":                   func(b *ttcbundle.BranchInfo) { b.Unplaced = true },
+		"it is exited":                     func(b *ttcbundle.BranchInfo) { b.State = "exited" },
+		"it runs from an older manifest": func(b *ttcbundle.BranchInfo) {
+			b.StorageManifest = "/shared/cold/manifests/family/main/publication-0.json"
+		},
+	} {
+		branch := activated
+		change(&branch)
+		if activatedFromPublication(store, branch, committed, "node-a") {
+			t.Errorf("a branch whose %s was taken for activated from the publication", name)
+		}
+	}
+}
+
 func TestResolveDistributedPersistentBranchUsesPublicationIdentity(t *testing.T) {
 	root := t.TempDir()
 	writeContainer := func(info ttcbundle.ContainerInfo) {

@@ -518,20 +518,30 @@ func (c *AuthorityCatalog) CommitPublication(family, branch, publicationID strin
 // cancellation of a revision the publication has left is refused; it is
 // proposed again for the revision the publication has then.
 func (c *AuthorityCatalog) CancelPublication(family, branch, publicationID string) error {
+	_, err := c.CancelUncommittedPublication(family, branch, publicationID)
+	return err
+}
+
+// CancelUncommittedPublication is CancelPublication, and reports whether the
+// publication had committed, which no cancellation undoes.
+func (c *AuthorityCatalog) CancelUncommittedPublication(family, branch, publicationID string) (committed bool, err error) {
 	key := publicationKey(family, branch, publicationID)
 	var refused error
 	var revision uint64
 	for {
 		state, err := c.query(AuthorityQuery{Publications: Only(key)})
 		if err != nil {
-			return err
+			return false, err
 		}
 		record, ok := state.Publications[key]
-		if !ok || record.State == PublicationCommitted || record.State == PublicationCanceled {
-			return nil
+		if ok && record.State == PublicationCommitted {
+			return true, nil
+		}
+		if !ok || record.State == PublicationCanceled {
+			return false, nil
 		}
 		if refused != nil && record.Revision == revision {
-			return refused
+			return false, refused
 		}
 		revision = record.Revision
 		refused = applyAuthorityNoValue(c, time.Now().UTC(), AuthorityPublicationCancel, AuthorityPublicationPayload{
@@ -539,7 +549,7 @@ func (c *AuthorityCatalog) CancelPublication(family, branch, publicationID strin
 			BranchGeneration: record.BranchGeneration, Revision: record.Revision,
 		})
 		if refused == nil {
-			return nil
+			return false, nil
 		}
 	}
 }
