@@ -2397,6 +2397,50 @@ func lifecycleCommandAcceptsBranch(command string, info ttcbundle.ContainerInfo,
 	return true
 }
 
+// completeCommittedPublication rolls the record of branchID in the runtime
+// info forward to publicationID, which a command's fence found committed, as
+// the publication's worker does once it commits it. The worker may not have
+// by then: one that failed after its commit and then found the fence's
+// cancellation left the record naming the publication uncommitted, and a
+// start went on from that record, an older manifest's. Its activation
+// dropped the publication from the record, which could then no longer be
+// rolled forward to it: every later command of the branch failed,
+// "repairing committed cold branch metadata: branch ... publication is "",
+// worker has ...".
+func (b *runtimeBackend) completeCommittedPublication(info ttcbundle.ContainerInfo, branchID, publicationID string) error {
+	if b.distributedSource == nil || b.distributedSource.authority == nil {
+		return nil
+	}
+	// The commit released the branch's placement, and with it the runtime
+	// and branch it named: the publication names its branch still.
+	state, err := b.distributedSource.authority.AuthorityStateOf(cluster.AuthorityQuery{Publications: cluster.All[string](), Family: logicalFamilyID(info)})
+	if err != nil {
+		return err
+	}
+	var publication *cluster.PublicationRecord
+	for _, record := range state.Publications {
+		if record.PublicationID == publicationID {
+			publication = &record
+			break
+		}
+	}
+	if publication == nil {
+		return fmt.Errorf("publication %q is not recorded", publicationID)
+	}
+	committed, err := b.distributedSource.authority.Branch(publication.FamilyID, publication.BranchID)
+	if err != nil {
+		return err
+	}
+	if committed.PublicationID != publicationID {
+		// A later lifecycle superseded the publication: the record is that one's.
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	_, _, err = waitForCommittedColdBranchMetadata(ctx, b.containerStore(), info.ID, branchID, *committed)
+	return err
+}
+
 // activatedFromPublication reports whether a command on node nodeID, a start
 // or rehydration that a publication of branch unplaced as it ran, went on
 // from that publication: the branch runs here from its manifest, and its

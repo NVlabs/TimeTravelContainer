@@ -8368,6 +8368,8 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 			}
 		} else if !errors.Is(fenceErr, ttcstorage.ErrPublicationCommitted) {
 			return 1, fmt.Errorf("fencing stopped snapshot publication for %s: %w", target, fenceErr)
+		} else if err := b.completeCommittedPublication(info, target.branch, branch.PublicationID); err != nil {
+			return 1, fmt.Errorf("completing stopped snapshot publication for %s: %w", target, err)
 		}
 		keepLocalFilesystem = fenceErr == nil
 		info, err = b.containerStore().LoadContainer(info.ID)
@@ -17569,8 +17571,9 @@ func (b *runtimeBackend) rehydrate(target selector) (retErr error) {
 	// the record that no longer named the publication could not be rolled
 	// forward to, and every later command of the branch failed, "repairing
 	// committed cold branch metadata: branch ... publication is "", worker
-	// has ...". A publication that committed first has, once the fence
-	// returns, completed the record the activation then goes on from.
+	// has ...". A publication that committed first completes, once the fence
+	// returns, the record the activation then goes on from; see
+	// completeCommittedPublication.
 	pendingPublication := persistentBranch.State == "dehydrated" && b.publicationQueue != nil &&
 		persistentBranch.PublicationID != "" && persistentBranch.StorageState != "shared"
 	if persistentBranch.State == "dehydrating" || pendingPublication {
@@ -17586,6 +17589,8 @@ func (b *runtimeBackend) rehydrate(target selector) (retErr error) {
 			}
 		} else if !errors.Is(fenceErr, ttcstorage.ErrPublicationCommitted) {
 			return fmt.Errorf("fencing dehydration publication for %s: %w", target, fenceErr)
+		} else if err := b.completeCommittedPublication(info, target.branch, publicationID); err != nil {
+			return fmt.Errorf("completing dehydration publication for %s: %w", target, err)
 		}
 		// A publication that committed before the fence made the branch
 		// durably dehydrated: it is rehydrated as such, from its record.
