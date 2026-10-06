@@ -49,6 +49,11 @@ type Intent struct {
 // committed first: its capture is the branch's durable state.
 var ErrPublicationCommitted = errors.New("publication was committed")
 
+// ErrPublicationElsewhere is what canceling a publication returns that
+// another node's queue holds, still under way: that node holds the capture,
+// and the publication is its to finish or cancel.
+var ErrPublicationElsewhere = errors.New("publication is another node's, under way")
+
 // ErrPublicationSuperseded means an immutable work item is no longer the
 // branch's current publication. It is terminal, not a transient storage
 // failure: the queue cleans its private capture and removes the intent.
@@ -90,6 +95,13 @@ type completionGater interface {
 // the commit came first.
 type cancellationFencer interface {
 	FenceCancellation(Intent) error
+}
+
+// publicationReader is implemented by distributed publishers that can say,
+// without changing it, how a publication this queue does not hold stands:
+// committed, or still under way on the node that holds it.
+type publicationReader interface {
+	PublicationState(container, branch, publicationID string) (committed, underWay bool, err error)
 }
 
 // Queue persists intents before returning to lifecycle commands and retries
@@ -203,6 +215,23 @@ func (q *Queue) Cancel(container, branch, publicationID string) error {
 // does: it returns ErrPublicationCommitted then, once the attempt that
 // committed it has ended.
 func (q *Queue) CancelUncommitted(container, branch, publicationID string) error {
+	// A publication another node's queue holds was taken for canceled, the
+	// authority not asked: a caller that went on from its capture dropped it
+	// from the branch's record while that node committed it, and the record
+	// that no longer named it could not be rolled forward to it.
+	if reader, ok := q.publisher.(publicationReader); ok {
+		if _, err := q.read(intentID(container, branch, publicationID) + ".json"); errors.Is(err, os.ErrNotExist) {
+			committed, underWay, err := reader.PublicationState(container, branch, publicationID)
+			switch {
+			case err != nil:
+				return err
+			case committed:
+				return ErrPublicationCommitted
+			case underWay:
+				return ErrPublicationElsewhere
+			}
+		}
+	}
 	committed, err := q.cancel(container, branch, publicationID)
 	if committed {
 		return errors.Join(err, ErrPublicationCommitted)

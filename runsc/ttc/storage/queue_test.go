@@ -679,6 +679,58 @@ func TestCancelOfACommittedPublication(t *testing.T) {
 	}
 }
 
+// remotePublisher's publications are another node's: this queue holds none,
+// and the authority says how each stands.
+type remotePublisher struct {
+	testPublisher
+	states map[string]string
+}
+
+func (p *remotePublisher) PublicationState(_, _, publicationID string) (committed, underWay bool, err error) {
+	switch p.states[publicationID] {
+	case "committed":
+		return true, false, nil
+	case "under way":
+		return false, true, nil
+	}
+	return false, false, nil
+}
+
+// A cancellation of a publication that another node's queue holds asks the
+// authority how it stands: one that committed is reported as such, and one
+// still under way is that node's to finish, not taken for canceled, which let
+// a caller drop it from its branch's record while the other node committed it.
+func TestCancelOfAnotherNodesPublication(t *testing.T) {
+	publisher := &remotePublisher{
+		testPublisher: testPublisher{completed: make(chan Intent, 1)},
+		states:        map[string]string{"publication-1": "committed", "publication-2": "under way"},
+	}
+	queue, err := Open(t.TempDir(), publisher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+	for _, test := range []struct {
+		publication string
+		want        error
+	}{
+		{"publication-1", ErrPublicationCommitted},
+		{"publication-2", ErrPublicationElsewhere},
+		{"publication-3", nil},
+	} {
+		if err := queue.CancelUncommitted("family", "main", test.publication); !errors.Is(err, test.want) || (test.want == nil && err != nil) {
+			t.Errorf("CancelUncommitted(%s) = %v, want %v", test.publication, err, test.want)
+		}
+	}
+	// One this queue holds is fenced here, as before.
+	if err := queue.Enqueue(Intent{Container: "family", Branch: "main", PublicationID: "publication-2", Kind: "stop", FilesystemBranch: "capture"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.CancelUncommitted("family", "main", "publication-2"); err != nil {
+		t.Fatalf("CancelUncommitted of a publication this queue holds = %v", err)
+	}
+}
+
 // removedPublisher's captures will never be ready: their branch was removed.
 type removedPublisher struct {
 	supersededPublisher

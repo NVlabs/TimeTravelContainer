@@ -503,6 +503,35 @@ func (p *branchPublisher) FenceCancellation(intent ttcstorage.Intent) error {
 	return err
 }
 
+// PublicationState reads, without changing it, how a publication that this
+// node's queue does not hold stands in the authority: committed, or still
+// under way on the node that captured its branch.
+func (p *branchPublisher) PublicationState(container, branch, publicationID string) (committed, underWay bool, err error) {
+	if p.authority == nil {
+		return false, false, nil
+	}
+	store := ttcbundle.Store{Root: p.sharedRoot, ActiveRoot: p.localRoot}
+	info, err := store.LoadContainer(container)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	family, authorityBranch := publicationAuthorityIdentity(info, ttcstorage.Intent{Container: container, Branch: branch})
+	record, ok, err := p.authority.Publication(family, authorityBranch, publicationID)
+	if err != nil || !ok {
+		return false, false, err
+	}
+	switch record.State {
+	case cluster.PublicationCommitted:
+		return true, false, nil
+	case cluster.PublicationPreparing, cluster.PublicationReady:
+		return false, true, nil
+	}
+	return false, false, nil
+}
+
 // branchRemoved reports whether the branch intent publishes was removed:
 // err, reading its container's record, finds the record gone, and the
 // authority, which drops a branch's publications as it removes the branch,
