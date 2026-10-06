@@ -693,6 +693,16 @@ func (ledger *ReferenceLedger) ApplyReferences(mutations []SnapshotReferenceMuta
 // identity. Retrying an already committed prefix succeeds and changes
 // nothing; skipping or reordering any mutation is rejected.
 func (ledger *ReferenceLedger) ApplyHandoff(origin SnapshotID, from uint64, mutations []SnapshotReferenceMutation) error {
+	return ledger.ApplyHandoffSettling(origin, from, mutations, nil)
+}
+
+// ApplyHandoffSettling is ApplyHandoff, but takes a release of a reference the
+// ledger no longer has for applied if settled reports that the ledger's
+// keeper released the reference on its own, as a coordinator releases an
+// incoming edge whose parent origin has died. The provider's handoff then
+// releases it as well, and was refused for good, "reference ... does not
+// exist", its origin frozen for the handoff all the while.
+func (ledger *ReferenceLedger) ApplyHandoffSettling(origin SnapshotID, from uint64, mutations []SnapshotReferenceMutation, settled func(name string) bool) error {
 	if ledger == nil || origin == 0 {
 		return errors.New("invalid reference-ledger handoff")
 	}
@@ -742,7 +752,7 @@ func (ledger *ReferenceLedger) ApplyHandoff(origin SnapshotID, from uint64, muta
 				var err error
 				if mutation.Retain {
 					err = state.retain(mutation.Name, mutation.Object)
-				} else {
+				} else if _, held := state.References[mutation.Name]; held || settled == nil || !settled(mutation.Name) {
 					err = state.release(mutation.Name, mutation.Object)
 				}
 				if err != nil {

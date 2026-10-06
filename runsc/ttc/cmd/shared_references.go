@@ -1179,8 +1179,35 @@ func (s *sharedReferenceService) ApplySharedSnapshotHandoff(_ context.Context, p
 			Object: object, Retain: input.Retain,
 		}
 	}
+	// An incoming edge whose parent origin dies, the coordinator releases on
+	// its own (see the reconciliation of bridges), and the provider then as
+	// its parent object goes: the second release finds nothing to release.
+	parents := make(map[uint64]struct{})
+	for _, mutation := range mutations {
+		if parent, edge, err := incomingEdgeParent(mutation.Name); err == nil && edge && !mutation.Retain {
+			parents[uint64(parent.Snapshot)] = struct{}{}
+		}
+	}
+	dead := make(map[uint64]bool, len(parents))
+	if len(parents) != 0 {
+		ids := make([]uint64, 0, len(parents))
+		for id := range parents {
+			ids = append(ids, id)
+		}
+		state, err := s.authority.AuthorityStateOf(cluster.OriginsQuery(ids...))
+		if err != nil {
+			return err
+		}
+		for _, id := range ids {
+			dead[id] = state.OriginDead(id)
+		}
+	}
+	settled := func(name string) bool {
+		parent, edge, err := incomingEdgeParent(name)
+		return err == nil && edge && dead[uint64(parent.Snapshot)]
+	}
 	return s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
-		return ledger.ApplyHandoff(ttcsnapshot.SnapshotID(snapshotID), from, mutations)
+		return ledger.ApplyHandoffSettling(ttcsnapshot.SnapshotID(snapshotID), from, mutations, settled)
 	})
 }
 

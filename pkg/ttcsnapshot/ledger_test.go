@@ -250,6 +250,41 @@ func TestReferenceLedgerHandoffCursorIsAtomic(t *testing.T) {
 	}
 }
 
+// A coordinator releases an incoming edge whose parent origin dies, and the
+// provider's handoff then releases it as well: the handoff takes that release
+// for applied, and refuses one of a reference never released so.
+func TestReferenceLedgerHandoffSettlesReleasesOfDeadParents(t *testing.T) {
+	ledger := NewReferenceLedger()
+	child := ledgerObject(12, 1, ObjectKindFile)
+	child.Refs = 2
+	parent := ObjectID{Snapshot: 14, Ordinal: 1, Kind: ObjectKindInode}
+	edge := edgeReferenceName(parent, 0)
+	if err := ledger.ImportOrigin(12, []Object{child}, map[string]ObjectID{"root/branch": child.ID, edge: child.ID}); err != nil {
+		t.Fatal(err)
+	}
+	// The coordinator's release, as the parent origin dies.
+	if err := ledger.ApplyReference("bridge-release", edge, child.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	mutations := []SnapshotReferenceMutation{{Sequence: 1, Operation: "handoff-12-1", Name: edge, Object: child.ID}}
+	if err := ledger.ApplyHandoff(12, 0, mutations); err == nil {
+		t.Fatal("released a reference the ledger no longer has")
+	}
+	if err := ledger.ApplyHandoffSettling(12, 0, mutations, func(string) bool { return false }); err == nil {
+		t.Fatal("released a reference the ledger no longer has, its release not settled")
+	}
+	if err := ledger.ApplyHandoffSettling(12, 0, mutations, func(name string) bool { return name == edge }); err != nil {
+		t.Fatalf("a settled release was refused: %v", err)
+	}
+	if inspection := ledger.Inspect(); inspection.HandoffCursors[12] != 1 || inspection.Objects[child.ID] != 1 {
+		t.Fatalf("handoff=%+v", inspection)
+	}
+	// A retry of the batch finds it applied.
+	if err := ledger.ApplyHandoff(12, 0, mutations); err != nil {
+		t.Fatalf("retrying the settled batch: %v", err)
+	}
+}
+
 func TestSnapshotLedgerCapturesForeignParentEdges(t *testing.T) {
 	graph, err := Open(filepath.Join(t.TempDir(), "graph"))
 	if err != nil {
