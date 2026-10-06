@@ -16858,6 +16858,40 @@ func transactionIDForBranch(info ttcbundle.ContainerInfo, branch ttcbundle.Branc
 	return info.DistributedForkTransactionID
 }
 
+// republishAbandonedDehydration queues again the publication of target's
+// capture of snapshot, which a rehydration canceled and then did not restore.
+// The branch stays dehydrating, as it was, rather than dehydrating without a
+// publication, which every command refuses. A runtime that runs the branch
+// again holds its state, and the capture is not published.
+func (b *runtimeBackend) republishAbandonedDehydration(target selector, snapshot uint64) error {
+	info, err := b.containerStore().LoadContainer(target.container)
+	if err != nil {
+		return err
+	}
+	branch, err := persistentBranchInfo(info, target.branch)
+	if err != nil {
+		return err
+	}
+	if branch.State != "dehydrating" || branch.PublicationID != "" || branch.SnapshotID != snapshot {
+		return nil
+	}
+	if output, err := b.command("timetravel", info.ID, "branches"); err == nil {
+		var runtimeBranches []runscBranchInfo
+		if err := json.Unmarshal(output, &runtimeBranches); err != nil {
+			return fmt.Errorf("decoding runtime branches: %w", err)
+		}
+		for _, runtimeBranch := range runtimeBranches {
+			if runtimeBranch.ID == target.branch && (runtimeBranch.State == "running" || runtimeBranch.State == "paused") {
+				return nil
+			}
+		}
+	}
+	if err := b.queueBranchPublication(target, "dehydrate"); err != nil {
+		return fmt.Errorf("publishing the capture of %s again: %w", target, err)
+	}
+	return nil
+}
+
 // lostResidentDehydration records that target's resident capture went with
 // its runtime, as a running branch's memory does, and says so.
 func (b *runtimeBackend) lostResidentDehydration(target selector, info ttcbundle.ContainerInfo) error {
@@ -16868,7 +16902,7 @@ func (b *runtimeBackend) lostResidentDehydration(target selector, info ttcbundle
 	return fmt.Errorf("branch %s was dehydrated in the runtime it shared with a live branch, and that runtime is gone; start it to boot it from its filesystem", target)
 }
 
-func (b *runtimeBackend) rehydrate(target selector) error {
+func (b *runtimeBackend) rehydrate(target selector) (retErr error) {
 	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
 		return err
@@ -16895,6 +16929,12 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 		if err := b.containerStore().AbandonBranchPublication(info.ID, target.branch, publicationID); err != nil {
 			return fmt.Errorf("retiring dehydration publication for %s: %w", target, err)
 		}
+		snapshot := persistentBranch.SnapshotID
+		defer func() {
+			if retErr != nil {
+				retErr = errors.Join(retErr, b.republishAbandonedDehydration(target, snapshot))
+			}
+		}()
 		// AbandonBranchPublication clears the immutable publication fence. Reload
 		// so the cold restore cannot accidentally reuse the canceled identity.
 		info, err = b.containerStore().LoadContainer(info.ID)

@@ -2365,6 +2365,20 @@ func (b *runtimeBackend) installColdExecConsoleLogs(info ttcbundle.ContainerInfo
 }
 
 func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) error {
+	localImage := existingMemoryBranchDir(b.activeDataRoot(), info.ID, "dehydrated", branch)
+	_, localErr := os.Stat(localImage)
+	if localErr != nil && !errors.Is(localErr, os.ErrNotExist) {
+		return localErr
+	}
+	localCurrent := localErr == nil && (branch.SnapshotID == 0 || localGraphCaptureMatches(localImage, branch))
+	// A local branch's capture here is its current state, with the internal
+	// mounts and exec output this node keeps: a manifest it names is an older
+	// ancestor, as when a rehydration canceled the publication of the
+	// capture. Installing from it would put back older files, and refused a
+	// branch that the ancestor's publication no longer describes.
+	if localCurrent && branch.StorageState == "local" {
+		return nil
+	}
 	// Portable internal mounts are not part of a TTC volume repository. Restore
 	// them even when a valid local control image is already cached: the branch
 	// may have returned to a node after its prior authoritative local state was
@@ -2375,12 +2389,8 @@ func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, bra
 	if err := b.installColdExecConsoleLogs(info, branch); err != nil {
 		return err
 	}
-	localImage := existingMemoryBranchDir(b.activeDataRoot(), info.ID, "dehydrated", branch)
-	if _, err := os.Stat(localImage); err == nil {
-		if branch.SnapshotID == 0 {
-			return nil
-		}
-		if localGraphCaptureMatches(localImage, branch) {
+	if localErr == nil {
+		if localCurrent {
 			return nil
 		}
 		// A branch may return to a node after another node captured a newer
@@ -2390,8 +2400,6 @@ func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, bra
 		if err := os.RemoveAll(localImage); err != nil {
 			return fmt.Errorf("discarding stale local dehydration control state: %w", err)
 		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
 	}
 	// A prior materialization failure records storage_state=error while
 	// preserving the committed manifest. Rehydration is retryable from that

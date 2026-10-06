@@ -6821,6 +6821,58 @@ func TestLocalGraphCaptureRejectsStaleSnapshot(t *testing.T) {
 	}
 }
 
+// A rehydration that cancels a dehydration's publication restores the
+// branch from its capture here. The manifest the branch still names is an
+// older publication's, its ancestor: the capture is current, and nothing is
+// installed or refused from the manifest.
+func TestLocalColdBranchKeepsItsCaptureOverAnAncestorManifest(t *testing.T) {
+	dataRoot := t.TempDir()
+	b := &runtimeBackend{dataRoot: dataRoot}
+	info := ttcbundle.ContainerInfo{ID: "physical"}
+	root := ttcsnapshot.ObjectID{Snapshot: 3, Ordinal: 1, Kind: ttcsnapshot.ObjectKindMetadata}
+	ancestor := coldBranchManifest{
+		Version: 5, Container: "physical", Branch: "main", PublicationID: "publication-ancestor", Kind: "dehydrate",
+		MemorySnapshot: 3, ControlRoot: ttcsnapshot.ObjectID{Snapshot: 3, Ordinal: 2, Kind: ttcsnapshot.ObjectKindMetadata}.String(),
+		InternalMounts: []cluster.InternalMountDescriptor{{Destination: "/etc/hostname", Contents: []byte("older\n"), Mode: 0644}},
+		Filesystems: []coldFilesystemSnapshot{{Root: cluster.FilesystemRootDescriptor{
+			Source: "rootfs-upper", RepositoryID: "0123456789abcdef0123456789abcdef",
+			RestoreID: "0123456789abcdef0123456789abcdef",
+			BranchID:  "main", Root: root.String(), NextInode: 2,
+		}, Origins: []uint64{3}}},
+	}
+	manifestPath := filepath.Join(dataRoot, "cold", "manifest.json")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(ancestor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	branch := ttcbundle.BranchInfo{
+		ID: "main", FilesystemBranch: "main", State: "dehydrating", StorageState: "local", StorageManifest: manifestPath,
+		SnapshotID: 8, MemoryRoots: []string{"memory/8/root"}, MemoryRootObjects: []string{"0000000000000008-03-0000000000000001"},
+	}
+	capture := existingMemoryBranchDir(b.activeDataRoot(), info.ID, "dehydrated", branch)
+	if err := os.MkdirAll(capture, 0700); err != nil {
+		t.Fatal(err)
+	}
+	control := `{"snapshot_id":8,"memory_roots":[{"name":"memory/8/root","root":"0000000000000008-03-0000000000000001"}]}`
+	if err := os.WriteFile(filepath.Join(capture, "control.json"), []byte(control), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.ensureLocalColdBranch(info, branch); err != nil {
+		t.Fatalf("restoring a canceled publication's capture: %v", err)
+	}
+	// A shared branch's manifest is its state, and must be its publication's.
+	branch.State, branch.StorageState = "dehydrated", "shared"
+	if err := b.ensureLocalColdBranch(info, branch); err == nil || !strings.Contains(err.Error(), "publication-ancestor") {
+		t.Fatalf("a shared branch whose manifest is another publication's = %v, want refused", err)
+	}
+}
+
 func TestValidateGraphRootObjectsAllowsInheritedOrigin(t *testing.T) {
 	if err := validateGraphRootObjects(9, []string{"memory/branch/main/resource-0000"}, []string{"0000000000000008-03-0000000000000001"}); err != nil {
 		t.Fatalf("inherited immutable origin was rejected: %v", err)
