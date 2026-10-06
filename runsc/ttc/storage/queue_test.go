@@ -283,14 +283,24 @@ func TestCanceledCleanupRetriesFromDurableIntent(t *testing.T) {
 	if err := queue.Enqueue(intent); err != nil {
 		t.Fatal(err)
 	}
+	// The queue's worker may meet the canceled intent before the
+	// cancellation's own cleanup does, and take the failure injected for the
+	// first: the cancellation then cleans it again at once.
 	if err := queue.Cancel("family", "main", "publication-9"); err == nil {
-		t.Fatal("Cancel succeeded despite injected cleanup failure")
+		publisher.mu.Lock()
+		attempts := publisher.attempts
+		publisher.mu.Unlock()
+		if attempts != 2 {
+			t.Fatalf("Cancel succeeded after %d cleanups, want a failed one and its retry", attempts)
+		}
+	} else {
+		pending, err := queue.Pending()
+		if err != nil || len(pending) != 1 || pending[0].LastError == "" {
+			t.Fatalf("failed canceled cleanup was not retained: pending=%+v err=%v", pending, err)
+		}
+		queue.signal()
 	}
-	pending, err := queue.Pending()
-	if err != nil || len(pending) != 1 || pending[0].LastError == "" {
-		t.Fatalf("failed canceled cleanup was not retained: pending=%+v err=%v", pending, err)
-	}
-	queue.signal()
+	var pending []Intent
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		pending, err = queue.Pending()
