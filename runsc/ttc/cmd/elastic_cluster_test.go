@@ -3238,6 +3238,8 @@ func TestDurableRestorePeerKeepsALiveSentry(t *testing.T) {
 		{mode: "absent"},
 		{mode: "dead", changes: []string{"delete --force family"}},
 		{mode: "unknown", failure: "cannot list its branches"},
+		// A Sentry that runs no branch has none to restore beside, and goes.
+		{mode: "elsewhere", changes: []string{"delete --force family"}},
 	} {
 		var peer bool
 		changes, err := fakeImportRuntimeChanges(t, runsc, test.mode, func() (err error) {

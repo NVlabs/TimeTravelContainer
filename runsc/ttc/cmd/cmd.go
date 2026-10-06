@@ -14381,8 +14381,23 @@ func (b *runtimeBackend) durableRestorePeer(containerID string) (bool, error) {
 		switch {
 		case runtime == nil:
 			return false, nil
-		case runtime.Error == "":
+		case runtime.Error == "" && runtimeFamilyLiveBranch(*runtime) != "":
 			return true, nil
+		case runtime.Error == "":
+			// A Sentry that runs no branch has none to restore beside: a
+			// restore beside one failed, "no active peer is available for
+			// dehydration restore". It goes as a release would take it, its
+			// captures made durable first, unless a remote fork is making a
+			// branch in it, which the restore waits for.
+			released, err := b.releaseIdleRuntime(containerID)
+			if err != nil {
+				return false, err
+			}
+			if released {
+				return false, nil
+			}
+			b.operations.waitMadeIn(containerID)
+			continue
 		case runtimeFamilyUnavailable(*runtime):
 			_, _ = b.command("delete", "--force", containerID)
 			return false, nil
@@ -16847,6 +16862,34 @@ func (b *runtimeBackend) releaseRuntime(id string, release func() error) error {
 	}
 	defer done()
 	return release()
+}
+
+// releaseIdleRuntime deletes the runtime with this ID if it runs no branch,
+// its resident dehydrations made durable first, unless a command is making a
+// branch in it. It reports whether it deleted the runtime.
+func (b *runtimeBackend) releaseIdleRuntime(id string) (bool, error) {
+	info, err := b.containerStore().LoadRuntimeContainer(id)
+	recorded := err == nil
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	released := false
+	err = b.releaseRuntime(id, func() error {
+		if !b.runtimeRunsNoBranch(id) {
+			return nil
+		}
+		if recorded {
+			if err := b.persistResidentDehydrations(info, nil); err != nil {
+				return err
+			}
+		}
+		if _, err := b.command("delete", "--force", id); err != nil {
+			return fmt.Errorf("releasing idle runtime %q: %w", id, err)
+		}
+		released = true
+		return nil
+	})
+	return released, err
 }
 
 // runtimeListsOnly reports whether the runtime with this ID lists no branch
