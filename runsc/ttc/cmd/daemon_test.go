@@ -1000,6 +1000,38 @@ func TestMigrationSourceRuntimeUsesPhysicalIdentity(t *testing.T) {
 	}
 }
 
+func TestTransactionSourcedFromMatchesFamilyAndRuntime(t *testing.T) {
+	tx := cluster.Transaction{
+		Identity:                cluster.ForkIdentity{SourceContainer: "family", SourceBranch: "visible"},
+		SourcePhysicalContainer: "fork-target", SourcePhysicalBranch: "physical",
+	}
+	for _, tc := range []struct {
+		container, branch string
+		want              bool
+	}{
+		{"family", "visible", true},
+		{"family", "", true},
+		{"fork-target", "physical", true},
+		{"fork-target", "", true},
+		{"", "physical", true},
+		{"", "", true},
+		{"family", "physical", false},
+		{"fork-target", "visible", false},
+		{"other", "", false},
+		{"fork-target", "other", false},
+	} {
+		if got := transactionSourcedFrom(tx, tc.container, tc.branch); got != tc.want {
+			t.Errorf("transactionSourcedFrom(%s@%s) = %t, want %t", tc.container, tc.branch, got, tc.want)
+		}
+	}
+	// A transaction recorded before physical sources were is matched by
+	// its family alone.
+	tx.SourcePhysicalContainer, tx.SourcePhysicalBranch = "", ""
+	if !transactionSourcedFrom(tx, "family", "visible") || transactionSourcedFrom(tx, "fork-target", "physical") {
+		t.Errorf("a transaction without a physical source is not matched by its family alone")
+	}
+}
+
 func TestStopDaemonContainersRemovesRuntimeWithoutFamilyMetadata(t *testing.T) {
 	dir := t.TempDir()
 	runsc := filepath.Join(dir, "runsc")

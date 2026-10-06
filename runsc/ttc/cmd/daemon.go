@@ -3083,11 +3083,25 @@ func migrationSourceRuntime(tx cluster.Transaction) (string, string) {
 
 func drainSourceDependenciesMatching(backend *runtimeBackend, source *distributedSourceRuntime, store cluster.TransactionCatalog, nodeID, containerID, branchID string) error {
 	return drainSourceDependenciesSelected(backend, source, store, nodeID, func(tx cluster.Transaction) bool {
-		if containerID != "" && tx.Identity.SourceContainer != containerID {
-			return false
-		}
-		return branchID == "" || tx.Identity.SourceBranch == branchID
+		return transactionSourcedFrom(tx, containerID, branchID)
 	})
+}
+
+// transactionSourcedFrom reports whether tx was taken from branchID of the
+// container with containerID, "" matching any: of the logical family, as the
+// transaction names its source, or of the physical runtime, as the commands
+// that act on a branch name it once they resolve it. A remote fork's target
+// runs in a runtime of its own, apart from its family: its dehydration, which
+// matched only the family, drained none of the forks taken from it, and
+// released the runtime they read their files through, "FetchSpec failed:
+// loading container: file does not exist", the forks unable to read any file
+// they had not read yet.
+func transactionSourcedFrom(tx cluster.Transaction, containerID, branchID string) bool {
+	matches := func(container, branch string) bool {
+		return (containerID == "" || container == containerID) && (branchID == "" || branch == branchID)
+	}
+	physicalContainer, physicalBranch := migrationSourceRuntime(tx)
+	return matches(tx.Identity.SourceContainer, tx.Identity.SourceBranch) || matches(physicalContainer, physicalBranch)
 }
 
 func drainSourceDependenciesSelected(backend *runtimeBackend, source *distributedSourceRuntime, store cluster.TransactionCatalog, nodeID string, selected func(cluster.Transaction) bool) error {
