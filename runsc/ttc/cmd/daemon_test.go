@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -2493,6 +2494,38 @@ func TestControlOnlyClusterFollowsTheHolderRedirect(t *testing.T) {
 	}
 	if _, ok := state.Nodes["leader"]; !ok {
 		t.Fatalf("redirected authority state=%+v", state.Nodes)
+	}
+}
+
+// A routed command that its node lost before answering goes to it again
+// while the node may run it once: with a request ID, without streamed input,
+// for a lost connection, until ownerLossWait passes.
+func TestOwnerLossRetry(t *testing.T) {
+	withID := daemonRequest{RequestID: "0123456789abcdef0123456789abcdef"}
+	lostErr := fmt.Errorf("Post \"http://node/v1/daemon\": %w", io.EOF)
+	var loss ownerLoss
+	if !ownerLossRetry(withID, false, lostErr, &loss) {
+		t.Error("a command with a request ID was not sent again once its node lost it")
+	}
+	for _, test := range []struct {
+		name      string
+		request   daemonRequest
+		automatic bool
+		err       error
+	}{
+		{"without a request ID", daemonRequest{}, false, lostErr},
+		{"with streamed input", daemonRequest{RequestID: withID.RequestID, Stdin: true}, false, lostErr},
+		{"answered with an error", withID, false, errors.New("the node refused the command")},
+		{"refused by a node chosen for it", withID, true, fmt.Errorf("dial: %w", syscall.ECONNREFUSED)},
+	} {
+		var loss ownerLoss
+		if ownerLossRetry(test.request, test.automatic, test.err, &loss) {
+			t.Errorf("a command %s was sent again", test.name)
+		}
+	}
+	loss.deadline = time.Now().Add(-time.Second)
+	if ownerLossRetry(withID, false, lostErr, &loss) {
+		t.Error("a command was sent again after ownerLossWait")
 	}
 }
 

@@ -6122,6 +6122,45 @@ func (s *controlOnlyDaemonServer) handle(conn net.Conn, serverErrors io.Writer) 
 	}
 }
 
+// ownerLossWait bounds how long a routed command waits, its node having lost
+// it, for the node to answer again: a node restarts within seconds once
+// another has taken the cluster's authority over.
+const ownerLossWait = 30 * time.Second
+
+// ownerLoss is what a routed command's node losing it has cost so far.
+type ownerLoss struct {
+	deadline time.Time
+	delay    time.Duration
+}
+
+// ownerLossRetry reports whether a routed command whose node ended its
+// connection with err before answering it goes to its node again, and waits
+// before it. A command with a request ID does, which the owner's journal runs
+// once, without streamed input, until ownerLossWait passes; but not one whose
+// node, chosen for it, refused the connection, which goes to another node.
+func ownerLossRetry(request daemonRequest, automaticPlacement bool, err error, loss *ownerLoss) bool {
+	if request.RequestID == "" || request.streamsClientFrames() {
+		return false
+	}
+	if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, syscall.ECONNRESET) &&
+		!errors.Is(err, syscall.ECONNREFUSED) && !errors.Is(err, syscall.EPIPE) {
+		return false
+	}
+	if automaticPlacement && errors.Is(err, syscall.ECONNREFUSED) {
+		return false
+	}
+	now := time.Now()
+	if loss.deadline.IsZero() {
+		loss.deadline, loss.delay = now.Add(ownerLossWait), 100*time.Millisecond
+	}
+	if now.After(loss.deadline) {
+		return false
+	}
+	time.Sleep(loss.delay)
+	loss.delay = min(2*loss.delay, time.Second)
+	return true
+}
+
 func controlOnlyProxyInput(header string, stdin io.Reader, streaming bool) io.Reader {
 	if !streaming {
 		return strings.NewReader(header)
@@ -7349,8 +7388,10 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		automaticPlacement := false
 		failedAdmissionNodes := make(map[string]struct{})
 		var err error
+		var lost ownerLoss
 		routing := s.routingPlacements()
-		if len(request.PlacementClaims) == 0 {
+		claimsRouted := len(request.PlacementClaims) == 0
+		if claimsRouted {
 			placements := cluster.PlacementCatalog(s.clusterPlacements)
 			if routing != nil {
 				placements = routing
@@ -7540,18 +7581,41 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 					return
 				}
 			}
-			output := io.Writer(conn)
+			counted := &countingDaemonWriter{writer: conn}
+			output := io.Writer(counted)
 			var tracked *daemonStatusWriter
 			if preparedIngress != nil {
-				tracked = &daemonStatusWriter{writer: conn}
+				tracked = &daemonStatusWriter{writer: counted}
 				output = tracked
 			}
-			if err := peer.ProxyDaemon(context.Background(), input, output); err == nil {
+			err = peer.ProxyDaemon(context.Background(), input, output)
+			if err == nil {
 				if tracked != nil {
 					ingressCommitted = tracked.statusSeen && tracked.status == 0
 				}
 				return
-			} else if !automaticPlacement || request.Stdin || !errors.Is(err, syscall.ECONNREFUSED) {
+			}
+			if counted.bytes == 0 && ownerLossRetry(request, automaticPlacement, err, &lost) {
+				// The node lost the command before it answered, as a node does
+				// that restarts once another has taken the cluster's authority
+				// over. The command goes again, routed anew, under its request
+				// ID, which the owner's journal runs once, or answers that it
+				// began before the node stopped.
+				if s.stderr != nil {
+					fmt.Fprintf(s.stderr, "ttcd: warning: node %q lost %v before answering it: %v; routing it again\n", owner, request.Args, err)
+				}
+				if claimsRouted {
+					placements := cluster.PlacementCatalog(s.clusterPlacements)
+					if routing != nil {
+						placements = routing
+					}
+					if rerouted, claims, routeErr := daemonCommandPlacementWithCatalog(s.dataRoot, placements, request.Args); routeErr == nil {
+						owner, request.PlacementClaims = rerouted, claims
+					}
+				}
+				continue
+			}
+			if !automaticPlacement || request.Stdin || !errors.Is(err, syscall.ECONNREFUSED) {
 				writeError(fmt.Errorf("proxying command to node %q: %w", owner, err))
 				return
 			}
