@@ -14997,7 +14997,36 @@ func (b *runtimeBackend) prepareStop(target selector) error {
 // The temporary child is removed immediately. Its purpose is to drive the
 // existing atomic live-filesystem snapshot protocol, which both flushes the
 // mounted branch and installs a fresh working generation for the source.
-func (b *runtimeBackend) preparePausedStop(target selector) (retErr error) {
+//
+// A snapshot refused because an origin the branch shares is frozen for an
+// authority handoff changes nothing, and is taken again once the handoff
+// ends, as a fork's is (forkThroughHandoffs): a stop of a paused branch was
+// refused, "snapshot ... references are frozen for authority handoff", as
+// another branch's publication handed off an origin the two share.
+func (b *runtimeBackend) preparePausedStop(target selector) error {
+	deadline := time.Now().Add(forkHandoffWait)
+	delay := 100 * time.Millisecond
+	for {
+		err := b.preparePausedStopOnce(target)
+		if err == nil || !frozenForAuthorityHandoff(err) || time.Now().After(deadline) {
+			return err
+		}
+		info, resolveErr := b.resolveContainer(target.container)
+		if resolveErr != nil {
+			return err
+		}
+		if err := b.withoutLifecycleLock(info, longOperation{branch: target.branch, state: "snapshotting"}, func() error {
+			time.Sleep(delay)
+			return nil
+		}); err != nil {
+			return err
+		}
+		delay = min(2*delay, 2*time.Second)
+	}
+}
+
+// preparePausedStopOnce is one attempt of preparePausedStop.
+func (b *runtimeBackend) preparePausedStopOnce(target selector) (retErr error) {
 	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
 		return err
