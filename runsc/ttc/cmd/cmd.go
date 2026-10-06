@@ -17287,16 +17287,20 @@ func (b *runtimeBackend) ensureDistributedTargetMemoryIndependent(info ttcbundle
 	if transactionID == "" || (branch.DependentMemoryBytes == 0 && branch.DependentFilesystemBytes == 0) {
 		return nil
 	}
-	action := "distributed-filesystem-drain"
-	if branch.DependentMemoryBytes != 0 {
-		action = "distributed-drain"
-	}
-	if _, err := b.command("timetravel", info.ID, action, branch.ID); err != nil {
-		return err
-	}
-	if branch.DependentMemoryBytes != 0 {
-		if err := b.waitDistributedBranchMemory(info.ID, branch.ID, 5*time.Minute); err != nil {
+	// The Sentry may have exited with the branch, its last, or exit as it is
+	// asked: it stays only while a remote fork's import still reads from its
+	// provider (see SandboxFamily.WaitDefaultExit), and one that is gone left
+	// the import's files local, unless it did not exit so. The branch's
+	// memory went with it. Asking it to drain, a natural exit's discard
+	// failed for good, "connecting to control server ...: connection
+	// refused", the branch never recorded exited, nor its runtime released.
+	if err := b.drainDistributedTarget(info, branch); err != nil {
+		// A Sentry closes its control server some time before it exits.
+		if !b.waitRuntimeGone(info.ID, 5*time.Second) {
 			return err
+		}
+		if err := b.distributedTargetFilesystemsLocal(info, branch); err != nil {
+			return fmt.Errorf("the runtime of %s exited before its import was drained: %w", branch.ID, err)
 		}
 	}
 	if err := b.containerStore().UpdateDistributedForkDependencies(logicalFamilyID(info), transactionID, 0, 0); err != nil {
@@ -17348,6 +17352,119 @@ func (b *runtimeBackend) waitDistributedBranchMemory(containerID, branchID strin
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// waitDistributedBranchFilesystems waits until the filesystem drain started
+// for one branch has replaced every source of a remote fork's import in its
+// runtime's repositories, or failed.
+func (b *runtimeBackend) waitDistributedBranchFilesystems(containerID, branchID string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		output, err := b.command("timetravel", containerID, "distributed-filesystem-drain-status", branchID)
+		if err != nil {
+			return err
+		}
+		var status boot.DistributedForkFilesystemDrainStatus
+		if err := json.Unmarshal(output, &status); err != nil {
+			return fmt.Errorf("decoding distributed filesystem drain status: %w", err)
+		}
+		if status.Done {
+			if status.Error != "" {
+				return fmt.Errorf("distributed filesystem drain failed: %s", status.Error)
+			}
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return errors.New("timed out materializing remote filesystems")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// drainDistributedTarget makes branch's runtime read what branch imported by
+// a remote fork from nowhere but itself.
+func (b *runtimeBackend) drainDistributedTarget(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) error {
+	// An exited branch's memory went with its process, and its Sentry
+	// refuses to drain it, "branch is exited": only its files are drained.
+	memory := branch.DependentMemoryBytes != 0 && normalizeLifecycleState(branch.State) != "exited"
+	action := "distributed-filesystem-drain"
+	if memory {
+		action = "distributed-drain"
+	}
+	if _, err := b.command("timetravel", info.ID, action, branch.ID); err != nil {
+		return err
+	}
+	if memory {
+		return b.waitDistributedBranchMemory(info.ID, branch.ID, 5*time.Minute)
+	}
+	// The action only starts the filesystem drain. Made independent before
+	// the drain ends, the transaction would let the source close the relay
+	// the drain still reads the files from.
+	return b.waitDistributedBranchFilesystems(info.ID, branch.ID, 5*time.Minute)
+}
+
+// runtimeGone reports whether the runtime with this ID is gone, or is a shell
+// whose Sentry has exited.
+func (b *runtimeBackend) runtimeGone(id string) bool {
+	families, err := b.listRuntimeFamiliesOf(id)
+	if err != nil {
+		return false
+	}
+	for _, family := range families {
+		if family.ID == id {
+			return runtimeFamilyUnavailable(family)
+		}
+	}
+	return true
+}
+
+// waitRuntimeGone reports whether the runtime with this ID is gone within
+// timeout; see runtimeGone.
+func (b *runtimeBackend) waitRuntimeGone(id string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for !b.runtimeGone(id) {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return true
+}
+
+// distributedTargetFilesystemsLocal reports, as an error, what of branch's
+// filesystems its repositories still hold only remotely.
+func (b *runtimeBackend) distributedTargetFilesystemsLocal(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) error {
+	spec, err := b.containerStore().LoadSpecOf(info)
+	if err != nil {
+		return err
+	}
+	configs, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return err
+	}
+	seen := make(map[string]struct{}, len(configs))
+	for _, config := range configs {
+		path := filepath.Clean(config.Path)
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		repository, err := ttcvolume.OpenRepository(path, ttcvolume.CopyMode(config.CopyMode))
+		if err != nil {
+			return err
+		}
+		remote, err := repository.BranchRemoteSourceObjects(repositoryPhysicalBranch(config, branch.FilesystemBranch))
+		if closeErr := repository.Close(); err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			return fmt.Errorf("reading filesystem %q: %w", config.Source, err)
+		}
+		if len(remote) != 0 {
+			return fmt.Errorf("%d files of filesystem %q are still remote", len(remote), config.Source)
+		}
+	}
+	return nil
 }
 
 func (b *runtimeBackend) completeDistributedTargetDehydration(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) error {

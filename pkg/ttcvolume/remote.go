@@ -333,6 +333,27 @@ type remoteObjectClient struct {
 	repository  *Repository
 	branchID    string
 	catalog     string
+	// transaction is whether the source serves a remote fork's import, its
+	// catalog not an image of the shared store: its provider serves it only
+	// while the fork's transaction lasts.
+	transaction bool
+}
+
+// HoldsTransactionSources reports whether a source still attached to r
+// serves a remote fork's import: until it is drained, r has files that no
+// other source can provide once the fork's transaction ends.
+func (r *Repository) HoldsTransactionSources() bool {
+	if r == nil {
+		return false
+	}
+	r.remoteMu.Lock()
+	defer r.remoteMu.Unlock()
+	for remote := range r.remotes {
+		if remote.transaction {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Repository) prepareDeferredInode(inode *Inode) error {
@@ -472,6 +493,7 @@ func (r *Repository) attachObjectSource(remote *remoteObjectClient, branchID str
 	}
 	remote.next, remote.complete, remote.objects, remote.sources = 1, make(map[string]bool), make(map[string]int64), make(map[string]string)
 	remote.repository, remote.branchID, remote.catalog = r, branchID, branch.RemoteCatalog
+	remote.transaction = branch.RemoteCatalog != "" && !branch.RemoteShared
 	if branch.RemoteCatalog != "" {
 		if branch.RemoteCatalogSnapshot == 0 {
 			return errors.New("remote filesystem branch has no catalog expansion origin")

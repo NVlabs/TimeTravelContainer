@@ -1197,6 +1197,10 @@ func reusablePhysicalTarget(records []cluster.PlacementRecord, family, node stri
 	return physical, true, nil
 }
 
+// stoppedPeerRuntimeWait bounds how long an import waits for a runtime that
+// runs no branch to go, within the two minutes its fork has; see Prepare.
+var stoppedPeerRuntimeWait = 30 * time.Second
+
 func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transaction, session cluster.RemoteSessionDescriptor) error {
 	defer r.lockTarget(tx.Identity.TargetContainer)()
 	info, targetBranch, peer, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TargetContainer, tx.Identity.TransactionID)
@@ -1311,12 +1315,30 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 	var runtimeState struct {
 		Status string `json:"status"`
 	}
+	// The runtime's state is its loader branch's, which may have exited while
+	// another branch runs there: the import goes beside that branch. A runtime
+	// that runs none is one whose last branch's exit ttcd is finalizing, which
+	// deletes it once the branch's own import is drained (see
+	// SandboxFamily.WaitDefaultExit): the import waits for that and makes a
+	// runtime of its own. It was refused, "distributed peer target runtime is
+	// "stopped", want running", once the runtime it would have gone into was
+	// gone.
+	deadline := time.Now().Add(stoppedPeerRuntimeWait)
 	stateOutput, stateErr := r.backend.command("state", info.ID)
-	if stateErr == nil {
+	for stateErr == nil {
 		if err := json.Unmarshal(stateOutput, &runtimeState); err != nil {
 			return fmt.Errorf("decoding target runtime state: %w", err)
 		}
-	} else {
+		if !peer || runtimeState.Status == "running" || runtimeState.Status == "created" || r.backend.runtimeRunsLiveBranch(info.ID) {
+			break
+		}
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			return fmt.Errorf("distributed peer target runtime is %q, want running", runtimeState.Status)
+		}
+		time.Sleep(100 * time.Millisecond)
+		stateOutput, stateErr = r.backend.command("state", info.ID)
+	}
+	if stateErr != nil {
 		// A new physical Sentry must bootstrap the exact visible branch and
 		// filesystem identities regardless of whether this transaction was
 		// reserved as a peer import. In particular, the first remote child of a
@@ -1339,12 +1361,6 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		}
 		runtimeState.Status = "created"
 		runtimeCreated = true
-	}
-	// The runtime's state is its loader branch's, which may have exited while
-	// another branch runs there: the import goes beside that branch. An import
-	// into one so stopped was refused while the runtime ran a live branch.
-	if peer && runtimeState.Status != "running" && runtimeState.Status != "created" && !r.backend.runtimeRunsLiveBranch(info.ID) {
-		return fmt.Errorf("distributed peer target runtime is %q, want running", runtimeState.Status)
 	}
 	if runtimeState.Status == "created" || peer {
 		// A metadata peer restored into a newly created empty Sentry is its

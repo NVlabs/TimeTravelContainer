@@ -165,6 +165,53 @@ func TestRemoteDescriptorFetchesWholeFileAndPrivatizesWrites(t *testing.T) {
 	finishTestRemote(t, target, serverErr)
 }
 
+// A repository holds a remote fork's import, whose provider serves it only
+// while the fork's transaction lasts, until a drain replaces its source; the
+// source of an image of the shared store, which serves it for good, it does
+// not hold so.
+func TestRepositoryHoldsTransactionSourcesUntilDrained(t *testing.T) {
+	for _, shared := range []bool{false, true} {
+		sourceManager := openTestManager(t)
+		source, err := sourceManager.Create("source")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer source.Close()
+		ino, err := source.CreateRegular(MainBranch, RootInode, "file", 0644, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := source.WriteAt(MainBranch, ino, bytes.Repeat([]byte("not read yet"), 4096), 0); err != nil {
+			t.Fatal(err)
+		}
+		if err := source.Fork(MainBranch, "sealed"); err != nil {
+			t.Fatal(err)
+		}
+		descriptor, err := source.DescribeRemoteSnapshot("sealed")
+		if err != nil {
+			t.Fatal(err)
+		}
+		descriptor.Shared = shared
+		targetManager := openTestManager(t)
+		target, err := targetManager.ImportPrivateRemoteDescriptor(filepath.Join(targetManager.root, "target"), "target", descriptor, "imported")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer target.Close()
+		if target.HoldsTransactionSources() {
+			t.Fatalf("shared=%t: a repository with no source attached holds one", shared)
+		}
+		serverErr := attachTestRemote(t, source, target, "sealed", "imported", nil)
+		if got := target.HoldsTransactionSources(); got != !shared {
+			t.Fatalf("shared=%t: attached, HoldsTransactionSources() = %t, want %t", shared, got, !shared)
+		}
+		finishTestRemote(t, target, serverErr)
+		if target.HoldsTransactionSources() {
+			t.Fatalf("shared=%t: drained, the repository still holds a transaction source", shared)
+		}
+	}
+}
+
 func TestSyncDataMaterializesRemoteWholeFile(t *testing.T) {
 	sourceManager := openTestManager(t)
 	source, err := sourceManager.Create("source")

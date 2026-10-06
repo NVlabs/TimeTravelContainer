@@ -998,6 +998,14 @@ func New(args Args) (*Loader, error) {
 			}
 			return result
 		},
+		HoldsTransactionSources: func() bool {
+			for _, volume := range l.ttcVolumeRepositories {
+				if volume.repository.HoldsTransactionSources() {
+					return true
+				}
+			}
+			return false
+		},
 		InitialBranchID:         initialBranchID,
 		InitialBranchParentID:   initialBranchParentID,
 		InitialFilesystemBranch: initialFilesystemBranch,

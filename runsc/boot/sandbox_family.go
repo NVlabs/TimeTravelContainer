@@ -686,6 +686,7 @@ type SandboxFamily struct {
 	forgetFilesystemBranch         func(string)
 	discardFilesystemBranch        func(string)
 	reclaimFilesystemBranch        func(string) error
+	holdsTransactionSources        func() bool
 }
 
 type distributedForkSession struct {
@@ -747,6 +748,9 @@ type SandboxFamilyOptions struct {
 	// It also performs runtime-side graph collection when this is the only
 	// Sentry using the repository.
 	ReclaimFilesystemBranch func(string) error
+	// HoldsTransactionSources reports whether the Sentry's repositories still
+	// read a remote fork's import from its provider: see WaitDefaultExit.
+	HoldsTransactionSources func() bool
 	// InitialBranchID and InitialFilesystemBranch identify the branch represented
 	// by the Loader's bootstrap Kernel. Empty values retain the canonical main
 	// defaults used by ordinary OCI creation.
@@ -809,6 +813,7 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 		forgetFilesystemBranch:         opts.ForgetFilesystemBranch,
 		discardFilesystemBranch:        opts.DiscardFilesystemBranch,
 		reclaimFilesystemBranch:        opts.ReclaimFilesystemBranch,
+		holdsTransactionSources:        opts.HoldsTransactionSources,
 		defaultStarted:                 make(chan struct{}),
 		distributedSessions:            make(map[string]*distributedForkSession),
 		distributedHandoffs:            make(map[string]*distributedForkHandoff),
@@ -2851,7 +2856,14 @@ func (f *SandboxFamily) WaitDefaultExit() linux.WaitStatus {
 		// only when the last live branch on the node goes. ttcd does that when
 		// it sees this exit and then deletes the runtime. A branch it
 		// rehydrates instead becomes the loader.
-		for replacement == nil && f.loaderBranchID == b.id && f.holdsDehydrationLocked() {
+		// And so must it while it reads a remote fork's import from its
+		// provider: ttcd makes the import independent when it sees this exit,
+		// through this Sentry, whose relay connections the import's files
+		// come by. A remote fork's target whose init exited at once took the
+		// Sentry with it, and the files it had not read with that: ttcd's
+		// drain found no Sentry, "connection refused", and the branch's exit
+		// was never recorded, nor its runtime released.
+		for replacement == nil && f.loaderBranchID == b.id && (f.holdsDehydrationLocked() || f.holdsTransactionSourcesLocked()) {
 			f.stateChanged.Wait()
 			replacement = f.liveLoaderReplacementLocked(b.id)
 		}
@@ -2887,6 +2899,25 @@ func (f *SandboxFamily) holdsDehydrationLocked() bool {
 		}
 	}
 	return false
+}
+
+// holdsTransactionSourcesLocked reports whether the Sentry's repositories
+// read a remote fork's import from its provider.
+//
+// Preconditions: f.mu is locked.
+func (f *SandboxFamily) holdsTransactionSourcesLocked() bool {
+	return f.holdsTransactionSources != nil && f.holdsTransactionSources()
+}
+
+// TransactionSourcesChanged wakes what waits on the sources of remote forks'
+// imports, once a drain has replaced them: see WaitDefaultExit.
+func (f *SandboxFamily) TransactionSourcesChanged() {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	f.stateChanged.Broadcast()
+	f.mu.Unlock()
 }
 
 // liveLoaderReplacementLocked returns an established hydrated branch whose

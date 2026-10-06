@@ -1405,6 +1405,9 @@ func (cm *containerManager) DistributedForkMemoryHandoffStatus(args *BranchArgs,
 }
 
 func (cm *containerManager) materializeDistributedFilesystems() error {
+	// A Sentry whose last init has exited stays for this drain; it may go
+	// once the drain has replaced the sources it stayed for.
+	defer cm.l.family.TransactionSourcesChanged()
 	for source, volume := range cm.l.ttcVolumeRepositories {
 		if err := volume.repository.MaterializeRemoteObjects(); err != nil {
 			return fmt.Errorf("materializing distributed filesystem %q: %w", source, err)
