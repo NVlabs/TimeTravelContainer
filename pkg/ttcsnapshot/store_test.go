@@ -3002,6 +3002,45 @@ func TestLocalDataStoreEmptyObjects(t *testing.T) {
 	}
 }
 
+// A store whose directory is gone, as a repository's is once its family's
+// node-local state is moved aside to be removed, does not make the directory
+// again, neither opened nor writing an object: the repository's path, made
+// again, refused every later import of the repository on its node.
+func TestLocalDataStoreDoesNotMakeItsDirectoryAgain(t *testing.T) {
+	repository := filepath.Join(t.TempDir(), "repository")
+	if data, err := OpenLocalDataStore(filepath.Join(repository, "data")); err == nil {
+		data.Close()
+		t.Fatal("opened a store in a directory that does not exist")
+	}
+	if _, err := os.Lstat(repository); !os.IsNotExist(err) {
+		t.Fatalf("opening the store made its repository's directory: %v", err)
+	}
+	if err := os.Mkdir(repository, 0700); err != nil {
+		t.Fatal(err)
+	}
+	data, err := OpenLocalDataStore(filepath.Join(repository, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+	if err := os.Rename(repository, repository+".removed"); err != nil {
+		t.Fatal(err)
+	}
+	id := ObjectID{Snapshot: 1, Kind: ObjectKindFile, Ordinal: 1}
+	if err := data.Install(id, bytes.NewReader([]byte("contents")), 8); err == nil {
+		t.Error("installed an object in a store whose directory is gone")
+	}
+	if created, err := data.InstallEmptyDeferred(id); err == nil {
+		t.Errorf("installed an empty object in a store whose directory is gone (created %t)", created)
+	}
+	if err := data.ReplaceDeferred(id, bytes.NewReader([]byte("contents")), 8); err == nil {
+		t.Error("replaced an object in a store whose directory is gone")
+	}
+	if _, err := os.Lstat(repository); !os.IsNotExist(err) {
+		t.Fatalf("writing objects made the store's repository's directory again: %v", err)
+	}
+}
+
 func assertGraphReferenceModel(t *testing.T, store *Store) {
 	t.Helper()
 	inspection := store.Inspect()

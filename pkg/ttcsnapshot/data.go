@@ -273,7 +273,12 @@ func OpenLocalDataStore(root string) (*LocalDataStore, error) {
 	if !filepath.IsAbs(root) {
 		return nil, errors.New("TTC bulk-object directory must be absolute")
 	}
-	if err := os.MkdirAll(root, 0700); err != nil {
+	// Only the directory itself is made, in one that exists: a repository's
+	// store opened as its family's node-local state was moved aside to be
+	// removed made the repository's path again, which the family's next
+	// import of the repository on the node then found, and refused, "already
+	// exists", as every later one did.
+	if err := os.Mkdir(root, 0700); err != nil && !errors.Is(err, os.ErrExist) {
 		return nil, err
 	}
 	lock, err := os.OpenFile(filepath.Join(root, ".gc.lock"), os.O_CREATE|os.O_RDWR, 0600)
@@ -393,6 +398,30 @@ func (store *LocalDataStore) mkdirAllRelative(relative string) error {
 			current = filepath.Join(current, component)
 		}
 		if err := unix.Mkdirat(int(store.rootFD.Fd()), current, 0700); err != nil && !errors.Is(err, unix.EEXIST) {
+			return err
+		}
+	}
+	return nil
+}
+
+// mkdirBelowRoot is mkdirAllRelative for a store with a host path: it makes
+// the directories of directory below the store's root, and never the root,
+// which a store moved aside to be removed no longer has.
+func (store *LocalDataStore) mkdirBelowRoot(directory string) error {
+	if info, err := os.Stat(directory); err == nil && info.IsDir() {
+		return nil
+	}
+	relative, err := filepath.Rel(store.root, directory)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("TTC bulk-object directory %q is outside %q", directory, store.root)
+	}
+	if relative == "." {
+		return nil
+	}
+	current := store.root
+	for _, component := range strings.Split(relative, string(filepath.Separator)) {
+		current = filepath.Join(current, component)
+		if err := os.Mkdir(current, 0700); err != nil && !errors.Is(err, os.ErrExist) {
 			return err
 		}
 	}
@@ -603,7 +632,7 @@ func (store *LocalDataStore) replaceDeferred(id ObjectID, source io.Reader, leng
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(destination), 0700); err != nil {
+	if err := store.mkdirBelowRoot(filepath.Dir(destination)); err != nil {
 		return err
 	}
 	temporary, err := os.CreateTemp(filepath.Dir(destination), ".replace-")
@@ -729,7 +758,7 @@ func (store *LocalDataStore) createEmpty(id ObjectID) (bool, error) {
 		if store.rootFD != nil {
 			err = store.mkdirAllRelative(filepath.Dir(relative))
 		} else {
-			err = os.MkdirAll(filepath.Dir(name), 0700)
+			err = store.mkdirBelowRoot(filepath.Dir(name))
 		}
 		if err != nil {
 			return false, err
@@ -855,7 +884,7 @@ func (store *LocalDataStore) installWith(id ObjectID, length int64, durable bool
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(destination), 0700); err != nil {
+	if err := store.mkdirBelowRoot(filepath.Dir(destination)); err != nil {
 		return err
 	}
 	temporary, err := os.CreateTemp(filepath.Dir(destination), ".object-")
@@ -969,7 +998,7 @@ func (store *LocalDataStore) LinkDeferred(sourceID, destinationID ObjectID) erro
 		if store.root == "" {
 			return errors.New("donated TTC bulk-object store has no host path")
 		}
-		if err := os.MkdirAll(filepath.Join(store.root, filepath.Dir(destination)), 0700); err != nil {
+		if err := store.mkdirBelowRoot(filepath.Join(store.root, filepath.Dir(destination))); err != nil {
 			return err
 		}
 		if err := os.Link(filepath.Join(store.root, source), filepath.Join(store.root, destination)); err != nil {
@@ -1071,7 +1100,7 @@ func (store *LocalDataStore) clone(sourceID, destinationID ObjectID, tryReflink,
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(destination), 0700); err != nil {
+	if err := store.mkdirBelowRoot(filepath.Dir(destination)); err != nil {
 		return err
 	}
 	temporary, err := os.CreateTemp(filepath.Dir(destination), ".clone-")
