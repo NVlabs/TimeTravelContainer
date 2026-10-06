@@ -1425,6 +1425,24 @@ func TestWaitForCommittedColdBranchMetadataRepairsLifecycleAfterMemoryDiscard(t 
 	}
 }
 
+// A start or a rehydration that refuses its branch's state claims nothing: a
+// refused start of a dehydrated branch left it materializing.
+func TestLifecycleCommandAcceptsState(t *testing.T) {
+	for _, test := range []struct {
+		command, state string
+		accepts        bool
+	}{
+		{"start", "exited", true}, {"start", "created", true}, {"start", "failed", true},
+		{"start", "dehydrated", false}, {"start", "running", false},
+		{"rehydrate", "dehydrated", true}, {"rehydrate", "exited", false}, {"rehydrate", "running", false},
+		{"restart", "dehydrated", true}, {"restart", "exited", true},
+	} {
+		if got := lifecycleCommandAcceptsState(test.command, test.state); got != test.accepts {
+			t.Errorf("%s of a %s branch accepted=%t, want %t", test.command, test.state, got, test.accepts)
+		}
+	}
+}
+
 func TestClaimUnplacedLifecycleTargetRecordsSelectedNode(t *testing.T) {
 	root := t.TempDir()
 	local := t.TempDir()
@@ -1497,7 +1515,7 @@ func TestClaimUnplacedLifecycleTargetRecordsSelectedNode(t *testing.T) {
 	if err := (ttcbundle.Store{Root: root, ActiveRoot: local}).CompareAndSwapBranchNodeID("web", "main", "node-a", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := server.claimUnplacedLifecycleTargets(backend, []string{"start", "web@main"}); err != nil {
+	if err := server.claimUnplacedLifecycleTargets(backend, []string{"rehydrate", "web@main"}); err != nil {
 		t.Fatal(err)
 	}
 	reclaimed, err := placements.Lookup("web", "main")

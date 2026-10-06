@@ -2297,6 +2297,13 @@ func (s *daemonServer) claimLifecycleTargets(backend *runtimeBackend, args []str
 				resolved = selector{container: persistent.ID, branch: persistentBranch.ID}
 			}
 		}
+		// A command that refuses the branch as it is claims nothing. A start
+		// of a dehydrated branch, refused, left the branch materializing,
+		// which every command but a rehydration, a start or a removal then
+		// refused.
+		if admit && !lifecycleCommandAcceptsState(args[0], branch.State) {
+			continue
+		}
 		claimed, err := placements.ClaimUnplaced(familyID, target.branch, node.NodeID, node.Incarnation, info.ID, resolved.branch, record.Generation, cluster.PlacementMaterializing, time.Now())
 		if err != nil {
 			return fmt.Errorf("claiming cold-branch placement for %s: %w", target, err)
@@ -2320,6 +2327,23 @@ func (s *daemonServer) claimLifecycleTargets(backend *runtimeBackend, args []str
 		}
 	}
 	return nil
+}
+
+// lifecycleCommandAcceptsState reports whether command, which claims the
+// unplaced branches it names, acts on a branch in state rather than refusing
+// it, as start and rehydrate do.
+func lifecycleCommandAcceptsState(command, state string) bool {
+	switch command {
+	case "start":
+		switch normalizeLifecycleState(state) {
+		case "created", "exited", "failed", "dead":
+			return true
+		}
+		return false
+	case "rehydrate":
+		return normalizeLifecycleState(state) == "dehydrated"
+	}
+	return true
 }
 
 // activatedFromPublication reports whether a command on node nodeID, a start
