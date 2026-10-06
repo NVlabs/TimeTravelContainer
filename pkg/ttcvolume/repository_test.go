@@ -2109,6 +2109,51 @@ func TestPrepareBranchPublicationTakesInWholeOrigins(t *testing.T) {
 	}
 }
 
+// A branch's metadata published during a handoff of an origin it shares
+// waits for the handoff, as an observation does, rather than failing.
+func TestPublishMetadataDuringOriginHandoff(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.CreateWithOrigin("publish-handoff", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	if _, err := repository.CreateRegular(MainBranch, RootInode, "payload", 0600, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ForkWithOrigins(MainBranch, "peer", 101, 102); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.PrepareBranchPublication("peer"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.FreezeOriginHandoff(100); err != nil {
+		t.Fatal(err)
+	}
+	// Main's tail, which the handoff of the origin it shares refuses.
+	if _, err := repository.CreateRegular(MainBranch, RootInode, "later", 0600, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- repository.PublishMetadata() }()
+	select {
+	case err := <-done:
+		t.Fatalf("PublishMetadata did not wait for the handoff: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := repository.CompleteOriginHandoff(100); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("PublishMetadata remained blocked after the handoff completed")
+	}
+}
+
 func TestBranchDiffDuringOriginHandoff(t *testing.T) {
 	manager := openTestManager(t)
 	repository, err := manager.CreateWithOrigin("diff-handoff", 100)

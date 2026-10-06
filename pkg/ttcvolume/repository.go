@@ -3559,8 +3559,15 @@ func (r *Repository) SyncBranchMetadata(branchID string) error {
 // use this after asking the live Sentry to publish its process-local tail.
 // Guest fsync(2), sync(2), fork, and lifecycle operations continue to use
 // SyncMetadata when persistence is required.
+//
+// While an authority handoff has frozen a snapshot the repository's branches
+// share, it waits for the handoff, as an observation does: a dehydration of
+// a branch whose sibling's publication was handing their origin off failed,
+// "publishing filesystem metadata before dehydration: I/O error".
 func (r *Repository) PublishMetadata() error {
-	return r.withLock(r.flushAllMetadataBatchesLocked)
+	return retryFrozenGraphObservation(func() error {
+		return r.withLock(r.flushAllMetadataBatchesLocked)
+	})
 }
 
 // syncBranchMetadataLocked publishes branchID's metadata tail and makes the
