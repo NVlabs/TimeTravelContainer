@@ -15406,7 +15406,17 @@ func (b *runtimeBackend) reclaimBranchBacking(info ttcbundle.ContainerInfo, bran
 	if err := b.releaseDistributedGraphReferencesEventually(operation); err != nil {
 		return fmt.Errorf("releasing distributed memory references: %w", err)
 	}
-	if err := b.releaseBranchGraphRoots(branch); err != nil {
+	err := b.releaseBranchGraphRoots(branch)
+	if frozenForAuthorityHandoff(err) {
+		// A publication is handing a snapshot the roots retain off, which
+		// ends with it: wait for it without the lock, as a dehydration
+		// releasing its superseded roots does. A removal failed, "snapshot 42
+		// references are frozen for authority handoff".
+		err = b.withoutLifecycleLock(info, longOperation{branch: branch.ID, state: "removing", shown: true}, func() error {
+			return b.releaseGraphMemoryRootsThroughHandoffs(branchGraphRootNames(branch))
+		})
+	}
+	if err != nil {
 		return fmt.Errorf("releasing local memory roots: %w", err)
 	}
 	if err := b.containerStore().RemoveBranchFilesystems(info.ID, branch); err != nil {
