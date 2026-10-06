@@ -16717,7 +16717,17 @@ func (b *runtimeBackend) persistDehydration(target selector, info ttcbundle.Cont
 			}
 		}
 		previousRoots := appendGraphRoot(append([]string(nil), previousGraphMemoryRoots...), previousGraphControlRoot)
-		if err := b.releaseGraphMemoryRoots(previousRoots); err != nil && b.stderr != nil {
+		err := b.releaseGraphMemoryRoots(previousRoots)
+		if frozenForAuthorityHandoff(err) {
+			// A publication is handing the superseded snapshot off, as this
+			// capture's does one that a rehydration's cancellation left
+			// volatile: wait for it without the lock. In a cluster no
+			// reconciliation releases the roots later.
+			err = b.withoutLifecycleLock(info, longOperation{branch: target.branch, state: "dehydrating", shown: true}, func() error {
+				return b.releaseGraphMemoryRootsThroughHandoffs(previousRoots)
+			})
+		}
+		if err != nil && b.stderr != nil {
 			// The new roots are already authoritative. Retaining the superseded
 			// roots is a safe leak that standalone graph reconciliation retries;
 			// it must not turn a successful dehydration into an ambiguous failure.
