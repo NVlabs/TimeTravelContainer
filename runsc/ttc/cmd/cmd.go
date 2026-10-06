@@ -16639,7 +16639,7 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 			return loadErr
 		}
 		allCold, localBranches := allBranchesColdOnNode(latest, b.nodeID)
-		if allCold && localBranches != 0 {
+		if allCold && localBranches != 0 && b.runtimeRunsNoBranch(info.ID) {
 			if err := b.persistResidentDehydrations(latest, &superseded); err != nil {
 				return err
 			}
@@ -16649,6 +16649,25 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		}
 	}
 	return nil
+}
+
+// runtimeRunsNoBranch reports whether the runtime with this ID runs no branch,
+// as its Sentry lists them, or is gone. A family's record does not say all its
+// runtime runs: a remote fork imports its branch into the family's Sentry on
+// the node, without the node's lifecycle lock, before the record lists the
+// branch, and a dehydration of the Sentry's last live branch that took the
+// record's word deleted the Sentry under the import.
+func (b *runtimeBackend) runtimeRunsNoBranch(id string) bool {
+	families, err := b.listRuntimeFamiliesOf(id)
+	if err != nil {
+		return false
+	}
+	for _, family := range families {
+		if family.ID == id {
+			return runtimeFamilyLiveBranch(family) == "" || runtimeFamilyUnavailable(family)
+		}
+	}
+	return true
 }
 
 // dehydrationMayStayResident reports whether branchID's dehydration may leave

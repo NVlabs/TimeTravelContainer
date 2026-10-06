@@ -3322,3 +3322,26 @@ func TestRemovalClaimsAnUnplacedBranchFirst(t *testing.T) {
 		t.Fatalf("a branch this node runs: placement %+v, %v, want it as it was", record, err)
 	}
 }
+
+// A dehydration of a family's last live branch on a node deletes the
+// family's runtime there only once its Sentry runs no branch: a remote fork
+// may be importing one into it, which the family's record does not list yet.
+func TestRuntimeRunsNoBranch(t *testing.T) {
+	runsc := fakeImportRuntime(t)
+	b := &runtimeBackend{root: "/runtime", runsc: runsc}
+	for mode, want := range map[string]bool{
+		"elsewhere": true,  // its only branch exited
+		"absent":    true,  // no runtime
+		"dead":      true,  // its Sentry gone
+		"alone":     false, // an import paused in it
+		"beside":    false,
+		"unknown":   false, // a live Sentry that cannot list its branches
+	} {
+		if err := os.WriteFile(runsc+".mode", []byte(mode+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if got := b.runtimeRunsNoBranch("family"); got != want {
+			t.Errorf("%s: runtimeRunsNoBranch = %t, want %t", mode, got, want)
+		}
+	}
+}
