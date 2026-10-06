@@ -2935,7 +2935,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	if err != nil {
 		return selector{}, fmt.Errorf("invalid distributed destination %q: %w", targetDestination, err)
 	}
-	logicalSource := source
+	requested, logicalSource := source, source
 	resolved, sourceInfo, err := b.resolveSelector(source)
 	if err != nil {
 		return selector{}, err
@@ -2951,6 +2951,13 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	}
 	sourceBranch, err := persistentBranchInfo(sourceInfo, source.branch)
 	if err != nil {
+		return selector{}, err
+	}
+	// Refused by the branch's state, as a fork on the node is: a fork of an
+	// exited branch went on to the node-local repository the branch's stop
+	// had published and let go, and failed opening it, "volume.json: no
+	// such file or directory".
+	if err := lifecycleStateRefusal(sourceInfo, source, requested, "fork", "running", "paused", "dehydrated", "dehydrating"); err != nil {
 		return selector{}, err
 	}
 	if _, err := b.renewDistributedExecutionAuthority(); err != nil {
@@ -3589,7 +3596,7 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		seenTargets[target.String()] = struct{}{}
 		destinations[i] = target
 	}
-	logicalSource := source
+	requested, logicalSource := source, source
 	resolved, sourceInfo, err := b.resolveSelector(source)
 	if err != nil {
 		return nil, err
@@ -3601,6 +3608,9 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 	}
 	sourceBranch, err := persistentBranchInfo(sourceInfo, source.branch)
 	if err != nil {
+		return nil, err
+	}
+	if err := lifecycleStateRefusal(sourceInfo, source, requested, "fork", "running", "paused", "dehydrated", "dehydrating"); err != nil {
 		return nil, err
 	}
 	if _, err := b.renewDistributedExecutionAuthority(); err != nil {
