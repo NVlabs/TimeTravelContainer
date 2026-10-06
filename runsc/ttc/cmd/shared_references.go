@@ -1506,11 +1506,108 @@ func (s *sharedReferenceService) reconcileAuthoritativeColdReferences() error {
 	}
 	sort.Strings(retain)
 	sort.Strings(release)
+	if err := s.importMissedSharedOrigins(state, desired, retain); err != nil {
+		return err
+	}
 	s.coldPass++
 	mutations := coldReferenceMutations(desired, current, retain, release, s.coldPass)
 	return s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
 		return applySharedReferenceBatches(ledger, mutations)
 	})
+}
+
+// importMissedSharedOrigins imports, as a rebuild does, each shared origin
+// that retain's names select and the ledger does not hold. A provider imports
+// its origin while the origin is still volatile, which a rebuild leaves to the
+// provider: a coordinator that rebuilt its ledger after the import reached the
+// one before, and before the publication made the origin shared, held it in
+// neither, and every collection after failed retaining the publication's
+// roots, "owned object ... cannot be retained", a node's stop with them. The
+// origin's live manifest references and the names retain selects in it are
+// its baseline, so that no object reachable from them is imported unreferenced.
+func (s *sharedReferenceService) importMissedSharedOrigins(state *cluster.AuthorityState, desired map[string]ttcsnapshot.ObjectID, retain []string) error {
+	var owned []ttcsnapshot.SnapshotID
+	if err := s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
+		owned = ledger.Origins()
+		return nil
+	}); err != nil {
+		return err
+	}
+	missed := missedSharedOrigins(state, owned, desired, retain)
+	origins := make([]ttcsnapshot.SnapshotID, 0, len(missed))
+	for origin := range missed {
+		origins = append(origins, origin)
+	}
+	slices.Sort(origins)
+	for _, origin := range origins {
+		manifest, err := s.packs.Manifest(origin)
+		if err != nil {
+			return fmt.Errorf("reading shared origin %d the ledger missed: %w", origin, err)
+		}
+		objects := make([]ttcsnapshot.Object, len(manifest.Objects))
+		for index, packed := range manifest.Objects {
+			objects[index] = packed.Object
+		}
+		references, err := missedOriginBaseline(state, origin, manifest.References, missed[origin])
+		if err != nil {
+			return err
+		}
+		if err := s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
+			return ledger.ImportOrigin(origin, objects, references)
+		}); err != nil {
+			return fmt.Errorf("importing shared origin %d the ledger missed: %w", origin, err)
+		}
+	}
+	return nil
+}
+
+// missedSharedOrigins returns, by origin, retain's names that select an
+// origin the authority holds shared and owned does not have.
+func missedSharedOrigins(state *cluster.AuthorityState, owned []ttcsnapshot.SnapshotID, desired map[string]ttcsnapshot.ObjectID, retain []string) map[ttcsnapshot.SnapshotID]map[string]ttcsnapshot.ObjectID {
+	missed := make(map[ttcsnapshot.SnapshotID]map[string]ttcsnapshot.ObjectID)
+	for _, name := range retain {
+		object := desired[name]
+		origin := object.Snapshot
+		if slices.Contains(owned, origin) || !state.SharedOrigins[uint64(origin)] || state.OriginDead(uint64(origin)) {
+			continue
+		}
+		if _, volatile := state.VolatileOrigins[uint64(origin)]; volatile {
+			continue
+		}
+		if _, retired := state.RetiredOrigins[uint64(origin)]; retired {
+			continue
+		}
+		if missed[origin] == nil {
+			missed[origin] = make(map[string]ttcsnapshot.ObjectID)
+		}
+		missed[origin][name] = object
+	}
+	return missed
+}
+
+// missedOriginBaseline returns what an origin the ledger missed is imported
+// with, as a rebuild imports it: its manifest's live references, a
+// provider's under its baseline names, and the names that select it.
+func missedOriginBaseline(state *cluster.AuthorityState, origin ttcsnapshot.SnapshotID, manifestReferences, selecting map[string]ttcsnapshot.ObjectID) (map[string]ttcsnapshot.ObjectID, error) {
+	references := make(map[string]ttcsnapshot.ObjectID, len(manifestReferences)+len(selecting))
+	for name, object := range manifestReferences {
+		live, err := manifestReferenceIsLive(state, name)
+		if err != nil {
+			return nil, fmt.Errorf("validating snapshot %d manifest reference: %w", origin, err)
+		}
+		if !live {
+			continue
+		}
+		if strings.HasPrefix(name, "root/bridge/edge/") {
+			references[name] = object
+		} else {
+			references[providerBaselineReferenceName(origin, name)] = object
+		}
+	}
+	for name, object := range selecting {
+		references[name] = object
+	}
+	return references, nil
 }
 
 // coldReferenceMutations retains each of retain's names at desired's object

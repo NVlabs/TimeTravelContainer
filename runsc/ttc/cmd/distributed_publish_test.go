@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -239,6 +240,57 @@ func TestColdReferenceNamesComeBack(t *testing.T) {
 	}
 	if collected, err := ledger.Collect(16); err != nil || collected != 0 {
 		t.Fatalf("collection of a referenced origin = (%d, %v), want nothing", collected, err)
+	}
+}
+
+// A coordinator that rebuilt its ledger while a publication's origin was
+// still volatile, its provider's import having reached the ledger before,
+// holds the origin in no ledger once the publication makes it shared:
+// reconciliation imports it, as a rebuild would, before it retains the
+// publication's roots, which every pass failed to retain before.
+func TestReconciliationImportsAnOriginTheLedgerMissed(t *testing.T) {
+	ledger := ttcsnapshot.NewReferenceLedger()
+	old := ttcsnapshot.ObjectID{Snapshot: 1, Ordinal: 1, Kind: ttcsnapshot.ObjectKindMetadata}
+	if err := ledger.ImportOrigin(1, []ttcsnapshot.Object{{ID: old, State: ttcsnapshot.ObjectLive}}, map[string]ttcsnapshot.ObjectID{"root/cold/old": old}); err != nil {
+		t.Fatal(err)
+	}
+	root := ttcsnapshot.ObjectID{Snapshot: 2, Ordinal: 3, Kind: ttcsnapshot.ObjectKindMetadata}
+	state := &cluster.AuthorityState{NextSnapshotID: 4, SharedOrigins: map[uint64]bool{1: true, 2: true}}
+	desired := map[string]ttcsnapshot.ObjectID{"root/cold/old": old, "root/cold/new": root}
+	retain := []string{"root/cold/new"}
+	if err := applySharedReferenceBatches(ledger, coldReferenceMutations(desired, ledger.References(), retain, nil, 1)); err == nil || !strings.Contains(err.Error(), "cannot be retained") {
+		t.Fatalf("retaining a root of an origin the ledger missed = %v, want it refused", err)
+	}
+	missed := missedSharedOrigins(state, ledger.Origins(), desired, retain)
+	if len(missed) != 1 || len(missed[2]) != 1 || missed[2]["root/cold/new"] != root {
+		t.Fatalf("missed origins = %v, want origin 2's new root", missed)
+	}
+	references, err := missedOriginBaseline(state, 2, map[string]ttcsnapshot.ObjectID{"root/memory": root}, missed[2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.ImportOrigin(2, []ttcsnapshot.Object{{ID: root, State: ttcsnapshot.ObjectLive}}, references); err != nil {
+		t.Fatal(err)
+	}
+	if err := applySharedReferenceBatches(ledger, coldReferenceMutations(desired, ledger.References(), retain, nil, 2)); err != nil {
+		t.Fatalf("retaining the root once its origin is imported: %v", err)
+	}
+	if got := ledger.References()["root/cold/new"]; got != root {
+		t.Fatalf("the publication's root selects %s, want %s", got, root)
+	}
+
+	// An origin still volatile is its provider's, and one retired is gone:
+	// neither is imported so.
+	volatile := ttcsnapshot.ObjectID{Snapshot: 3, Ordinal: 1, Kind: ttcsnapshot.ObjectKindMetadata}
+	state.SharedOrigins[3] = true
+	state.VolatileOrigins = map[uint64]cluster.SnapshotOriginProvider{3: {SnapshotID: 3, NodeID: "node-a"}}
+	if missed := missedSharedOrigins(state, ledger.Origins(), map[string]ttcsnapshot.ObjectID{"root/cold/volatile": volatile}, []string{"root/cold/volatile"}); len(missed) != 0 {
+		t.Fatalf("a volatile origin was taken for missed: %v", missed)
+	}
+	delete(state.VolatileOrigins, 3)
+	state.RetiredOrigins = map[uint64]cluster.SharedPackRetirement{3: {}}
+	if missed := missedSharedOrigins(state, ledger.Origins(), map[string]ttcsnapshot.ObjectID{"root/cold/volatile": volatile}, []string{"root/cold/volatile"}); len(missed) != 0 {
+		t.Fatalf("a retired origin was taken for missed: %v", missed)
 	}
 }
 
