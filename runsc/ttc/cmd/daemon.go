@@ -6161,6 +6161,107 @@ func ownerLossRetry(request daemonRequest, automaticPlacement bool, err error, l
 	return true
 }
 
+// staleRouteWait bounds how long a routed command keeps being routed again
+// while its owner refuses it as routed by a placement since changed, as one
+// does while another command moves or claims the branch.
+const staleRouteWait = time.Minute
+
+// staleRouteRefusal begins the owner's answer to a command routed by a
+// placement that another command has changed since. The owner gives it
+// before the command does anything.
+const staleRouteRefusal = "ttcd: stale routed command:"
+
+// staleRouteFilter holds back the first frame of a routed command's answer
+// until it knows whether the answer is the owner's refusal of a stale route:
+// that refusal, and the status after it, it keeps from the client, and
+// reports; any other answer it passes on whole.
+type staleRouteFilter struct {
+	next    io.Writer
+	held    []byte
+	passing bool
+	refused bool
+}
+
+func (f *staleRouteFilter) Write(p []byte) (int, error) {
+	if f.passing {
+		return f.next.Write(p)
+	}
+	if f.refused {
+		return len(p), nil
+	}
+	f.held = append(f.held, p...)
+	refusal, decided := staleRouteFrames(f.held)
+	if !decided {
+		return len(p), nil
+	}
+	if refusal {
+		f.refused = true
+		return len(p), nil
+	}
+	f.passing = true
+	held := f.held
+	f.held = nil
+	if err := writeDaemonBytes(f.next, held); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// release passes on what the filter holds, the refusal it reported among it,
+// which the routed command's answer ended with.
+func (f *staleRouteFilter) release() error {
+	held := f.held
+	f.held, f.passing, f.refused = nil, true, false
+	return writeDaemonBytes(f.next, held)
+}
+
+// staleRouteRetry reports whether a routed command that its owner refused as
+// routed stale goes again, and waits before it: at once the first time, the
+// branch's placement having changed, and then less often, as while another
+// command claims the branch, until staleRouteWait passes.
+func staleRouteRetry(retry *ownerLoss) bool {
+	now := time.Now()
+	if retry.deadline.IsZero() {
+		retry.deadline, retry.delay = now.Add(staleRouteWait), 25*time.Millisecond
+		return true
+	}
+	if now.After(retry.deadline) {
+		return false
+	}
+	time.Sleep(retry.delay)
+	retry.delay = min(2*retry.delay, time.Second)
+	return true
+}
+
+// staleRouteFrames reports whether data, the start of a routed command's
+// answer, is the owner's refusal of a stale route and the status that ends
+// it, and whether it has enough of the answer to tell.
+func staleRouteFrames(data []byte) (refusal, decided bool) {
+	const header = 5
+	if len(data) < header {
+		return false, false
+	}
+	length := int(binary.BigEndian.Uint32(data[1:header]))
+	if data[0] != daemonFrameStderr || length < len(staleRouteRefusal) || length > 4096 {
+		return false, true
+	}
+	if len(data) < header+len(staleRouteRefusal) {
+		return false, false
+	}
+	if string(data[header:header+len(staleRouteRefusal)]) != staleRouteRefusal {
+		return false, true
+	}
+	status := header + length
+	if len(data) < status+header+4 {
+		return false, false
+	}
+	if data[status] != daemonFrameStatus || binary.BigEndian.Uint32(data[status+1:status+header]) != 4 ||
+		binary.BigEndian.Uint32(data[status+header:status+header+4]) == 0 {
+		return false, true
+	}
+	return true, true
+}
+
 func controlOnlyProxyInput(header string, stdin io.Reader, streaming bool) io.Reader {
 	if !streaming {
 		return strings.NewReader(header)
@@ -7388,7 +7489,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		automaticPlacement := false
 		failedAdmissionNodes := make(map[string]struct{})
 		var err error
-		var lost ownerLoss
+		var lost, stale ownerLoss
 		routing := s.routingPlacements()
 		claimsRouted := len(request.PlacementClaims) == 0
 		if claimsRouted {
@@ -7588,7 +7689,38 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 				tracked = &daemonStatusWriter{writer: counted}
 				output = tracked
 			}
+			var staleRoute *staleRouteFilter
+			if !request.streamsClientFrames() {
+				staleRoute = &staleRouteFilter{next: output}
+				output = staleRoute
+			}
 			err = peer.ProxyDaemon(context.Background(), input, output)
+			if err == nil && staleRoute != nil && staleRoute.refused {
+				// The owner refused the command, before it did anything, as
+				// routed by a placement that another command has changed
+				// since: it moved the branch, unplaced it, or is claiming it.
+				// The command goes as the branch is placed now, and waits out
+				// a claim under way, rather than failing for the other's sake.
+				// One that admits an unplaced branch to a node has the entry
+				// choose the node, which it no longer does here.
+				placements := cluster.PlacementCatalog(s.clusterPlacements)
+				if routing != nil {
+					placements = routing
+				}
+				rerouted, claims, routeErr := daemonCommandPlacementWithCatalog(s.dataRoot, placements, request.Args)
+				if routeErr == nil && (rerouted != "" || !daemonCommandNeedsPlacementAdmission(request.Args)) && staleRouteRetry(&stale) {
+					owner, request.PlacementClaims = rerouted, claims
+					continue
+				}
+			}
+			// What the filter holds goes on before the answer is judged: a
+			// node that lost the command after it began answering, which the
+			// count of what reached the client tells, is not asked again.
+			if staleRoute != nil {
+				if releaseErr := staleRoute.release(); err == nil {
+					err = releaseErr
+				}
+			}
 			if err == nil {
 				if tracked != nil {
 					ingressCommitted = tracked.statusSeen && tracked.status == 0

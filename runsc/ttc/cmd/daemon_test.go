@@ -2497,6 +2497,63 @@ func TestControlOnlyClusterFollowsTheHolderRedirect(t *testing.T) {
 	}
 }
 
+// An owner refuses a command routed by a placement that another command has
+// changed since, before the command does anything. The entry routes it again
+// rather than give the client the refusal: it holds back the first frame of
+// the answer, however the answer comes in pieces, until it knows. Any other
+// answer reaches the client as it came.
+func TestStaleRouteFilter(t *testing.T) {
+	frames := func(write func(io.Writer, *sync.Mutex)) []byte {
+		var buffer bytes.Buffer
+		var mu sync.Mutex
+		write(&buffer, &mu)
+		return buffer.Bytes()
+	}
+	refusal := frames(func(w io.Writer, mu *sync.Mutex) {
+		_ = writeDaemonFrame(w, mu, daemonFrameStderr, []byte("ttcd: stale routed command: branch f@b is unplaced\n"))
+		_ = writeDaemonStatus(w, mu, 1)
+	})
+	other := frames(func(w io.Writer, mu *sync.Mutex) {
+		_ = writeDaemonFrame(w, mu, daemonFrameStderr, []byte("ttcd: cannot pause f@b: branch is exited\n"))
+		_ = writeDaemonStatus(w, mu, 1)
+	})
+	output := frames(func(w io.Writer, mu *sync.Mutex) {
+		_ = writeDaemonFrame(w, mu, daemonFrameStdout, []byte("f@b\n"))
+		_ = writeDaemonStatus(w, mu, 0)
+	})
+	for _, chunk := range []int{1, 3, 7, len(refusal)} {
+		feed := func(filter *staleRouteFilter, data []byte) {
+			for len(data) != 0 {
+				n := min(chunk, len(data))
+				if written, err := filter.Write(data[:n]); err != nil || written != n {
+					t.Fatalf("writing %d bytes: %d, %v", n, written, err)
+				}
+				data = data[n:]
+			}
+		}
+		var client bytes.Buffer
+		filter := &staleRouteFilter{next: &client}
+		feed(filter, refusal)
+		if !filter.refused || client.Len() != 0 {
+			t.Fatalf("in pieces of %d, a stale route's refusal: refused %t, %d bytes reached the client", chunk, filter.refused, client.Len())
+		}
+		if err := filter.release(); err != nil || !bytes.Equal(client.Bytes(), refusal) {
+			t.Fatalf("in pieces of %d, the refusal released after the last retry: %q, %v", chunk, client.Bytes(), err)
+		}
+		for _, answer := range [][]byte{other, output} {
+			client.Reset()
+			filter := &staleRouteFilter{next: &client}
+			feed(filter, answer)
+			if err := filter.release(); err != nil {
+				t.Fatal(err)
+			}
+			if filter.refused || !bytes.Equal(client.Bytes(), answer) {
+				t.Fatalf("in pieces of %d, answer %q reached the client as %q (refused %t)", chunk, answer, client.Bytes(), filter.refused)
+			}
+		}
+	}
+}
+
 // A routed command that its node lost before answering goes to it again
 // while the node may run it once: with a request ID, without streamed input,
 // for a lost connection, until ownerLossWait passes.
