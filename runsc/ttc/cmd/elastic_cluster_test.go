@@ -324,6 +324,60 @@ func TestDaemonCommandOwner(t *testing.T) {
 	}
 }
 
+// A start or a rehydration claims an unplaced branch for a node before it
+// makes the branch run there. A command of the branch meanwhile waits for it,
+// rather than fail for its sake; one of a branch claimed long ago, which a
+// failed command left so, is refused, as only a lifecycle command retries it.
+func TestRoutingWaitsForAClaimUnderWay(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "web")
+	if err := os.MkdirAll(filepath.Join(containerDir, "bundle"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(containerDir, "bundle", "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+		ID: "web", Name: "web", BundleDir: filepath.Join(containerDir, "bundle"),
+		Branches: []ttcbundle.BranchInfo{{ID: "main"}, {ID: "old"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	placements, err := cluster.OpenPlacementStore(filepath.Join(root, "cluster", "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := placements.Create(cluster.PlacementRecord{
+		FamilyID: "web", BranchID: "main", PhysicalContainer: "web", PhysicalBranch: "main",
+		OwnerNode: "node-b", OwnerIncarnation: "boot-b", State: cluster.PlacementMaterializing,
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := placements.Create(cluster.PlacementRecord{
+		FamilyID: "web", BranchID: "old", PhysicalContainer: "web", PhysicalBranch: "old",
+		OwnerNode: "node-b", OwnerIncarnation: "boot-b", State: cluster.PlacementMaterializing,
+	}, time.Now().Add(-2*materializingClaimWait)); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		_, _ = placements.UpdateStableState("web", "main", "node-b", "boot-b", claimed.Generation, cluster.PlacementRunning, time.Now())
+	}()
+	start := time.Now()
+	owner, claims, err := placementAfterClaims(root, placements, []string{"stop", "web@main"})
+	if err != nil || owner != "node-b" || len(claims) != 1 {
+		t.Fatalf("a stop of a branch whose start is under way: (%q, %+v, %v), want it routed to node-b once started", owner, claims, err)
+	}
+	if waited := time.Since(start); waited < 150*time.Millisecond {
+		t.Fatalf("the stop was routed after %v, before the start made the branch run", waited)
+	}
+	var refused *branchMaterializingError
+	if _, _, err := placementAfterClaims(root, placements, []string{"stop", "web@old"}); !errors.As(err, &refused) {
+		t.Fatalf("a stop of a branch a failed start left claimed: %v, want refused", err)
+	}
+}
+
 // A node's proxy of a daemon request ends the local daemon's stream, which
 // the daemon takes for its client's going, when the request's input does:
 // for a request that carries none, only when the request ends, not with its

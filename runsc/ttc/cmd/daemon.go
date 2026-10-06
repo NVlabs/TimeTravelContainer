@@ -7503,7 +7503,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			if routing != nil {
 				placements = routing
 			}
-			owner, request.PlacementClaims, err = daemonCommandPlacementWithCatalog(s.dataRoot, placements, request.Args)
+			owner, request.PlacementClaims, err = placementAfterClaims(s.dataRoot, placements, request.Args)
 		} else {
 			for _, claim := range request.PlacementClaims {
 				if owner != "" && owner != claim.OwnerNode {

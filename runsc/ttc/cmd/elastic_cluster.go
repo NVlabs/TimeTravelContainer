@@ -391,6 +391,42 @@ func (r *placementReader) Lookup(family, branch string) (*cluster.PlacementRecor
 	return &record, nil
 }
 
+// branchMaterializingError refuses a command of a branch that a start or a
+// rehydration has claimed for a node, and not yet made run there.
+type branchMaterializingError struct {
+	branch    selector
+	owner     string
+	claimedAt time.Time
+}
+
+func (e *branchMaterializingError) Error() string {
+	return fmt.Sprintf("branch %s is materializing on %q; only lifecycle recovery may retry it", e.branch, e.owner)
+}
+
+// materializingClaimWait is how long after a branch's claim for a node a
+// command of the branch waits for the start or rehydration that claimed it. A
+// claim older is one that a failed command left, which only a lifecycle
+// command retries.
+const materializingClaimWait = 90 * time.Second
+
+// placementAfterClaims is daemonCommandPlacementWithCatalog for a command a
+// client asked for, which waits while a branch it names is claimed by a start
+// or a rehydration under way, rather than fail for the other's sake. Four
+// clients acting at once on one family's branches had a stop, a fork or an
+// exec of a branch refused as another started it, a dozen times a run.
+func placementAfterClaims(dataRoot string, placements cluster.PlacementCatalog, args []string) (string, []daemonPlacementClaim, error) {
+	delay := 25 * time.Millisecond
+	for {
+		owner, claims, err := daemonCommandPlacementWithCatalog(dataRoot, placements, args)
+		var claimed *branchMaterializingError
+		if !errors.As(err, &claimed) || time.Since(claimed.claimedAt) >= materializingClaimWait {
+			return owner, claims, err
+		}
+		time.Sleep(delay)
+		delay = min(2*delay, 500*time.Millisecond)
+	}
+}
+
 func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.PlacementCatalog, args []string) (string, []daemonPlacementClaim, error) {
 	if dataRoot == "" {
 		return "", nil, nil
@@ -531,7 +567,7 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 					}
 				}
 				if !claimMaterializing {
-					return "", nil, fmt.Errorf("branch %s is materializing on %q; only lifecycle recovery may retry it", selected, placement.OwnerNode)
+					return "", nil, &branchMaterializingError{branch: selected, owner: placement.OwnerNode, claimedAt: placement.UpdatedAt}
 				}
 			}
 			if placement.State != cluster.PlacementUnplaced {
