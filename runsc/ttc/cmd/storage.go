@@ -1823,23 +1823,36 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 		p.recordStorageEvent(intent, "shared", "", result.Manifest)
 		return nil
 	}
-	transactions := p.transactions
-	if transactions == nil {
+	if p.transactions == nil {
 		return errors.New("transaction authority is unavailable")
 	}
+	if err := advanceDehydratedFork(p.transactions, transactionID); err != nil {
+		return err
+	}
+	p.recordStorageEvent(intent, "shared", "", result.Manifest)
+	return nil
+}
+
+// advanceDehydratedFork makes independent transactionID, the distributed fork
+// that made a branch whose dehydration a publication has made durable: the
+// branch needs the fork's source no longer. The authority retires only a
+// terminal transaction whose target holds no placement, and a branch forked
+// in the target's container since names the container's transaction: one
+// retired needs nothing. Its lookup failed every completion of the branch's
+// publications, "file does not exist", and left the branch's record in error.
+func advanceDehydratedFork(transactions cluster.TransactionCatalog, transactionID string) error {
 	tx, err := transactions.Load(transactionID)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
 	switch tx.State {
 	case cluster.TransactionPublished, cluster.TransactionDraining:
 		_, err = transactions.Advance(transactionID, tx.Revision, cluster.TransactionIndependent, "", time.Now())
-		if err == nil {
-			p.recordStorageEvent(intent, "shared", "", result.Manifest)
-		}
 		return err
 	case cluster.TransactionIndependent:
-		p.recordStorageEvent(intent, "shared", "", result.Manifest)
 		return nil
 	default:
 		return fmt.Errorf("distributed fork transaction %q is %s", transactionID, tx.State)
@@ -2331,8 +2344,11 @@ func validateColdManifestIdentity(info ttcbundle.ContainerInfo, branch ttcbundle
 	// Explicit stop of a durable dehydrated branch consumes its process
 	// snapshot and publication transaction without consuming the immutable
 	// filesystem ancestor. Until fresh-start materialization commits, that
-	// exited branch correctly remains shared with an empty PublicationID.
-	if branch.PublicationID == "" && branch.StorageState == "shared" && state == "exited" {
+	// exited branch correctly remains shared with an empty PublicationID. A
+	// publication that failed after its commit, and a stop retired, left the
+	// branch in error, which leaves the manifest its ancestor as well: a
+	// failure must not make durable data unreachable.
+	if branch.PublicationID == "" && (branch.StorageState == "shared" || branch.StorageState == "error") && state == "exited" {
 		return nil
 	}
 	return fmt.Errorf("cold manifest publication is %q, branch publication is %q", manifest.PublicationID, branch.PublicationID)

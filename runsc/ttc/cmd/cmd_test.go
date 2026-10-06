@@ -7234,6 +7234,13 @@ func TestColdManifestIdentityRetainsActivatedFilesystemAncestor(t *testing.T) {
 	}, manifest); err != nil {
 		t.Fatalf("consumed stopped filesystem ancestor rejected: %v", err)
 	}
+	// A publication that failed after its commit left the branch in error
+	// before a stop retired it: the manifest is still its ancestor.
+	if err := validateColdManifestIdentity(info, ttcbundle.BranchInfo{
+		ID: "child", State: "exited", StorageState: "error", StorageManifest: "/shared/cold.json",
+	}, manifest); err != nil {
+		t.Fatalf("stopped filesystem ancestor of a failed completion rejected: %v", err)
+	}
 	branch := ttcbundle.BranchInfo{
 		ID: "child", State: "dehydrated", StorageState: "shared",
 		PublicationID: "publication-cold",
@@ -7253,6 +7260,25 @@ func TestColdManifestIdentityRetainsActivatedFilesystemAncestor(t *testing.T) {
 	manifest.Container = "other"
 	if err := validateColdManifestIdentity(info, branch, manifest); err == nil {
 		t.Fatal("foreign physical manifest was accepted as an ancestor")
+	}
+}
+
+// A branch forked in a remote fork's target container names the container's
+// transaction, which the authority retires once the fork is terminal and its
+// target holds no placement. Completing the branch's dehydration made the
+// fork independent, and failed on the retired transaction, "file does not
+// exist", on every retry.
+func TestAdvanceDehydratedForkPassesOverARetiredFork(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "transactions")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	transactions, err := cluster.OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := advanceDehydratedFork(transactions, "fork-0123456789abcdef0123456789abcdef"); err != nil {
+		t.Fatalf("completing the dehydration of a branch whose fork is retired: %v", err)
 	}
 }
 
