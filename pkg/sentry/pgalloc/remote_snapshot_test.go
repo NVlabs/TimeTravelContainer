@@ -701,6 +701,79 @@ func TestRemoteSnapshotRetainsGraphPageLoads(t *testing.T) {
 	}
 }
 
+// TestRemoteSnapshotLendsPageLoads checks that a peer reading the same
+// MemoryFile as a capture can keep the loaders the capture retained, so pages
+// still loading stay readable once the capture is closed.
+func TestRemoteSnapshotLendsPageLoads(t *testing.T) {
+	source, sourceFR := newRemoteTestMemoryFile(t, 8)
+	target, targetFR := newRemoteTestMemoryFile(t, 8)
+	want := make([]byte, sourceFR.Length())
+	for i := range want {
+		want[i] = byte(i*11 + 5)
+	}
+	fillRemoteTestRange(t, source, sourceFR, want)
+	sourceSnapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: source, Range: sourceFR}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sourceSnapshot.Close()
+	reader := NewLoopbackRemoteReader(sourceSnapshot, hostarch.PageSize, 1, 2)
+	pages, err := StartAsyncPagesFileLoadWithOpts(reader, nil, nil, AsyncPagesFileLoadOpts{DemandOnly: true, DurableBacking: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.AttachRemotePageLoad(pages, []RemoteLoadRange{{Target: targetFR, StreamOffset: 0}}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+	capture, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: target, Range: targetFR}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retained, err := capture.RetainGraphPageLoads(); err != nil || !retained {
+		t.Fatalf("RetainGraphPageLoads: retained=%t err=%v", retained, err)
+	}
+	// The Kernel that loaded the pages goes, leaving the capture their
+	// loader's only owner.
+	if err := pages.DecOwner(); err != nil {
+		t.Fatal(err)
+	}
+	lent := capture.LendPageLoads()
+	if len(lent) != 1 || lent[0] != pages {
+		t.Fatalf("LendPageLoads = %v, want the retained loader", lent)
+	}
+	if err := capture.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if stats := pages.Stats(); stats.Done || stats.BytesLoaded != 0 {
+		t.Fatalf("the lent loader ended, or loaded, with the capture: %+v", stats)
+	}
+	if loads := capture.LendPageLoads(); len(loads) != 0 {
+		t.Fatalf("a closed capture lent %d loaders", len(loads))
+	}
+	// The peer reads the pages still loading.
+	peer, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: target, Range: targetFR}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(want))
+	if n, err := peer.CopyStreamAt(got, 0); err != nil || n != len(got) {
+		t.Fatalf("CopyStreamAt after the capture closed: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("pages read through the lent loader differ")
+	}
+	if err := peer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := lent[0].DecOwner(); err != nil {
+		t.Fatal(err)
+	}
+	if stats := pages.Stats(); !stats.Done {
+		t.Fatalf("the lent loader did not end with its borrower: %+v", stats)
+	}
+}
+
 func TestLogicalChunkDemandLoadsWholeChunk(t *testing.T) {
 	const pageCount = 2 * SparseChunkBytes / hostarch.PageSize
 	target, targetFR := newRemoteTestMemoryFile(t, pageCount)

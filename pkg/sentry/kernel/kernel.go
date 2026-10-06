@@ -200,6 +200,10 @@ type Kernel struct {
 	// restored from a process-free dehydration image. Application memory uses
 	// remotePageLoad so existing distributed-fork controls retain their meaning.
 	auxiliaryRemotePageLoads []*pgalloc.AsyncPagesFileLoad `state:"nosave"`
+	// remoteLoadsMu guards auxiliaryRemotePageLoads, which the destruction of
+	// a peer sharing k's MemoryFile extends while other operations, such as a
+	// live fork of k, read it.
+	remoteLoadsMu sync.Mutex `state:"nosave"`
 
 	// See InitKernelArgs for the meaning of these fields.
 	featureSet           cpuid.FeatureSet
@@ -2541,10 +2545,13 @@ func (k *Kernel) Release() {
 	}
 	k.remoteLoadRanges = nil
 	k.remoteHandoffSnapshot = 0
-	for _, load := range k.auxiliaryRemotePageLoads {
+	k.remoteLoadsMu.Lock()
+	loads := k.auxiliaryRemotePageLoads
+	k.auxiliaryRemotePageLoads = nil
+	k.remoteLoadsMu.Unlock()
+	for _, load := range loads {
 		_ = load.DecOwner()
 	}
-	k.auxiliaryRemotePageLoads = nil
 	k.mf.Destroy()
 	k.RootPIDNamespace().DecRef(ctx)
 	k.rootUserNamespace.DecRef(ctx)

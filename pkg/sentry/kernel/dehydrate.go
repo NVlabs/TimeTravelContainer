@@ -157,6 +157,30 @@ func (d *DehydrationCapture) MemoryFiles() []*pgalloc.MemoryFile {
 	return files
 }
 
+// LendPageLoads gives each of targets an owner reference on each loader d
+// keeps alive. A branch of the Sentry that shares the MemoryFile d was
+// captured from may still have pages to load from those loaders, without
+// owning them, as when it read units an import of d's branch installed: a
+// capture closed with its branch's destruction was their last owner, and
+// stopped them, and every later dehydration of the branch that read them
+// failed, "materializing branch memory before dehydration: context canceled".
+func (d *DehydrationCapture) LendPageLoads(targets ...*Kernel) {
+	if d == nil || d.consumed || len(targets) == 0 {
+		return
+	}
+	snapshots := append([]*pgalloc.RemoteSnapshot(nil), d.reservations...)
+	if d.SparseSnapshot != nil {
+		snapshots = append(snapshots, d.SparseSnapshot)
+	}
+	for _, target := range targets {
+		for _, snapshot := range snapshots {
+			for _, load := range snapshot.LendPageLoads() {
+				target.adoptPageLoad(load)
+			}
+		}
+	}
+}
+
 // Close releases page and owner reservations held by d.
 func (d *DehydrationCapture) Close() error {
 	if d == nil || d.consumed {
@@ -318,6 +342,8 @@ func (d *DehydrationCapture) RetainGraphPageLoads() (bool, error) {
 // ownPageLoad makes k an owner of load, which loads pages k may read, unless it
 // is one already.
 func (k *Kernel) ownPageLoad(load *pgalloc.AsyncPagesFileLoad) {
+	k.remoteLoadsMu.Lock()
+	defer k.remoteLoadsMu.Unlock()
 	if k.remotePageLoad == load || slices.Contains(k.auxiliaryRemotePageLoads, load) {
 		return
 	}
@@ -328,11 +354,15 @@ func (k *Kernel) ownPageLoad(load *pgalloc.AsyncPagesFileLoad) {
 // adoptPageLoad is ownPageLoad for an owner reference the caller already
 // holds, which k takes over.
 func (k *Kernel) adoptPageLoad(load *pgalloc.AsyncPagesFileLoad) {
-	if k.remotePageLoad == load || slices.Contains(k.auxiliaryRemotePageLoads, load) {
-		_ = load.DecOwner()
-		return
+	k.remoteLoadsMu.Lock()
+	owned := k.remotePageLoad == load || slices.Contains(k.auxiliaryRemotePageLoads, load)
+	if !owned {
+		k.auxiliaryRemotePageLoads = append(k.auxiliaryRemotePageLoads, load)
 	}
-	k.auxiliaryRemotePageLoads = append(k.auxiliaryRemotePageLoads, load)
+	k.remoteLoadsMu.Unlock()
+	if owned {
+		_ = load.DecOwner()
+	}
 }
 
 // DurableMetadata returns the process-independent description represented by

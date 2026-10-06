@@ -318,6 +318,8 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 }
 
 func (k *Kernel) distributedForkMemorySources() []*pgalloc.AsyncPagesFileLoad {
+	k.remoteLoadsMu.Lock()
+	defer k.remoteLoadsMu.Unlock()
 	loads := make([]*pgalloc.AsyncPagesFileLoad, 0, 1+len(k.auxiliaryRemotePageLoads))
 	if k.remotePageLoad != nil {
 		loads = append(loads, k.remotePageLoad)
@@ -336,6 +338,12 @@ func (k *Kernel) InheritDistributedForkMemorySources(source *Kernel, packedLoadR
 	if k == nil || source == nil || k == source {
 		return
 	}
+	source.remoteLoadsMu.Lock()
+	sourcePrimary := source.remotePageLoad
+	sourceAuxiliary := append([]*pgalloc.AsyncPagesFileLoad(nil), source.auxiliaryRemotePageLoads...)
+	source.remoteLoadsMu.Unlock()
+	k.remoteLoadsMu.Lock()
+	defer k.remoteLoadsMu.Unlock()
 	has := func(load *pgalloc.AsyncPagesFileLoad) bool {
 		if load == nil || k.remotePageLoad == load {
 			return true
@@ -359,8 +367,8 @@ func (k *Kernel) InheritDistributedForkMemorySources(source *Kernel, packedLoadR
 		}
 		k.auxiliaryRemotePageLoads = append(k.auxiliaryRemotePageLoads, load)
 	}
-	inherit(source.remotePageLoad, true)
-	for _, load := range source.auxiliaryRemotePageLoads {
+	inherit(sourcePrimary, true)
+	for _, load := range sourceAuxiliary {
 		inherit(load, k.remotePageLoad == nil)
 	}
 }
@@ -657,7 +665,10 @@ func (k *Kernel) HandoffDistributedForkMemoryGraph(data *ttcsnapshot.LocalDataSt
 	// supplied by an older family loader. The new transaction cannot become
 	// independent until every inherited loader is either fully resident or has
 	// itself switched to durable graph backing.
-	for _, load := range k.auxiliaryRemotePageLoads {
+	k.remoteLoadsMu.Lock()
+	inherited := append([]*pgalloc.AsyncPagesFileLoad(nil), k.auxiliaryRemotePageLoads...)
+	k.remoteLoadsMu.Unlock()
+	for _, load := range inherited {
 		if load.HasDurableBacking() {
 			continue
 		}
@@ -807,12 +818,18 @@ func (k *Kernel) TransferDistributedForkMemorySources(target *Kernel) {
 	if target == nil || target == k {
 		return
 	}
+	k.remoteLoadsMu.Lock()
+	var loads []*pgalloc.AsyncPagesFileLoad
 	if k.remotePageLoad != nil {
-		target.auxiliaryRemotePageLoads = append(target.auxiliaryRemotePageLoads, k.remotePageLoad)
+		loads = append(loads, k.remotePageLoad)
 		k.remotePageLoad = nil
 	}
-	target.auxiliaryRemotePageLoads = append(target.auxiliaryRemotePageLoads, k.auxiliaryRemotePageLoads...)
+	loads = append(loads, k.auxiliaryRemotePageLoads...)
 	k.auxiliaryRemotePageLoads = nil
+	k.remoteLoadsMu.Unlock()
+	for _, load := range loads {
+		target.adoptPageLoad(load)
+	}
 	k.remoteLoadRanges = nil
 	k.remoteHandoffSnapshot = 0
 }

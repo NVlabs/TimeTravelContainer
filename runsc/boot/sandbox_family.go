@@ -27,6 +27,7 @@ import (
 	"net"
 	"os"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -2906,6 +2907,22 @@ func (f *SandboxFamily) liveLoaderReplacementLocked(exclude string) *sandboxBran
 	return f.branches[ids[0]]
 }
 
+// pageLoadHeirsLocked returns the Kernels of the running and paused branches
+// other than exclude that read one of files, to keep the loaders exclude's
+// capture keeps alive. Each may read pages the loaders have yet to load
+// without owning them; one alone, dehydrated later, would keep only those its
+// own pages need.
+func (f *SandboxFamily) pageLoadHeirsLocked(exclude string, files []*pgalloc.MemoryFile) []*kernel.Kernel {
+	var heirs []*kernel.Kernel
+	for id, b := range f.branches {
+		if id != exclude && b.k != nil && (b.state == BranchRunning || b.state == BranchPaused) &&
+			slices.Contains(files, b.k.MemoryFile()) {
+			heirs = append(heirs, b.k)
+		}
+	}
+	return heirs
+}
+
 // PrepareStop transfers the Loader bookkeeping role away from id when another
 // branch will survive. Branch ancestry and visible names are unaffected.
 func (f *SandboxFamily) PrepareStop(id string) error {
@@ -3053,12 +3070,19 @@ func (f *SandboxFamily) destroy(id string, reclaimFilesystem bool) error {
 	b.opMu.Unlock()
 	if image != nil {
 		// A capture keeps loading what its branch had not read of the image
-		// it was restored from, and closing it stops that loader. Free the
+		// it was restored from, and closing it stops that loader unless the
+		// live peers still reading the same MemoryFile keep it, as one takes
+		// a live branch's loaders below: a peer may read pages the loader
+		// has yet to load without being one of its owners. Free the
 		// chunks only the capture used, as a live branch's destruction does
 		// below: a later restore of the same image into the family would
 		// otherwise reuse them, waiting on the stopped loader for pages it
 		// never loaded.
 		files := image.image.MemoryFiles()
+		f.mu.Lock()
+		heirs := f.pageLoadHeirsLocked(id, files)
+		f.mu.Unlock()
+		image.image.LendPageLoads(heirs...)
 		err := image.image.Close()
 		for _, mf := range files {
 			mf.ReclaimUnusedSparseChunks()

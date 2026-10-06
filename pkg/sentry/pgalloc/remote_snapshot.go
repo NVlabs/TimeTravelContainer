@@ -378,6 +378,28 @@ func (s *RemoteSnapshot) RetainPageLoads(loads []*AsyncPagesFileLoad) error {
 	return nil
 }
 
+// LendPageLoads returns the upstream loaders s keeps alive, each with an
+// owner reference of the caller's, for a Kernel that reads s's pages still
+// loading, as one sharing the MemoryFile s was captured from may, to keep them
+// alive once s is closed.
+func (s *RemoteSnapshot) LendPageLoads() []*AsyncPagesFileLoad {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
+	loads := make([]*AsyncPagesFileLoad, 0, len(s.shared.pageLoads))
+	for _, load := range s.shared.pageLoads {
+		if load.tryIncOwner() {
+			loads = append(loads, load)
+		}
+	}
+	return loads
+}
+
 // RetainGraphPageLoads keeps s's pages that are still loading readable after
 // the Kernels that loaded them are released, by owning their loaders, if each
 // of those reads an immutable snapshot graph, and reports whether it did. A
