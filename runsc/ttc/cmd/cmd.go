@@ -13911,6 +13911,9 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 	if err != nil {
 		return nil, err
 	}
+	if err := lifecycleStateRefusal(containerInfo, source, logicalSource, "fork", "running", "paused", "dehydrated", "dehydrating"); err != nil {
+		return nil, err
+	}
 	if state := normalizeLifecycleState(sourceRecord.State); state == "dehydrated" || state == "dehydrating" {
 		// A dehydrated branch is forked from its durable image, which a
 		// resident dehydration does not have yet.
@@ -14353,9 +14356,29 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, logicalParent strin
 	return result, nil
 }
 
-func (b *runtimeBackend) pause(target selector) error {
-	resolved, _, err := b.resolveSelector(target)
+// lifecycleStateRefusal refuses verb of the branch that target, as the client
+// named it, resolved to, unless the branch's record calls it one of states.
+// The runtime has no branch that is not live: of one exited or dehydrated it
+// answered that the branch "does not exist", or failed loading the family's
+// runtime, gone with its last live branch, or a node without the family's
+// repositories failed opening them.
+func lifecycleStateRefusal(info ttcbundle.ContainerInfo, resolved, target selector, verb string, states ...string) error {
+	branch, err := persistentBranchInfo(info, resolved.branch)
 	if err != nil {
+		return nil
+	}
+	if state := normalizeLifecycleState(branch.State); !slices.Contains(states, state) {
+		return fmt.Errorf("cannot %s %s: branch is %s", verb, target, state)
+	}
+	return nil
+}
+
+func (b *runtimeBackend) pause(target selector) error {
+	resolved, info, err := b.resolveSelector(target)
+	if err != nil {
+		return err
+	}
+	if err := lifecycleStateRefusal(info, resolved, target, "pause", "running", "paused"); err != nil {
 		return err
 	}
 	target = resolved
@@ -14367,8 +14390,11 @@ func (b *runtimeBackend) pause(target selector) error {
 }
 
 func (b *runtimeBackend) resume(target selector) error {
-	resolved, _, err := b.resolveSelector(target)
+	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
+		return err
+	}
+	if err := lifecycleStateRefusal(info, resolved, target, "resume", "running", "paused"); err != nil {
 		return err
 	}
 	target = resolved

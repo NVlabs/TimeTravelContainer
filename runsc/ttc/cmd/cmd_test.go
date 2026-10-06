@@ -7282,6 +7282,37 @@ func TestAdvanceDehydratedForkPassesOverARetiredFork(t *testing.T) {
 	}
 }
 
+// The runtime has no branch that is not live, and of one exited or
+// dehydrated it answered that the branch "does not exist", or could not load
+// the family's runtime at all. A pause, a resume and a fork are refused by the
+// state the branch's record gives, as an exec is.
+func TestLifecycleStateRefusal(t *testing.T) {
+	info := ttcbundle.ContainerInfo{ID: "physical", Branches: []ttcbundle.BranchInfo{
+		{ID: "live", State: "running"}, {ID: "held", State: "paused"},
+		{ID: "gone", State: "exited"}, {ID: "cold", State: "dehydrated"},
+	}}
+	named := selector{container: "web", branch: "b"}
+	for _, test := range []struct {
+		branch, verb string
+		states       []string
+		refused      bool
+	}{
+		{"live", "pause", []string{"running", "paused"}, false},
+		{"held", "resume", []string{"running", "paused"}, false},
+		{"gone", "pause", []string{"running", "paused"}, true},
+		{"cold", "resume", []string{"running", "paused"}, true},
+		{"cold", "fork", []string{"running", "paused", "dehydrated", "dehydrating"}, false},
+		{"gone", "fork", []string{"running", "paused", "dehydrated", "dehydrating"}, true},
+	} {
+		err := lifecycleStateRefusal(info, selector{container: "physical", branch: test.branch}, named, test.verb, test.states...)
+		if refused := err != nil; refused != test.refused {
+			t.Errorf("%s of a branch %s: %v, want refused %t", test.verb, test.branch, err, test.refused)
+		} else if refused && !strings.Contains(err.Error(), "cannot "+test.verb+" web@b: branch is ") {
+			t.Errorf("%s of a branch %s refused as %q", test.verb, test.branch, err)
+		}
+	}
+}
+
 func TestColdExecConsolePackRoundTrip(t *testing.T) {
 	shared, active := t.TempDir(), t.TempDir()
 	info := ttcbundle.ContainerInfo{ID: "physical", ConsoleLogMaxFiles: 3}
