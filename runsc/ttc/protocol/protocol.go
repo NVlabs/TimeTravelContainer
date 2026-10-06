@@ -8,11 +8,28 @@ package protocol
 import (
 	"strconv"
 	"strings"
+	"time"
 )
 
 // DaemonAPIVersion is the exact native CLI protocol version. Official TTC
 // clients also require an exact build match; SDKs negotiate their own API.
 const DaemonAPIVersion = 10
+
+// StaleRouteRefusal begins a node's answer to a command routed to it by a
+// placement that another command has changed since: it moved the command's
+// branch, unplaced it, or claims it. The node refuses before it runs or
+// journals the command, which may therefore go again under its request ID.
+const StaleRouteRefusal = "ttcd: stale routed command:"
+
+// StaleRouteWait bounds how long a client, or a node that routed a command,
+// sends the command again while nodes refuse it as routed stale.
+const StaleRouteWait = time.Minute
+
+// StaleRouteAnswer reports whether stderr, all that a command's answer wrote
+// there, is a node's refusal of a stale route and nothing else.
+func StaleRouteAnswer(stderr string) bool {
+	return strings.HasPrefix(stderr, StaleRouteRefusal) && strings.Count(stderr, "\n") == 1 && strings.HasSuffix(stderr, "\n")
+}
 
 // CommandUsesTerminalControl reports whether a CLI command can ask the client
 // for terminal mode or size updates. This is part of the wire contract rather

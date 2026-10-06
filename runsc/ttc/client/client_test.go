@@ -214,6 +214,74 @@ func TestDaemonStopRetriesReportedLegacyAPI(t *testing.T) {
 	}
 }
 
+// A node that a command was routed to refuses it, before it runs or
+// journals it, when another command has moved, unplaced or claimed its branch
+// since. The client sends the command again, under its request ID, and gives
+// its caller only the answer that came of it.
+func TestCommandRefusedAsRoutedStaleGoesAgain(t *testing.T) {
+	socket := filepath.Join(shortSocketDir(t), "ttcd.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	requests := make(chan request, 2)
+	serverErr := make(chan error, 1)
+	go func() {
+		for attempt := 0; attempt < 2; attempt++ {
+			conn, err := listener.Accept()
+			if err != nil {
+				serverErr <- err
+				return
+			}
+			header, err := bufio.NewReader(conn).ReadBytes('\n')
+			if err != nil {
+				conn.Close()
+				serverErr <- err
+				return
+			}
+			var req request
+			if err := json.Unmarshal(header, &req); err != nil {
+				conn.Close()
+				serverErr <- err
+				return
+			}
+			requests <- req
+			var writeMu sync.Mutex
+			status := 1
+			if attempt == 0 {
+				err = writeFrame(conn, &writeMu, daemonFrameStderr, []byte("ttcd: stale routed command: branch web@b is unplaced\n"))
+			} else {
+				status = 0
+				err = writeFrame(conn, &writeMu, daemonFrameStdout, []byte("web@b\n"))
+			}
+			var encodedStatus [4]byte
+			binary.BigEndian.PutUint32(encodedStatus[:], uint32(status))
+			if err == nil {
+				err = writeFrame(conn, &writeMu, daemonFrameStatus, encodedStatus[:])
+			}
+			conn.Close()
+			if err != nil {
+				serverErr <- err
+				return
+			}
+		}
+		serverErr <- nil
+	}()
+	var stdout, stderr bytes.Buffer
+	status, err := runCommand(socket, []string{"stop", "web@b"}, strings.NewReader(""), &stdout, &stderr, nil)
+	if err != nil || status != 0 || stdout.String() != "web@b\n" || stderr.Len() != 0 {
+		t.Fatalf("a stop refused once as routed stale: status %d, %v, stdout %q, stderr %q", status, err, stdout.String(), stderr.String())
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+	first, second := <-requests, <-requests
+	if first.RequestID == "" || first.RequestID != second.RequestID {
+		t.Fatalf("the stop went again as request %q, first sent as %q", second.RequestID, first.RequestID)
+	}
+}
+
 func TestReportedDaemonAPIVersion(t *testing.T) {
 	for _, test := range []struct {
 		diagnostic string

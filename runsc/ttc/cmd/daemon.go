@@ -6161,16 +6161,6 @@ func ownerLossRetry(request daemonRequest, automaticPlacement bool, err error, l
 	return true
 }
 
-// staleRouteWait bounds how long a routed command keeps being routed again
-// while its owner refuses it as routed by a placement since changed, as one
-// does while another command moves or claims the branch.
-const staleRouteWait = time.Minute
-
-// staleRouteRefusal begins the owner's answer to a command routed by a
-// placement that another command has changed since. The owner gives it
-// before the command does anything.
-const staleRouteRefusal = "ttcd: stale routed command:"
-
 // staleRouteFilter holds back the first frame of a routed command's answer
 // until it knows whether the answer is the owner's refusal of a stale route:
 // that refusal, and the status after it, it keeps from the client, and
@@ -6218,11 +6208,11 @@ func (f *staleRouteFilter) release() error {
 // staleRouteRetry reports whether a routed command that its owner refused as
 // routed stale goes again, and waits before it: at once the first time, the
 // branch's placement having changed, and then less often, as while another
-// command claims the branch, until staleRouteWait passes.
+// command claims the branch, until protocol.StaleRouteWait passes.
 func staleRouteRetry(retry *ownerLoss) bool {
 	now := time.Now()
 	if retry.deadline.IsZero() {
-		retry.deadline, retry.delay = now.Add(staleRouteWait), 25*time.Millisecond
+		retry.deadline, retry.delay = now.Add(protocol.StaleRouteWait), 25*time.Millisecond
 		return true
 	}
 	if now.After(retry.deadline) {
@@ -6231,12 +6221,6 @@ func staleRouteRetry(retry *ownerLoss) bool {
 	time.Sleep(retry.delay)
 	retry.delay = min(2*retry.delay, time.Second)
 	return true
-}
-
-// staleRouteAnswer reports whether stderr, all a command's answer wrote
-// there, is its owner's refusal of a stale route and nothing else.
-func staleRouteAnswer(stderr string) bool {
-	return strings.HasPrefix(stderr, staleRouteRefusal) && strings.Count(stderr, "\n") == 1 && strings.HasSuffix(stderr, "\n")
 }
 
 // staleRouteFrames reports whether data, the start of a routed command's
@@ -6248,13 +6232,14 @@ func staleRouteFrames(data []byte) (refusal, decided bool) {
 		return false, false
 	}
 	length := int(binary.BigEndian.Uint32(data[1:header]))
-	if data[0] != daemonFrameStderr || length < len(staleRouteRefusal) || length > 4096 {
+	prefix := protocol.StaleRouteRefusal
+	if data[0] != daemonFrameStderr || length < len(prefix) || length > 4096 {
 		return false, true
 	}
-	if len(data) < header+len(staleRouteRefusal) {
+	if len(data) < header+len(prefix) {
 		return false, false
 	}
-	if string(data[header:header+len(staleRouteRefusal)]) != staleRouteRefusal {
+	if string(data[header:header+len(prefix)]) != prefix {
 		return false, true
 	}
 	status := header + length
@@ -8917,7 +8902,7 @@ func runViaDaemon(opts options, args []string, stdin io.Reader, stdout, stderr i
 			// command had moved, unplaced or claimed the branch: a node that
 			// routed it to itself has no hop to route it again. The command
 			// goes again, under its request ID, waiting out the other.
-			if status != 0 && bufferedStdout.Len() == 0 && staleRouteAnswer(bufferedStderr.String()) && staleRouteRetry(&stale) {
+			if status != 0 && bufferedStdout.Len() == 0 && protocol.StaleRouteAnswer(bufferedStderr.String()) && staleRouteRetry(&stale) {
 				attempt--
 				continue
 			}

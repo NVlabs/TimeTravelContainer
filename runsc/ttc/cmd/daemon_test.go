@@ -32,6 +32,7 @@ import (
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
+	"gvisor.dev/gvisor/runsc/ttc/protocol"
 	"gvisor.dev/gvisor/runsc/version"
 )
 
@@ -2540,10 +2541,10 @@ func TestStaleRouteFilter(t *testing.T) {
 		if err := filter.release(); err != nil || !bytes.Equal(client.Bytes(), refusal) {
 			t.Fatalf("in pieces of %d, the refusal released after the last retry: %q, %v", chunk, client.Bytes(), err)
 		}
-		if !staleRouteAnswer("ttcd: stale routed command: branch f@b is unplaced\n") ||
-			staleRouteAnswer("ttcd: cannot pause f@b: branch is exited\n") ||
-			staleRouteAnswer("ttc: warning: x\nttcd: stale routed command: branch f@b is unplaced\n") ||
-			staleRouteAnswer("ttcd: stale routed command: branch f@b is unplaced\nttc: more\n") {
+		if !protocol.StaleRouteAnswer("ttcd: stale routed command: branch f@b is unplaced\n") ||
+			protocol.StaleRouteAnswer("ttcd: cannot pause f@b: branch is exited\n") ||
+			protocol.StaleRouteAnswer("ttc: warning: x\nttcd: stale routed command: branch f@b is unplaced\n") ||
+			protocol.StaleRouteAnswer("ttcd: stale routed command: branch f@b is unplaced\nttc: more\n") {
 			t.Fatal("a client's answer was misjudged as, or not as, a stale route's refusal alone")
 		}
 		for _, answer := range [][]byte{other, output} {

@@ -833,6 +833,8 @@ func runCommand(socket string, args []string, stdin io.Reader, stdout, stderr io
 		attempts = 2
 	}
 	var lastErr error
+	var staleUntil time.Time
+	staleDelay := 25 * time.Millisecond
 	for attempt := 0; attempt < attempts; attempt++ {
 		conn, err := connect(socket)
 		if err != nil {
@@ -850,6 +852,24 @@ func runCommand(socket string, args []string, stdin io.Reader, stdout, stderr io
 			continue
 		}
 		if req.RequestID != "" {
+			// The node that owned the command's branch refused it before it
+			// ran or journaled it, as another command had moved, unplaced or
+			// claimed the branch. It goes again under its request ID, at once
+			// and then less often, waiting out the other command.
+			if status != 0 && bufferedOut.Len() == 0 && protocol.StaleRouteAnswer(bufferedErr.String()) {
+				now := time.Now()
+				if staleUntil.IsZero() {
+					staleUntil = now.Add(protocol.StaleRouteWait)
+					attempt--
+					continue
+				}
+				if now.Before(staleUntil) {
+					time.Sleep(staleDelay)
+					staleDelay = min(2*staleDelay, time.Second)
+					attempt--
+					continue
+				}
+			}
 			_, _ = stdout.Write(bufferedOut.Bytes())
 			_, _ = stderr.Write(bufferedErr.Bytes())
 		}
