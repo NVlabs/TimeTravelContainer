@@ -3321,6 +3321,19 @@ func TestRemovalClaimsAnUnplacedBranchFirst(t *testing.T) {
 	if record, err := placements.Lookup("web", "running"); err != nil || record.Generation != running.Generation || record.State != cluster.PlacementRunning {
 		t.Fatalf("a branch this node runs: placement %+v, %v, want it as it was", record, err)
 	}
+
+	// A node that takes no placement, as a gateway or one draining, cannot
+	// claim the branch, and removes it unclaimed.
+	if _, err := directory.Transition(node.NodeID, node.Incarnation, cluster.NodeDraining, time.Now(), time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	unclaimed := create("unclaimed", "", cluster.PlacementUnplaced, now)
+	if err := backend.claimUnplacedForRemoval("web", "unclaimed", "web", "unclaimed"); err != nil {
+		t.Fatalf("a draining node's removal: %v", err)
+	}
+	if record, err := placements.Lookup("web", "unclaimed"); err != nil || record.Generation != unclaimed.Generation || record.State != cluster.PlacementUnplaced {
+		t.Fatalf("a draining node's removal: placement %+v, %v, want it as it was", record, err)
+	}
 }
 
 // A dehydration of a family's last live branch on a node deletes the

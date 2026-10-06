@@ -11290,6 +11290,13 @@ func (b *runtimeBackend) claimUnplacedForRemoval(familyID, branchID, physicalCon
 			if err != nil {
 				return fmt.Errorf("renewing placement authority to remove %s: %w", target, err)
 			}
+			// A node that takes no placement, a gateway or one draining,
+			// cannot claim the branch, and removes it unclaimed, as before:
+			// a gateway's removal of a dehydrated family was refused, "node
+			// is not accepting placement".
+			if !node.AcceptsPlacement(time.Now()) {
+				return nil
+			}
 			_, claimErr := placements.ClaimUnplaced(familyID, branchID, node.NodeID, node.Incarnation, physicalContainer, physicalBranch, record.Generation, cluster.PlacementMaterializing, time.Now())
 			if claimErr == nil {
 				return nil
