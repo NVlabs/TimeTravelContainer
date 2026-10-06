@@ -578,6 +578,18 @@ func loadRelocatedDistributedFork(p platform.Platform, targetMF *pgalloc.MemoryF
 	if err := references.Commit(); err != nil {
 		return nil, err
 	}
+	// The units the installation reused may still be loading for the owners
+	// that installed them, whose going would stop their loaders: the child,
+	// which reads them too, keeps those loaders, as a sparse dehydrated
+	// branch's restore does. Committing let them go. A branch's dehydration
+	// that its Sentry kept was then its loader's last owner, and dropping it
+	// once it was made durable stopped the loader with pages of units that
+	// imports had reused still to load: no dehydration of theirs could
+	// capture them, "materializing branch memory before dehydration: context
+	// canceled".
+	for _, load := range installation.TakePageLoads() {
+		child.adoptPageLoad(load)
+	}
 	if err := installation.Commit(); err != nil {
 		return nil, err
 	}
