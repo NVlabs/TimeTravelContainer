@@ -2052,6 +2052,63 @@ func TestBranchRemovedDuringAFrozenHandoff(t *testing.T) {
 	}
 }
 
+// A publication hands off whole origins, and the shared ledger takes in every
+// edge of every object of each, so it publishes too what an object only
+// another branch still reaches depends on, before the origin holding it.
+func TestPrepareBranchPublicationTakesInWholeOrigins(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.CreateWithOrigin("whole", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	write := func(ino uint64, data string) {
+		t.Helper()
+		if _, _, err := repository.WriteAt(MainBranch, ino, []byte(data), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fork := func(child string, working, childWorking uint64) {
+		t.Helper()
+		if err := repository.ForkWithOrigins(MainBranch, child, working, childWorking); err != nil {
+			t.Fatal(err)
+		}
+	}
+	file, err := repository.CreateRegular(MainBranch, RootInode, "f", 0600, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(file, "first")
+	fork("keep", 101, 102)
+	// Origin 101 holds the file's second version ...
+	write(file, "other")
+	fork("before", 103, 104)
+	// ... which origin 103, that another file changed, still names ...
+	if _, err := repository.CreateRegular(MainBranch, RootInode, "g", 0600, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	fork("sibling", 105, 106)
+	// ... and main, which changed the file again, no longer reaches.
+	write(file, "third")
+	fork("publish", 107, 108)
+	origins, err := repository.PrepareBranchPublication("publish")
+	if err != nil {
+		t.Fatal(err)
+	}
+	position := make(map[ttcsnapshot.SnapshotID]int, len(origins))
+	for index, origin := range origins {
+		position[origin] = index
+	}
+	for _, origin := range []ttcsnapshot.SnapshotID{101, 103, 105} {
+		if _, ok := position[origin]; !ok {
+			t.Fatalf("publication origins %v omit %d", origins, origin)
+		}
+	}
+	if position[101] > position[103] || position[103] > position[105] {
+		t.Fatalf("publication origins %v hand an origin off before one it depends on", origins)
+	}
+}
+
 func TestBranchDiffDuringOriginHandoff(t *testing.T) {
 	manager := openTestManager(t)
 	repository, err := manager.CreateWithOrigin("diff-handoff", 100)
@@ -2141,8 +2198,10 @@ func TestOriginDependenciesIncludeNewerCrossOriginChildren(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(prepared) != 2 || prepared[0] != 100 || prepared[1] != 101 {
-		t.Fatalf("PrepareRetirementPublication()=%v, want [100 101]", prepared)
+	// The dependency goes first, though no branch reaches the object that
+	// depends on it: the origin is handed off whole.
+	if len(prepared) != 2 || prepared[0] != 101 || prepared[1] != 100 {
+		t.Fatalf("PrepareRetirementPublication()=%v, want [101 100]", prepared)
 	}
 	for _, origin := range prepared {
 		snapshot, ok := repository.graph.Snapshot(origin)

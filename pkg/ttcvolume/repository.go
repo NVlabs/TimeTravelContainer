@@ -669,6 +669,68 @@ func (r *Repository) prepareBranchPublication(branchID string, byReference bool)
 				}
 			}
 		}
+		// An origin is handed off whole, and the shared ledger takes in every
+		// edge of every object of it, not only of those the published root
+		// reaches. An object that another branch still reached, and this one
+		// no longer did, led into an origin the walk above never saw, which
+		// stayed the provider's: the handoff needed a bridge into it that a
+		// filesystem's provider cannot hold, and the publication retried for
+		// good, its origin frozen, "root object ... cannot be retained".
+		pending := make([]ttcsnapshot.SnapshotID, 0, len(wanted))
+		for origin := range wanted {
+			pending = append(pending, origin)
+		}
+		sort.Slice(pending, func(i, j int) bool { return pending[i] < pending[j] })
+		for len(pending) != 0 {
+			origin := pending[0]
+			pending = pending[1:]
+			children, err := r.OriginDependencies(origin)
+			if err != nil {
+				return fmt.Errorf("reading filesystem snapshot origin %d dependencies: %w", origin, err)
+			}
+			for _, child := range children {
+				if _, mirror := mirrors[child]; mirror {
+					continue
+				}
+				snapshot, ok := r.graph.Snapshot(child)
+				if !ok {
+					// A deferred object's foreign source, which publication
+					// path-compresses through the shared or peer source.
+					continue
+				}
+				if dependencies[origin] == nil {
+					dependencies[origin] = make(map[ttcsnapshot.SnapshotID]struct{})
+				}
+				dependencies[origin][child] = struct{}{}
+				if _, ok := wanted[child]; ok {
+					continue
+				}
+				switch snapshot.State {
+				case ttcsnapshot.SnapshotSealedVolatile:
+				case ttcsnapshot.SnapshotWorking:
+					// A lazy catalog, as the walk above seals, but not an
+					// origin a branch still writes.
+					writer, err := r.branchWritingOriginLocked(child)
+					if err != nil {
+						return err
+					}
+					if writer != "" {
+						return fmt.Errorf("filesystem origin %d references origin %d, which branch %q still writes", origin, child, writer)
+					}
+					if err := r.graph.Seal(child, ttcsnapshot.SnapshotSealedVolatile); err != nil {
+						return fmt.Errorf("sealing filesystem catalog origin %d: %w", child, err)
+					}
+				case ttcsnapshot.SnapshotShared:
+					continue
+				case ttcsnapshot.SnapshotSealedLocal:
+					return fmt.Errorf("cluster publication reached standalone origin %d", child)
+				default:
+					return fmt.Errorf("filesystem graph origin %d is %s", child, snapshot.State)
+				}
+				wanted[child] = struct{}{}
+				pending = append(pending, child)
+			}
+		}
 		// Handoff dependencies before their parents. Otherwise importing a
 		// parent into the shared ledger may need to retain a child that is still
 		// provider-owned, forcing a transient cross-store bridge and deadlocking
@@ -731,6 +793,36 @@ func (r *Repository) MarkBranchPublished(branchID string) error {
 		branch.RemoteInherited = false
 		return r.writeBranch(branch)
 	})
+}
+
+// branchWritingOriginLocked returns a branch of r whose writable origin is
+// origin, or "" if none is.
+//
+// Preconditions: Repository.withLock is held.
+func (r *Repository) branchWritingOriginLocked(origin ttcsnapshot.SnapshotID) (string, error) {
+	directory, err := r.openFile("branches", os.O_RDONLY|unix.O_DIRECTORY, 0)
+	if err != nil {
+		return "", err
+	}
+	entries, readErr := directory.ReadDir(-1)
+	closeErr := directory.Close()
+	if readErr != nil || closeErr != nil {
+		return "", errors.Join(readErr, closeErr)
+	}
+	for _, entry := range entries {
+		id, ok := strings.CutSuffix(entry.Name(), ".json")
+		if entry.IsDir() || !ok || validateName(id, "branch") != nil {
+			continue
+		}
+		branch, err := r.readBranch(id)
+		if err != nil {
+			return "", err
+		}
+		if ttcsnapshot.SnapshotID(branch.WorkingSnapshot) == origin {
+			return id, nil
+		}
+	}
+	return "", nil
 }
 
 // sharedCatalogOriginsLocked returns the origins of the catalogs by which
