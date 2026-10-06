@@ -1497,6 +1497,30 @@ func TestLifecycleCommandAcceptsState(t *testing.T) {
 	}
 }
 
+// Nor does a start that its peers on the node refuse.
+func TestLifecycleCommandAcceptsBranch(t *testing.T) {
+	target := ttcbundle.BranchInfo{ID: "target", NodeID: "node-a", State: "exited"}
+	for _, test := range []struct {
+		command string
+		peer    ttcbundle.BranchInfo
+		accepts bool
+	}{
+		{command: "start", peer: ttcbundle.BranchInfo{ID: "peer", NodeID: "node-a", State: "running"}, accepts: true},
+		{command: "start", peer: ttcbundle.BranchInfo{ID: "peer", NodeID: "node-a", State: "dehydrating"}, accepts: true},
+		{command: "start", peer: ttcbundle.BranchInfo{ID: "peer", NodeID: "node-a", State: "rehydrating"}},
+		{command: "start", peer: ttcbundle.BranchInfo{ID: "peer", NodeID: "node-b", State: "rehydrating"}, accepts: true},
+		{command: "restart", peer: ttcbundle.BranchInfo{ID: "peer", NodeID: "node-a", State: "rehydrating"}, accepts: true},
+	} {
+		info := ttcbundle.ContainerInfo{ID: "web", Branches: []ttcbundle.BranchInfo{target, test.peer}}
+		if got := lifecycleCommandAcceptsBranch(test.command, info, target, "node-a"); got != test.accepts {
+			t.Errorf("%s beside a %s peer on %s accepted=%t, want %t", test.command, test.peer.State, test.peer.NodeID, got, test.accepts)
+		}
+	}
+	if lifecycleCommandAcceptsBranch("start", ttcbundle.ContainerInfo{ID: "web", Branches: []ttcbundle.BranchInfo{{ID: "target", State: "dehydrated"}}}, ttcbundle.BranchInfo{ID: "target", State: "dehydrated"}, "node-a") {
+		t.Error("a start of a dehydrated branch was accepted")
+	}
+}
+
 func TestClaimUnplacedLifecycleTargetRecordsSelectedNode(t *testing.T) {
 	root := t.TempDir()
 	local := t.TempDir()

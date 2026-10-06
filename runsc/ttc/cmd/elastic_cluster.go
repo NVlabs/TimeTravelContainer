@@ -2337,7 +2337,7 @@ func (s *daemonServer) claimLifecycleTargets(backend *runtimeBackend, args []str
 		// of a dehydrated branch, refused, left the branch materializing,
 		// which every command but a rehydration, a start or a removal then
 		// refused.
-		if admit && !lifecycleCommandAcceptsState(args[0], branch.State) {
+		if admit && !lifecycleCommandAcceptsBranch(args[0], info, branch, node.NodeID) {
 			continue
 		}
 		claimed, err := placements.ClaimUnplaced(familyID, target.branch, node.NodeID, node.Incarnation, info.ID, resolved.branch, record.Generation, cluster.PlacementMaterializing, time.Now())
@@ -2378,6 +2378,21 @@ func lifecycleCommandAcceptsState(command, state string) bool {
 		return false
 	case "rehydrate":
 		return normalizeLifecycleState(state) == "dehydrated"
+	}
+	return true
+}
+
+// lifecycleCommandAcceptsBranch is lifecycleCommandAcceptsState for branch of
+// info, which a start also refuses by its peers on node nodeID: one refused so
+// once it had claimed the branch left it materializing, and every other
+// command of the branch waited 90 s for the claim and was refused.
+func lifecycleCommandAcceptsBranch(command string, info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, nodeID string) bool {
+	if !lifecycleCommandAcceptsState(command, branch.State) {
+		return false
+	}
+	if command == "start" {
+		_, err := freshStartPeers(info, selector{container: info.ID, branch: branch.ID}, nodeID)
+		return err == nil
 	}
 	return true
 }
