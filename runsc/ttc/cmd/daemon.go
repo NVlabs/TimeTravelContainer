@@ -3135,7 +3135,7 @@ func drainSourceDependency(backend *runtimeBackend, source *distributedSourceRun
 			current *cluster.Transaction
 			stepErr error
 		)
-		previousState := tx.State
+		previousState, previousRevision := tx.State, tx.Revision
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		switch tx.State {
 		case cluster.TransactionPublished:
@@ -3166,7 +3166,11 @@ func drainSourceDependency(backend *runtimeBackend, source *distributedSourceRun
 			if tx.State == cluster.TransactionCanceled || tx.State == cluster.TransactionFailed {
 				return fmt.Errorf("distributed target %q became %s while draining: %s", tx.Identity.TargetContainer, tx.State, tx.Failure)
 			}
-			if distributedDrainStepAdvanced(previousState, tx.State) {
+			// The transaction changed meanwhile without advancing, and the
+			// step met a revision it no longer has: a dehydration failed so,
+			// "transaction is published revision 7, want published revision
+			// 6". The step goes again from the revision read.
+			if distributedDrainStepAdvanced(previousState, tx.State) || tx.Revision != previousRevision {
 				continue
 			}
 			if !distributedDrainRetryable(stepErr) {
