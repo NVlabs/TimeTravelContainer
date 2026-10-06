@@ -4473,6 +4473,55 @@ func (b *runtimeBackend) removeUnrecordedMigratedSourceRuntime(containerID, bran
 	return b.containerStore().RemoveActiveContainerState(containerID)
 }
 
+// releaseCanceledImport takes a canceled import, which its family's record
+// never listed, out of the family's Sentry on this node. That Sentry runs the
+// family's other branches here, and the node-local state beside it holds
+// their filesystems: only the import's own branch goes, and the Sentry with it
+// only if the import is all it runs. The node-local state is left to the
+// cancel's removeLocalFamilyStateIfUnowned, which keeps what a branch still
+// needs. Released as a migrated source's private runtime, the Sentry and the
+// state went whenever the record named no live branch on the node: a cancel
+// deleted both while a stop of the Sentry's last branch sealed the branch's
+// filesystem in that state. The stop failed, the branch was lost, and the
+// seal made the state's repository again, which every later import of the
+// family on the node refused.
+func (b *runtimeBackend) releaseCanceledImport(containerID, branchID string) error {
+	runtimes, err := b.listRuntimeFamiliesOf(containerID)
+	if err != nil {
+		return fmt.Errorf("listing the runtime of canceled import %s@%s: %w", containerID, branchID, err)
+	}
+	for _, family := range runtimes {
+		if family.ID != containerID {
+			continue
+		}
+		present, onlyBranch := runtimeFamilyBranchDisposition(family, branchID)
+		switch {
+		case !present && family.branchesUnknown() && !runtimeFamilyUnavailable(family):
+			// A Sentry that cannot list its branches is left for the cancel's
+			// retry: it may run the import, and others.
+			return fmt.Errorf("inspecting the runtime of canceled import %s@%s: %s", containerID, branchID, family.Error)
+		case !present:
+			return nil
+		case !onlyBranch:
+			if _, err := b.command("timetravel", containerID, "destroy", branchID); err != nil {
+				return fmt.Errorf("destroying canceled import %s@%s: %w", containerID, branchID, err)
+			}
+			return nil
+		}
+		// The Sentry was made for the import, unless an operation of the
+		// family's has taken its other branches out of it meanwhile, as a
+		// dehydration does before its capture is durable.
+		if _, busy := b.operations.lookup(containerID); busy {
+			return fmt.Errorf("the runtime of canceled import %s@%s is busy", containerID, branchID)
+		}
+		if _, err := b.command("delete", "--force", containerID); err != nil {
+			return fmt.Errorf("deleting the runtime of canceled import %s@%s: %w", containerID, branchID, err)
+		}
+		return nil
+	}
+	return nil
+}
+
 // removeMigratedSourceMetadata drops the retired physical incarnation after
 // its sparse consumers have become independent. Logical identity and current
 // placement live in the authority; retaining this record would leak one branch, one

@@ -1933,11 +1933,15 @@ func (r *daemonTargetRuntime) Cancel(_ context.Context, tx *cluster.Transaction)
 		}
 		if peer {
 			// Preparation can fail before a target Sentry exists. The
-			// runtime-only release helper is idempotent in that case. It also
-			// handles a pending import that is the only physical branch in this
-			// node's Sentry, where DestroyBranch deliberately rejects removal
-			// of the last branch.
-			if destroyErr := r.backend.releaseMigratedSourceRuntime(info.ID, branch.ID); destroyErr != nil {
+			// runtime-only release helpers are idempotent in that case. They
+			// also handle a pending import that is the only physical branch in
+			// this node's Sentry, where DestroyBranch deliberately rejects
+			// removal of the last branch.
+			release := r.backend.releaseMigratedSourceRuntime
+			if !slices.ContainsFunc(info.Branches, func(recorded ttcbundle.BranchInfo) bool { return recorded.ID == branch.ID }) {
+				release = r.backend.releaseCanceledImport
+			}
+			if destroyErr := release(info.ID, branch.ID); destroyErr != nil {
 				return fmt.Errorf("destroying canceled distributed target branch %q: %w", branch.ID, destroyErr)
 			}
 		} else {

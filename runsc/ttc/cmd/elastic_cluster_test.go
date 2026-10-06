@@ -3091,3 +3091,106 @@ func TestSentryRunsChecksTheCommandLine(t *testing.T) {
 		t.Fatal("a process that is no Sentry was taken for one")
 	}
 }
+
+// fakeImportRuntime writes a runsc whose family's runtime the file "$0.mode"
+// describes, and that records each command it runs in "$0.calls".
+func fakeImportRuntime(t *testing.T) string {
+	t.Helper()
+	runsc := filepath.Join(t.TempDir(), "runsc")
+	script := `#!/bin/sh
+shift 2
+echo "$*" >>"$0.calls"
+case "$1" in
+list)
+	case "$(cat "$0.mode")" in
+	absent) echo '[]' ;;
+	dead) echo '[{"id":"family","pid":2147483647,"status":"running"}]' ;;
+	*) printf '[{"id":"family","pid":%s,"status":"running"}]\n' "$PPID" ;;
+	esac
+	exit 0 ;;
+timetravel)
+	[ "$3" = "branches" ] || exit 0
+	case "$(cat "$0.mode")" in
+	beside) echo '[{"ID":"main","State":"running"},{"ID":"fork-import","State":"paused"}]' ;;
+	elsewhere) echo '[{"ID":"main","State":"exited"}]' ;;
+	alone|busy) echo '[{"ID":"fork-import","State":"paused"}]' ;;
+	*) echo "control server unavailable" >&2; exit 1 ;;
+	esac
+	exit 0 ;;
+delete) exit 0 ;;
+esac
+exit 2
+`
+	if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	return runsc
+}
+
+// fakeImportRuntimeChanges returns the commands besides listings that the
+// fake runsc ran in mode.
+func fakeImportRuntimeChanges(t *testing.T, runsc, mode string, run func() error) ([]string, error) {
+	t.Helper()
+	if err := os.WriteFile(runsc+".mode", []byte(mode+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Remove(runsc + ".calls")
+	err := run()
+	calls, readErr := os.ReadFile(runsc + ".calls")
+	if readErr != nil && !os.IsNotExist(readErr) {
+		t.Fatal(readErr)
+	}
+	var changes []string
+	for _, call := range strings.Split(strings.TrimSpace(string(calls)), "\n") {
+		if call != "" && !strings.HasPrefix(call, "list ") && !strings.HasSuffix(call, " branches") {
+			changes = append(changes, call)
+		}
+	}
+	return changes, err
+}
+
+// A canceled import, which its family's record never listed, goes from its
+// family's Sentry on the node alone. The Sentry runs the family's other
+// branches there: a cancel that took it for the import's own deleted it, and
+// the node-local state beside it, while a stop of its last branch used both.
+func TestReleaseCanceledImportTakesOnlyItsBranch(t *testing.T) {
+	runsc := fakeImportRuntime(t)
+	operations := &familyOperations{}
+	b := &runtimeBackend{root: "/runtime", runsc: runsc, operations: operations}
+	dehydration := &familyOperation{id: "family", name: "family", longOperation: longOperation{branch: "main", state: "dehydrating", shown: true}}
+	if err := operations.begin(dehydration); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		mode    string
+		changes []string
+		failure string
+	}{
+		{mode: "beside", changes: []string{"timetravel family destroy fork-import"}},
+		{mode: "elsewhere"},
+		{mode: "absent"},
+		{mode: "dead"},
+		{mode: "unknown", failure: "control server unavailable"},
+		{mode: "busy", failure: "is busy"},
+	} {
+		changes, err := fakeImportRuntimeChanges(t, runsc, test.mode, func() error {
+			return b.releaseCanceledImport("family", "fork-import")
+		})
+		if test.failure == "" && err != nil {
+			t.Errorf("%s: %v", test.mode, err)
+		}
+		if test.failure != "" && (err == nil || !strings.Contains(err.Error(), test.failure)) {
+			t.Errorf("%s: %v, want %q", test.mode, err, test.failure)
+		}
+		if strings.Join(changes, "; ") != strings.Join(test.changes, "; ") {
+			t.Errorf("%s: ran %q, want %q", test.mode, changes, test.changes)
+		}
+	}
+	operations.end(dehydration)
+	changes, err := fakeImportRuntimeChanges(t, runsc, "alone", func() error {
+		return b.releaseCanceledImport("family", "fork-import")
+	})
+	if err != nil || strings.Join(changes, "; ") != "delete --force family" {
+		t.Errorf("alone: ran %q, %v; want the runtime made for the import deleted", changes, err)
+	}
+}
