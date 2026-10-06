@@ -3988,6 +3988,9 @@ func TestFreshStartPeers(t *testing.T) {
 		{ID: "a-paused", State: "paused"},
 		{ID: "cold", State: "dehydrated"},
 		{ID: "old", State: "stopped"},
+		// A corrupted branch, which only rm is left to, refused every
+		// start of its runtime's other branches.
+		{ID: "lost", State: "corrupted"},
 	}}
 	got, err := freshStartPeers(info, selector{container: "demo", branch: "target"}, "")
 	if err != nil {

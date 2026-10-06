@@ -8487,6 +8487,10 @@ func freshStartPeers(info ttcbundle.ContainerInfo, target selector, localNodeID 
 		case "running", "paused":
 			peers = append(peers, selector{container: target.container, branch: branch.ID})
 		case "created", "dehydrated", "exited", "failed", "dead":
+		case "corrupted":
+			// Only removal is left to a corrupted branch: its runtime is
+			// lost, or fenced to be. It refused every start in its family
+			// as a peer of unknown state.
 		case "creating", "dehydrating", "rehydrating", "restarting":
 			return nil, fmt.Errorf("cannot start %s while peer %s@%s is %s", target, target.container, branch.ID, normalizeLifecycleState(branch.State))
 		default:
@@ -11322,6 +11326,23 @@ func (b *runtimeBackend) removeCorruptedBranch(target selector) error {
 		}
 	} else if !errors.Is(loadErr, os.ErrNotExist) {
 		return loadErr
+	}
+	// A branch of a remote fork's is recorded in its physical runtime's
+	// record, where it stayed corrupted after its removal: a peer of unknown
+	// state, it refused every start of the runtime's other branches.
+	if physical := removed.PhysicalContainer; physical != "" && physical != target.container {
+		physicalBranch := removed.PhysicalBranch
+		if physicalBranch == "" {
+			physicalBranch = target.branch
+		}
+		info, loadErr := shared.LoadRuntimeContainer(physical)
+		if loadErr == nil && len(info.Branches) > 1 && slices.ContainsFunc(info.Branches, func(branch ttcbundle.BranchInfo) bool { return branch.ID == physicalBranch }) {
+			if err := shared.RemoveBranchRecord(info.ID, physicalBranch); err != nil {
+				return fmt.Errorf("removing physical branch metadata for %s: %w", target, err)
+			}
+		} else if loadErr != nil && !errors.Is(loadErr, os.ErrNotExist) {
+			return loadErr
+		}
 	}
 	_, err = b.reconcileVolatileSnapshotOrigins()
 	return err
