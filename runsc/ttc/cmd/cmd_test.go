@@ -5225,19 +5225,32 @@ if [ "$1" != "--root" ] || [ "$2" != "/runtime" ]; then
 fi
 if [ "$3" = "list" ]; then
 	case "$(cat "$0.mode")" in
-	stopped) printf '[{"id":"web","pid":%s,"status":"stopped"}]\n' "$PPID" ;;
-	running) printf '[{"id":"web","pid":%s,"status":"running"}]\n' "$PPID" ;;
+	stopped|loader-exited|unknown) printf '[{"id":"web","pid":%s,"status":"stopped"}]\n' "$PPID" ;;
+	running|dehydrated) printf '[{"id":"web","pid":%s,"status":"running"}]\n' "$PPID" ;;
 	stale) echo '[{"id":"web","pid":2147483647,"status":"running"}]' ;;
 	transition)
 		count=$(cat "$0.transition")
 		if [ "$count" -lt 2 ]; then
 			echo $((count + 1)) >"$0.transition"
+			echo running >"$0.last"
 			printf '[{"id":"web","pid":%s,"status":"running"}]\n' "$PPID"
 		else
+			echo exited >"$0.last"
 			printf '[{"id":"web","pid":%s,"status":"stopped"}]\n' "$PPID"
 		fi
 		;;
 	absent) echo '[]' ;;
+	esac
+	exit 0
+fi
+if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "branches" ]; then
+	case "$(cat "$0.mode")" in
+	stopped) echo '[{"ID":"main","State":"exited"}]' ;;
+	running) echo '[{"ID":"main","State":"running"}]' ;;
+	dehydrated) echo '[{"ID":"main","State":"dehydrated"}]' ;;
+	loader-exited) echo '[{"ID":"main","State":"exited"},{"ID":"peer","State":"running"}]' ;;
+	transition) printf '[{"ID":"main","State":"%s"}]\n' "$(cat "$0.last")" ;;
+	*) echo "control server unavailable" >&2; exit 1 ;;
 	esac
 	exit 0
 fi
@@ -5296,6 +5309,39 @@ exit 2
 	}
 	if _, err := os.Stat(runsc + ".deleted"); err != nil {
 		t.Errorf("transitioned runtime was not deleted: %v", err)
+	}
+	if err := os.Remove(runsc + ".deleted"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The runtime's state is its loader branch's. A runtime whose loader
+	// exited runs its other branches still, and one whose loader is
+	// dehydrated, whose capture the start has made durable, runs none.
+	for _, test := range []struct {
+		mode    string
+		deleted bool
+		refusal string
+	}{
+		{mode: "loader-exited", refusal: `still runs branch "peer"`},
+		{mode: "dehydrated", deleted: true},
+		// A live Sentry that cannot list its branches may run any.
+		{mode: "unknown", refusal: "already exited"},
+	} {
+		if err := os.WriteFile(runsc+".mode", []byte(test.mode+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		err := b.removeStoppedRuntime("web", false)
+		if test.refusal == "" && err != nil {
+			t.Errorf("removeStoppedRuntime(%s): %v", test.mode, err)
+		}
+		if test.refusal != "" && (err == nil || !strings.Contains(err.Error(), test.refusal)) {
+			t.Errorf("removeStoppedRuntime(%s)=%v, want %q", test.mode, err, test.refusal)
+		}
+		_, statErr := os.Stat(runsc + ".deleted")
+		if deleted := statErr == nil; deleted != test.deleted {
+			t.Errorf("removeStoppedRuntime(%s) deleted the runtime: %t, want %t", test.mode, deleted, test.deleted)
+		}
+		_ = os.Remove(runsc + ".deleted")
 	}
 }
 

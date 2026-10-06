@@ -8844,14 +8844,22 @@ func (b *runtimeBackend) removeStoppedRuntime(name string, waitForTeardown bool)
 				continue
 			}
 			found = true
-			if family.State == "stopped" || family.State == "exited" || runtimeFamilyUnavailable(family) {
+			// The runtime's state is its loader branch's: it was "exited"
+			// while another branch of its ran, which went with it, and
+			// "dehydrated" while it ran none, and a start waited for it to stop
+			// and was refused. Its branches say whether it runs.
+			live := runtimeFamilyLiveBranch(family)
+			if live == "" || runtimeFamilyUnavailable(family) {
 				if _, err := b.command("delete", "--force", name); err != nil {
 					return fmt.Errorf("deleting unavailable runtime container %q: %w", name, err)
 				}
 				return nil
 			}
 			if !waitForTeardown || time.Now().After(deadline) {
-				return fmt.Errorf("container %q is already %s", name, family.State)
+				if live == defaultBranchID || family.Error != "" {
+					return fmt.Errorf("container %q is already %s", name, family.State)
+				}
+				return fmt.Errorf("container %q still runs branch %q", name, live)
 			}
 			break
 		}
@@ -13246,6 +13254,23 @@ func visiblePhysicalRuntimeBranches(branches []Branch, placements []cluster.Plac
 // alive; the process-liveness check is the second required signal.
 func runtimeFamilyUnavailable(family Family) bool {
 	return family.Error != "" && !processutil.IsRunning(family.SandboxPID)
+}
+
+// runtimeFamilyLiveBranch names a branch that a runtime runs, or may run: one
+// that could not list its branches may run any. It is "" for a runtime whose
+// branches have all exited, dehydrated or failed.
+func runtimeFamilyLiveBranch(family Family) string {
+	if family.Error != "" {
+		return defaultBranchID
+	}
+	for _, branch := range family.Branches {
+		switch normalizeLifecycleState(branch.State) {
+		case "exited", "dehydrated", "failed":
+		default:
+			return branch.ID
+		}
+	}
+	return ""
 }
 
 func persistentBranchRequiredRuntime(container ttcbundle.ContainerInfo, branchID string) bool {
