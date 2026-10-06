@@ -557,6 +557,60 @@ func TestCaptureWaitsForTheGateWithoutTheLifecycleLock(t *testing.T) {
 	}
 }
 
+// A command making branches in a runtime releases it, and waits for the
+// branches being made there, as if its own were not: a fork of a dehydrated
+// branch, making its children, found the runtime idle and waited for its own
+// children, holding the family's lifecycle lock.
+func TestReleaseAndMakingLeaveOutTheCallersOwnBranches(t *testing.T) {
+	var operations familyOperations
+	made := operations.beginMaking("web", "child")
+	if _, ok := operations.beginRelease("web"); ok {
+		t.Fatal("a runtime another command makes a branch in was released")
+	}
+	release, ok := operations.beginRelease("web", "child")
+	if !ok {
+		t.Fatal("a command's own branches kept it from releasing the runtime")
+	}
+	release()
+	waited := make(chan struct{})
+	go func() {
+		operations.waitMadeIn("web", "child")
+		close(waited)
+	}()
+	select {
+	case <-waited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a command waited for its own branches to be made")
+	}
+	other := operations.beginMaking("web", "other")
+	if _, ok := operations.beginRelease("web", "child"); ok {
+		t.Fatal("a runtime another command makes a branch in was released")
+	}
+	waited = make(chan struct{})
+	go func() {
+		operations.waitMadeIn("web", "child")
+		close(waited)
+	}()
+	select {
+	case <-waited:
+		t.Fatal("waitMadeIn returned while another command made a branch")
+	case <-time.After(50 * time.Millisecond):
+	}
+	other()
+	select {
+	case <-waited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("waitMadeIn did not return once the other branch was made")
+	}
+	// Another command making a branch of the same name keeps the runtime.
+	same := operations.beginMaking("web", "child")
+	if _, ok := operations.beginRelease("web", "child"); ok {
+		t.Fatal("a runtime another command makes the same branch in was released")
+	}
+	same()
+	made()
+}
+
 // A runtime a command is making a branch in is not released, and a command
 // making a branch in a runtime being released waits for the release: a remote
 // fork imports its branch into the family's Sentry on the node without the

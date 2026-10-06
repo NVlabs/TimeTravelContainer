@@ -174,11 +174,13 @@ func (o *familyOperations) beginMaking(runtime string, branches ...string) func(
 	}
 }
 
-// makingInLocked reports whether a command is making a branch of runtime.
-func (o *familyOperations) makingInLocked(runtime string) bool {
+// makingInLocked reports whether a command is making a branch of runtime,
+// other than the branches own, which the caller is making itself.
+func (o *familyOperations) makingInLocked(runtime string, own ...string) bool {
 	prefix := runtime + "\x00"
-	for key := range o.making {
-		if strings.HasPrefix(key, prefix) {
+	for key, count := range o.making {
+		branch, ok := strings.CutPrefix(key, prefix)
+		if ok && (count > 1 || !slices.Contains(own, branch)) {
 			return true
 		}
 	}
@@ -187,14 +189,16 @@ func (o *familyOperations) makingInLocked(runtime string) bool {
 
 // beginRelease marks runtime as being released until the returned function is
 // called, unless a command is making a branch in it, when it reports false
-// and the runtime must be kept.
-func (o *familyOperations) beginRelease(runtime string) (func(), bool) {
+// and the runtime must be kept. own are the branches the caller is making in
+// runtime itself, which do not keep it: a fork of a dehydrated branch, making
+// its children, releases the idle runtime it would have restored them beside.
+func (o *familyOperations) beginRelease(runtime string, own ...string) (func(), bool) {
 	if o == nil {
 		return func() {}, true
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if o.makingInLocked(runtime) {
+	if o.makingInLocked(runtime, own...) {
 		return nil, false
 	}
 	if o.releasing == nil {
@@ -214,14 +218,15 @@ func (o *familyOperations) beginRelease(runtime string) (func(), bool) {
 	}, true
 }
 
-// waitMadeIn blocks until no command is making a branch of runtime.
-func (o *familyOperations) waitMadeIn(runtime string) {
+// waitMadeIn blocks until no command is making a branch of runtime, but the
+// branches own the caller is making itself, which it would wait for forever.
+func (o *familyOperations) waitMadeIn(runtime string, own ...string) {
 	if o == nil {
 		return
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	for o.makingInLocked(runtime) {
+	for o.makingInLocked(runtime, own...) {
 		o.condLocked().Wait()
 	}
 }

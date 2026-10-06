@@ -14363,8 +14363,8 @@ var durableRestorePeerWait = 5 * time.Second
 // does not keep the branch's runtime from being made. A Sentry that runs but
 // could not list its branches, as a loaded one may not at once, runs them
 // still: a fork took it for such a shell and deleted it, with every branch it
-// ran.
-func (b *runtimeBackend) durableRestorePeer(containerID string) (bool, error) {
+// ran. own are the branches the caller is making in the runtime itself.
+func (b *runtimeBackend) durableRestorePeer(containerID string, own ...string) (bool, error) {
 	deadline := time.Now().Add(durableRestorePeerWait)
 	for {
 		runtimes, err := b.listRuntimeFamiliesOf(containerID)
@@ -14389,14 +14389,14 @@ func (b *runtimeBackend) durableRestorePeer(containerID string) (bool, error) {
 			// dehydration restore". It goes as a release would take it, its
 			// captures made durable first, unless a remote fork is making a
 			// branch in it, which the restore waits for.
-			released, err := b.releaseIdleRuntime(containerID)
+			released, err := b.releaseIdleRuntime(containerID, own...)
 			if err != nil {
 				return false, err
 			}
 			if released {
 				return false, nil
 			}
-			b.operations.waitMadeIn(containerID)
+			b.operations.waitMadeIn(containerID, own...)
 			continue
 		case runtimeFamilyUnavailable(*runtime):
 			_, _ = b.command("delete", "--force", containerID)
@@ -14590,7 +14590,11 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, logicalParent strin
 		}
 	}
 
-	peer, err := b.durableRestorePeer(info.ID)
+	// The fork is making its children in the runtime (forkMany): the runtime
+	// is not kept for them, which it does not run yet. Waiting for them, a
+	// fork that found the runtime idle waited for itself, holding the
+	// family's lifecycle lock, and every later command of the family hung.
+	peer, err := b.durableRestorePeer(info.ID, destinations...)
 	if err != nil {
 		return nil, fmt.Errorf("checking the runtime of %s before forking: %w", source, err)
 	}
@@ -16854,9 +16858,10 @@ func (b *runtimeBackend) runtimeRunsNoBranch(id string) bool {
 // finds the runtime running nothing it is kept for, unless a command is making
 // a branch in the runtime, which keeps it; see familyOperations.releasing.
 // release must decide from what the runtime lists once it runs: a branch
-// made before then is listed, and none is made until it returns.
-func (b *runtimeBackend) releaseRuntime(id string, release func() error) error {
-	done, ok := b.operations.beginRelease(id)
+// made before then is listed, and none is made until it returns. own are the
+// branches the caller is making in the runtime itself; see beginRelease.
+func (b *runtimeBackend) releaseRuntime(id string, release func() error, own ...string) error {
+	done, ok := b.operations.beginRelease(id, own...)
 	if !ok {
 		return nil
 	}
@@ -16882,7 +16887,7 @@ func (b *runtimeBackend) runtimeRunsLiveBranch(id string) bool {
 // releaseIdleRuntime deletes the runtime with this ID if it runs no branch,
 // its resident dehydrations made durable first, unless a command is making a
 // branch in it. It reports whether it deleted the runtime.
-func (b *runtimeBackend) releaseIdleRuntime(id string) (bool, error) {
+func (b *runtimeBackend) releaseIdleRuntime(id string, own ...string) (bool, error) {
 	info, err := b.containerStore().LoadRuntimeContainer(id)
 	recorded := err == nil
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -16903,7 +16908,7 @@ func (b *runtimeBackend) releaseIdleRuntime(id string) (bool, error) {
 		}
 		released = true
 		return nil
-	})
+	}, own...)
 	return released, err
 }
 
