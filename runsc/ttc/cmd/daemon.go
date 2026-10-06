@@ -1340,7 +1340,10 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		runtimeState.Status = "created"
 		runtimeCreated = true
 	}
-	if peer && runtimeState.Status != "running" && runtimeState.Status != "created" {
+	// The runtime's state is its loader branch's, which may have exited while
+	// another branch runs there: the import goes beside that branch. An import
+	// into one so stopped was refused while the runtime ran a live branch.
+	if peer && runtimeState.Status != "running" && runtimeState.Status != "created" && !r.backend.runtimeRunsLiveBranch(info.ID) {
 		return fmt.Errorf("distributed peer target runtime is %q, want running", runtimeState.Status)
 	}
 	if runtimeState.Status == "created" || peer {

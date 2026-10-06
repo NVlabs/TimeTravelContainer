@@ -16864,6 +16864,21 @@ func (b *runtimeBackend) releaseRuntime(id string, release func() error) error {
 	return release()
 }
 
+// runtimeRunsLiveBranch reports whether the runtime with this ID lists a
+// branch that may run, its Sentry able to say.
+func (b *runtimeBackend) runtimeRunsLiveBranch(id string) bool {
+	families, err := b.listRuntimeFamiliesOf(id)
+	if err != nil {
+		return false
+	}
+	for _, family := range families {
+		if family.ID == id {
+			return family.Error == "" && runtimeFamilyLiveBranch(family) != ""
+		}
+	}
+	return false
+}
+
 // releaseIdleRuntime deletes the runtime with this ID if it runs no branch,
 // its resident dehydrations made durable first, unless a command is making a
 // branch in it. It reports whether it deleted the runtime.
