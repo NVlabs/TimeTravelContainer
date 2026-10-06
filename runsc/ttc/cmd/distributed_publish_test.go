@@ -213,6 +213,35 @@ func TestInactiveGraphReferenceReconciliationReleasesOnlyFencedClaims(t *testing
 	}
 }
 
+// A branch's cold reference names come back: running from the same roots
+// twice, between two publications or after a rehydration canceled one, a
+// branch names them alike. Each reconciliation pass retains and releases
+// them anew, and the roots' origin keeps its reference.
+func TestColdReferenceNamesComeBack(t *testing.T) {
+	root := ttcsnapshot.ObjectID{Snapshot: 1, Ordinal: 6, Kind: ttcsnapshot.ObjectKindMetadata}
+	ledger := ttcsnapshot.NewReferenceLedger()
+	const baseline = "root/provider/1/baseline"
+	if err := ledger.ImportOrigin(1, []ttcsnapshot.Object{{ID: root, State: ttcsnapshot.ObjectLive}}, map[string]ttcsnapshot.ObjectID{baseline: root}); err != nil {
+		t.Fatal(err)
+	}
+	const running, published = "root/cold/running", "root/cold/published"
+	previous := baseline
+	for pass, name := range []string{running, published, running, published, running} {
+		desired := map[string]ttcsnapshot.ObjectID{name: root}
+		mutations := coldReferenceMutations(desired, ledger.References(), []string{name}, []string{previous}, uint64(pass+1))
+		if err := applySharedReferenceBatches(ledger, mutations); err != nil {
+			t.Fatalf("pass %d: %v", pass+1, err)
+		}
+		previous = name
+		if references := ledger.References(); len(references) != 1 || references[name] != root {
+			t.Fatalf("after pass %d to %q, references are %v", pass+1, name, references)
+		}
+	}
+	if collected, err := ledger.Collect(16); err != nil || collected != 0 {
+		t.Fatalf("collection of a referenced origin = (%d, %v), want nothing", collected, err)
+	}
+}
+
 func TestTerminalSourceAction(t *testing.T) {
 	tests := []struct {
 		name   string

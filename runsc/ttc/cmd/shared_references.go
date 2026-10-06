@@ -310,6 +310,10 @@ type sharedReferenceService struct {
 	// elect asks the node's coordinator election to try for the lease at
 	// once; see electCoordinator.
 	elect chan struct{}
+	// coldMu serializes reconcileAuthoritativeColdReferences, and coldPass
+	// numbers its passes; see coldReferenceMutations.
+	coldMu   sync.Mutex
+	coldPass uint64
 }
 
 // electCoordinator asks this node's coordinator election to try for the
@@ -1434,6 +1438,10 @@ func (s *sharedReferenceService) authoritativeColdReferences(state *cluster.Auth
 // walking immutable objects. Retains precede releases so replacing one branch
 // root can never expose a transient zero-count graph.
 func (s *sharedReferenceService) reconcileAuthoritativeColdReferences() error {
+	// A pass reads the ledger's references and changes them: two at once
+	// would release one twice.
+	s.coldMu.Lock()
+	defer s.coldMu.Unlock()
 	state, err := s.authority.AuthorityStateOf(withSnapshotOrigins(cluster.AuthorityQuery{Branches: cluster.All[string](), Publications: cluster.All[string]()}))
 	if err != nil {
 		return err
@@ -1498,26 +1506,41 @@ func (s *sharedReferenceService) reconcileAuthoritativeColdReferences() error {
 	}
 	sort.Strings(retain)
 	sort.Strings(release)
+	s.coldPass++
+	mutations := coldReferenceMutations(desired, current, retain, release, s.coldPass)
 	return s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
-		mutations := make([]ttcsnapshot.SnapshotReferenceMutation, 0, len(retain)+len(release))
-		for _, name := range retain {
-			object := desired[name]
-			digest := sha256.Sum256([]byte("retain\x00" + name + "\x00" + object.String()))
-			mutations = append(mutations, ttcsnapshot.SnapshotReferenceMutation{
-				Operation: fmt.Sprintf("authority-root-retain/%x", digest),
-				Name:      name, Object: object, Retain: true,
-			})
-		}
-		for _, name := range release {
-			object := current[name]
-			digest := sha256.Sum256([]byte("release\x00" + name + "\x00" + object.String()))
-			mutations = append(mutations, ttcsnapshot.SnapshotReferenceMutation{
-				Operation: fmt.Sprintf("authority-root-release/%x", digest),
-				Name:      name, Object: object,
-			})
-		}
 		return applySharedReferenceBatches(ledger, mutations)
 	})
+}
+
+// coldReferenceMutations retains each of retain's names at desired's object
+// and releases each of release's at current's, as reconciliation pass pass.
+// A name comes back after it was released: a branch's names are its
+// publication's and its roots', and a branch running from the same roots
+// twice, between two publications or after a rehydration canceled one,
+// names them alike. An operation named for the name and object alone was
+// then the ledger's already, and ignored, and the roots' origin, with no
+// reference left, was retired from under the branch. Each pass's
+// operations are its own.
+func coldReferenceMutations(desired, current map[string]ttcsnapshot.ObjectID, retain, release []string, pass uint64) []ttcsnapshot.SnapshotReferenceMutation {
+	mutations := make([]ttcsnapshot.SnapshotReferenceMutation, 0, len(retain)+len(release))
+	for _, name := range retain {
+		object := desired[name]
+		digest := sha256.Sum256([]byte("retain\x00" + name + "\x00" + object.String()))
+		mutations = append(mutations, ttcsnapshot.SnapshotReferenceMutation{
+			Operation: fmt.Sprintf("authority-root-retain/%x/%d", digest, pass),
+			Name:      name, Object: object, Retain: true,
+		})
+	}
+	for _, name := range release {
+		object := current[name]
+		digest := sha256.Sum256([]byte("release\x00" + name + "\x00" + object.String()))
+		mutations = append(mutations, ttcsnapshot.SnapshotReferenceMutation{
+			Operation: fmt.Sprintf("authority-root-release/%x/%d", digest, pass),
+			Name:      name, Object: object,
+		})
+	}
+	return mutations
 }
 
 // reconcileInactiveGraphReferences removes active-consumer roots whose owning
