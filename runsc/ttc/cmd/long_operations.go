@@ -664,10 +664,11 @@ func (b *runtimeBackend) forkThroughHandoffs(info ttcbundle.ContainerInfo, branc
 }
 
 // throughAuthorityHandoffs runs op, for work that runs without the lifecycle
-// lock, and while it is refused because a snapshot it would change the
-// references of is frozen for an authority handoff, as a dehydration's
-// publication leaves the branch's snapshot for a moment, waits for the handoff
-// to end and runs it again. op must change nothing when refused.
+// lock or holds nothing a handoff's end waits for, and while it is refused
+// because a snapshot it would change the references of is frozen for an
+// authority handoff, as a dehydration's publication leaves the branch's
+// snapshot for a moment, waits for the handoff to end and runs it again. op
+// must change nothing when refused.
 func throughAuthorityHandoffs(op func() error) error {
 	deadline := time.Now().Add(forkHandoffWait)
 	delay := 100 * time.Millisecond

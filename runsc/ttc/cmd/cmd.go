@@ -14247,7 +14247,19 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 				records[i].DistributedGraphReferenceOperation = referenceOperations[i]
 			}
 		}
-		graphRoots, err := b.cloneGraphMemoryRootsMany(sourceRecord.MemoryRoots, sourceRecord.MemoryRootObjects, sourceRecord.SnapshotID, records)
+		// The image the source reads lazily may be frozen for a handoff, as a
+		// publication of a branch that shares it makes one: the children's
+		// roots of it wait the handoff out, as the fork itself does above. A
+		// refused clone changes nothing, and the handoff's end takes neither
+		// this lock nor anything the fork holds; the fork failed, and took
+		// its children with it, "rooting graph memory for batch fork: snapshot
+		// 92 references are frozen for authority handoff".
+		var graphRoots map[string][]string
+		err := throughAuthorityHandoffs(func() error {
+			var cloneErr error
+			graphRoots, cloneErr = b.cloneGraphMemoryRootsMany(sourceRecord.MemoryRoots, sourceRecord.MemoryRootObjects, sourceRecord.SnapshotID, records)
+			return cloneErr
+		})
 		if err != nil {
 			var cleanupErr error
 			store := b.containerStore()
