@@ -8508,11 +8508,17 @@ func freshStartPeers(info ttcbundle.ContainerInfo, target selector, localNodeID 
 		case "running", "paused":
 			peers = append(peers, selector{container: target.container, branch: branch.ID})
 		case "created", "dehydrated", "exited", "failed", "dead":
+		case "dehydrating":
+			// A dehydration under way holds its family's lifecycle lock or
+			// long operation, which the start waited for. A branch still
+			// dehydrating is one whose publication is under way, from its
+			// durable local capture, which needs no runtime: a start of its
+			// peer was refused for as long as the publication took.
 		case "corrupted":
 			// Only removal is left to a corrupted branch: its runtime is
 			// lost, or fenced to be. It refused every start in its family
 			// as a peer of unknown state.
-		case "creating", "dehydrating", "rehydrating", "restarting":
+		case "creating", "rehydrating", "restarting":
 			return nil, fmt.Errorf("cannot start %s while peer %s@%s is %s", target, target.container, branch.ID, normalizeLifecycleState(branch.State))
 		default:
 			return nil, fmt.Errorf("cannot start %s while peer %s@%s has unknown state %q", target, target.container, branch.ID, branch.State)

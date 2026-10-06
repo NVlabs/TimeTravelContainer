@@ -4004,8 +4004,18 @@ func TestFreshStartPeers(t *testing.T) {
 		t.Fatalf("freshStartPeers=%+v, want %+v", got, want)
 	}
 
-	info.Branches = append(info.Branches, ttcbundle.BranchInfo{ID: "busy", State: "dehydrating"})
-	if _, err := freshStartPeers(info, selector{container: "demo", branch: "target"}, ""); err == nil || !strings.Contains(err.Error(), "busy is dehydrating") {
+	// A branch still dehydrating once the start holds the lifecycle lock is
+	// one whose publication is under way, which needs no runtime.
+	info.Branches = append(info.Branches, ttcbundle.BranchInfo{ID: "publishing", State: "dehydrating"})
+	got, err = freshStartPeers(info, selector{container: "demo", branch: "target"}, "")
+	if err != nil {
+		t.Fatalf("freshStartPeers beside a publication: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("freshStartPeers beside a publication=%+v, want %+v", got, want)
+	}
+	info.Branches = append(info.Branches, ttcbundle.BranchInfo{ID: "busy", State: "rehydrating"})
+	if _, err := freshStartPeers(info, selector{container: "demo", branch: "target"}, ""); err == nil || !strings.Contains(err.Error(), "busy is rehydrating") {
 		t.Fatalf("freshStartPeers transient error=%v", err)
 	}
 
