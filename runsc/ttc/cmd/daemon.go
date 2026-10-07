@@ -8273,11 +8273,37 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			mutationBackend.nodeID = s.clusterCapabilities.NodeID
 		}
 		s.configureFamilyLocks(mutationBackend)
+		if movableDaemonCommand(request, archiveFile != nil) {
+			mutationBackend.moves = &commandMoves{}
+		}
 		status := runCommand(request.Args, mutationBackend.stdout, mutationBackend.stderr, mutationBackend)
 		// What the command changed, it resolves anew after.
 		mutationBackend.claimedAuthority.discard()
-		s.recordCommandEvents(opts.dataRoot, request.Args, status, mutationBackend.resolvedFamilies)
-		if status == 0 {
+		unlocked, forwarded := false, false
+		if owner := mutationBackend.moves.movedTo(); status != 0 && owner != "" && s.clusterCapabilities != nil && owner != s.clusterCapabilities.NodeID {
+			// The command's branch went to another node after the command
+			// was routed here, as a claim of the branch there or a migration
+			// of it takes it, and the command, which failed resolving the
+			// branch, did nothing: it goes to the branch's node, whose answer
+			// is the command's, journaled here too. Commands failed so,
+			// "branch ... belongs to cluster node ...", beside a start of
+			// their cold branch on another node.
+			unlock()
+			unlocked = true
+			if forwardedStatus, stdout, stderr, forwardErr := s.forwardMovedCommand(request); forwardErr == nil {
+				mutationStdout.Reset()
+				mutationStdout.WriteString(stdout)
+				mutationStderr.Reset()
+				mutationStderr.WriteString(stderr)
+				status, forwarded = forwardedStatus, true
+			} else {
+				fmt.Fprintf(&mutationStderr, "ttcd: sending the command to node %q, where its branch is now: %v\n", owner, forwardErr)
+			}
+		}
+		if !forwarded {
+			s.recordCommandEvents(opts.dataRoot, request.Args, status, mutationBackend.resolvedFamilies)
+		}
+		if status == 0 && !forwarded {
 			// Publication runs outside the lifecycle lock. It may unplace a
 			// dehydration after the pre-command claim but before rehydrate
 			// consumes the durable image. Repeat the idempotent claim at the
@@ -8296,7 +8322,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 				}
 			}
 		}
-		if status == 0 && mutationBackend.daemonStopRequested {
+		if status == 0 && mutationBackend.daemonStopRequested && !forwarded {
 			if err := s.retireBeforeReply(); err != nil {
 				fmt.Fprintf(&mutationStderr, "ttcd: retiring cluster node: %v\n", err)
 				status = 1
@@ -8310,7 +8336,9 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			record = completed
 			s.maybeCompactDaemonMutations(mutationRoot)
 		}
-		unlock()
+		if !unlocked {
+			unlock()
+		}
 		stdinReader.Close()
 		if err == nil {
 			ingressCommitted = preparedIngress != nil && record.Status == 0
@@ -8318,7 +8346,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		} else {
 			writeDaemonBufferedResult(conn, &writeMu, mutationStdout.Bytes(), mutationStderr.Bytes(), status)
 		}
-		if status == 0 && mutationBackend.daemonStopRequested {
+		if status == 0 && mutationBackend.daemonStopRequested && !forwarded {
 			s.stopAfterReply(conn)
 		}
 		return
@@ -8383,6 +8411,72 @@ func (s *daemonServer) runListing(dataRoot string, args []string, backend *runti
 	_, _ = backend.stdout.Write(stdout.Bytes())
 	_, _ = backend.stderr.Write(stderr.Bytes())
 	return status
+}
+
+// movableDaemonCommand reports whether request, a journaled command, may go
+// to another node once its first resolution of a branch finds the branch
+// there (forwardMovedCommand): a lifecycle command of one branch, which takes
+// no input and no file from its client.
+func movableDaemonCommand(request daemonRequest, archive bool) bool {
+	if archive || request.Stdin || request.streamsClientFrames() || len(daemonCommandFamilyTargets(request.Args)) != 1 {
+		return false
+	}
+	args := request.Args
+	if args[0] == "container" {
+		args = args[1:]
+	}
+	if args[0] == "cp" || args[0] == "port" {
+		return false
+	}
+	selectors := 0
+	for _, arg := range args[1:] {
+		if !strings.HasPrefix(arg, "-") && strings.Contains(arg, "@") {
+			selectors++
+		}
+	}
+	return selectors == 1
+}
+
+// forwardMovedCommand sends request, whose branch its first resolution here
+// found on another node, to the node the branch's placement names now, and
+// returns that node's answer. It routes the command again if the node
+// refuses it as routed stale, as one does if the branch moves on again.
+func (s *daemonServer) forwardMovedCommand(request daemonRequest) (int, string, string, error) {
+	routing := s.routingPlacements()
+	placements := cluster.PlacementCatalog(s.clusterPlacements)
+	if routing != nil {
+		placements = routing
+	}
+	lastErr := errors.New("the command was refused as routed stale")
+	for attempt := 0; attempt < 3; attempt++ {
+		owner, claims, err := placementAfterClaims(s.dataRoot, placements, request.Args)
+		if err != nil {
+			return 0, "", "", err
+		}
+		if owner == "" || owner == s.clusterCapabilities.NodeID {
+			return 0, "", "", fmt.Errorf("the branch's placement names node %q now", owner)
+		}
+		if slices.Contains(request.Route, owner) {
+			return 0, "", "", fmt.Errorf("cluster command routing loop through %v to node %q", request.Route, owner)
+		}
+		peer, err := s.routedPeer(owner, routing)
+		if err != nil {
+			return 0, "", "", err
+		}
+		forwarded := request
+		forwarded.Route = append(append([]string(nil), request.Route...), s.clusterCapabilities.NodeID)
+		forwarded.PlacementClaims = claims
+		status, stdout, stderr, err := executeRemoteDaemonRequest(context.Background(), peer, forwarded)
+		if err != nil {
+			return 0, "", "", err
+		}
+		if status != 0 && strings.HasPrefix(stderr, protocol.StaleRouteRefusal) {
+			lastErr = errors.New(strings.TrimSpace(stderr))
+			continue
+		}
+		return status, stdout, stderr, nil
+	}
+	return 0, "", "", lastErr
 }
 
 // claimedRuntimeOperation returns a long operation of another request working

@@ -6842,7 +6842,11 @@ type runtimeBackend struct {
 	claimedAuthority *claimedBranchAuthority
 	// makingFamily, if not nil, is how a request that makes a family, holding
 	// the lifecycle lock shared, makes it beside other commands.
-	makingFamily     *familyMaking
+	makingFamily *familyMaking
+	// moves, if not nil, records for the request's daemon whether the
+	// command's first resolution of a branch found the branch on another
+	// node; see forwardMovedCommand.
+	moves            *commandMoves
 	publicationQueue *ttcstorage.Queue
 	snapshotGraph    *ttcsnapshot.Store
 	snapshotData     *ttcsnapshot.LocalDataStore
@@ -7420,6 +7424,47 @@ func familyContainersForPlacement(store ttcbundle.Store, familyID string) ([]ttc
 }
 
 func (b *runtimeBackend) resolveSelector(target selector) (selector, ttcbundle.ContainerInfo, error) {
+	resolved, info, err := b.resolveSelectorOf(target)
+	b.moves.note(err)
+	return resolved, info, err
+}
+
+// commandMoves is what a command's resolutions of branches found of their
+// placement, for the daemon that runs the command.
+type commandMoves struct {
+	mu       sync.Mutex
+	resolved bool
+	owner    string
+}
+
+// note records the outcome of a resolution: the first of a command's that
+// found its branch on another node leaves the command undone, which the
+// daemon may then send there.
+func (m *commandMoves) note(err error) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var moved *remoteBranchOwnershipError
+	if !m.resolved && errors.As(err, &moved) {
+		m.owner = moved.owner
+	}
+	m.resolved = true
+}
+
+// movedTo names the node that owned the branch the command's first
+// resolution resolved, if another node did.
+func (m *commandMoves) movedTo() string {
+	if m == nil {
+		return ""
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.owner
+}
+
+func (b *runtimeBackend) resolveSelectorOf(target selector) (selector, ttcbundle.ContainerInfo, error) {
 	info, err := b.resolveContainer(target.container)
 	if err != nil {
 		return selector{}, ttcbundle.ContainerInfo{}, err

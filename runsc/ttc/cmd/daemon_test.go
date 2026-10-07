@@ -4,6 +4,7 @@
 package cmd
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -3495,6 +3496,108 @@ func (heldPublisher) Cleanup(ttcstorage.Intent) error                     { retu
 // A migration from a runtime that a dehydration has just released leaves
 // the runtime's node-local state, whose capture the dehydration's publication
 // reads until it is done, and the state of a branch that needs the runtime.
+// A journaled command whose first resolution found its branch on another
+// node goes there, routed as the branch is placed now, under its request ID,
+// and that node's answer is the command's.
+func TestForwardMovedCommandSendsItToTheBranchsNode(t *testing.T) {
+	root := t.TempDir()
+	bundleDir := filepath.Join(root, "containers", "web", "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(root, "containers", "web", "container.json"), ttcbundle.ContainerInfo{ID: "web", Name: "web", NodeID: "node-b", BundleDir: bundleDir}); err != nil {
+		t.Fatal(err)
+	}
+	placements, err := cluster.OpenPlacementStore(filepath.Join(root, "cluster", "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := placements.Create(cluster.PlacementRecord{
+		FamilyID: "web", BranchID: "main", PhysicalContainer: "web", PhysicalBranch: "main",
+		OwnerNode: "node-b", OwnerIncarnation: "boot-b", State: cluster.PlacementRunning,
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	var received daemonRequest
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/daemon" {
+			http.NotFound(w, r)
+			return
+		}
+		line, _ := bufio.NewReader(r.Body).ReadBytes('\n')
+		_ = json.Unmarshal(line, &received)
+		var frames bytes.Buffer
+		var mu sync.Mutex
+		_ = writeDaemonFrame(&frames, &mu, daemonFrameStdout, []byte("web@main\n"))
+		_ = writeDaemonStatus(&frames, &mu, 0)
+		_, _ = w.Write(frames.Bytes())
+	}))
+	defer server.Close()
+	peer, err := cluster.NewClient(server.URL, server.Client().Transport.(*http.Transport).TLSClientConfig, 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &daemonServer{
+		dataRoot: root, clusterPlacements: placements, clusterCapabilities: &cluster.Capabilities{NodeID: "node-a"},
+		distributedSource: &distributedSourceRuntime{peers: map[string]*cluster.Client{"node-b": peer}},
+	}
+	status, stdout, _, err := s.forwardMovedCommand(daemonRequest{Version: daemonAPIVersion, Action: "command", RequestID: "request-1", Args: []string{"pause", "web@main"}, Route: []string{"gw"}})
+	if err != nil || status != 0 || stdout != "web@main\n" {
+		t.Fatalf("forwardMovedCommand = %d, %q, %v; want node-b's answer", status, stdout, err)
+	}
+	if received.RequestID != "request-1" || !reflect.DeepEqual(received.Route, []string{"gw", "node-a"}) ||
+		len(received.PlacementClaims) != 1 || received.PlacementClaims[0].OwnerNode != "node-b" {
+		t.Fatalf("node-b received %+v, want the command under its request ID, routed by its claim", received)
+	}
+	// A node the command came through is not sent it again.
+	if _, _, _, err := s.forwardMovedCommand(daemonRequest{Version: daemonAPIVersion, Action: "command", RequestID: "request-2", Args: []string{"pause", "web@main"}, Route: []string{"node-b"}}); err == nil {
+		t.Fatal("forwardMovedCommand sent a command back to a node it came through")
+	}
+}
+
+// Only a command's first resolution of a branch, before the command did
+// anything, can leave it undone for its daemon to send on.
+func TestCommandMovesNotesTheFirstResolution(t *testing.T) {
+	moved := &remoteBranchOwnershipError{target: selector{container: "web", branch: "main"}, owner: "node-b"}
+	var first commandMoves
+	first.note(fmt.Errorf("resolving: %w", moved))
+	if first.movedTo() != "node-b" {
+		t.Fatalf("movedTo = %q after a first resolution that found the branch on node-b", first.movedTo())
+	}
+	var later commandMoves
+	later.note(nil)
+	later.note(moved)
+	if later.movedTo() != "" {
+		t.Fatalf("movedTo = %q after a resolution that followed another", later.movedTo())
+	}
+	var none *commandMoves
+	none.note(moved)
+	if none.movedTo() != "" {
+		t.Fatal("a command without a record of moves recorded one")
+	}
+	for _, test := range []struct {
+		args    []string
+		archive bool
+		want    bool
+	}{
+		{args: []string{"pause", "fc@main"}, want: true},
+		{args: []string{"fork", "--node", "n2", "fc@main", "child"}, want: true},
+		{args: []string{"migrate", "--node", "n3", "fc@c4n11"}, want: true},
+		{args: []string{"stop", "fc@a", "fc@b"}},
+		{args: []string{"rm", "fc"}},
+		{args: []string{"cp", "fc@main:/x", "/tmp/x"}},
+		{args: []string{"exec", "fc@main", "true"}},
+		{args: []string{"pause", "fc@main"}, archive: true},
+	} {
+		if got := movableDaemonCommand(daemonRequest{Args: test.args}, test.archive); got != test.want {
+			t.Errorf("movableDaemonCommand(%q, %t) = %t, want %t", test.args, test.archive, got, test.want)
+		}
+	}
+}
+
 // A command making a branch in a migration's source runtime keeps the
 // runtime from the source's release, which says so: a drain of the source,
 // as a stop of the migrated branch makes, takes it for "later", not for a
