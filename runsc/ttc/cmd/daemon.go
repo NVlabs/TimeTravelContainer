@@ -8227,6 +8227,15 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	if err := s.claimUnplacedLifecycleTargets(backend, request.Args); err != nil {
 		unlock()
 		stdinReader.Close()
+		// Another node claimed the branch since the command was routed here,
+		// as a start or a rehydration there does: the command, which has done
+		// nothing and is journaled nowhere, is refused as routed stale, and
+		// its router sends it there. A rehydration failed so, "branch ...
+		// belongs to cluster node ...", beside a rehydration on another node.
+		var moved *remoteBranchOwnershipError
+		if errors.As(err, &moved) {
+			err = fmt.Errorf("stale routed command: %w", err)
+		}
 		writeError(err)
 		return
 	}
