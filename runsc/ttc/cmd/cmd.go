@@ -7597,6 +7597,23 @@ func (b *runtimeBackend) commit(target selector, reference string, options image
 			return ttcimages.Info{}, err
 		}
 		temporaryBranch = "commit-" + hex.EncodeToString(random[:])
+		// A cluster's snapshot origins are its authority's to hand out. A
+		// snapshot that took its own sealed the branch's origin as a
+		// standalone one, past which no publication of the branch could go,
+		// "cluster publication reached standalone origin", and numbered the
+		// new ones as the authority numbers the next it hands out: a fork of
+		// the branch then found its origin taken, "fresh working snapshot ID
+		// ... is already working".
+		var origins []ttcsnapshot.SnapshotID
+		allocateOrigins, finishOrigins := b.newFilesystemOriginScope()
+		if allocateOrigins != nil {
+			if origins, err = allocateOrigins(2); err != nil {
+				repository.Close()
+				reader.Close()
+				writer.Close()
+				return ttcimages.Info{}, errors.Join(err, finishOrigins(false))
+			}
+		}
 		state := normalizeLifecycleState(branch.State)
 		if state == "running" || state == "paused" {
 			// The Sentry may still have a bounded metadata batch for this
@@ -7615,27 +7632,47 @@ func (b *runtimeBackend) commit(target selector, reference string, options image
 				writer.Close()
 				return ttcimages.Info{}, fmt.Errorf("loading live branch for commit: %w", loadErr)
 			}
-			resource := checkpoint.ResourceID{ContainerName: "ttc-volume", Path: repository.Info().ID}
-			if snapshotErr := cont.Sandbox.SnapshotFilesystemBranch(&boot.FilesystemBranchSnapshotArgs{
-				BranchID: resolved.branch, ResourceID: resource, Child: temporaryBranch,
-			}); snapshotErr != nil {
+			args := &boot.FilesystemBranchSnapshotArgs{
+				BranchID: resolved.branch, ResourceID: checkpoint.ResourceID{ContainerName: "ttc-volume", Path: repository.Info().ID},
+				Child: temporaryBranch,
+			}
+			if len(origins) == 2 {
+				args.SourceWorking, args.ChildWorking = uint64(origins[0]), uint64(origins[1])
+			}
+			if snapshotErr := cont.Sandbox.SnapshotFilesystemBranch(args); snapshotErr != nil {
 				repository.Close()
 				reader.Close()
 				writer.Close()
-				return ttcimages.Info{}, fmt.Errorf("snapshotting live rootfs upper: %w", snapshotErr)
+				return ttcimages.Info{}, errors.Join(fmt.Errorf("snapshotting live rootfs upper: %w", snapshotErr), finishOrigins(false))
 			}
-		} else if err := repository.Fork(filesystemBranch, temporaryBranch); err != nil {
-			repository.Close()
-			reader.Close()
-			writer.Close()
-			return ttcimages.Info{}, fmt.Errorf("snapshotting rootfs upper: %w", err)
+		} else {
+			var forkErr error
+			if len(origins) == 2 {
+				forkErr = repository.ForkWithOrigins(filesystemBranch, temporaryBranch, uint64(origins[0]), uint64(origins[1]))
+			} else {
+				forkErr = repository.Fork(filesystemBranch, temporaryBranch)
+			}
+			if forkErr != nil {
+				repository.Close()
+				reader.Close()
+				writer.Close()
+				return ttcimages.Info{}, errors.Join(fmt.Errorf("snapshotting rootfs upper: %w", forkErr), finishOrigins(false))
+			}
 		}
+		_ = finishOrigins(true)
 		defer func() {
 			cleanupErr := repository.RemoveBranch(temporaryBranch)
 			if cleanupErr == nil {
 				cleanupErr = repository.GarbageCollect()
 			}
 			cleanupErr = errors.Join(cleanupErr, repository.Close())
+			// The snapshot's origin, emptied with its branch, goes as a
+			// removed branch's does.
+			if cleanupErr == nil && len(origins) != 0 {
+				if _, err := b.reconcileVolatileSnapshotOrigins(); err != nil {
+					cleanupErr = fmt.Errorf("reconciling its snapshot origins: %w", err)
+				}
+			}
 			if cleanupErr != nil {
 				retErr = errors.Join(retErr, fmt.Errorf("removing commit snapshot: %w", cleanupErr))
 			}
