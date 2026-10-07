@@ -33,6 +33,7 @@ import (
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 	"gvisor.dev/gvisor/runsc/ttc/protocol"
+	ttcstorage "gvisor.dev/gvisor/runsc/ttc/storage"
 	"gvisor.dev/gvisor/runsc/version"
 )
 
@@ -3417,5 +3418,70 @@ func TestRemoveMovedBranchEntry(t *testing.T) {
 	}
 	if err := b.removeMovedBranchEntry("gone", "mv"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// heldPublisher keeps every intent pending: its capture is never available.
+type heldPublisher struct{}
+
+func (heldPublisher) CaptureAvailable(ttcstorage.Intent) (bool, error) { return false, nil }
+func (heldPublisher) Publish(context.Context, ttcstorage.Intent) (ttcstorage.Result, error) {
+	return ttcstorage.Result{}, errors.New("held")
+}
+func (heldPublisher) Complete(ttcstorage.Intent, ttcstorage.Result) error { return nil }
+func (heldPublisher) Failed(ttcstorage.Intent, error, time.Time) error    { return nil }
+func (heldPublisher) Cleanup(ttcstorage.Intent) error                     { return nil }
+
+// A migration from a runtime that a dehydration has just released leaves
+// the runtime's node-local state, whose capture the dehydration's publication
+// reads until it is done, and the state of a branch that needs the runtime.
+func TestUnrecordedMigratedSourceKeepsWhatItsBranchesNeed(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		state   string
+		pending bool
+		kept    bool
+	}{
+		{name: "a publication pending", state: "dehydrated", pending: true, kept: true},
+		{name: "nothing pending", state: "dehydrated"},
+		{name: "a branch that needs the runtime", state: "dehydrating", kept: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			runsc := filepath.Join(dir, "runsc")
+			script := "#!/bin/sh\ncase \"$3\" in\nlist) echo '[]' ;;\n*) echo \"unexpected command: $*\" >&2; exit 2 ;;\nesac\n"
+			if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
+				t.Fatal(err)
+			}
+			queue, err := ttcstorage.Open(filepath.Join(dir, "queue"), heldPublisher{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer queue.Close()
+			if test.pending {
+				if err := queue.Enqueue(ttcstorage.Intent{Container: "fork-1", Branch: "x", PublicationID: "publication-1", Kind: "dehydrate", FilesystemBranch: "b-x"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: filepath.Join(dir, "shared"), localRoot: filepath.Join(dir, "local"),
+				operations: &familyOperations{}, publicationQueue: queue, nodeID: "n3"}
+			capture := filepath.Join(dir, "local", "containers", "fork-1", "capture")
+			if err := os.MkdirAll(filepath.Dir(capture), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(capture, []byte("pages"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			info := ttcbundle.ContainerInfo{
+				ID: "fork-1", Name: "fork-1", DistributedFamilyID: "family", DistributedPhysicalRuntime: true,
+				Branches: []ttcbundle.BranchInfo{{ID: "x", State: test.state, NodeID: "n3"}},
+			}
+			if err := b.removeUnrecordedMigratedSourceRuntime("fork-1", "y", &info); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(capture); (err == nil) != test.kept {
+				t.Fatalf("the runtime's node-local state kept: %t, want %t", err == nil, test.kept)
+			}
+		})
 	}
 }

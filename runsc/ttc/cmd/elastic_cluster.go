@@ -4750,15 +4750,40 @@ func (b *runtimeBackend) removeUnrecordedMigratedSourceRuntime(containerID, bran
 	// clean retirement leaked the complete sandbox. The transaction has already
 	// reached independence, so metadata absence (or metadata containing only
 	// process-free/remote branches) makes this exact physical runtime disposable.
+	//
+	// A publication of a branch of the runtime, a dehydration's or a stop's,
+	// reads the branch's capture from the runtime's node-local state until it
+	// is done, as the orphan cleanup knows, which keeps the state for it: so
+	// does this, which deletes only the runtime then. Removed under the
+	// publication, a dehydration's capture went 20 ms after the dehydration,
+	// as a migration from the runtime drained, and the branch stayed
+	// dehydrating, every command of it waiting for its publication.
+	pinned, err := b.pendingPublicationProtectsContainer(containerID)
+	if err != nil {
+		return err
+	}
+	release := func() error {
+		if !pinned {
+			return b.removeOrphanRuntime(containerID)
+		}
+		consoleErr := b.stopContainerConsoleDrains(containerID)
+		if _, err := b.command("delete", "--force", containerID); err != nil {
+			return errors.Join(consoleErr, fmt.Errorf("deleting physical runtime: %w", err))
+		}
+		return consoleErr
+	}
 	if info == nil || !persistentFamilyRequiredRuntime(*info, b.nodeID) {
 		sandboxes, err := b.runtimeSandboxIDs()
 		if err != nil {
 			return fmt.Errorf("listing unrecorded migrated source %s@%s: %w", containerID, branchID, err)
 		}
 		if _, ok := sandboxes[containerID]; ok {
-			if err := b.removeOrphanRuntime(containerID); err != nil {
+			if err := release(); err != nil {
 				return fmt.Errorf("removing unrecorded migrated source %s@%s: %w", containerID, branchID, err)
 			}
+			return nil
+		}
+		if pinned {
 			return nil
 		}
 		return b.containerStore().RemoveActiveContainerState(containerID)
@@ -4797,15 +4822,18 @@ func (b *runtimeBackend) removeUnrecordedMigratedSourceRuntime(containerID, bran
 			}
 			return nil
 		}
-		if err := b.removeOrphanRuntime(containerID); err != nil {
+		if err := release(); err != nil {
 			return fmt.Errorf("removing unrecorded migrated source %s@%s: %w", containerID, branchID, err)
 		}
 		return nil
 	}
-	// A previous attempt may have removed runsc state but lost its response.
-	// The remaining active-tier directory is non-authoritative and safe to
-	// discard once no physical sandbox bears this exact ID.
-	return b.containerStore().RemoveActiveContainerState(containerID)
+	// No runtime bears the ID, though the record has branches on this node
+	// that need one: a previous attempt may have removed it, or the record's
+	// last live branch went, by a dehydration or a stop, whose capture is
+	// in the runtime's node-local state until it is published. That state is
+	// the record's branches', which the orphan cleanup reclaims once nothing
+	// needs it.
+	return nil
 }
 
 // releaseCanceledImport takes a canceled import, which its family's record
