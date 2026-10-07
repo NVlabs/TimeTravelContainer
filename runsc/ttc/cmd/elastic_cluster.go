@@ -3757,7 +3757,9 @@ func (s *daemonServer) executeDistributedChild(request daemonRequest, ordinal in
 // that one node runs whole, which is routed as any is.
 func (s *daemonServer) executeDistributedEachTarget(request daemonRequest) (bool, int, []byte, []byte, error) {
 	prefix, operands, ok := eachTargetCommand(request.Args)
-	if !ok || len(operands) == 0 {
+	// A single branch is routed as any command is, without looking its
+	// placement up twice.
+	if !ok || len(operands) == 0 || len(operands) == 1 && strings.Contains(operands[0], "@") {
 		return false, 0, nil, nil, nil
 	}
 	command := request.Args[0]
