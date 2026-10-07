@@ -7084,10 +7084,37 @@ func (s Store) BranchConsolePathsIn(info ContainerInfo, branch string) (ConsoleP
 		return ConsolePaths{}, err
 	}
 	paths := s.BranchConsolePathsOf(info.ID, branch)
-	if err := os.MkdirAll(paths.FamilyDir, 0700); err != nil {
+	if err := s.makeActiveContainerSubdir(info.ID, paths.FamilyDir); err != nil {
 		return ConsolePaths{}, fmt.Errorf("creating console state for %q: %w", info.ID, err)
 	}
 	return paths, nil
+}
+
+// makeActiveContainerSubdir makes dir, a directory below the active state of
+// the container with this ID. Where the active root is the store's root, the
+// container's directory is its record's, which a removal renames away: a
+// directory made all the way down after that made the container's directory
+// again, with neither a record nor a creation marker, as a console's was for
+// a branch whose Sentry was killed as it was removed, and every strict
+// listing of the containers then failed, "reading container ...:
+// open .../container.json: no such file or directory". There dir is made only
+// below a container's directory that exists.
+func (s Store) makeActiveContainerSubdir(id, dir string) error {
+	if filepath.Clean(s.activeRoot()) != filepath.Clean(s.Root) {
+		return os.MkdirAll(dir, 0700)
+	}
+	current := filepath.Join(s.Root, "containers", id)
+	relative, err := filepath.Rel(current, dir)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("%q is not below container directory %q", dir, current)
+	}
+	for _, part := range strings.Split(relative, string(filepath.Separator)) {
+		current = filepath.Join(current, part)
+		if err := os.Mkdir(current, 0700); err != nil && !errors.Is(err, fs.ErrExist) {
+			return err
+		}
+	}
+	return nil
 }
 
 // BranchConsolePathsOf is BranchConsolePaths of the container with the exact
@@ -7137,7 +7164,7 @@ func (s Store) ExecConsolePathsIn(info ContainerInfo, branch, execID string) (Co
 		return ConsolePaths{}, err
 	}
 	paths := s.ExecConsolePathsOf(info.ID, branch, execID)
-	if err := os.MkdirAll(filepath.Dir(paths.Log), 0700); err != nil {
+	if err := s.makeActiveContainerSubdir(info.ID, filepath.Dir(paths.Log)); err != nil {
 		return ConsolePaths{}, fmt.Errorf("creating exec console state for %q: %w", info.ID, err)
 	}
 	return paths, nil

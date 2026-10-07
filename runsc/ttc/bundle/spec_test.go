@@ -2179,6 +2179,37 @@ func TestContainerPublicationIsAtomicAgainstRecovery(t *testing.T) {
 	}
 }
 
+// A console's directory is made only below a container directory that
+// exists: made all the way down after a removal, it made the container's
+// directory again, with neither its record nor its marker.
+func TestConsolePathsDoNotRemakeARemovedContainer(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root, ActiveRoot: root}
+	info := ContainerInfo{ID: strings.Repeat("a", 64)}
+	if _, err := store.BranchConsolePathsIn(info, "main"); err == nil {
+		t.Fatal("console paths of a removed container were made")
+	}
+	if _, err := store.ExecConsolePathsIn(info, "main", "session"); err == nil {
+		t.Fatal("exec console paths of a removed container were made")
+	}
+	if _, err := os.Lstat(filepath.Join(root, "containers", info.ID)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the removed container's directory was made again: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "containers", info.ID), 0700); err != nil {
+		t.Fatal(err)
+	}
+	paths, err := store.ExecConsolePathsIn(info, "main", "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Dir(paths.Log)); err != nil {
+		t.Fatalf("exec console directory: %v", err)
+	}
+	if _, err := store.BranchConsolePathsIn(info, "main"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // A strict listing never finds a container being made in place without its
 // marker: made first and marked after, a directory was for a moment neither
 // a record nor one being made, and the listing failed on it.
