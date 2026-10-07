@@ -2102,6 +2102,21 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 	metadata.ExitedAt = nil
 	metadata.Branches = []BranchInfo{{ID: "main", NodeID: opts.NodeID, FilesystemBranch: ttcvolume.MainBranch, State: "created", StorageState: "local", CreatedAt: now}}
 	metadata.NodeID = opts.NodeID
+	// The restored family is unrelated to the checkpoint's. A checkpoint of a
+	// remote fork's branch records the transaction-scoped runtime of the
+	// fork, which names the source's family and transaction, and a family
+	// restored with them was taken for a runtime of the source's family: the
+	// restore rehydrated the source's main, "branch ...@main belongs to
+	// cluster node ...". Nor are the source's memory backings on its node
+	// this family's.
+	metadata.RuntimeMemoryBackings = nil
+	metadata.DistributedForkTransactionID = ""
+	metadata.DistributedForkNodeID = ""
+	metadata.DistributedForkHidden = false
+	metadata.DistributedPhysicalRuntime = false
+	metadata.DistributedFamilyID = ""
+	metadata.DistributedForkImports = nil
+	metadata.DistributedCatalogOnly = false
 	for index := range metadata.Volumes {
 		oldID := metadata.Volumes[index].ID
 		if info, ok := volumeIDMap[oldID]; ok {
