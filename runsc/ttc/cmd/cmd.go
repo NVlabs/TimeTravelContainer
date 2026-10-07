@@ -16977,6 +16977,167 @@ func (b *runtimeBackend) releaseIdleRuntime(id string, own ...string) (bool, err
 	return released, err
 }
 
+// importReplacement is the hand-over between an import that waits for its
+// runtime's replacement and the replacement, which may outlast the import's
+// patience: the replacement acts only once it has begun, and the import gives
+// up only before.
+type importReplacement struct {
+	mu     sync.Mutex
+	gaveUp bool
+	begun  bool
+}
+
+// begin reports whether the import still waits, and if so, that it will wait
+// for the replacement to end.
+func (h *importReplacement) begin() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.begun = !h.gaveUp
+	return h.begun
+}
+
+// giveUp reports whether the import may give up, as it may before the
+// replacement has begun, and if so, that it has.
+func (h *importReplacement) giveUp() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.gaveUp = !h.begun
+	return h.gaveUp
+}
+
+// abandoned reports whether the import has given up.
+func (h *importReplacement) abandoned() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.gaveUp
+}
+
+// errImportGaveUp is a replacement's end once its import has given up.
+var errImportGaveUp = errors.New("the import gave up")
+
+// replaceRuntimeForImport makes the runtime with this ID one that a remote
+// fork's import of branch can be restored into, under the lifecycle lock,
+// which an import does not otherwise take. A runtime that runs a branch is
+// kept, for the import to go beside the branch. One that runs none goes, its
+// resident dehydrations made durable first, as a release would take it, and
+// create makes the import's own in its place, as it makes one where the
+// family has none: a peer restore needs a live branch to restore beside. It
+// goes only once the exit of each branch it ran is recorded: a branch's exit
+// is finalized through its Sentry, which drains the files the branch imported
+// itself and has yet to read.
+//
+// It reports whether create made the runtime, and returns what ends the mark
+// that the import is making branch in it, taken before the lock is given up,
+// as an import takes it before it looks at a runtime. b must hold no
+// lifecycle lock, nor make a branch in the runtime: a command making one, as
+// a fork of a dehydrated branch, is waited for.
+func (b *runtimeBackend) replaceRuntimeForImport(id, branch string, create func() error, handover *importReplacement) (bool, func(), error) {
+	for {
+		if handover.abandoned() {
+			return false, func() {}, errImportGaveUp
+		}
+		unlock := b.holdFamilyLifecycle(b.familyID(id))
+		done, ok := b.operations.beginRelease(id)
+		if !ok {
+			unlock()
+			b.operations.waitMadeIn(id)
+			continue
+		}
+		disposition, err := b.runtimeDispositionForImport(id)
+		if err == nil && disposition == runtimeExiting {
+			done()
+			unlock()
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		if !handover.begin() {
+			done()
+			unlock()
+			return false, func() {}, errImportGaveUp
+		}
+		created := false
+		if err == nil && disposition != runtimeLive {
+			err = b.replaceStoppedRuntime(id, disposition == runtimeStopped, create)
+			created = err == nil
+		}
+		done()
+		making := b.operations.beginMaking(id, branch)
+		unlock()
+		return created, making, err
+	}
+}
+
+// runtimeDisposition is what an import makes of a runtime it would go into.
+type runtimeDisposition int
+
+const (
+	// runtimeGone is a runtime that is not there.
+	runtimeGone runtimeDisposition = iota
+	// runtimeLive runs a branch, beside which the import goes.
+	runtimeLive
+	// runtimeStopped runs none, and every exit of its branches is recorded.
+	runtimeStopped
+	// runtimeExiting runs none, and a branch's exit is still to be recorded.
+	runtimeExiting
+)
+
+// runtimeDispositionForImport says what the runtime with this ID is to an
+// import, under the lifecycle lock.
+func (b *runtimeBackend) runtimeDispositionForImport(id string) (runtimeDisposition, error) {
+	families, err := b.listRuntimeFamiliesOf(id)
+	if err != nil {
+		return runtimeGone, err
+	}
+	for _, family := range families {
+		if family.ID != id {
+			continue
+		}
+		if !runtimeFamilyUnavailable(family) && runtimeFamilyLiveBranch(family) != "" {
+			return runtimeLive, nil
+		}
+		info, err := b.containerStore().LoadRuntimeContainer(id)
+		if errors.Is(err, os.ErrNotExist) {
+			return runtimeStopped, nil
+		}
+		if err != nil {
+			return runtimeGone, err
+		}
+		for _, branch := range info.Branches {
+			if b.nodeID != "" && info.BranchNodeID(branch.ID) != b.nodeID {
+				continue
+			}
+			switch normalizeLifecycleState(branch.State) {
+			case "created", "dehydrated", "exited", "failed", "dead":
+			default:
+				return runtimeExiting, nil
+			}
+		}
+		return runtimeStopped, nil
+	}
+	return runtimeGone, nil
+}
+
+// replaceStoppedRuntime deletes the runtime with this ID, if stopped says it
+// is there, its resident dehydrations made durable first, and has create make
+// the import's in its place.
+func (b *runtimeBackend) replaceStoppedRuntime(id string, stopped bool, create func() error) error {
+	if stopped {
+		info, err := b.containerStore().LoadRuntimeContainer(id)
+		if err == nil {
+			err = b.persistResidentDehydrations(info, nil)
+		} else if errors.Is(err, os.ErrNotExist) {
+			err = nil
+		}
+		if err != nil {
+			return err
+		}
+		if _, err := b.command("delete", "--force", id); err != nil {
+			return fmt.Errorf("releasing runtime %q, which runs no branch: %w", id, err)
+		}
+	}
+	return create()
+}
+
 // runtimeListsOnly reports whether the runtime with this ID lists no branch
 // but those in seen, or is gone: a command that decided from seen to delete
 // the runtime must keep it for any other, as a remote fork's import.
@@ -17738,11 +17899,27 @@ func (b *runtimeBackend) rehydrate(target selector) (retErr error) {
 		// branch to restore beside. Its Sentry may still be exiting and answer,
 		// as a stale shell's does not, or keep the captures of other dehydrated
 		// branches. Make those durable, remove it, and rebuild from the image.
+		// A remote fork's import making a branch in it, as one that made the
+		// runtime anew for want of a branch to go beside, keeps it, as it
+		// keeps it from a release: the rehydration waits for the import, and
+		// goes beside its branch once it runs.
 		rebuild := func() error {
-			if err := b.persistResidentDehydrations(info, nil); err != nil {
+			done, ok := b.operations.beginRelease(info.ID)
+			for !ok {
+				b.operations.waitMadeIn(info.ID)
+				if b.runtimeRunsLiveBranch(info.ID) {
+					return rehydrateCold(true)
+				}
+				done, ok = b.operations.beginRelease(info.ID)
+			}
+			err := b.persistResidentDehydrations(info, nil)
+			if err == nil {
+				_, _ = b.command("delete", "--force", info.ID)
+			}
+			done()
+			if err != nil {
 				return err
 			}
-			_, _ = b.command("delete", "--force", info.ID)
 			return rehydrateCold(false)
 		}
 		if !present {
@@ -18815,17 +18992,38 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 		// node while persistent siblings run elsewhere. runsc's branch destroy
 		// correctly refuses to remove a runtime's final branch, so delete this
 		// node-local runtime shell instead; shared family metadata is removed
-		// separately below only for the selected branch.
-		if families, listErr := b.listRuntimeFamiliesOf(target.container); listErr == nil {
+		// separately below only for the selected branch. As a release does,
+		// wait for a remote fork's import into the runtime under way, which
+		// the runtime lists only once it is made, and keep a runtime that
+		// lists a branch made meanwhile, of which this branch alone then goes;
+		// see familyOperations.releasing.
+	final:
+		for {
+			families, listErr := b.listRuntimeFamiliesOf(target.container)
+			if listErr != nil {
+				break
+			}
 			for _, family := range families {
 				if family.ID != target.container || family.branchesUnknown() || len(family.Branches) != 1 || family.Branches[0].ID != target.branch {
 					continue
 				}
-				if _, err := b.command("delete", "--force", target.container); err != nil {
+				done, ok := b.operations.beginRelease(target.container)
+				if !ok {
+					b.operations.waitMadeIn(target.container)
+					continue final
+				}
+				if !b.runtimeListsOnly(target.container, family.Branches) {
+					done()
+					continue final
+				}
+				_, err := b.command("delete", "--force", target.container)
+				done()
+				if err != nil {
 					return fmt.Errorf("deleting final physical runtime branch %s: %w", target, err)
 				}
 				return nil
 			}
+			break
 		}
 		if _, err := b.command("timetravel", target.container, "destroy-reclaim", target.branch); err == nil {
 			return nil

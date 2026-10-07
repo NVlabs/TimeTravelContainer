@@ -1197,6 +1197,63 @@ func reusablePhysicalTarget(records []cluster.PlacementRecord, family, node stri
 	return physical, true, nil
 }
 
+// peerRuntimeReplaceWait bounds how long an import waits for the lifecycle
+// lock to replace the runtime it was reserved into; see replacePeerRuntime.
+var peerRuntimeReplaceWait = time.Minute
+
+// replacePeerRuntime makes the runtime with this ID one that the import of
+// branch can be restored into, as replaceRuntimeForImport does, and reports
+// whether create made it. making ends the import's mark on the runtime,
+// which goes first: a command holding the lifecycle lock may be waiting for
+// the import's branch to be made. It is replaced by the mark taken under the
+// lock. The lock may be long in coming, and its holder may be a remote fork
+// from this node waiting for a target whose import waits for this one's: the
+// import gives up after peerRuntimeReplaceWait, or once ctx is done, unless
+// the replacement has begun.
+func (r *daemonTargetRuntime) replacePeerRuntime(ctx context.Context, id, branch string, create func() error, making *func()) (bool, error) {
+	(*making)()
+	*making = func() {}
+	type replacement struct {
+		created bool
+		making  func()
+		err     error
+	}
+	handover := &importReplacement{}
+	replaced := make(chan replacement, 1)
+	go func() {
+		created, making, err := r.backend.forBackground().replaceRuntimeForImport(id, branch, create, handover)
+		replaced <- replacement{created: created, making: making, err: err}
+	}()
+	timer := time.NewTimer(peerRuntimeReplaceWait)
+	defer timer.Stop()
+	var result replacement
+	select {
+	case result = <-replaced:
+	case <-timer.C:
+		if handover.giveUp() {
+			return false, fmt.Errorf("the node's lifecycle lock was not free in %v", peerRuntimeReplaceWait)
+		}
+		result = <-replaced
+	case <-ctx.Done():
+		if handover.giveUp() {
+			return false, ctx.Err()
+		}
+		result = <-replaced
+	}
+	*making = result.making
+	return result.created, result.err
+}
+
+// restoreLostItsPeer reports whether err is a peer restore's refusal for want
+// of a live branch to restore beside, which its runtime had when the import
+// looked.
+func restoreLostItsPeer(err error) bool {
+	message := err.Error()
+	return strings.Contains(message, "no active peer is available") ||
+		strings.Contains(message, "not available for distributed peer import") ||
+		strings.Contains(message, "dehydration restore peer ") && strings.Contains(message, " became ")
+}
+
 func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transaction, session cluster.RemoteSessionDescriptor) error {
 	defer r.lockTarget(tx.Identity.TargetContainer)()
 	info, targetBranch, peer, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TargetContainer, tx.Identity.TransactionID)
@@ -1205,8 +1262,11 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 	}
 	// The import takes no lifecycle lock: keep a release of the runtime from
 	// deleting it from under the branch until the runtime lists the branch,
-	// once the restore below returns; see familyOperations.releasing.
-	defer r.backend.operations.beginMaking(info.ID, targetBranch.ID)()
+	// once the restore below returns; see familyOperations.releasing. A
+	// replacement of the runtime gives the mark up and takes it again; see
+	// replacePeerRuntime.
+	doneMaking := r.backend.operations.beginMaking(info.ID, targetBranch.ID)
+	defer func() { doneMaking() }()
 	info, err = r.backend.containerStore().RefreshContainerImageRoot(ctx, info.ID)
 	if err != nil {
 		return fmt.Errorf("materializing target image cache: %w", err)
@@ -1307,16 +1367,14 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 	if err != nil {
 		return err
 	}
-	runtimeCreated := false
-	var runtimeState struct {
-		Status string `json:"status"`
-	}
-	stateOutput, stateErr := r.backend.command("state", info.ID)
-	if stateErr == nil {
-		if err := json.Unmarshal(stateOutput, &runtimeState); err != nil {
-			return fmt.Errorf("decoding target runtime state: %w", err)
+	var cleanups []func()
+	defer func() {
+		for _, cleanup := range cleanups {
+			cleanup()
 		}
-	} else {
+	}()
+	// create makes the target's runtime, the import's branch its loader.
+	create := func() error {
 		// A new physical Sentry must bootstrap the exact visible branch and
 		// filesystem identities regardless of whether this transaction was
 		// reserved as a peer import. In particular, the first remote child of a
@@ -1326,7 +1384,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		if err != nil {
 			return fmt.Errorf("preparing distributed target bundle: %w", err)
 		}
-		defer cleanup()
+		cleanups = append(cleanups, cleanup)
 		var diagnostic bytes.Buffer
 		commandBackend := *r.backend
 		commandBackend.stderr = &diagnostic
@@ -1337,199 +1395,243 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		if status != 0 {
 			return fmt.Errorf("creating distributed target runtime exited with status %d: %s", status, strings.TrimSpace(diagnostic.String()))
 		}
+		return nil
+	}
+	runtimeCreated := false
+	var runtimeState struct {
+		Status string `json:"status"`
+	}
+	stateOutput, stateErr := r.backend.command("state", info.ID)
+	if stateErr == nil {
+		if err := json.Unmarshal(stateOutput, &runtimeState); err != nil {
+			return fmt.Errorf("decoding target runtime state: %w", err)
+		}
+	}
+	// The runtime's state is its loader branch's, which may have exited while
+	// another branch runs there: the import goes beside that branch. One that
+	// runs no branch has none to restore beside, and the family's runtime on
+	// the node is made and released under the lifecycle lock: the import
+	// replaces it under the lock, as it makes one the family has no more.
+	// Such a runtime was one whose last live branch a stop or a dehydration
+	// took as the fork went on, keeping the runtime for the import, which was
+	// refused, "distributed peer target runtime is "stopped", want running".
+	switch {
+	case peer && (stateErr != nil || runtimeState.Status != "running" && runtimeState.Status != "created" && !r.backend.runtimeRunsLiveBranch(info.ID)):
+		created, err := r.replacePeerRuntime(ctx, info.ID, targetBranch.ID, create, &doneMaking)
+		if err != nil {
+			return fmt.Errorf("replacing distributed peer target runtime, which runs no branch: %w", err)
+		}
+		if created {
+			runtimeState.Status = "created"
+			runtimeCreated = true
+		}
+	case stateErr != nil:
+		if err := create(); err != nil {
+			return err
+		}
 		runtimeState.Status = "created"
 		runtimeCreated = true
 	}
-	// The runtime's state is its loader branch's, which may have exited while
-	// another branch runs there: the import goes beside that branch. An import
-	// into one so stopped was refused while the runtime ran a live branch.
-	if peer && runtimeState.Status != "running" && runtimeState.Status != "created" && !r.backend.runtimeRunsLiveBranch(info.ID) {
-		return fmt.Errorf("distributed peer target runtime is %q, want running", runtimeState.Status)
-	}
 	if runtimeState.Status == "created" || peer {
+		restore := func(restoreArgs boot.DistributedForkRestoreArgs) error {
+			encoded, err := json.Marshal(&restoreArgs)
+			if err != nil {
+				return err
+			}
+			reader, err := newConfigMemFD("ttc-distributed-restore-config", encoded)
+			if err != nil {
+				return err
+			}
+			connectionCount := restoreArgs.FilesystemConnections
+			if !restoreArgs.SharedMetadata {
+				connectionCount++
+			}
+			if !restoreArgs.GraphSparse {
+				connectionCount += (restoreArgs.MaxParallel + 1) * (restoreArgs.RetryLimit + 1)
+				if restoreArgs.PushPolicy != ttcremote.TCPPushDemandOnly {
+					connectionCount++
+				}
+			}
+			connectionFiles := make([]*os.File, 0, connectionCount)
+			for i := 0; i < connectionCount; i++ {
+				conn, err := (&net.Dialer{Timeout: restoreArgs.Timeout}).DialContext(ctx, "tcp", session.Address)
+				if err != nil {
+					for _, file := range connectionFiles {
+						file.Close()
+					}
+					reader.Close()
+					return fmt.Errorf("connecting donated distributed page stream %d/%d: %w", i+1, connectionCount, err)
+				}
+				tcp, ok := conn.(*net.TCPConn)
+				if !ok {
+					conn.Close()
+					for _, file := range connectionFiles {
+						file.Close()
+					}
+					reader.Close()
+					return fmt.Errorf("distributed page connection is %T, want TCP", conn)
+				}
+				file, err := tcp.File()
+				conn.Close()
+				if err != nil {
+					for _, opened := range connectionFiles {
+						opened.Close()
+					}
+					reader.Close()
+					return err
+				}
+				// The isolated Sentry intentionally treats donated streams as plain
+				// byte FDs and performs no host socket control operations. Install
+				// kernel-enforced per-I/O timeouts before donating the descriptor so
+				// an unreachable source cannot block a guest page fault forever.
+				timeout := unix.NsecToTimeval(restoreArgs.Timeout.Nanoseconds())
+				if err := unix.SetsockoptTimeval(int(file.Fd()), unix.SOL_SOCKET, unix.SO_RCVTIMEO, &timeout); err != nil {
+					file.Close()
+					for _, opened := range connectionFiles {
+						opened.Close()
+					}
+					reader.Close()
+					return fmt.Errorf("setting donated page stream receive timeout: %w", err)
+				}
+				if err := unix.SetsockoptTimeval(int(file.Fd()), unix.SOL_SOCKET, unix.SO_SNDTIMEO, &timeout); err != nil {
+					file.Close()
+					for _, opened := range connectionFiles {
+						opened.Close()
+					}
+					reader.Close()
+					return fmt.Errorf("setting donated page stream send timeout: %w", err)
+				}
+				connectionFiles = append(connectionFiles, file)
+			}
+			files := []*os.File{reader}
+			connectionsStartFD := 4
+			var sharedMetadata *os.File
+			var graphRestore *graphMemoryRestore
+			var durableTargets []*os.File
+			durableActiveDir := ""
+			keepDurableTargets := false
+			defer func() {
+				for _, file := range durableTargets {
+					_ = file.Close()
+				}
+				if durableActiveDir != "" && !keepDurableTargets {
+					_ = os.RemoveAll(durableActiveDir)
+				}
+			}()
+			if restoreArgs.SharedMetadata {
+				sharedMetadata, err = fetchRemoteArtifact(ctx, session.Address, token, session.MetadataArtifact, session.MetadataBytes)
+				if err != nil {
+					reader.Close()
+					return fmt.Errorf("fetching peer distributed metadata: %w", err)
+				}
+				files = append(files, sharedMetadata)
+				connectionsStartFD++
+			}
+			if restoreArgs.GraphSparse {
+				graphManifest, openErr := fetchRemoteArtifact(ctx, session.Address, token, session.GraphArtifact, session.GraphArtifactBytes)
+				if openErr != nil {
+					reader.Close()
+					for _, file := range connectionFiles {
+						file.Close()
+					}
+					return fmt.Errorf("fetching peer graph memory manifest: %w", openErr)
+				}
+				graphRestore, err = r.backend.openDistributedGraphRestore(graphManifest, tx.Identity.TransactionID, restoreArgs.GraphRemoteToken)
+				if err != nil {
+					graphManifest.Close()
+					reader.Close()
+					for _, file := range connectionFiles {
+						file.Close()
+					}
+					return fmt.Errorf("preparing graph memory resolver: %w", err)
+				}
+				files = append(files, graphRestore.manifest, graphRestore.objects)
+				connectionsStartFD += 2
+				files = append(files, graphRestore.remote)
+				connectionsStartFD++
+			}
+			if peer && restoreArgs.DurableDehydration {
+				if sharedMetadata == nil {
+					return errors.New("durable peer metadata is unavailable")
+				}
+				if _, err := sharedMetadata.Seek(0, io.SeekStart); err != nil {
+					return fmt.Errorf("rewinding durable peer metadata: %w", err)
+				}
+				durable, readErr := kernel.ReadDurableDehydrationMetadata(sharedMetadata)
+				if readErr != nil {
+					return fmt.Errorf("reading durable peer metadata: %w", readErr)
+				}
+				if _, err := sharedMetadata.Seek(0, io.SeekStart); err != nil {
+					return fmt.Errorf("rewinding durable peer metadata after inspection: %w", err)
+				}
+				durableActiveDir = memoryBranchDir(r.backend.activeDataRoot(), info.ID, "active", targetBranch)
+				if err := os.RemoveAll(durableActiveDir); err != nil {
+					return err
+				}
+				if err := os.MkdirAll(durableActiveDir, 0700); err != nil {
+					return err
+				}
+				for i := 1; i < len(durable.Memories); i++ {
+					file, err := os.OpenFile(filepath.Join(durableActiveDir, fmt.Sprintf("memory-%04d.mem", i)), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+					if err != nil {
+						return fmt.Errorf("creating durable distributed peer memory %d: %w", i, err)
+					}
+					pgalloc.IMAWorkAroundForMemFile(file.Fd())
+					durableTargets = append(durableTargets, file)
+				}
+				files = append(files, durableTargets...)
+				connectionsStartFD += len(durableTargets)
+			}
+			files = append(files, connectionFiles...)
+			commandArgs := []string{"timetravel", "--distributed-config-fd=3"}
+			if restoreArgs.SharedMetadata {
+				commandArgs = append(commandArgs, "--distributed-metadata-fd=4")
+			}
+			if restoreArgs.GraphSparse {
+				graphStartFD := 5
+				commandArgs = append(commandArgs,
+					"--dehydration-graph-manifest-fd="+strconv.Itoa(graphStartFD),
+					"--dehydration-graph-objects-fd="+strconv.Itoa(graphStartFD+1))
+				if restoreArgs.GraphRemote {
+					commandArgs = append(commandArgs, "--dehydration-memory-remote-fd="+strconv.Itoa(graphStartFD+2))
+				}
+			}
+			commandArgs = append(commandArgs,
+				"--distributed-connections-start-fd="+strconv.Itoa(connectionsStartFD), "--distributed-connections-count="+strconv.Itoa(len(connectionFiles)),
+				info.ID, "distributed-restore", tx.Identity.TransactionID)
+			_, err = r.backend.commandWithFiles(files, commandArgs...)
+			reader.Close()
+			if sharedMetadata != nil {
+				sharedMetadata.Close()
+			}
+			if graphRestore != nil {
+				graphRestore.close()
+			}
+			for _, file := range connectionFiles {
+				file.Close()
+			}
+			if err != nil {
+				return err
+			}
+			keepDurableTargets = true
+			return nil
+		}
 		// A metadata peer restored into a newly created empty Sentry is its
 		// physical loader branch, not an import into an already-running family.
 		restoreArgs.Peer = peer && !runtimeCreated
-		encoded, err := json.Marshal(&restoreArgs)
-		if err != nil {
-			return err
-		}
-		reader, err := newConfigMemFD("ttc-distributed-restore-config", encoded)
-		if err != nil {
-			return err
-		}
-		connectionCount := restoreArgs.FilesystemConnections
-		if !restoreArgs.SharedMetadata {
-			connectionCount++
-		}
-		if !restoreArgs.GraphSparse {
-			connectionCount += (restoreArgs.MaxParallel + 1) * (restoreArgs.RetryLimit + 1)
-			if restoreArgs.PushPolicy != ttcremote.TCPPushDemandOnly {
-				connectionCount++
+		err := restore(restoreArgs)
+		if err != nil && restoreArgs.Peer && (restoreLostItsPeer(err) || !r.backend.runtimeRunsLiveBranch(info.ID)) {
+			// The runtime's last live branch went after the import looked, as
+			// the restore went on beside it or before.
+			if created, replaceErr := r.replacePeerRuntime(ctx, info.ID, targetBranch.ID, create, &doneMaking); replaceErr == nil && created {
+				runtimeCreated = true
+				restoreArgs.Peer = false
+				err = restore(restoreArgs)
 			}
-		}
-		connectionFiles := make([]*os.File, 0, connectionCount)
-		for i := 0; i < connectionCount; i++ {
-			conn, err := (&net.Dialer{Timeout: restoreArgs.Timeout}).DialContext(ctx, "tcp", session.Address)
-			if err != nil {
-				for _, file := range connectionFiles {
-					file.Close()
-				}
-				reader.Close()
-				return fmt.Errorf("connecting donated distributed page stream %d/%d: %w", i+1, connectionCount, err)
-			}
-			tcp, ok := conn.(*net.TCPConn)
-			if !ok {
-				conn.Close()
-				for _, file := range connectionFiles {
-					file.Close()
-				}
-				reader.Close()
-				return fmt.Errorf("distributed page connection is %T, want TCP", conn)
-			}
-			file, err := tcp.File()
-			conn.Close()
-			if err != nil {
-				for _, opened := range connectionFiles {
-					opened.Close()
-				}
-				reader.Close()
-				return err
-			}
-			// The isolated Sentry intentionally treats donated streams as plain
-			// byte FDs and performs no host socket control operations. Install
-			// kernel-enforced per-I/O timeouts before donating the descriptor so
-			// an unreachable source cannot block a guest page fault forever.
-			timeout := unix.NsecToTimeval(restoreArgs.Timeout.Nanoseconds())
-			if err := unix.SetsockoptTimeval(int(file.Fd()), unix.SOL_SOCKET, unix.SO_RCVTIMEO, &timeout); err != nil {
-				file.Close()
-				for _, opened := range connectionFiles {
-					opened.Close()
-				}
-				reader.Close()
-				return fmt.Errorf("setting donated page stream receive timeout: %w", err)
-			}
-			if err := unix.SetsockoptTimeval(int(file.Fd()), unix.SOL_SOCKET, unix.SO_SNDTIMEO, &timeout); err != nil {
-				file.Close()
-				for _, opened := range connectionFiles {
-					opened.Close()
-				}
-				reader.Close()
-				return fmt.Errorf("setting donated page stream send timeout: %w", err)
-			}
-			connectionFiles = append(connectionFiles, file)
-		}
-		files := []*os.File{reader}
-		connectionsStartFD := 4
-		var sharedMetadata *os.File
-		var graphRestore *graphMemoryRestore
-		var durableTargets []*os.File
-		durableActiveDir := ""
-		keepDurableTargets := false
-		defer func() {
-			for _, file := range durableTargets {
-				_ = file.Close()
-			}
-			if durableActiveDir != "" && !keepDurableTargets {
-				_ = os.RemoveAll(durableActiveDir)
-			}
-		}()
-		if restoreArgs.SharedMetadata {
-			sharedMetadata, err = fetchRemoteArtifact(ctx, session.Address, token, session.MetadataArtifact, session.MetadataBytes)
-			if err != nil {
-				reader.Close()
-				return fmt.Errorf("fetching peer distributed metadata: %w", err)
-			}
-			files = append(files, sharedMetadata)
-			connectionsStartFD++
-		}
-		if restoreArgs.GraphSparse {
-			graphManifest, openErr := fetchRemoteArtifact(ctx, session.Address, token, session.GraphArtifact, session.GraphArtifactBytes)
-			if openErr != nil {
-				reader.Close()
-				for _, file := range connectionFiles {
-					file.Close()
-				}
-				return fmt.Errorf("fetching peer graph memory manifest: %w", openErr)
-			}
-			graphRestore, err = r.backend.openDistributedGraphRestore(graphManifest, tx.Identity.TransactionID, restoreArgs.GraphRemoteToken)
-			if err != nil {
-				graphManifest.Close()
-				reader.Close()
-				for _, file := range connectionFiles {
-					file.Close()
-				}
-				return fmt.Errorf("preparing graph memory resolver: %w", err)
-			}
-			files = append(files, graphRestore.manifest, graphRestore.objects)
-			connectionsStartFD += 2
-			files = append(files, graphRestore.remote)
-			connectionsStartFD++
-		}
-		if peer && restoreArgs.DurableDehydration {
-			if sharedMetadata == nil {
-				return errors.New("durable peer metadata is unavailable")
-			}
-			if _, err := sharedMetadata.Seek(0, io.SeekStart); err != nil {
-				return fmt.Errorf("rewinding durable peer metadata: %w", err)
-			}
-			durable, readErr := kernel.ReadDurableDehydrationMetadata(sharedMetadata)
-			if readErr != nil {
-				return fmt.Errorf("reading durable peer metadata: %w", readErr)
-			}
-			if _, err := sharedMetadata.Seek(0, io.SeekStart); err != nil {
-				return fmt.Errorf("rewinding durable peer metadata after inspection: %w", err)
-			}
-			durableActiveDir = memoryBranchDir(r.backend.activeDataRoot(), info.ID, "active", targetBranch)
-			if err := os.RemoveAll(durableActiveDir); err != nil {
-				return err
-			}
-			if err := os.MkdirAll(durableActiveDir, 0700); err != nil {
-				return err
-			}
-			for i := 1; i < len(durable.Memories); i++ {
-				file, err := os.OpenFile(filepath.Join(durableActiveDir, fmt.Sprintf("memory-%04d.mem", i)), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
-				if err != nil {
-					return fmt.Errorf("creating durable distributed peer memory %d: %w", i, err)
-				}
-				pgalloc.IMAWorkAroundForMemFile(file.Fd())
-				durableTargets = append(durableTargets, file)
-			}
-			files = append(files, durableTargets...)
-			connectionsStartFD += len(durableTargets)
-		}
-		files = append(files, connectionFiles...)
-		commandArgs := []string{"timetravel", "--distributed-config-fd=3"}
-		if restoreArgs.SharedMetadata {
-			commandArgs = append(commandArgs, "--distributed-metadata-fd=4")
-		}
-		if restoreArgs.GraphSparse {
-			graphStartFD := 5
-			commandArgs = append(commandArgs,
-				"--dehydration-graph-manifest-fd="+strconv.Itoa(graphStartFD),
-				"--dehydration-graph-objects-fd="+strconv.Itoa(graphStartFD+1))
-			if restoreArgs.GraphRemote {
-				commandArgs = append(commandArgs, "--dehydration-memory-remote-fd="+strconv.Itoa(graphStartFD+2))
-			}
-		}
-		commandArgs = append(commandArgs,
-			"--distributed-connections-start-fd="+strconv.Itoa(connectionsStartFD), "--distributed-connections-count="+strconv.Itoa(len(connectionFiles)),
-			info.ID, "distributed-restore", tx.Identity.TransactionID)
-		_, err = r.backend.commandWithFiles(files, commandArgs...)
-		reader.Close()
-		if sharedMetadata != nil {
-			sharedMetadata.Close()
-		}
-		if graphRestore != nil {
-			graphRestore.close()
-		}
-		for _, file := range connectionFiles {
-			file.Close()
 		}
 		if err != nil {
 			return fmt.Errorf("%w (filesystem restore aliases: %v)", err, restoreArgs.FilesystemRestoreIDs)
 		}
-		keepDurableTargets = true
 		if runtimeCreated {
 			var diagnostic bytes.Buffer
 			commandBackend := *r.backend

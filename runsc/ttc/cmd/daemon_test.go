@@ -1032,6 +1032,110 @@ func TestTransactionSourcedFromMatchesFamilyAndRuntime(t *testing.T) {
 	}
 }
 
+// An import whose runtime runs no branch replaces the runtime with its own,
+// under the lifecycle lock; one that runs a branch it goes beside; and either
+// way the import's mark on the runtime is held once the replacement returns,
+// unless the import gave up first, when nothing is done.
+func TestReplaceRuntimeForImport(t *testing.T) {
+	for _, test := range []struct {
+		name, branches string
+		gaveUp         bool
+		wantCreated    bool
+		wantDeleted    bool
+	}{
+		{name: "stopped", branches: `[{"ID":"x","State":"exited"},{"ID":"d","State":"dehydrated"}]`, wantCreated: true, wantDeleted: true},
+		{name: "live", branches: `[{"ID":"x","State":"running"}]`},
+		{name: "gave up", branches: `[{"ID":"x","State":"exited"}]`, gaveUp: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			runsc := filepath.Join(dir, "runsc")
+			script := `#!/bin/sh
+case "$3" in
+list)
+	if [ -f "$0.deleted" ]; then echo '[]'; else printf '[{"id":"family","pid":%s,"status":"stopped"}]\n' "$PPID"; fi
+	;;
+timetravel)
+	cat "$0.branches"
+	;;
+delete)
+	touch "$0.deleted"
+	;;
+*)
+	echo "unexpected command: $*" >&2
+	exit 2
+	;;
+esac
+`
+			if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(runsc+".branches", []byte(test.branches), 0644); err != nil {
+				t.Fatal(err)
+			}
+			b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: filepath.Join(dir, "shared"), localRoot: filepath.Join(dir, "local"), operations: &familyOperations{}}
+			handover := &importReplacement{}
+			if test.gaveUp && !handover.giveUp() {
+				t.Fatal("an import could not give up before its replacement began")
+			}
+			created := false
+			replaced, making, err := b.replaceRuntimeForImport("family", "y", func() error {
+				created = true
+				return nil
+			}, handover)
+			if test.gaveUp {
+				if !errors.Is(err, errImportGaveUp) || created || replaced {
+					t.Fatalf("replacement for an import that gave up = %t, %v, create called %t", replaced, err, created)
+				}
+				if b.operations.beingMade("family", "y") {
+					t.Fatal("a replacement for an import that gave up left its mark")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, statErr := os.Stat(runsc + ".deleted")
+			if replaced != test.wantCreated || created != test.wantCreated || (statErr == nil) != test.wantDeleted {
+				t.Fatalf("replaced %t, create called %t, deleted %t; want %t, %t, %t", replaced, created, statErr == nil, test.wantCreated, test.wantCreated, test.wantDeleted)
+			}
+			if !b.operations.beingMade("family", "y") {
+				t.Fatal("the import's mark is not held after the replacement")
+			}
+			making()
+			if b.operations.beingMade("family", "y") {
+				t.Fatal("the import's mark outlived its end")
+			}
+		})
+	}
+}
+
+// A replacement begins only if the import still waits, and an import gives
+// up only before the replacement begins.
+func TestImportReplacementHandover(t *testing.T) {
+	waiting := &importReplacement{}
+	if !waiting.begin() || waiting.giveUp() || waiting.abandoned() {
+		t.Fatal("an import gave up after its replacement began")
+	}
+	gone := &importReplacement{}
+	if !gone.giveUp() || gone.begin() || !gone.abandoned() {
+		t.Fatal("a replacement began after its import gave up")
+	}
+}
+
+func TestRestoreLostItsPeer(t *testing.T) {
+	for message, want := range map[string]bool{
+		"timetravel distributed-restore failed: restoring distributed fork \"t\": no active peer is available for dehydration restore": true,
+		"sandbox is stopped, not available for distributed peer import":                                                                true,
+		"dehydration restore peer \"x\" became exited":                                                                                 true,
+		"connecting donated distributed page stream 1/4: connection refused":                                                           false,
+	} {
+		if got := restoreLostItsPeer(errors.New(message)); got != want {
+			t.Errorf("restoreLostItsPeer(%q) = %t, want %t", message, got, want)
+		}
+	}
+}
+
 func TestStopDaemonContainersRemovesRuntimeWithoutFamilyMetadata(t *testing.T) {
 	dir := t.TempDir()
 	runsc := filepath.Join(dir, "runsc")
