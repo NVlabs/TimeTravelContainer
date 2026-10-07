@@ -4733,6 +4733,13 @@ func (b *runtimeBackend) releaseMigratedSourceRuntimeWithPolicy(containerID, bra
 		// An idempotent retry may observe that the branch is already absent.
 		return b.removeMigratedSourceMetadataWithPolicy(info, branchID, publishBacking)
 	}
+	// The runtime's other branches may run no more, exited or dehydrated
+	// here: a family whose main migrated away kept its runtime, which ran
+	// nothing, until the family was removed. It goes as an idle runtime does,
+	// its resident dehydrations made durable first.
+	if _, err := b.releaseIdleRuntime(info.ID); err != nil {
+		return fmt.Errorf("releasing the migrated source's idle runtime: %w", err)
+	}
 	return b.removeMigratedSourceMetadataWithPolicy(info, branchID, publishBacking)
 }
 

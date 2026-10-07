@@ -7590,23 +7590,20 @@ func (b *runtimeBackend) resolveSelectorOnce(info ttcbundle.ContainerInfo, targe
 				// dehydration leaves it, is its filesystem root's, which names
 				// the record of the branch: a migration leaves the branch's
 				// entry in its family's record, the family's catalog entry of
-				// the branch, whose lifecycle is not the branch's. Taken for
-				// the branch, it had a cp of the branch stopped refused,
-				// "cannot copy the offline branch ... while another branch in
-				// its family is live", and the branch, started again, placed
-				// on it.
+				// the branch, which is not the branch's record. Taken for it,
+				// it had a cp of the branch stopped refused, "cannot copy the
+				// offline branch ... while another branch in its family is
+				// live", and the branch, started again, placed on it.
 				if placement.State == cluster.PlacementUnplaced && branchAuthority != nil && branchAuthority.Roots.FilesystemRoot != "" {
-					if entry, entryErr := persistentBranchInfo(info, target.branch); entryErr != nil || normalizeLifecycleState(entry.State) != normalizeLifecycleState(branchAuthority.Lifecycle) {
-						ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-						physical, physicalBranch, resolveErr := waitForCommittedColdBranchMetadata(ctx, b.containerStore(), info.ID, target.branch, *branchAuthority)
-						cancel()
-						if resolveErr != nil {
-							return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("loading durable physical branch for %s: %w", target, resolveErr)
-						}
-						target.container = physical.ID
-						target.branch = physicalBranch.ID
-						return target, physical, nil
+					ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+					physical, physicalBranch, resolveErr := waitForCommittedColdBranchMetadata(ctx, b.containerStore(), info.ID, target.branch, *branchAuthority)
+					cancel()
+					if resolveErr != nil {
+						return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("loading durable physical branch for %s: %w", target, resolveErr)
 					}
+					target.container = physical.ID
+					target.branch = physicalBranch.ID
+					return target, physical, nil
 				}
 				if _, branchErr := persistentBranchInfo(info, target.branch); branchErr != nil && placement.State == cluster.PlacementUnplaced {
 					physical, physicalBranch, resolveErr := b.resolveDistributedPersistentBranch(info, target.branch, "")
@@ -8627,6 +8624,16 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 	preservedPeers, err := freshStartPeers(info, target, b.nodeID)
 	if err != nil {
 		return 1, err
+	}
+	// The record's peers on this node run in the family's runtime here, if
+	// it runs: a migration leaves the branch's entry in its family's record,
+	// naming the node the branch runs on, in a runtime of its own. A start
+	// beside such a branch on its node found no runtime of the family there,
+	// "querying active peers before starting ...: loading container: file
+	// does not exist", and kept its claim of the branch, which every later
+	// command of the branch was then refused for.
+	if len(preservedPeers) != 0 && !b.sandboxSentryRuns(info.ID) {
+		preservedPeers = nil
 	}
 	startBesidePeers := func() (int, error) {
 		info, branch, err = b.prepareFreshStartStorage(info, target, keepLocalFilesystem)
