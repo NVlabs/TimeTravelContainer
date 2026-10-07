@@ -8566,7 +8566,7 @@ func daemonCommandReadsLifecycle(args []string) bool {
 		}
 	}
 	switch args[0] {
-	case "ps", "ls", "inspect", "top", "_processes-local", "stats", "diff":
+	case "ps", "ls", "inspect", "top", "_processes-local", "_rootfs-sizes-local", "stats", "diff":
 		return true
 	default:
 		return daemonCommandReleasesLifecycleAfterStart(args)

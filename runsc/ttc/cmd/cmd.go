@@ -404,6 +404,8 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runStats(args[1:], stdout, stderr, backend)
 	case "_processes-local":
 		err = runProcessesLocal(args[1:], stdout, backend)
+	case "_rootfs-sizes-local":
+		err = runRootfsSizesLocal(args[1:], stdout, backend)
 	case "inspect":
 		err = runInspect(args[1:], stdout, stderr, backend)
 	case "rm":
@@ -4215,31 +4217,129 @@ type psRow struct {
 }
 
 func populatePsSizes(rows []psRow, backend backend) error {
+	writable := make([]uint64, len(rows))
+	known := make([]bool, len(rows))
+	// A branch another node runs is sized there: its Sentry is that node's.
+	// Each node is asked once for each family's.
+	type familyOnNode struct{ node, family string }
+	elsewhere := make(map[familyOnNode][]int)
+	var askOrder []familyOnNode
+	for i := range rows {
+		row := &rows[i]
+		known[i] = row.State == "created"
+		if row.State != "running" && row.State != "paused" {
+			continue
+		}
+		size, err := backend.rootfsSize(selector{container: row.Container, branch: row.Branch})
+		var remote *remoteBranchOwnershipError
+		if errors.As(err, &remote) {
+			key := familyOnNode{node: remote.owner, family: row.Container}
+			if _, ok := elsewhere[key]; !ok {
+				askOrder = append(askOrder, key)
+			}
+			elsewhere[key] = append(elsewhere[key], i)
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("getting size for %s: %w", rows[i].ID, err)
+		}
+		writable[i], known[i] = size, true
+	}
+	if len(askOrder) != 0 {
+		sizer, ok := backend.(interface {
+			remoteRootfsSizes(node, family string, branches []string) (map[string]branchRootfsSize, error)
+		})
+		if !ok {
+			return errors.New("this backend cannot size branches another node runs")
+		}
+		for _, key := range askOrder {
+			branches := make([]string, len(elsewhere[key]))
+			for j, i := range elsewhere[key] {
+				branches[j] = rows[i].Branch
+			}
+			sizes, err := sizer.remoteRootfsSizes(key.node, key.family, branches)
+			if err != nil {
+				return fmt.Errorf("getting sizes on node %q: %w", key.node, err)
+			}
+			for _, i := range elsewhere[key] {
+				size, ok := sizes[rows[i].Branch]
+				switch {
+				case !ok:
+					return fmt.Errorf("getting size for %s: node %q did not size it", rows[i].ID, key.node)
+				case size.Error != "":
+					return fmt.Errorf("getting size for %s: %s", rows[i].ID, size.Error)
+				}
+				writable[i], known[i] = size.WritableBytes, true
+			}
+		}
+	}
 	for i := range rows {
 		row := &rows[i]
 		imageSize := uint64(0)
 		if row.imageSize > 0 {
 			imageSize = uint64(row.imageSize)
 		}
-		known := row.State == "created"
-		writable := uint64(0)
-		if row.State == "running" || row.State == "paused" {
-			var err error
-			writable, err = backend.rootfsSize(selector{container: row.Container, branch: row.Branch})
-			if err != nil {
-				return fmt.Errorf("getting size for %s: %w", row.ID, err)
-			}
-			known = true
-		}
-		row.SizeRootFS = imageSize + writable
-		if known {
-			row.SizeRW = writable
-			row.Size = fmt.Sprintf("%s (virtual %s)", formatImageSize(int64(writable)), formatImageSize(int64(row.SizeRootFS)))
+		row.SizeRootFS = imageSize + writable[i]
+		if known[i] {
+			row.SizeRW = writable[i]
+			row.Size = fmt.Sprintf("%s (virtual %s)", formatImageSize(int64(writable[i])), formatImageSize(int64(row.SizeRootFS)))
 		} else {
 			row.Size = fmt.Sprintf("- (virtual %s)", formatImageSize(int64(imageSize)))
 		}
 	}
 	return nil
+}
+
+// branchRootfsSize is a branch's writable size as the node that runs it
+// sizes it for a listing on another, or why it could not.
+type branchRootfsSize struct {
+	WritableBytes uint64 `json:"writable_bytes"`
+	Error         string `json:"error,omitempty"`
+}
+
+// runRootfsSizesLocal prints, as JSON by branch, the writable size of each of
+// a family's branches that this node runs, for a listing on another node.
+func runRootfsSizesLocal(args []string, stdout io.Writer, backend backend) error {
+	if len(args) < 2 {
+		return errors.New("usage: ttc _rootfs-sizes-local CONTAINER BRANCH...")
+	}
+	sizes := make(map[string]branchRootfsSize, len(args)-1)
+	for _, branch := range args[1:] {
+		size, err := backend.rootfsSize(selector{container: args[0], branch: branch})
+		entry := branchRootfsSize{WritableBytes: size}
+		if err != nil {
+			entry.Error = err.Error()
+		}
+		sizes[branch] = entry
+	}
+	return json.NewEncoder(stdout).Encode(sizes)
+}
+
+// remoteRootfsSizes asks node for the writable sizes of family's branches.
+func (b *runtimeBackend) remoteRootfsSizes(node, family string, branches []string) (map[string]branchRootfsSize, error) {
+	if b.distributedSource == nil {
+		return nil, errors.New("this daemon is not a cluster node")
+	}
+	peer, err := b.distributedSource.peer(node, false)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), remoteProcessesTimeout)
+	defer cancel()
+	status, stdout, stderr, err := executeRemoteDaemonRequest(ctx, peer, daemonRequest{
+		Version: daemonAPIVersion, Action: "command", Args: append([]string{"_rootfs-sizes-local", family}, branches...), DistributedLeaf: true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if status != 0 {
+		return nil, fmt.Errorf("status %d: %s", status, strings.TrimSpace(stderr))
+	}
+	var sizes map[string]branchRootfsSize
+	if err := json.Unmarshal([]byte(stdout), &sizes); err != nil {
+		return nil, fmt.Errorf("decoding the sizes: %w", err)
+	}
+	return sizes, nil
 }
 
 func familyDisplayName(family Family) string {
