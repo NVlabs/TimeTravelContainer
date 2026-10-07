@@ -4539,6 +4539,17 @@ func (b *runtimeBackend) monitorSparseMigrationCleanup(peer *cluster.Client, con
 			tx, err = peer.Status(ctx, transactionID)
 			cancel()
 			if err != nil {
+				// A removal of the branch retires the migration once it has
+				// discarded the migration's source itself, and its target,
+				// which the peer then has no record of: the monitor waited
+				// for the peer for good, and a stop of the node waited for the
+				// monitor until its deadline.
+				if b.distributedSource.transactions != nil {
+					if _, loadErr := b.distributedSource.transactions.Load(transactionID); errors.Is(loadErr, os.ErrNotExist) {
+						relay.Close()
+						return
+					}
+				}
 				continue
 			}
 			switch tx.State {
