@@ -3360,3 +3360,62 @@ func TestFamilyMakingReservesItsNameAndClaimsItsLock(t *testing.T) {
 		t.Error("an anonymous volume is more than the family's own")
 	}
 }
+
+func TestRemoveMovedBranchEntry(t *testing.T) {
+	root := t.TempDir()
+	write := func(info ttcbundle.ContainerInfo) {
+		t.Helper()
+		dir := filepath.Join(root, "containers", info.ID)
+		info.BundleDir = filepath.Join(dir, "bundle")
+		if err := os.MkdirAll(info.BundleDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(info.BundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeCurrentBundleFixture(filepath.Join(dir, "container.json"), info); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The family's record keeps the entry its migration left of mv, and mv's
+	// fork, beside main; the migration's record holds the branch itself.
+	write(ttcbundle.ContainerInfo{ID: "family", Name: "family", Branches: []ttcbundle.BranchInfo{
+		{ID: "main", State: "running", NodeID: "n1", FilesystemBranch: "main"},
+		{ID: "mv", ParentID: "main", State: "running", NodeID: "n1", FilesystemBranch: "b-mv"},
+		{ID: "child", ParentID: "mv", State: "running", NodeID: "n1", FilesystemBranch: "b-child"},
+	}})
+	write(ttcbundle.ContainerInfo{
+		ID: "fork-1", Name: "fork-1", DistributedFamilyID: "family", DistributedForkTransactionID: "fork-1",
+		DistributedPhysicalRuntime: true,
+		Branches:                   []ttcbundle.BranchInfo{{ID: "fork-1", ParentID: "main", State: "running", NodeID: "n2", FilesystemBranch: "b-1"}},
+	})
+	b := &runtimeBackend{dataRoot: root}
+	if err := b.removeMovedBranchEntry("family", "mv"); err != nil {
+		t.Fatal(err)
+	}
+	store := ttcbundle.Store{Root: root}
+	family, err := store.LoadRuntimeContainer("family")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var branches []string
+	for _, branch := range family.Branches {
+		branches = append(branches, branch.ID+"<"+branch.ParentID)
+	}
+	if want := []string{"main<", "child<main"}; !slices.Equal(branches, want) {
+		t.Fatalf("family branches after removal = %v, want %v", branches, want)
+	}
+	// Again, and of a physical runtime's record: nothing to remove.
+	if err := b.removeMovedBranchEntry("family", "mv"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.removeMovedBranchEntry("fork-1", "fork-1"); err != nil {
+		t.Fatal(err)
+	}
+	if physical, err := store.LoadRuntimeContainer("fork-1"); err != nil || len(physical.Branches) != 1 {
+		t.Fatalf("physical runtime record = %+v, %v; want its branch kept", physical, err)
+	}
+	if err := b.removeMovedBranchEntry("gone", "mv"); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -1127,6 +1127,9 @@ func (b *runtimeBackend) reconcilePlacementCatalogOf(families ...string) error {
 			if _, alive := liveSandboxes[info.ID]; !alive {
 				continue
 			}
+			if !internalPhysical && movedBranchEntry(authorityState, record, found, info.ID, branch.ID) {
+				continue
+			}
 			if !found {
 				if internalPhysical {
 					// The transaction is known but publication has not installed its
@@ -1234,6 +1237,40 @@ func (b *runtimeBackend) reconcilePlacementCatalogOf(families ...string) error {
 		}
 	}
 	return result
+}
+
+// movedBranchEntry reports whether the entry of branchID in the record of
+// containerID is only what a migration of the branch left in its family's
+// record, the family's catalog entry of a branch whose runtime is another:
+// the branch's placement, if found, names another physical branch, one that
+// names none saying nothing of it, and if not, a migration in state took the
+// entry's branch for its source. The family's runtime running on the node
+// does not make the entry's branch run in it: taken for its runtime, the
+// entry of a branch migrated and then started on its family's node again put
+// the branch's placement running, and paused, and running again, a paused
+// branch's on every pass; and it placed the branch again once its removal had
+// removed it, and the removal of its family failed, "cannot retire migration
+// source ... while placement ... still exists".
+func movedBranchEntry(state *cluster.AuthorityState, record cluster.PlacementRecord, found bool, containerID, branchID string) bool {
+	if found {
+		if record.PhysicalContainer == "" {
+			return false
+		}
+		physicalBranch := record.PhysicalBranch
+		if physicalBranch == "" {
+			physicalBranch = record.BranchID
+		}
+		return record.PhysicalContainer != containerID || physicalBranch != branchID
+	}
+	if state == nil {
+		return false
+	}
+	for _, tx := range state.Transactions {
+		if tx.Identity.Migration && tx.Identity.SourceContainer == containerID && tx.Identity.SourceBranch == branchID {
+			return true
+		}
+	}
+	return false
 }
 
 // newPlacementReservation is the authority's ownership record installed before a

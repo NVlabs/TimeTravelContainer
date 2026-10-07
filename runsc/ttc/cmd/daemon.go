@@ -3705,6 +3705,30 @@ func migrationSourceIncarnationFenced(state *cluster.AuthorityState, tx cluster.
 	return !record.LeaseActive(now)
 }
 
+// removeMovedBranchEntry removes the entry of branchID from the record of
+// the family familyID, which a migration of the branch left there, the
+// family's catalog entry of a branch that ran elsewhere, once the branch is
+// removed. Left, it named a branch that no longer existed: a fork could not
+// take its name, "branch ... already exists", and a reconciliation on the
+// node it named placed it again. A physical runtime's record is not a
+// family's catalog.
+func (b *runtimeBackend) removeMovedBranchEntry(familyID, branchID string) error {
+	info, err := b.containerStore().LoadRuntimeContainer(familyID)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.IsDistributedPhysicalRuntime() || info.DistributedFamilyID != "" {
+		return nil
+	}
+	if _, err := persistentBranchInfo(info, branchID); err != nil {
+		return nil
+	}
+	return b.containerStore().RemoveBranchRecord(info.ID, branchID)
+}
+
 // discardRemovedMigrationSources completes distributed rm after logical
 // placement deletion. Source cleanup is idempotently rechecked, then the
 // terminal transaction can be retired without losing its recovery intent.
@@ -3745,6 +3769,9 @@ func (b *runtimeBackend) discardRemovedMigrationSources(transactionIDs []string)
 		}
 		if err := b.cleanupRemovedMigrationSource(*tx); err != nil {
 			return err
+		}
+		if err := b.removeMovedBranchEntry(tx.Identity.SourceContainer, tx.Identity.SourceBranch); err != nil {
+			return fmt.Errorf("removing removed migration's family entry %s@%s: %w", tx.Identity.SourceContainer, tx.Identity.SourceBranch, err)
 		}
 		current, err := store.Load(transactionID)
 		if errors.Is(err, os.ErrNotExist) {

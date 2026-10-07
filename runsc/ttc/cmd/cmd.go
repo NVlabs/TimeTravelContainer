@@ -7455,6 +7455,7 @@ func (b *runtimeBackend) resolveSelectorIn(info ttcbundle.ContainerInfo, target 
 			logicalFamily = info.DistributedFamilyID
 		}
 		var publicationID string
+		var branchAuthority *cluster.BranchAuthority
 		// A command's first resolution is of the branch its claim names,
 		// which the claim was validated against just before.
 		claimed := b.claimedAuthority.take(info.ID, target.branch)
@@ -7489,6 +7490,7 @@ func (b *runtimeBackend) resolveSelectorIn(info ttcbundle.ContainerInfo, target 
 				return target, info, nil
 			} else if authorityErr == nil {
 				publicationID = authority.PublicationID
+				branchAuthority = authority
 			} else if !errors.Is(authorityErr, os.ErrNotExist) {
 				return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("resolving authority for %s: %w", target, authorityErr)
 			}
@@ -7545,6 +7547,28 @@ func (b *runtimeBackend) resolveSelectorIn(info ttcbundle.ContainerInfo, target 
 					target.container = physical.ID
 					target.branch = physicalBranch
 					return target, physical, nil
+				}
+				// A cold branch without a publication, as a stop of its
+				// dehydration leaves it, is its filesystem root's, which names
+				// the record of the branch: a migration leaves the branch's
+				// entry in its family's record, the family's catalog entry of
+				// the branch, whose lifecycle is not the branch's. Taken for
+				// the branch, it had a cp of the branch stopped refused,
+				// "cannot copy the offline branch ... while another branch in
+				// its family is live", and the branch, started again, placed
+				// on it.
+				if placement.State == cluster.PlacementUnplaced && branchAuthority != nil && branchAuthority.Roots.FilesystemRoot != "" {
+					if entry, entryErr := persistentBranchInfo(info, target.branch); entryErr != nil || normalizeLifecycleState(entry.State) != normalizeLifecycleState(branchAuthority.Lifecycle) {
+						ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+						physical, physicalBranch, resolveErr := waitForCommittedColdBranchMetadata(ctx, b.containerStore(), info.ID, target.branch, *branchAuthority)
+						cancel()
+						if resolveErr != nil {
+							return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("loading durable physical branch for %s: %w", target, resolveErr)
+						}
+						target.container = physical.ID
+						target.branch = physicalBranch.ID
+						return target, physical, nil
+					}
 				}
 				if _, branchErr := persistentBranchInfo(info, target.branch); branchErr != nil && placement.State == cluster.PlacementUnplaced {
 					physical, physicalBranch, resolveErr := b.resolveDistributedPersistentBranch(info, target.branch, "")

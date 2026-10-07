@@ -3453,3 +3453,40 @@ func TestRuntimeHasOtherBranches(t *testing.T) {
 		}
 	}
 }
+
+func TestMovedBranchEntry(t *testing.T) {
+	state := &cluster.AuthorityState{Transactions: map[string]cluster.Transaction{
+		"fork-1": {Identity: cluster.ForkIdentity{
+			TransactionID: "fork-1", Migration: true,
+			SourceContainer: "family", SourceBranch: "mv", TargetContainer: "family", TargetBranch: "fork-1",
+		}},
+		"fork-2": {Identity: cluster.ForkIdentity{
+			TransactionID: "fork-2", SourceContainer: "family", SourceBranch: "main", TargetContainer: "family", TargetBranch: "rf",
+		}},
+	}}
+	for _, test := range []struct {
+		name      string
+		record    cluster.PlacementRecord
+		found     bool
+		container string
+		branch    string
+		want      bool
+	}{
+		{"the branch's own placement", cluster.PlacementRecord{FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main"}, true, "family", "main", false},
+		{"a placement naming no physical branch", cluster.PlacementRecord{FamilyID: "family", BranchID: "main"}, true, "family", "main", false},
+		{"a fork's runtime's branch whose placement names no physical branch", cluster.PlacementRecord{FamilyID: "family", BranchID: "rf"}, true, "fork-2", "rf", false},
+		{"a branch migrated away", cluster.PlacementRecord{FamilyID: "family", BranchID: "mv", PhysicalContainer: "fork-1", PhysicalBranch: "fork-1"}, true, "family", "mv", true},
+		{"a branch migrated back into its family's runtime", cluster.PlacementRecord{FamilyID: "family", BranchID: "mv", PhysicalContainer: "family", PhysicalBranch: "fork-3"}, true, "family", "mv", true},
+		{"a branch a fork's runtime runs", cluster.PlacementRecord{FamilyID: "family", BranchID: "rf2", PhysicalContainer: "fork-2", PhysicalBranch: "rf2"}, true, "fork-2", "rf2", false},
+		{"a migrated branch removed", cluster.PlacementRecord{}, false, "family", "mv", true},
+		{"a remote fork's source", cluster.PlacementRecord{}, false, "family", "main", false},
+		{"a branch never placed", cluster.PlacementRecord{}, false, "family", "other", false},
+	} {
+		if got := movedBranchEntry(state, test.record, test.found, test.container, test.branch); got != test.want {
+			t.Errorf("%s: movedBranchEntry = %t, want %t", test.name, got, test.want)
+		}
+	}
+	if movedBranchEntry(nil, cluster.PlacementRecord{}, false, "family", "mv") {
+		t.Error("movedBranchEntry without an authority state = true, want false")
+	}
+}
