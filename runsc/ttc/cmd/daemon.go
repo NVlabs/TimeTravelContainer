@@ -3171,6 +3171,22 @@ func distributedDrainRetryable(err error) bool {
 	return false
 }
 
+// distributedTargetGoneWait bounds how long a source's drain waits for the
+// transaction of a remote fork whose target's branch is gone to be canceled,
+// as a removal of the fork does next.
+const distributedTargetGoneWait = 30 * time.Second
+
+// distributedTargetGone reports whether err is a target node's refusal to
+// drain a remote fork's target for want of the target's branch.
+func distributedTargetGone(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "target branch is unavailable") ||
+		strings.Contains(message, "file does not exist") || strings.Contains(message, "no such file or directory")
+}
+
 // distributedDrainStepAdvanced reports the only successful state advances a
 // concurrent target worker may commit between a drain RPC and the following
 // status read. In that case an RPC revision conflict describes stale input,
@@ -3272,6 +3288,23 @@ func drainSourceDependency(backend *runtimeBackend, source *distributedSourceRun
 			return fmt.Errorf("finding distributed target node %q for transaction %q: %w", tx.Identity.TargetNodeID, tx.Identity.TransactionID, err)
 		}
 	}
+	// A removal of a remote fork cancels its transaction and takes its
+	// target, in either order. No branch reads the source for the fork then,
+	// and the source's command goes on, as had the removal come first: a
+	// dehydration of the source beside the removal failed, "draining
+	// distributed target ... failed permanently while transaction remained
+	// published", the target's branch gone and its transaction not yet
+	// canceled. A canceled migration keeps its source; see
+	// monitorSparseMigrationCleanup.
+	sourceRuntime, _ := migrationSourceRuntime(tx)
+	canceledFork := func(tx cluster.Transaction) bool {
+		if tx.State != cluster.TransactionCanceled || tx.Identity.Migration {
+			return false
+		}
+		_, _ = backend.command("timetravel", sourceRuntime, distributedSourceTerminalCommand(&tx), tx.Identity.TransactionID)
+		return true
+	}
+	var targetGone time.Time
 	for tx.State != cluster.TransactionIndependent {
 		var (
 			current *cluster.Transaction
@@ -3286,6 +3319,9 @@ func drainSourceDependency(backend *runtimeBackend, source *distributedSourceRun
 			current, stepErr = peer.MarkIndependent(ctx, tx.Identity.TransactionID, tx.Revision)
 		case cluster.TransactionCanceled, cluster.TransactionFailed:
 			cancel()
+			if canceledFork(tx) {
+				return nil
+			}
 			return fmt.Errorf("distributed target %q became %s while draining: %s", tx.Identity.TargetContainer, tx.State, tx.Failure)
 		default:
 			cancel()
@@ -3306,6 +3342,9 @@ func drainSourceDependency(backend *runtimeBackend, source *distributedSourceRun
 		if statusErr == nil {
 			tx = *current
 			if tx.State == cluster.TransactionCanceled || tx.State == cluster.TransactionFailed {
+				if canceledFork(tx) {
+					return nil
+				}
 				return fmt.Errorf("distributed target %q became %s while draining: %s", tx.Identity.TargetContainer, tx.State, tx.Failure)
 			}
 			// The transaction changed meanwhile without advancing, and the
@@ -3316,6 +3355,15 @@ func drainSourceDependency(backend *runtimeBackend, source *distributedSourceRun
 				continue
 			}
 			if !distributedDrainRetryable(stepErr) {
+				// The target's branch went before its transaction was
+				// canceled, which comes next; see canceledFork.
+				if !tx.Identity.Migration && distributedTargetGone(stepErr) && (targetGone.IsZero() || time.Since(targetGone) < distributedTargetGoneWait) {
+					if targetGone.IsZero() {
+						targetGone = time.Now()
+					}
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
 				return fmt.Errorf("draining distributed target %q failed permanently while transaction remained %s: %w", tx.Identity.TargetContainer, tx.State, stepErr)
 			}
 			time.Sleep(100 * time.Millisecond)

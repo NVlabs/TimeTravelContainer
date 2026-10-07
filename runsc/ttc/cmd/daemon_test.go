@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -346,6 +347,65 @@ func TestDistributedDrainRetryable(t *testing.T) {
 	} {
 		if got := distributedDrainRetryable(test.err); got != test.want {
 			t.Errorf("distributedDrainRetryable(%q)=%t, want %t", test.err, got, test.want)
+		}
+	}
+}
+
+// A removal of a remote fork takes its target's branch and cancels its
+// transaction, in either order: a drain of the fork's source, as a
+// dehydration of the source makes, waits out the gap between the two and goes
+// on once the transaction is canceled, its source session canceled too.
+func TestSourceDrainSettlesAForkRemovedMeanwhile(t *testing.T) {
+	const id = "fork-0123456789abcdef0123456789abcdef"
+	var statuses atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/forks/"+id+"/drain":
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": `distributed fork transaction "` + id + `" target branch is unavailable`})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/forks/"+id:
+			tx := cluster.Transaction{Identity: cluster.ForkIdentity{TransactionID: id, SourceNodeID: "node-a", TargetNodeID: "node-b", SourceContainer: "web", SourceBranch: "main", TargetContainer: id}, State: cluster.TransactionPublished, Revision: 6}
+			if statuses.Add(1) >= 3 {
+				tx.State, tx.Revision = cluster.TransactionCanceled, 7
+			}
+			_ = json.NewEncoder(w).Encode(&tx)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	calls := filepath.Join(t.TempDir(), "calls")
+	runsc := filepath.Join(t.TempDir(), "runsc")
+	if err := os.WriteFile(runsc, []byte("#!/bin/sh\necho \"$@\" >> "+calls+"\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	backend := &runtimeBackend{root: t.TempDir(), runsc: runsc, stdin: strings.NewReader(""), stdout: io.Discard, stderr: io.Discard}
+	source := &distributedSourceRuntime{peers: map[string]*cluster.Client{"node-b": {BaseURL: server.URL, HTTP: server.Client()}}}
+	tx := cluster.Transaction{
+		Identity: cluster.ForkIdentity{TransactionID: id, SourceNodeID: "node-a", TargetNodeID: "node-b", SourceContainer: "web", SourceBranch: "main", TargetContainer: id},
+		State:    cluster.TransactionPublished, Revision: 6, SourceNeeded: true,
+	}
+	if err := drainSourceDependency(backend, source, nil, tx); err != nil {
+		t.Fatalf("drainSourceDependency: %v", err)
+	}
+	data, err := os.ReadFile(calls)
+	if err != nil || !strings.Contains(string(data), "timetravel web distributed-cancel "+id) {
+		t.Fatalf("the source's session was not canceled: %q, %v", data, err)
+	}
+}
+
+func TestDistributedTargetGone(t *testing.T) {
+	for _, test := range []struct {
+		err  error
+		want bool
+	}{
+		{err: errors.New(`cluster peer: distributed fork transaction "fork-1" target branch is unavailable`), want: true},
+		{err: errors.New("cluster peer: loading container: file does not exist"), want: true},
+		{err: errors.New("distributed memory drain failed: remote page server: I/O error")},
+		{err: errors.New("cluster peer: distributed memory drain is still in progress")},
+	} {
+		if got := distributedTargetGone(test.err); got != test.want {
+			t.Errorf("distributedTargetGone(%q)=%t, want %t", test.err, got, test.want)
 		}
 	}
 }
