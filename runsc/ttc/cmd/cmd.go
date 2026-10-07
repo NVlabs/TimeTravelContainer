@@ -5356,9 +5356,11 @@ func stopBranchLifecycle(target branchOperationTarget, stopSignal, timeoutSecond
 		// a running branch's stop does while its init exits: a publication that
 		// could not complete held a stop, and with it the lock, for good, and
 		// every command of the family on the node behind them.
+		// The wait is bounded as a remote fork's of the branch is, rather
+		// than hold the command for as long as the publication retries.
 		var result waitResult
 		if err := withoutLifecycleLock(backend, target.selector, longOperation{branch: target.selector.branch, state: "stopping"}, func() error {
-			result = waitForDurableBranch(target.selector, backend)
+			result = waitForDurableBranchUntil(target.selector, backend, time.Now().Add(sharedDehydrationWait))
 			return nil
 		}); err != nil {
 			return fmt.Errorf("waiting for dehydration of %s: %w", target.selector, err)
@@ -5462,9 +5464,18 @@ type residentDehydrationBackend interface {
 }
 
 func waitForDurableBranch(target selector, backend backend) waitResult {
+	return waitForDurableBranchUntil(target, backend, time.Time{})
+}
+
+// waitForDurableBranchUntil is waitForDurableBranch, which gives up at
+// deadline, unless it is zero.
+func waitForDurableBranchUntil(target selector, backend backend, deadline time.Time) waitResult {
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 	for {
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			return waitResult{err: fmt.Errorf("%s is not durable yet: its storage publication is still under way", target)}
+		}
 		// runtimeBackend implements both interfaces in every mode. Select the
 		// cluster authority only for clustered storage; in standalone mode TTC_ROOT is
 		// the authoritative store and a local capture is already durable. Merely

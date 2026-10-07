@@ -3226,9 +3226,9 @@ func (b *runtimeBackend) awaitSharedDehydratedSource(sourceInfo ttcbundle.Contai
 	return true, err
 }
 
-// sharedDehydrationWait bounds how long a remote fork of a dehydrated branch
-// waits for the branch's image to be published; see
-// awaitSharedDehydratedSource.
+// sharedDehydrationWait bounds how long a remote fork of a dehydrated branch,
+// and a stop of a dehydrating one, wait for the branch's image to be
+// published; see awaitSharedDehydratedSource.
 const sharedDehydrationWait = 5 * time.Minute
 
 func (b *runtimeBackend) forkRemoteDehydrated(source, logicalSource selector, sourceInfo ttcbundle.ContainerInfo, peer *cluster.Client, targetNode string, target selector, paused bool, committedTransaction *string) (result selector, retErr error) {

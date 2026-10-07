@@ -3835,6 +3835,26 @@ func TestWaitDurableUsesClusterAuthorityInsteadOfStaleLocalMetadata(t *testing.T
 	}
 }
 
+// A stop of a dehydrating branch waits for the branch's publication for so
+// long, then gives up rather than hold the command for as long as the
+// publication retries.
+func TestWaitForDurableBranchUntilGivesUpAtItsDeadline(t *testing.T) {
+	b := &authoritativeWaitBackend{fakeBackend: &fakeBackend{}}
+	target := selector{container: "web", branch: "child"}
+	started := time.Now()
+	result := waitForDurableBranchUntil(target, b, started.Add(200*time.Millisecond))
+	if result.err == nil || !strings.Contains(result.err.Error(), "still under way") {
+		t.Fatalf("waitForDurableBranchUntil = %v, want the publication still under way", result.err)
+	}
+	if elapsed := time.Since(started); elapsed < 200*time.Millisecond || elapsed > 5*time.Second {
+		t.Fatalf("waitForDurableBranchUntil gave up after %v, want its deadline", elapsed)
+	}
+	b.durable = true
+	if result := waitForDurableBranchUntil(target, b, time.Now().Add(time.Minute)); result.err != nil {
+		t.Fatalf("waitForDurableBranchUntil of a durable branch = %v", result.err)
+	}
+}
+
 func containsSelector(values []selector, target selector) bool {
 	for _, value := range values {
 		if value == target {
