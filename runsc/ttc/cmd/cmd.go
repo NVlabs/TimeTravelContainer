@@ -58,6 +58,7 @@ import (
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
 	ttcimages "gvisor.dev/gvisor/runsc/ttc/images"
+	"gvisor.dev/gvisor/runsc/ttc/protocol"
 	ttcstorage "gvisor.dev/gvisor/runsc/ttc/storage"
 	"gvisor.dev/gvisor/runsc/version"
 )
@@ -594,6 +595,10 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		var status exitStatus
 		if errors.As(err, &status) {
 			return status.code
+		}
+		if mover, ok := backend.(interface{ refusedAsMoved() bool }); ok && mover.refusedAsMoved() {
+			fmt.Fprintf(stderr, "%s %v\n", protocol.StaleRouteRefusal, err)
+			return 1
 		}
 		fmt.Fprintf(stderr, "ttc: %v\n", err)
 		return 1
@@ -7443,6 +7448,19 @@ type commandMoves struct {
 	mu       sync.Mutex
 	resolved bool
 	owner    string
+	// refuse has the command's failure refused as routed stale, if its
+	// first resolution found its branch on another node; see runCommand.
+	refuse bool
+}
+
+// refusedAsMoved reports whether the command's failure is to be refused as
+// routed stale: its daemon asked for that, and its first resolution found
+// its branch on another node.
+func (b *runtimeBackend) refusedAsMoved() bool {
+	if b == nil || b.moves == nil || !b.moves.refuse {
+		return false
+	}
+	return b.moves.movedTo() != ""
 }
 
 // note records the outcome of a resolution: the first of a command's that

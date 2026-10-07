@@ -3578,6 +3578,22 @@ func TestCommandMovesNotesTheFirstResolution(t *testing.T) {
 	if none.movedTo() != "" {
 		t.Fatal("a command without a record of moves recorded one")
 	}
+	// A routed command that is not journaled is refused as routed stale.
+	refused := &runtimeBackend{moves: &commandMoves{refuse: true}}
+	if refused.refusedAsMoved() {
+		t.Fatal("a command was refused before it found its branch moved")
+	}
+	refused.moves.note(moved)
+	if !refused.refusedAsMoved() {
+		t.Fatal("a routed command whose branch moved was not refused as routed stale")
+	}
+	var status bytes.Buffer
+	if code := runCommand([]string{"pause", "web@main"}, io.Discard, &status, &movedPauseBackend{runtimeBackend: refused}); code != 1 || !strings.HasPrefix(status.String(), protocol.StaleRouteRefusal) {
+		t.Fatalf("runCommand = %d, %q; want the stale-route refusal", code, status.String())
+	}
+	if got := branchSelectorCount([]string{"exec", "-t", "web@main", "echo", "a"}); got != 1 {
+		t.Fatalf("branchSelectorCount = %d, want 1", got)
+	}
 	for _, test := range []struct {
 		args    []string
 		archive bool
@@ -3596,6 +3612,15 @@ func TestCommandMovesNotesTheFirstResolution(t *testing.T) {
 			t.Errorf("movableDaemonCommand(%q, %t) = %t, want %t", test.args, test.archive, got, test.want)
 		}
 	}
+}
+
+// movedPauseBackend fails every pause on its branch's move to node-b.
+type movedPauseBackend struct {
+	*runtimeBackend
+}
+
+func (b *movedPauseBackend) pause(target selector) error {
+	return &remoteBranchOwnershipError{target: target, owner: "node-b"}
 }
 
 // A command making a branch in a migration's source runtime keeps the

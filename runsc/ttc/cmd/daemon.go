@@ -8358,6 +8358,14 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	if listing {
 		status = s.runListing(opts.dataRoot, request.Args, backend)
 	} else {
+		// A command a router sent here that its first resolution finds
+		// the branch of on another node, as an exec whose branch a
+		// rehydration there took meanwhile, has done nothing: it is refused
+		// as routed stale, before any output, and its router sends it on.
+		// An exec failed so, "branch ... belongs to cluster node ...".
+		if len(request.Route) != 0 && !request.streamsClientFrames() && archiveFile == nil && branchSelectorCount(request.Args) == 1 {
+			backend.moves = &commandMoves{refuse: true}
+		}
 		status = runCommand(request.Args, backend.stdout, backend.stderr, backend)
 	}
 	// What the command changed, it resolves anew after.
@@ -8431,13 +8439,21 @@ func movableDaemonCommand(request daemonRequest, archive bool) bool {
 	if args[0] == "cp" || args[0] == "port" {
 		return false
 	}
+	return branchSelectorCount(request.Args) == 1
+}
+
+// branchSelectorCount counts the CONTAINER@BRANCH operands of a command.
+func branchSelectorCount(args []string) int {
+	if len(args) != 0 && args[0] == "container" {
+		args = args[1:]
+	}
 	selectors := 0
-	for _, arg := range args[1:] {
-		if !strings.HasPrefix(arg, "-") && strings.Contains(arg, "@") {
+	for i, arg := range args {
+		if i != 0 && !strings.HasPrefix(arg, "-") && strings.Contains(arg, "@") {
 			selectors++
 		}
 	}
-	return selectors == 1
+	return selectors
 }
 
 // forwardMovedCommand sends request, whose branch its first resolution here
