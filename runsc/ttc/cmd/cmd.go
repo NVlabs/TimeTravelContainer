@@ -7597,6 +7597,12 @@ func (b *runtimeBackend) commit(target selector, reference string, options image
 			return ttcimages.Info{}, err
 		}
 		temporaryBranch = "commit-" + hex.EncodeToString(random[:])
+		if err := b.drainDistributedTargetFilesystems(info, branch); err != nil {
+			repository.Close()
+			reader.Close()
+			writer.Close()
+			return ttcimages.Info{}, err
+		}
 		// A cluster's snapshot origins are its authority's to hand out. A
 		// snapshot that took its own sealed the branch's origin as a
 		// standalone one, past which no publication of the branch could go,
@@ -7660,6 +7666,7 @@ func (b *runtimeBackend) commit(target selector, reference string, options image
 			}
 		}
 		_ = finishOrigins(true)
+		attachErr := b.attachPublishedFilesystemSource(repository, *rootfs, branch, temporaryBranch)
 		defer func() {
 			cleanupErr := repository.RemoveBranch(temporaryBranch)
 			if cleanupErr == nil {
@@ -7677,6 +7684,11 @@ func (b *runtimeBackend) commit(target selector, reference string, options image
 				retErr = errors.Join(retErr, fmt.Errorf("removing commit snapshot: %w", cleanupErr))
 			}
 		}()
+		if attachErr != nil {
+			reader.Close()
+			writer.Close()
+			return ttcimages.Info{}, attachErr
+		}
 		go func() {
 			err := repository.WriteLayerTar(temporaryBranch, writer)
 			_ = writer.CloseWithError(err)
@@ -17725,6 +17737,61 @@ func (b *runtimeBackend) distributedTargetFilesystemsLocal(info ttcbundle.Contai
 		}
 		if len(remote) != 0 {
 			return fmt.Errorf("%d files of filesystem %q are still remote", len(remote), config.Source)
+		}
+	}
+	return nil
+}
+
+// drainDistributedTargetFilesystems makes local, through its Sentry, the
+// files that branch, a remote fork's import, still reads from its source: a
+// reader of the branch's repositories in this process, as a commit's or a
+// checkpoint's export, has no source of them attached.
+func (b *runtimeBackend) drainDistributedTargetFilesystems(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) error {
+	if transactionIDForBranch(info, branch) == "" || branch.DependentFilesystemBytes == 0 {
+		return nil
+	}
+	switch normalizeLifecycleState(branch.State) {
+	case "running", "paused":
+	default:
+		return nil
+	}
+	if _, err := b.command("timetravel", info.ID, "distributed-filesystem-drain", branch.ID); err != nil {
+		return fmt.Errorf("draining the files %s imports: %w", branch.ID, err)
+	}
+	return b.waitDistributedBranchFilesystems(info.ID, branch.ID, 5*time.Minute)
+}
+
+// attachPublishedFilesystemSource attaches to repository, of the filesystem
+// that config describes, the shared packs of the last publication of branch
+// as the source of what a lazy rehydration of the branch has yet to read, for
+// branchID, the repository's branch of it or a fork of that, to be read in
+// this process, as the branch's next publication reads it. A commit's or a
+// checkpoint's export of a branch rehydrated from its durable image failed
+// so, "deferred TTC catalog ... has no attached authoritative source", until
+// every file had been read.
+func (b *runtimeBackend) attachPublishedFilesystemSource(repository *ttcvolume.Repository, config specutils.TTCVolumeRepository, branch ttcbundle.BranchInfo, branchID string) error {
+	if branch.StorageManifest == "" || b.snapshotShared == nil {
+		return nil
+	}
+	if lazy, err := repository.Branch(branchID); err != nil {
+		return err
+	} else if lazy.RemoteCatalog == "" || !lazy.RemoteShared {
+		return nil
+	}
+	published, err := readColdBranchManifest(branch.StorageManifest)
+	if err != nil {
+		return fmt.Errorf("reading the published filesystems of %s: %w", branch.ID, err)
+	}
+	for _, filesystem := range published.Filesystems {
+		if filesystem.Root.Source != config.Source {
+			continue
+		}
+		source, err := newSharedFilesystemSource(b.snapshotShared, filesystem.Root.Root, config.Source, filesystem.Origins)
+		if err == nil {
+			err = repository.AttachLocalObjectSource(source, branchID)
+		}
+		if err != nil {
+			return fmt.Errorf("attaching the published filesystem %q of %s: %w", config.Source, branch.ID, err)
 		}
 	}
 	return nil

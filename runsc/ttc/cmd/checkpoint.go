@@ -212,6 +212,15 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest, output io.Writer)
 		}
 		return fmt.Errorf("branch %s is %s, cannot checkpoint", target, sourceState)
 	}
+	sourceBranch, err := persistentBranchInfo(info, target.branch)
+	if err != nil {
+		return err
+	}
+	// The export reads the branch's files in this process, which has no
+	// source of those still to come from a remote fork's.
+	if err := b.drainDistributedTargetFilesystems(info, sourceBranch); err != nil {
+		return err
+	}
 	spec, err := b.containerStore().LoadSpecOf(info)
 	if err != nil {
 		return err
@@ -311,7 +320,7 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest, output io.Writer)
 		if memorySegments, err = b.saveCheckpointDehydration(info, hiddenBranch, request.compression, stateDir, archive); err != nil {
 			return fmt.Errorf("saving checkpoint state: %w", err)
 		}
-		manifestRepositories, hostMounts, err = b.saveCheckpointState(spec, hiddenInfo.FilesystemBranch, stage)
+		manifestRepositories, hostMounts, err = b.saveCheckpointState(spec, hiddenInfo.FilesystemBranch, stage, sourceBranch)
 		return err
 	}); err != nil {
 		return err
@@ -361,7 +370,9 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest, output io.Writer)
 
 // saveCheckpointState saves the hidden checkpoint branch's repositories, of
 // its filesystem branch persistentBranch, and host mounts in stage.
-func (b *runtimeBackend) saveCheckpointState(spec *specs.Spec, persistentBranch, stage string) (manifestRepositories []ttccheckpoint.RepositorySnapshot, hostMounts []ttccheckpoint.HostMountSnapshot, retErr error) {
+// saveCheckpointState exports the filesystems of persistentBranch, the
+// checkpoint's fork of source, and the host mounts of spec, into stage.
+func (b *runtimeBackend) saveCheckpointState(spec *specs.Spec, persistentBranch, stage string, source ttcbundle.BranchInfo) (manifestRepositories []ttccheckpoint.RepositorySnapshot, hostMounts []ttccheckpoint.HostMountSnapshot, retErr error) {
 	repositories, err := specutils.TTCVolumeRepositories(spec)
 	if err != nil {
 		return nil, nil, err
@@ -385,6 +396,9 @@ func (b *runtimeBackend) saveCheckpointState(spec *specs.Spec, persistentBranch,
 			return nil, nil, fmt.Errorf("opening checkpoint repository %q: %w", config.Source, err)
 		}
 		opened = append(opened, repository)
+		if err := b.attachPublishedFilesystemSource(repository, config, source, persistentBranch); err != nil {
+			return nil, nil, err
+		}
 		relative := filepath.Join("repositories", strconv.Itoa(index))
 		if _, err := repository.ExportSnapshot(persistentBranch, filepath.Join(stage, relative)); err != nil {
 			return nil, nil, fmt.Errorf("exporting checkpoint repository %q: %w", config.Source, err)
