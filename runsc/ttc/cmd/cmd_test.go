@@ -3835,6 +3835,53 @@ func TestWaitDurableUsesClusterAuthorityInsteadOfStaleLocalMetadata(t *testing.T
 	}
 }
 
+// A fork of a dehydrated branch away from the node that holds its capture
+// waits for the branch's publication to write its image to the shared store,
+// as a remote fork's target reads it from there, and says it waited.
+func TestForkOfAPublishingBranchWaitsForItsImage(t *testing.T) {
+	root := t.TempDir()
+	bundleDir := filepath.Join(root, "containers", "web", "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	branch := ttcbundle.BranchInfo{ID: "main", State: "dehydrated", StorageState: "publishing", PublicationID: "publication-2", CreatedAt: time.Now()}
+	info := ttcbundle.ContainerInfo{ID: "web", Name: "web", BundleDir: bundleDir, Branches: []ttcbundle.BranchInfo{branch}}
+	if err := writeCurrentBundleFixture(filepath.Join(root, "containers", "web", "container.json"), info); err != nil {
+		t.Fatal(err)
+	}
+	b := &runtimeBackend{dataRoot: root, stdin: strings.NewReader(""), stdout: io.Discard, stderr: io.Discard,
+		distributedSource: &distributedSourceRuntime{authority: &cluster.AuthorityCatalog{}}}
+	target := selector{container: "web", branch: "main"}
+	store := ttcbundle.Store{Root: root}
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		_ = store.CompleteBranchPublication("web", "main", "publication-2", filepath.Join(root, "manifest.json"), "", false)
+	}()
+	started := time.Now()
+	waited, err := b.awaitSharedDehydratedSource(info, target, target, branch)
+	if err != nil || !waited {
+		t.Fatalf("awaitSharedDehydratedSource = %t, %v; want it to wait for the image", waited, err)
+	}
+	if elapsed := time.Since(started); elapsed < 150*time.Millisecond {
+		t.Fatalf("awaitSharedDehydratedSource returned after %v, before the image was shared", elapsed)
+	}
+	// Shared, the image is forked at once.
+	shared, err := store.LoadContainer("web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := persistentBranchInfo(shared, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if waited, err := b.awaitSharedDehydratedSource(shared, target, target, record); err != nil || waited {
+		t.Fatalf("awaitSharedDehydratedSource of a shared image = %t, %v; want no wait", waited, err)
+	}
+}
+
 // movedStopBackend's branch was rehydrated on another node while a stop
 // waited for its dehydration.
 type movedStopBackend struct {

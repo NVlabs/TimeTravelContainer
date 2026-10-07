@@ -14493,6 +14493,18 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 				return nil, err
 			}
 		}
+		// Away from the node that holds its capture, the branch is forked
+		// from its image in the shared store, which its publication may still
+		// be writing, as a remote fork's target reads it: a fork read the
+		// image of the publication before, "materializing dehydrated source:
+		// cold manifest publication is ..., branch publication is ...".
+		if sourceRecord.StorageState != "shared" && !b.coldCaptureLocal(containerInfo, sourceRecord) {
+			if waited, err := b.awaitSharedDehydratedSource(containerInfo, source, logicalSource, sourceRecord); err != nil {
+				return nil, err
+			} else if waited {
+				return b.forkMany(logicalSource, destinations, paused, quarantine)
+			}
+		}
 		return b.forkDehydratedMany(source, logicalSource.branch, containerInfo, sourceRecord, destinations, paused, sourceRecord.Quarantined || quarantine)
 	}
 	// A source that no transaction produced has shared-only roots, and its

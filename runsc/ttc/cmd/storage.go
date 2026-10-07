@@ -2501,6 +2501,17 @@ func (b *runtimeBackend) installColdExecConsoleLogs(info ttcbundle.ContainerInfo
 	return nil
 }
 
+// coldCaptureLocal reports whether this node holds branch's current capture,
+// which a cold branch's commands read instead of its image in the shared
+// store; see ensureLocalColdBranch.
+func (b *runtimeBackend) coldCaptureLocal(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) bool {
+	localImage := existingMemoryBranchDir(b.activeDataRoot(), info.ID, "dehydrated", branch)
+	if _, err := os.Stat(localImage); err != nil {
+		return false
+	}
+	return branch.SnapshotID == 0 || localGraphCaptureMatches(localImage, branch)
+}
+
 func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) error {
 	localImage := existingMemoryBranchDir(b.activeDataRoot(), info.ID, "dehydrated", branch)
 	_, localErr := os.Stat(localImage)
