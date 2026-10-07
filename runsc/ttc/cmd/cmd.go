@@ -19352,11 +19352,23 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 	if err != nil {
 		return fmt.Errorf("checking logical peers before removing %s: %w", requested, err)
 	}
+	// An import going into the container, as a migration's or a remote
+	// fork's target beside its last branch does, is recorded apart from its
+	// branches until it is published, and runs in the container's runtime
+	// by then: the container stays for it, and only the branch goes. Imports
+	// take no lifecycle lock, so the record is read again. Removed whole, the
+	// container took a migrated branch's runtime with it, and the branch was
+	// lost, "loading physical runtime for ...: container ... does not exist",
+	// in a run of the four-client probe with migrations.
+	importing := len(info.DistributedForkImports) != 0
+	if latest, loadErr := b.containerStore().LoadRuntimeContainer(info.ID); loadErr == nil && len(latest.DistributedForkImports) != 0 {
+		importing = true
+	}
 	// A transaction-scoped physical container may always disappear with its
 	// final local branch: the canonical family record is a different object.
 	// The canonical physical container, however, also carries the logical
 	// family identity and must survive while a peer placement exists remotely.
-	if remaining == 1 && (!logicalPeers || info.ID != logicalFamily) {
+	if remaining == 1 && !importing && (!logicalPeers || info.ID != logicalFamily) {
 		// Removing the family's final branch also removes the now-empty family.
 		// Named volumes remain independently managed, matching a normal rm
 		// without --volumes.
