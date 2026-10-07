@@ -16363,6 +16363,17 @@ runtime:
 			}
 			branch = updated
 			if _, err := b.command("timetravel", info.ID, "destroy", target.branch); err != nil {
+				// The runtime may have gone since it was listed, as a release
+				// of it does once another branch's dehydration or migration
+				// leaves it running nothing: the branch's state there went
+				// with it, and the discard goes on. Refused, a stop of a
+				// dehydrated branch left the record's memory parked, which
+				// the authority still named as the branch's image: every
+				// command of the branch failed for good, "memory snapshot is
+				// 0, committed authority has ...".
+				if families, listErr := b.listRuntimeFamiliesOf(info.ID); listErr == nil && !runtimeListsBranch(families, info.ID, target.branch) {
+					break runtime
+				}
 				return fmt.Errorf("discarding live runtime state for %s: %w", target, err)
 			}
 			break runtime
@@ -16406,6 +16417,21 @@ runtime:
 		return err
 	}
 	return b.deleteRuntimeIfProcessFree(latest)
+}
+
+// runtimeListsBranch reports whether the runtime with this ID, in families,
+// runs, or might, branch: one whose Sentry is gone runs none, and one that
+// could not list its branches may run any.
+func runtimeListsBranch(families []Family, id, branch string) bool {
+	for _, family := range families {
+		if family.ID != id || runtimeFamilyUnavailable(family) {
+			continue
+		}
+		if family.Error != "" || slices.ContainsFunc(family.Branches, func(listed Branch) bool { return listed.ID == branch }) {
+			return true
+		}
+	}
+	return false
 }
 
 // runtimeFamilyBranchDisposition decides whether discarding branch may delete

@@ -8978,3 +8978,24 @@ func TestBranchOperationTargetsInspectStatesAlone(t *testing.T) {
 		t.Errorf("the states were inspected %d times, want twice", backend.states)
 	}
 }
+
+func TestRuntimeListsBranch(t *testing.T) {
+	families := []Family{
+		{ID: "other", Branches: []Branch{{ID: "x"}}},
+		{ID: "family", Branches: []Branch{{ID: "main"}, {ID: "x"}}},
+	}
+	if !runtimeListsBranch(families, "family", "x") {
+		t.Error("a runtime listing the branch does not run it")
+	}
+	if runtimeListsBranch(families, "family", "y") || runtimeListsBranch(nil, "family", "x") {
+		t.Error("a runtime not listing the branch, or gone, runs it")
+	}
+	unknown := []Family{{ID: "family", Error: "connection refused", SandboxPID: os.Getpid(), Branches: []Branch{{ID: "main"}}}}
+	if !runtimeListsBranch(unknown, "family", "x") {
+		t.Error("a live runtime that could not list its branches does not run the branch")
+	}
+	gone := []Family{{ID: "family", Error: "connection refused", SandboxPID: 0x7fffffff, Branches: []Branch{{ID: "x"}}}}
+	if runtimeListsBranch(gone, "family", "x") {
+		t.Error("a runtime whose Sentry is gone runs the branch")
+	}
+}
