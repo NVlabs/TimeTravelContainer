@@ -8345,7 +8345,14 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 		if err := b.discard(target); err != nil {
 			return containerRunResult{ID: id, Status: status}, fmt.Errorf("releasing foreground execution state for %s: %w", target, err)
 		}
-		if err := b.queueBranchPublication(target, "stop"); err != nil {
+		if err := b.queueBranchPublication(target, "stop"); err != nil && !b.branchPublicationRecorded(target) {
+			// The run gave its locks up once its container started, and the
+			// exit's own finalization, which takes the lifecycle lock,
+			// publishes a branch that exits by itself: one that published the
+			// branch first refused the run's, "installing captured
+			// publication: branch "main" publication changed", and a run
+			// whose container had run as it should exited 1. The branch is
+			// published either way.
 			return containerRunResult{ID: id, Status: status}, fmt.Errorf("queueing foreground filesystem publication for %s: %w", target, err)
 		}
 	}
@@ -8353,6 +8360,17 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 		status, err = b.applyAutoRemove(target, running, status, err)
 	}
 	return containerRunResult{ID: id, Status: status}, err
+}
+
+// branchPublicationRecorded reports whether target's record names a
+// publication of it under way or made, as one the exit's finalization made.
+func (b *runtimeBackend) branchPublicationRecorded(target selector) bool {
+	info, err := b.containerStore().LoadContainer(target.container)
+	if err != nil {
+		return false
+	}
+	branch, err := persistentBranchInfo(info, target.branch)
+	return err == nil && (branch.PublicationID != "" || branch.StorageState == "publishing" || branch.StorageState == "shared")
 }
 
 func (b *runtimeBackend) create(request runRequest) (string, error) {
