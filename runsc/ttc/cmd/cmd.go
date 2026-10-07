@@ -16058,33 +16058,54 @@ func (b *runtimeBackend) discard(target selector) error {
 		return err
 	}
 
-	runtimeFamilies, listErr := b.listRuntimeFamiliesOf(info.ID)
-	if listErr != nil {
-		return fmt.Errorf("checking runtime state while discarding %s: %w", target, listErr)
-	}
-	for _, family := range runtimeFamilies {
-		if family.ID != info.ID {
-			continue
+runtime:
+	for {
+		runtimeFamilies, listErr := b.listRuntimeFamiliesOf(info.ID)
+		if listErr != nil {
+			return fmt.Errorf("checking runtime state while discarding %s: %w", target, listErr)
 		}
-		if runtimeFamilyUnavailable(family) {
-			// The Sentry exited with the branch, its last, before it could
-			// be asked: the shell it left, a state whose process is gone,
-			// refused every later rehydration of the family's branches on the
-			// node, "connecting to control server ...: connection refused".
-			if _, err := b.command("delete", "--force", info.ID); err != nil {
-				return fmt.Errorf("releasing the exited runtime of %s: %w", target, err)
+		for _, family := range runtimeFamilies {
+			if family.ID != info.ID {
+				continue
 			}
-			break
-		}
-		present, onlyBranch := runtimeFamilyBranchDisposition(family, target.branch)
-		if !present {
-			break
-		}
-		if onlyBranch {
-			if _, err := b.command("delete", "--force", info.ID); err != nil {
-				return fmt.Errorf("releasing final runtime branch %s: %w", target, err)
+			if runtimeFamilyUnavailable(family) {
+				// The Sentry exited with the branch, its last, before it could
+				// be asked: the shell it left, a state whose process is gone,
+				// refused every later rehydration of the family's branches on the
+				// node, "connecting to control server ...: connection refused".
+				if _, err := b.command("delete", "--force", info.ID); err != nil {
+					return fmt.Errorf("releasing the exited runtime of %s: %w", target, err)
+				}
+				break runtime
 			}
-		} else {
+			present, onlyBranch := runtimeFamilyBranchDisposition(family, target.branch)
+			if !present {
+				break runtime
+			}
+			if onlyBranch {
+				// A remote fork imports its branch into the runtime without the
+				// lifecycle lock, and the runtime lists the branch only once it
+				// is made: deleting the runtime with its last listed branch
+				// would take the import with it. As a release does, wait for an
+				// import under way, and keep a runtime that lists a branch made
+				// meanwhile, of which this branch alone then goes; see
+				// familyOperations.releasing.
+				done, ok := b.operations.beginRelease(info.ID)
+				if !ok {
+					b.operations.waitMadeIn(info.ID)
+					continue runtime
+				}
+				if !b.runtimeListsOnly(info.ID, family.Branches) {
+					done()
+					continue runtime
+				}
+				_, deleteErr := b.command("delete", "--force", info.ID)
+				done()
+				if deleteErr != nil {
+					return fmt.Errorf("releasing final runtime branch %s: %w", target, deleteErr)
+				}
+				break runtime
+			}
 			var updated ttcbundle.BranchInfo
 			info, updated, err = b.parkBranchMemoryGraph(info, branch)
 			if err != nil {
@@ -16094,6 +16115,7 @@ func (b *runtimeBackend) discard(target selector) error {
 			if _, err := b.command("timetravel", info.ID, "destroy", target.branch); err != nil {
 				return fmt.Errorf("discarding live runtime state for %s: %w", target, err)
 			}
+			break runtime
 		}
 		break
 	}
