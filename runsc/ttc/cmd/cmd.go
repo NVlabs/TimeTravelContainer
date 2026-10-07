@@ -5352,8 +5352,17 @@ func stopBranchLifecycle(target branchOperationTarget, stopSignal, timeoutSecond
 		// generation. Canceling it would remove that hidden branch and make stop
 		// publish an older working generation. Let the immutable capture reach its
 		// durability boundary first, then discard only its memory roots through the
-		// ordinary dehydrated-stop path.
-		result := waitForDurableBranch(target.selector, backend)
+		// ordinary dehydrated-stop path. The wait gives the lifecycle lock up, as
+		// a running branch's stop does while its init exits: a publication that
+		// could not complete held a stop, and with it the lock, for good, and
+		// every command of the family on the node behind them.
+		var result waitResult
+		if err := withoutLifecycleLock(backend, target.selector, longOperation{branch: target.selector.branch, state: "stopping"}, func() error {
+			result = waitForDurableBranch(target.selector, backend)
+			return nil
+		}); err != nil {
+			return fmt.Errorf("waiting for dehydration of %s: %w", target.selector, err)
+		}
 		if result.err != nil {
 			return fmt.Errorf("waiting for dehydration of %s: %w", target.selector, result.err)
 		}
