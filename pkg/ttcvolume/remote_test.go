@@ -4,6 +4,7 @@
 package ttcvolume
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -1255,6 +1256,105 @@ func TestDeferredMetadataObservationDoesNotRequireBulkTransport(t *testing.T) {
 	}
 	if len(changes) != 1 || changes[0].Path != "/local" || changes[0].Kind != "add" {
 		t.Fatalf("changes=%+v, want local addition", changes)
+	}
+}
+
+// An export of a lazily imported branch, whose repository reads pending
+// objects through a reader of its own, holds the files' bytes, read from
+// their source, and installs none of them: the process that runs the branch
+// fetches them itself.
+func TestExportOfLazyImportReadsPendingObjectsThrough(t *testing.T) {
+	sourceManager := openTestManager(t)
+	source, err := sourceManager.Create("source-export")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	ino, err := source.CreateRegular(MainBranch, RootInode, "artifact", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("exported without installing\n"), 3000)
+	if _, _, err := source.WriteAt(MainBranch, ino, payload, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Fork(MainBranch, "sealed"); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := source.DescribeRemoteSnapshot("sealed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetManager := openTestManager(t)
+	target, err := targetManager.ImportPrivateRemoteDescriptorWithOrigins(filepath.Join(targetManager.root, "target-export"), "target-export", descriptor, "imported", 100, 101)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	if err := target.AttachImmutableMetadataSource("imported", source.graph.ResolveObject); err != nil {
+		t.Fatal(err)
+	}
+	target.ReadPendingObjectsFrom(repositoryObjectReader{repository: source})
+
+	var layer bytes.Buffer
+	if err := target.WriteLayerTar("imported", &layer); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	reader := tar.NewReader(&layer)
+	for {
+		header, err := reader.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.TrimPrefix(header.Name, "./") != "artifact" {
+			continue
+		}
+		content, err := io.ReadAll(reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(content, payload) {
+			t.Fatalf("the layer's artifact has %d bytes, want the source's %d", len(content), len(payload))
+		}
+		found = true
+	}
+	if !found {
+		t.Fatal("the layer has no artifact")
+	}
+	exported := filepath.Join(t.TempDir(), "snapshot")
+	if _, err := target.ExportSnapshot("imported", exported); err != nil {
+		t.Fatal(err)
+	}
+	branch, err := target.Branch("imported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := ttcsnapshot.ParseObjectID(branch.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inodes, _, err := target.graph.FilesystemRecords(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, inode := range inodes {
+		if inode.Type != "regular" {
+			continue
+		}
+		content, err := os.ReadFile(filepath.Join(exported, "objects", inode.File.String()))
+		if err != nil || !bytes.Equal(content, payload) {
+			t.Fatalf("the snapshot's object %s: %d bytes, %v; want the source's %d", inode.File, len(content), err, len(payload))
+		}
+		if file, err := target.data.Open(inode.File, int64(inode.Size)); err == nil {
+			file.Close()
+			t.Fatalf("the export installed object %s", inode.File)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
 	}
 }
 

@@ -398,6 +398,10 @@ type Repository struct {
 	remotes           map[*remoteObjectClient]struct{}
 	remoteByObject    map[string]*remoteObjectClient
 	remoteByCatalog   map[string]*remoteObjectClient
+	// pendingReader, if set, reads for this process's exports the objects
+	// still to come from their source, without installing them; see
+	// ReadPendingObjectsFrom.
+	pendingReader RemoteObjectReader
 
 	// materializationMu serializes installation of remotely inherited objects
 	// with runtime backing-cache invalidation. Hooks are invoked while this
@@ -4421,9 +4425,13 @@ func (r *Repository) WriteLayerTar(branchID string, output io.Writer) error {
 			}
 		}
 		if inode.Type == "regular" && !whiteout && header.Typeflag != tar.TypeLink {
-			file, err := r.openObject(inode.Object, os.O_RDONLY)
+			// A file of a lazy import is local only once it is read. Opened
+			// as it was, a commit of a branch rehydrated from its durable
+			// image failed at its first file not yet read, "no such file or
+			// directory".
+			file, err := r.objectContent(inode.Object, inode.Size)
 			if err != nil {
-				return err
+				return fmt.Errorf("reading %s: %w", name, err)
 			}
 			_, copyErr := io.CopyN(writer, file, inode.Size)
 			closeErr := file.Close()
@@ -4859,6 +4867,60 @@ func (r *Repository) markRemoteObjectPending(id, source string) error {
 	}
 	r.markDirtyFile(marker)
 	return nil
+}
+
+// ReadPendingObjectsFrom has this process's exports of the repository's
+// branches, a commit's layer and a checkpoint's snapshot, read the objects
+// still to come from their source through reader, by their sources'
+// identities, without installing them: such an export, reading a lazily
+// imported branch, must not materialize the files a Sentry may be fetching
+// itself, nor change the shared image's catalog a publication refers to by
+// reference.
+func (r *Repository) ReadPendingObjectsFrom(reader RemoteObjectReader) {
+	r.pendingReader = reader
+}
+
+// objectContent returns a reader of object's bytes: its file, or, while the
+// object is still to come from its source and the repository has a reader
+// of pending objects, the source's.
+func (r *Repository) objectContent(object string, size int64) (io.ReadCloser, error) {
+	if r.pendingReader != nil && size > 0 {
+		source, pending, err := r.remoteSourceObject(object)
+		if err != nil {
+			return nil, err
+		}
+		if pending {
+			return io.NopCloser(io.NewSectionReader(objectRangeReaderAt{reader: r.pendingReader, object: source}, 0, size)), nil
+		}
+	}
+	if err := r.ensureObjectRange(object, size, 0, size); err != nil {
+		return nil, err
+	}
+	return r.openObject(object, os.O_RDONLY)
+}
+
+// objectRangeReaderAt is an io.ReaderAt of one object of a RemoteObjectReader.
+type objectRangeReaderAt struct {
+	reader RemoteObjectReader
+	object string
+}
+
+func (r objectRangeReaderAt) ReadAt(destination []byte, offset int64) (int, error) {
+	read := 0
+	for read < len(destination) {
+		n, err := r.reader.ReadObjectRange(r.object, destination[read:], offset+int64(read))
+		read += n
+		if errors.Is(err, io.EOF) {
+			return read, io.EOF
+		}
+		if err != nil {
+			return read, err
+		}
+		if n == 0 {
+			return read, io.EOF
+		}
+	}
+	return read, nil
 }
 
 func (r *Repository) remoteSourceObject(id string) (string, bool, error) {

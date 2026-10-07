@@ -320,7 +320,7 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest, output io.Writer)
 		if memorySegments, err = b.saveCheckpointDehydration(info, hiddenBranch, request.compression, stateDir, archive); err != nil {
 			return fmt.Errorf("saving checkpoint state: %w", err)
 		}
-		manifestRepositories, hostMounts, err = b.saveCheckpointState(spec, hiddenInfo.FilesystemBranch, stage, sourceBranch)
+		manifestRepositories, hostMounts, err = b.saveCheckpointState(spec, hiddenInfo.FilesystemBranch, stage)
 		return err
 	}); err != nil {
 		return err
@@ -370,9 +370,7 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest, output io.Writer)
 
 // saveCheckpointState saves the hidden checkpoint branch's repositories, of
 // its filesystem branch persistentBranch, and host mounts in stage.
-// saveCheckpointState exports the filesystems of persistentBranch, the
-// checkpoint's fork of source, and the host mounts of spec, into stage.
-func (b *runtimeBackend) saveCheckpointState(spec *specs.Spec, persistentBranch, stage string, source ttcbundle.BranchInfo) (manifestRepositories []ttccheckpoint.RepositorySnapshot, hostMounts []ttccheckpoint.HostMountSnapshot, retErr error) {
+func (b *runtimeBackend) saveCheckpointState(spec *specs.Spec, persistentBranch, stage string) (manifestRepositories []ttccheckpoint.RepositorySnapshot, hostMounts []ttccheckpoint.HostMountSnapshot, retErr error) {
 	repositories, err := specutils.TTCVolumeRepositories(spec)
 	if err != nil {
 		return nil, nil, err
@@ -396,7 +394,7 @@ func (b *runtimeBackend) saveCheckpointState(spec *specs.Spec, persistentBranch,
 			return nil, nil, fmt.Errorf("opening checkpoint repository %q: %w", config.Source, err)
 		}
 		opened = append(opened, repository)
-		if err := b.attachPublishedFilesystemSource(repository, config, source, persistentBranch); err != nil {
+		if err := b.readSharedImageInProcess(repository, persistentBranch); err != nil {
 			return nil, nil, err
 		}
 		relative := filepath.Join("repositories", strconv.Itoa(index))

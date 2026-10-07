@@ -7766,7 +7766,7 @@ func (b *runtimeBackend) commit(target selector, reference string, options image
 			}
 		}
 		_ = finishOrigins(true)
-		attachErr := b.attachPublishedFilesystemSource(repository, *rootfs, branch, temporaryBranch)
+		attachErr := b.readSharedImageInProcess(repository, temporaryBranch)
 		defer func() {
 			cleanupErr := repository.RemoveBranch(temporaryBranch)
 			if cleanupErr == nil {
@@ -17879,16 +17879,19 @@ func (b *runtimeBackend) drainDistributedTargetFilesystems(info ttcbundle.Contai
 	return b.waitDistributedBranchFilesystems(info.ID, branch.ID, 5*time.Minute)
 }
 
-// attachPublishedFilesystemSource attaches to repository, of the filesystem
-// that config describes, the shared packs of the last publication of branch
-// as the source of what a lazy rehydration of the branch has yet to read, for
-// branchID, the repository's branch of it or a fork of that, to be read in
-// this process, as the branch's next publication reads it. A commit's or a
-// checkpoint's export of a branch rehydrated from its durable image failed
-// so, "deferred TTC catalog ... has no attached authoritative source", until
-// every file had been read.
-func (b *runtimeBackend) attachPublishedFilesystemSource(repository *ttcvolume.Repository, config specutils.TTCVolumeRepository, branch ttcbundle.BranchInfo, branchID string) error {
-	if branch.StorageManifest == "" || b.snapshotShared == nil {
+// readSharedImageInProcess has this process read what a lazy import of a
+// shared image into branchID, the repository's branch or a fork of it, has
+// yet to read, for an export of it, as a commit's or a checkpoint's: its
+// metadata through the shared packs' catalog, as a diff's observation does,
+// and its files' bytes from the shared packs, without installing either in
+// the repository, which the branch's Sentry owns. An export of a branch
+// rehydrated from its durable image failed, "deferred TTC catalog ... has no
+// attached authoritative source", until every file had been read; and one
+// that installed the files itself left the image's catalog changed under the
+// publications that name it by reference: a fork of the branch after its next
+// rehydration was refused, "owned object ... cannot be retained".
+func (b *runtimeBackend) readSharedImageInProcess(repository *ttcvolume.Repository, branchID string) error {
+	if b.snapshotShared == nil {
 		return nil
 	}
 	if lazy, err := repository.Branch(branchID); err != nil {
@@ -17896,23 +17899,25 @@ func (b *runtimeBackend) attachPublishedFilesystemSource(repository *ttcvolume.R
 	} else if lazy.RemoteCatalog == "" || !lazy.RemoteShared {
 		return nil
 	}
-	published, err := readColdBranchManifest(branch.StorageManifest)
-	if err != nil {
-		return fmt.Errorf("reading the published filesystems of %s: %w", branch.ID, err)
+	if err := repository.AttachImmutableMetadataSource(branchID, b.snapshotShared.Object); err != nil {
+		return fmt.Errorf("attaching the shared image's metadata: %w", err)
 	}
-	for _, filesystem := range published.Filesystems {
-		if filesystem.Root.Source != config.Source {
-			continue
-		}
-		source, err := newSharedFilesystemSource(b.snapshotShared, filesystem.Root.Root, config.Source, filesystem.Origins)
-		if err == nil {
-			err = repository.AttachLocalObjectSource(source, branchID)
-		}
-		if err != nil {
-			return fmt.Errorf("attaching the published filesystem %q of %s: %w", config.Source, branch.ID, err)
-		}
-	}
+	repository.ReadPendingObjectsFrom(sharedPackObjectReader{store: b.snapshotShared})
 	return nil
+}
+
+// sharedPackObjectReader reads the objects of a node's shared packs by their
+// own identities.
+type sharedPackObjectReader struct {
+	store *ttcsnapshot.SharedPackStore
+}
+
+func (r sharedPackObjectReader) ReadObjectRange(object string, destination []byte, offset int64) (int, error) {
+	id, err := ttcsnapshot.ParseObjectID(object)
+	if err != nil {
+		return 0, err
+	}
+	return r.store.ReadObjectRange(context.Background(), id, destination, offset)
 }
 
 func (b *runtimeBackend) completeDistributedTargetDehydration(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) error {

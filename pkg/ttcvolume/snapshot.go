@@ -348,12 +348,26 @@ func (r *Repository) exportSnapshot(branchID, destination string) (SnapshotInfo,
 		objectIDs = append(objectIDs, id)
 	}
 	sort.Strings(objectIDs)
+	local := objectIDs[:0:0]
 	for _, id := range objectIDs {
+		if r.pendingReader != nil {
+			source, pending, err := r.remoteSourceObject(id)
+			if err != nil {
+				return SnapshotInfo{}, err
+			}
+			if pending {
+				if err := r.exportPendingObject(source, objects[id], filepath.Join(destination, "objects", id)); err != nil {
+					return SnapshotInfo{}, fmt.Errorf("exporting remote object %q: %w", id, err)
+				}
+				continue
+			}
+		}
 		if err := r.ensureObjectRange(id, objects[id], 0, objects[id]); err != nil {
 			return SnapshotInfo{}, fmt.Errorf("materializing remote object %q: %w", id, err)
 		}
+		local = append(local, id)
 	}
-	if err := r.exportSnapshotObjects(objectIDs, filepath.Join(destination, "objects")); err != nil {
+	if err := r.exportSnapshotObjects(local, filepath.Join(destination, "objects")); err != nil {
 		return SnapshotInfo{}, err
 	}
 	if err := writeJSONAtomic(destination, filepath.Join(destination, "snapshot.json"), snapshot); err != nil {
@@ -361,6 +375,21 @@ func (r *Repository) exportSnapshot(branchID, destination string) (SnapshotInfo,
 	}
 	keep = true
 	return snapshot, nil
+}
+
+// exportPendingObject writes to destination the size bytes of source, an
+// object still to come from its source, through the repository's reader of
+// pending objects; see ReadPendingObjectsFrom.
+func (r *Repository) exportPendingObject(source string, size int64, destination string) error {
+	file, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(file, io.NewSectionReader(objectRangeReaderAt{reader: r.pendingReader, object: source}, 0, size))
+	if closeErr := file.Close(); copyErr == nil {
+		copyErr = closeErr
+	}
+	return copyErr
 }
 
 // exportSnapshotObjects stages immutable, already-local branch objects

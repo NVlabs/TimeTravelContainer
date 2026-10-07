@@ -450,6 +450,13 @@ func (r *Repository) registerDeferredFileObject(id ttcsnapshot.ObjectID, size in
 	}
 	remote := r.remoteByCatalog[catalog]
 	if remote == nil {
+		// An export that reads pending objects through a reader of its own
+		// needs only the marker that names the object's source; see
+		// ReadPendingObjectsFrom. The process that runs the branch attaches
+		// its source when it reads the file.
+		if r.pendingReader != nil {
+			return r.markRemoteObjectPending(id.String(), sourceID.String())
+		}
 		return fmt.Errorf("deferred filesystem catalog %q has no attached authoritative source", catalog)
 	}
 	if err := r.markRemoteObjectPending(id.String(), sourceID.String()); err != nil {
