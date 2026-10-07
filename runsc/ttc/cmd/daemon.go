@@ -7594,6 +7594,18 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		return
 	}
 	if s.distributedSource != nil && s.clusterCapabilities != nil && !request.DistributedLeaf {
+		request.Args = mainBranchOperands(request.Args)
+		handled, status, stdout, stderr, err := s.executeDistributedEachTarget(request)
+		if err != nil {
+			writeError(err)
+			return
+		}
+		if handled {
+			writeDaemonBufferedResult(conn, &writeMu, stdout, stderr, status)
+			return
+		}
+	}
+	if s.distributedSource != nil && s.clusterCapabilities != nil && !request.DistributedLeaf {
 		handled, status, stdout, stderr, err := s.executeDistributedStats(request)
 		if err != nil {
 			writeError(err)

@@ -2481,6 +2481,7 @@ func lifecycleCommandOperands(args []string) ([]string, error) {
 		fs.Int("time", ttcbundle.DefaultStopTimeoutSeconds, "")
 		fs.Int("timeout", ttcbundle.DefaultStopTimeoutSeconds, "")
 		fs.Int("t", ttcbundle.DefaultStopTimeoutSeconds, "")
+		fs.Bool("force", false, "")
 	case "rehydrate":
 		// Placement flags such as --node are consumed by the daemon router.
 	default:
@@ -3644,53 +3645,8 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 		err    error
 	}
 	execute := func(i int, child child) childOutcome {
-		// Clustered roots have exactly one placement authority: the
-		// authority catalog installed on the daemon. Do not reopen the retired
-		// shared-filesystem catalog here. In particular, a family operation
-		// runs several child mutations and re-resolves each one after the
-		// preceding child may have changed metadata; consulting the empty
-		// legacy catalog at this point made rm/stop/dehydrate fail after an
-		// otherwise successful migration.
-		routing := s.routingPlacements()
-		placements := cluster.PlacementCatalog(s.clusterPlacements)
-		if routing != nil {
-			placements = routing
-		}
-		// A child waits for a start or a rehydration claiming its branch, as
-		// a command routed alone does: a dehydration of a branch that a start
-		// had just claimed was refused, "only lifecycle recovery may retry
-		// it".
-		if owner, claims, err := placementAfterClaims(s.dataRoot, placements, child.args); err != nil {
-			return childOutcome{status: 1, err: err}
-		} else {
-			if owner != "" {
-				child.node = owner
-			}
-			child.claims = claims
-		}
-		childRequest := daemonRequest{
-			Version: daemonAPIVersion, Action: "command", RequestID: distributedChildRequestID(request.RequestID, i, child.args),
-			Args: child.args, ClientTERM: request.ClientTERM,
-			DistributedLeaf: true, PlacementClaims: child.claims,
-		}
-		var status int
-		var stderr string
-		var err error
-		if child.node == s.clusterCapabilities.NodeID {
-			// Child commands print branch-local selectors; the coordinator
-			// prints original operands.
-			status, _, stderr, err = s.executeLocalDistributedCommand(childRequest)
-		} else {
-			peer, peerErr := s.routedPeer(child.node, routing)
-			if peerErr != nil {
-				return childOutcome{status: 1, err: peerErr}
-			}
-			status, _, stderr, err = executeRemoteDaemonRequest(context.Background(), peer, childRequest)
-		}
-		if err != nil {
-			return childOutcome{status: 1, stderr: stderr, err: fmt.Errorf("executing family operation on node %q: %w", child.node, err)}
-		}
-		return childOutcome{status: status, stderr: stderr}
+		status, stderr, err := s.executeDistributedChild(request, i, child.node, child.args)
+		return childOutcome{status: status, stderr: stderr, err: err}
 	}
 	var diagnostic bytes.Buffer
 	for i := 0; i < len(children); {
@@ -3735,6 +3691,211 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 		return true, 1, []byte(output.String()), append(reported.Bytes(), diagnostic.Bytes()...), nil
 	}
 	return true, 0, []byte(output.String()), diagnostic.Bytes(), nil
+}
+
+// executeDistributedChild runs args, the ordinal-th child command of a
+// distributed command request, on the node of the branch it names, or on node
+// if it names none that a node runs, and returns its status and its standard
+// error. Child commands print branch-local selectors; their parent prints its
+// own operands.
+func (s *daemonServer) executeDistributedChild(request daemonRequest, ordinal int, node string, args []string) (int, string, error) {
+	// Clustered roots have exactly one placement authority: the
+	// authority catalog installed on the daemon. Do not reopen the retired
+	// shared-filesystem catalog here. In particular, a family operation
+	// runs several child mutations and re-resolves each one after the
+	// preceding child may have changed metadata; consulting the empty
+	// legacy catalog at this point made rm/stop/dehydrate fail after an
+	// otherwise successful migration.
+	routing := s.routingPlacements()
+	placements := cluster.PlacementCatalog(s.clusterPlacements)
+	if routing != nil {
+		placements = routing
+	}
+	// A child waits for a start or a rehydration claiming its branch, as
+	// a command routed alone does: a dehydration of a branch that a start
+	// had just claimed was refused, "only lifecycle recovery may retry
+	// it".
+	owner, claims, err := placementAfterClaims(s.dataRoot, placements, args)
+	if err != nil {
+		return 1, "", err
+	}
+	if owner != "" {
+		node = owner
+	}
+	childRequest := daemonRequest{
+		Version: daemonAPIVersion, Action: "command", RequestID: distributedChildRequestID(request.RequestID, ordinal, args),
+		Args: args, ClientTERM: request.ClientTERM,
+		DistributedLeaf: true, PlacementClaims: claims,
+	}
+	var status int
+	var stderr string
+	if node == s.clusterCapabilities.NodeID {
+		status, _, stderr, err = s.executeLocalDistributedCommand(childRequest)
+	} else {
+		peer, peerErr := s.routedPeer(node, routing)
+		if peerErr != nil {
+			return 1, "", peerErr
+		}
+		status, _, stderr, err = executeRemoteDaemonRequest(context.Background(), peer, childRequest)
+	}
+	if err != nil {
+		return 1, stderr, fmt.Errorf("executing family operation on node %q: %w", node, err)
+	}
+	return status, stderr, nil
+}
+
+// executeDistributedEachTarget runs a command of several targets, which a
+// standalone daemon runs on each in turn, as one command for each target, on
+// the node of its branch, when its targets span nodes: routed whole, it was
+// refused, "command spans cluster nodes ...". A family that a pause or a
+// resume names is its branches that the command changes, its running ones
+// paused or its paused ones resumed, the rest left as they are, as a
+// standalone daemon's family is: run by the daemon it reached, it paused
+// none, its first branch on another node refused, "branch ... belongs to
+// cluster node ...". As on a standalone daemon, a target that fails is
+// reported, and the others are still run. It reports false for a command
+// that one node runs whole, which is routed as any is.
+func (s *daemonServer) executeDistributedEachTarget(request daemonRequest) (bool, int, []byte, []byte, error) {
+	prefix, operands, ok := eachTargetCommand(request.Args)
+	if !ok || len(operands) == 0 {
+		return false, 0, nil, nil, nil
+	}
+	command := request.Args[0]
+	familyBranches := command == "pause" || command == "resume" || command == "unpause"
+	store := ttcbundle.Store{Root: s.dataRoot}
+	placements := cluster.PlacementCatalog(s.clusterPlacements)
+	if routing := s.routingPlacements(); routing != nil {
+		placements = routing
+	}
+	type target struct {
+		operand  string
+		branches []string
+		err      error
+	}
+	targets := make([]target, 0, len(operands))
+	owners := make(map[string]struct{})
+	expanded := false
+	for _, operand := range operands {
+		t := target{operand: operand, branches: []string{operand}}
+		if familyBranches && !strings.Contains(operand, "@") {
+			expanded = true
+			changed := cluster.PlacementPaused
+			if command == "pause" {
+				changed = cluster.PlacementRunning
+			}
+			info, err := loadDistributedFamily(store, s.clusterPlacements, operand)
+			var family []cluster.PlacementRecord
+			if err == nil {
+				family, err = logicalFamilyPlacements(s.clusterPlacements, info.ID)
+			}
+			t.branches, t.err = nil, err
+			for _, placement := range family {
+				if placement.State == changed {
+					t.branches = append(t.branches, operand+"@"+placement.BranchID)
+				}
+			}
+		}
+		for _, branch := range t.branches {
+			if owner, _, err := daemonCommandPlacementWithCatalog(s.dataRoot, placements, append(append([]string(nil), prefix...), branch)); err == nil && owner != "" {
+				owners[owner] = struct{}{}
+			}
+		}
+		targets = append(targets, t)
+	}
+	if !expanded && len(owners) < 2 {
+		return false, 0, nil, nil, nil
+	}
+	var stdout, stderr bytes.Buffer
+	status, ordinal := 0, 0
+	for _, t := range targets {
+		if t.err != nil {
+			fmt.Fprintf(&stderr, "ttc: invalid target %q: %v\n", t.operand, t.err)
+			status = 1
+			continue
+		}
+		failed := false
+		for _, branch := range t.branches {
+			childStatus, childStderr, err := s.executeDistributedChild(request, ordinal, s.clusterCapabilities.NodeID, append(append([]string(nil), prefix...), branch))
+			ordinal++
+			stderr.WriteString(childStderr)
+			if err != nil {
+				fmt.Fprintf(&stderr, "ttc: %s %s: %v\n", command, branch, err)
+			}
+			if err != nil || childStatus != 0 {
+				failed = true
+				// A family's branches stop at its first that fails, as on a
+				// standalone daemon.
+				break
+			}
+		}
+		if failed {
+			status = 1
+			continue
+		}
+		fmt.Fprintln(&stdout, t.operand)
+	}
+	return true, status, stdout.Bytes(), stderr.Bytes(), nil
+}
+
+// eachTargetCommand splits args, of a command that a standalone daemon runs
+// on each of its targets in turn, into the command and its options, and its
+// targets. It reports false for another command, or for arguments it cannot
+// split, which the command's own parser reports.
+func eachTargetCommand(args []string) ([]string, []string, bool) {
+	if len(args) < 2 {
+		return nil, nil, false
+	}
+	fs := flag.NewFlagSet(args[0]+"-targets", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	switch args[0] {
+	case "pause", "resume", "unpause", "quarantine", "unquarantine":
+	case "kill":
+		fs.String("signal", "", "")
+		fs.String("s", "", "")
+		fs.Bool("all", false, "")
+	case "restart":
+		fs.Int("time", ttcbundle.DefaultStopTimeoutSeconds, "")
+		fs.Int("timeout", ttcbundle.DefaultStopTimeoutSeconds, "")
+		fs.Int("t", ttcbundle.DefaultStopTimeoutSeconds, "")
+		fs.Bool("force", false, "")
+	default:
+		return nil, nil, false
+	}
+	if err := fs.Parse(args[1:]); err != nil {
+		return nil, nil, false
+	}
+	operands := fs.Args()
+	prefix := append([]string(nil), args[:len(args)-len(operands)]...)
+	// kill TARGET... SIGNAL names its signal last.
+	if args[0] == "kill" && !flagWasSet(fs, "signal") && !flagWasSet(fs, "s") && len(operands) > 1 {
+		if _, err := parseSignal(operands[len(operands)-1]); err == nil {
+			prefix = append(prefix, "--signal", operands[len(operands)-1])
+			operands = operands[:len(operands)-1]
+		}
+	}
+	return prefix, operands, true
+}
+
+// mainBranchOperands is args with each container operand of a start or a
+// restart that names no branch named as the container's main branch, as a
+// standalone daemon takes it, as docker does: the routing of a cluster
+// command finds the node of a branch only by CONTAINER@BRANCH, and refused a
+// container alone, "branch selector ... must be CONTAINER@BRANCH".
+func mainBranchOperands(args []string) []string {
+	if len(args) == 0 || (args[0] != "start" && args[0] != "restart") {
+		return args
+	}
+	operands, err := lifecycleCommandOperands(args)
+	if err != nil || len(operands) == 0 || len(operands) >= len(args) {
+		return args
+	}
+	rewritten := append([]string(nil), args...)
+	for i := len(rewritten) - len(operands); i < len(rewritten); i++ {
+		if rewritten[i] != "" && !strings.Contains(rewritten[i], "@") {
+			rewritten[i] += "@" + defaultBranchID
+		}
+	}
+	return rewritten
 }
 
 // branchRemovalParts splits the arguments of an rm of branches into its flags

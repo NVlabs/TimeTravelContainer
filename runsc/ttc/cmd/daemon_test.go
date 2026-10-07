@@ -1032,6 +1032,45 @@ func TestTransactionSourcedFromMatchesFamilyAndRuntime(t *testing.T) {
 	}
 }
 
+// A command a standalone daemon runs on each of its targets in turn splits
+// into its options and its targets, the signal kill names last among the
+// options.
+func TestEachTargetCommand(t *testing.T) {
+	for _, test := range []struct {
+		args            []string
+		prefix, targets []string
+		ok              bool
+	}{
+		{args: []string{"pause", "f@a", "g"}, prefix: []string{"pause"}, targets: []string{"f@a", "g"}, ok: true},
+		{args: []string{"kill", "--all", "-s", "TERM", "f@a", "f@b"}, prefix: []string{"kill", "--all", "-s", "TERM"}, targets: []string{"f@a", "f@b"}, ok: true},
+		{args: []string{"kill", "f@a", "f@b", "TERM"}, prefix: []string{"kill", "--signal", "TERM"}, targets: []string{"f@a", "f@b"}, ok: true},
+		{args: []string{"restart", "-t", "0", "--force", "f@a"}, prefix: []string{"restart", "-t", "0", "--force"}, targets: []string{"f@a"}, ok: true},
+		{args: []string{"restart", "--bogus", "f@a"}},
+		{args: []string{"stop", "f@a"}},
+		{args: []string{"pause"}},
+	} {
+		prefix, targets, ok := eachTargetCommand(test.args)
+		if ok != test.ok || !slices.Equal(prefix, test.prefix) || !slices.Equal(targets, test.targets) {
+			t.Errorf("eachTargetCommand(%q) = %q, %q, %t; want %q, %q, %t", test.args, prefix, targets, ok, test.prefix, test.targets, test.ok)
+		}
+	}
+}
+
+// A start's or a restart's container operand names its main branch.
+func TestMainBranchOperands(t *testing.T) {
+	for _, test := range []struct{ args, want []string }{
+		{args: []string{"restart", "-t", "3", "fam", "fam@a"}, want: []string{"restart", "-t", "3", "fam@main", "fam@a"}},
+		{args: []string{"start", "-ai", "fam"}, want: []string{"start", "-ai", "fam@main"}},
+		{args: []string{"start", "fam@b"}, want: []string{"start", "fam@b"}},
+		{args: []string{"kill", "fam"}, want: []string{"kill", "fam"}},
+		{args: []string{"restart", "--bogus", "fam"}, want: []string{"restart", "--bogus", "fam"}},
+	} {
+		if got := mainBranchOperands(test.args); !slices.Equal(got, test.want) {
+			t.Errorf("mainBranchOperands(%q) = %q, want %q", test.args, got, test.want)
+		}
+	}
+}
+
 // An import whose runtime runs no branch replaces the runtime with its own,
 // under the lifecycle lock; one that runs a branch it goes beside; and either
 // way the import's mark on the runtime is held once the replacement returns,
