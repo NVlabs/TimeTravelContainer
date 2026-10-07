@@ -2539,6 +2539,40 @@ func TestRuntimeFamiliesContainToleratesConcurrentEviction(t *testing.T) {
 	}
 }
 
+// A branch of a remote fork's runtime, apart from its family, has the
+// placement of the family that names the runtime and branch as its physical
+// ones: looked up by the runtime's ID alone, it had none, and a fence of a
+// revoked grant destroyed the runtime.
+func TestBranchPlacementOfAPhysicalRuntime(t *testing.T) {
+	child := cluster.PlacementRecord{
+		FamilyID: "family", BranchID: "child", PhysicalContainer: "fork-tx", PhysicalBranch: "child",
+		OwnerNode: "node-a", State: cluster.PlacementRunning,
+	}
+	lookup := func(family, branch string) (*cluster.PlacementRecord, error) {
+		switch {
+		case family == "family" && branch == "child":
+			record := child
+			return &record, nil
+		case family == "family" && branch == "main":
+			return &cluster.PlacementRecord{FamilyID: "family", BranchID: "main"}, nil
+		}
+		return nil, os.ErrNotExist
+	}
+	logical := &cluster.AuthorityState{Placements: map[string]cluster.PlacementRecord{"child": child}}
+	if placement, err := branchPlacementOf(lookup, nil, "family", "main"); err != nil || placement.BranchID != "main" {
+		t.Fatalf("the family's own branch: placement=%+v err=%v", placement, err)
+	}
+	if placement, err := branchPlacementOf(lookup, logical, "fork-tx", "child"); err != nil || placement.BranchID != "child" || placement.PhysicalContainer != "fork-tx" {
+		t.Fatalf("a physical runtime's branch: placement=%+v err=%v", placement, err)
+	}
+	if _, err := branchPlacementOf(lookup, nil, "fork-tx", "child"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("without its family's placements, err=%v, want ErrNotExist", err)
+	}
+	if _, err := branchPlacementOf(lookup, logical, "fork-tx", "other"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a branch no placement names, err=%v, want ErrNotExist", err)
+	}
+}
+
 func TestProvisionalTargetAuthorization(t *testing.T) {
 	info := ttcbundle.ContainerInfo{
 		ID: "family-id", Name: "family",
@@ -2574,6 +2608,14 @@ func TestProvisionalTargetAuthorization(t *testing.T) {
 	tx.State = cluster.TransactionPublished
 	if !provisionalTargetAuthorized(info, "child", "node-b", "inc-b", load) {
 		t.Fatal("published but unactivated migration target lost its provisional grant")
+	}
+	// A target made in a runtime of its own, whose record names its family.
+	physical := visible
+	physical.ID, physical.Name, physical.DistributedFamilyID = "fork-tx", "fork-tx", "family"
+	physical.DistributedForkTransactionID, physical.DistributedForkNodeID = "tx-fork", "node-b"
+	physical.Branches = []ttcbundle.BranchInfo{{ID: "child", NodeID: "node-b", State: "running"}}
+	if !provisionalTargetAuthorized(physical, "child", "node-b", "inc-b", load) {
+		t.Fatal("a target in a runtime of its own lost its provisional grant")
 	}
 	tx.State = cluster.TransactionTargetRestoring
 

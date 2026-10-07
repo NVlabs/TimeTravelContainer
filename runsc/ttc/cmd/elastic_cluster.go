@@ -5270,7 +5270,11 @@ func provisionalTargetAuthorized(info ttcbundle.ContainerInfo, branchID, nodeID,
 		if err != nil || tx == nil || tx.Identity.TransactionID != transactionID ||
 			tx.Identity.TargetNodeID != nodeID || tx.TargetIncarnation != incarnation ||
 			(tx.Identity.VisibleTargetBranch() != branchID && tx.Identity.TargetBranch != branchID) ||
-			(tx.Identity.TargetContainer != info.ID && tx.Identity.TargetContainer != info.Name) {
+			(tx.Identity.TargetContainer != info.ID && tx.Identity.TargetContainer != info.Name &&
+				tx.Identity.TargetContainer != logicalFamilyID(info)) {
+			// A remote fork's target made in a runtime of its own names its
+			// logical family, which the runtime's record names only as its
+			// family.
 			continue
 		}
 		switch tx.State {
@@ -6851,6 +6855,45 @@ func placementKeepsRuntime(placement *cluster.PlacementRecord, nodeID, incarnati
 	return false
 }
 
+// branchPlacementOf returns the placement of the branch with this ID of the
+// runtime with this ID, by lookup: the runtime's family's, or, for a remote
+// fork's or a migration's runtime, apart from its family, the family's
+// placement that names the runtime and branch as its physical ones, as
+// logical, the family's placements, has it. Looked up by the runtime's ID
+// alone, such a branch had no placement, and a fence of a revoked grant
+// destroyed every such runtime on the node with the branches it ran.
+func branchPlacementOf(lookup func(family, branch string) (*cluster.PlacementRecord, error), logical *cluster.AuthorityState, runtimeID, branchID string) (*cluster.PlacementRecord, error) {
+	placement, err := lookup(runtimeID, branchID)
+	if !errors.Is(err, os.ErrNotExist) {
+		return placement, err
+	}
+	family, branch, found := logicalPlacementForPhysicalRuntime(logical, runtimeID, branchID)
+	if !found {
+		return nil, err
+	}
+	return lookup(family, branch)
+}
+
+// physicalRuntimeFamilyPlacements returns the placements of the family of
+// the runtime with this ID if the runtime is a remote fork's or a
+// migration's, apart from its family, and nil otherwise or if they cannot be
+// read.
+func (b *runtimeBackend) physicalRuntimeFamilyPlacements(runtimeID string) *cluster.AuthorityState {
+	info, err := b.containerStore().LoadRuntimeContainer(runtimeID)
+	if err != nil {
+		return nil
+	}
+	family := logicalFamilyID(info)
+	if family == runtimeID {
+		return nil
+	}
+	state, err := b.distributedSource.authority.AuthorityStateOf(cluster.AuthorityQuery{Placements: cluster.All[string](), Family: family})
+	if err != nil {
+		return nil
+	}
+	return state
+}
+
 // enforceLocalPlacements projects committed branch authority into the
 // running Sentry. Node leases are renewed only after this succeeds. Therefore
 // a branch revoked since the preceding lease grant can run only through that
@@ -6882,8 +6925,14 @@ func enforceLocalPlacements(backend *runtimeBackend, nodeID, incarnation string)
 		var info ttcbundle.ContainerInfo
 		var infoErr error
 		infoLoaded := false
+		var logical *cluster.AuthorityState
+		logicalLoaded := false
 		for _, branch := range family.Branches {
-			placement, lookupErr := backend.distributedSource.authority.LookupPlacement(family.ID, branch.ID)
+			if !logicalLoaded {
+				logical = backend.physicalRuntimeFamilyPlacements(family.ID)
+				logicalLoaded = true
+			}
+			placement, lookupErr := branchPlacementOf(backend.distributedSource.authority.LookupPlacement, logical, family.ID, branch.ID)
 			if lookupErr == nil && placementKeepsRuntime(placement, nodeID, incarnation) {
 				continue
 			}
