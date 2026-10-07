@@ -214,6 +214,48 @@ func TestInactiveGraphReferenceReconciliationReleasesOnlyFencedClaims(t *testing
 	}
 }
 
+func TestInactiveClaimReconciliationKeepsAClaimRetainedMeanwhile(t *testing.T) {
+	inherited := ttcsnapshot.ObjectID{Snapshot: 17, Kind: ttcsnapshot.ObjectKindMetadata, Ordinal: 1}
+	handoff := ttcsnapshot.ObjectID{Snapshot: 17, Kind: ttcsnapshot.ObjectKindMetadata, Ordinal: 2}
+	ledger := ttcsnapshot.NewReferenceLedger()
+	if err := ledger.ImportOrigin(17, []ttcsnapshot.Object{
+		{ID: inherited, State: ttcsnapshot.ObjectLive},
+		{ID: handoff, State: ttcsnapshot.ObjectLive},
+	}, map[string]ttcsnapshot.ObjectID{
+		"remote/17/fenced/00000000":   inherited,
+		"remote/17/released/00000000": inherited,
+		"root/cold-memory/17/stable":  handoff,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	state := cluster.NewAuthorityState()
+	state.NextSnapshotID = 18
+	state.SharedOrigins[17] = true
+	withLedger := func(fn func(*ttcsnapshot.ReferenceLedger) error) error { return fn(ledger) }
+	claims := func() (*cluster.AuthorityState, map[string]ttcsnapshot.ObjectID, error) {
+		// While the nodes' inventories are read, which name neither: a remote
+		// fork's handoff writes its claim's intent after its node's was read
+		// and retains the claim, and another claim's owner releases it.
+		if err := ledger.ApplyReference("retain-handoff", "remote/17/handoff/00000000", handoff, true); err != nil {
+			return nil, nil, err
+		}
+		if err := ledger.ApplyReference("release-released", "remote/17/released/00000000", inherited, false); err != nil {
+			return nil, nil, err
+		}
+		return state, map[string]ttcsnapshot.ObjectID{}, nil
+	}
+	if err := reconcileInactiveClaims(withLedger, claims); err != nil {
+		t.Fatal(err)
+	}
+	references := ledger.References()
+	if references["remote/17/handoff/00000000"] != handoff {
+		t.Fatalf("the claim retained while the inventories were read was released: %+v", references)
+	}
+	if _, ok := references["remote/17/fenced/00000000"]; ok {
+		t.Fatalf("the claim no inventory names was kept: %+v", references)
+	}
+}
+
 // A branch's cold reference names come back: running from the same roots
 // twice, between two publications or after a rehydration canceled one, a
 // branch names them alike. Each reconciliation pass retains and releases

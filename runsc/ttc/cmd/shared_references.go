@@ -1680,33 +1680,61 @@ func coldReferenceMutations(desired, current map[string]ttcsnapshot.ObjectID, re
 // absent remote/... name cannot be reused by another lifetime: operation names
 // are branch/transaction-unique, making release-only reconciliation monotonic.
 func (s *sharedReferenceService) reconcileInactiveGraphReferences(lease cluster.SharedGCLease) error {
-	state, err := s.authority.AuthorityStateOf(withSnapshotOrigins(cluster.AuthorityQuery{Nodes: cluster.All[string]()}))
-	if err != nil {
-		return err
-	}
-	desiredByOrigin, err := s.activeSharedClaimReferences(state, lease.ExpiresAt)
-	if err != nil {
-		return err
-	}
-	desired := make(map[string]ttcsnapshot.ObjectID)
-	for _, roots := range desiredByOrigin {
-		for name, object := range roots {
-			desired[name] = object
+	return reconcileInactiveClaims(s.withLedger, func() (*cluster.AuthorityState, map[string]ttcsnapshot.ObjectID, error) {
+		state, err := s.authority.AuthorityStateOf(withSnapshotOrigins(cluster.AuthorityQuery{Nodes: cluster.All[string]()}))
+		if err != nil {
+			return nil, nil, err
 		}
-	}
+		desiredByOrigin, err := s.activeSharedClaimReferences(state, lease.ExpiresAt)
+		if err != nil {
+			return nil, nil, err
+		}
+		desired := make(map[string]ttcsnapshot.ObjectID)
+		for _, roots := range desiredByOrigin {
+			for name, object := range roots {
+				desired[name] = object
+			}
+		}
+		return state, desired, nil
+	})
+}
+
+// reconcileInactiveClaims releases the ledger's remote/... references that
+// claims, the authority and the inventories of the nodes' claims it returns,
+// no longer name. The ledger is read first: a claim's intent is written before
+// its retain reaches the ledger and goes only once its release has, so each
+// reference the ledger held then is in an inventory read after, or released
+// since. Read after the inventories, the ledger held what was retained in
+// between, which no inventory named: a remote fork handed off to an origin
+// just published lost its claim so, and the next pass retired the origin
+// under the fork's lazy reads, "snapshots/...: no such file or directory".
+func reconcileInactiveClaims(withLedger func(func(*ttcsnapshot.ReferenceLedger) error) error, claims func() (*cluster.AuthorityState, map[string]ttcsnapshot.ObjectID, error)) error {
 	var current map[string]ttcsnapshot.ObjectID
-	if err := s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
+	if err := withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
 		current = ledger.References()
 		return nil
 	}); err != nil {
 		return err
 	}
-	mutations, err := inactiveGraphReferenceMutations(state, current, desired)
+	state, desired, err := claims()
 	if err != nil {
 		return err
 	}
-	return s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
-		return applySharedReferenceBatches(ledger, mutations)
+	mutations, err := inactiveGraphReferenceMutations(state, current, desired)
+	if err != nil || len(mutations) == 0 {
+		return err
+	}
+	return withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
+		// A claim released by its owner since the ledger was read is gone
+		// already; its release again would fail the batch.
+		held := ledger.References()
+		live := mutations[:0]
+		for _, mutation := range mutations {
+			if object, ok := held[mutation.Name]; ok && object == mutation.Object {
+				live = append(live, mutation)
+			}
+		}
+		return applySharedReferenceBatches(ledger, live)
 	})
 }
 
