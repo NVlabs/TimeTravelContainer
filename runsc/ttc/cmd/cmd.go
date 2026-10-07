@@ -5084,7 +5084,7 @@ func runKill(args []string, stdout, stderr io.Writer, backend backend) error {
 		}
 	}
 	if len(targets) == 0 {
-		return errors.New("usage: ttc kill [--signal SIGNAL] TARGET [TARGET...] | ttc kill TARGET SIGNAL")
+		return errors.New("usage: ttc kill [--signal SIGNAL] CONTAINER@BRANCH [CONTAINER@BRANCH...] | ttc kill CONTAINER@BRANCH SIGNAL")
 	}
 	signal, err := parseSignal(signalName)
 	if err != nil {
@@ -5408,7 +5408,7 @@ func runWait(args []string, stdout, stderr io.Writer, backend backend) error {
 		return err
 	}
 	if fs.NArg() == 0 {
-		return errors.New("usage: ttc wait [--condition not-running|durable] TARGET [TARGET...]")
+		return errors.New("usage: ttc wait [--condition not-running|durable] CONTAINER@BRANCH [CONTAINER@BRANCH...]")
 	}
 	if *condition != "not-running" && *condition != "durable" {
 		return fmt.Errorf("wait condition %q is not implemented; use 'not-running' or 'durable'", *condition)

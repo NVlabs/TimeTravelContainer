@@ -659,10 +659,11 @@ and attaching accepts exactly one branch.`,
 
 TARGET may be a family or CONTAINER@BRANCH. The timeout defaults to the
 container stop policy (normally 10 seconds); -1 waits forever.`,
-	"restart": `Usage: ttc restart [-t|--time|--timeout SECONDS] TARGET...
+	"restart": `Usage: ttc restart [-t|--time|--timeout SECONDS] (CONTAINER|CONTAINER@BRANCH)...
 
-Restart branches using their configured stop signal. The timeout defaults to
-the container stop policy (normally 10 seconds); -1 waits forever.`,
+Restart branches using their configured stop signal; a CONTAINER alone names
+its main branch. The timeout defaults to the container stop policy (normally
+10 seconds); -1 waits forever.`,
 	"rm": `Usage: ttc rm [-f|--force] [-v|--volumes] TARGET...
 
 Without --force (default), running branches are rejected. --volumes applies
@@ -726,7 +727,7 @@ ls' to discover valid node names.`,
 	"quarantine":   "Usage: ttc quarantine CONTAINER@BRANCH...",
 	"unquarantine": "Usage: ttc unquarantine CONTAINER@BRANCH...",
 	"dehydrate":    "Usage: ttc dehydrate TARGET...\n\nTARGET may be a family or CONTAINER@BRANCH; no options are required.",
-	"rehydrate": `Usage: ttc rehydrate [--node NODE] TARGET...
+	"rehydrate": `Usage: ttc rehydrate [--node NODE] CONTAINER@BRANCH...
 
 Reconstruct dehydrated branches. In cluster mode, omitted --node lets the
 scheduler choose a compute node.`,
@@ -757,12 +758,12 @@ JSON for all requested containers.`,
 Without --follow, replay existing matching events and return. TIME accepts the
 same timestamp/relative forms as 'ttc logs'. Filters are repeatable and accept
 type, event, action, subject, or container. Options default to unset/false.`,
-	"wait": `Usage: ttc wait [--condition not-running|durable] TARGET...
+	"wait": `Usage: ttc wait [--condition not-running|durable] CONTAINER@BRANCH...
 
 Wait for each branch concurrently. The default condition is not-running and
 prints exit codes; durable waits for authoritative persistent storage.`,
 	"rename": "Usage: ttc rename CONTAINER@BRANCH NEW_BRANCH",
-	"kill": `Usage: ttc kill [--signal SIGNAL] [--all] TARGET...
+	"kill": `Usage: ttc kill [--signal SIGNAL] [--all] CONTAINER@BRANCH...
 
 SIGNAL is a name or number (default: KILL). --all signals every process in the
 branch instead of only init (default: false).`,
