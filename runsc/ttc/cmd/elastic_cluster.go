@@ -4710,7 +4710,15 @@ func (b *runtimeBackend) releaseMigratedSourceRuntimeWithPolicy(containerID, bra
 		return b.removeMigratedSourceMetadataWithPolicy(info, branchID, publishBacking)
 	}
 	if physicalPeers == 0 {
-		if err := b.purgeRuntime(info.ID); err != nil {
+		// A command making a branch in the runtime keeps it; see
+		// removeUnrecordedMigratedSourceRuntime.
+		done, ok := b.operations.beginRelease(info.ID)
+		if !ok {
+			return fmt.Errorf("keeping runtime %q while a command makes a branch in it", info.ID)
+		}
+		err := b.purgeRuntime(info.ID)
+		done()
+		if err != nil {
 			return err
 		}
 		// The wrapper is the transaction's that made the runtime, and it goes
@@ -4798,6 +4806,17 @@ func (b *runtimeBackend) removeUnrecordedMigratedSourceRuntime(containerID, bran
 	// publication, a dehydration's capture went 20 ms after the dehydration,
 	// as a migration from the runtime drained, and the branch stayed
 	// dehydrating, every command of it waiting for its publication.
+	//
+	// A command making a branch in the runtime keeps both, as it keeps the
+	// runtime from any release: the release is tried again later. A fork of a
+	// dehydrated branch of the family, which forks its files in the family's
+	// node-local state, failed so, "rootfs-upper/volume.json: no such file or
+	// directory".
+	done, ok := b.operations.beginRelease(containerID)
+	if !ok {
+		return fmt.Errorf("keeping runtime %q while a command makes a branch in it", containerID)
+	}
+	defer done()
 	pinned, err := b.pendingPublicationProtectsContainer(containerID)
 	if err != nil {
 		return err
@@ -5261,6 +5280,16 @@ func (b *runtimeBackend) removeLocalFamilyStateIfUnowned(containerID string) err
 			return fmt.Errorf("runtime family %q still exists: %w", containerID, errRuntimeFamilyLive)
 		}
 	}
+	// A command making a branch of the family on the node reads the state
+	// meanwhile, as a fork of a dehydrated branch of the family forks its
+	// files in the family's repositories here: the state stays for it, until
+	// the node reclaims it as orphaned. Removed under such a fork, the fork
+	// failed, "rootfs-upper/volume.json: no such file or directory".
+	done, ok := b.operations.beginRelease(containerID)
+	if !ok {
+		return nil
+	}
+	defer done()
 	return b.containerStore().RemoveActiveContainerState(containerID)
 }
 
@@ -5462,11 +5491,20 @@ func (b *runtimeBackend) reclaimOrphanLocalContainerDirs(state *cluster.Authorit
 			}
 			continue
 		}
+		// A command making a branch of the family keeps its state; see
+		// removeLocalFamilyStateIfUnowned.
+		done, ok := b.operations.beginRelease(id)
+		if !ok {
+			continue
+		}
 		if err := b.stopContainerConsoleDrains(id); err != nil {
+			done()
 			result = errors.Join(result, fmt.Errorf("stopping orphan console followers for %q: %w", id, err))
 			continue
 		}
-		if err := b.containerStore().RemoveActiveContainerState(id); err != nil {
+		err := b.containerStore().RemoveActiveContainerState(id)
+		done()
+		if err != nil {
 			result = errors.Join(result, fmt.Errorf("removing orphan local container %q: %w", id, err))
 			continue
 		}

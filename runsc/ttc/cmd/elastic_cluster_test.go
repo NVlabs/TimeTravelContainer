@@ -1871,6 +1871,42 @@ func TestNonOwnedBranchCleanupLeavesABranchBeingMade(t *testing.T) {
 	}
 }
 
+// A command making a branch of a family on the node reads the family's
+// node-local state, as a fork of a dehydrated branch of the family forks its
+// files in the family's repositories there: the orphan cleanup leaves the
+// state to it.
+func TestOrphanCleanupLeavesTheStateOfAFamilyBeingMade(t *testing.T) {
+	root, local := t.TempDir(), t.TempDir()
+	runsc := filepath.Join(t.TempDir(), "runsc")
+	if err := os.WriteFile(runsc, []byte("#!/bin/sh\n[ \"$3\" = list ] && { echo '[]'; exit 0; }\nexit 2\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	upper := filepath.Join(local, "containers", "web", "rootfs-upper")
+	if err := os.MkdirAll(upper, 0700); err != nil {
+		t.Fatal(err)
+	}
+	var operations familyOperations
+	made := operations.beginMaking("web", "child")
+	backend := &runtimeBackend{
+		root: filepath.Join(root, "runsc-root"), runsc: runsc, dataRoot: root, localRoot: local, nodeID: "node-a",
+		operations: &operations, stdin: strings.NewReader(""), stdout: io.Discard, stderr: io.Discard,
+	}
+	state := cluster.NewAuthorityState()
+	if removed, err := backend.reclaimOrphanLocalContainerDirs(state); err != nil || removed != 0 {
+		t.Fatalf("reclaimOrphanLocalContainerDirs = %d, %v; want 0, nil", removed, err)
+	}
+	if _, err := os.Stat(upper); err != nil {
+		t.Fatalf("the orphan cleanup took the state of a family a fork makes a branch of: %v", err)
+	}
+	made()
+	if removed, err := backend.reclaimOrphanLocalContainerDirs(state); err != nil || removed != 1 {
+		t.Fatalf("reclaimOrphanLocalContainerDirs = %d, %v; want 1, nil", removed, err)
+	}
+	if _, err := os.Stat(upper); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the orphan cleanup left the state of a family nothing needs: %v", err)
+	}
+}
+
 // countingNodes counts the heartbeats of a node directory: the renewals of
 // a node's execution lease.
 type countingNodes struct {
