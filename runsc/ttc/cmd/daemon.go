@@ -2074,8 +2074,13 @@ func (r *daemonTargetRuntime) Cancel(_ context.Context, tx *cluster.Transaction)
 	if err := r.backend.containerStore().RemoveDistributedForkTarget(tx.Identity.TargetContainer, tx.Identity.TransactionID); err != nil {
 		return err
 	}
+	// The family's node-local state goes with its last runtime on the node;
+	// while one still runs there, the state stays until the node reclaims it
+	// as orphaned, and the cancel, done, does not fail for it.
 	if familyID != "" {
-		return r.backend.removeLocalFamilyStateIfUnowned(familyID)
+		if err := r.backend.removeLocalFamilyStateIfUnowned(familyID); err != nil && !errors.Is(err, errRuntimeFamilyLive) {
+			return err
+		}
 	}
 	return nil
 }
@@ -3659,7 +3664,11 @@ func (b *runtimeBackend) cleanupRemovedMigrationSource(tx cluster.Transaction) e
 		if err := b.releaseMigratedSourceRuntimeDiscard(sourceContainer, sourceBranch); err != nil {
 			return fmt.Errorf("discarding removed migration source %s@%s: %w", tx.Identity.SourceContainer, tx.Identity.SourceBranch, err)
 		}
-		if err := b.removeLocalFamilyStateIfUnowned(tx.Identity.SourceContainer); err != nil {
+		// While a runtime of the family still runs on the node, its state
+		// stays until the node reclaims it as orphaned: the removal, whose
+		// source is gone, failed for it, "reclaiming removed migration source
+		// family ...: runtime family ... still exists: its runtime still runs".
+		if err := b.removeLocalFamilyStateIfUnowned(tx.Identity.SourceContainer); err != nil && !errors.Is(err, errRuntimeFamilyLive) {
 			return fmt.Errorf("reclaiming removed migration source family %s: %w", tx.Identity.SourceContainer, err)
 		}
 		return nil
