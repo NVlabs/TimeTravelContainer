@@ -1989,6 +1989,47 @@ func awaitDaemonColdUnplacement(ctx context.Context, dataRoot string, placements
 	}
 }
 
+// errColdRecordMovedOn is waitForCommittedColdBranchMetadata's error for a
+// branch whose record no longer names the publication that the authority it
+// was given commits: a command of the branch on another node moved the
+// record on, and moves the authority next, or did since it was read. A
+// command that finds it waits for the authority (awaitColdAuthorityMovedOn)
+// and takes the branch as it then is: one that failed instead, a start beside
+// a stop of the branch dehydrated, failed for good, "repairing committed cold
+// branch metadata: branch ... publication is "", worker has ...".
+var errColdRecordMovedOn = errors.New("the branch's record has moved on from the publication")
+
+// coldRecordMovedOnWait bounds how long a command waits for the authority of
+// a branch whose record moved on; see awaitColdAuthorityMovedOn.
+var coldRecordMovedOnWait = 30 * time.Second
+
+// awaitColdAuthorityMovedOn waits, for up to coldRecordMovedOnWait, for the
+// authority of branch to be other than was, the authority against which a
+// command found the branch's record moved on (errColdRecordMovedOn), and
+// reports whether it is.
+func (b *runtimeBackend) awaitColdAuthorityMovedOn(family, branch string, was cluster.BranchAuthority) bool {
+	if b == nil || b.distributedSource == nil || b.distributedSource.authority == nil {
+		return false
+	}
+	deadline := time.Now().Add(coldRecordMovedOnWait)
+	delay := 25 * time.Millisecond
+	for {
+		current, err := b.distributedSource.authority.Branch(family, branch)
+		if errors.Is(err, os.ErrNotExist) {
+			return true
+		}
+		if err == nil && (current.Generation != was.Generation || current.PublicationID != was.PublicationID ||
+			current.Lifecycle != was.Lifecycle || current.Roots.FilesystemRoot != was.Roots.FilesystemRoot) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(delay)
+		delay = min(2*delay, 500*time.Millisecond)
+	}
+}
+
 // waitForCommittedColdBranchMetadata closes the deliberately small gap between
 // the authoritative publication commit and its derived container.json
 // update. CommitPublication first makes the immutable roots authoritative and
@@ -2072,6 +2113,14 @@ func waitForCommittedColdBranchMetadata(ctx context.Context, store ttcbundle.Sto
 			}
 		}
 		if activePublication {
+			// The repair rolls the record forward to the publication it
+			// names. One that names none, or another, moved on after the
+			// authority was read: a stop of the branch dehydrated retires
+			// the publication in the record, and only then in the authority,
+			// and a start goes on from the publication.
+			if branch.PublicationID != manifest.PublicationID {
+				return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("repairing committed cold branch metadata: branch %q publication is %q, authority has %q: %w", manifest.Branch, branch.PublicationID, manifest.PublicationID, errColdRecordMovedOn)
+			}
 			if err := store.CompleteBranchPublication(manifest.Container, manifest.Branch, manifest.PublicationID, expectedManifest, lifecycle, true); err != nil {
 				return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("repairing committed cold branch metadata: %w", err)
 			}
@@ -2279,7 +2328,9 @@ func (s *daemonServer) claimLifecycleTargets(backend *runtimeBackend, args []str
 	if err != nil {
 		return err
 	}
-	for _, operand := range operands {
+	movedOn := 0
+	for i := 0; i < len(operands); i++ {
+		operand := operands[i]
 		target, err := parseSelector(operand)
 		if err != nil {
 			return err
@@ -2364,6 +2415,13 @@ func (s *daemonServer) claimLifecycleTargets(backend *runtimeBackend, args []str
 				persistent, persistentBranch, waitErr := waitForCommittedColdBranchMetadata(ctx, store, info.ID, resolved.branch, *committed)
 				cancel()
 				if waitErr != nil {
+					// The record moved on: the branch is claimed as it is
+					// once the authority has too.
+					if errors.Is(waitErr, errColdRecordMovedOn) && movedOn < 3 && backend.awaitColdAuthorityMovedOn(familyID, target.branch, *committed) {
+						movedOn++
+						i--
+						continue
+					}
 					return fmt.Errorf("waiting to claim cold branch %s: %w", target, waitErr)
 				}
 				info, branch = persistent, persistentBranch
@@ -2475,6 +2533,11 @@ func (b *runtimeBackend) completeCommittedPublication(info ttcbundle.ContainerIn
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	_, _, err = waitForCommittedColdBranchMetadata(ctx, b.containerStore(), info.ID, branchID, *committed)
+	if errors.Is(err, errColdRecordMovedOn) && b.awaitColdAuthorityMovedOn(publication.FamilyID, publication.BranchID, *committed) {
+		// A later lifecycle superseded the publication as the record was
+		// read.
+		return nil
+	}
 	return err
 }
 

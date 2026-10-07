@@ -3454,6 +3454,67 @@ func TestRuntimeHasOtherBranches(t *testing.T) {
 	}
 }
 
+func TestWaitForCommittedColdBranchMetadataRefusesARecordMovedOn(t *testing.T) {
+	root := t.TempDir()
+	const publicationID = "publication-retired"
+	containerDir := filepath.Join(root, "containers", "physical")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := coldManifestPath(root, "physical", "cold", publicationID)
+	// The record as a stop of the branch dehydrated leaves it before it
+	// changes the authority: exited, its publication retired.
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+		ID: "physical", Name: "physical", DistributedFamilyID: "family", BundleDir: bundleDir,
+		Branches: []ttcbundle.BranchInfo{{
+			ID: "cold", State: "exited", Unplaced: true, StorageState: "shared", StorageManifest: manifestPath,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(coldBranchManifest{
+		Version: 5, Container: "physical", Branch: "cold", PublicationID: publicationID,
+		Kind: "dehydrate", MemorySnapshot: 19,
+		ControlRoot: ttcsnapshot.ObjectID{Snapshot: 19, Ordinal: 1, Kind: ttcsnapshot.ObjectKindMetadata}.String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDurableJSON(manifestPath, json.RawMessage(encoded)); err != nil {
+		t.Fatal(err)
+	}
+	relativeManifest, err := filepath.Rel(root, manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := cluster.BranchAuthority{
+		FamilyID: "family", BranchID: "cold", PublicationID: publicationID, Lifecycle: "dehydrated",
+		Roots: cluster.DurableRoots{FilesystemRoot: relativeManifest, MemorySnapshot: 19},
+	}
+	store := ttcbundle.Store{Root: root}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, _, err := waitForCommittedColdBranchMetadata(ctx, store, "family", "cold", authority); !errors.Is(err, errColdRecordMovedOn) {
+		t.Fatalf("waitForCommittedColdBranchMetadata = %v, want errColdRecordMovedOn", err)
+	}
+	// The authority as the stop then leaves it: the record is the branch's.
+	authority.PublicationID, authority.Lifecycle, authority.Roots.MemorySnapshot = "", "exited", 0
+	info, branch, err := waitForCommittedColdBranchMetadata(ctx, store, "family", "cold", authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.ID != "physical" || branch.ID != "cold" || branch.State != "exited" {
+		t.Fatalf("resolved %s@%s in state %q, want physical@cold exited", info.ID, branch.ID, branch.State)
+	}
+}
+
 func TestMovedBranchEntry(t *testing.T) {
 	state := &cluster.AuthorityState{Transactions: map[string]cluster.Transaction{
 		"fork-1": {Identity: cluster.ForkIdentity{

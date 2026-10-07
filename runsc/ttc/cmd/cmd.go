@@ -7449,6 +7449,40 @@ func (b *runtimeBackend) resolveSelectorWaiting(info ttcbundle.ContainerInfo, ta
 // placements and branch authorities of info's family, which it reads instead
 // of querying the authority for the branch's.
 func (b *runtimeBackend) resolveSelectorIn(info ttcbundle.ContainerInfo, target selector, state *cluster.AuthorityState) (selector, ttcbundle.ContainerInfo, error) {
+	for retries := 0; ; retries++ {
+		resolved, physical, err := b.resolveSelectorOnce(info, target, state)
+		// A cold branch's record moved on from the publication the
+		// authority named, as a command of the branch on another node moved
+		// it, which moves the authority next; or the authority read had
+		// already moved on, and no record named its publication. The branch
+		// is resolved as it is once the authority has moved: a command that
+		// failed instead, an exec beside a start, failed "branch ... does not
+		// exist", and a resume beside a stop of the branch dehydrated, "branch
+		// ... publication is "", worker has ...".
+		var moved *coldRecordMovedError
+		if err == nil || retries == 3 || !errors.As(err, &moved) || !b.awaitColdAuthorityMovedOn(moved.family, moved.branch, moved.authority) {
+			return resolved, physical, err
+		}
+		state = nil
+	}
+}
+
+// coldRecordMovedError is resolveSelectorOnce's error for a cold branch that
+// it could not find by the publication that authority, the branch's as the
+// resolution read it, names: its record has moved on from it, or no record
+// names it.
+type coldRecordMovedError struct {
+	family, branch string
+	authority      cluster.BranchAuthority
+	err            error
+}
+
+func (e *coldRecordMovedError) Error() string { return e.err.Error() }
+
+func (e *coldRecordMovedError) Unwrap() error { return e.err }
+
+// resolveSelectorOnce is resolveSelectorIn's resolution, once.
+func (b *runtimeBackend) resolveSelectorOnce(info ttcbundle.ContainerInfo, target selector, state *cluster.AuthorityState) (selector, ttcbundle.ContainerInfo, error) {
 	if b.nodeID != "" {
 		logicalFamily := info.ID
 		if info.DistributedFamilyID != "" {
@@ -7542,7 +7576,11 @@ func (b *runtimeBackend) resolveSelectorIn(info ttcbundle.ContainerInfo, target 
 				if placement.State == cluster.PlacementUnplaced && publicationID != "" {
 					physical, physicalBranch, resolveErr := b.resolveDistributedPersistentBranch(info, target.branch, publicationID)
 					if resolveErr != nil {
-						return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("loading durable physical branch for %s: %w", target, resolveErr)
+						err := fmt.Errorf("loading durable physical branch for %s: %w", target, resolveErr)
+						if branchAuthority != nil && (errors.Is(resolveErr, errColdRecordMovedOn) || errors.Is(resolveErr, os.ErrNotExist)) {
+							err = &coldRecordMovedError{family: logicalFamily, branch: target.branch, authority: *branchAuthority, err: err}
+						}
+						return selector{}, ttcbundle.ContainerInfo{}, err
 					}
 					target.container = physical.ID
 					target.branch = physicalBranch
