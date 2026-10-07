@@ -4760,13 +4760,14 @@ func (b *runtimeBackend) releaseMigratedSourceRuntimeWithPolicy(containerID, bra
 		// entire source graph permanently.
 		return b.removeMigratedSourceMetadataWithPolicy(info, branchID, publishBacking)
 	}
-	if physicalPeers == 0 {
-		// A command making a branch in the runtime keeps it; see
-		// removeUnrecordedMigratedSourceRuntime.
-		done, ok := b.operations.beginRelease(info.ID)
-		if !ok {
-			return fmt.Errorf("keeping runtime %q: %w", info.ID, errRuntimeBeingMade)
-		}
+	// A command making a branch in the runtime keeps it, and only the
+	// source's branch goes, as beside the runtime's other branches below;
+	// see removeUnrecordedMigratedSourceRuntime.
+	done, purge := func() {}, physicalPeers == 0
+	if purge {
+		done, purge = b.operations.beginRelease(info.ID)
+	}
+	if purge {
 		err := b.purgeRuntime(info.ID)
 		done()
 		if err != nil {
@@ -4835,6 +4836,19 @@ func (b *runtimeBackend) releaseMigratedSourceRuntimeWithPolicy(containerID, bra
 	return b.removeMigratedSourceMetadataWithPolicy(info, branchID, publishBacking)
 }
 
+// destroyMigratedSourceBranch destroys a migration's source branch in its
+// runtime, which a command making a branch in it keeps: a branch the runtime
+// lists no more has gone already.
+func (b *runtimeBackend) destroyMigratedSourceBranch(containerID, branchID string) error {
+	if _, err := b.command("timetravel", containerID, "destroy", branchID); err != nil {
+		if families, listErr := b.listRuntimeFamiliesOf(containerID); listErr == nil && !runtimeListsBranch(families, containerID, branchID) {
+			return nil
+		}
+		return fmt.Errorf("destroying migrated source %s@%s: %w", containerID, branchID, err)
+	}
+	return nil
+}
+
 // removeUnrecordedMigratedSourceRuntime closes the crash/race boundary where
 // durable physical metadata has already been reclaimed but runsc still lists
 // the old source branch. The transaction supplies the exact physical identity,
@@ -4859,20 +4873,20 @@ func (b *runtimeBackend) removeUnrecordedMigratedSourceRuntime(containerID, bran
 	// dehydrating, every command of it waiting for its publication.
 	//
 	// A command making a branch in the runtime keeps both, as it keeps the
-	// runtime from any release: the release is tried again later. A fork of a
-	// dehydrated branch of the family, which forks its files in the family's
-	// node-local state, failed so, "rootfs-upper/volume.json: no such file or
-	// directory".
-	done, ok := b.operations.beginRelease(containerID)
-	if !ok {
-		return fmt.Errorf("keeping runtime %q: %w", containerID, errRuntimeBeingMade)
-	}
-	defer done()
+	// runtime from any release: only the source's branch goes then. A fork
+	// of a dehydrated branch of the family, which forks its files in the
+	// family's node-local state, failed so, "rootfs-upper/volume.json: no
+	// such file or directory".
 	pinned, err := b.pendingPublicationProtectsContainer(containerID)
 	if err != nil {
 		return err
 	}
 	release := func() error {
+		done, ok := b.operations.beginRelease(containerID)
+		if !ok {
+			return b.destroyMigratedSourceBranch(containerID, branchID)
+		}
+		defer done()
 		if !pinned {
 			return b.removeOrphanRuntime(containerID)
 		}
@@ -4896,6 +4910,11 @@ func (b *runtimeBackend) removeUnrecordedMigratedSourceRuntime(containerID, bran
 		if pinned {
 			return nil
 		}
+		done, ok := b.operations.beginRelease(containerID)
+		if !ok {
+			return nil
+		}
+		defer done()
 		return b.containerStore().RemoveActiveContainerState(containerID)
 	}
 
@@ -5343,10 +5362,6 @@ func (b *runtimeBackend) removeLocalFamilyStateIfUnowned(containerID string) err
 	defer done()
 	return b.containerStore().RemoveActiveContainerState(containerID)
 }
-
-// errRuntimeBeingMade is why a migration's source runtime stays for now: a
-// command makes a branch in it; see removeUnrecordedMigratedSourceRuntime.
-var errRuntimeBeingMade = errors.New("a command makes a branch in it")
 
 // errRuntimeFamilyLive is why node-local family state that no placement needs
 // stays: the family's runtime still runs on the node.

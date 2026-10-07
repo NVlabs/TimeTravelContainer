@@ -3599,17 +3599,40 @@ func TestCommandMovesNotesTheFirstResolution(t *testing.T) {
 }
 
 // A command making a branch in a migration's source runtime keeps the
-// runtime from the source's release, which says so: a drain of the source,
-// as a stop of the migrated branch makes, takes it for "later", not for a
-// failure.
+// runtime, and its node-local state, from the source's release: only the
+// source's branch goes. A stop or a removal of the migrated branch, which
+// releases the source at once, failed on a release that refused instead.
 func TestMigratedSourceReleaseKeepsARuntimeBeingMade(t *testing.T) {
+	calls := filepath.Join(t.TempDir(), "calls")
+	runsc := filepath.Join(t.TempDir(), "runsc")
+	script := "#!/bin/sh\necho \"$@\" >> " + calls + "\n" +
+		"[ \"$3\" = list ] && { echo '[{\"id\":\"fork-0123\",\"status\":\"paused\"}]'; exit 0; }\n" +
+		"[ \"$5\" = destroy ] && exit 0\nexit 2\n"
+	if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	local := t.TempDir()
+	state := filepath.Join(local, "containers", "fork-0123")
+	if err := os.MkdirAll(state, 0700); err != nil {
+		t.Fatal(err)
+	}
 	var operations familyOperations
 	made := operations.beginMaking("fork-0123", "child")
 	defer made()
-	backend := &runtimeBackend{dataRoot: t.TempDir(), localRoot: t.TempDir(), nodeID: "node-a", operations: &operations,
-		stdin: strings.NewReader(""), stdout: io.Discard, stderr: io.Discard}
-	if err := backend.removeUnrecordedMigratedSourceRuntime("fork-0123", "moved", nil); !errors.Is(err, errRuntimeBeingMade) {
-		t.Fatalf("removeUnrecordedMigratedSourceRuntime = %v, want the runtime kept for the branch being made", err)
+	backend := &runtimeBackend{root: filepath.Join(t.TempDir(), "runsc-root"), runsc: runsc, dataRoot: t.TempDir(), localRoot: local,
+		nodeID: "node-a", operations: &operations, stdin: strings.NewReader(""), stdout: io.Discard, stderr: io.Discard}
+	if err := backend.removeUnrecordedMigratedSourceRuntime("fork-0123", "moved", nil); err != nil {
+		t.Fatalf("removeUnrecordedMigratedSourceRuntime: %v", err)
+	}
+	data, err := os.ReadFile(calls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "timetravel fork-0123 destroy moved") || strings.Contains(string(data), "delete") {
+		t.Fatalf("runtime calls %q, want the source's branch destroyed and the runtime kept", data)
+	}
+	if _, err := os.Stat(state); err != nil {
+		t.Fatalf("the runtime's node-local state went: %v", err)
 	}
 }
 
