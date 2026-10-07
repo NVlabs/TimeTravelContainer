@@ -378,6 +378,65 @@ func TestRoutingWaitsForAClaimUnderWay(t *testing.T) {
 	}
 }
 
+// A migration places its branch on its target at its cutover. A command of
+// the branch meanwhile waits for it, and goes to the target, rather than be
+// refused for the migration's sake, "retry after cutover"; one of a branch
+// migrating for longer than a claim is waited for is refused.
+func TestRoutingWaitsForAMigrationsCutover(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "web")
+	if err := os.MkdirAll(filepath.Join(containerDir, "bundle"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(containerDir, "bundle", "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+		ID: "web", Name: "web", BundleDir: filepath.Join(containerDir, "bundle"),
+		Branches: []ttcbundle.BranchInfo{{ID: "main"}, {ID: "old"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	placements, err := cluster.OpenPlacementStore(filepath.Join(root, "cluster", "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	migrate := func(branch string, at time.Time) {
+		t.Helper()
+		record, err := placements.Create(cluster.PlacementRecord{
+			FamilyID: "web", BranchID: branch, PhysicalContainer: "web", PhysicalBranch: branch,
+			OwnerNode: "node-a", OwnerIncarnation: "boot-a", State: cluster.PlacementRunning,
+		}, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := placements.BeginMigration("web", branch, "node-a", "boot-a", record.Generation, "fork-"+branch, "node-b", at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	migrate("main", time.Now())
+	migrate("old", time.Now().Add(-2*materializingClaimWait))
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		_, _ = placements.CommitMigration("web", "main", "fork-main", "node-b", "boot-b", "fork-main", "fork-main", time.Now())
+	}()
+	start := time.Now()
+	owner, claims, err := placementAfterClaims(root, placements, []string{"stop", "web@main"})
+	if err != nil || owner != "node-b" || len(claims) != 1 {
+		t.Fatalf("a stop of a branch migrating: (%q, %+v, %v), want it routed to node-b after the cutover", owner, claims, err)
+	}
+	if waited := time.Since(start); waited < 150*time.Millisecond {
+		t.Fatalf("the stop was routed after %v, before the migration's cutover", waited)
+	}
+	var refused *branchMigratingError
+	if _, _, err := placementAfterClaims(root, placements, []string{"stop", "web@old"}); !errors.As(err, &refused) {
+		t.Fatalf("a stop of a branch migrating for long: %v, want refused", err)
+	}
+	if _, _, err := placementAfterClaims(root, placements, []string{"stop", "web@gone"}); err == nil || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("a stop of a branch with no placement: %v, want it not to exist", err)
+	}
+}
+
 // A node's proxy of a daemon request ends the local daemon's stream, which
 // the daemon takes for its client's going, when the request's input does:
 // for a request that carries none, only when the request ends, not with its

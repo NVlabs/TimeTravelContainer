@@ -403,6 +403,18 @@ func (e *branchMaterializingError) Error() string {
 	return fmt.Sprintf("branch %s is materializing on %q; only lifecycle recovery may retry it", e.branch, e.owner)
 }
 
+// branchMigratingError refuses a command of a branch that a migration is
+// moving to another node, until the migration's cutover places it there.
+type branchMigratingError struct {
+	branch   selector
+	from, to string
+	since    time.Time
+}
+
+func (e *branchMigratingError) Error() string {
+	return fmt.Sprintf("branch %s is migrating from %q to %q; retry after cutover", e.branch, e.from, e.to)
+}
+
 // materializingClaimWait is how long after a branch's claim for a node a
 // command of the branch waits for the start or rehydration that claimed it. A
 // claim older is one that a failed command left, which only a lifecycle
@@ -411,15 +423,22 @@ const materializingClaimWait = 90 * time.Second
 
 // placementAfterClaims is daemonCommandPlacementWithCatalog for a command a
 // client asked for, which waits while a branch it names is claimed by a start
-// or a rehydration under way, rather than fail for the other's sake. Four
-// clients acting at once on one family's branches had a stop, a fork or an
-// exec of a branch refused as another started it, a dozen times a run.
+// or a rehydration under way, or migrated, rather than fail for the other's
+// sake. Four clients acting at once on one family's branches had a stop, a
+// fork or an exec of a branch refused as another started it, a dozen times a
+// run, and, migrating branches too, a stop refused as another migrated it,
+// "retry after cutover". A migration's placement is the migration's for as
+// long as a claim is the claim's at most.
 func placementAfterClaims(dataRoot string, placements cluster.PlacementCatalog, args []string) (string, []daemonPlacementClaim, error) {
 	delay := 25 * time.Millisecond
 	for {
 		owner, claims, err := daemonCommandPlacementWithCatalog(dataRoot, placements, args)
 		var claimed *branchMaterializingError
-		if !errors.As(err, &claimed) || time.Since(claimed.claimedAt) >= materializingClaimWait {
+		var migrating *branchMigratingError
+		switch {
+		case errors.As(err, &claimed) && time.Since(claimed.claimedAt) < materializingClaimWait:
+		case errors.As(err, &migrating) && time.Since(migrating.since) < materializingClaimWait:
+		default:
 			return owner, claims, err
 		}
 		time.Sleep(delay)
@@ -544,7 +563,7 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 				return "", nil, fmt.Errorf("branch %s is corrupted; only rm is permitted", selected)
 			}
 			if placement.State == cluster.PlacementMigrating {
-				return "", nil, fmt.Errorf("branch %s is migrating from %q to %q; retry after cutover", selected, placement.OwnerNode, placement.TargetNode)
+				return "", nil, &branchMigratingError{branch: selected, from: placement.OwnerNode, to: placement.TargetNode, since: placement.UpdatedAt}
 			}
 			if placement.State == cluster.PlacementMaterializing && !claimMaterializing {
 				if allowCreatedProcessFree {
@@ -583,7 +602,10 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 				}
 			}
 		case errors.Is(err, os.ErrNotExist):
-			return "", nil, fmt.Errorf("resolving placement for %s: current-format clustered branch has no placement record", selected)
+			// A branch removed, or never made: a command of a branch a removal
+			// had just removed was refused for a branch with "no placement
+			// record", which read as a damaged one.
+			return "", nil, fmt.Errorf("branch %s does not exist", selected)
 		default:
 			return "", nil, fmt.Errorf("resolving placement for %s: %w", selected, err)
 		}
