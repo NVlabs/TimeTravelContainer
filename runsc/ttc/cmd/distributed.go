@@ -2981,6 +2981,11 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 		return selector{}, fmt.Errorf("renewing source execution authority: %w", err)
 	}
 	if state := normalizeLifecycleState(sourceBranch.State); state == "dehydrated" || state == "dehydrating" {
+		if waited, err := b.awaitSharedDehydratedSource(sourceInfo, source, logicalSource, sourceBranch); err != nil {
+			return selector{}, err
+		} else if waited {
+			return b.forkRemote(requested, targetNode, targetDestination, paused)
+		}
 		return b.forkRemoteDehydrated(source, logicalSource, sourceInfo, peer, targetNode, target, paused, nil)
 	}
 	finishForegroundCapture, err := b.beginForegroundCapture(sourceInfo, longOperation{branch: source.branch, state: "forking"})
@@ -3167,6 +3172,65 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 // forkRemoteDehydrated restores a process-free branch directly from its
 // durable kernel metadata and sparse memory graph. No source Sentry is
 // created, and the target is independent as soon as publication completes.
+// awaitSharedDehydratedSource waits for the image of source, a dehydrated
+// branch, to be in the shared store, as a remote fork's target reads it from
+// there alone: or for the branch to move on, as a rehydration takes it. The
+// wait gives the lifecycle lock up, as a stop's of a dehydrating branch does.
+// A fork right after the dehydration found the image's pack still being
+// written, "opening shared graph objects: ... manifest.json: no such file or
+// directory". It reports whether it waited, when the caller resolves the
+// source again.
+func (b *runtimeBackend) awaitSharedDehydratedSource(sourceInfo ttcbundle.ContainerInfo, source, logicalSource selector, sourceBranch ttcbundle.BranchInfo) (bool, error) {
+	if b.distributedSource == nil || b.distributedSource.authority == nil {
+		return false, nil
+	}
+	if ttcbundle.ResidentDehydration(sourceBranch) {
+		// Nothing makes a resident capture durable until its family's last
+		// live branch goes; see forkMany.
+		if err := b.persistDehydration(source, sourceInfo, sourceBranch, nil); err != nil {
+			return false, fmt.Errorf("making the dehydration of %s durable to fork it: %w", source, err)
+		}
+	}
+	// The record says it: the authority learns the branch dehydrated only once
+	// the publication commits, and the record is shared once the publication
+	// has written the image's packs.
+	var storage string
+	settled := func() (bool, error) {
+		info, err := b.containerStore().LoadRuntimeContainer(sourceInfo.ID)
+		if err != nil {
+			return false, err
+		}
+		branch, err := persistentBranchInfo(info, source.branch)
+		if err != nil {
+			return false, err
+		}
+		if state := normalizeLifecycleState(branch.State); state != "dehydrated" && state != "dehydrating" {
+			return true, nil
+		}
+		storage = branch.StorageState
+		return branch.StorageState == "shared" && branch.StorageManifest != "", nil
+	}
+	if done, err := settled(); err != nil || done {
+		return false, err
+	}
+	err := b.withoutLifecycleLock(sourceInfo, longOperation{branch: source.branch, state: "forking"}, func() error {
+		deadline := time.Now().Add(sharedDehydrationWait)
+		for time.Now().Before(deadline) {
+			time.Sleep(50 * time.Millisecond)
+			if done, err := settled(); err != nil || done {
+				return err
+			}
+		}
+		return fmt.Errorf("the image of %s is not in the shared store after %v: its storage is %q", source, sharedDehydrationWait, storage)
+	})
+	return true, err
+}
+
+// sharedDehydrationWait bounds how long a remote fork of a dehydrated branch
+// waits for the branch's image to be published; see
+// awaitSharedDehydratedSource.
+const sharedDehydrationWait = 5 * time.Minute
+
 func (b *runtimeBackend) forkRemoteDehydrated(source, logicalSource selector, sourceInfo ttcbundle.ContainerInfo, peer *cluster.Client, targetNode string, target selector, paused bool, committedTransaction *string) (result selector, retErr error) {
 	sourceBranch, branchErr := persistentBranchInfo(sourceInfo, source.branch)
 	if branchErr != nil {
@@ -3634,6 +3698,11 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		return nil, fmt.Errorf("renewing source execution authority: %w", err)
 	}
 	if state := normalizeLifecycleState(sourceBranch.State); state == "dehydrated" || state == "dehydrating" {
+		if waited, err := b.awaitSharedDehydratedSource(sourceInfo, source, logicalSource, sourceBranch); err != nil {
+			return nil, err
+		} else if waited {
+			return b.forkRemoteMany(requested, targetNode, targetContainers, paused)
+		}
 		results := make([]selector, 0, len(targetContainers))
 		transactions := make([]string, 0, len(targetContainers))
 		for _, target := range destinations {
