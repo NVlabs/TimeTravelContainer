@@ -1620,14 +1620,23 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		// physical loader branch, not an import into an already-running family.
 		restoreArgs.Peer = peer && !runtimeCreated
 		err := restore(restoreArgs)
-		if err != nil && restoreArgs.Peer && (restoreLostItsPeer(err) || !r.backend.runtimeRunsLiveBranch(info.ID)) {
+		for attempt := 0; err != nil && restoreArgs.Peer && attempt < 3 && (restoreLostItsPeer(err) || !r.backend.runtimeRunsLiveBranch(info.ID)); attempt++ {
 			// The runtime's last live branch went after the import looked, as
-			// the restore went on beside it or before.
-			if created, replaceErr := r.replacePeerRuntime(ctx, info.ID, targetBranch.ID, create, &doneMaking); replaceErr == nil && created {
+			// the restore went on beside it or before: the import replaces
+			// the runtime. Or the runtime was still restoring its branch, as a
+			// rehydration or another import making it does, "sandbox is
+			// restoringUnstarted, not available for distributed peer import":
+			// the replacement waits that out and finds the runtime live, and
+			// the import goes beside its branch then. It failed so before.
+			created, replaceErr := r.replacePeerRuntime(ctx, info.ID, targetBranch.ID, create, &doneMaking)
+			if replaceErr != nil {
+				break
+			}
+			if created {
 				runtimeCreated = true
 				restoreArgs.Peer = false
-				err = restore(restoreArgs)
 			}
+			err = restore(restoreArgs)
 		}
 		if err != nil {
 			return fmt.Errorf("%w (filesystem restore aliases: %v)", err, restoreArgs.FilesystemRestoreIDs)
