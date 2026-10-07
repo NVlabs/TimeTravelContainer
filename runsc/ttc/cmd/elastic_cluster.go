@@ -4765,7 +4765,7 @@ func (b *runtimeBackend) releaseMigratedSourceRuntimeWithPolicy(containerID, bra
 		// removeUnrecordedMigratedSourceRuntime.
 		done, ok := b.operations.beginRelease(info.ID)
 		if !ok {
-			return fmt.Errorf("keeping runtime %q while a command makes a branch in it", info.ID)
+			return fmt.Errorf("keeping runtime %q: %w", info.ID, errRuntimeBeingMade)
 		}
 		err := b.purgeRuntime(info.ID)
 		done()
@@ -4865,7 +4865,7 @@ func (b *runtimeBackend) removeUnrecordedMigratedSourceRuntime(containerID, bran
 	// directory".
 	done, ok := b.operations.beginRelease(containerID)
 	if !ok {
-		return fmt.Errorf("keeping runtime %q while a command makes a branch in it", containerID)
+		return fmt.Errorf("keeping runtime %q: %w", containerID, errRuntimeBeingMade)
 	}
 	defer done()
 	pinned, err := b.pendingPublicationProtectsContainer(containerID)
@@ -5343,6 +5343,10 @@ func (b *runtimeBackend) removeLocalFamilyStateIfUnowned(containerID string) err
 	defer done()
 	return b.containerStore().RemoveActiveContainerState(containerID)
 }
+
+// errRuntimeBeingMade is why a migration's source runtime stays for now: a
+// command makes a branch in it; see removeUnrecordedMigratedSourceRuntime.
+var errRuntimeBeingMade = errors.New("a command makes a branch in it")
 
 // errRuntimeFamilyLive is why node-local family state that no placement needs
 // stays: the family's runtime still runs on the node.

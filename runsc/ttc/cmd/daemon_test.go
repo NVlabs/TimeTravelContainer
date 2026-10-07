@@ -3495,6 +3495,21 @@ func (heldPublisher) Cleanup(ttcstorage.Intent) error                     { retu
 // A migration from a runtime that a dehydration has just released leaves
 // the runtime's node-local state, whose capture the dehydration's publication
 // reads until it is done, and the state of a branch that needs the runtime.
+// A command making a branch in a migration's source runtime keeps the
+// runtime from the source's release, which says so: a drain of the source,
+// as a stop of the migrated branch makes, takes it for "later", not for a
+// failure.
+func TestMigratedSourceReleaseKeepsARuntimeBeingMade(t *testing.T) {
+	var operations familyOperations
+	made := operations.beginMaking("fork-0123", "child")
+	defer made()
+	backend := &runtimeBackend{dataRoot: t.TempDir(), localRoot: t.TempDir(), nodeID: "node-a", operations: &operations,
+		stdin: strings.NewReader(""), stdout: io.Discard, stderr: io.Discard}
+	if err := backend.removeUnrecordedMigratedSourceRuntime("fork-0123", "moved", nil); !errors.Is(err, errRuntimeBeingMade) {
+		t.Fatalf("removeUnrecordedMigratedSourceRuntime = %v, want the runtime kept for the branch being made", err)
+	}
+}
+
 func TestUnrecordedMigratedSourceKeepsWhatItsBranchesNeed(t *testing.T) {
 	for _, test := range []struct {
 		name    string

@@ -3393,7 +3393,13 @@ func drainSourceDependency(backend *runtimeBackend, source *distributedSourceRun
 			unlockSource()
 			return fmt.Errorf("releasing migrated graph roots for %q: %w", tx.Identity.TransactionID, err)
 		}
-		if err := backend.releaseMigratedSourceRuntime(sourceContainer, sourceBranch); err != nil {
+		// A command making a branch in the source's runtime keeps it, which
+		// the migration's monitor, or a retiring node's final fence
+		// (reclaimRetiringNodeRuntimes), releases once the command is done:
+		// the source is independent, and the drain is. A stop of a migrated
+		// branch failed so, "releasing migrated source ...: keeping runtime
+		// ...", as a fork made a branch in the runtime.
+		if err := backend.releaseMigratedSourceRuntime(sourceContainer, sourceBranch); err != nil && !errors.Is(err, errRuntimeBeingMade) {
 			unlockSource()
 			return fmt.Errorf("releasing migrated source %s@%s: %w", tx.Identity.SourceContainer, tx.Identity.SourceBranch, err)
 		}
