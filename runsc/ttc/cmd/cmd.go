@@ -13311,14 +13311,23 @@ func (b *runtimeBackend) listFamiliesReading(familyID string, reads *familyReads
 	// Persistent container metadata describes cold branches, but must not expose
 	// a half-published target during ownership cutover.
 	if b.nodeID != "" {
+		// A family shown from its placements is named after one that names
+		// it, not after a runtime of it, as one made before
+		// familyDisplayRecord may; see there.
+		named := make(map[string]cluster.PlacementRecord)
+		for _, record := range placementRecords {
+			if current, ok := named[record.FamilyID]; record.FamilyName != "" && (!ok || current.FamilyName == current.PhysicalContainer) {
+				named[record.FamilyID] = record
+			}
+		}
 		for _, record := range placementRecords {
 			family, ok := byID[record.FamilyID]
-			if !ok && record.FamilyName != "" {
+			if display, found := named[record.FamilyID]; !ok && found {
 				family = Family{
-					ID: record.FamilyID, Name: record.FamilyName, Image: record.ImageReference,
-					Digest: record.ImageDigest, ImageSize: record.ImageSize,
-					LiveForkEligible: record.LiveForkEligible, LiveForkWaiver: record.LiveForkWaiver,
-					CreatedAt: record.FamilyCreatedAt,
+					ID: record.FamilyID, Name: display.FamilyName, Image: display.ImageReference,
+					Digest: display.ImageDigest, ImageSize: display.ImageSize,
+					LiveForkEligible: display.LiveForkEligible, LiveForkWaiver: display.LiveForkWaiver,
+					CreatedAt: display.FamilyCreatedAt,
 				}
 				ok = true
 			}

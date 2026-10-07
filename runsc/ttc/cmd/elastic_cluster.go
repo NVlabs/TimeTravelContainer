@@ -1176,12 +1176,17 @@ func (b *runtimeBackend) reconcilePlacementCatalogOf(families ...string) error {
 				if b.operations.beingMade(info.ID, branch.ID) {
 					continue
 				}
+				display, displayErr := b.familyDisplayRecord(info, authorityState)
+				if displayErr != nil {
+					result = errors.Join(result, fmt.Errorf("naming the placement of %s@%s: %w", info.ID, branch.ID, displayErr))
+					continue
+				}
 				_, createErr := placements.Create(cluster.PlacementRecord{
 					FamilyID: placementFamily, BranchID: placementBranch, PhysicalContainer: info.ID, PhysicalBranch: branch.ID,
 					OwnerNode: b.nodeID, OwnerIncarnation: current.Incarnation, State: state,
-					FamilyName: info.Name, ImageReference: info.Reference, ImageDigest: info.Digest, ImageSize: info.ImageSize,
-					LiveForkEligible: info.LiveForkEligible, LiveForkWaiver: info.LiveForkWaiver,
-					FamilyCreatedAt: info.CreatedAt, ParentBranch: branch.ParentID, BranchCreatedAt: branch.CreatedAt,
+					FamilyName: display.Name, ImageReference: display.Reference, ImageDigest: display.Digest, ImageSize: display.ImageSize,
+					LiveForkEligible: display.LiveForkEligible, LiveForkWaiver: display.LiveForkWaiver,
+					FamilyCreatedAt: display.CreatedAt, ParentBranch: branch.ParentID, BranchCreatedAt: branch.CreatedAt,
 					Quarantined: branch.Quarantined,
 				}, now)
 				if createErr != nil && !errors.Is(createErr, os.ErrExist) {
@@ -1460,6 +1465,53 @@ func (b *runtimeBackend) ensureForkPlacementDestinationsAvailable(info ttcbundle
 // logical branches routable. This is especially important for a locally
 // forked descendant of a remote import, whose physical container is private
 // transaction state and is intentionally hidden from ordinary discovery.
+// familyDisplayRecord returns the record whose name and image the placements
+// of info's branches show: info's own, or, when info is a physical runtime
+// apart from its logical family, as a remote fork's or a migration's
+// container is, the family's. A placement that showed the runtime's name
+// renamed the family in every listing after it, the listing naming a family
+// after its first placement: the family's branches, main too, were listed
+// under "fork-...", none under the family's name, in a run of the four-client
+// probe on the simulated NFS mount. The family's record, which other nodes
+// rewrite, is read again if a read misses it, and the family's placements
+// made from it say the same; with neither, the placement is not made.
+func (b *runtimeBackend) familyDisplayRecord(info ttcbundle.ContainerInfo, state *cluster.AuthorityState) (ttcbundle.ContainerInfo, error) {
+	family := logicalFamilyID(info)
+	if family == info.ID {
+		return info, nil
+	}
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt != 0 {
+			time.Sleep(50 * time.Millisecond)
+		}
+		var canonical ttcbundle.ContainerInfo
+		if canonical, err = b.containerStore().LoadContainer(family); err == nil {
+			return canonical, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return ttcbundle.ContainerInfo{}, fmt.Errorf("loading the record of family %q: %w", family, err)
+		}
+	}
+	var records []cluster.PlacementRecord
+	if state != nil {
+		records = state.PlacementList()
+	} else if placements, placementErr := b.placementCatalog(); placementErr == nil {
+		records, _ = placements.List()
+	}
+	for _, record := range records {
+		// A runtime's name is its ID, which no family's name is.
+		if record.FamilyID == family && record.FamilyName != "" && record.FamilyName != record.PhysicalContainer {
+			return ttcbundle.ContainerInfo{
+				ID: family, Name: record.FamilyName, Reference: record.ImageReference, Digest: record.ImageDigest,
+				ImageSize: record.ImageSize, LiveForkEligible: record.LiveForkEligible, LiveForkWaiver: record.LiveForkWaiver,
+				CreatedAt: record.FamilyCreatedAt,
+			}, nil
+		}
+	}
+	return ttcbundle.ContainerInfo{}, fmt.Errorf("loading the record of family %q: %w", family, err)
+}
+
 func (b *runtimeBackend) registerLocalForkPlacements(info ttcbundle.ContainerInfo, branches []ttcbundle.BranchInfo) error {
 	if b == nil || b.distributedSource == nil || b.distributedSource.authority == nil || b.nodeID == "" || len(branches) == 0 {
 		return nil
@@ -1469,13 +1521,9 @@ func (b *runtimeBackend) registerLocalForkPlacements(info ttcbundle.ContainerInf
 		return err
 	}
 	logicalFamily := logicalFamilyID(info)
-	display := info
-	if logicalFamily != info.ID {
-		if canonical, loadErr := b.containerStore().LoadContainer(logicalFamily); loadErr == nil {
-			display = canonical
-		} else if !errors.Is(loadErr, os.ErrNotExist) {
-			return fmt.Errorf("loading logical fork family %q: %w", logicalFamily, loadErr)
-		}
+	display, err := b.familyDisplayRecord(info, nil)
+	if err != nil {
+		return fmt.Errorf("naming the placements of fork family %q: %w", logicalFamily, err)
 	}
 	created := make([]cluster.PlacementRecord, 0, len(branches))
 	rollback := func(cause error) error {
@@ -4188,14 +4236,17 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	}
 	placement, err := placements.Lookup(logicalFamily, logicalTarget.branch)
 	if errors.Is(err, os.ErrNotExist) {
-		placement, err = placements.Create(cluster.PlacementRecord{
-			FamilyID: logicalFamily, BranchID: logicalTarget.branch, PhysicalContainer: info.ID, PhysicalBranch: target.branch,
-			OwnerNode: b.nodeID, OwnerIncarnation: sourceRecord.Incarnation, State: cluster.PlacementState(state),
-			FamilyName: info.Name, ImageReference: info.Reference, ImageDigest: info.Digest, ImageSize: info.ImageSize,
-			LiveForkEligible: info.LiveForkEligible, LiveForkWaiver: info.LiveForkWaiver,
-			FamilyCreatedAt: info.CreatedAt, ParentBranch: persistentBranch.ParentID, BranchCreatedAt: persistentBranch.CreatedAt,
-			Quarantined: persistentBranch.Quarantined,
-		}, time.Now())
+		var display ttcbundle.ContainerInfo
+		if display, err = b.familyDisplayRecord(info, nil); err == nil {
+			placement, err = placements.Create(cluster.PlacementRecord{
+				FamilyID: logicalFamily, BranchID: logicalTarget.branch, PhysicalContainer: info.ID, PhysicalBranch: target.branch,
+				OwnerNode: b.nodeID, OwnerIncarnation: sourceRecord.Incarnation, State: cluster.PlacementState(state),
+				FamilyName: display.Name, ImageReference: display.Reference, ImageDigest: display.Digest, ImageSize: display.ImageSize,
+				LiveForkEligible: display.LiveForkEligible, LiveForkWaiver: display.LiveForkWaiver,
+				FamilyCreatedAt: display.CreatedAt, ParentBranch: persistentBranch.ParentID, BranchCreatedAt: persistentBranch.CreatedAt,
+				Quarantined: persistentBranch.Quarantined,
+			}, time.Now())
+		}
 	}
 	if err != nil {
 		return err

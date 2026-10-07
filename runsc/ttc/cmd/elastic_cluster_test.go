@@ -1871,6 +1871,47 @@ func TestNonOwnedBranchCleanupLeavesABranchBeingMade(t *testing.T) {
 	}
 }
 
+// A placement of a branch in a physical runtime apart from its family, as a
+// remote fork's container is, shows the family's name and image, never the
+// runtime's: a listing names a family after its first placement.
+func TestFamilyDisplayRecordNamesTheLogicalFamily(t *testing.T) {
+	root := t.TempDir()
+	backend := &runtimeBackend{dataRoot: root, stdin: strings.NewReader(""), stdout: io.Discard, stderr: io.Discard}
+	wrapper := ttcbundle.ContainerInfo{ID: "fork-0123", Name: "fork-0123", DistributedFamilyID: "web", Reference: "fork-image"}
+	state := cluster.NewAuthorityState()
+	if _, err := backend.familyDisplayRecord(wrapper, state); err == nil {
+		t.Fatal("named a placement with neither the family's record nor its placements")
+	}
+	// A placement made from the runtime's record names nothing; one made
+	// from the family's does.
+	state.Placements["web/c1n4"] = cluster.PlacementRecord{FamilyID: "web", BranchID: "c1n4", PhysicalContainer: "fork-0123", FamilyName: "fork-0123"}
+	if _, err := backend.familyDisplayRecord(wrapper, state); err == nil {
+		t.Fatal("named a placement after the runtime")
+	}
+	state.Placements["web/c1r0"] = cluster.PlacementRecord{FamilyID: "web", BranchID: "c1r0", PhysicalContainer: "fork-0123", FamilyName: "fc", ImageReference: "alpine:3.20"}
+	if display, err := backend.familyDisplayRecord(wrapper, state); err != nil || display.Name != "fc" || display.Reference != "alpine:3.20" || display.ID != "web" {
+		t.Fatalf("familyDisplayRecord from the placements = %+v, %v; want the family fc", display, err)
+	}
+	// The family's record comes first.
+	bundleDir := filepath.Join(root, "containers", "web", "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(root, "containers", "web", "container.json"), ttcbundle.ContainerInfo{ID: "web", Name: "web-family", Reference: "busybox", BundleDir: bundleDir}); err != nil {
+		t.Fatal(err)
+	}
+	if display, err := backend.familyDisplayRecord(wrapper, state); err != nil || display.Name != "web-family" || display.Reference != "busybox" {
+		t.Fatalf("familyDisplayRecord from the record = %+v, %v; want the family's record", display, err)
+	}
+	// A family's own record is its own display.
+	if display, err := backend.familyDisplayRecord(ttcbundle.ContainerInfo{ID: "web", Name: "web-family"}, nil); err != nil || display.Name != "web-family" {
+		t.Fatalf("familyDisplayRecord of the family = %+v, %v", display, err)
+	}
+}
+
 // A command making a branch of a family on the node reads the family's
 // node-local state, as a fork of a dehydrated branch of the family forks its
 // files in the family's repositories there: the orphan cleanup leaves the

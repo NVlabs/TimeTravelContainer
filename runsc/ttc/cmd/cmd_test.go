@@ -6043,6 +6043,40 @@ func TestListFamiliesIncludesRemotePlacementWithoutReconcilingIt(t *testing.T) {
 	}
 }
 
+// A family listed from its placements alone is named after one that names
+// it, not after one a runtime of it, apart from it, named, whichever comes
+// first.
+func TestListFamiliesNamesAFamilyAfterAPlacementThatNamesIt(t *testing.T) {
+	dir := t.TempDir()
+	runsc := filepath.Join(dir, "runsc")
+	if err := os.WriteFile(runsc, []byte("#!/bin/sh\n[ \"$3\" = list ] && { echo '[]'; exit 0; }\nexit 2\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	dataRoot := filepath.Join(dir, "data")
+	placements, err := cluster.OpenPlacementStore(filepath.Join(dataRoot, "cluster", "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	for _, record := range []cluster.PlacementRecord{
+		{FamilyID: "family", BranchID: "a", FamilyName: "fork-0123", PhysicalContainer: "fork-0123", PhysicalBranch: "a"},
+		{FamilyID: "family", BranchID: "b", FamilyName: "fc", PhysicalContainer: "family", PhysicalBranch: "b"},
+	} {
+		record.OwnerNode, record.OwnerIncarnation, record.State = "node-b", "boot-b", cluster.PlacementRunning
+		if _, err := placements.Create(record, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: dataRoot, nodeID: "node-a", distributedSource: &distributedSourceRuntime{placements: placements}}
+	families, err := b.listFamilies()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(families) != 1 || families[0].Name != "fc" || len(families[0].Branches) != 2 {
+		t.Fatalf("families=%+v, want fc with both branches", families)
+	}
+}
+
 func TestListFamiliesHidesCompletedPhysicalMigrationRuntime(t *testing.T) {
 	dir := t.TempDir()
 	runsc := filepath.Join(dir, "runsc")
