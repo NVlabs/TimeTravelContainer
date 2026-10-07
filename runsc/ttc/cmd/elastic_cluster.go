@@ -3885,33 +3885,45 @@ func (s *daemonServer) executeDistributedChild(request daemonRequest, ordinal in
 	// a command routed alone does: a dehydration of a branch that a start
 	// had just claimed was refused, "only lifecycle recovery may retry
 	// it".
-	owner, claims, err := placementAfterClaims(s.dataRoot, placements, args)
-	if err != nil {
-		return 1, "", err
-	}
-	if owner != "" {
-		node = owner
-	}
-	childRequest := daemonRequest{
-		Version: daemonAPIVersion, Action: "command", RequestID: distributedChildRequestID(request.RequestID, ordinal, args),
-		Args: args, ClientTERM: request.ClientTERM,
-		DistributedLeaf: true, PlacementClaims: claims,
-	}
-	var status int
-	var stderr string
-	if node == s.clusterCapabilities.NodeID {
-		status, _, stderr, err = s.executeLocalDistributedCommand(childRequest)
-	} else {
-		peer, peerErr := s.routedPeer(node, routing)
-		if peerErr != nil {
-			return 1, "", peerErr
+	requestID := distributedChildRequestID(request.RequestID, ordinal, args)
+	for attempt := 0; ; attempt++ {
+		owner, claims, err := placementAfterClaims(s.dataRoot, placements, args)
+		if err != nil {
+			return 1, "", err
 		}
-		status, _, stderr, err = executeRemoteDaemonRequest(context.Background(), peer, childRequest)
+		if owner != "" {
+			node = owner
+		}
+		childRequest := daemonRequest{
+			Version: daemonAPIVersion, Action: "command", RequestID: requestID,
+			Args: args, ClientTERM: request.ClientTERM,
+			DistributedLeaf: true, PlacementClaims: claims,
+		}
+		var status int
+		var stderr string
+		if node == s.clusterCapabilities.NodeID {
+			status, _, stderr, err = s.executeLocalDistributedCommand(childRequest)
+		} else {
+			peer, peerErr := s.routedPeer(node, routing)
+			if peerErr != nil {
+				return 1, "", peerErr
+			}
+			status, _, stderr, err = executeRemoteDaemonRequest(context.Background(), peer, childRequest)
+		}
+		if err != nil {
+			return 1, stderr, fmt.Errorf("executing family operation on node %q: %w", node, err)
+		}
+		// The child's branch went to another node after the child was
+		// routed, as a start there takes a cold branch, and the child failed
+		// resolving it, having done nothing: it goes again, routed as the
+		// branch is placed now, under a request ID of its own. A removal
+		// failed so, "branch ... belongs to cluster node ...".
+		if status != 0 && attempt < 2 && strings.Contains(stderr, "belongs to cluster node") {
+			requestID = distributedChildRequestID(requestID, attempt+1, args)
+			continue
+		}
+		return status, stderr, nil
 	}
-	if err != nil {
-		return 1, stderr, fmt.Errorf("executing family operation on node %q: %w", node, err)
-	}
-	return status, stderr, nil
 }
 
 // executeDistributedEachTarget runs a command of several targets, which a
