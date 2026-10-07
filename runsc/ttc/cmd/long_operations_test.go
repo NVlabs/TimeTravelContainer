@@ -6,6 +6,7 @@ package cmd
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -13,6 +14,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
+	"gvisor.dev/gvisor/runsc/ttc/cluster"
 )
 
 // A long operation gives the lifecycle lock up while it works, so other
@@ -176,6 +178,47 @@ func TestListingsShowLongOperations(t *testing.T) {
 	}
 	if len(families[2].Branches) != 1 || families[2].Branches[0].ID != "main" {
 		t.Fatalf("a checkpoint's hidden branch is listed: %+v", families[2].Branches)
+	}
+}
+
+// A routed command waits, before its claims are validated, for a long
+// operation working on the physical runtime of a branch it claims, apart from
+// the branch's family, as a migration of the branch from there does: the
+// branch may move meanwhile, which the claims then find stale.
+func TestRoutedCommandWaitsForItsBranchsRuntime(t *testing.T) {
+	server := &daemonServer{}
+	placements, err := cluster.OpenPlacementStore(filepath.Join(t.TempDir(), "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range []cluster.PlacementRecord{
+		{FamilyID: "fam", BranchID: "moved", PhysicalContainer: "fork-0123", PhysicalBranch: "moved"},
+		{FamilyID: "fam", BranchID: "home", PhysicalContainer: "fam", PhysicalBranch: "home"},
+	} {
+		record.OwnerNode, record.OwnerIncarnation, record.State = "node-a", "boot-a", cluster.PlacementRunning
+		if _, err := placements.Create(record, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	backend := &runtimeBackend{distributedSource: &distributedSourceRuntime{placements: placements}}
+	request := daemonRequest{Args: []string{"pause", "fc@moved"}, PlacementClaims: []daemonPlacementClaim{{FamilyID: "fam", BranchID: "moved"}}}
+	if _, busy := server.claimedRuntimeOperation(backend, request); busy {
+		t.Fatal("a command waited with no long operation under way")
+	}
+	if err := server.operations.begin(&familyOperation{id: "fork-0123", name: "fork-0123", longOperation: longOperation{branch: "moved", state: "migrating"}}); err != nil {
+		t.Fatal(err)
+	}
+	if op, busy := server.claimedRuntimeOperation(backend, request); !busy || op.id != "fork-0123" {
+		t.Fatalf("claimedRuntimeOperation = %+v, %t; want the migration of the claimed branch's runtime", op, busy)
+	}
+	request.PlacementClaims[0].BranchID, request.Args[1] = "home", "fc@home"
+	if _, busy := server.claimedRuntimeOperation(backend, request); busy {
+		t.Fatal("a command on a branch in its family's runtime waited for another runtime's operation")
+	}
+	request.Args = []string{"exec", "fc@moved", "true"}
+	request.PlacementClaims[0].BranchID = "moved"
+	if _, busy := server.claimedRuntimeOperation(backend, request); busy {
+		t.Fatal("a command that changes nothing waited for the operation")
 	}
 }
 

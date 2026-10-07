@@ -8186,6 +8186,9 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	// unless its client leaves; a node command waits for every one.
 	for {
 		operation, busy := s.operations.target(request.Args)
+		if !busy {
+			operation, busy = s.claimedRuntimeOperation(backend, request)
+		}
 		allIdle := !daemonCommandKeepsLifecycleLock(request.Args) || !s.operations.any()
 		if !busy && allIdle {
 			break
@@ -8374,6 +8377,37 @@ func (s *daemonServer) runListing(dataRoot string, args []string, backend *runti
 	_, _ = backend.stdout.Write(stdout.Bytes())
 	_, _ = backend.stderr.Write(stderr.Bytes())
 	return status
+}
+
+// claimedRuntimeOperation returns a long operation of another request working
+// on the physical runtime of a branch that request's placement claims name,
+// where that runtime is apart from the branch's family, as a migration's
+// source or a remote fork's container is: the command would wait for the
+// operation once it resolved the branch (resolveSelectorWaiting), journaled
+// by then, and a migration that moved the branch meanwhile failed it, "branch
+// ... belongs to cluster node ...", 10 commands of 6,552 in ten runs of the
+// four-client probe with migrations. Waited for before the claims are
+// validated, the move has the command refused as routed stale, and its router
+// sends it to the branch's new owner.
+func (s *daemonServer) claimedRuntimeOperation(backend *runtimeBackend, request daemonRequest) (familyOperation, bool) {
+	if len(request.PlacementClaims) == 0 || !daemonCommandNeedsMutationLock(request.Args) || !s.operations.any() {
+		return familyOperation{}, false
+	}
+	placements, err := backend.placementCatalog()
+	if err != nil {
+		return familyOperation{}, false
+	}
+	command := daemonCommandName(request.Args)
+	for _, claim := range request.PlacementClaims {
+		record, err := placements.Lookup(claim.FamilyID, claim.BranchID)
+		if err != nil || record.PhysicalContainer == "" || record.PhysicalContainer == claim.FamilyID {
+			continue
+		}
+		if op, ok := s.operations.lookup(record.PhysicalContainer); ok && !op.admits(command) {
+			return op, true
+		}
+	}
+	return familyOperation{}, false
 }
 
 // validateRoutedClaims validates the placement claims a command was routed
