@@ -3835,6 +3835,36 @@ func TestWaitDurableUsesClusterAuthorityInsteadOfStaleLocalMetadata(t *testing.T
 	}
 }
 
+// movedStopBackend's branch was rehydrated on another node while a stop
+// waited for its dehydration.
+type movedStopBackend struct {
+	*fakeBackend
+	moved []selector
+}
+
+func (b *movedStopBackend) authoritativeBranchDurable(target selector) (bool, error) {
+	return false, fmt.Errorf("%s is running: only a stopped or dehydrated branch has durable state to wait for", target)
+}
+
+func (b *movedStopBackend) branchMovedAway(target selector) bool {
+	b.moved = append(b.moved, target)
+	return true
+}
+
+// A stop of a dehydrating branch that another node rehydrates meanwhile has
+// done nothing, and asks whether the branch has moved, for its daemon to send
+// the stop where it went.
+func TestStopOfABranchRehydratedElsewhereAsksWhereItWent(t *testing.T) {
+	b := &movedStopBackend{fakeBackend: &fakeBackend{}}
+	target := branchOperationTarget{selector: selector{container: "web", branch: "child"}, state: "dehydrating"}
+	if err := stopBranchLifecycle(target, 15, 10, b, true); err == nil || !strings.Contains(err.Error(), "is running") {
+		t.Fatalf("stopBranchLifecycle = %v, want the wait's failure", err)
+	}
+	if len(b.moved) != 1 || b.moved[0] != target.selector {
+		t.Fatalf("asked whether %v moved, want %v", b.moved, target.selector)
+	}
+}
+
 // A stop of a dehydrating branch waits for the branch's publication for so
 // long, then gives up rather than hold the command for as long as the
 // publication retries.

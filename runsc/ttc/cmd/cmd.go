@@ -5366,6 +5366,14 @@ func stopBranchLifecycle(target branchOperationTarget, stopSignal, timeoutSecond
 			return fmt.Errorf("waiting for dehydration of %s: %w", target.selector, err)
 		}
 		if result.err != nil {
+			// A start or a rehydration on another node took the branch while
+			// the stop waited, and failed it, "... is running: only a stopped
+			// or dehydrated branch has durable state to wait for": the stop,
+			// which has done nothing, goes to stop the branch there, sent on
+			// by its daemon (forwardMovedCommand).
+			if mover, ok := backend.(movedBranchBackend); ok {
+				mover.branchMovedAway(target.selector)
+			}
 			return fmt.Errorf("waiting for dehydration of %s: %w", target.selector, result.err)
 		}
 		target.state = "dehydrated"
@@ -7451,6 +7459,39 @@ func (m *commandMoves) note(err error) {
 		m.owner = moved.owner
 	}
 	m.resolved = true
+}
+
+// force records that the command, which has done nothing, finds its branch
+// on owner, whatever it resolved before.
+func (m *commandMoves) force(owner string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.owner, m.resolved = owner, true
+}
+
+// movedBranchBackend is a backend that can tell whether a branch, which a
+// command has done nothing to, has moved to another node meanwhile.
+type movedBranchBackend interface {
+	branchMovedAway(selector) bool
+}
+
+// branchMovedAway reports whether target, which the command has done nothing
+// to, now belongs to another node, and records so for the command's daemon,
+// which sends the command there.
+func (b *runtimeBackend) branchMovedAway(target selector) bool {
+	if b.moves == nil {
+		return false
+	}
+	_, _, err := b.resolveSelectorOf(target)
+	var moved *remoteBranchOwnershipError
+	if !errors.As(err, &moved) {
+		return false
+	}
+	b.moves.force(moved.owner)
+	return true
 }
 
 // movedTo names the node that owned the branch the command's first
