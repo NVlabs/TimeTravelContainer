@@ -243,27 +243,37 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest, output io.Writer)
 	defer os.RemoveAll(stage)
 
 	forkArgs := []string{"timetravel", "--source", target.branch, "--paused", info.ID, "fork", hiddenBranch}
-	filesystemOrigins, finishFilesystemOrigins, err := b.allocateFilesystemForkOrigins(info.ID, 1)
-	if err != nil {
-		return fmt.Errorf("allocating checkpoint filesystem origins: %w", err)
-	}
-	var forkOutput []byte
-	if len(filesystemOrigins) == 0 {
-		forkOutput, err = b.command(forkArgs...)
-	} else {
-		originsReader, pipeErr := filesystemOriginAssignmentsPipe(filesystemOrigins)
-		if pipeErr != nil {
-			return errors.Join(pipeErr, finishFilesystemOrigins(false))
+	fork := func() ([]byte, func(bool) error, error) {
+		filesystemOrigins, finishFilesystemOrigins, err := b.allocateFilesystemForkOrigins(info.ID, 1)
+		if err != nil {
+			return nil, nil, fmt.Errorf("allocating checkpoint filesystem origins: %w", err)
 		}
-		forkArgs = append([]string{"timetravel", "--filesystem-origins-fd=3"}, forkArgs[1:]...)
-		forkOutput, err = b.commandWithFiles([]*os.File{originsReader}, forkArgs...)
-		closeErr := originsReader.Close()
-		if err == nil {
-			err = closeErr
+		var output []byte
+		if len(filesystemOrigins) == 0 {
+			output, err = b.command(forkArgs...)
+		} else {
+			originsReader, pipeErr := filesystemOriginAssignmentsPipe(filesystemOrigins)
+			if pipeErr != nil {
+				return nil, nil, errors.Join(pipeErr, finishFilesystemOrigins(false))
+			}
+			withOrigins := append([]string{"timetravel", "--filesystem-origins-fd=3"}, forkArgs[1:]...)
+			output, err = b.commandWithFiles([]*os.File{originsReader}, withOrigins...)
+			closeErr := originsReader.Close()
+			if err == nil {
+				err = closeErr
+			}
 		}
+		if err != nil {
+			return nil, nil, errors.Join(fmt.Errorf("creating checkpoint snapshot branch: %w", err), finishFilesystemOrigins(false))
+		}
+		return output, finishFilesystemOrigins, nil
 	}
+	// The fork adds references to the branch's origins, which a publication
+	// of a branch sharing them freezes while it hands them to the shared
+	// store; it waits that out as a fork of the branch does.
+	forkOutput, finishFilesystemOrigins, err := b.forkThroughHandoffs(info, target.branch, fork)
 	if err != nil {
-		return errors.Join(fmt.Errorf("creating checkpoint snapshot branch: %w", err), finishFilesystemOrigins(false))
+		return err
 	}
 	// The source and hidden child now use the exact authority-allocated working
 	// origins. They cannot be abandoned even if archive construction fails:

@@ -682,6 +682,28 @@ func throughAuthorityHandoffs(op func() error) error {
 	}
 }
 
+// waitOutHandoffs runs run, and while it is refused because a snapshot it
+// would change the references of is frozen for an authority handoff, waits
+// without the lifecycle lock, as op, and runs it again, as a fork does; see
+// forkThroughHandoffs. run must change nothing when refused.
+func (b *runtimeBackend) waitOutHandoffs(info ttcbundle.ContainerInfo, op longOperation, run func() error) error {
+	deadline := time.Now().Add(forkHandoffWait)
+	delay := 100 * time.Millisecond
+	for {
+		err := run()
+		if err == nil || !frozenForAuthorityHandoff(err) || time.Now().After(deadline) {
+			return err
+		}
+		if err := b.withoutLifecycleLock(info, op, func() error {
+			time.Sleep(delay)
+			return nil
+		}); err != nil {
+			return err
+		}
+		delay = min(2*delay, 2*time.Second)
+	}
+}
+
 // releaseGraphMemoryRootsThroughHandoffs is releaseGraphMemoryRoots through
 // authority handoffs. A refused release changes nothing, and a repeated one
 // skips the roots already released.

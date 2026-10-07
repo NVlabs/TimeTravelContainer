@@ -466,6 +466,39 @@ func TestForkWaitsOutAHandoff(t *testing.T) {
 	}
 }
 
+// A commit's snapshot refused by a frozen authority handoff is run again once
+// the handoff is over, without the lifecycle lock meanwhile; any other
+// failure is final.
+func TestSnapshotWaitsOutAHandoff(t *testing.T) {
+	server := &daemonServer{}
+	root := t.TempDir()
+	hold := &lifecycleHold{acquire: func() func() { return server.lockDataRoot(root) }, release: server.lockDataRoot(root)}
+	b := &runtimeBackend{lifecycleLockHeld: true, mutating: true}
+	server.configureLongOperations(b, hold)
+	defer hold.unlock()
+	info := ttcbundle.ContainerInfo{ID: "id", Name: "s"}
+	attempts := 0
+	if err := b.waitOutHandoffs(info, longOperation{branch: "main", state: "committing"}, func() error {
+		attempts++
+		if attempts < 3 {
+			if _, locked := server.tryLockDataRoot(root); locked {
+				t.Error("a snapshot attempt ran without the lifecycle lock")
+			}
+			return errors.New("snapshotting rootfs upper: snapshot 13 references are frozen for authority handoff: snapshot ledger is frozen for authority handoff")
+		}
+		return nil
+	}); err != nil || attempts != 3 {
+		t.Fatalf("waitOutHandoffs = %v after %d attempts, want success after 3", err, attempts)
+	}
+	attempts = 0
+	if err := b.waitOutHandoffs(info, longOperation{branch: "main", state: "committing"}, func() error {
+		attempts++
+		return errors.New("snapshotting rootfs upper: no space left on device")
+	}); err == nil || attempts != 1 {
+		t.Fatalf("an ordinary failure was retried: %d attempts, %v", attempts, err)
+	}
+}
+
 func TestFrozenForAuthorityHandoff(t *testing.T) {
 	for _, test := range []struct {
 		err  error
