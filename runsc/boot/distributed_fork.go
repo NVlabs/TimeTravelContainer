@@ -627,9 +627,12 @@ func aliasRestoreFilesystemResources(resources vfs.RestoreFilesystemResources, r
 // deliberately reuses the peer's Platform and application MemoryFile, which is
 // what makes repeated imports of identical chunks share resident host pages in
 // one Sentry instead of allocating another sandbox process.
-func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*DistributedForkRestoreInfo, error) {
+func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (_ *DistributedForkRestoreInfo, retErr error) {
 	if args.DurableDehydration {
 		return l.restoreDistributedDurablePeer(args)
+	}
+	if !l.family.HasActivePeer() {
+		return nil, errNoActivePeer
 	}
 	releaseFilesystemRestore := pinRemoteFilesystemRestore(l.ttcVolumeRepositories)
 	defer releaseFilesystemRestore()
@@ -665,6 +668,17 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*
 	}
 	var filesystemToken ttcvolume.RemoteToken
 	copy(filesystemToken[:], args.SnapshotToken[:])
+	// A restore that fails after the attachments undoes them: see
+	// ttcvolume.Repository.AttachRemoteObjectSourceUndoable.
+	var detachFilesystemSources []func()
+	defer func() {
+		if retErr != nil && len(detachFilesystemSources) != 0 {
+			for _, detach := range detachFilesystemSources {
+				detach()
+			}
+			l.family.TransactionSourcesChanged()
+		}
+	}()
 	connectionIndex := 0
 	for _, volume := range l.ttcVolumeRepositories {
 		key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(volume.config.Source)))
@@ -672,9 +686,11 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*
 		// bootstrapped this Sentry, so volume.config.Branch may name that older
 		// branch after a remote branch migrates back to the same node. Attach the
 		// donated source to the freshly imported generation named by the request.
-		if err := volume.repository.AttachRemoteObjectSource(donated[connectionIndex], filesystemToken, key, args.FilesystemBranch); err != nil {
+		detach, err := volume.repository.AttachRemoteObjectSourceUndoable(donated[connectionIndex], filesystemToken, key, args.FilesystemBranch)
+		if err != nil {
 			return nil, fmt.Errorf("attaching distributed peer filesystem source %q branch %q: %w", volume.config.Source, args.FilesystemBranch, err)
 		}
+		detachFilesystemSources = append(detachFilesystemSources, detach)
 		connectionIndex++
 	}
 	donated = donated[args.FilesystemConnections:]
@@ -813,7 +829,10 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*
 // restoreDistributedDurablePeer imports a process-free graph dehydration
 // image into an existing family. Durable metadata is not a SessionMetadata
 // envelope, so it must be dispatched before the live transport decoder.
-func (l *Loader) restoreDistributedDurablePeer(args *DistributedForkRestoreArgs) (*DistributedForkRestoreInfo, error) {
+func (l *Loader) restoreDistributedDurablePeer(args *DistributedForkRestoreArgs) (_ *DistributedForkRestoreInfo, retErr error) {
+	if !l.family.HasActivePeer() {
+		return nil, errNoActivePeer
+	}
 	releaseFilesystemRestore := pinRemoteFilesystemRestore(l.ttcVolumeRepositories)
 	defer releaseFilesystemRestore()
 	files := args.FilePayload.Files
@@ -828,9 +847,16 @@ func (l *Loader) restoreDistributedDurablePeer(args *DistributedForkRestoreArgs)
 	filesystemFiles := files[len(memoryFiles):]
 	var filesystemToken ttcvolume.RemoteToken
 	copy(filesystemToken[:], args.SnapshotToken[:])
-	if err := l.attachColdFilesystemSources(filesystemFiles, filesystemToken, args.FilesystemBranch); err != nil {
+	detachFilesystemSources, err := l.attachColdFilesystemSources(filesystemFiles, filesystemToken, args.FilesystemBranch)
+	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		if retErr != nil {
+			detachFilesystemSources()
+			l.family.TransactionSourcesChanged()
+		}
+	}()
 	files = memoryFiles
 	var graphManifest ttcchunk.Manifest
 	var graphChunks map[ttcchunk.ID]ttcsnapshot.ObjectID

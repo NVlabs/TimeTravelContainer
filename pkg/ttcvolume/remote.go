@@ -333,6 +333,8 @@ type remoteObjectClient struct {
 	repository  *Repository
 	branchID    string
 	catalog     string
+	// catalogOrigin is the snapshot that expands catalog.
+	catalogOrigin ttcsnapshot.SnapshotID
 	// transaction is whether the source serves a remote fork's import, its
 	// catalog not an image of the shared store: its provider serves it only
 	// while the fork's transaction lasts.
@@ -465,7 +467,86 @@ func (r *Repository) AttachRemoteObjectSource(conn io.ReadWriteCloser, token Rem
 	if r == nil || conn == nil {
 		return errors.New("remote filesystem source requires repository and connection")
 	}
-	return r.attachObjectSource(&remoteObjectClient{conn: conn, token: token, source: source}, branchID)
+	_, err := r.attachObjectSource(&remoteObjectClient{conn: conn, token: token, source: source}, branchID)
+	return err
+}
+
+// AttachRemoteObjectSourceUndoable is AttachRemoteObjectSource, and returns
+// what undoes the attachment, for a restore that fails after it: the source
+// takes over the files and the catalog that earlier attachments of the same
+// source serve, the newest attachment preferred, and one left attached once
+// its restore failed, its connection closed, failed them all. A remote
+// fork's import whose peer exited as it restored left the branch imported
+// before it unable to be drained, "deferred filesystem catalog ... has no
+// attached authoritative source". undo detaches the source and gives what it
+// took over back to the sources it took it from, if they are still attached.
+func (r *Repository) AttachRemoteObjectSourceUndoable(conn io.ReadWriteCloser, token RemoteToken, source RemoteSourceKey, branchID string) (func(), error) {
+	if r == nil || conn == nil {
+		return func() {}, errors.New("remote filesystem source requires repository and connection")
+	}
+	attachment, err := r.attachObjectSource(&remoteObjectClient{conn: conn, token: token, source: source}, branchID)
+	if err != nil || attachment == nil {
+		return func() {}, err
+	}
+	var once sync.Once
+	return func() { once.Do(attachment.undo) }, nil
+}
+
+// remoteAttachment is what attaching remote displaced: the earlier owners of
+// the objects it took over, and of its catalog.
+type remoteAttachment struct {
+	repository *Repository
+	remote     *remoteObjectClient
+	// catalog is remote's catalog, and previousCatalog its owner before.
+	catalog         string
+	previousCatalog *remoteObjectClient
+	displaced       map[string]*remoteObjectClient
+}
+
+// undo detaches the attachment's source, as if it had never been attached.
+func (a *remoteAttachment) undo() {
+	r, remote := a.repository, a.remote
+	r.remoteLifecycleMu.Lock()
+	defer r.remoteLifecycleMu.Unlock()
+	// Serialize behind a reader using the source, as a drain's detach does.
+	remote.mu.Lock()
+	r.remoteMu.Lock()
+	attached := func(client *remoteObjectClient) bool {
+		_, ok := r.remotes[client]
+		return client != nil && ok
+	}
+	delete(r.remotes, remote)
+	for object, owner := range r.remoteByObject {
+		if owner != remote {
+			continue
+		}
+		// An object found through the catalog since is the catalog's.
+		heir := a.displaced[object]
+		if heir == nil {
+			heir = a.previousCatalog
+		}
+		if !attached(heir) {
+			delete(r.remoteByObject, object)
+			continue
+		}
+		if _, ok := heir.objects[object]; !ok {
+			heir.objects[object] = remote.objects[object]
+			heir.sources[object] = remote.sources[object]
+		}
+		r.remoteByObject[object] = heir
+	}
+	if a.catalog != "" && r.remoteByCatalog[a.catalog] == remote {
+		if attached(a.previousCatalog) {
+			r.remoteByCatalog[a.catalog] = a.previousCatalog
+			_ = r.graph.AttachDeferredResolver(a.catalog, a.previousCatalog.catalogOrigin, a.previousCatalog.pullMetadata)
+		} else {
+			delete(r.remoteByCatalog, a.catalog)
+			r.graph.DetachDeferredResolver(a.catalog)
+		}
+	}
+	r.remoteMu.Unlock()
+	remote.mu.Unlock()
+	_ = remote.close()
 }
 
 // AttachLocalObjectSource attaches source, which this process reads itself,
@@ -477,10 +558,13 @@ func (r *Repository) AttachLocalObjectSource(source RemoteObjectSource, branchID
 	if r == nil || source.Reader == nil || source.Catalog == nil {
 		return errors.New("local filesystem source requires repository, reader and catalog")
 	}
-	return r.attachObjectSource(&remoteObjectClient{local: &source, source: source.Key}, branchID)
+	_, err := r.attachObjectSource(&remoteObjectClient{local: &source, source: source.Key}, branchID)
+	return err
 }
 
-func (r *Repository) attachObjectSource(remote *remoteObjectClient, branchID string) error {
+// attachObjectSource attaches remote as the source of branchID's remote
+// files, and returns what it displaced, nil if it attached nothing.
+func (r *Repository) attachObjectSource(remote *remoteObjectClient, branchID string) (*remoteAttachment, error) {
 	// A source attachment changes the resolver set consumed by the
 	// repository-wide independence barrier. Serialize the two operations so a
 	// concurrent sibling migration cannot have its newly attached catalog
@@ -489,17 +573,19 @@ func (r *Repository) attachObjectSource(remote *remoteObjectClient, branchID str
 	defer r.remoteLifecycleMu.Unlock()
 	branch, err := r.Branch(branchID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	remote.next, remote.complete, remote.objects, remote.sources = 1, make(map[string]bool), make(map[string]int64), make(map[string]string)
 	remote.repository, remote.branchID, remote.catalog = r, branchID, branch.RemoteCatalog
 	remote.transaction = branch.RemoteCatalog != "" && !branch.RemoteShared
+	attachment := &remoteAttachment{repository: r, remote: remote, catalog: branch.RemoteCatalog, displaced: make(map[string]*remoteObjectClient)}
 	if branch.RemoteCatalog != "" {
 		if branch.RemoteCatalogSnapshot == 0 {
-			return errors.New("remote filesystem branch has no catalog expansion origin")
+			return nil, errors.New("remote filesystem branch has no catalog expansion origin")
 		}
-		if err := r.graph.AttachDeferredResolver(branch.RemoteCatalog, ttcsnapshot.SnapshotID(branch.RemoteCatalogSnapshot), remote.pullMetadata); err != nil {
-			return err
+		remote.catalogOrigin = ttcsnapshot.SnapshotID(branch.RemoteCatalogSnapshot)
+		if err := r.graph.AttachDeferredResolver(branch.RemoteCatalog, remote.catalogOrigin, remote.pullMetadata); err != nil {
+			return nil, err
 		}
 		r.remoteMu.Lock()
 		if r.remotes == nil {
@@ -508,13 +594,14 @@ func (r *Repository) attachObjectSource(remote *remoteObjectClient, branchID str
 			r.remoteByCatalog = make(map[string]*remoteObjectClient)
 		}
 		r.remotes[remote] = struct{}{}
+		attachment.previousCatalog = r.remoteByCatalog[branch.RemoteCatalog]
 		r.remoteByCatalog[branch.RemoteCatalog] = remote
 		r.remoteMu.Unlock()
-		return nil
+		return attachment, nil
 	}
 	objects, err := r.BranchObjects(branchID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	r.remoteMu.Lock()
 	defer r.remoteMu.Unlock()
@@ -526,7 +613,7 @@ func (r *Repository) attachObjectSource(remote *remoteObjectClient, branchID str
 	for object, size := range objects {
 		sourceObject, pending, err := r.remoteSourceObject(object)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if !pending {
 			continue
@@ -536,6 +623,9 @@ func (r *Repository) attachObjectSource(remote *remoteObjectClient, branchID str
 		// The immutable graph object identifies the authorized source bytes.
 		// Prefer the newest live attachment over a reader retained by an older
 		// branch.
+		if previous := r.remoteByObject[object]; previous != nil {
+			attachment.displaced[object] = previous
+		}
 		r.remoteByObject[object] = remote
 	}
 	// Target-local IDs are not content hashes. A newer attachment for the
@@ -547,7 +637,7 @@ func (r *Repository) attachObjectSource(remote *remoteObjectClient, branchID str
 		}
 		sourceObject, pending, err := r.remoteSourceObject(localObject)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if !pending {
 			continue
@@ -564,21 +654,22 @@ func (r *Repository) attachObjectSource(remote *remoteObjectClient, branchID str
 		}
 		id, err := ttcsnapshot.ParseObjectID(localObject)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		object, ok := r.graph.Object(id)
 		if !ok {
-			return fmt.Errorf("remote target object %s is absent from graph", localObject)
+			return nil, fmt.Errorf("remote target object %s is absent from graph", localObject)
 		}
 		remote.objects[localObject] = int64(object.BulkLength)
 		remote.sources[localObject] = sourceObject
+		attachment.displaced[localObject] = owner
 		r.remoteByObject[localObject] = remote
 	}
 	if len(remote.objects) == 0 {
-		return remote.close()
+		return nil, remote.close()
 	}
 	r.remotes[remote] = struct{}{}
-	return nil
+	return attachment, nil
 }
 
 // PinRemoteRestore prevents repository-wide remote materialization from

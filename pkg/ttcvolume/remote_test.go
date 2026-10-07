@@ -212,6 +212,59 @@ func TestRepositoryHoldsTransactionSourcesUntilDrained(t *testing.T) {
 	}
 }
 
+// A source attached for a restore that then fails is undone: the catalog it
+// took over from the source attached before it, of the same import, goes
+// back to that source, which serves the import's files once the failed
+// restore's connection is gone, and the repository holds the undone source
+// no longer.
+func TestUndoneRemoteSourceGivesBackWhatItTookOver(t *testing.T) {
+	sourceManager := openTestManager(t)
+	source, err := sourceManager.Create("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	ino, err := source.CreateRegular(MainBranch, RootInode, "file", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("served by the first source\n"), 4096)
+	if n, _, err := source.WriteAt(MainBranch, ino, payload, 0); err != nil || n != len(payload) {
+		t.Fatalf("WriteAt: %d, %v", n, err)
+	}
+	if err := source.Fork(MainBranch, "sealed"); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := source.DescribeRemoteSnapshot("sealed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetManager := openTestManager(t)
+	target, err := targetManager.ImportPrivateRemoteDescriptor(filepath.Join(targetManager.root, "target"), "target", descriptor, "imported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	firstServer := attachTestRemote(t, source, target, "sealed", "imported", nil)
+
+	server, client := net.Pipe()
+	var token RemoteToken
+	copy(token[:], []byte("graph-only-token"))
+	undo, err := target.AttachRemoteObjectSourceUndoable(client, token, RemoteSourceKey(sha256.Sum256([]byte("rootfs-upper"))), "imported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.Close()
+	undo()
+	if got := readAll(t, target, "imported", ino); got != string(payload) {
+		t.Fatalf("read %d bytes through the first source, want %d", len(got), len(payload))
+	}
+	finishTestRemote(t, target, firstServer)
+	if target.HoldsTransactionSources() {
+		t.Fatal("the drained repository still holds a transaction source")
+	}
+}
+
 func TestSyncDataMaterializesRemoteWholeFile(t *testing.T) {
 	sourceManager := openTestManager(t)
 	source, err := sourceManager.Create("source")

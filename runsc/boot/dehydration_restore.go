@@ -133,7 +133,7 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 	if len(payloadMemoryFiles) != 3+boolInt(args.GraphRemote) {
 		return nil, errors.New("graph dehydration restore requires metadata, manifest, object directory, and optional graph relay")
 	}
-	if err := l.attachColdFilesystemSources(filesystemFiles, args.FilesystemToken, args.FilesystemBranch); err != nil {
+	if _, err := l.attachColdFilesystemSources(filesystemFiles, args.FilesystemToken, args.FilesystemBranch); err != nil {
 		return nil, err
 	}
 	args.FilePayload.Files = payloadMemoryFiles
@@ -350,34 +350,51 @@ func boolInt(value bool) int {
 	return 0
 }
 
-func (l *Loader) attachColdFilesystemSources(files []*os.File, token ttcvolume.RemoteToken, branch string) error {
+// attachColdFilesystemSources attaches files, one stream for each of the
+// Sentry's repositories, as the sources of branch's remote files, and
+// returns what undoes the attachments, for a peer restore that fails after
+// them: see ttcvolume.Repository.AttachRemoteObjectSourceUndoable.
+func (l *Loader) attachColdFilesystemSources(files []*os.File, token ttcvolume.RemoteToken, branch string) (func(), error) {
 	if len(files) == 0 {
-		return nil
+		return func() {}, nil
 	}
 	if len(files) != len(l.ttcVolumeRepositories) {
-		return fmt.Errorf("cold restore has %d filesystem streams for %d repositories", len(files), len(l.ttcVolumeRepositories))
+		return func() {}, fmt.Errorf("cold restore has %d filesystem streams for %d repositories", len(files), len(l.ttcVolumeRepositories))
 	}
 	volumes := make([]ttcVolumeRepository, 0, len(l.ttcVolumeRepositories))
 	for _, volume := range l.ttcVolumeRepositories {
 		volumes = append(volumes, volume)
 	}
 	sort.Slice(volumes, func(i, j int) bool { return volumes[i].config.Source < volumes[j].config.Source })
+	var undos []func()
+	undo := func() {
+		for _, undo := range undos {
+			undo()
+		}
+	}
 	for index, volume := range volumes {
 		fd, err := unix.Dup(int(files[index].Fd()))
 		if err != nil {
-			return fmt.Errorf("duplicating cold filesystem stream %d: %w", index, err)
+			undo()
+			return func() {}, fmt.Errorf("duplicating cold filesystem stream %d: %w", index, err)
 		}
 		stream := os.NewFile(uintptr(fd), "ttc-cold-filesystem-stream")
 		key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(volume.config.Source)))
-		if err := volume.repository.AttachRemoteObjectSource(stream, token, key, branch); err != nil {
+		detach, err := volume.repository.AttachRemoteObjectSourceUndoable(stream, token, key, branch)
+		if err != nil {
 			stream.Close()
-			return fmt.Errorf("attaching cold filesystem source %q: %w", volume.config.Source, err)
+			undo()
+			return func() {}, fmt.Errorf("attaching cold filesystem source %q: %w", volume.config.Source, err)
 		}
+		undos = append(undos, detach)
 	}
-	return nil
+	return undo, nil
 }
 
-func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreArgs) (*DurableDehydrationRestoreInfo, error) {
+func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreArgs) (_ *DurableDehydrationRestoreInfo, retErr error) {
+	if !l.family.HasActivePeer() {
+		return nil, errNoActivePeer
+	}
 	releaseFilesystemRestore := pinRemoteFilesystemRestore(l.ttcVolumeRepositories)
 	defer releaseFilesystemRestore()
 	metadataFD, err := unix.Dup(int(args.FilePayload.Files[0].Fd()))
@@ -396,9 +413,16 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 	}
 	memoryFiles := args.FilePayload.Files[:len(args.FilePayload.Files)-args.FilesystemConnections]
 	filesystemFiles := args.FilePayload.Files[len(memoryFiles):]
-	if err := l.attachColdFilesystemSources(filesystemFiles, args.FilesystemToken, args.FilesystemBranch); err != nil {
+	detachFilesystemSources, err := l.attachColdFilesystemSources(filesystemFiles, args.FilesystemToken, args.FilesystemBranch)
+	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		if retErr != nil {
+			detachFilesystemSources()
+			l.family.TransactionSourcesChanged()
+		}
+	}()
 	args.FilePayload.Files = memoryFiles
 	n := len(metadata.Memories)
 	memorySources := 2 + boolInt(args.GraphRemote)
@@ -549,6 +573,24 @@ func (f *SandboxFamily) RestoreDistributedPeer(branchID, filesystemBranch string
 	return f.restorePeer(branchID, "", filesystemBranch, quarantined, false, sessions, load)
 }
 
+// errNoActivePeer is a peer restore's refusal for want of a running or paused
+// branch to restore beside.
+var errNoActivePeer = errors.New("no active peer is available for dehydration restore")
+
+// HasActivePeer reports whether a branch runs, or is paused, that a peer
+// restore can restore beside. A restore looks before it attaches anything
+// that its failure would have to undo.
+func (f *SandboxFamily) HasActivePeer() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, branch := range f.branches {
+		if branch.k != nil && (branch.state == BranchRunning || branch.state == BranchPaused) {
+			return true
+		}
+	}
+	return false
+}
+
 func (f *SandboxFamily) restorePeer(id, parentID, filesystemBranch string, quarantined, resume bool, sessions []ExecSessionInfo, load func(*kernel.Kernel, vfs.LiveForkFilesystemResources) (*kernel.Kernel, error)) error {
 	f.mu.Lock()
 	if _, ok := f.branches[id]; ok {
@@ -564,7 +606,7 @@ func (f *SandboxFamily) restorePeer(id, parentID, filesystemBranch string, quara
 	sort.Strings(ids)
 	if len(ids) == 0 {
 		f.mu.Unlock()
-		return errors.New("no active peer is available for dehydration restore")
+		return errNoActivePeer
 	}
 	source := f.branches[ids[0]]
 	f.mu.Unlock()
