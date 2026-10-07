@@ -3174,12 +3174,27 @@ func (s Store) createContainerInPlaceDir(id string) (string, error) {
 		return "", fmt.Errorf("creating container state root: %w", err)
 	}
 	dir := filepath.Join(root, id)
-	if err := os.Mkdir(dir, 0700); err != nil {
+	if _, err := os.Lstat(dir); err == nil {
+		return "", fs.ErrExist
+	} else if !errors.Is(err, fs.ErrNotExist) {
 		return "", err
 	}
-	if err := os.WriteFile(filepath.Join(dir, containerCreationMarker), []byte("in progress\n"), 0600); err != nil {
-		_ = os.RemoveAll(dir)
+	// The directory appears with its marker, in one rename. Made in place
+	// and marked after, it was for a moment neither a record nor one being
+	// made, and a strict listing of the containers that found it so failed,
+	// "reading container ...: open .../container.json: no such file or
+	// directory": a removal of another family failed so, pruning image roots.
+	staging, err := s.createContainerStagingDir(id)
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(staging, containerCreationMarker), []byte("in progress\n"), 0600); err != nil {
+		_ = os.RemoveAll(staging)
 		return "", fmt.Errorf("marking in-place container construction: %w", err)
+	}
+	if err := s.rename(staging, dir); err != nil {
+		_ = os.RemoveAll(staging)
+		return "", err
 	}
 	return dir, nil
 }

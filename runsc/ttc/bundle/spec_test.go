@@ -2179,6 +2179,40 @@ func TestContainerPublicationIsAtomicAgainstRecovery(t *testing.T) {
 	}
 }
 
+// A strict listing never finds a container being made in place without its
+// marker: made first and marked after, a directory was for a moment neither
+// a record nor one being made, and the listing failed on it.
+func TestInPlaceConstructionIsMarkedWhenListed(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root, ActiveRoot: root}
+	done := make(chan struct{})
+	listed := make(chan error, 1)
+	go func() {
+		defer close(listed)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			if _, err := store.listContainers(true); err != nil {
+				listed <- err
+				return
+			}
+		}
+	}()
+	for i := 0; i < 500; i++ {
+		if _, _, err := store.createContainerDir(); err != nil {
+			close(done)
+			t.Fatal(err)
+		}
+	}
+	close(done)
+	if err := <-listed; err != nil {
+		t.Fatalf("a strict listing failed on a container being made: %v", err)
+	}
+}
+
 func TestContainerPublicationWithUnifiedActiveRoot(t *testing.T) {
 	root := t.TempDir()
 	store := Store{Root: root, ActiveRoot: root}
@@ -2192,6 +2226,9 @@ func TestContainerPublicationWithUnifiedActiveRoot(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(building, containerCreationMarker)); err != nil {
 		t.Fatalf("in-place construction has no marker: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, containerStagingDir, id)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("in-place construction left its staging directory: %v", err)
 	}
 	if containers, err := store.listContainers(true); err != nil || len(containers) != 0 {
 		t.Fatalf("marked construction is visible: containers=%+v err=%v", containers, err)
