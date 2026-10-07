@@ -4417,7 +4417,16 @@ func (b *runtimeBackend) releaseMigratedSourceRuntimeWithPolicy(containerID, bra
 		if err := b.purgeRuntime(info.ID); err != nil {
 			return err
 		}
-		if info.DistributedFamilyID != "" && info.DistributedForkTransactionID != "" {
+		// The wrapper is the transaction's that made the runtime, and it goes
+		// only once it records no other branch: one a remote fork imported
+		// beside the branch it was made for may be this branch, and the other
+		// may have stopped and gone cold, which the Sentry no longer lists.
+		// Removing the wrapper's transaction took that branch's record, its
+		// filesystems and its publication with it: a cancel of the import, as
+		// a removal of the family makes, left the family unremovable, "loading
+		// durable physical branch for ...: branch "x" does not exist".
+		onlyBranch := !slices.ContainsFunc(info.Branches, func(branch ttcbundle.BranchInfo) bool { return branch.ID != branchID })
+		if onlyBranch && info.DistributedFamilyID != "" && info.DistributedForkTransactionID != "" {
 			// Removing the transaction wrapper alone reclaims its directories but
 			// does not release graph/reference authority. Do that while the exact
 			// branch metadata is still available, then let the bundle store drop
