@@ -103,7 +103,9 @@ go_library(
 
 go_test(
     name = "cmd_test",
-    size = "small",
+    # Its daemon and cluster tests take 50 s of a small test's minute on
+    # macOS, and time out when other tests run beside them.
+    size = "medium",
     srcs = [
         "carried_test.go",
         "cmd_test.go",

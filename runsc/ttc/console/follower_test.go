@@ -112,10 +112,16 @@ func TestFollowerMessageWaitedForAndOversized(t *testing.T) {
 	if err := <-sent; err != nil {
 		t.Fatal(err)
 	}
-	if err := sendFollowerPacket(client, make([]byte, maxFollowerMessage+1), nil); err != nil {
-		t.Fatal(err)
-	}
+	// On macOS a message is a frame on a stream, and one larger than the
+	// socket's buffer is written only as it is read: a reader reads its
+	// length alone, and closes the connection.
+	oversized := make(chan error, 1)
+	go func() {
+		oversized <- sendFollowerPacket(client, make([]byte, maxFollowerMessage+1), nil)
+	}()
 	if _, _, err := ReadFollowerMessage(server); err == nil || !strings.Contains(err.Error(), "truncated") {
 		t.Fatalf("an oversized packet read: %v, want it truncated", err)
 	}
+	server.Close()
+	<-oversized
 }

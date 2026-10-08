@@ -451,7 +451,7 @@ func TestClusterProxyEndsTheStreamOfARequestWithoutInputWithIt(t *testing.T) {
 		{"with input", `{"version":1,"action":"command","args":["exec","-i","web@main","cat"],"stdin":true}`, "ended"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			socket := filepath.Join(t.TempDir(), "ttcd.sock")
+			socket := shortDaemonTestSocket(t)
 			listener, err := net.Listen("unix", socket)
 			if err != nil {
 				t.Fatal(err)
