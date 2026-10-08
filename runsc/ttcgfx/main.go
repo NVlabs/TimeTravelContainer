@@ -25,5 +25,5 @@ import (
 )
 
 func main() {
-	os.Exit(gfxrenderer.Main(os.Args[1:], nil))
+	os.Exit(gfxrenderer.Main(os.Args[1:]))
 }

@@ -19,9 +19,13 @@ virtual GPU's in `g3doc/proposals/ttc_gpu_gfx_nvproxy.md`.
 
 ttcd is the renderer, or carries it, so that a host needs no file of it.
 On macOS, where ttcd links C and loads the renderer's graphics libraries only
-when it renders, ttcd runs as the renderer with `ttcd _gfx-renderer MODE`
-(`GFXRendererArg` in `runsc/ttc/cmd`). On Linux, where ttcd links no C
-library and the renderer does, ttcd carries the renderer, gzip-compressed
+when it renders, ttcd is the renderer when it runs as `ttc-gfx-renderer`
+(`Name`): the daemon gives it that argv[0], as it gives runsc's gofer
+`runsc-gofer`, and `ttcd _gfx-renderer MODE` runs it by hand
+(`GFXRendererArg` in `runsc/ttc/cmd`). Every renderer runs as
+`ttc-gfx-renderer`, whatever its executable, so that process listings name
+it alike on every host. On Linux, where ttcd links no C library and the
+renderer does, ttcd carries the renderer, gzip-compressed
 (`runsc/ttc/hostbin`), and runs it from a sealed memory file, or from a file
 in its root where memory files cannot run. Its C library functions are
 bound to versions that every glibc since 2.17 has (`runsc/ttc/glibccompat`).

@@ -21,9 +21,8 @@ import (
 )
 
 func main() {
-	if len(os.Args) >= 2 && os.Args[1] == cmd.GFXRendererArg {
-		// ttcd is its GPU renderer on macOS (see cmd.GFXRendererArg).
-		os.Exit(gfxrenderer.Main(os.Args[2:], []string{cmd.GFXRendererArg}))
+	if args, ok := rendererArgs(os.Args); ok {
+		os.Exit(gfxrenderer.Main(args))
 	}
 	cmd.SetGuestCopyHelper(copyguest.Binary())
 	cmd.SetCarriedHelpers(hostbin.GFXRenderer(), hostbin.CUDACheckpoint())
@@ -115,6 +114,20 @@ func inheritedChildren() []int {
 		}
 	}
 	return children
+}
+
+// rendererArgs returns the GPU renderer's arguments if ttcd runs as the
+// renderer, as it does on macOS: as gfxrenderer.Name, the argv[0] that the
+// daemon gives it, as runsc gives its gofer runsc-gofer, or by hand, with
+// cmd.GFXRendererArg.
+func rendererArgs(args []string) ([]string, bool) {
+	if filepath.Base(args[0]) == gfxrenderer.Name {
+		return args[1:], true
+	}
+	if len(args) >= 2 && args[1] == cmd.GFXRendererArg {
+		return args[2:], true
+	}
+	return nil, false
 }
 
 func embeddedRuntimeArgv0(argv0 string) bool {

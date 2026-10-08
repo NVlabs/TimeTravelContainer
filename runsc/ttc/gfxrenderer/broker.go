@@ -19,13 +19,9 @@ import (
 
 // BrokerOptions configures a renderers' broker.
 type BrokerOptions struct {
-	// Renderer is the path of ttc-gfx-renderer, or of an executable that is
-	// it with RendererArgs.
+	// Renderer is the path of the renderer's executable: ttc-gfx-renderer,
+	// or ttcd, which is the renderer when it runs as Name.
 	Renderer string
-
-	// RendererArgs precede a renderer's mode in its arguments: ttcd's
-	// _gfx-renderer, where ttcd is the renderer.
-	RendererArgs []string
 
 	// Stderr receives the renderers' logs.
 	Stderr io.Writer
@@ -39,14 +35,16 @@ type BrokerOptions struct {
 	Unconfined bool
 }
 
-// args returns the arguments of a renderer in mode, "serve-family",
-// "probe" or "launch".
-func (o *BrokerOptions) args(mode string) []string {
-	args := append(append([]string(nil), o.RendererArgs...), mode)
+// command returns the command that runs a renderer in mode, "serve-family",
+// "probe" or "launch", as Name.
+func (o *BrokerOptions) command(ctx context.Context, mode string) *exec.Cmd {
+	args := []string{mode}
 	if o.Unconfined {
 		args = append(args, "--unconfined")
 	}
-	return args
+	cmd := exec.CommandContext(ctx, o.Renderer, args...)
+	cmd.Args[0] = Name
+	return cmd
 }
 
 // ServeBroker connects the branches of the Sentry connected to the Unix
@@ -173,7 +171,7 @@ func startFamilyRenderer(opts *BrokerOptions) (*gfxproto.Conn, error) {
 		}
 		rendererEnd := os.NewFile(uintptr(fds[1]), "gfx-renderer-control")
 		defer rendererEnd.Close()
-		cmd := exec.Command(opts.Renderer, opts.args("serve-family")...)
+		cmd := opts.command(context.Background(), "serve-family")
 		// The control connection is the renderer's fd 3.
 		cmd.ExtraFiles = []*os.File{rendererEnd}
 		cmd.Stdout = opts.Stderr
@@ -202,7 +200,7 @@ func ProbeRenderer(opts BrokerOptions) ([]byte, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, opts.Renderer, opts.args("probe")...)
+	cmd := opts.command(ctx, "probe")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

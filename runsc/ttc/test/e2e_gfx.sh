@@ -114,6 +114,8 @@ if [ -n "$TTC_PLATFORM" ]; then
   set -- "$@" --platform "$TTC_PLATFORM"
 fi
 ttc "$@"
+DAEMON_PID=$(ttc daemon status | sed -n 's/.*"pid":\([0-9][0-9]*\).*/\1/p')
+[ -n "$DAEMON_PID" ] || fail "the daemon's status has no PID"
 if [ -n "$TTC_PLATFORM" ]; then
   case "$(ttc daemon status)" in
     *"\"runtime_platform\":\"$TTC_PLATFORM\""*) ;;
@@ -247,11 +249,31 @@ wait_pair() {
 }
 wait_pair one "iteration 2 ok"
 wait_pair two "iteration 2 ok"
+# renderers prints the PIDs of the daemon's renderers: its descendants that
+# run as ttc-gfx-renderer, whatever their executable (ttcd on macOS), and
+# serve a family.
+renderers() {
+  ps -A -o pid= -o ppid= -o args= | awk -v daemon="$DAEMON_PID" '
+    {
+      pid = $1
+      parent[pid] = $2
+      sub(/^[ \t]*[0-9]+[ \t]+[0-9]+[ \t]*/, "")
+      args[pid] = $0
+    }
+    END {
+      for (pid in args) {
+        if (args[pid] !~ /^ttc-gfx-renderer serve-family/) continue
+        for (p = parent[pid]; p in parent && p != parent[p]; p = parent[p]) {
+          if (p == daemon) { print pid; break }
+        }
+      }
+    }'
+}
 # Renderers that a daemon with host isolation starts on macOS confine
 # themselves. python3 asks the kernel's sandbox.
 if [ "$(uname -s)" = Darwin ] && [ "$TTC_UNSAFE_NO_HOST_ISOLATION" != 1 ] &&
   command -v python3 >/dev/null; then
-  renderers=$(pgrep -f "$BIN_DIR/ttc-gfx-renderer serve-family" || true)
+  renderers=$(renderers)
   [ -n "$renderers" ] || fail "no renderer runs while two branches render"
   for pid in $renderers; do
     python3 -c '
@@ -273,9 +295,9 @@ done
 
 # Nothing uses the GPU now, so no renderer runs.
 deadline=$(($(date +%s) + 30))
-while pgrep -f "$BIN_DIR/ttc-gfx-renderer serve-family" >/dev/null; do
+while [ -n "$(renderers)" ]; do
   if [ "$(date +%s)" -ge "$deadline" ]; then
-    fail "renderers outlive their GPU's use: $(pgrep -fl "$BIN_DIR/ttc-gfx-renderer serve-family")"
+    fail "renderers outlive their GPU's use: $(renderers)"
   fi
   sleep 0.5
 done

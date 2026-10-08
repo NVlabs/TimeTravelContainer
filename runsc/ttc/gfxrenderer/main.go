@@ -14,6 +14,12 @@ import (
 // connFD is the descriptor of a renderer's connection to the broker or ttcd.
 const connFD = 3
 
+// Name is the renderer's name, which its processes take as their argv[0],
+// whatever their executable: the renderer's own, or ttcd, which is the
+// renderer on macOS when it runs as Name, as it is runsc's gofer when it runs
+// as runsc-gofer.
+const Name = "ttc-gfx-renderer"
+
 // Main runs a renderer with args, its mode and flags, and returns its exit
 // status:
 //
@@ -24,11 +30,9 @@ const connFD = 3
 //	launch                       starts renderers for the ttcd connected to
 //	                             fd 3
 //
-// A renderer confines itself before it loads Vulkan, unless --unconfined.
-// rendererArgs precede the mode in the arguments of the renderers that a
-// launcher starts, of its own executable: ttcd's _gfx-renderer, where ttcd
-// is the renderer.
-func Main(args []string, rendererArgs []string) int {
+// A renderer confines itself before it loads Vulkan, unless --unconfined. A
+// launcher starts renderers of its own executable.
+func Main(args []string) int {
 	if len(args) < 1 {
 		return usage(os.Stderr)
 	}
@@ -72,7 +76,7 @@ func Main(args []string, rendererArgs []string) int {
 		if err != nil {
 			return fatal(err)
 		}
-		if err := ServeLauncher(connFD, exe, rendererArgs); err != nil {
+		if err := ServeLauncher(connFD, exe); err != nil {
 			return fatal(err)
 		}
 	}
@@ -80,12 +84,12 @@ func Main(args []string, rendererArgs []string) int {
 }
 
 func fatal(err error) int {
-	fmt.Fprintf(os.Stderr, "ttc-gfx-renderer: %v\n", err)
+	fmt.Fprintf(os.Stderr, "%s: %v\n", Name, err)
 	return 1
 }
 
 func usage(w io.Writer) int {
-	fmt.Fprintln(w, "usage: ttc-gfx-renderer serve-family|probe [--unconfined]")
-	fmt.Fprintln(w, "       ttc-gfx-renderer launch")
+	fmt.Fprintf(w, "usage: %s serve-family|probe [--unconfined]\n", Name)
+	fmt.Fprintf(w, "       %s launch\n", Name)
 	return 2
 }

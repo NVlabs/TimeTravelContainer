@@ -28,6 +28,25 @@ func TestEmbeddedRuntimeArgv0(t *testing.T) {
 	}
 }
 
+func TestRendererArgs(t *testing.T) {
+	for _, test := range []struct {
+		args []string
+		want []string
+		ok   bool
+	}{
+		{[]string{"ttc-gfx-renderer", "serve-family"}, []string{"serve-family"}, true},
+		{[]string{"/usr/local/bin/ttcd", "_gfx-renderer", "probe", "--unconfined"}, []string{"probe", "--unconfined"}, true},
+		{[]string{"/usr/local/bin/ttcd", "--socket", "/tmp/ttcd.sock"}, nil, false},
+		{[]string{"runsc-gofer", "gofer"}, nil, false},
+		{[]string{"/usr/local/bin/ttcd"}, nil, false},
+	} {
+		got, ok := rendererArgs(test.args)
+		if ok != test.ok || !slices.Equal(got, test.want) {
+			t.Errorf("rendererArgs(%q) = %q, %t, want %q, %t", test.args, got, ok, test.want, test.ok)
+		}
+	}
+}
+
 func TestInheritedChildren(t *testing.T) {
 	child := exec.Command("sleep", "60")
 	if err := child.Start(); err != nil {

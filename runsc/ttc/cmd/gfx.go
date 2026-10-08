@@ -23,7 +23,7 @@ import (
 
 // gfxRendererName is the file name of the GPU renderer, which a ttcd that
 // carries none looks for beside itself (rendererOptions).
-const gfxRendererName = "ttc-gfx-renderer"
+const gfxRendererName = gfxrenderer.Name
 
 // The guest's Vulkan driver, which ttcd gives the containers of --gfx
 // families, is Mesa's Venus driver. ttcd looks for it in gfx-guest/ARCH
@@ -271,17 +271,19 @@ func writeContainerFile(dir, name string, content []byte, mode os.FileMode) (str
 	return path, nil
 }
 
-// GFXRendererArg is the argument with which ttcd runs as its GPU renderer.
-// On macOS ttcd is its renderer, which loads its graphics libraries only when
-// it runs as it. On Linux, where ttcd links no C library and the renderer
-// does, ttcd carries the renderer, and runs it from a memory file
-// (carriedRenderer).
+// GFXRendererArg is the argument with which ttcd runs as its GPU renderer by
+// hand: `ttcd _gfx-renderer probe`. On macOS ttcd is its renderer, which
+// loads its graphics libraries only when it runs as it. The daemon runs it as
+// gfxrenderer.Name, its argv[0], as it runs runsc's gofer as runsc-gofer. On
+// Linux, where ttcd links no C library and the renderer does, ttcd carries
+// the renderer, and runs it from a memory file (carriedRenderer).
 const GFXRendererArg = "_gfx-renderer"
 
 // rendererOptions returns how the renderer starts: the one that
 // TTC_GFX_RENDERER names; on macOS, ttcd; on Linux, the one that ttcd
-// carries, or the one beside ttcd. dir is a directory of the daemon's, for a
-// file of the carried renderer, where a memory file cannot run.
+// carries, or the one beside ttcd. Each runs as gfxrenderer.Name. dir is a
+// directory of the daemon's, for a file of the carried renderer, where a
+// memory file cannot run.
 func rendererOptions(dir string) (gfxrenderer.BrokerOptions, error) {
 	if renderer := os.Getenv("TTC_GFX_RENDERER"); renderer != "" {
 		if _, err := os.Stat(renderer); err != nil {
@@ -294,7 +296,7 @@ func rendererOptions(dir string) (gfxrenderer.BrokerOptions, error) {
 		return gfxrenderer.BrokerOptions{}, err
 	}
 	if runtime.GOOS == "darwin" {
-		return gfxrenderer.BrokerOptions{Renderer: exe, RendererArgs: []string{GFXRendererArg}}, nil
+		return gfxrenderer.BrokerOptions{Renderer: exe}, nil
 	}
 	if renderer, err := carriedRenderer(dir); err != nil {
 		return gfxrenderer.BrokerOptions{}, fmt.Errorf("the GPU renderer that ttcd carries: %w", err)

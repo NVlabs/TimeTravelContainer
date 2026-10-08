@@ -971,18 +971,22 @@ NVIDIA RTX PRO 6000 Blackwell and its driver 590.08, a pre-release.*
     and call their oldest (`runsc/ttc/glibccompat`): they run with any
     glibc since 2.17, as in CentOS 7, Ubuntu 18.04 and 20.04 containers,
     on x86-64 and arm64. On macOS, where ttcd links C and the renderer
-    loads its graphics libraries itself, ttcd is the renderer, as
-    `ttcd _gfx-renderer MODE`. With nothing installed but ttc and ttcd,
-    `e2e_gfx.sh` and `e2e_nvproxy.sh` pass on the x86 node, and
-    `e2e_gfx.sh` on the GB300 node, on systrap and KVM. A cross-build for
-    another architecture, whose rules_go platform has no cgo, carries
-    neither.
+    loads its graphics libraries itself, ttcd is the renderer: the daemon
+    runs it as `ttc-gfx-renderer`, its argv[0], as it runs runsc's gofer
+    as `runsc-gofer`, and `ttcd _gfx-renderer MODE` runs it by hand. Every
+    renderer runs as `ttc-gfx-renderer`, whatever its executable. A
+    daemon with host isolation keeps its launcher, ttcd too, from its
+    start: 6.7 MB of memory, where the renderer's own executable took 3.7.
+    With nothing installed but ttc and ttcd, `e2e_gfx.sh` and
+    `e2e_nvproxy.sh` pass on the x86 node, and `e2e_gfx.sh` on the GB300
+    node, on systrap and KVM, and on an M5 Pro Mac, with host isolation
+    and without. A cross-build for another architecture, whose rules_go
+    platform has no cgo, carries neither.
 *   **Not done:** B5; forks of `--nvproxy` families to other nodes;
     NVIDIA's own Vulkan through `--nvproxy=graphics`, whose ICD does not
     initialize on the pre-release driver under 590.48.01's interface; the
     renderer's confinement on Linux; `--nvproxy` on KVM; on arm64, CUDA,
-    Android, and SVE on KVM; ttcd as the renderer on macOS, which no Mac
-    has built or run yet; and a guest driver for containers whose glibc
+    Android, and SVE on KVM; and a guest driver for containers whose glibc
     is older than 2.38, which the guest's Venus driver, built on Debian
     sid, needs.
 

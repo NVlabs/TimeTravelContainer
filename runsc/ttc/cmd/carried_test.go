@@ -119,9 +119,6 @@ func TestRendererOptionsRunTheCarriedRenderer(t *testing.T) {
 	if filepath.Base(opts.Renderer) != gfxRendererName {
 		t.Fatalf("Renderer = %q, want the carried renderer, as %s", opts.Renderer, gfxRendererName)
 	}
-	if len(opts.RendererArgs) != 0 {
-		t.Fatalf("RendererArgs = %q, want none on Linux", opts.RendererArgs)
-	}
 	if err := exec.Command(opts.Renderer).Run(); err != nil {
 		t.Fatalf("running %s: %v", opts.Renderer, err)
 	}
