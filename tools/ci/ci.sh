@@ -52,6 +52,10 @@ tests="
 "
 if [ "$os" = Darwin ]; then
 	tests="$tests //pkg/sentry/platform/hvf/..."
+else
+	# The helpers that ttcd carries on Linux, which verify_binaries checks:
+	# of what its cache holds, Bazel fetches only what a build names.
+	helpers="//runsc/ttc/hostbin:gfx_renderer_gz //runsc/ttc/hostbin:cuda_checkpoint_gz"
 fi
 
 log() {
@@ -177,7 +181,7 @@ check() {
 	ensure_bazel
 	mkdir -p "$out"
 	# shellcheck disable=SC2086 # The targets are words.
-	run_bazel build $binaries
+	run_bazel build $binaries ${helpers:-}
 	verify_binaries
 	marker="$out/.tests-started"
 	touch "$marker"
@@ -199,7 +203,11 @@ verify_binaries() {
 			file -L "$binary" | grep -q 'statically linked' || fail "$binary is not static: $(file -L "$binary")"
 		done
 		for helper in ttc-gfx-renderer ttc-cuda-checkpoint; do
-			[ -s "bazel-bin/runsc/ttc/hostbin/$helper.gz" ] || fail "ttcd carries no $helper"
+			gz=bazel-bin/runsc/ttc/hostbin/$helper.gz
+			[ -s "$gz" ] || fail "ttcd carries no $helper"
+			# ttcd embeds the archive as it is.
+			python3 -c 'import sys; sys.exit(open(sys.argv[2], "rb").read() not in open(sys.argv[1], "rb").read())' "$ttcd" "$gz" ||
+				fail "ttcd carries another $helper than $gz"
 		done
 	else
 		"$ttcd" _gfx-renderer >/dev/null 2>&1 && status=0 || status=$?
