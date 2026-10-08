@@ -36,14 +36,15 @@ last release, other than in `g3doc/`, `website/` and Markdown files:
    last release.
 2. `release:linux-amd64`, `release:linux-arm64` and `release:macos-arm64`
    build and test each platform's binaries, whose version is the release's
-   tag. macOS's `ttcd` is signed ad hoc with the Hypervisor entitlement.
-   Without a release they end at once.
-3. `release:publish` uploads the binaries and `SHA256SUMS` to the project's
-   package registry, as package `ttc`, and makes the release, and its tag,
-   with each file as a direct asset under the name that `install.sh` uses:
-   `ttc-linux-amd64`, `ttcd-linux-amd64`, `ttc-linux-arm64`,
-   `ttcd-linux-arm64`, `ttc-darwin-arm64`, `ttcd-darwin-arm64`. The latest
-   release's files are at
+   tag, and archive them: `ttc-linux-amd64.zip`, `ttc-linux-arm64.zip` and
+   `ttc-darwin-arm64.zip` each hold `ttc` and `ttcd`, to install side by
+   side. macOS's `ttcd` is signed ad hoc with the Hypervisor entitlement,
+   and its zip also holds the entitlements, `hvf.entitlements`, to sign it
+   again. Each job unpacks its zip and runs what it holds. Without a release
+   they end at once.
+3. `release:publish` uploads the zips and their `SHA256SUMS` to the
+   project's package registry, as package `ttc`, and makes the release, and
+   its tag, with each file as a direct asset: the latest release's are at
    `<project>/-/releases/permalink/latest/downloads/<file>`.
 
 It authenticates with the job's token, so the schedule's owner needs the

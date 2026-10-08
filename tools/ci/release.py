@@ -13,9 +13,9 @@
                            RELEASE_TAG of them, which makes its tag at
                            CI_COMMIT_SHA; RELEASE_NOTES names its description
 
-It authenticates with the job's token, CI_JOB_TOKEN. A release's files keep
-the names that install.sh downloads (ttc-linux-amd64, ttcd-linux-amd64, ...),
-and each is a direct asset of the release: the latest's is at
+It authenticates with the job's token, CI_JOB_TOKEN. A release's files are
+its platforms' zips (ttc-linux-amd64.zip, ...) and SHA256SUMS, and each is a
+direct asset of the release: the latest's is at
 <project>/-/releases/permalink/latest/downloads/<file>.
 """
 

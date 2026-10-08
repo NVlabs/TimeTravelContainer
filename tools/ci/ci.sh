@@ -12,8 +12,8 @@
 #   tools/ci/ci.sh release-plan   decides whether the default branch has
 #                                 changed since the last release, into
 #                                 release.env
-#   tools/ci/ci.sh release-build  builds this platform's release binaries
-#                                 into ci-out/release
+#   tools/ci/ci.sh release-build  builds this platform's release archive,
+#                                 ci-out/release/ttc-OS-ARCH.zip
 #
 # Each runs the Bazel release that .bazelversion names, which it downloads
 # once. On Linux, Bazel keeps it, its downloads and its outputs in
@@ -248,10 +248,14 @@ release_plan() {
 	} >release.env
 	cat release.env >&2
 	{
-		echo "Daily build of $(git rev-parse HEAD), for Linux x86-64 and arm64 and macOS arm64."
+		echo "Daily build of $(git rev-parse HEAD), for Linux x86-64 and arm64 and macOS arm64:"
+		echo "each platform's zip holds ttc and ttcd, to install side by side."
 		echo
-		echo "On macOS, ttcd is signed ad hoc with the Hypervisor entitlement; a file"
-		echo "that a browser downloads needs \`xattr -d com.apple.quarantine\` first."
+		echo "On macOS, ttcd is signed ad hoc with the Hypervisor entitlement, which the zip's"
+		echo "hvf.entitlements holds, to sign it again if need be:"
+		echo "\`codesign --force --sign - --entitlements hvf.entitlements ttcd\`. A zip that a"
+		echo "browser downloads is quarantined: \`xattr -d com.apple.quarantine\` it before"
+		echo "unpacking it."
 		if [ -n "$last" ] && git cat-file -e "$last_commit^{commit}" 2>/dev/null; then
 			echo
 			echo "Changes since $last_tag:"
@@ -275,17 +279,53 @@ release_build() {
 		trap 'git tag -d "$RELEASE_TAG" >/dev/null 2>&1 || true' EXIT
 	fi
 	check
-	cp bazel-bin/runsc/ttc/ttc_/ttc "$out/release/ttc-$platform"
-	cp bazel-bin/runsc/ttcd/ttcd_/ttcd "$out/release/ttcd-$platform"
-	chmod 0755 "$out/release/ttc-$platform" "$out/release/ttcd-$platform"
+	# The platform's archive holds ttc and ttcd as they install, and on
+	# macOS the entitlements that ttcd's signature carries, to sign it again.
+	stage=$out/stage
+	rm -rf "$stage"
+	mkdir -p "$stage"
+	cp bazel-bin/runsc/ttc/ttc_/ttc bazel-bin/runsc/ttcd/ttcd_/ttcd "$stage/"
+	chmod 0755 "$stage/ttc" "$stage/ttcd"
+	files="ttc ttcd"
 	if [ "$os" = Darwin ]; then
 		# Hypervisor.framework requires its entitlement of ttcd, which an
 		# ad-hoc signature carries.
-		codesign --force --sign - --entitlements runsc/hvf.entitlements "$out/release/ttcd-$platform"
-		codesign --verify --strict "$out/release/ttcd-$platform"
+		codesign --force --sign - --entitlements runsc/hvf.entitlements "$stage/ttcd"
+		cp runsc/hvf.entitlements "$stage/"
+		chmod 0644 "$stage/hvf.entitlements"
+		files="$files hvf.entitlements"
 	fi
-	"$out/release/ttc-$platform" --version
-	"$out/release/ttcd-$platform" --version
+	archive=$out/release/ttc-$platform.zip
+	rm -f "$archive"
+	# shellcheck disable=SC2086 # The files are words.
+	(cd "$stage" && zip -q -X "$archive" $files)
+	rm -rf "$stage"
+	verify_archive "$archive" $files
+}
+
+# verify_archive checks that archive holds exactly the files that follow it,
+# that its ttc and ttcd run from where it unpacks, and on macOS that ttcd
+# keeps its signature and entitlement there.
+verify_archive() {
+	archive=$1
+	shift
+	unpacked=$out/unpacked
+	rm -rf "$unpacked"
+	mkdir -p "$unpacked"
+	(cd "$unpacked" && unzip -q "$archive")
+	want=$(printf '%s\n' "$@" | sort)
+	got=$(cd "$unpacked" && find . -type f | sed 's#^\./##' | sort)
+	[ "$got" = "$want" ] || fail "$archive holds $(echo "$got" | tr '\n' ' '), want $(echo "$want" | tr '\n' ' ')"
+	for binary in ttc ttcd; do
+		[ -x "$unpacked/$binary" ] || fail "$archive's $binary is not executable"
+		"$unpacked/$binary" --version
+	done
+	if [ "$os" = Darwin ]; then
+		codesign --verify --strict "$unpacked/ttcd"
+		codesign -d --entitlements - "$unpacked/ttcd" 2>/dev/null | grep -q com.apple.security.hypervisor ||
+			fail "$archive's ttcd lacks the Hypervisor entitlement"
+	fi
+	rm -rf "$unpacked"
 }
 
 case "${1:-}" in
