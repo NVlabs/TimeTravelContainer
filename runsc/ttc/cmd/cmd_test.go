@@ -4467,14 +4467,18 @@ func TestPreflightCgroupV2Delegation(t *testing.T) {
 	if err := preflightCgroupV2Delegation(proc, root, []string{"cpu", "memory"}); err != nil {
 		t.Fatalf("preflightCgroupV2Delegation: %v", err)
 	}
-	if err := os.Chmod(filepath.Join(parent, "cgroup.subtree_control"), 0400); err != nil {
-		t.Fatal(err)
-	}
-	if err := preflightCgroupV2Delegation(proc, root, []string{"memory"}); err == nil || !strings.Contains(err.Error(), "Delegate=yes") {
-		t.Fatalf("non-delegated preflight error=%v", err)
-	}
-	if err := os.Chmod(filepath.Join(parent, "cgroup.subtree_control"), 0600); err != nil {
-		t.Fatal(err)
+	// A cgroup whose controls the user cannot write is not delegated to it;
+	// root writes them whatever their mode.
+	if os.Geteuid() != 0 {
+		if err := os.Chmod(filepath.Join(parent, "cgroup.subtree_control"), 0400); err != nil {
+			t.Fatal(err)
+		}
+		if err := preflightCgroupV2Delegation(proc, root, []string{"memory"}); err == nil || !strings.Contains(err.Error(), "Delegate=yes") {
+			t.Fatalf("non-delegated preflight error=%v", err)
+		}
+		if err := os.Chmod(filepath.Join(parent, "cgroup.subtree_control"), 0600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := preflightCgroupV2Delegation(proc, root, []string{"io"}); err == nil || !strings.Contains(err.Error(), `controller "io"`) {
 		t.Fatalf("missing-controller preflight error=%v", err)

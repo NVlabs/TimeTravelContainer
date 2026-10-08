@@ -73,7 +73,10 @@ func TestClient(t *testing.T) {
 	}
 	defer shm.Close()
 	const size = 4 * hostarch.PageSize
-	if err := shm.Truncate(size); err != nil {
+	// The renderer's memory is whole host pages, which the client maps: 64
+	// KiB on some arm64 Linux hosts.
+	hostPage := int64(unix.Getpagesize())
+	if err := shm.Truncate((size + hostPage - 1) &^ (hostPage - 1)); err != nil {
 		t.Fatal(err)
 	}
 	var received []gfxproto.MsgType

@@ -6,16 +6,26 @@
 package cmd
 
 import (
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // A child's exit is awaited in the poller, not in a system call that holds a
 // thread.
 func TestAwaitExitWaitsInThePoller(t *testing.T) {
+	// A kernel before 5.10, or a container's seccomp policy, has no pidfd
+	// that polls, and awaitExit returns at once for a Wait to wait.
+	fd, err := unix.PidfdOpen(os.Getpid(), unix.PIDFD_NONBLOCK)
+	if err != nil {
+		t.Skipf("no pidfd that polls here: %v", err)
+	}
+	unix.Close(fd)
 	child := exec.Command("sleep", "0.3")
 	if err := child.Start(); err != nil {
 		t.Fatal(err)

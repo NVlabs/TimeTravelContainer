@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"os"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -448,6 +450,11 @@ type testEnv struct {
 
 func newTestEnv(t *testing.T, policy ForkPolicy) *testEnv {
 	t.Helper()
+	// On Linux the test's kernel runs on the ptrace platform, which maps the
+	// kernel's 4 KiB pages one for one: some arm64 hosts' pages are 64 KiB.
+	if hostPage := os.Getpagesize(); runtime.GOOS == "linux" && hostPage != hostarch.PageSize {
+		t.Skipf("the ptrace platform needs %d-byte host pages, not %d", hostarch.PageSize, hostPage)
+	}
 	k, err := testutil.Boot()
 	if err != nil {
 		t.Fatalf("Boot: %v", err)

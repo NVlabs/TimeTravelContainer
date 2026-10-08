@@ -19,6 +19,10 @@ no GPU: the renderer's tests on a GPU skip where none renders. Their JUnit
 reports show in merge requests, and the logs of failed tests are the job's
 artifacts.
 
+A test must not assume much of its host: Linux jobs run as root, in
+containers whose pidfds may not poll, and the arm64 runner's pages are
+64 KiB, which the ptrace platform cannot map.
+
 Linux jobs run in `TTC_CI_LINUX_IMAGE` (default `ubuntu:22.04`), into which
 `ci.sh setup` installs what the build needs and Bazel; the pipeline caches
 Bazel's downloads and outputs, and apt's packages, per architecture. The
