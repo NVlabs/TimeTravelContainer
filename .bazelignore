@@ -1,1 +1,4 @@
 bazel-gvisor
+# CI's caches and outputs (tools/ci/ci.sh).
+.ci-cache
+ci-out

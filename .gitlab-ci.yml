@@ -1,0 +1,159 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# TTC's CI: light checks of every push, on Linux x86-64 and arm64 and on
+# macOS arm64, and a daily release when the default branch has changed since
+# the last one. tools/ci/ci.sh holds the steps, which also run by hand.
+#
+# Checks build ttc and ttcd and run TTC's unit tests (and, on macOS, the HVF
+# platform's), in a job per platform.
+#
+# The release runs from a pipeline schedule of the default branch (Build >
+# Pipeline schedules, daily), or from a pipeline run by hand with
+# TTC_RELEASE=1. It builds and tests each platform's binaries, and makes the
+# release daily-YYYYMMDD-COMMIT of them, with its tag, unless nothing but
+# documentation changed since the last one. Its files are in the package
+# registry, as package ttc; install.sh's names, ttc-linux-amd64 and so on, are
+# direct assets: the latest release's are at
+# <project>/-/releases/permalink/latest/downloads/<file>.
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    # A branch with an open merge request runs its merge request's pipeline.
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS && $CI_PIPELINE_SOURCE == "push"
+      when: never
+    # Branches, not tags: a release's tag runs nothing.
+    - if: $CI_COMMIT_BRANCH
+
+variables:
+  # The image of the Linux jobs, which install what the build needs into it:
+  # a mirror's name may replace it.
+  TTC_CI_LINUX_IMAGE: ubuntu:22.04
+
+stages:
+  - check
+  - plan
+  - build
+  - publish
+
+# Linux jobs run on the shared Docker runners. Bazel's downloads and outputs
+# are cached between jobs of each architecture.
+.linux:
+  image: $TTC_CI_LINUX_IMAGE
+  timeout: 2h
+  cache:
+    key: ttc-bazel-linux-$TTC_CI_ARCH-v1
+    paths:
+      - .ci-cache/
+    when: always
+  before_script:
+    - tools/ci/ci.sh setup
+
+.linux-amd64:
+  extends: .linux
+  tags: [os/linux, size/large]
+  variables:
+    TTC_CI_ARCH: amd64
+
+.linux-arm64:
+  extends: .linux
+  tags: [os/linux-arm]
+  variables:
+    TTC_CI_ARCH: arm64
+
+# macOS jobs run on the project's Mac, one at a time, whose Bazel output base
+# persists between them.
+.macos:
+  tags: [os/macos-arm]
+  timeout: 1h
+
+.check:
+  stage: check
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" || $TTC_RELEASE == "1"
+      when: never
+    - when: on_success
+  interruptible: true
+  script:
+    - tools/ci/ci.sh check
+  artifacts:
+    when: always
+    expire_in: 1 week
+    reports:
+      junit: ci-out/junit/**/test.xml
+    paths:
+      - ci-out/failed/
+
+check:linux-amd64:
+  extends: [.linux-amd64, .check]
+
+check:linux-arm64:
+  extends: [.linux-arm64, .check]
+
+check:macos-arm64:
+  extends: [.macos, .check]
+
+.release:
+  rules:
+    - if: ($CI_PIPELINE_SOURCE == "schedule" || $TTC_RELEASE == "1") && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+release:plan:
+  extends: .release
+  stage: plan
+  image: $TTC_CI_LINUX_IMAGE
+  tags: [os/linux]
+  variables:
+    # The last release's commit, which it compares the branch with.
+    GIT_DEPTH: "0"
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates git python3 >/dev/null
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
+  script:
+    - tools/ci/ci.sh release-plan
+  artifacts:
+    reports:
+      dotenv: release.env
+    paths:
+      - release-notes.md
+
+.release-build:
+  extends: .release
+  stage: build
+  needs: ["release:plan"]
+  script:
+    - tools/ci/ci.sh release-build
+  artifacts:
+    paths:
+      - ci-out/release/
+    expire_in: 1 month
+
+release:linux-amd64:
+  extends: [.linux-amd64, .release-build]
+  cache:
+    policy: pull
+
+release:linux-arm64:
+  extends: [.linux-arm64, .release-build]
+  cache:
+    policy: pull
+
+release:macos-arm64:
+  extends: [.macos, .release-build]
+
+release:publish:
+  extends: .release
+  stage: publish
+  image: $TTC_CI_LINUX_IMAGE
+  tags: [os/linux]
+  needs:
+    - "release:plan"
+    - "release:linux-amd64"
+    - "release:linux-arm64"
+    - "release:macos-arm64"
+  resource_group: ttc-release
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates python3 >/dev/null
+  script:
+    - if [ "$RELEASE" != 1 ]; then echo "No release"; exit 0; fi
+    - RELEASE_NOTES=release-notes.md python3 tools/ci/release.py publish ci-out/release

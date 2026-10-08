@@ -21,3 +21,9 @@
 # clangd compilation database
 /.cache/clangd
 /compile_commands.json
+
+# CI's caches, outputs and release plan (tools/ci/ci.sh).
+/.ci-cache/
+/ci-out/
+/release.env
+/release-notes.md
