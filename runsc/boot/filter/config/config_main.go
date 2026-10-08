@@ -494,10 +494,6 @@ func hostFilesystemFilters() seccomp.SyscallRules {
 	})
 }
 
-// ttcVolumeFilters contains the descriptor-relative host filesystem syscalls
-// used by TTC's userspace managed-volume filesystem. Repository directory
-// descriptors are opened and donated by runsc; paths are always resolved
-// relative to one of those descriptors with O_NOFOLLOW.
 // gfxFilters are the system calls of the Sentry's connections to GPU
 // renderers, for the virtual GPU, beyond those of its gofer connections: it
 // sizes their sockets' buffers for command streams.
@@ -522,6 +518,10 @@ func gfxFilters() seccomp.SyscallRules {
 	})
 }
 
+// ttcVolumeFilters contains the descriptor-relative host filesystem syscalls
+// used by TTC's userspace managed-volume filesystem. Repository directory
+// descriptors are opened and donated by runsc; paths are always resolved
+// relative to one of those descriptors with O_NOFOLLOW.
 func ttcVolumeFilters() seccomp.SyscallRules {
 	return seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 		unix.SYS_OPENAT: seccomp.PerArg{

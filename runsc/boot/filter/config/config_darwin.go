@@ -16,6 +16,7 @@ func controlServerFilters(fd uint32) seccomp.SyscallRules { return seccomp.NewSy
 func selfPIDFilters(pid uint64) seccomp.SyscallRules      { return seccomp.NewSyscallRules() }
 func hostFilesystemFilters() seccomp.SyscallRules         { return seccomp.NewSyscallRules() }
 func ttcVolumeFilters() seccomp.SyscallRules              { return seccomp.NewSyscallRules() }
+func gfxFilters() seccomp.SyscallRules                    { return seccomp.NewSyscallRules() }
 func cgoFilters() seccomp.SyscallRules                    { return seccomp.NewSyscallRules() }
 func profileFilters() seccomp.SyscallRules                { return seccomp.NewSyscallRules() }
 func hostInetFilters(allowRawSockets bool) seccomp.SyscallRules {
