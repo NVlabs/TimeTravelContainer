@@ -480,6 +480,7 @@ go_test(
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/state/stateio",
         "//pkg/sentry/time",
+        "//pkg/sentry/ttcchunk",
         "//pkg/sentry/usage",
         "//pkg/sentry/vfs",
         "//pkg/state",

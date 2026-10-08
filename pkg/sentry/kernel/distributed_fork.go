@@ -657,17 +657,18 @@ func (k *Kernel) HandoffDistributedForkMemoryGraph(data *ttcsnapshot.LocalDataSt
 		closeInputs()
 		return fmt.Errorf("distributed memory was already handed to graph snapshot %d", k.remoteHandoffSnapshot)
 	}
-	if k.remotePageLoad == nil {
-		closeInputs()
-		return errors.New("kernel has no active distributed remote-memory load")
-	}
 	// A branch may own a new loader while also referring to sparse chunks
 	// supplied by an older family loader. The new transaction cannot become
 	// independent until every inherited loader is either fully resident or has
 	// itself switched to durable graph backing.
 	k.remoteLoadsMu.Lock()
+	primary := k.remotePageLoad
 	inherited := append([]*pgalloc.AsyncPagesFileLoad(nil), k.auxiliaryRemotePageLoads...)
 	k.remoteLoadsMu.Unlock()
+	if primary == nil && len(inherited) == 0 {
+		closeInputs()
+		return errors.New("kernel has no active distributed remote-memory load")
+	}
 	for _, load := range inherited {
 		if load.HasDurableBacking() {
 			continue
@@ -682,7 +683,16 @@ func (k *Kernel) HandoffDistributedForkMemoryGraph(data *ttcsnapshot.LocalDataSt
 		}
 		return errors.New("inherited distributed memory load is not durable yet")
 	}
-	if stats := k.remotePageLoad.Stats(); stats.Done {
+	if primary == nil {
+		// The import gave the branch no loader of its own: its pages were all
+		// of units that earlier imports installed, whose loaders it inherited,
+		// and that are durable or resident now. Nothing of the transaction's
+		// source is left to read.
+		closeInputs()
+		k.remoteHandoffSnapshot = uint64(snapshot)
+		return nil
+	}
+	if stats := primary.Stats(); stats.Done {
 		closeInputs()
 		if stats.Error != "" {
 			return fmt.Errorf("distributed memory load stopped before graph handoff: %s", stats.Error)
@@ -690,7 +700,7 @@ func (k *Kernel) HandoffDistributedForkMemoryGraph(data *ttcsnapshot.LocalDataSt
 		k.remoteHandoffSnapshot = uint64(snapshot)
 		return nil
 	}
-	geometry := k.remotePageLoad.ReaderGeometry()
+	geometry := primary.ReaderGeometry()
 	if geometry.NeedsRegisterDestinationFD {
 		closeInputs()
 		return errors.New("distributed graph memory handoff does not support registered destination files")
@@ -701,7 +711,7 @@ func (k *Kernel) HandoffDistributedForkMemoryGraph(data *ttcsnapshot.LocalDataSt
 		return err
 	}
 	reader := stateio.NewIOReader(packed, geometry.MaxReadBytes, geometry.MaxRanges, geometry.MaxParallel)
-	if err := switchRemotePageReader(k.remotePageLoad, reader); err != nil {
+	if err := switchRemotePageReader(primary, reader); err != nil {
 		return err
 	}
 	k.remoteHandoffSnapshot = uint64(snapshot)
