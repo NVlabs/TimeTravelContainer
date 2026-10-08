@@ -24,6 +24,11 @@ type contextID int
 const (
 	// CtxPlatform is a Context.Value key for a Platform.
 	CtxPlatform contextID = iota
+
+	// CtxFileCoherence is a Context.Value key for the FileCoherence of the
+	// Platform that is used to execute the context's application code, if
+	// that Platform needs one.
+	CtxFileCoherence
 )
 
 // FromContext returns the Platform that is used to execute ctx's application
@@ -31,6 +36,15 @@ const (
 func FromContext(ctx context.Context) Platform {
 	if v := ctx.Value(CtxPlatform); v != nil {
 		return v.(Platform)
+	}
+	return nil
+}
+
+// FileCoherenceFromContext returns the FileCoherence of the Platform that is
+// used to execute ctx's application code, or nil if that Platform needs none.
+func FileCoherenceFromContext(ctx context.Context) FileCoherence {
+	if v := ctx.Value(CtxFileCoherence); v != nil {
+		return v.(FileCoherence)
 	}
 	return nil
 }

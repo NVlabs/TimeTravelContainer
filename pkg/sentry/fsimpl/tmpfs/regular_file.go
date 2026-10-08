@@ -36,6 +36,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -1357,6 +1358,17 @@ func (rf *regularFile) preadDisk(ctx context.Context, dst usermem.IOSequence, of
 	if err := rf.ensureDiskData(); err != nil {
 		return 0, err, false
 	}
+	// On a platform whose address spaces map copies of the file's pages,
+	// what guests write through their mappings is in the copies until it is
+	// flushed (see platform.FileCoherence).
+	if coherence := platform.FileCoherenceFromContext(ctx); coherence != nil {
+		if m := rf.writableDiskMap(); m != nil {
+			fr := memmap.FileRange{Start: uint64(offset), End: uint64(offset) + uint64(dst.NumBytes())}
+			if err := coherence.FlushFile(m, fr); err != nil {
+				return 0, diskVolumeError("flush mapped writes", err), false
+			}
+		}
+	}
 	rf.diskIOMu.Lock()
 	defer rf.diskIOMu.Unlock()
 	file, _, err := rf.openDiskIOLocked(false, nil)
@@ -1390,6 +1402,19 @@ func (rf *regularFile) preadDisk(ctx context.Context, dst usermem.IOSequence, of
 		}
 	}
 	return done, nil, true
+}
+
+// writableDiskMap returns the mapping of the file's object that its writable
+// mappings map, or nil if none does.
+func (rf *regularFile) writableDiskMap() *diskMapping {
+	rf.mapsMu.Lock()
+	defer rf.mapsMu.Unlock()
+	if rf.writableMappingPages == 0 {
+		return nil
+	}
+	rf.diskMapMu.Lock()
+	defer rf.diskMapMu.Unlock()
+	return rf.diskMap
 }
 
 // Read implements vfs.FileDescriptionImpl.Read.
@@ -1461,6 +1486,19 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 		if err == nil && cloned {
 			f.resetDiskMapLocked(memmap.InvalidateOpts{})
 		}
+		// On a platform whose address spaces map copies of the file's
+		// pages, the write must reach the copies too (see
+		// platform.FileCoherence). A shared mapping is of a sealed object,
+		// which the write does not change.
+		var mapped *diskMapping
+		coherence := platform.FileCoherenceFromContext(ctx)
+		if err == nil && coherence != nil && !f.mappings.IsEmpty() {
+			f.diskMapMu.Lock()
+			if m := f.diskMap; m != nil && !m.shared.Load() {
+				mapped = m
+			}
+			f.diskMapMu.Unlock()
+		}
 		f.mapsMu.Unlock()
 		if err != nil {
 			f.diskIOMu.Unlock()
@@ -1475,6 +1513,11 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 			n, readErr := src.TakeFirst64(want).CopyIn(ctx, buf[:want])
 			if n != 0 {
 				written, writeErr := file.WriteAt(buf[:n], offset+done)
+				if written > 0 && mapped != nil {
+					if err := coherence.UpdateFile(mapped, uint64(offset+done), buf[:written]); err != nil && writeErr == nil {
+						writeErr = diskVolumeError("update mapped pages", err)
+					}
+				}
 				done += int64(written)
 				src = src.DropFirst(written)
 				if writeErr != nil {

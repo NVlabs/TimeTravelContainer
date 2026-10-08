@@ -509,6 +509,21 @@ type AddressSpaceCoherence interface {
 	SyncRange(ctx context.Context, addr hostarch.Addr, length uint64) error
 }
 
+// FileCoherence is optionally implemented by Platforms whose address spaces
+// map copies of host-backed memmap.Files' pages, not the pages themselves, as
+// the VM platforms' staging does: a file's own reads and writes of its host
+// file then meet the copies through it. Linux platforms do not need to
+// implement it.
+type FileCoherence interface {
+	// FlushFile makes guest writes to the copies of file's pages in fr
+	// visible to its host file, as a read of fr from the host file needs.
+	FlushFile(file memmap.File, fr memmap.FileRange) error
+
+	// UpdateFile writes data, just written to file's host file at offset,
+	// into the copies of its pages that address spaces map.
+	UpdateFile(file memmap.File, offset uint64, data []byte) error
+}
+
 // CheckpointCoherence is optionally implemented by Platforms that must flush
 // execution caches or staged writable mappings before portable memory and
 // filesystem state is captured. Linux platforms do not need to implement it.

@@ -330,6 +330,71 @@ func (s *stagingCache) flushPages(pages []*stagedPage) error {
 	return retErr
 }
 
+// flushFile writes back the dirty staged pages of file in fr, so that a read
+// of the file's host file sees what guests wrote through their mappings.
+func (s *stagingCache) flushFile(file memmap.File, fr memmap.FileRange) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var retErr error
+	for offset := hostarch.PageRoundDown(fr.Start); offset < fr.End; offset += hostarch.PageSize {
+		page, err := s.stagedLocked(file, offset)
+		if err != nil {
+			return err
+		}
+		if page != nil {
+			retErr = errors.Join(retErr, s.flushPageLocked(page))
+		}
+	}
+	return retErr
+}
+
+// updateFile copies data, which a write of file's host file just put there at
+// offset, into file's staged pages, so that guests that map them see it.
+func (s *stagingCache) updateFile(file memmap.File, offset uint64, data []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	end := offset + uint64(len(data))
+	for start := hostarch.PageRoundDown(offset); start < end; start += hostarch.PageSize {
+		page, err := s.stagedLocked(file, start)
+		if err != nil {
+			return err
+		}
+		if page == nil {
+			continue
+		}
+		resolved, frameLease, err := s.backing.AcquireMapping(memmap.FileRange{Start: page.backingOffset, End: page.backingOffset + hostarch.PageSize}, hostarch.Write)
+		if err != nil {
+			return err
+		}
+		if len(resolved) != 1 {
+			frameLease.Release()
+			return fmt.Errorf("VM staging backing returned %d frames for an update", len(resolved))
+		}
+		from, to := max(offset, start), min(end, start+hostarch.PageSize)
+		frame := unsafe.Slice((*byte)(unsafe.Pointer(resolved[0].HostAddress)), hostarch.PageSize)
+		copy(frame[from-start:to-start], data[from-offset:to-offset])
+		frameLease.Release()
+	}
+	return nil
+}
+
+// stagedLocked returns the staged page of file at offset, or nil if none is
+// staged, once no release of it is under way.
+//
+// Preconditions: s.mu is locked.
+func (s *stagingCache) stagedLocked(file memmap.File, offset uint64) (*stagedPage, error) {
+	key, err := stagingFileKey(file, offset)
+	if err != nil {
+		return nil, err
+	}
+	page := s.pages[key]
+	for page != nil && page.releasing {
+		s.cond.Wait()
+		page = s.pages[key]
+	}
+	return page, nil
+}
+
 func (s *stagingCache) flushAll() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

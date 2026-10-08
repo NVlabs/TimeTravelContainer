@@ -322,3 +322,68 @@ func TestStagingResolveFailureReleasesEarlierPages(t *testing.T) {
 		t.Fatalf("staging frames remain resident after a failed resolve: %+v", metrics)
 	}
 }
+
+// A file's own reads and writes of its host file meet the staged copies of its
+// pages that guests map: a flush of a range puts guests' writes in the file,
+// and an update puts the file's writes in the copies, across pages, without
+// changing their other bytes or another file's.
+func TestStagingFileCoherence(t *testing.T) {
+	_, cache := newStagingTestCache(t)
+	file := &stagingTestFile{data: make([]byte, 2*hostarch.PageSize)}
+	other := &stagingTestFile{data: make([]byte, 2*hostarch.PageSize)}
+	fr := memmap.FileRange{Start: 0, End: 2 * hostarch.PageSize}
+	frames, pages, err := cache.resolve(file, fr, hostarch.ReadWrite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherFrames, otherPages, err := cache.resolve(other, fr, hostarch.ReadWrite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, page := range append(pages, otherPages...) {
+		if err := cache.commitMapping(page); err != nil {
+			t.Fatal(err)
+		}
+	}
+	staged := func(frames []pgalloc.BackingFrame, page int) []byte {
+		return unsafe.Slice((*byte)(unsafe.Pointer(frames[page].HostAddress)), int(hostarch.PageSize))
+	}
+
+	// A guest writes through its mapping; a read of the file's second page
+	// flushes it, and not the first page's.
+	staged(frames, 0)[0] = 'a'
+	staged(frames, 1)[0] = 'b'
+	if err := cache.flushFile(file, memmap.FileRange{Start: hostarch.PageSize, End: hostarch.PageSize + 1}); err != nil {
+		t.Fatal(err)
+	}
+	if file.data[0] != 0 || file.data[hostarch.PageSize] != 'b' {
+		t.Errorf("flushing the second page made the file %q, %q; want 0, 'b'", file.data[0], file.data[hostarch.PageSize])
+	}
+
+	// The file is written across both pages; its mapping sees the write,
+	// and keeps the guest's other bytes.
+	written := []byte("across")
+	offset := uint64(hostarch.PageSize - 3)
+	copy(file.data[offset:], written)
+	if err := cache.updateFile(file, offset, written); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(staged(frames, 0)[offset:]) + string(staged(frames, 1)[:3]); got != "across" {
+		t.Errorf("the mapping sees %q, want %q", got, "across")
+	}
+	if staged(frames, 0)[0] != 'a' || staged(frames, 1)[3] != 0 {
+		t.Errorf("the update changed the mapping's other bytes: %q, %q", staged(frames, 0)[0], staged(frames, 1)[3])
+	}
+	if staged(otherFrames, 0)[offset] != 0 {
+		t.Error("the update reached another file's staged page")
+	}
+
+	// A file nothing maps has nothing staged to flush or update.
+	unmapped := &stagingTestFile{data: make([]byte, hostarch.PageSize)}
+	if err := cache.flushFile(unmapped, memmap.FileRange{Start: 0, End: hostarch.PageSize}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.updateFile(unmapped, 0, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -124,6 +124,8 @@ func (t *Task) contextValue(key any, isTaskGoroutine bool) any {
 		return t.k.mf
 	case platform.CtxPlatform:
 		return t.k
+	case platform.CtxFileCoherence:
+		return t.k.fileCoherence()
 	case shm.CtxDeviceID:
 		return t.k.sysVShmDevID
 	case uniqueid.CtxGlobalUniqueID:

@@ -1412,6 +1412,8 @@ func (ctx *createProcessContext) Value(key any) any {
 		return ctx.kernel.mf
 	case platform.CtxPlatform:
 		return ctx.kernel
+	case platform.CtxFileCoherence:
+		return ctx.kernel.fileCoherence()
 	case uniqueid.CtxGlobalUniqueID:
 		return ctx.kernel.UniqueID()
 	case uniqueid.CtxGlobalUniqueIDProvider:
@@ -2241,6 +2243,15 @@ func (k *Kernel) MemoryFile() *pgalloc.MemoryFile {
 	return k.mf
 }
 
+// fileCoherence returns the FileCoherence of k's Platform, or nil (not a nil
+// FileCoherence) if it needs none: see platform.CtxFileCoherence.
+func (k *Kernel) fileCoherence() any {
+	if c, ok := k.Platform.(platform.FileCoherence); ok {
+		return c
+	}
+	return nil
+}
+
 // SupervisorContext returns a Context with maximum privileges in k. It should
 // only be used by goroutines outside the control of the emulated kernel
 // defined by e.
@@ -2376,6 +2387,8 @@ func (ctx *supervisorContext) Value(key any) any {
 		return ctx.Kernel.mf
 	case platform.CtxPlatform:
 		return ctx.Kernel
+	case platform.CtxFileCoherence:
+		return ctx.Kernel.fileCoherence()
 	case uniqueid.CtxGlobalUniqueID:
 		return ctx.Kernel.UniqueID()
 	case uniqueid.CtxGlobalUniqueIDProvider:

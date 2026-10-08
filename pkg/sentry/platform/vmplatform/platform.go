@@ -280,6 +280,18 @@ func (p *Platform) NewContext(context.Context) sentryplatform.Context {
 	return &platformContext{platform: p, registers: p.arch.NewVCPUState()}
 }
 
+// FlushFile implements sentryplatform.FileCoherence.FlushFile.
+func (p *Platform) FlushFile(file memmap.File, fr memmap.FileRange) error {
+	return p.staging.flushFile(file, fr)
+}
+
+// UpdateFile implements sentryplatform.FileCoherence.UpdateFile.
+func (p *Platform) UpdateFile(file memmap.File, offset uint64, data []byte) error {
+	return p.staging.updateFile(file, offset, data)
+}
+
+var _ sentryplatform.FileCoherence = (*Platform)(nil)
+
 // FlushForCheckpoint implements sentryplatform.CheckpointCoherence. The kernel
 // is quiesced before this call; GuestRAM itself is already coherent.
 // +checklocksignore: lockEpoch conditionally returns with epochMu read-locked.
