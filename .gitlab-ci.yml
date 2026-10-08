@@ -68,6 +68,12 @@ stages:
 .macos:
   tags: [os/macos-arm]
   timeout: 1h
+  variables:
+    # Xcode's git stores credentials, the job's token among them, in the
+    # login keychain, which its system configuration names: the runner's
+    # user has no login session, and the fetch waited on its keychain
+    # forever. The fetch takes this variable too.
+    GIT_CONFIG_NOSYSTEM: "1"
 
 .check:
   stage: check
