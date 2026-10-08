@@ -56,6 +56,9 @@ const (
 	opBeginHandoff
 	opAppendHandoff
 	opApplyFilesystem
+	// opApplyFilesystemBalanced is opApplyFilesystem of a mutation whose
+	// B-trees are balanced: see filesystemJournalMutation.Balanced.
+	opApplyFilesystemBalanced
 )
 
 // Operations of an encoded filesystem mutation, which may have several.
@@ -334,7 +337,11 @@ func (e *graphEncoder) op(op *journalOp) error {
 		e.out = append(e.out, opAppendHandoff)
 		e.referenceMutation(op.AppendHandoff)
 	case op.ApplyFilesystem != nil:
-		e.out = append(e.out, opApplyFilesystem)
+		if op.ApplyFilesystem.Balanced {
+			e.out = append(e.out, opApplyFilesystemBalanced)
+		} else {
+			e.out = append(e.out, opApplyFilesystem)
+		}
 		e.filesystemMutation(op.ApplyFilesystem)
 	default:
 		return errors.New("empty TTC snapshot graph journal operation")
@@ -844,8 +851,11 @@ func (d *graphDecoder) op() journalOp {
 	case opAppendHandoff:
 		mutation := d.referenceMutation()
 		op.AppendHandoff = &mutation
-	case opApplyFilesystem:
+	case opApplyFilesystem, opApplyFilesystemBalanced:
 		op.ApplyFilesystem = d.filesystemMutation()
+		if op.ApplyFilesystem != nil {
+			op.ApplyFilesystem.Balanced = code == opApplyFilesystemBalanced
+		}
 	default:
 		d.fail("invalid journal operation %d", code)
 	}

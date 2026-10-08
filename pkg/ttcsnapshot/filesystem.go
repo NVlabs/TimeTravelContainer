@@ -64,6 +64,10 @@ type filesystemJournalMutation struct {
 	Operations  []FilesystemOperation
 	ReleasePins []string
 	Result      ObjectID
+	// Balanced is whether the mutation's B-trees keep every leaf at one
+	// depth, as every one made since does: replaying an older one makes its
+	// trees as it made them. See bTreeBalancedDepth.
+	Balanced bool `json:",omitempty"`
 }
 
 func validateFilesystemJournalMutation(mutation filesystemJournalMutation) error {
@@ -215,7 +219,7 @@ func (builder *bTreeBuilder) delete(root ObjectID, key []byte) (ObjectID, bool, 
 	if root.IsZero() {
 		return ObjectID{}, false, nil
 	}
-	updated, _, changed, err := builder.remove(root, key)
+	updated, _, changed, err := builder.remove(root, key, true)
 	return updated, changed, err
 }
 
@@ -249,7 +253,7 @@ func (s *Store) ApplyFilesystemAndReleasePinsReclaimed(origin SnapshotID, rootNa
 	if err := s.resolveFilesystemOperationPathsLocked(rootName, operations); err != nil {
 		return ObjectID{}, nil, err
 	}
-	mutation, logicalRoot, err := buildFilesystemMutationStore(s, origin, rootName, operations, releasePins)
+	mutation, logicalRoot, err := buildFilesystemMutationStore(s, origin, rootName, operations, releasePins, true)
 	if err != nil {
 		return ObjectID{}, nil, err
 	}
@@ -257,6 +261,7 @@ func (s *Store) ApplyFilesystemAndReleasePinsReclaimed(origin SnapshotID, rootNa
 		Origin: origin, RootName: rootName,
 		Operations:  append([]FilesystemOperation(nil), operations...),
 		ReleasePins: append([]string(nil), releasePins...), Result: logicalRoot,
+		Balanced: true,
 	}
 	var reclaimed []ObjectID
 	err = s.commitLockedPrepared([]journalOp{{ApplyFilesystem: &journalMutation}}, nil, func(state *graphState) error {
@@ -339,19 +344,19 @@ func (s *Store) resolveFilesystemOperationPathsLocked(rootName string, operation
 	return loadErr
 }
 
-func buildFilesystemMutation(state *graphState, origin SnapshotID, rootName string, operations []FilesystemOperation, releasePins []string) (*graphMutation, ObjectID, error) {
-	return buildFilesystemMutationStore(&Store{state: *state}, origin, rootName, operations, releasePins)
+func buildFilesystemMutation(state *graphState, origin SnapshotID, rootName string, operations []FilesystemOperation, releasePins []string, balanced bool) (*graphMutation, ObjectID, error) {
+	return buildFilesystemMutationStore(&Store{state: *state}, origin, rootName, operations, releasePins, balanced)
 }
 
-func buildFilesystemMutationStore(store *Store, origin SnapshotID, rootName string, operations []FilesystemOperation, releasePins []string) (*graphMutation, ObjectID, error) {
-	return buildFilesystemMutationBatched(store, origin, rootName, operations, releasePins)
+func buildFilesystemMutationStore(store *Store, origin SnapshotID, rootName string, operations []FilesystemOperation, releasePins []string, balanced bool) (*graphMutation, ObjectID, error) {
+	return buildFilesystemMutationBatched(store, origin, rootName, operations, releasePins, balanced)
 }
 
 // buildFilesystemMutationBatched applies a logical transaction with at most
 // three descents through the global inode tree and one descent through each
 // affected directory tree. Work is proportional to changed keys times tree
 // depth, rather than creating an obsolete immutable path for every operation.
-func buildFilesystemMutationBatched(store *Store, origin SnapshotID, rootName string, operations []FilesystemOperation, releasePins []string) (*graphMutation, ObjectID, error) {
+func buildFilesystemMutationBatched(store *Store, origin SnapshotID, rootName string, operations []FilesystemOperation, releasePins []string, balanced bool) (*graphMutation, ObjectID, error) {
 	state := &store.state
 	mutation, err := newGraphMutation(store, origin)
 	if err != nil {
@@ -451,7 +456,7 @@ func buildFilesystemMutationBatched(store *Store, origin SnapshotID, rootName st
 		}
 		return mutation.create(ObjectKindInode, data, children)
 	}
-	inodeBuilder := bTreeBuilder{mutation: mutation, kind: ObjectKindInodeNode}
+	inodeBuilder := bTreeBuilder{mutation: mutation, kind: ObjectKindInodeNode, balanced: balanced}
 
 	// Update the whole-filesystem byte aggregate from the final inode changes
 	// before replacing any immutable paths. Directory entries and hard links do
@@ -579,7 +584,7 @@ func buildFilesystemMutationBatched(store *Store, origin SnapshotID, rootName st
 			}
 			entryEdits = append(entryEdits, bTreeEdit{key: []byte(name), value: object})
 		}
-		directoryBuilder := bTreeBuilder{mutation: mutation, kind: ObjectKindDirectoryNode, final: true}
+		directoryBuilder := bTreeBuilder{mutation: mutation, kind: ObjectKindDirectoryNode, final: true, balanced: balanced}
 		parent.Directory, err = directoryBuilder.apply(parent.Directory, entryEdits)
 		if err != nil {
 			return nil, ObjectID{}, err
@@ -990,7 +995,7 @@ func bTreeLookupObjects(root ObjectID, kind ObjectKind, key []byte, objectFor fu
 		return ObjectID{}, false, nil
 	}
 	current := root
-	for depth := 0; depth < 64; depth++ {
+	for depth := 0; depth < bTreeMaxDepth; depth++ {
 		object, ok := objectFor(current)
 		if !ok {
 			return ObjectID{}, false, fmt.Errorf("TTC B-tree node %s does not exist", current.key())
@@ -1047,7 +1052,7 @@ func (s *Store) ExclusiveFile(rootName string, number uint64) (ObjectID, bool, e
 		if current.IsZero() {
 			return ObjectID{}, false, nil
 		}
-		if depth == 64 {
+		if depth == bTreeMaxDepth {
 			return ObjectID{}, false, errors.New("TTC B-tree exceeds maximum structural depth")
 		}
 		object, ok := sole(current)

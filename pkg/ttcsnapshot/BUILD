@@ -43,7 +43,8 @@ go_library(
 
 go_test(
     name = "ttcsnapshot_test",
-    size = "small",
+    # It takes half a minute or more, and a minute beside other tests.
+    size = "medium",
     srcs = [
 		"catalog_test.go",
 		"deferred_test.go",

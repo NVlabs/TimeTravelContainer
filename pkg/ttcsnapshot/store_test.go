@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -1774,6 +1775,273 @@ func TestPersistentBTreeSplitsAndHardlinks(t *testing.T) {
 		if count == 0 {
 			t.Fatalf("GC stalled with stats %+v", store.Stats())
 		}
+	}
+}
+
+// bTreeShapeForTest returns the depths of the shallowest and deepest leaves of
+// the tree at root, and its entries' keys, in order.
+func bTreeShapeForTest(t *testing.T, objectFor func(ObjectID) (Object, bool), root ObjectID, kind ObjectKind) (int, int, [][]byte) {
+	t.Helper()
+	shallowest, deepest := 0, 0
+	var keys [][]byte
+	var visit func(ObjectID, int)
+	visit = func(id ObjectID, depth int) {
+		object, ok := objectFor(id)
+		if !ok {
+			t.Fatalf("B-tree node %s is missing", id.key())
+		}
+		node, err := decodeBTreeNode(object, kind)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !node.leaf {
+			for _, child := range node.children {
+				visit(child, depth+1)
+			}
+			return
+		}
+		if shallowest == 0 || depth < shallowest {
+			shallowest = depth
+		}
+		deepest = max(deepest, depth)
+		keys = append(keys, node.keys...)
+	}
+	visit(root, 1)
+	return shallowest, deepest, keys
+}
+
+// appendBTreeEntries appends count entries, of increasing keys from first, to
+// the tree at root, batch at a time, as files made one after another add
+// their inodes, and returns the tree's root.
+func appendBTreeEntries(t *testing.T, builder *bTreeBuilder, root ObjectID, first, count, batch int, value ObjectID) ObjectID {
+	t.Helper()
+	for key := first; key < first+count; key += batch {
+		var edits []bTreeEdit
+		for k := key; k < min(key+batch, first+count); k++ {
+			edits = append(edits, bTreeEdit{key: InodeKey(uint64(k)), value: value})
+		}
+		var err error
+		if root, err = builder.apply(root, edits); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
+}
+
+// A B-tree that gains entries a few at a time keeps every leaf at one depth,
+// that of a full tree of its entries. Older releases replaced each inner node
+// left with one child by that child, and splits of the root then drove its
+// leaves' depths apart: a container's builds made its inode tree 68 deep, and
+// its lookups failed.
+func TestBTreesStayBalanced(t *testing.T) {
+	store := openTestStore(t)
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err := store.CreateObject(origin, "build/value", ObjectKindInode, []byte("value"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, batch := range []int{1, 2, 3, 64} {
+		for _, balanced := range []bool{false, true} {
+			mutation, err := newGraphMutation(store, origin)
+			if err != nil {
+				t.Fatal(err)
+			}
+			builder := &bTreeBuilder{mutation: mutation, kind: ObjectKindInodeNode, balanced: balanced}
+			root := appendBTreeEntries(t, builder, ObjectID{}, 1, 3000, batch, value)
+			shallowest, deepest, keys := bTreeShapeForTest(t, mutation.object, root, ObjectKindInodeNode)
+			if len(keys) != 3000 {
+				t.Fatalf("batch %d: the tree has %d entries, want 3000", batch, len(keys))
+			}
+			if !balanced {
+				t.Logf("batch %d, unbalanced as older releases made it: leaves %d to %d deep", batch, shallowest, deepest)
+				continue
+			}
+			// 3000 entries fill 97 leaves, under 4 inner nodes and a root.
+			if shallowest != deepest || deepest > 3 {
+				t.Errorf("batch %d: leaves %d to %d deep, want all at most 3", batch, shallowest, deepest)
+			}
+		}
+	}
+}
+
+// A balanced builder rebuilds a tree that an older release left unbalanced,
+// with the edits it applies, when it finds it deeper than any balanced tree.
+func TestBTreeApplyRebuildsAnUnbalancedTree(t *testing.T) {
+	store := openTestStore(t)
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err := store.CreateObject(origin, "build/value", ObjectKindInode, []byte("value"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := store.CreateObject(origin, "build/other", ObjectKindInode, []byte("other"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutation, err := newGraphMutation(store, origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A tree as older releases left a growing one: each inner node holds the
+	// tree so far and a leaf of the next keys.
+	builder := &bTreeBuilder{mutation: mutation, kind: ObjectKindInodeNode}
+	root, err := builder.makeNode(bTreeNode{leaf: true, keys: [][]byte{InodeKey(0)}, children: []ObjectID{value}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key := uint64(1); key < 40; key++ {
+		leaf, err := builder.makeNode(bTreeNode{leaf: true, keys: [][]byte{InodeKey(key)}, children: []ObjectID{value}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if root, err = builder.makeNode(bTreeNode{keys: [][]byte{InodeKey(0), InodeKey(key)}, children: []ObjectID{root, leaf}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, deepest, _ := bTreeShapeForTest(t, mutation.object, root, ObjectKindInodeNode); deepest != 40 {
+		t.Fatalf("the unbalanced tree is %d deep, want 40", deepest)
+	}
+	builder.balanced = true
+	root, err = builder.apply(root, []bTreeEdit{
+		{key: InodeKey(3), delete: true},
+		{key: InodeKey(7), value: other},
+		{key: InodeKey(50), value: other},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	shallowest, deepest, keys := bTreeShapeForTest(t, mutation.object, root, ObjectKindInodeNode)
+	if shallowest != deepest || deepest != 2 {
+		t.Errorf("the rebuilt tree's leaves are %d to %d deep, want all 2", shallowest, deepest)
+	}
+	var want [][]byte
+	for key := uint64(0); key < 40; key++ {
+		if key != 3 {
+			want = append(want, InodeKey(key))
+		}
+	}
+	want = append(want, InodeKey(50))
+	if !slices.EqualFunc(keys, want, bytes.Equal) {
+		t.Errorf("the rebuilt tree has keys %x, want %x", keys, want)
+	}
+	if got, ok, err := bTreeLookupMutation(mutation, root, ObjectKindInodeNode, InodeKey(7)); err != nil || !ok || got != other {
+		t.Errorf("key 7 = %s, %t, %v; want %s", got.key(), ok, err, other.key())
+	}
+}
+
+// copyGraphForTest copies the graph in directory to a new directory, which it
+// returns: opening the copy replays its journal, where reopening directory
+// would find the state that closing it kept.
+func copyGraphForTest(t *testing.T, directory string) string {
+	t.Helper()
+	copied := t.TempDir()
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		data, err := os.ReadFile(filepath.Join(directory, entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(copied, entry.Name()), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return copied
+}
+
+// A journal's filesystem mutations replay as they were made: those of older
+// releases, whose trees were unbalanced, as such, and later ones balanced, so
+// that a store opens to the roots it committed.
+func TestFilesystemJournalReplaysUnbalancedMutations(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const name = "branch/main/filesystem"
+	apply := func(balanced bool, operations []FilesystemOperation) {
+		t.Helper()
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		mutation, root, err := buildFilesystemMutationStore(store, origin, name, operations, nil, balanced)
+		if err != nil {
+			t.Fatal(err)
+		}
+		journal := filesystemJournalMutation{Origin: origin, RootName: name, Operations: operations, Result: root, Balanced: balanced}
+		if err := store.commitLockedPrepared([]journalOp{{ApplyFilesystem: &journal}}, nil, func(state *graphState) error {
+			_, err := installGraphMutation(state, mutation, name, root, nil)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// inodeDepths returns the depths of the inode tree's shallowest and
+	// deepest leaves.
+	inodeDepths := func(s *Store) [2]int {
+		t.Helper()
+		rootID, ok := s.Root(name)
+		if !ok {
+			t.Fatal("the filesystem has no root")
+		}
+		root, err := decodeFilesystemRoot(s.state.Objects[rootID])
+		if err != nil {
+			t.Fatal(err)
+		}
+		shallowest, deepest, _ := bTreeShapeForTest(t, func(id ObjectID) (Object, bool) {
+			object, ok := s.state.Objects[id]
+			return object, ok
+		}, root.inodes, ObjectKindInodeNode)
+		return [2]int{shallowest, deepest}
+	}
+	// Files made one at a time, as an older release recorded them.
+	for number := uint64(1); number <= 1500; number++ {
+		inode := InodeRecord{Number: number, Type: "regular", Mode: 0644, Nlink: 1}
+		apply(false, []FilesystemOperation{{PutInode: &inode}})
+	}
+	unbalanced := inodeDepths(store)
+	if unbalanced[0] == unbalanced[1] {
+		t.Fatalf("the older mutations made a tree whose leaves are all %d deep, as a balanced one's are", unbalanced[0])
+	}
+	committed, _ := store.Root(name)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dir = copyGraphForTest(t, dir)
+	store, err = Open(dir)
+	if err != nil {
+		t.Fatalf("reopening the store of older mutations: %v", err)
+	}
+	if root, _ := store.Root(name); root != committed || inodeDepths(store) != unbalanced {
+		t.Fatalf("the older mutations replayed to root %s, leaves %v deep; want %s, %v", root.key(), inodeDepths(store), committed.key(), unbalanced)
+	}
+	// Later files, balanced.
+	for number := uint64(1501); number <= 1600; number++ {
+		inode := InodeRecord{Number: number, Type: "regular", Mode: 0644, Nlink: 1}
+		apply(true, []FilesystemOperation{{PutInode: &inode}})
+	}
+	committed, _ = store.Root(name)
+	depths := inodeDepths(store)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(copyGraphForTest(t, dir))
+	if err != nil {
+		t.Fatalf("reopening the store of both: %v", err)
+	}
+	defer store.Close()
+	if root, _ := store.Root(name); root != committed || inodeDepths(store) != depths {
+		t.Fatalf("both replayed to root %s, leaves %v deep; want %s, %v", root.key(), inodeDepths(store), committed.key(), depths)
 	}
 }
 

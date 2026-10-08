@@ -16,7 +16,19 @@ import (
 const (
 	bTreeMaxEntries  = 31
 	bTreeMaxKeyBytes = 4096
-	bTreeMaxDepth    = 64
+	// bTreeMaxDepth bounds a walk down a tree, which a corrupted graph's
+	// cycle would make endless. It is far deeper than any tree this package
+	// makes, but older ones made trees as deep as 68: see bTreeBalancedDepth.
+	bTreeMaxDepth = 256
+	// bTreeBalancedDepth is deeper than any tree that this package makes,
+	// whose leaves are all at one depth: a tree grows a level only when its
+	// root splits, which takes 31 times as many entries for each level. Older
+	// ones replaced each inner node that edits left with one child by that
+	// child, wherever it was, and leaves then lay at depths that splits of
+	// the root drove apart, a level each: a container's builds made its
+	// inode tree 68 deep with 8,525 nodes, and its lookups failed. apply
+	// rebuilds a tree whose leftmost or rightmost leaf is deeper than this.
+	bTreeBalancedDepth = 16
 )
 
 type bTreeNode struct {
@@ -355,6 +367,11 @@ type bTreeBuilder struct {
 	// transaction makes of their tree: none is copied again before it
 	// commits. See lends.
 	final bool
+	// balanced is whether apply keeps every leaf at one depth, and rebuilds
+	// a tree that is not, as it does for every transaction since
+	// filesystemJournalMutation's Balanced. A journal's earlier transactions
+	// replay as they were made: see bTreeBalancedDepth.
+	balanced bool
 }
 
 type bTreeEdit struct {
@@ -417,23 +434,121 @@ func (builder *bTreeBuilder) apply(root ObjectID, edits []bTreeEdit) (ObjectID, 
 			return ObjectID{}, errors.New("TTC B-tree batch put has zero value")
 		}
 	}
-	if root.IsZero() {
-		var keys [][]byte
-		var children []ObjectID
-		for _, edit := range edits {
-			if edit.delete {
-				continue
-			}
-			keys = append(keys, append([]byte(nil), edit.key...))
-			children = append(children, edit.value)
+	if !builder.balanced && !root.IsZero() {
+		ids, minima, changed, err := builder.applyNode(root, edits, true)
+		if err != nil || !changed {
+			return root, err
 		}
-		return builder.buildTree(true, keys, children)
+		return builder.buildUpper(ids, minima)
 	}
-	ids, minima, changed, err := builder.applyNode(root, edits)
-	if err != nil || !changed {
-		return root, err
+	var keys [][]byte
+	var children []ObjectID
+	if !root.IsZero() {
+		left, err := builder.edgeDepth(root, false)
+		if err != nil {
+			return ObjectID{}, err
+		}
+		right, err := builder.edgeDepth(root, true)
+		if err != nil {
+			return ObjectID{}, err
+		}
+		if max(left, right) <= bTreeBalancedDepth {
+			ids, minima, changed, err := builder.applyNode(root, edits, true)
+			if err != nil || !changed {
+				return root, err
+			}
+			return builder.buildUpper(ids, minima)
+		}
+		// An older release's tree, unbalanced: build it anew, with the
+		// edits. Its nodes go once the new tree replaces it.
+		if keys, children, err = builder.entries(root); err != nil {
+			return ObjectID{}, err
+		}
 	}
-	return builder.buildUpper(ids, minima)
+	keys, children = applyEdits(keys, children, edits)
+	return builder.buildTree(true, keys, children)
+}
+
+// edgeDepth returns the depth of the tree at root's leftmost leaf, or its
+// rightmost if last, which is every leaf's in a balanced tree. An unbalanced
+// one that older releases made by appending entries, as inode numbers are, or
+// prepending them, is deepest at an end.
+func (builder *bTreeBuilder) edgeDepth(root ObjectID, last bool) (int, error) {
+	current := root
+	for depth := 1; depth <= bTreeMaxDepth; depth++ {
+		object, ok := builder.mutation.object(current)
+		if !ok {
+			return 0, fmt.Errorf("TTC B-tree node %s does not exist", current.key())
+		}
+		node, err := decodeBTreeNode(object, builder.kind)
+		if err != nil {
+			return 0, err
+		}
+		if node.leaf {
+			return depth, nil
+		}
+		current = node.children[0]
+		if last {
+			current = node.children[len(node.children)-1]
+		}
+	}
+	return 0, errors.New("TTC B-tree exceeds maximum structural depth")
+}
+
+// entries returns the keys and values of the tree at root, in order.
+func (builder *bTreeBuilder) entries(root ObjectID) ([][]byte, []ObjectID, error) {
+	var keys [][]byte
+	var values []ObjectID
+	var visit func(ObjectID, int) error
+	visit = func(id ObjectID, depth int) error {
+		if depth >= bTreeMaxDepth {
+			return errors.New("TTC B-tree exceeds maximum structural depth")
+		}
+		object, ok := builder.mutation.object(id)
+		if !ok {
+			return fmt.Errorf("TTC B-tree node %s does not exist", id.key())
+		}
+		node, err := decodeBTreeNode(object, builder.kind)
+		if err != nil {
+			return err
+		}
+		if node.leaf {
+			keys = append(keys, node.keys...)
+			values = append(values, node.children...)
+			return nil
+		}
+		for _, child := range node.children {
+			if err := visit(child, depth+1); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := visit(root, 0); err != nil {
+		return nil, nil, err
+	}
+	return keys, values, nil
+}
+
+// applyEdits returns keys and values, in order, with edits, sorted, applied.
+func applyEdits(keys [][]byte, values []ObjectID, edits []bTreeEdit) ([][]byte, []ObjectID) {
+	outKeys := make([][]byte, 0, len(keys)+len(edits))
+	outValues := make([]ObjectID, 0, cap(outKeys))
+	index := 0
+	for _, edit := range edits {
+		for index < len(keys) && bytes.Compare(keys[index], edit.key) < 0 {
+			outKeys, outValues = append(outKeys, keys[index]), append(outValues, values[index])
+			index++
+		}
+		if index < len(keys) && bytes.Equal(keys[index], edit.key) {
+			index++
+		}
+		if !edit.delete {
+			outKeys = append(outKeys, append([]byte(nil), edit.key...))
+			outValues = append(outValues, edit.value)
+		}
+	}
+	return append(outKeys, keys[index:]...), append(outValues, values[index:]...)
 }
 
 func (builder *bTreeBuilder) buildTree(leaf bool, keys [][]byte, children []ObjectID) (ObjectID, error) {
@@ -486,7 +601,11 @@ func (builder *bTreeBuilder) makeLevel(leaf bool, keys [][]byte, children []Obje
 	return ids, minima, nil
 }
 
-func (builder *bTreeBuilder) applyNode(current ObjectID, edits []bTreeEdit) ([]ObjectID, [][]byte, bool, error) {
+// applyNode applies edits to the subtree at current, and returns the nodes,
+// of its height, that replace it, and their minima. Only the root, if root,
+// is replaced by its one remaining child, which keeps every leaf at one
+// depth; without balanced, as older releases did, any inner node is.
+func (builder *bTreeBuilder) applyNode(current ObjectID, edits []bTreeEdit, root bool) ([]ObjectID, [][]byte, bool, error) {
 	object, ok := builder.mutation.object(current)
 	if !ok {
 		return nil, nil, false, fmt.Errorf("TTC B-tree node %s does not exist", current.key())
@@ -564,7 +683,7 @@ func (builder *bTreeBuilder) applyNode(current ObjectID, edits []bTreeEdit) ([]O
 			from = append(from, index)
 			continue
 		}
-		ids, minima, childChanged, err := builder.applyNode(child, grouped[index])
+		ids, minima, childChanged, err := builder.applyNode(child, grouped[index], false)
 		if err != nil {
 			return nil, nil, false, err
 		}
@@ -572,7 +691,7 @@ func (builder *bTreeBuilder) applyNode(current ObjectID, edits []bTreeEdit) ([]O
 		keys = append(keys, minima...)
 		children = append(children, ids...)
 		// An unchanged child is the node's; a changed one is replaced by its
-		// copies, or by its one remaining child, which is not the node's.
+		// copies, which are not.
 		for range ids {
 			if childChanged {
 				from = append(from, -1)
@@ -584,7 +703,7 @@ func (builder *bTreeBuilder) applyNode(current ObjectID, edits []bTreeEdit) ([]O
 	if !changed {
 		return []ObjectID{current}, [][]byte{append([]byte(nil), node.keys[0]...)}, false, nil
 	}
-	if len(children) == 1 {
+	if (root || !builder.balanced) && len(children) == 1 {
 		childObject, ok := builder.mutation.object(children[0])
 		if !ok {
 			return nil, nil, false, fmt.Errorf("TTC B-tree child %s does not exist", children[0].key())
@@ -659,7 +778,10 @@ func (builder *bTreeBuilder) insert(current ObjectID, key []byte, value ObjectID
 	return []ObjectID{leftID, rightID}, [][]byte{append([]byte(nil), left.keys[0]...), append([]byte(nil), right.keys[0]...)}, nil
 }
 
-func (builder *bTreeBuilder) remove(current ObjectID, key []byte) (ObjectID, []byte, bool, error) {
+// remove removes key from the subtree at current, and returns the node that
+// replaces it, or none if it is empty, and its minimum. Only the root, if
+// root, is replaced by its one remaining child: see applyNode.
+func (builder *bTreeBuilder) remove(current ObjectID, key []byte, root bool) (ObjectID, []byte, bool, error) {
 	object, ok := builder.mutation.object(current)
 	if !ok {
 		return ObjectID{}, nil, false, fmt.Errorf("TTC B-tree node %s does not exist", current.key())
@@ -677,7 +799,7 @@ func (builder *bTreeBuilder) remove(current ObjectID, key []byte) (ObjectID, []b
 		node.children = append(node.children[:index], node.children[index+1:]...)
 	} else {
 		index := bTreePosition(node.keys, key)
-		child, minimum, changed, err := builder.remove(node.children[index], key)
+		child, minimum, changed, err := builder.remove(node.children[index], key, false)
 		if err != nil || !changed {
 			return current, append([]byte(nil), node.keys[0]...), changed, err
 		}
@@ -692,7 +814,7 @@ func (builder *bTreeBuilder) remove(current ObjectID, key []byte) (ObjectID, []b
 	if len(node.keys) == 0 {
 		return ObjectID{}, nil, true, nil
 	}
-	if !node.leaf && len(node.keys) == 1 {
+	if root && !node.leaf && len(node.keys) == 1 {
 		childObject, ok := builder.mutation.object(node.children[0])
 		if !ok {
 			return ObjectID{}, nil, false, fmt.Errorf("TTC B-tree child %s does not exist", node.children[0].key())
@@ -776,7 +898,7 @@ func (s *Store) BTreeDelete(origin SnapshotID, rootName string, kind ObjectKind,
 		return false, err
 	}
 	builder := bTreeBuilder{mutation: mutation, kind: kind}
-	root, _, changed, err := builder.remove(oldRoot, key)
+	root, _, changed, err := builder.remove(oldRoot, key, true)
 	if err != nil || !changed {
 		return changed, err
 	}

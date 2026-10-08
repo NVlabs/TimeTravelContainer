@@ -94,7 +94,7 @@ func journalFixture(random *rand.Rand) journalRecord {
 					{PutEntry: &DirectoryEntryRecord{Parent: 1, Name: "name", Inode: 9}},
 					{DeleteEntry: &DirectoryEntryRecord{Parent: 1, Name: "gone", Inode: 10}},
 				},
-				ReleasePins: []string{"construct/x"}, Result: root,
+				ReleasePins: []string{"construct/x"}, Result: root, Balanced: true,
 			}},
 			{ApplyFilesystem: &filesystemJournalMutation{Origin: 3, RootName: "branch/main", Operations: []FilesystemOperation{{DeleteInode: 9}}, Result: root}},
 		},

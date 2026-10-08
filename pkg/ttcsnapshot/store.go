@@ -1922,7 +1922,7 @@ func applyJournalRecord(state *graphState, record journalRecord) error {
 			handoff.NextSequence++
 			state.putHandoff(handoff)
 		case op.ApplyFilesystem != nil:
-			mutation, root, err := buildFilesystemMutation(state, op.ApplyFilesystem.Origin, op.ApplyFilesystem.RootName, op.ApplyFilesystem.Operations, op.ApplyFilesystem.ReleasePins)
+			mutation, root, err := buildFilesystemMutation(state, op.ApplyFilesystem.Origin, op.ApplyFilesystem.RootName, op.ApplyFilesystem.Operations, op.ApplyFilesystem.ReleasePins, op.ApplyFilesystem.Balanced)
 			if err != nil {
 				return err
 			}

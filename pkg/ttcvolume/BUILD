@@ -30,7 +30,8 @@ go_library(
 
 go_test(
     name = "ttcvolume_test",
-    size = "small",
+    # It takes half a minute or more, and a minute beside other tests.
+    size = "medium",
     srcs = [
         "adopt_test.go",
         "remote_test.go",
