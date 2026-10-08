@@ -19,10 +19,10 @@ import (
 	"sync"
 	"syscall"
 	"testing"
-
-	"gvisor.dev/gvisor/pkg/hostarch"
 	"time"
 
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
 
@@ -3092,6 +3092,133 @@ func TestBranchForkedByAnotherHandleKeepsItsPointer(t *testing.T) {
 			}
 			defer reopened.Close()
 		})
+	}
+}
+
+// A handle's cache of a branch pointer may vouch, by the file's stat, for a
+// record that another handle replaced: Linux's filesystems give a freed inode
+// number out again at once and stamp modifications by a coarse clock, so that
+// a pointer another handle rewrote twice within a tick stats as the file this
+// handle read. A fence must not write such a record back over the other
+// handle's fork, as it did on CI's Linux runners.
+func TestFenceReadsAPointerItsCacheVouchesFor(t *testing.T) {
+	manager := openTestManager(t)
+	sentry, err := manager.Create("cache-vouches")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sentry.Close()
+	if err := sentry.Fork(MainBranch, "child"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sentry.CreateRegular("child", RootInode, "file", 0644, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := sentry.PublishMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := sentry.Branch("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	daemon, err := manager.Open("cache-vouches")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer daemon.Close()
+	if err := daemon.Fork("child", "publication"); err != nil {
+		t.Fatal(err)
+	}
+	forked, err := daemon.Branch("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The sentry's cache holds its own record, as if the daemon's pointer
+	// file were the one it read.
+	var stat unix.Stat_t
+	if err := unix.Fstatat(int(sentry.dir.Fd()), filepath.Join("branches", "child.json"), &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		t.Fatal(err)
+	}
+	sentry.branchMu.Lock()
+	sentry.branchCache["child"] = cachedBranch{
+		branch: stale, device: uint64(stat.Dev), inode: stat.Ino,
+		size: stat.Size, mtimeNsec: stat.Mtim.Sec*1e9 + stat.Mtim.Nsec,
+	}
+	sentry.branchMu.Unlock()
+	if err := sentry.SyncMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := daemon.Branch("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Generation != forked.Generation || got.WorkingSnapshot != forked.WorkingSnapshot {
+		t.Fatalf("the fence wrote back the pointer of before the daemon's fork: generation %d at origin %d, want %d at %d", got.Generation, got.WorkingSnapshot, forked.Generation, forked.WorkingSnapshot)
+	}
+}
+
+// Nor does a fork trust such a record (see
+// TestFenceReadsAPointerItsCacheVouchesFor): a fork of a branch that another
+// handle forked must seal the branch's working origin, not the one that the
+// other handle sealed.
+func TestForkReadsAPointerItsCacheVouchesFor(t *testing.T) {
+	manager := openTestManager(t)
+	sentry, err := manager.Create("cache-forks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sentry.Close()
+	if err := sentry.Fork(MainBranch, "child"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sentry.PublishMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := sentry.Branch("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	daemon, err := manager.Open("cache-forks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer daemon.Close()
+	if err := daemon.Fork("child", "publication"); err != nil {
+		t.Fatal(err)
+	}
+	forked, err := daemon.Branch("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstatat(int(sentry.dir.Fd()), filepath.Join("branches", "child.json"), &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		t.Fatal(err)
+	}
+	sentry.branchMu.Lock()
+	sentry.branchCache["child"] = cachedBranch{
+		branch: stale, device: uint64(stat.Dev), inode: stat.Ino,
+		size: stat.Size, mtimeNsec: stat.Mtim.Sec*1e9 + stat.Mtim.Nsec,
+	}
+	sentry.branchMu.Unlock()
+	if err := sentry.Fork("child", "grandchild"); err != nil {
+		t.Fatalf("forking a branch that another handle forked: %v", err)
+	}
+	got, err := daemon.Branch("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Generation != forked.Generation+1 || got.WorkingSnapshot == forked.WorkingSnapshot {
+		t.Fatalf("the fork did not follow the other handle's: generation %d at origin %d, after %d at %d", got.Generation, got.WorkingSnapshot, forked.Generation, forked.WorkingSnapshot)
+	}
+	reopened, err := manager.Open("cache-forks")
+	if err != nil {
+		t.Fatalf("reopening after the forks: %v", err)
+	}
+	defer reopened.Close()
+	for _, branch := range []string{"child", "publication", "grandchild"} {
+		if _, err := reopened.Branch(branch); err != nil {
+			t.Errorf("branch %s: %v", branch, err)
+		}
 	}
 }
 

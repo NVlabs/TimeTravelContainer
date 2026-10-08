@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -383,6 +384,14 @@ type Repository struct {
 
 	branchMu    sync.Mutex
 	branchCache map[string]cachedBranch
+	// branchEpoch counts the times this process forgot branchCache, so that a
+	// read of a pointer that began before does not cache it after. It is
+	// protected by branchMu.
+	branchEpoch uint64
+	// pointerWrites is the count of branch pointer writes in the lock file
+	// as of this process's last write or hold of the repository flock (see
+	// observePointerWritesLocked). The flock protects it.
+	pointerWrites uint64
 	// discarding holds the branches DiscardBranch marked. It is protected by
 	// branchMu.
 	discarding map[string]struct{}
@@ -2003,6 +2012,9 @@ func (r *Repository) withLock(fn func() error) (result error) {
 		return err
 	}
 	defer unix.Flock(int(r.lockFile.Fd()), unix.LOCK_UN)
+	if err := r.observePointerWritesLocked(); err != nil {
+		return err
+	}
 	if r.graph != nil {
 		if err := r.graph.BeginExternalTransaction(); err != nil {
 			return err
@@ -2014,6 +2026,45 @@ func (r *Repository) withLock(fn func() error) (result error) {
 	return fn()
 }
 
+// observePointerWritesLocked forgets the branch pointers that this process
+// cached if another process wrote a pointer since this one last held the
+// repository flock: writers of pointers hold the flock, and count their writes
+// in the lock file. A cached pointer's stat may not tell another process's
+// rewrite (see readBranchRecord), and what the flock's holder reads of a
+// pointer it may write back. The flock must be held by the caller.
+func (r *Repository) observePointerWritesLocked() error {
+	var count [8]byte
+	if _, err := r.lockFile.ReadAt(count[:], 0); err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("reading the count of branch pointer writes: %w", err)
+	}
+	writes := binary.LittleEndian.Uint64(count[:])
+	if writes == r.pointerWrites {
+		return nil
+	}
+	r.pointerWrites = writes
+	r.branchMu.Lock()
+	clear(r.branchCache)
+	r.branchEpoch++
+	r.branchMu.Unlock()
+	return nil
+}
+
+// countPointerWriteLocked counts a write of a branch pointer, before it is
+// made, for other processes' caches (see observePointerWritesLocked). The
+// flock must be held by the caller.
+func (r *Repository) countPointerWriteLocked() error {
+	if r.lockFile == nil {
+		return errors.New("writing a branch pointer without the repository lock")
+	}
+	var count [8]byte
+	binary.LittleEndian.PutUint64(count[:], r.pointerWrites+1)
+	if _, err := r.lockFile.WriteAt(count[:], 0); err != nil {
+		return fmt.Errorf("counting a branch pointer write: %w", err)
+	}
+	r.pointerWrites++
+	return nil
+}
+
 func (r *Repository) readBranch(id string) (Branch, error) {
 	return r.readBranchRecord(id, true)
 }
@@ -2021,11 +2072,23 @@ func (r *Repository) readBranch(id string) (Branch, error) {
 // readBranchRecord is readBranch, which, unless rooted, also returns a pointer
 // that names no root yet: a new repository writes its main branch's before
 // the first fence publishes the root.
+//
+// It returns the record it cached when the pointer file's device, inode, size
+// and modification time are those of the file it read. Those may be another
+// file's: Linux's filesystems give a freed inode number out again at once, so
+// that a pointer that another process rewrote twice can be back at the inode
+// number of the file this process read, and they stamp modifications by a
+// coarse clock: of the same size, within a tick, the rewrite passes for the
+// file it read. So the holder of the repository flock forgets the cache when
+// another process wrote a pointer (see observePointerWritesLocked).
 func (r *Repository) readBranchRecord(id string, rooted bool) (Branch, error) {
 	if err := validateName(id, "branch"); err != nil {
 		return Branch{}, err
 	}
 	name := filepath.Join("branches", id+".json")
+	r.branchMu.Lock()
+	epoch := r.branchEpoch
+	r.branchMu.Unlock()
 	var stat unix.Stat_t
 	if err := unix.Fstatat(int(r.dir.Fd()), name, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 		return Branch{}, err
@@ -2054,15 +2117,20 @@ func (r *Repository) readBranchRecord(id string, rooted bool) (Branch, error) {
 	if r.branchCache == nil {
 		r.branchCache = make(map[string]cachedBranch)
 	}
-	r.branchCache[id] = cachedBranch{
-		branch: branch, device: uint64(stat.Dev), inode: stat.Ino,
-		size: stat.Size, mtimeNsec: stat.Mtim.Sec*1e9 + stat.Mtim.Nsec,
+	if r.branchEpoch == epoch {
+		r.branchCache[id] = cachedBranch{
+			branch: branch, device: uint64(stat.Dev), inode: stat.Ino,
+			size: stat.Size, mtimeNsec: stat.Mtim.Sec*1e9 + stat.Mtim.Nsec,
+		}
 	}
 	r.branchMu.Unlock()
 	return branch, nil
 }
 
 func (r *Repository) writeBranch(branch Branch) error {
+	if err := r.countPointerWriteLocked(); err != nil {
+		return err
+	}
 	if err := r.writeJSONAtomic(filepath.Join("branches", branch.ID+".json"), branch); err != nil {
 		return err
 	}
