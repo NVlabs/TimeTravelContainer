@@ -637,7 +637,7 @@ func (d *LazyDirectory) lock(canonical string, wait bool) (*lazyFile, error) {
 	if err != nil {
 		return nil, err
 	}
-	lockFD, err := unix.Openat(shardFD, name, unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC, 0600)
+	lockFD, err := openLockFile(shardFD, name)
 	_ = unix.Close(shardFD)
 	if err != nil {
 		return nil, err
@@ -659,6 +659,19 @@ func (d *LazyDirectory) lock(canonical string, wait bool) (*lazyFile, error) {
 		f.complete = true
 	}
 	return f, nil
+}
+
+// openLockFile opens the lock file name in the directory dirFD, creating it
+// if need be. macOS's openat fails with ENOENT, rather than opening the file,
+// when another thread creates it at once, as fetches of the same file do: it
+// opens the file again then, which finds it.
+func openLockFile(dirFD int, name string) (int, error) {
+	for attempt := 0; ; attempt++ {
+		fd, err := unix.Openat(dirFD, name, unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC, 0600)
+		if err == nil || !errors.Is(err, unix.ENOENT) || attempt == 3 {
+			return fd, err
+		}
+	}
 }
 
 // release closes f's file and releases its lock.
