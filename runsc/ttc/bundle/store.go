@@ -1015,10 +1015,15 @@ func hostResolverConfig(data []byte) (nameservers, search, options []string) {
 }
 
 func buildResolvConf(hostData []byte, dns, search, options []string) string {
-	return buildResolvConfForNetwork(hostData, dns, search, options, "none")
+	return buildResolvConfForNetwork(hostData, dns, search, options, "none", "")
 }
 
-func buildResolvConfForNetwork(hostData []byte, dns, search, options []string, networkMode string) string {
+// buildResolvConfForNetwork is buildResolvConf for a container whose network
+// mode is networkMode and, with --network=ttc, whose NIC's address is guestIP,
+// or the default if empty. TTC's NAT gives the guest's /24 the host's
+// loopback addresses, so a resolver on the host's loopback, such as
+// 127.0.0.53, is the same address in the guest's /24.
+func buildResolvConfForNetwork(hostData []byte, dns, search, options []string, networkMode, guestIP string) string {
 	hostDNS, hostSearch, hostOptions := hostResolverConfig(hostData)
 	if len(dns) == 0 {
 		dns = hostDNS
@@ -1027,20 +1032,26 @@ func buildResolvConfForNetwork(hostData []byte, dns, search, options []string, n
 		dns = []string{"127.0.0.1"}
 	}
 	if networkMode == "ttc" {
+		guest := [4]byte{10, 0, 2, 15}
+		if address, err := netip.ParseAddr(guestIP); err == nil && address.Is4() {
+			guest = address.As4()
+		}
 		dns = append([]string(nil), dns...)
 		for i, value := range dns {
 			address, err := netip.ParseAddr(value)
 			if err != nil || !address.IsLoopback() {
 				continue
 			}
+			// The gateway, .2, is the host's 127.0.0.1, which the guest's
+			// own address and the broadcast address cannot be.
 			last := byte(2)
 			if address.Is4() {
 				last = address.As4()[3]
-				if last == 1 || last == 15 || last == 255 {
+				if last == 1 || last == guest[3] || last == 255 {
 					last = 2
 				}
 			}
-			dns[i] = netip.AddrFrom4([4]byte{10, 0, 2, last}).String()
+			dns[i] = netip.AddrFrom4([4]byte{guest[0], guest[1], guest[2], last}).String()
 		}
 	}
 	if len(search) == 0 {
@@ -1062,7 +1073,7 @@ func buildResolvConfForNetwork(hostData []byte, dns, search, options []string, n
 	return result.String()
 }
 
-func materializeNetworkFiles(containerDir string, opts SpecOptions) ([]HostMount, error) {
+func materializeNetworkFiles(containerDir string, opts SpecOptions, guestIP string) ([]HostMount, error) {
 	networkDir := filepath.Join(containerDir, "network")
 	if err := os.Mkdir(networkDir, 0700); err != nil {
 		return nil, fmt.Errorf("creating container network configuration: %w", err)
@@ -1082,7 +1093,7 @@ func materializeNetworkFiles(containerDir string, opts SpecOptions) ([]HostMount
 	}{
 		{name: "hostname", destination: "/etc/hostname", contents: hostname + "\n"},
 		{name: "hosts", destination: "/etc/hosts", contents: buildHostsFile(opts.ExtraHosts)},
-		{name: "resolv.conf", destination: "/etc/resolv.conf", contents: buildResolvConfForNetwork(hostResolv, opts.DNS, opts.DNSSearch, opts.DNSOptions, opts.NetworkMode)},
+		{name: "resolv.conf", destination: "/etc/resolv.conf", contents: buildResolvConfForNetwork(hostResolv, opts.DNS, opts.DNSSearch, opts.DNSOptions, opts.NetworkMode, guestIP)},
 	}
 	mounts := make([]HostMount, 0, len(files))
 	for _, file := range files {
@@ -1737,7 +1748,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	// the lifetime of its gofer. Keep them with the node-local active state,
 	// not in the shared catalog. Apart from avoiding hot shared-filesystem I/O,
 	// this ensures removing shared metadata never unlinks an open NFS file.
-	internalMounts, err := materializeNetworkFiles(activeContainerDir, opts.SpecOptions)
+	internalMounts, err := materializeNetworkFiles(activeContainerDir, opts.SpecOptions, opts.NetworkIP)
 	if err != nil {
 		return Prepared{}, err
 	}

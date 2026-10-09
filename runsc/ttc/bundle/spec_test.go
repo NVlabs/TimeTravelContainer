@@ -1444,7 +1444,7 @@ func TestNetworkFileMaterialization(t *testing.T) {
 		ExtraHosts: []string{"db:192.0.2.10", "v6:2001:db8::10"},
 		DNS:        []string{"203.0.113.53"}, DNSSearch: []string{"example.test"}, DNSOptions: []string{"ndots:2", "rotate"},
 	}
-	mounts, err := materializeNetworkFiles(containerDir, opts)
+	mounts, err := materializeNetworkFiles(containerDir, opts, "")
 	if err != nil {
 		t.Fatalf("materializeNetworkFiles: %v", err)
 	}
@@ -1616,11 +1616,19 @@ func TestBuildResolvConf(t *testing.T) {
 	if got, want := buildResolvConf(nil, nil, nil, nil), "nameserver 127.0.0.1\n"; got != want {
 		t.Errorf("fallback resolver=%q, want %q", got, want)
 	}
-	if got, want := buildResolvConfForNetwork([]byte("nameserver 127.0.0.53\n"), nil, nil, nil, "ttc"), "nameserver 10.0.2.53\n"; got != want {
+	if got, want := buildResolvConfForNetwork([]byte("nameserver 127.0.0.53\n"), nil, nil, nil, "ttc", ""), "nameserver 10.0.2.53\n"; got != want {
 		t.Errorf("TTC host stub resolver=%q, want %q", got, want)
 	}
-	if got, want := buildResolvConfForNetwork(nil, []string{"127.0.0.1", "203.0.113.53"}, nil, nil, "ttc"), "nameserver 10.0.2.2\nnameserver 203.0.113.53\n"; got != want {
+	if got, want := buildResolvConfForNetwork(nil, []string{"127.0.0.1", "203.0.113.53"}, nil, nil, "ttc", ""), "nameserver 10.0.2.2\nnameserver 203.0.113.53\n"; got != want {
 		t.Errorf("TTC mixed resolver=%q, want %q", got, want)
+	}
+	// TTC's NAT gives the host's loopback addresses to the guest's own /24,
+	// whatever --ip puts it in.
+	if got, want := buildResolvConfForNetwork([]byte("nameserver 127.0.0.53\n"), nil, nil, nil, "ttc", "192.0.2.44"), "nameserver 192.0.2.53\n"; got != want {
+		t.Errorf("TTC host stub resolver with --ip=%q, want %q", got, want)
+	}
+	if got, want := buildResolvConfForNetwork([]byte("nameserver 127.0.0.44\nnameserver 127.0.0.15\n"), nil, nil, nil, "ttc", "192.0.2.44"), "nameserver 192.0.2.2\nnameserver 192.0.2.15\n"; got != want {
+		t.Errorf("TTC resolver at the guest's own address=%q, want %q", got, want)
 	}
 }
 
