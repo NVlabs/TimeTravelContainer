@@ -113,7 +113,7 @@ func preflightDaemonExecutable(path string) error {
 		return err
 	}
 	if !hasDarwinBooleanEntitlement(entitlements, "com.apple.security.hypervisor") {
-		return fmt.Errorf("missing required com.apple.security.hypervisor entitlement in %q; after copying ttcd to its final path, run: codesign --force --sign - --entitlements /path/to/runsc/hvf.entitlements %q", path, path)
+		return fmt.Errorf("missing required com.apple.security.hypervisor entitlement in %q; after copying ttcd to its final path, sign it with the hvf.entitlements of its release's zip, or runsc/hvf.entitlements of a source tree: codesign --force --sign - --entitlements hvf.entitlements %q", path, path)
 	}
 	return nil
 }

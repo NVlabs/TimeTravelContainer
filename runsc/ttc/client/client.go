@@ -442,8 +442,9 @@ It does not advertise a TCP endpoint, register a node, or accept container
 placement; it opens only its socket in TTC_LOCAL_ROOT.`,
 	"daemon status": `Usage: ttc daemon status
 
-Show the running daemon's build ID, runtime mode, root format, and cluster
-membership. The client and daemon must have exactly matching builds.`,
+Show the running daemon's build ID, API version, roots, runtime platform, host
+isolation, and cluster membership. The client and daemon must have exactly
+matching builds.`,
 	"daemon stop": `Usage: ttc daemon stop [--dehydrate-all|--stop-all|--migrate-all]
 
 Stop the local daemon. With live branches, select exactly one policy:
@@ -634,8 +635,8 @@ choose a compute node. Important options:
   --shm-size SIZE             Size of memory-backed /dev/shm (default: 64m)
   --network none|host|ttc     Network mode (default: none)
   --nat                       Permit outbound NAT for --network=ttc (default: false)
-  --ip IPv4                   Virtual NIC address (default: allocated)
-  --mac-address MAC           Virtual NIC address (default: generated)
+  --ip IPv4                   Virtual NIC address (default: 10.0.2.15)
+  --mac-address MAC           Virtual NIC address (default: 02:42:0a:00:02:0f)
   -p, --publish SPEC          [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]; repeatable
   -v, --volume SPEC           VOLUME:PATH[:ro] or HOST:PATH[:ro|rw|copy]; repeatable
   --tmpfs PATH[:OPTIONS]      Add an explicitly memory-backed mount; repeatable
@@ -644,6 +645,12 @@ choose a compute node. Important options:
   -w, --workdir DIR           Guest cwd (default: image working directory)
   --hostname NAME             Guest hostname (default: container name)
   --log-driver DRIVER         local|json-file|none (default: local)
+  --gfx                       Virtual Vulkan GPU, /dev/dri/renderD128 (default: false)
+  --nvproxy[=CAPS]            The host's NVIDIA GPUs, for CUDA, on Linux
+                              (default: none)
+  --gfx-fork, --nvproxy-fork device-lost|snapshot
+                              What a live fork does with the GPU while it is in
+                              use; without one, the family must waive live forks
   --waive-live-fork           Permit a non-forkable configuration (default: false)`,
 	"create": `Usage: ttc create [OPTIONS] IMAGE [COMMAND] [ARG...]
 
@@ -692,7 +699,8 @@ Options:
 
 Exactly one endpoint must use CONTAINER@BRANCH:PATH. Use '-' for a tar stream.
 --archive preserves ownership and --follow-link follows the source symlink;
-both default to false. Paused and dehydrated branches are supported.`,
+both default to false. Paused, dehydrated, stopped, and exited branches are
+supported.`,
 	"pull": `Usage: ttc pull [--platform OS/ARCH] [-q|--quiet] IMAGE
 
 Alias for 'ttc image pull'. Docker Hub and tag latest are the defaults;
@@ -1443,16 +1451,19 @@ func normalizeIndex(args []string, index int) ([]string, error) {
 	return args, nil
 }
 
+// completionCommands are the commands that shell completion offers: those that
+// 'ttc --help' lists.
+const completionCommands = "run create start stop restart rm exec attach logs cp images image pull load save commit rmi ls ps inspect top stats diff events wait fork migrate pause resume quarantine unquarantine dehydrate rehydrate checkpoint restore port volume node tty rename kill daemon completion"
+
 func writeCompletion(shell string, w io.Writer) error {
 	var script string
 	switch shell {
 	case "bash":
-		script = `complete -W "run create start stop restart rm exec attach logs cp images image pull load save commit ls ps inspect top stats diff events wait fork migrate pause resume dehydrate rehydrate checkpoint restore port volume node tty rename kill daemon" ttc` + "\n"
+		script = `complete -W "` + completionCommands + `" ttc` + "\n"
 	case "zsh":
-		script = `#compdef ttc
-_arguments '1:command:(run create start stop restart rm exec attach logs cp images image pull load save commit ls ps inspect top stats diff events wait fork migrate pause resume dehydrate rehydrate checkpoint restore port volume node tty rename kill daemon)'` + "\n"
+		script = "#compdef ttc\n_arguments '1:command:(" + completionCommands + ")'\n"
 	case "fish":
-		script = `complete -c ttc -f -a "run create start stop restart rm exec attach logs cp images image pull load save commit ls ps inspect top stats diff events wait fork migrate pause resume dehydrate rehydrate checkpoint restore port volume node tty rename kill daemon"` + "\n"
+		script = `complete -c ttc -f -a "` + completionCommands + `"` + "\n"
 	default:
 		return fmt.Errorf("unsupported completion shell %q", shell)
 	}

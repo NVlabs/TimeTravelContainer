@@ -37,5 +37,5 @@ func explainDaemonExecFailure(path string, err error) error {
 	if output, verifyErr := exec.Command("/usr/bin/codesign", "--verify", "--strict", path).CombinedOutput(); verifyErr != nil {
 		detail = "codesign reports: " + strings.Join(strings.Fields(strings.ReplaceAll(strings.TrimSpace(string(output)), "\n", "; ")), " ")
 	}
-	return fmt.Errorf("macOS killed %s as it started, as it does an executable whose code signature it rejects (%s). Reinstall ttc and ttcd with tools/ttc/install_macos.sh, or sign ttcd: codesign --force --sign - --entitlements runsc/hvf.entitlements %s", path, detail, path)
+	return fmt.Errorf("macOS killed %s as it started, as it does an executable whose code signature it rejects (%s). Sign ttcd again with the hvf.entitlements of its release's zip, or runsc/hvf.entitlements of a source tree: codesign --force --sign - --entitlements hvf.entitlements %s", path, detail, path)
 }

@@ -257,7 +257,7 @@ Commands:
   node ls [--json]                 List elastic cluster nodes and memory load
   node rm NODE                    Forget an offline, expired node identity
   node stop [POLICY] NODE         Evacuate a node and stop its daemon
-  node rebalance [--node NODE] NODE Relieve a node's configured memory pressure
+  node rebalance NODE             Relieve a node's configured memory pressure
   checkpoint TARGET FILE          Save one branch as a standalone checkpoint
   restore [--name NAME] FILE      Restore a checkpoint as a new container
   rename CONTAINER@BRANCH NAME    Give a branch another name
