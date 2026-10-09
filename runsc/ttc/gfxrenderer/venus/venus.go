@@ -16,7 +16,6 @@ package venus
 import (
 	"encoding/binary"
 	"fmt"
-	"runtime"
 	"sync"
 
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/venus/vk"
@@ -95,18 +94,9 @@ func Capset() []byte {
 	return buf
 }
 
-// libraryPaths are where the renderer looks for Vulkan: the loader, then
-// MoltenVK itself on macOS.
+// libraryPaths are where the renderer looks for the host's Vulkan loader,
+// where it links no Vulkan (see vk.Linked).
 func libraryPaths() []string {
-	if runtime.GOOS == "darwin" {
-		return []string{
-			"libvulkan.1.dylib",
-			"/opt/homebrew/lib/libvulkan.1.dylib",
-			"/usr/local/lib/libvulkan.1.dylib",
-			"libMoltenVK.dylib",
-			"/opt/homebrew/lib/libMoltenVK.dylib",
-		}
-	}
 	return []string{"libvulkan.so.1", "libvulkan.so"}
 }
 
@@ -116,9 +106,14 @@ var (
 	libraryErr  error
 )
 
-// loadLibrary loads Vulkan, once for the process.
+// loadLibrary loads Vulkan, once for the process: on macOS, MoltenVK, which
+// the renderer links; on Linux, the host's loader.
 func loadLibrary() (*vk.Library, error) {
 	libraryOnce.Do(func() {
+		if linked, ok := vk.Linked(); ok {
+			library = linked
+			return
+		}
 		library, libraryErr = vk.Open(libraryPaths()...)
 		if libraryErr != nil {
 			libraryErr = fmt.Errorf("loading Vulkan: %w", libraryErr)

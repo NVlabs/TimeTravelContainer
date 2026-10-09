@@ -60,6 +60,17 @@ llvm_configure = use_repo_rule("@llvm-raw//utils/bazel:configure.bzl", "llvm_con
 
 llvm_configure(name = "llvm-project")
 
+### MoltenVK
+# Vulkan on Metal, which the GPU renderer links on macOS (tools/moltenvk.BUILD).
+# A new release needs tools/third_party_notices.py run again.
+http_archive(
+    name = "moltenvk",
+    build_file = "//tools:moltenvk.BUILD",
+    sha256 = "f95765a6229cb7b915990a2890ce12ebe36a730b021545d3d52ae69ce4c4024e",
+    strip_prefix = "MoltenVK",
+    urls = ["https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.2/MoltenVK-macos.tar"],
+)
+
 http_archive(
     name = "kythe_release",
     sha256 = "52a9c6e8111237043b8d0b6127637f0eb8d2ba3a776e4749b036e911ec3529ce",

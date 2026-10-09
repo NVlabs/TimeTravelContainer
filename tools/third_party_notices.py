@@ -10,10 +10,12 @@ It reads the modules go.mod requires from the Go module cache (`go mod
 download` fetches any missing), the Go distribution's license from the Go
 toolchain, the MCP server's npm dependencies from sdk/node_modules (run `npm
 ci` in sdk/ first) and the Rust SDK's crates through `cargo metadata` (run
-`cargo fetch` in sdk/rust first).
+`cargo fetch` in sdk/rust first). It fetches from GitHub the license files of
+MoltenVK, which ttcd links on macOS, and of the components that MoltenVK's
+library holds, at the revisions of the release that MODULE.bazel names.
 
-Run it from the repository root whenever go.mod or an SDK's dependencies
-change: python3 tools/third_party_notices.py
+Run it from the repository root whenever go.mod, an SDK's dependencies or
+MoltenVK change: python3 tools/third_party_notices.py
 """
 
 import collections
@@ -22,6 +24,7 @@ import os
 import re
 import subprocess
 import sys
+import urllib.request
 
 OUTPUT = "THIRD_PARTY_NOTICES.md"
 
@@ -73,7 +76,10 @@ def is_notice(name):
 
 
 def component(name, version, directory, kind, declared=None):
-    files = read_license_files(directory)
+    return component_of_files(name, version, read_license_files(directory), directory, kind, declared)
+
+
+def component_of_files(name, version, files, origin, kind, declared=None):
     licenses = []
     for file_name, text in files:
         if not is_notice(file_name):
@@ -81,9 +87,9 @@ def component(name, version, directory, kind, declared=None):
                 if spdx not in licenses:
                     licenses.append(spdx)
     if not any(not is_notice(f) for f, _ in files):
-        sys.exit(f"{name} {version}: no license file in {directory}")
+        sys.exit(f"{name} {version}: no license file in {origin}")
     if not licenses:
-        sys.exit(f"{name} {version}: unrecognized license in {directory}")
+        sys.exit(f"{name} {version}: unrecognized license in {origin}")
     return {
         "name": name,
         "version": version,
@@ -161,6 +167,54 @@ def bazel_patches():
     return patches
 
 
+# The components that MoltenVK's static library holds, besides MoltenVK, as
+# its symbols show, with their licenses where their files leave them unsaid:
+# they are of the revisions in MoltenVK's ExternalRevisions.
+MOLTENVK_HOLDS = [
+    ("SPIRV-Cross", "KhronosGroup/SPIRV-Cross", None),
+    ("SPIRV-Tools", "KhronosGroup/SPIRV-Tools", None),
+    ("SPIRV-Headers", "KhronosGroup/SPIRV-Headers", None),
+    ("Vulkan-Headers", "KhronosGroup/Vulkan-Headers", "Apache-2.0 OR MIT"),
+    ("cereal", "USCiLab/cereal", None),
+]
+
+
+def fetch(url):
+    with urllib.request.urlopen(url, timeout=120) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+
+def github_license_files(repo, ref):
+    """Returns (name, text) for each license or notice file of repo at ref:
+    those at its root, and, where those only point to them, those in
+    LICENSES/."""
+    def files_in(path):
+        entries = json.loads(fetch(f"https://api.github.com/repos/{repo}/contents/{path}?ref={ref}"))
+        return [e["path"] for e in entries if e["type"] == "file"]
+
+    def text(path):
+        return fetch(f"https://raw.githubusercontent.com/{repo}/{ref}/{path}").replace("\r\n", "\n").strip("\n") + "\n"
+
+    files = [(path, text(path)) for path in files_in("") if LICENSE_FILE.match(path)]
+    if not any(classify(t) for p, t in files if not is_notice(p)):
+        files += [(path, text(path)) for path in files_in("LICENSES")]
+    return files
+
+
+def moltenvk_components():
+    with open("MODULE.bazel") as f:
+        module = f.read()
+    tag = re.search(r'name = "moltenvk",.*?/releases/download/([^/"]+)/', module, re.DOTALL).group(1)
+    repo = "KhronosGroup/MoltenVK"
+    components = [component_of_files("MoltenVK", tag.lstrip("v"), github_license_files(repo, tag), repo,
+                                     "linked into ttcd on macOS")]
+    for name, held, declared in MOLTENVK_HOLDS:
+        revision = fetch(f"https://raw.githubusercontent.com/{repo}/{tag}/ExternalRevisions/{name}_repo_revision").split()[0]
+        components.append(component_of_files(name, revision[:12], github_license_files(held, revision), held,
+                                             "in MoltenVK", declared))
+    return components
+
+
 def npm_components():
     with open("sdk/package-lock.json") as f:
         lock = json.load(f)
@@ -224,6 +278,7 @@ def main():
         sys.exit("run from the repository root")
     go = go_components()
     toolchain = go_toolchain_component()
+    moltenvk = moltenvk_components()
     npm = npm_components()
     cargo = cargo_components()
     out = []
@@ -251,6 +306,10 @@ def main():
     out.append("Bazel builds apply these patches to the components they name.\n")
     out.append("\n".join(["| Component | Patch |", "|---|---|"] +
                          [f"| {name} | [{patch}]({patch}) |" for name, patch in bazel_patches()]) + "\n")
+    out.append("### C and C++ components\n")
+    out.append("`ttcd` for macOS links MoltenVK's static library, of its release, which "
+               "holds the other components of this table.\n")
+    out.append(table(["Component", "Version", "License", "Use"], moltenvk))
     out.append("### Go modules\n")
     out.append("Every module `go.mod` requires. `ttc` and `ttcd` link those their packages "
                "import; the others build tests and tools, or only settle versions.\n")
@@ -264,7 +323,7 @@ def main():
     out.append("## License and notice texts\n")
     out.append("Components whose license or notice files differ only in spacing share one copy of the text.\n")
     groups = collections.OrderedDict()
-    for c in [toolchain] + go + npm + cargo:
+    for c in [toolchain] + moltenvk + go + npm + cargo:
         for file_name, text in c["files"]:
             key = " ".join(text.split())
             groups.setdefault(key, (text, file_name, []))[2].append(f"{c['name']} {c['version']} ({file_name})")
@@ -279,7 +338,8 @@ def main():
         out.append(fence(text))
     with open(OUTPUT, "w") as f:
         f.write("\n".join(out))
-    print(f"wrote {OUTPUT}: {len(go)} Go modules, {len(npm) + len(cargo)} SDK dependencies, {len(groups)} texts")
+    print(f"wrote {OUTPUT}: {len(go)} Go modules, {len(moltenvk)} C and C++ components, "
+          f"{len(npm) + len(cargo)} SDK dependencies, {len(groups)} texts")
 
 
 if __name__ == "__main__":

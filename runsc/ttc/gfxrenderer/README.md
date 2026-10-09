@@ -39,8 +39,10 @@ branch's GPU contexts for it, sharing their compiled objects, so that no
 shader is compiled again and nothing is serialized. A snapshot is a
 reference to the clone, which the children restore.
 
-The renderer loads the Vulkan loader with `dlopen`: on macOS, Homebrew's
-`vulkan-loader` and `molten-vk`; on Linux, the host's loader and driver.
+On macOS the renderer links MoltenVK, of its release (MODULE.bazel), so
+that ttcd loads no library but Apple's, as a signature of a developer's
+certificate requires; it calls MoltenVK without the Vulkan loader. On Linux
+it loads the host's loader with `dlopen`, which loads the host's driver.
 
 Guests map host-visible memory, which is the renderer's shared memory. On
 macOS the renderer imports it into Vulkan as `MTLBuffer`s
@@ -54,11 +56,9 @@ llvmpipe, where the host has a GPU.
 
 A renderer decodes guests' command streams, so it confines itself before it
 loads Vulkan or reads anything from its Sentry (`Confine`). On macOS it
-applies `seatbelt.RendererProfile`: reading only Apple's system files, the
-package prefixes `/opt/homebrew` and `/usr/local`, and its own files; the
-GPU's IOKit user clients; and POSIX shared memory of its own names. It
-cannot write files, use the network, or start processes. So the Vulkan
-loader and MoltenVK must be installed under a package prefix.
+applies `seatbelt.RendererProfile`: reading only Apple's system files and
+its own files; the GPU's IOKit user clients; and POSIX shared memory of its
+own names. It cannot write files, use the network, or start processes.
 `--unconfined` skips this, as ttcd with `--unsafe-no-host-isolation` does.
 
 macOS lets no process change its sandbox profile, and ttcd's bars the GPU,

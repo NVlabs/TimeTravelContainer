@@ -6,7 +6,6 @@ package gfxrenderer
 import (
 	"os"
 	"path/filepath"
-	"strings"
 
 	"gvisor.dev/gvisor/runsc/ttc/seatbelt"
 )
@@ -20,24 +19,16 @@ import (
 // the GPU. Such a daemon starts renderers through a launcher that it started
 // before it confined itself (see ServeLauncher).
 func Confine() error {
+	// The renderer reads its executable, by the path it ran and the path
+	// that resolves.
 	var readable []string
-	add := func(path string) {
-		if !strings.Contains(path, "/") {
-			// A bare library name is the dynamic linker's to find, in
-			// directories that the profile admits or not.
-			return
-		}
-		path, err := filepath.Abs(path)
-		if err != nil {
-			return
-		}
-		readable = append(readable, path)
-		if resolved, err := filepath.EvalSymlinks(path); err == nil && resolved != path {
-			readable = append(readable, resolved)
-		}
-	}
 	if exe, err := os.Executable(); err == nil {
-		add(exe)
+		if exe, err := filepath.Abs(exe); err == nil {
+			readable = append(readable, exe)
+			if resolved, err := filepath.EvalSymlinks(exe); err == nil && resolved != exe {
+				readable = append(readable, resolved)
+			}
+		}
 	}
 	profile, err := seatbelt.RendererProfile(readable)
 	if err != nil {

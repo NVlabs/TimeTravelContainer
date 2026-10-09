@@ -44,10 +44,10 @@ const DaemonProfile = `(version 1)
 // renderer, confines itself to before it reads anything from its Sentry. It
 // decodes guests' command streams, so it gets only what rendering takes:
 //
-//   - reading Apple's system files; the package prefixes where Homebrew
-//     installs the Vulkan loader and MoltenVK, /opt/homebrew and /usr/local;
-//     and readable, the renderer's files, and the metadata of the
-//     directories above them, which resolving their paths reads;
+//   - reading Apple's system files, and readable, the renderer's files, and
+//     the metadata of the directories above them, which resolving their
+//     paths reads: the renderer links MoltenVK, and loads no library but
+//     Apple's;
 //   - the GPU's IOKit user clients, and IOSurface's;
 //   - POSIX shared memory of the names that the renderer gives it,
 //     "/ttcgfx.", random and unlinked at once.
@@ -66,9 +66,7 @@ func RendererProfile(readable []string) (string, error) {
 (allow file-read*
     (subpath "/System")
     (subpath "/usr/lib")
-    (subpath "/usr/share")
-    (subpath "/opt/homebrew")
-    (subpath "/usr/local")`)
+    (subpath "/usr/share")`)
 	ancestors := make(map[string]bool)
 	for _, path := range readable {
 		if strings.IndexFunc(path, unicode.IsControl) >= 0 {

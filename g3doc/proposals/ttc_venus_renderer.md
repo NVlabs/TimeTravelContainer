@@ -63,8 +63,10 @@ command submission, transfers, and fences per ring.
     index; a fence on ring 0 signals once the commands before it are
     executed, and on another ring once its queue has finished the work
     submitted before it.
-*   **Vulkan:** the renderer loads the Vulkan loader and MoltenVK at run
-    time; generated C trampolines call through per-device dispatch tables.
+*   **Vulkan:** on macOS the renderer links MoltenVK, which it calls
+    without the Vulkan loader, so that ttcd loads no library but Apple's;
+    on Linux it loads the host's loader at run time. Generated C
+    trampolines call through per-device dispatch tables.
 
 ## Renderers per family
 

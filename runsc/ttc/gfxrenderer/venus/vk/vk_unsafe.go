@@ -70,11 +70,22 @@ import (
 // Handle is a Vulkan handle, dispatchable or not.
 type Handle uint64
 
-// Library is a loaded Vulkan loader, or driver.
+// Library is a Vulkan loader, or driver, that the renderer loaded or links.
 type Library struct {
+	// handle is the loaded library's, or nil for the linked one.
 	handle unsafe.Pointer
 	gipa   C.PFN_vkGetInstanceProcAddr
 	global *C.struct_vn_global_proc_table
+}
+
+func newLibrary(handle unsafe.Pointer, gipa C.PFN_vkGetInstanceProcAddr) *Library {
+	l := &Library{
+		handle: handle,
+		gipa:   gipa,
+		global: (*C.struct_vn_global_proc_table)(C.calloc(1, C.sizeof_struct_vn_global_proc_table)),
+	}
+	C.vk_init_global(gipa, l.global)
+	return l
 }
 
 // Open loads the first of paths that loads.
@@ -94,13 +105,7 @@ func Open(paths ...string) (*Library, error) {
 			errs = append(errs, fmt.Errorf("%s has no vkGetInstanceProcAddr", path))
 			continue
 		}
-		l := &Library{
-			handle: h,
-			gipa:   gipa,
-			global: (*C.struct_vn_global_proc_table)(C.calloc(1, C.sizeof_struct_vn_global_proc_table)),
-		}
-		C.vk_init_global(gipa, l.global)
-		return l, nil
+		return newLibrary(h, gipa), nil
 	}
 	return nil, errors.Join(errs...)
 }
@@ -108,7 +113,9 @@ func Open(paths ...string) (*Library, error) {
 // Close unloads the library, whose tables must be no longer used.
 func (l *Library) Close() {
 	C.free(unsafe.Pointer(l.global))
-	C.dlclose(l.handle)
+	if l.handle != nil {
+		C.dlclose(l.handle)
+	}
 }
 
 // Table is a procedure table, of the commands of one level: global, or of an
