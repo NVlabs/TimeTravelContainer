@@ -349,8 +349,8 @@ nodes in TTC_ROOT, the cluster's shared root.`,
 			"port ls":           "Usage: ttc port ls [--json] CONTAINER@BRANCH",
 			"port unpublish":    "Usage: ttc port unpublish TARGET [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]",
 			"volume create":     "Usage: ttc volume create NAME",
-			"volume ls":         "Usage: ttc volume ls",
-			"volume list":       "Usage: ttc volume ls",
+			"volume ls":         "Usage: ttc volume ls [--json]",
+			"volume list":       "Usage: ttc volume ls [--json]",
 			"volume inspect":    "Usage: ttc volume inspect NAME [NAME...]",
 			"volume rm":         "Usage: ttc volume rm [--force] NAME [NAME...]",
 			"volume remove":     "Usage: ttc volume rm [--force] NAME [NAME...]",
@@ -6313,11 +6313,14 @@ func runVolume(args []string, stdout io.Writer, b backend) error {
 		fmt.Fprintln(stdout, info.Name)
 		return nil
 	case "ls", "list":
-		local := len(args) == 2 && args[1] == "--_local"
-		if len(args) != 1 && !local {
-			return errors.New("usage: ttc volume ls")
+		fs := flag.NewFlagSet("volume ls", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		asJSON := fs.Bool("json", false, "print the volumes as a JSON array")
+		local := fs.Bool("_local", false, "list only the addressed daemon's volumes, as JSON")
+		if err := fs.Parse(args[1:]); err != nil || fs.NArg() != 0 {
+			return errors.New("usage: ttc volume ls [--json]")
 		}
-		if !local {
+		if !*local {
 			if clustered, ok := volumes.(clusterVolumeBackend); ok {
 				list, inCluster, err := clustered.clusterVolumes()
 				if err != nil {
@@ -6327,6 +6330,9 @@ func runVolume(args []string, stdout io.Writer, b backend) error {
 					sort.Slice(list, func(i, j int) bool {
 						return list[i].Name < list[j].Name || list[i].Name == list[j].Name && list[i].Node < list[j].Node
 					})
+					if *asJSON {
+						return json.NewEncoder(stdout).Encode(list)
+					}
 					tw := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
 					fmt.Fprintln(tw, "DRIVER\tVOLUME NAME\tNODE")
 					for _, volume := range list {
@@ -6345,7 +6351,7 @@ func runVolume(args []string, stdout io.Writer, b backend) error {
 			return err
 		}
 		sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
-		if local {
+		if *local || *asJSON {
 			listing := make([]clusterVolume, 0, len(list))
 			for _, info := range list {
 				listing = append(listing, clusterVolume{Name: info.Name, Driver: driver})

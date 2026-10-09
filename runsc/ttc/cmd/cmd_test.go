@@ -1610,6 +1610,44 @@ func TestRemoveAcceptsFamiliesAndQualifiedBranches(t *testing.T) {
 }
 
 // missingTargetsBackend is a fakeBackend without the containers in missing.
+type volumesBackend struct {
+	*fakeBackend
+	volumes []ttcvolume.VolumeInfo
+}
+
+func (b *volumesBackend) createVolume(name string) (ttcvolume.VolumeInfo, error) {
+	return ttcvolume.VolumeInfo{}, errors.New("not supported")
+}
+
+func (b *volumesBackend) listVolumes() ([]ttcvolume.VolumeInfo, error) {
+	return b.volumes, nil
+}
+
+func (b *volumesBackend) removeVolume(string, bool) error { return errors.New("not supported") }
+
+func (b *volumesBackend) volumeDriver() (string, error) { return "ttcvol", nil }
+
+func TestVolumeListJSON(t *testing.T) {
+	b := &volumesBackend{fakeBackend: &fakeBackend{}, volumes: []ttcvolume.VolumeInfo{{Name: "web"}, {Name: "db"}}}
+	var out bytes.Buffer
+	if err := runVolume([]string{"ls", "--json"}, &out, b); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := out.String(), `[{"name":"db","driver":"ttcvol"},{"name":"web","driver":"ttcvol"}]`+"\n"; got != want {
+		t.Errorf("volume ls --json = %q, want %q", got, want)
+	}
+	out.Reset()
+	if err := runVolume([]string{"ls"}, &out, b); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := out.String(), "DRIVER  VOLUME NAME\nttcvol  db\nttcvol  web\n"; got != want {
+		t.Errorf("volume ls = %q, want %q", got, want)
+	}
+	if err := runVolume([]string{"ls", "extra"}, &out, b); err == nil {
+		t.Error("volume ls accepted an argument")
+	}
+}
+
 type missingTargetsBackend struct {
 	*fakeBackend
 	missing  map[string]bool

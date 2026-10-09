@@ -269,7 +269,7 @@ func TestCommandRefusedAsRoutedStaleGoesAgain(t *testing.T) {
 		serverErr <- nil
 	}()
 	var stdout, stderr bytes.Buffer
-	status, err := runCommand(socket, []string{"stop", "web@b"}, strings.NewReader(""), &stdout, &stderr, nil)
+	status, err := runCommand(socket, []string{"stop", "web@b"}, strings.NewReader(""), &stdout, &stderr, nil, "")
 	if err != nil || status != 0 || stdout.String() != "web@b\n" || stderr.Len() != 0 {
 		t.Fatalf("a stop refused once as routed stale: status %d, %v, stdout %q, stderr %q", status, err, stdout.String(), stderr.String())
 	}
@@ -279,6 +279,74 @@ func TestCommandRefusedAsRoutedStaleGoesAgain(t *testing.T) {
 	first, second := <-requests, <-requests
 	if first.RequestID == "" || first.RequestID != second.RequestID {
 		t.Fatalf("the stop went again as request %q, first sent as %q", second.RequestID, first.RequestID)
+	}
+}
+
+// A caller names a mutating command by its request ID, so that ttcd runs it
+// once however often the caller sends it.
+func TestRequestIDNamesTheCommand(t *testing.T) {
+	const id = "0123456789abcdef0123456789abcdef"
+	socket := filepath.Join(shortSocketDir(t), "ttcd.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	requests := make(chan request, 1)
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+		header, err := bufio.NewReader(conn).ReadBytes('\n')
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		var req request
+		if err := json.Unmarshal(header, &req); err != nil {
+			serverErr <- err
+			return
+		}
+		requests <- req
+		var writeMu sync.Mutex
+		serverErr <- writeFrame(conn, &writeMu, daemonFrameStatus, []byte{0, 0, 0, 0})
+	}()
+	var stderr bytes.Buffer
+	if status := Run([]string{"--daemon-socket", socket, "--request-id", id, "fork", "web@main", "child"}, strings.NewReader(""), io.Discard, &stderr); status != 0 {
+		t.Fatalf("fork with a request ID: status %d, %s", status, stderr.String())
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+	if req := <-requests; req.RequestID != id {
+		t.Fatalf("the fork went as request %q, want %q", req.RequestID, id)
+	}
+
+	for _, args := range [][]string{
+		{"--request-id", "not-hex", "fork", "web@main", "child"},
+		{"--request-id", "0123", "fork", "web@main", "child"},
+		{"--request-id"},
+	} {
+		stderr.Reset()
+		if status := Run(args, strings.NewReader(""), io.Discard, &stderr); status != 2 || !strings.Contains(stderr.String(), "32 hexadecimal digits") {
+			t.Errorf("Run(%q): status %d, %q", args, status, stderr.String())
+		}
+	}
+	// ttcd keeps no record of a query, or of a command that consumes
+	// standard input, to answer it again from.
+	for _, args := range [][]string{
+		{"--daemon-socket", socket, "--request-id", id, "ls"},
+		{"--daemon-socket", socket, "--request-id", id, "cp", "-", "web@main:/tmp"},
+		{"--daemon-socket", socket, "--request-id", id, "daemon", "status"},
+	} {
+		stderr.Reset()
+		if status := Run(args, strings.NewReader(""), io.Discard, &stderr); status != 2 || !strings.Contains(stderr.String(), "--request-id") {
+			t.Errorf("Run(%q): status %d, %q", args, status, stderr.String())
+		}
 	}
 }
 
@@ -331,7 +399,7 @@ func TestDetachedTTYRequestKeepsTerminalControlStreamOpen(t *testing.T) {
 		var writeMu sync.Mutex
 		serverErr <- writeFrame(conn, &writeMu, daemonFrameStatus, status[:])
 	}()
-	status, err := runCommand(socket, []string{"exec", "-td", "--session", "build", "demo@main", "sh"}, strings.NewReader(""), io.Discard, io.Discard, nil)
+	status, err := runCommand(socket, []string{"exec", "-td", "--session", "build", "demo@main", "sh"}, strings.NewReader(""), io.Discard, io.Discard, nil, "")
 	if err != nil || status != 0 {
 		t.Fatalf("runCommand status=%d err=%v", status, err)
 	}

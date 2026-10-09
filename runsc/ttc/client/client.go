@@ -54,6 +54,8 @@ const (
 
 type options struct {
 	socket string
+	// requestID names a mutating command, so that ttcd runs it at most once.
+	requestID string
 }
 
 type request struct {
@@ -120,6 +122,10 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if args[0] == "daemon" {
+		if opts.requestID != "" {
+			fmt.Fprintln(stderr, "ttc: --request-id does not apply to daemon commands")
+			return 2
+		}
 		return runDaemon(opts, args[1:], stdout, stderr)
 	}
 	args, stdin, stdout, archive, closeArchive, err := prepareImageArchiveIO(args, stdin, stdout)
@@ -144,7 +150,13 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ttc: %v\n", err)
 		return 2
 	}
-	status, err := runCommand(opts.socket, args, stdin, stdout, stderr, archive)
+	if opts.requestID != "" && (!commandCanRetry(args) || commandUsesStdin(args) && archive == nil) {
+		_ = closeCheckpoint()
+		_ = closeArchive()
+		fmt.Fprintf(stderr, "ttc: --request-id applies to a command that ttcd can answer again from its record, not to %q\n", args[0])
+		return 2
+	}
+	status, err := runCommand(opts.socket, args, stdin, stdout, stderr, archive, opts.requestID)
 	closeErr := errors.Join(closeCheckpoint(), closeArchive())
 	if err != nil {
 		fmt.Fprintf(stderr, "ttc: daemon transport: %v\n", err)
@@ -300,6 +312,17 @@ func parseGlobal(args []string, stdout io.Writer) (options, []string, bool, erro
 			if opts.socket == "" {
 				return opts, nil, false, errors.New("--daemon-socket requires a path")
 			}
+		case arg == "--request-id" || strings.HasPrefix(arg, "--request-id="):
+			if value, ok := strings.CutPrefix(arg, "--request-id="); ok {
+				opts.requestID, args = value, args[1:]
+			} else if len(args) >= 2 {
+				opts.requestID, args = args[1], args[2:]
+			} else {
+				args = args[1:]
+			}
+			if id, err := hex.DecodeString(opts.requestID); err != nil || len(id) != 16 {
+				return opts, nil, false, errors.New("--request-id requires 32 hexadecimal digits")
+			}
 		case strings.HasPrefix(arg, "-"):
 			return opts, nil, false, fmt.Errorf("unknown global option %q", arg)
 		default:
@@ -324,7 +347,7 @@ func knownCommand(command string) bool {
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprint(w, `Usage: ttc [--daemon-socket PATH] COMMAND
+	fmt.Fprint(w, `Usage: ttc [--daemon-socket PATH] [--request-id ID] COMMAND
 
 Manage TimeTravelContainer container families and live branches.
 
@@ -349,6 +372,9 @@ and 2m. Defaults are stated in command-specific help.
 Global options:
   --daemon-socket PATH   Unix socket of the daemon to use (default: ttcd.sock
                          in TTC_LOCAL_ROOT if set, and otherwise in TTC_ROOT)
+  --request-id ID        Name a mutating command, by 32 hexadecimal digits:
+                         ttcd runs a command of an ID once, and answers it
+                         again with its first result (default: a new ID)
 
 Run 'ttc COMMAND --help' for command usage. ttcd requires TTC_ROOT; clustered
 compute daemons additionally require TTC_LOCAL_ROOT.
@@ -565,7 +591,7 @@ Commands:
   inspect NAME...      Inspect volumes
   rm [-f] NAME...      Remove volumes (alias: remove)`,
 	"volume create":  "Usage: ttc volume create NAME\n\nCreate an empty TTC-managed persistent volume.",
-	"volume ls":      "Usage: ttc volume ls\n\nList all managed volumes (alias: volume list).",
+	"volume ls":      "Usage: ttc volume ls [--json]\n\nList all managed volumes (alias: volume list); --json prints them as a JSON\narray of their names, drivers, and in a cluster nodes.",
 	"volume list":    "Usage: ttc volume list",
 	"volume inspect": "Usage: ttc volume inspect NAME [NAME...]",
 	"volume rm":      "Usage: ttc volume rm [-f|--force] NAME [NAME...]\n\n--force removes referenced volumes and defaults to false.",
@@ -825,17 +851,22 @@ func printHelpTopic(topic []string, stdout io.Writer) {
 }
 
 // runCommand runs a command on the daemon at socket, passing it archive, a
-// checkpoint's or a restore's, or an image load's or save's, if not nil.
-func runCommand(socket string, args []string, stdin io.Reader, stdout, stderr io.Writer, archive *os.File) (int, error) {
+// checkpoint's or a restore's, or an image load's or save's, if not nil. A
+// command that ttcd can answer again from its record goes under requestID, or
+// a new one if empty, which a lost answer retries.
+func runCommand(socket string, args []string, stdin io.Reader, stdout, stderr io.Writer, archive *os.File, requestID string) (int, error) {
 	terminal, width := terminalWriterInfo(stderr)
 	req := request{Version: daemonAPIVersion, ClientBuildID: version.Version(), Action: "command", Args: args,
 		Stdin: commandUsesStdin(args) && archive == nil, ArchiveFile: archive != nil, TerminalControl: protocol.CommandUsesTerminalControl(args), ClientTERM: os.Getenv("TERM"), StderrTerminal: terminal, StderrWidth: width}
 	if commandCanRetry(args) && !req.Stdin {
-		id, err := newRequestID()
-		if err != nil {
-			return 1, err
+		req.RequestID = requestID
+		if req.RequestID == "" {
+			id, err := newRequestID()
+			if err != nil {
+				return 1, err
+			}
+			req.RequestID = id
 		}
-		req.RequestID = id
 	}
 	attempts := 1
 	if req.RequestID != "" {
