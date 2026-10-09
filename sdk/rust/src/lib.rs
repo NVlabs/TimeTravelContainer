@@ -15,7 +15,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::Duration;
 
-pub const API_VERSION: u32 = 9;
+/// The version of ttcd's API, which must equal the daemon's
+/// (`DaemonAPIVersion` in runsc/ttc/protocol/protocol.go): ttcd refuses any
+/// other.
+pub const API_VERSION: u32 = 10;
 const MAX_FRAME: usize = 1 << 20;
 const STDIN_WINDOW: usize = 1 << 20;
 
@@ -172,6 +175,8 @@ struct StreamState {
     settled: bool,
     eof_requested: bool,
     eof_sent: bool,
+    /// Whether a terminal size has been sent: see `answer_terminal`.
+    size_sent: bool,
 }
 
 #[derive(Debug)]
@@ -280,6 +285,7 @@ impl TtcStream {
         }
         let write_result = {
             let mut writer = self.shared.writer.lock().unwrap();
+            self.shared.state.lock().unwrap().size_sent = true;
             write_frame(&mut writer, b'W', &payload)
         };
         if let Err(error) = write_result {
@@ -330,6 +336,79 @@ fn ensure_stream_active(state: &StreamState) -> Result<(), Error> {
         Err(Error::Protocol("TTC stream is already settled".to_owned()))
     } else {
         Ok(())
+    }
+}
+
+/// ttcd asks the client of a terminal command for its terminal's size, and
+/// waits for it: a stream given none, and not resized since, has no terminal,
+/// which the CLI answers so too when its own is none.
+fn answer_terminal(shared: &StreamShared) -> Result<(), Error> {
+    let mut writer = shared.writer.lock().unwrap();
+    {
+        let mut state = shared.state.lock().unwrap();
+        if state.size_sent {
+            return Ok(());
+        }
+        state.size_sent = true;
+    }
+    write_frame(&mut writer, b'W', &[0; 8])
+}
+
+/// The values of a boolean flag that Go's strconv.ParseBool accepts.
+const TRUE_VALUES: [&str; 6] = ["1", "t", "T", "TRUE", "true", "True"];
+const FALSE_VALUES: [&str; 6] = ["0", "f", "F", "FALSE", "false", "False"];
+
+fn bool_flag(args: &[String], short: char, long: &str) -> bool {
+    let mut value = false;
+    for arg in args {
+        if arg == "--" {
+            break;
+        }
+        if arg == long {
+            value = true;
+        } else if let Some(parsed) = arg
+            .strip_prefix(long)
+            .and_then(|rest| rest.strip_prefix('='))
+        {
+            if TRUE_VALUES.contains(&parsed) {
+                value = true;
+            } else if FALSE_VALUES.contains(&parsed) {
+                value = false;
+            }
+        } else if arg.len() > 1
+            && arg.starts_with('-')
+            && !arg.starts_with("--")
+            && arg[1..].contains(short)
+        {
+            value = true;
+        }
+    }
+    value
+}
+
+/// Reports whether a command can ask its client for a terminal, as the CLI
+/// decides (`protocol.CommandUsesTerminalControl`): a daemon of a cluster
+/// relays the terminal frames of such a command to the node that runs it.
+pub fn uses_terminal_control(args: &[String]) -> bool {
+    let args = match args.first() {
+        Some(first) if first == "container" => &args[1..],
+        _ => args,
+    };
+    match args.first().map(String::as_str) {
+        Some("attach") => true,
+        Some("start") => bool_flag(&args[1..], 'a', "--attach"),
+        Some(command @ ("run" | "exec")) => {
+            if command == "exec"
+                && matches!(
+                    args.get(1).map(String::as_str),
+                    Some("ls" | "wait" | "kill")
+                )
+            {
+                return false;
+            }
+            bool_flag(&args[1..], 't', "--tty")
+        }
+        _ => false,
     }
 }
 
@@ -431,13 +510,17 @@ impl Client {
             None => random_request_id()?,
         };
         let has_input = options.input.is_some();
-        let request = json!({
+        let terminal_control = uses_terminal_control(&args);
+        let mut request = json!({
             "version": API_VERSION,
             "action": "command",
             "request_id": request_id,
             "args": args,
             "stdin": has_input,
         });
+        if terminal_control {
+            request["terminal_control"] = Value::Bool(true);
+        }
         self.exchange(request, options.input.as_deref(), options.timeout)
     }
 
@@ -520,7 +603,7 @@ impl Client {
     }
 
     pub fn exec_sessions(&self, target: &str) -> Result<serde_json::Value, Error> {
-        Ok(self.command(["exec", "ls", "--json", target])?.json()?)
+        checked_json(self.command(["exec", "ls", "--json", target])?)
     }
 
     pub fn exec_logs(&self, target: &str, session: &str) -> Result<CommandResult, Error> {
@@ -536,9 +619,7 @@ impl Client {
     }
 
     pub fn tty_stat(&self, target: &str, session: &str) -> Result<serde_json::Value, Error> {
-        Ok(self
-            .command(["tty", "stat", target, "--session", session, "--json"])?
-            .json()?)
+        checked_json(self.command(["tty", "stat", target, "--session", session, "--json"])?)
     }
 
     pub fn commit(
@@ -615,11 +696,11 @@ impl Client {
     }
 
     pub fn stats(&self, target: &str) -> Result<serde_json::Value, Error> {
-        Ok(self.command(["stats", "--json", target])?.json()?)
+        checked_json(self.command(["stats", "--json", target])?)
     }
 
     pub fn diff(&self, target: &str) -> Result<serde_json::Value, Error> {
-        Ok(self.command(["diff", "--json", target])?.json()?)
+        checked_json(self.command(["diff", "--json", target])?)
     }
 
     pub fn copy(&self, source: &str, destination: &str) -> Result<CommandResult, Error> {
@@ -693,17 +774,10 @@ impl Client {
         self.command(args)
     }
 
-    pub fn rebalance_node(
-        &self,
-        node: &str,
-        destination_node: Option<&str>,
-    ) -> Result<serde_json::Value, Error> {
-        let mut args = vec!["node".to_owned(), "rebalance".to_owned()];
-        if let Some(destination_node) = destination_node {
-            args.extend(["--node".to_owned(), destination_node.to_owned()]);
-        }
-        args.push(node.to_owned());
-        checked_json(self.command(args)?)
+    /// Moves a pressure-relieving subset of `node`'s branches to nodes that the
+    /// cluster's scheduler chooses, and returns the plan.
+    pub fn rebalance_node(&self, node: &str) -> Result<serde_json::Value, Error> {
+        checked_json(self.command(["node", "rebalance", node])?)
     }
 
     pub fn pause(&self, target: &str) -> Result<CommandResult, Error> {
@@ -848,13 +922,17 @@ impl Client {
             None => random_request_id()?,
         };
         let stream_args = args.clone();
-        let request = json!({
+        let terminal_control = uses_terminal_control(&args);
+        let mut request = json!({
             "version": API_VERSION,
             "action": "command",
             "request_id": request_id,
             "args": args,
             "stdin": options.stdin,
         });
+        if terminal_control {
+            request["terminal_control"] = Value::Bool(true);
+        }
         let mut writer = UnixStream::connect(&self.socket_path)?;
         writer.set_read_timeout(options.timeout)?;
         writer.set_write_timeout(options.timeout)?;
@@ -869,7 +947,10 @@ impl Client {
         let reader = writer.try_clone()?;
         let shutdown = writer.try_clone()?;
         let shared = Arc::new(StreamShared {
-            state: Mutex::new(StreamState::default()),
+            state: Mutex::new(StreamState {
+                size_sent: options.size.is_some(),
+                ..StreamState::default()
+            }),
             changed: Condvar::new(),
             input: Mutex::new(()),
             writer: Mutex::new(writer),
@@ -990,6 +1071,7 @@ impl Client {
         let mut input_offset = 0usize;
         let mut unacknowledged = 0usize;
         let mut eof_sent = input.is_none();
+        let mut size_sent = false;
 
         loop {
             if let Some(input) = input {
@@ -1028,7 +1110,16 @@ impl Client {
                     }
                     unacknowledged -= acknowledged;
                 }
-                b'T' => {}
+                b'T' => {
+                    // ttcd asks the client of a terminal command, such as a
+                    // detached exec --tty, for its terminal's size, and waits
+                    // for it: this client has none, which the CLI answers so
+                    // too when its own is none.
+                    if !size_sent {
+                        write_frame(&mut stream, b'W', &[0; 8])?;
+                        size_sent = true;
+                    }
+                }
                 b'X' => {
                     if payload.len() != 4 {
                         return Err(Error::Protocol("invalid status frame".to_owned()));
@@ -1103,6 +1194,12 @@ fn stream_read_loop(
             b'O' | b'E' | b'S' | b'T' => {
                 if shared.state.lock().unwrap().settled {
                     return;
+                }
+                if kind == b'T' {
+                    if let Err(error) = answer_terminal(&shared) {
+                        settle_stream(&shared, &sender, Err(error));
+                        return;
+                    }
                 }
                 let event = match kind {
                     b'O' => StreamEvent::Stdout(payload),
@@ -1241,12 +1338,115 @@ mod tests {
         let path = temporary_socket("ping");
         let server = mock_server(&path, |mut stream, request| {
             assert_eq!(request, json!({"version": API_VERSION, "action": "ping"}));
-            write_frame(&mut stream, b'O', br#"{"version":9}"#).unwrap();
+            write_frame(
+                &mut stream,
+                b'O',
+                format!(r#"{{"version":{API_VERSION}}}"#).as_bytes(),
+            )
+            .unwrap();
             write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
         });
         assert_eq!(
             Client::new(path.parent().unwrap()).ping().unwrap()["version"],
             API_VERSION
+        );
+        server.join().unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn api_version_is_the_daemons() {
+        // ttcd refuses any other: runsc/ttc/protocol/protocol.go.
+        let protocol =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runsc/ttc/protocol/protocol.go");
+        let Ok(source) = fs::read_to_string(protocol) else {
+            return;
+        };
+        assert!(source.contains(&format!("const DaemonAPIVersion = {API_VERSION}\n")));
+    }
+
+    #[test]
+    fn tty_session_answers_the_terminal_request() {
+        let path = temporary_socket("tty-session");
+        let server = mock_server(&path, |mut stream, request| {
+            assert_eq!(
+                request["args"],
+                json!([
+                    "exec",
+                    "--session",
+                    "repl",
+                    "--detach",
+                    "--tty",
+                    "demo@main",
+                    "sh"
+                ])
+            );
+            assert_eq!(request["terminal_control"], json!(true));
+            // ttcd asks for the terminal's size, and waits for it.
+            write_frame(&mut stream, b'T', &[0]).unwrap();
+            let (kind, payload) = read_frame(&mut stream).unwrap();
+            assert_eq!((kind, payload.as_slice()), (b'W', [0u8; 8].as_slice()));
+            write_frame(&mut stream, b'T', &[1]).unwrap();
+            write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
+        });
+        let result = Client::new(path.parent().unwrap())
+            .exec_session("demo@main", &["sh"], "repl", true, false)
+            .unwrap();
+        assert!(result.ok());
+        server.join().unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn stream_without_a_size_answers_the_terminal_request() {
+        let path = temporary_socket("stream-terminal");
+        let server = mock_server(&path, |mut stream, request| {
+            assert_eq!(request["terminal_control"], json!(true));
+            write_frame(&mut stream, b'T', &[0]).unwrap();
+            let (kind, payload) = read_frame(&mut stream).unwrap();
+            assert_eq!((kind, payload.as_slice()), (b'W', [0u8; 8].as_slice()));
+            write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
+        });
+        let stream = Client::new(path.parent().unwrap())
+            .stream(["exec", "-t", "demo@main", "sh"], StreamOptions::default())
+            .unwrap();
+        assert_eq!(stream.recv().unwrap(), StreamEvent::Terminal(vec![0]));
+        assert_eq!(stream.wait().unwrap(), 0);
+        server.join().unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn terminal_control_follows_the_cli() {
+        for (args, want) in [
+            (vec!["attach", "demo@main"], true),
+            (vec!["start", "-a", "demo@main"], true),
+            (vec!["start", "demo@main"], false),
+            (vec!["run", "-dit", "ubuntu"], true),
+            (vec!["exec", "--tty=false", "demo@main", "sh"], false),
+            (vec!["exec", "demo@main", "--", "ls", "-t"], false),
+            (vec!["exec", "ls", "demo@main"], false),
+            (vec!["container", "exec", "-t", "demo@main", "sh"], true),
+            (vec!["ps"], false),
+        ] {
+            let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+            assert_eq!(uses_terminal_control(&args), want, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn rebalance_lets_the_scheduler_choose() {
+        let path = temporary_socket("rebalance");
+        let server = mock_server(&path, |mut stream, request| {
+            assert_eq!(request["args"], json!(["node", "rebalance", "node-a"]));
+            write_frame(&mut stream, b'O', br#"{"moves":[]}"#).unwrap();
+            write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
+        });
+        assert_eq!(
+            Client::new(path.parent().unwrap())
+                .rebalance_node("node-a")
+                .unwrap(),
+            json!({"moves": []})
         );
         server.join().unwrap();
         fs::remove_dir_all(path.parent().unwrap()).unwrap();

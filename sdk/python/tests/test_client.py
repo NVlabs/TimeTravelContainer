@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 
 from ttcx import Client, CommandFailed, StreamCancelled, TTCError
-from ttcx.client import API_VERSION, socket_path
+from ttcx.client import API_VERSION, socket_path, uses_terminal_control
 
 
 def frame(kind: bytes, payload: bytes = b"") -> bytes:
@@ -61,7 +61,7 @@ class ClientTest(unittest.TestCase):
     def test_ping_uses_direct_protocol(self):
         def handler(conn, request):
             self.assertEqual(request, {"version": API_VERSION, "action": "ping"})
-            conn.sendall(frame(b"O", b'{"version":9,"isolation_mode":"rootless"}\n'))
+            conn.sendall(frame(b"O", b'{"version":%d,"isolation_mode":"rootless"}\n' % API_VERSION))
             conn.sendall(frame(b"X", struct.pack(">I", 0)))
 
         with __import__("tempfile").TemporaryDirectory() as directory:
@@ -103,6 +103,68 @@ class ClientTest(unittest.TestCase):
                     result.check()
             finally:
                 daemon.close()
+
+    def test_api_version_is_the_daemons(self):
+        # ttcd refuses any other: runsc/ttc/protocol/protocol.go.
+        protocol = Path(__file__).resolve().parents[3] / "runsc/ttc/protocol/protocol.go"
+        if not protocol.exists():
+            self.skipTest("not in a TTC checkout")
+        self.assertIn(f"const DaemonAPIVersion = {API_VERSION}\n", protocol.read_text())
+
+    def test_exec_input_is_interactive(self):
+        def handler(conn, request):
+            self.assertEqual(request["args"], ["exec", "--interactive", "demo@main", "cat"])
+            self.assertIs(request["stdin"], True)
+            while read_exact(conn, 1) != b"C":
+                data = read_exact(conn, struct.unpack(">I", read_exact(conn, 4))[0])
+                conn.sendall(frame(b"A", struct.pack(">I", len(data))))
+            read_exact(conn, 4)
+            conn.sendall(frame(b"X", struct.pack(">I", 0)))
+
+        with __import__("tempfile").TemporaryDirectory() as directory:
+            daemon = MockDaemon(Path(directory) / "ttcd.sock", handler)
+            try:
+                self.assertTrue(Client(directory).exec("demo@main", ["cat"], input="hi").ok)
+            finally:
+                daemon.close()
+
+    def test_tty_session_answers_the_terminal_request(self):
+        def handler(conn, request):
+            self.assertEqual(
+                request["args"],
+                ["exec", "--session", "repl", "--detach", "--tty", "demo@main", "sh"],
+            )
+            self.assertIs(request["terminal_control"], True)
+            # ttcd asks for the terminal's size, and waits for it.
+            conn.sendall(frame(b"T", b"\x00"))
+            kind = read_exact(conn, 1)
+            size = struct.unpack(">I", read_exact(conn, 4))[0]
+            self.assertEqual((kind, size), (b"W", 8))
+            self.assertEqual(struct.unpack(">II", read_exact(conn, size)), (0, 0))
+            conn.sendall(frame(b"T", b"\x01"))
+            conn.sendall(frame(b"X", struct.pack(">I", 0)))
+
+        with __import__("tempfile").TemporaryDirectory() as directory:
+            daemon = MockDaemon(Path(directory) / "ttcd.sock", handler)
+            try:
+                result = Client(directory).exec_session("demo@main", ["sh"], session="repl", tty=True)
+                self.assertTrue(result.ok)
+            finally:
+                daemon.close()
+
+    def test_terminal_control_follows_the_cli(self):
+        for args, want in [
+            (["attach", "demo@main"], True),
+            (["start", "-a", "demo@main"], True),
+            (["start", "demo@main"], False),
+            (["run", "-dit", "ubuntu"], True),
+            (["exec", "--tty=false", "demo@main", "sh"], False),
+            (["exec", "demo@main", "--", "ls", "-t"], False),
+            (["exec", "ls", "demo@main"], False),
+            (["container", "exec", "-t", "demo@main", "sh"], True),
+            (["ps"], False),
+        ]:
+            self.assertIs(uses_terminal_control(args), want, args)
 
     def test_socket_is_in_the_daemon_root(self):
         self.assertEqual(Client("/data/ttc").socket_path, "/data/ttc/ttcd.sock")
@@ -194,6 +256,19 @@ class ClientTest(unittest.TestCase):
                 self.assertTrue(
                     Client(directory).stop_node("node-a", policy="migrate").ok
                 )
+            finally:
+                daemon.close()
+
+    def test_rebalance_lets_the_scheduler_choose(self):
+        def handler(conn, request):
+            self.assertEqual(request["args"], ["node", "rebalance", "node-a"])
+            conn.sendall(frame(b"O", b'{"moves":[]}\n'))
+            conn.sendall(frame(b"X", struct.pack(">I", 0)))
+
+        with __import__("tempfile").TemporaryDirectory() as directory:
+            daemon = MockDaemon(Path(directory) / "ttcd.sock", handler)
+            try:
+                self.assertEqual(Client(directory).rebalance_node("node-a"), {"moves": []})
             finally:
                 daemon.close()
 
@@ -335,6 +410,29 @@ class ClientTest(unittest.TestCase):
                 )
                 self.assertEqual(stream.wait(), 0)
                 self.assertEqual([item["output_bytes"] for item in seen], [1, 2])
+            finally:
+                daemon.close()
+
+    def test_stream_without_a_size_answers_the_terminal_request(self):
+        def handler(conn, request):
+            self.assertIs(request["terminal_control"], True)
+            conn.sendall(frame(b"T", b"\x00"))
+            kind = read_exact(conn, 1)
+            size = struct.unpack(">I", read_exact(conn, 4))[0]
+            self.assertEqual((kind, size), (b"W", 8))
+            self.assertEqual(struct.unpack(">II", read_exact(conn, size)), (0, 0))
+            conn.sendall(frame(b"O", b"$ "))
+            conn.sendall(frame(b"X", struct.pack(">I", 0)))
+
+        with __import__("tempfile").TemporaryDirectory() as directory:
+            daemon = MockDaemon(Path(directory) / "ttcd.sock", handler)
+            try:
+                output = []
+                stream = Client(directory).stream(
+                    ["exec", "-t", "demo@main", "sh"], on_stdout=output.append
+                )
+                self.assertEqual(stream.wait(5), 0)
+                self.assertEqual(output, [b"$ "])
             finally:
                 daemon.close()
 

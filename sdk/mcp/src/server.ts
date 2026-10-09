@@ -342,15 +342,14 @@ export function createServer(client: Client): McpServer {
   server.registerTool(
     "ttc_rebalance_node",
     {
-      description: "Relieve a node's configured memory pressure using CoW-aware placement.",
+      description: "Relieve a node's configured memory pressure using CoW-aware placement; the cluster's scheduler chooses the destinations.",
 	  inputSchema: {
 		node: z.string(),
-		destinationNode: z.string().optional().describe("Restrict placement to one node"),
       },
       annotations: { destructiveHint: true },
     },
-	async ({ node, destinationNode }) =>
-	  jsonResponse(await client.rebalanceNode(node, destinationNode)),
+	async ({ node }) =>
+	  jsonResponse(await client.rebalanceNode(node)),
   );
 
   for (const [name, description] of [

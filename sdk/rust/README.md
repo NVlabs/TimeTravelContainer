@@ -55,7 +55,7 @@ ttc.fork_many(
 )?.check()?;
 ttc.migrate("demo@candidate-a", "node-b")?.check()?;
 println!("{}", ttc.nodes()?);
-println!("{}", ttc.rebalance_node("node-a", Some("node-b"))?);
+println!("{}", ttc.rebalance_node("node-a")?);
 ttc.stop_node("node-a", Some("migrate"))?.check()?;
 ```
 
@@ -69,8 +69,9 @@ named work. `inspect` takes a family name and returns its branches under
 graph/GC counts, and private/shared bytes. `commit`
 accepts Docker-style image changes, while `load` and `save` exchange standard
 image archives. `copy` exposes branch-aware file transfer.
-`wait_for(target, "durable")` waits for shared publication instead of process
-exit.
+`wait_for(target, "durable")` waits until a stopped or dehydrated branch's
+capture is durable (in a cluster, published to shared storage) instead of for
+process exit; it refuses a running or paused branch.
 
 The byte-oriented `load`/`save` forms buffer archives in the client. Prefer
 daemon-host `input`/`output` paths or `stream` for large archives.
@@ -111,7 +112,8 @@ the daemon. Use absolute host paths in raw file-oriented commands because
 `Client::new(root)` takes the root of the daemon to use explicitly: the
 `TTC_ROOT` of a standalone `ttcd`, or the `TTC_LOCAL_ROOT` of a node of a
 cluster. It connects to `ttcd.sock` there, reads no environment variables, and
-never accesses the daemon's storage. Clients negotiate the public API/features
+never accesses the daemon's storage. A client sends its `API_VERSION`, which
+`ttcd` requires to equal its own API version, and can inspect the features
 returned by `ping`; exact build matching is specific to the official CLI.
 
 ## Test

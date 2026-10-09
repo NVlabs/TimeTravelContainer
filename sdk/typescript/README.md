@@ -6,9 +6,10 @@ Node.js 20 or newer is required.
 
 ## Install
 
-From this checkout:
+From this checkout, build the package and then install it:
 
 ```sh
+(cd sdk && npm install && npm run build --workspace=ttcx)
 npm install ./sdk/typescript
 ```
 
@@ -48,7 +49,7 @@ wait, and removal. A coordinated local fan-out uses one source pause:
 )).check();
 (await ttc.migrate("demo@candidate-a", "node-b")).check();
 console.log(await ttc.nodes());
-console.log(await ttc.rebalanceNode("node-a", "node-b"));
+console.log(await ttc.rebalanceNode("node-a"));
 (await ttc.stopNode("node-a", "migrate")).check();
 ```
 
@@ -64,7 +65,9 @@ console.log(await ttc.inspect("demo"));
 console.log(await ttc.ttyStat("demo@candidate-a", "build1"));
 console.log(await ttc.stats("demo@candidate-a"));
 console.log(await ttc.diff("demo@candidate-a"));
-(await ttc.wait("demo@candidate-a", { condition: "durable" })).check();
+// Durable waits apply to stopped or dehydrated branches.
+(await ttc.dehydrate("demo@candidate-b")).check();
+(await ttc.wait("demo@candidate-b", { condition: "durable" })).check();
 (await ttc.commit("demo@candidate-a", "local/result:latest",
                   { changes: ["LABEL timetravel.usage=review"] })).check();
 const archive = await ttc.save(["local/result:latest"]);
@@ -114,8 +117,9 @@ A client takes the root of the daemon to use explicitly, as
 `new Client(root)` or `new Client({root, timeoutMs})`: the `TTC_ROOT` of a
 standalone `ttcd`, or the `TTC_LOCAL_ROOT` of a node of a cluster. It connects
 to `ttcd.sock` there, reads no environment variables, and never accesses the
-daemon's storage. Clients negotiate the public API/features reported by
-`ping`; exact build matching is specific to the official CLI.
+daemon's storage. A client sends its `API_VERSION`, which `ttcd` requires to
+equal its own API version, and can inspect the features reported by `ping`;
+exact build matching is specific to the official CLI.
 
 ## Develop and test
 

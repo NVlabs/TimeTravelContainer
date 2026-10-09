@@ -23,7 +23,7 @@ python -m pip install -e ./sdk/python
 Start `ttcd` before using the SDK:
 
 ```sh
-ttc daemon start
+TTC_ROOT=/path/to/ttc-root ttc daemon start
 ```
 
 ## Use
@@ -67,7 +67,7 @@ ttc.fork_many(
 ).check()
 ttc.migrate("demo@candidate-a", "node-b").check()
 print(ttc.nodes())
-print(ttc.rebalance_node("node-a", destination_node="node-b"))
+print(ttc.rebalance_node("node-a"))
 ttc.stop_node("node-a", policy="migrate").check()
 ```
 
@@ -83,7 +83,9 @@ print(ttc.tty_stat("demo@candidate-a", "build1"))
 # and private/shared memory and filesystem bytes.
 print(ttc.stats("demo@candidate-a"))
 print(ttc.diff("demo@candidate-a"))
-ttc.wait("demo@candidate-a", condition="durable").check()
+# Durable waits apply to stopped or dehydrated branches.
+ttc.dehydrate("demo@candidate-b").check()
+ttc.wait("demo@candidate-b", condition="durable").check()
 ttc.commit("demo@candidate-a", "local/result:latest",
            changes=["LABEL timetravel.usage=review"]).check()
 archive = ttc.save(["local/result:latest"]).stdout
@@ -142,9 +144,9 @@ working directory.
 A client takes the root of the daemon to use explicitly: the `TTC_ROOT` of a
 standalone `ttcd`, or the `TTC_LOCAL_ROOT` of a node of a cluster. It connects
 to `ttcd.sock` there, reads no environment variables, and never accesses the
-daemon's storage. Clients negotiate the public API/features reported by
-`ping`; the exact-build restriction applies to the official `ttc` binary, not
-SDKs.
+daemon's storage. A client sends its `API_VERSION`, which `ttcd` requires to
+equal its own API version, and can inspect the features reported by `ping`;
+the exact-build restriction applies to the official `ttc` binary, not SDKs.
 
 ## Test
 

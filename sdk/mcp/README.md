@@ -11,19 +11,20 @@ From this checkout:
 ```sh
 cd sdk
 npm install
-npm run build --workspace=ttcx-mcp
+npm run build
 node mcp/dist/src/bin.js --root /path/to/ttc-root
 ```
 
-The server uses stdio transport. Configure an MCP host with a command similar
-to:
+`npm run build` builds the `ttcx` SDK and then the server, which compiles
+against it. The server uses stdio transport. Configure an MCP host with a
+command similar to:
 
 ```json
 {
   "mcpServers": {
     "ttc": {
-      "command": "npx",
-      "args": ["-y", "ttcx-mcp", "--root", "/path/to/ttc-root"]
+      "command": "node",
+      "args": ["/path/to/checkout/sdk/mcp/dist/src/bin.js", "--root", "/path/to/ttc-root"]
     }
   }
 }
@@ -64,8 +65,9 @@ omitting it delegates placement to TTC. `ttc_stop_node` requires an explicit
 Long operations use the SDK's 30-second timeout by default. Set `timeoutMs` on
 `ttc_wait` or `ttc_command` when a pull, checkpoint, remote fork, or wait may
 take longer. Set `ttc_wait.condition` to `durable` when an orchestrator must
-wait until the branch's current immutable publication is committed to shared
-storage.
+wait until a stopped or dehydrated branch's capture is durable, which in a
+cluster means committed to shared storage; a running or paused branch is
+refused.
 
 Tools return TTC's output as text and mark nonzero command results as MCP
 errors. `ttc_list` includes each non-root branch's `parent`, allowing MCP hosts
@@ -78,6 +80,8 @@ daemon have different working directories.
 
 ```sh
 cd sdk
+npm install
+npm run build --workspace=ttcx
 npm test --workspace=ttcx-mcp
 ```
 

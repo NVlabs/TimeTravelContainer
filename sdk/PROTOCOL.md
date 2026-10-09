@@ -14,12 +14,14 @@ read no environment variables; they have no default daemon.
 ttcd accepts clients owned by the same Unix user. Each operation uses a new
 connection.
 
-The official `ttc` binary includes its build ID and requires an exact match
-with `ttcd` for daemon operations. SDK and MCP clients intentionally omit that
-private build assertion: they negotiate the public API version and inspect the
-feature/status fields returned by `ping`. This lets an SDK remain usable across
-daemon builds that preserve the same public protocol. Storage roots never
-cross this interface.
+The official `ttc` binary includes its build ID (`client_build_id`) and
+requires an exact match with `ttcd` for daemon operations. SDK and MCP clients
+intentionally omit that private build assertion. They send the public API
+`version`, which must equal ttcd's own: ttcd answers any other with
+`unsupported API version N (server uses M)` and status 1. They then inspect
+the feature/status fields returned by `ping`. This lets an SDK remain usable
+across daemon builds that preserve the same public protocol. Clients never
+send storage roots; `ping` reports the daemon's own.
 
 ## Request
 
@@ -27,7 +29,7 @@ The client writes one newline-terminated JSON object:
 
 ```json
 {
-  "version": 9,
+  "version": 10,
   "action": "command",
   "request_id": "optional-32-character-hex-id",
   "args": ["ls", "--json"],
@@ -35,12 +37,24 @@ The client writes one newline-terminated JSON object:
 }
 ```
 
-`action` is `ping` or `command` for public SDK operations. Command arguments
-are exactly the arguments that would follow the `ttc` executable. SDK clients
-omit TTC's private runtime-path and daemon-selection options; `ttcd` supplies
-its own paths, data root, isolation mode, and runtime platform.
+`action` is `ping` or `command` for public SDK operations. `ping` writes one
+JSON object to stdout: the daemon's `version`, `build_id`, and `features`
+(such as `batch-fork`, `durable-wait`, `named-exec`, and `tty-observation`),
+runtime status such as `runtime_platform` and `isolation_mode`, and its roots.
+Command arguments are exactly the arguments that would follow the `ttc`
+executable. SDK clients omit TTC's private runtime-path and daemon-selection
+options; `ttcd` supplies its own paths, data root, isolation mode, and runtime
+platform.
 `request_id` makes supported mutating commands idempotent when a caller
 deliberately retries the same request.
+
+`stdin` declares that the client sends `I` and `C` frames. ttcd gives that
+input to a command only when the command reads standard input, as `exec -i`,
+`attach -i`, `load` without `--input`, `restore -`, and `cp -` do; `exec`
+without `-i` ignores it. Set `terminal_control` to `true` for a command that
+may ask for the client's terminal size: `attach`, `start --attach`, and `run`
+or `exec` with `--tty`. A daemon that routes a command to another cluster node
+relays the client's frames only when `stdin` or `terminal_control` is set.
 
 Existing branches use full `CONTAINER@BRANCH` selectors. A fork destination is
 a new branch name in the source family; `--node NODE` selects where it runs.
@@ -49,17 +63,19 @@ placement constraint and otherwise use scheduler placement. The protocol does
 not add implicit `main` selection beyond what the CLI command itself documents.
 
 `ttc ls --json` reports branch ancestry as `parent`. Root branches omit it.
-Inspection and statistics also expose storage placement (`local`,
+Inspection and statistics also expose storage placement (`local`, `resident`,
 `publishing`, `shared`, `materializing`, or `error`) and any volatile source
 dependencies. `inspect` accepts a family name and returns branch records under
 `TTC.branches`; `stats --json` accepts a full branch selector and reports
 placement, immutable snapshot/root IDs, publication errors, graph/GC counts,
-and private/shared resource bytes. `wait --condition durable` completes only
-after the branch's current immutable publication is committed to shared
+and private/shared resource bytes. `wait --condition durable` refuses a
+running or paused branch; for a stopped or dehydrated branch it completes once
+the branch's capture is durable, which in a cluster means committed to shared
 storage.
 
-Host file paths are interpreted by the daemon. SDK convenience methods for
-checkpoint and restore make paths absolute; callers using raw `command`
+Host file paths are interpreted by the daemon that runs the command, which in
+a cluster may be another node's. SDK convenience methods for checkpoint,
+restore, and image load/save make paths absolute; callers using raw `command`
 requests should do the same for checkpoint, restore, copy, process JSON, env
 files, and other host-path arguments.
 
@@ -73,16 +89,20 @@ After the JSON header, both directions use:
 
 Payloads are at most 1 MiB. Server frame types are `O` (stdout), `E` (stderr),
 `X` (four-byte exit status), `A` (four-byte stdin acknowledgement), `T`
-(terminal mode), and `S` (one complete JSON terminal-observation object).
-Buffered SDK requests expose consecutive `S` objects as newline-delimited
-stdout records. Client frame types are `I` (stdin bytes), `C` (stdin EOF), and
-`W` (terminal resize).
+(one-byte terminal mode: 1 raw, 0 normal), and `S` (one complete JSON
+terminal-observation object). Buffered SDK requests expose consecutive `S`
+objects as newline-delimited stdout records. Client frame types are `I` (stdin
+bytes), `C` (stdin EOF), and `W` (terminal resize).
 
 A `W` payload is eight bytes: a big-endian `uint32` row count followed by a
-big-endian `uint32` column count. `attach` does not begin streaming until the
-client reports a size, and fails with `timed out waiting for attached client
-terminal size` otherwise. A non-interactive caller must therefore send one `W`
-frame immediately after the header rather than waiting for a real resize.
+big-endian `uint32` column count. A command that allocates or attaches a
+terminal, such as `attach` to a TTY, `exec --tty` (a detached named session
+included), or `run --tty`, needs the client's size. Unless the client has
+already sent a `W` frame, ttcd sends `T` and fails the command with
+`timed out waiting for attached client terminal size` if no `W` frame arrives
+within two seconds. A client must therefore answer its first `T` frame with a
+`W` frame, reporting 0 rows and 0 columns when it has no terminal, or send one
+`W` frame immediately after the header rather than waiting for a real resize.
 
 The bindings support non-interactive input and implement ttcd's 1 MiB stdin
 flow-control window. Interactive terminal ownership remains the responsibility
@@ -111,5 +131,7 @@ operation.
 
 The SDKs default to a 30-second client timeout. Long pulls, waits,
 checkpoints, remote forks, and dehydration may need an operation-specific or
-client-wide override. A client timeout does not cancel an operation already
-accepted by `ttcd`; use daemon request inspection when its outcome is unclear.
+client-wide override. A client timeout does not cancel an operation that
+`ttcd` has begun, though one still queued behind another operation on its
+family is dropped when its client disconnects. Use
+`ttc daemon request inspect REQUEST_ID` when a mutation's outcome is unclear.

@@ -11,8 +11,9 @@ import (
 	"time"
 )
 
-// DaemonAPIVersion is the exact native CLI protocol version. Official TTC
-// clients also require an exact build match; SDKs negotiate their own API.
+// DaemonAPIVersion is the exact version of ttcd's API, which every request
+// names and ttcd requires. Official TTC clients also require an exact build
+// match; the SDKs (sdk/) name this version too, and must change with it.
 const DaemonAPIVersion = 10
 
 // StaleRouteRefusal begins a node's answer to a command routed to it by a

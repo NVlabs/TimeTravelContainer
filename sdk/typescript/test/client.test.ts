@@ -4,7 +4,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -17,6 +17,7 @@ import {
   StreamCancelled,
   TTCError,
   daemonSocketPath,
+  usesTerminalControl,
 } from "../src/index.js";
 
 function frame(kind: string, payload: Buffer = Buffer.alloc(0)): Buffer {
@@ -61,7 +62,7 @@ test("ping uses the direct protocol", async () => {
   await withServer(
     (socket, request) => {
       assert.deepEqual(request, { version: API_VERSION, action: "ping" });
-      socket.write(frame("O", Buffer.from('{"version":9}\n')));
+      socket.write(frame("O", Buffer.from(`{"version":${API_VERSION}}\n`)));
       socket.end(frame("X", Buffer.from([0, 0, 0, 0])));
     },
     async (root) => {
@@ -112,6 +113,69 @@ test("command streams flow-controlled stdin and preserves status", async () => {
       assert.throws(() => result.check(), CommandFailed);
     },
   );
+});
+
+test("the API version is the daemon's", async () => {
+  // ttcd refuses any other: runsc/ttc/protocol/protocol.go.
+  const protocol = new URL("../../../../runsc/ttc/protocol/protocol.go", import.meta.url);
+  const source = await readFile(protocol, "utf8").catch(() => undefined);
+  if (source === undefined) return;
+  assert.match(source, new RegExp(`const DaemonAPIVersion = ${API_VERSION}\\n`));
+});
+
+test("exec input is interactive", async () => {
+  await withServer(
+    (socket, request) => {
+      assert.deepEqual(request.args, ["exec", "--interactive", "demo@main", "cat"]);
+      assert.equal(request.stdin, true);
+      socket.end(frame("X", Buffer.alloc(4)));
+    },
+    async (root) => {
+      assert.equal((await new Client(root).exec("demo@main", ["cat"], { input: "hi" })).ok, true);
+    },
+  );
+});
+
+test("a tty session answers the terminal request", async () => {
+  await withServer(
+    (socket, request, rest) => {
+      assert.deepEqual(request.args, [
+        "exec", "--session", "repl", "--detach", "--tty", "demo@main", "sh",
+      ]);
+      assert.equal(request.terminal_control, true);
+      // ttcd asks for the terminal's size, and waits for it.
+      socket.write(frame("T", Buffer.from([0])));
+      let received = rest;
+      socket.on("data", (chunk: Buffer) => {
+        received = Buffer.concat([received, chunk]);
+        if (received.length < 13) return;
+        assert.equal(String.fromCharCode(received[0]!), "W");
+        assert.equal(received.readUInt32BE(1), 8);
+        assert.deepEqual([received.readUInt32BE(5), received.readUInt32BE(9)], [0, 0]);
+        socket.write(frame("T", Buffer.from([1])));
+        socket.end(frame("X", Buffer.alloc(4)));
+      });
+    },
+    async (root) => {
+      const result = await new Client(root).execSession("demo@main", ["sh"], "repl", { tty: true });
+      assert.equal(result.ok, true);
+    },
+  );
+});
+
+test("terminal control follows the CLI", () => {
+  const cases: Array<[string[], boolean]> = [
+    [["attach", "demo@main"], true],
+    [["start", "-a", "demo@main"], true],
+    [["start", "demo@main"], false],
+    [["run", "-dit", "ubuntu"], true],
+    [["exec", "--tty=false", "demo@main", "sh"], false],
+    [["exec", "demo@main", "--", "ls", "-t"], false],
+    [["exec", "ls", "demo@main"], false],
+    [["container", "exec", "-t", "demo@main", "sh"], true],
+    [["ps"], false],
+  ];
+  for (const [args, want] of cases) assert.equal(usesTerminalControl(args), want, args.join(" "));
 });
 
 test("socket is in the daemon root", () => {
@@ -193,6 +257,16 @@ test("elastic cluster helpers use the current CLI shape", async () => {
     },
     async (root) => {
       assert.equal((await new Client(root).stopNode("node-a", "migrate")).ok, true);
+    },
+  );
+  await withServer(
+    (socket, request) => {
+      assert.deepEqual(request.args, ["node", "rebalance", "node-a"]);
+      socket.write(frame("O", Buffer.from('{"moves":[]}\n')));
+      socket.end(frame("X", Buffer.alloc(4)));
+    },
+    async (root) => {
+      assert.deepEqual(await new Client(root).rebalanceNode("node-a"), { moves: [] });
     },
   );
 });

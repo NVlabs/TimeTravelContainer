@@ -7,7 +7,11 @@ import { randomBytes } from "node:crypto";
 import { join, resolve } from "node:path";
 import { createConnection, type Socket } from "node:net";
 
-export const API_VERSION = 9;
+/**
+ * The version of ttcd's API, which must equal the daemon's (DaemonAPIVersion
+ * in runsc/ttc/protocol/protocol.go): ttcd refuses any other.
+ */
+export const API_VERSION = 10;
 const MAX_FRAME = 1 << 20;
 const STDIN_WINDOW = 1 << 20;
 
@@ -99,6 +103,48 @@ export const SOCKET_NAME = "ttcd.sock";
  * TTC_ROOT of a standalone ttcd or the TTC_LOCAL_ROOT of a node of a cluster,
  * identifies it.
  */
+/** The values of a boolean flag that Go's strconv.ParseBool accepts. */
+const TRUE_VALUES = new Set(["1", "t", "T", "TRUE", "true", "True"]);
+const FALSE_VALUES = new Set(["0", "f", "F", "FALSE", "false", "False"]);
+
+function boolFlag(args: readonly string[], short: string, long: string): boolean {
+  let value = false;
+  for (const arg of args) {
+    if (arg === "--") break;
+    if (arg === long) {
+      value = true;
+    } else if (arg.startsWith(`${long}=`)) {
+      const parsed = arg.slice(long.length + 1);
+      if (TRUE_VALUES.has(parsed)) value = true;
+      else if (FALSE_VALUES.has(parsed)) value = false;
+    } else if (arg.length > 1 && arg[0] === "-" && arg[1] !== "-" && arg.slice(1).includes(short)) {
+      value = true;
+    }
+  }
+  return value;
+}
+
+/**
+ * Reports whether a command can ask its client for a terminal, as the CLI
+ * decides (protocol.CommandUsesTerminalControl): a daemon of a cluster relays
+ * the terminal frames of such a command to the node that runs it.
+ */
+export function usesTerminalControl(command: readonly string[]): boolean {
+  const args = command[0] === "container" ? command.slice(1) : command;
+  switch (args[0]) {
+    case "attach":
+      return true;
+    case "start":
+      return boolFlag(args.slice(1), "a", "--attach");
+    case "run":
+    case "exec":
+      if (args[0] === "exec" && ["ls", "wait", "kill"].includes(args[1] ?? "")) return false;
+      return boolFlag(args.slice(1), "t", "--tty");
+    default:
+      return false;
+  }
+}
+
 export function daemonSocketPath(root: string): string {
   return join(root, SOCKET_NAME);
 }
@@ -199,6 +245,8 @@ export class TtcStream {
    */
   private connected = false;
   private pendingSize: { rows: number; cols: number } | undefined;
+  /** Whether a size has been sent, or is pending: see `answerTerminal`. */
+  private sizeSent = false;
   private readonly stdinDeclared: boolean;
   private timer: ReturnType<typeof setTimeout> | undefined;
   private resolveExit!: (status: number) => void;
@@ -215,6 +263,7 @@ export class TtcStream {
     this.stdinDeclared = options.stdin === true;
     if (options.size) sizeFrame(options.size.rows, options.size.cols);
     this.pendingSize = options.size;
+    this.sizeSent = options.size !== undefined;
     this.exited = new Promise<number>((res, rej) => {
       this.resolveExit = res;
       this.rejectExit = rej;
@@ -289,6 +338,7 @@ export class TtcStream {
     if (this.settled) throw new TTCError("stream is already settled");
     // Validate synchronously even when the connection is still pending.
     sizeFrame(rows, cols);
+    this.sizeSent = true;
     if (!this.connected) {
       // Only the latest pre-connect size matters. It must be sent by the
       // connect handler after the JSON header, never queued on Socket first.
@@ -346,7 +396,9 @@ export class TtcStream {
       case "S":
         return this.deliver(this.handlers.onObservation, payload);
       case "T":
-        return this.deliver(this.handlers.onTerminal, payload);
+        if (!this.deliver(this.handlers.onTerminal, payload)) return false;
+        this.answerTerminal();
+        return true;
       case "A": {
         if (payload.length !== 4) {
           this.finish(new ProtocolError("invalid stdin acknowledgement"));
@@ -373,6 +425,17 @@ export class TtcStream {
         this.finish(new ProtocolError(`unexpected TTC frame ${JSON.stringify(kind)}`));
         return false;
     }
+  }
+
+  /**
+   * ttcd asks the client of a terminal command for its terminal's size, and
+   * waits for it: a stream given none, whose handler sent none either, has no
+   * terminal, which the CLI answers so too when its own is none.
+   */
+  private answerTerminal(): void {
+    if (this.sizeSent) return;
+    this.sizeSent = true;
+    this.socket.write(sizeFrame(0, 0));
   }
 
   private deliver(handler: ((payload: Buffer) => void) | undefined, payload: Buffer): boolean {
@@ -438,6 +501,7 @@ export class Client {
         request_id: options.requestId ?? randomBytes(16).toString("hex"),
         args: [...args],
         stdin: options.input !== undefined,
+        ...(usesTerminalControl(args) ? { terminal_control: true } : {}),
       },
       input,
       options.timeoutMs,
@@ -476,7 +540,9 @@ export class Client {
     command: readonly string[],
     options: Pick<CommandOptions, "input" | "timeoutMs"> = {},
   ): Promise<Result> {
-    return this.command(["exec", target, ...command], options);
+    // ttcd gives a process its client's input only with --interactive.
+    const interactive = options.input !== undefined ? ["--interactive"] : [];
+    return this.command(["exec", ...interactive, target, ...command], options);
   }
 
   execSession(
@@ -591,12 +657,12 @@ export class Client {
 	return this.command(["node", "stop", ...(policy ? [`--${policy}-all`] : []), node]);
   }
 
-  async rebalanceNode<T = unknown>(node: string, destinationNode?: string): Promise<T> {
-    return (await this.command([
-      "node", "rebalance",
-      ...(destinationNode ? ["--node", destinationNode] : []),
-      node,
-    ], { check: true })).json<T>();
+  /**
+   * Moves a pressure-relieving subset of node's branches to nodes that the
+   * cluster's scheduler chooses, and returns the plan.
+   */
+  async rebalanceNode<T = unknown>(node: string): Promise<T> {
+    return (await this.command(["node", "rebalance", node], { check: true })).json<T>();
   }
 
   pause(target: string): Promise<Result> {
@@ -697,6 +763,7 @@ export class Client {
         request_id: options.requestId ?? randomBytes(16).toString("hex"),
         args: [...args],
         stdin: options.stdin === true,
+        ...(usesTerminalControl(args) ? { terminal_control: true } : {}),
       },
       options,
     );

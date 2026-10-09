@@ -17,7 +17,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-API_VERSION = 9
+# The version of ttcd's API, which must equal the daemon's (DaemonAPIVersion in
+# runsc/ttc/protocol/protocol.go): ttcd refuses any other.
+API_VERSION = 10
 MAX_FRAME = 1 << 20
 STDIN_WINDOW = 1 << 20
 
@@ -101,6 +103,48 @@ def _size_frame(rows: int, cols: int) -> bytes:
     return _frame(b"W", struct.pack(">II", rows, cols))
 
 
+# The values of a boolean flag that Go's strconv.ParseBool accepts.
+_TRUE = ("1", "t", "T", "TRUE", "true", "True")
+_FALSE = ("0", "f", "F", "FALSE", "false", "False")
+
+
+def _bool_flag(args: Sequence[str], short: str, long: str) -> bool:
+    value = False
+    for arg in args:
+        if arg == "--":
+            break
+        if arg == long:
+            value = True
+        elif arg.startswith(long + "="):
+            parsed = arg[len(long) + 1 :]
+            if parsed in _TRUE:
+                value = True
+            elif parsed in _FALSE:
+                value = False
+        elif len(arg) > 1 and arg[0] == "-" and arg[1] != "-" and short in arg[1:]:
+            value = True
+    return value
+
+
+def uses_terminal_control(args: Sequence[str]) -> bool:
+    """Reports whether a command can ask its client for a terminal, as the CLI
+    decides (protocol.CommandUsesTerminalControl): a daemon of a cluster relays
+    the terminal frames of such a command to the node that runs it."""
+    if args and args[0] == "container":
+        args = args[1:]
+    if not args:
+        return False
+    if args[0] == "attach":
+        return True
+    if args[0] == "start":
+        return _bool_flag(args[1:], "a", "--attach")
+    if args[0] in ("run", "exec"):
+        if args[0] == "exec" and len(args) > 1 and args[1] in ("ls", "wait", "kill"):
+            return False
+        return _bool_flag(args[1:], "t", "--tty")
+    return False
+
+
 class TTCStream:
     """One long-lived ttcd operation with incremental callbacks and stdin."""
 
@@ -126,6 +170,7 @@ class TTCStream:
             b"T": on_terminal,
         }
         initial_size = _size_frame(*size) if size is not None else None
+        self._size_sent = size is not None
         self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._socket.settimeout(timeout)
         self._send_lock = threading.Lock()
@@ -199,7 +244,7 @@ class TTCStream:
                 self._eof_sent = True
 
     def resize(self, rows: int, cols: int) -> None:
-        self._send(_size_frame(rows, cols))
+        self._send(_size_frame(rows, cols), size=True)
 
     def close(self) -> None:
         """Cancel locally without fabricating a successful daemon status."""
@@ -223,11 +268,23 @@ class TTCStream:
             assert self._status is not None
             return self._status
 
-    def _send(self, data: bytes) -> None:
+    def _send(self, data: bytes, *, size: bool = False) -> None:
         with self._state:
             self._raise_if_settled()
         with self._send_lock:
+            if size:
+                self._size_sent = True
             self._socket.sendall(data)
+
+    def _answer_terminal(self) -> None:
+        # ttcd asks the client of a terminal command for its terminal's size,
+        # and waits for it: a stream given none has no terminal, which the CLI
+        # answers so too when its own is none.
+        with self._send_lock:
+            if self._size_sent:
+                return
+            self._size_sent = True
+            self._socket.sendall(_size_frame(0, 0))
 
     def _raise_if_settled(self) -> None:
         if not self._settled:
@@ -260,6 +317,8 @@ class TTCStream:
                     raise ProtocolError(f"unexpected ttcd frame type {kind!r}")
                 if callback is not None:
                     callback(payload)
+                if kind == b"T":
+                    self._answer_terminal()
                 with self._state:
                     if self._settled:
                         return
@@ -331,6 +390,8 @@ class Client:
             "args": list(args),
             "stdin": input is not None,
         }
+        if uses_terminal_control(args):
+            request["terminal_control"] = True
         result = self._exchange(request, data, timeout)
         return result.check() if check else result
 
@@ -351,7 +412,9 @@ class Client:
         return self.command(["start", *(["--node", node] if node else []), target])
 
     def exec(self, target: str, command: Sequence[str], *, input: bytes | str | None = None) -> Result:
-        return self.command(["exec", target, *command], input=input)
+        # ttcd gives a process its client's input only with --interactive.
+        options = ["--interactive"] if input is not None else []
+        return self.command(["exec", *options, target, *command], input=input)
 
     def exec_session(
         self,
@@ -493,11 +556,10 @@ class Client:
         option = f"--{policy}-all" if policy else None
         return self.command(["node", "stop", *([option] if option else []), node])
 
-    def rebalance_node(self, node: str, *, destination_node: str | None = None) -> Any:
-        args = ["node", "rebalance"]
-        if destination_node is not None:
-            args.extend(["--node", destination_node])
-        return self.command([*args, node], check=True).json()
+    def rebalance_node(self, node: str) -> Any:
+        """Move a pressure-relieving subset of node's branches to nodes that
+        the cluster's scheduler chooses, and return the plan."""
+        return self.command(["node", "rebalance", node], check=True).json()
 
     def pause(self, target: str) -> Result:
         return self.command(["pause", target])
@@ -576,13 +638,15 @@ class Client:
         """Open a long-lived operation without buffering its output."""
         if not args or any(not isinstance(arg, str) for arg in args):
             raise ValueError("args must be a non-empty sequence of strings")
-        request = {
+        request: dict[str, Any] = {
             "version": API_VERSION,
             "action": "command",
             "request_id": request_id or secrets.token_hex(16),
             "args": list(args),
             "stdin": stdin,
         }
+        if uses_terminal_control(args):
+            request["terminal_control"] = True
         return TTCStream(
             self.socket_path,
             request,
@@ -696,6 +760,7 @@ class Client:
             stdout = bytearray()
             stderr = bytearray()
             send_buffer = b""
+            size_sent = False
             input_offset = 0
             unacknowledged = 0
             eof_sent = not bool(request.get("stdin"))
@@ -756,7 +821,13 @@ class Client:
                             raise ProtocolError("ttcd acknowledged unsent stdin")
                         unacknowledged -= acknowledged
                     elif kind == b"T":
-                        continue
+                        # ttcd asks the client of a terminal command, such as
+                        # a detached exec --tty, for its terminal's size, and
+                        # waits for it: this client has none, which the CLI
+                        # answers so too when its own is none.
+                        if not size_sent:
+                            send_buffer += _size_frame(0, 0)
+                            size_sent = True
                     elif kind == b"X":
                         if len(payload) != 4:
                             raise ProtocolError("invalid status frame")
