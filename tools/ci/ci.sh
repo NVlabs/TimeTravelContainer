@@ -194,7 +194,8 @@ check() {
 
 # verify_binaries checks what a release needs of the binaries just built: on
 # Linux, static executables, whose ttcd carries the GPU renderer and
-# ttc-cuda-checkpoint; on macOS, a ttcd that is its renderer.
+# ttc-cuda-checkpoint; on macOS, a ttcd that is its renderer, and that loads
+# no library but Apple's.
 verify_binaries() {
 	ttc=bazel-bin/runsc/ttc/ttc_/ttc
 	ttcd=bazel-bin/runsc/ttcd/ttcd_/ttcd
@@ -214,6 +215,11 @@ verify_binaries() {
 		# The renderer's usage exits 2; a ttcd that is not the renderer
 		# would start a daemon, or fail otherwise.
 		[ "$status" = 2 ] || fail "ttcd is not the GPU renderer (exit $status)"
+		# Signed by a developer's certificate, under the hardened runtime,
+		# ttcd may load only Apple's libraries and the developer's: it
+		# links the others, MoltenVK among them.
+		others=$(otool -L "$ttcd" | tail -n +2 | awk '{print $1}' | grep -vE '^(/usr/lib/|/System/Library/)' || true)
+		[ -z "$others" ] || fail "ttcd loads libraries other than Apple's: $others"
 	fi
 }
 
@@ -257,7 +263,8 @@ release_plan() {
 	cat release.env >&2
 	{
 		echo "Daily build of $(git rev-parse HEAD), for Linux x86-64 and arm64 and macOS arm64:"
-		echo "each platform's zip holds ttc and ttcd, to install side by side."
+		echo "each platform's zip holds ttc and ttcd, to install side by side, with their"
+		echo "LICENSE and THIRD_PARTY_NOTICES.md."
 		echo
 		echo "On macOS, ttcd is signed ad hoc with the Hypervisor entitlement, which the zip's"
 		echo "hvf.entitlements holds, to sign it again if need be:"
@@ -287,14 +294,17 @@ release_build() {
 		trap 'git tag -d "$RELEASE_TAG" >/dev/null 2>&1 || true' EXIT
 	fi
 	check
-	# The platform's archive holds ttc and ttcd as they install, and on
-	# macOS the entitlements that ttcd's signature carries, to sign it again.
+	# The platform's archive holds ttc and ttcd as they install, their
+	# license and third-party notices, and on macOS the entitlements that
+	# ttcd's signature carries, to sign it again.
 	stage=$out/stage
 	rm -rf "$stage"
 	mkdir -p "$stage"
 	cp bazel-bin/runsc/ttc/ttc_/ttc bazel-bin/runsc/ttcd/ttcd_/ttcd "$stage/"
 	chmod 0755 "$stage/ttc" "$stage/ttcd"
-	files="ttc ttcd"
+	cp LICENSE THIRD_PARTY_NOTICES.md "$stage/"
+	chmod 0644 "$stage/LICENSE" "$stage/THIRD_PARTY_NOTICES.md"
+	files="ttc ttcd LICENSE THIRD_PARTY_NOTICES.md"
 	if [ "$os" = Darwin ]; then
 		# Hypervisor.framework requires its entitlement of ttcd, which an
 		# ad-hoc signature carries.

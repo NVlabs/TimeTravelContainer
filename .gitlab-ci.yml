@@ -14,7 +14,8 @@
 # release daily-YYYYMMDD-COMMIT of them, with its tag, unless nothing but
 # documentation changed since the last one: a zip for each platform,
 # ttc-linux-amd64.zip, ttc-linux-arm64.zip and ttc-darwin-arm64.zip, of ttc
-# and ttcd, and on macOS the entitlements that ttcd is signed with. The zips
+# and ttcd, their license and third-party notices, and on macOS the
+# entitlements that ttcd is signed with. The zips
 # are in the package registry, as package ttc, and are direct assets: the
 # latest release's are at <project>/-/releases/permalink/latest/downloads/<file>.
 

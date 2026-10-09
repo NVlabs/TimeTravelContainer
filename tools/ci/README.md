@@ -12,7 +12,7 @@ Every push to a branch, or to a merge request's branch, builds `ttc` and
 | -------------------- | ------------------------------ | -------------------------- |
 | `check:linux-amd64`  | shared Docker, `os/linux`, `size/large` | static binaries that carry the GPU renderer |
 | `check:linux-arm64`  | shared Docker, `os/linux-arm`  | the same, natively built    |
-| `check:macos-arm64`  | the project's Mac, `os/macos-arm` | HVF platform tests, a `ttcd` that is the GPU renderer |
+| `check:macos-arm64`  | the project's Mac, `os/macos-arm` | HVF platform tests, a `ttcd` that is the GPU renderer and loads only Apple's libraries |
 
 The tests are those of TTC's own packages, which need no privileges and
 no GPU: the renderer's tests on a GPU skip where none renders. Their JUnit
@@ -42,10 +42,10 @@ last release, other than in `g3doc/`, `website/` and Markdown files:
    build and test each platform's binaries, whose version is the release's
    tag, and archive them: `ttc-linux-amd64.zip`, `ttc-linux-arm64.zip` and
    `ttc-darwin-arm64.zip` each hold `ttc` and `ttcd`, to install side by
-   side. macOS's `ttcd` is signed ad hoc with the Hypervisor entitlement,
-   and its zip also holds the entitlements, `hvf.entitlements`, to sign it
-   again. Each job unpacks its zip and runs what it holds. Without a release
-   they end at once.
+   side, with `LICENSE` and `THIRD_PARTY_NOTICES.md`. macOS's `ttcd` is
+   signed ad hoc with the Hypervisor entitlement, and its zip also holds the
+   entitlements, `hvf.entitlements`, to sign it again. Each job unpacks its
+   zip and runs what it holds. Without a release they end at once.
 3. `release:publish` uploads the zips and their `SHA256SUMS` to the
    project's package registry, as package `ttc`, and makes the release, and
    its tag, with each file as a direct asset: the latest release's are at
