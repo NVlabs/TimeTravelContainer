@@ -18,7 +18,7 @@ Unlike microVM-based platforms such as
 KVM, Linux kernel patches, root privileges, or special kernel modules. It runs
 rootlessly on Linux 3.17+ and can itself run inside another sandbox, such as a
 Docker container, bubblewrap, or a virtual machine.
-Apart from Linux hosts, TTC also runs on Apple Silicon Macs (natively) 
+Apart from Linux hosts, TTC also runs on Apple Silicon Macs (natively)
 and Windows (through WSL 2), providing a live forking Linux runtime for them.
 This makes TTC a portable foundation for agent harnesses.
 
@@ -26,7 +26,10 @@ This makes TTC a portable foundation for agent harnesses.
 
 The same primitive supports speculative tool use, parallel coding attempts,
 integration testing, and debugging—without replaying expensive environment
-setup.
+setup. Moreover, thanks to its portability, TTC might make it practical to
+collect branched agent trajectories across diverse real-world tasks directly
+on edge devices. Such trajectories could probably help in the development
+of continuously improving agentic models that learn from interactions over time.
 
 TTC provides basic isolation and cross-node scaling, but is not intended to be
 a complete agent guardrail. During inference, it can run inside a guardrail
@@ -48,12 +51,24 @@ TTC is designed for efficiency. Memory and writable storage are
   memory chunks and whole files are fetched on demand from the fenced source
   or shared storage; target writes are always node-local.
 
+TTC is an extensible platform in which you can add your own abstractions of
+physical hardware, such as a GPU, and define their forking semantics.
+As built-in examples, TTC supports
+in-container Vulkan graphics acceleration and CUDA GPGPU, which allows booting
+a forkable, graphics-accelerated [Android](https://github.com/remote-android/redroid-doc)
+or running [llama.cpp](https://github.com/ggml-org/llama.cpp) (Vulkan and CUDA
+backends).
+
 ## Get Started
 
-TTC is delivered as two binaries. `ttc` is the CLI client and `ttcd` is the
-server daemon; `ttcd` also contains the re-executed `runsc` runtime entry point.
+**You can download the prebuilt binaries for your OS and CPU in [Releases](https://gitlab-master.nvidia.com/avr/TimeTravelContainer/-/releases)**
+(automatic daily builds).
 
-\<Download instruction TBA, do not remove this yet\>
+TTC is delivered as two binaries. `ttc` is the CLI client and `ttcd` is
+the server daemon. They have no runtime dependencies and can be extracted
+to anywhere in your `PATH`; always use a `ttc` and `ttcd` from the same
+release. On macOS, a zip that a browser downloads is quarantined: run
+`xattr -d com.apple.quarantine` on it before extracting it.
 
 ```console
 $ export TTC_ROOT="$HOME/.local/share/ttc"
@@ -66,6 +81,24 @@ CONTAINER  BRANCH  IMAGE         STATE    CREATED    PARENT
 myapp      main    ubuntu:26.04  running  1 day ago  -
 ```
 
+Environment variable `TTC_ROOT` (and `TTC_LOCAL_ROOT` for distributed TTC)
+specifies the directory where TTC stores its data and control socket.
+Different directories run independent TTC daemon instances.
+A daemon by default runs within an OS sandbox (a user namespace on Linux, and
+Seatbelt on macOS). That requirement can be waived with
+`--unsafe-no-host-isolation` when starting the daemon, which is necessary when
+TTC runs inside another sandbox that forbids user namespaces or, on macOS,
+applies its own Seatbelt profile.
+
+TTC works by intercepting system calls from guest processes and interpreting
+them in a virtualized userspace Linux kernel. On Linux, `ttc daemon start
+--platform=systrap` (the default) uses seccomp to achieve this, whereas
+`--platform=kvm` uses hardware virtualization. The macOS build's platform is
+a native `hvf` backend (requires Apple Silicon and macOS 15.0+) so you can run
+TTC directly on Macs and get a Linux shell.
+While it uses virtualization (Hypervisor.framework), it does not boot a Linux
+VM. Instead, TTC runs itself as the guest-facing kernel inside the hypervisor.
+
 ## Usage
 `ttc` uses familiar Docker-style commands and pulls standard OCI images
 directly from Docker Hub and other registries. TTC adds branch-aware commands
@@ -77,7 +110,7 @@ ordinary branch and can be forked or removed like any other.
 
 ```sh
 # Start a prepared environment and fork two possible futures.
-ttc run -dit --name agent ubuntu:26.04 bash
+ttc run -dit --name agent --network=ttc --nat ubuntu:26.04 bash
 ttc exec agent@main sh -lc 'apt-get update && apt-get install -y git'
 ttc fork agent@main approach-a approach-b
 
@@ -112,9 +145,17 @@ Common workflows include:
 | Manage networking | `ttc quarantine`, `ttc unquarantine`, `ttc port publish`, `ttc port ls`, `ttc port unpublish` |
 | Manage storage | `ttc volume create`, `ttc volume ls`, `ttc volume rm` |
 
+During `ttc run` or `ttc create`, a container family gets access to specific
+emulated hardware. For example, `--network=ttc` gives it a virtual network
+card, `--gfx` gives it a virtual Vulkan GPU, and `--nvproxy` gives it the
+host's NVIDIA GPUs for CUDA (on Linux). Most options are compatible with live
+forks; `--gfx-fork` and `--nvproxy-fork` choose what a fork does with a GPU in
+use, and `--waive-live-fork` gives up live forking to enable more options.
+
 The [end-user guide](g3doc/user_guide/timetravelcontainer.md) covers daemon
 operation, networking, volumes, host mounts, checkpoints, remote forks, shell
-completion, and recovery in detail.
+completion, and recovery in detail. See also the
+[current limitations](g3doc/user_guide/ttc_limitations.md).
 
 ## SDKs and agent integration
 
@@ -141,86 +182,6 @@ result = ttc.exec("agent@candidate", ["sh", "-lc", "make test"])
 result.check()
 print(result.stdout_text())
 ```
-
-## Features and Requirements
-
-TTC includes:
-
-- Direct OCI image pulls and Docker-style image, container, volume, log, exec,
-  attach, copy, commit, port-forwarding, and lifecycle commands.
-- Full-branch pause, resume, fork, dehydration, rehydration, checkpoint, and
-  restore.
-- Per-branch CoW resource accounting, metadata-based filesystem diffs, named
-  reattachable exec sessions, and terminal-observation APIs for agent harnesses.
-- Stable JSON observability for placement, immutable snapshot and root IDs,
-  publication errors, volatile dependencies, graph/GC counts, and image-cache
-  progress.
-- Copy-on-write process memory, tmpfs, internal IPC and sockets, and persistent
-  writable filesystems.
-- Rootless userspace networking with isolated virtual NICs, outbound NAT,
-  published TCP ports, and configurable IP and MAC addresses.
-- Read-only host mounts, branch-private writable views of host paths, tmpfs,
-  and managed persistent volumes.
-- In-sandbox FUSE filesystems, including executable and writable shared
-  mappings; AppImages, the FUSE daemon, mount state, and cached pages remain
-  forkable.
-- Optional multi-node live fork over a trusted private network, with an
-  optional shared token, a shared TTC data root, and a page-transfer network.
-  Elastic mode adds dynamic node discovery, transparent command routing,
-  branch migration, policy-driven node shutdown, and pressure-aware placement.
-
-Unlike [CRIU](https://github.com/checkpoint-restore/criu) or a
-[Firecracker](https://github.com/firecracker-microvm/firecracker) microVM, a
-TTC live fork does not save the container's memory to a checkpoint first.
-Durable storage is used only for explicitly requested operations such as
-dehydration and checkpointing, or when a remote branch must no longer depend
-on a source node. Dehydration stores branch-reachable memory in compact 1 MiB
-records while retaining independent 4 KiB page identities. Immutable pages
-already represented in the snapshot graph are referenced again rather than
-written a second time.
-
-Live-fork eligibility is a lifetime property of a container family. Families
-are eligible by default, and TTC rejects incompatible features when they are
-requested rather than allowing a running workload to become unexpectedly
-unforkable. A feature whose state is deliberately outside the Sentry, such as
-host networking, can be selected only together with `--waive-live-fork`; every
-fork of that family then fails predictably. Guest-created, Sentry-managed
-resources—including network namespaces, virtual interfaces, routes, iptables,
-and internal sockets—remain forkable.
-
-Host requirements are deliberately small:
-
-- Linux 3.17 or newer on x86-64 or ARM64. Linux 4.14.77+ is recommended for
-  full network performance.
-- (Optional) An unprivileged user namespace for normal rootless isolation. No
-  subordinate UID/GID ranges or `newuidmap` helpers are required. Trusted
-  environments that prohibit user namespaces can explicitly use
-  `--unsafe-no-host-isolation`.
-- A data root on any supported local filesystem. TTC uses reflinks when
-  available and otherwise transparently falls back to whole-file copying on
-  the first write after a fork.
-- (Optional) A delegated cgroup v2 subtree only when hard host CPU or memory
-  limits are requested.
-
-TTC includes a native macOS backend (requires Apple Silicon and macOS 15.0+)
-so you can use TTC directly on Macs to run an ARM64 Linux shell.
-While it uses virtualization (Hypervisor.framework), it does not boot a Linux
-VM. Instead, TTC runs itself as the guest-facing kernel inside the hypervisor.
-To run TTC on macOS, the installer handles necessary ad-hoc code signatures.
-
-`TTC_ROOT` is always explicit and on a local filesystem. In standalone mode it
-contains all of the daemon's files, including its socket, which `ttc` finds
-there. Cluster nodes use the same shared `TTC_ROOT` and each set a distinct,
-node-local `TTC_LOCAL_ROOT` for their daemon's own files, active runtimes, and
-caches; `ttc` finds a node's daemon in its `TTC_LOCAL_ROOT`. `--daemon-socket`
-takes precedence for a single client invocation. `ttc` owns its help and
-command grammar locally, so help, completion, and version output do not depend
-on a running daemon. For daemon operations, the official client and daemon
-builds must match exactly.
-
-## Current Limitations
-
-See [Current Limitations](g3doc/user_guide/ttc_limitations.md).
 
 ## Development
 
@@ -263,9 +224,10 @@ recovery, and nested execution.
 - [Client/daemon boundary and size audit](g3doc/development/ttc_client_boundary.md)
 - [Live-fork design](g3doc/proposals/timetravel_live_fork.md)
 - [Branch state machine](g3doc/ttc_state_machine.md)
-- [Distributed live-fork plan](g3doc/proposals/ttc_distributed_live_fork.md)
-- [Disk-backed storage design](g3doc/proposals/ttc_disk_backed_volumes.md)
-- [Security, performance, and compatibility audit](g3doc/proposals/timetravel_ttc_audit.md)
+- [macOS Hypervisor.framework platform](g3doc/proposals/hvf_full_sentry.md)
+- [GPU devices: `--gfx` and `--nvproxy`](g3doc/proposals/ttc_gpu_gfx_nvproxy.md)
+- [Venus GPU renderer](g3doc/proposals/ttc_venus_renderer.md)
+- [Security, performance, and compatibility audit (August 2026)](g3doc/proposals/timetravel_ttc_audit.md)
 - [Upstream gVisor documentation](https://gvisor.dev/docs/)
 
 ## Contributing
@@ -277,6 +239,5 @@ Commits must be signed off under the Developer Certificate of Origin; see
 
 TimeTravelContainer is licensed under the [Apache License 2.0](LICENSE). It is
 a modified version of [gVisor](https://github.com/google/gvisor).
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) names gVisor and the
-third-party components TimeTravelContainer uses, with their licenses and the
-texts of those licenses.
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) names all
+third-party components TimeTravelContainer uses, with their respective licenses.
