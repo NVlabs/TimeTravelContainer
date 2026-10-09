@@ -100,13 +100,13 @@ start_node b "$PORT_B"
 start_node c "$PORT_C"
 
 # Find the actual coordinator instead of assuming the first node won its
-# independent lease-acquisition race. The generation directory is disposable
-# node-local state created only after a complete ledger rebuild.
+# independent lease-acquisition race. A daemon logs when it starts
+# coordinating, once it has rebuilt its ledger.
 coordinator=
 attempt=0
 while test "$attempt" -lt 300 && test -z "$coordinator"; do
 	for node in a b c; do
-		if find "$ROOT/local-$node/snapshot-graph/shared-reference-ledger" -mindepth 1 -maxdepth 1 -type d -name 'generation-*' 2>/dev/null | grep -q .; then
+		if grep -q 'coordinating shared garbage collection' "$ROOT/local-$node/ttcd.log" 2>/dev/null; then
 			coordinator=$node
 			break
 		fi

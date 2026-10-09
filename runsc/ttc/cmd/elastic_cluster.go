@@ -8394,9 +8394,14 @@ func maintainSharedGCCoordinator(authority *cluster.AuthorityCatalog, packs *ttc
 			stopKeeper := keepSharedGCLeaseAlive(authority, held, duration)
 			var maintenanceErr error
 			if references != nil {
+				coordinating := references.activeFor(held)
 				if err := references.activate(held); err != nil {
 					maintenanceErr = fmt.Errorf("activating shared reference ledger: %w", err)
 					retryActivation = true
+				} else if !coordinating && stderr != nil {
+					// Which node coordinates is otherwise visible only in the
+					// authority's state; e2e_shared_gc_turnover.sh looks for this.
+					fmt.Fprintf(stderr, "ttcd: coordinating shared garbage collection, lease generation %d\n", held.Generation)
 				}
 			}
 			if references != nil && maintenanceErr == nil {
