@@ -77,10 +77,12 @@ Bazel builds apply these patches to the components they name.
 
 ### C and C++ components
 
-`ttcd` for macOS links MoltenVK's static library, of its release, which holds the other components of this table.
+`ttcd`'s GPU renderer compiles Vulkan's headers and the code that venus-protocol generates, which this repository holds; on macOS, `ttcd` also links MoltenVK's static library, of its release, with what that holds.
 
 | Component | Version | License | Use |
 |---|---|---|---|
+| Vulkan-Headers | 1.4.357 | Apache-2.0 OR MIT | compiled into ttcd's GPU renderer |
+| venus-protocol | 1.1.3 | MIT | generated code of ttcd's GPU renderer |
 | MoltenVK | 1.4.2 | Apache-2.0 | linked into ttcd on macOS |
 | SPIRV-Cross | 6c09849fe88c | Apache-2.0 | in MoltenVK |
 | SPIRV-Tools | 0d6fd73ca738 | Apache-2.0 | in MoltenVK |
@@ -303,9 +305,35 @@ rights granted to you under this License for this implementation of Go
 shall terminate as of the date such litigation is filed.
 ````
 
+### Notice
+
+Of Vulkan-Headers 1.4.357 (LICENSE.md); Vulkan-Headers e3b1eec08173 (LICENSE.md).
+
+````text
+Copyright 2015-2026 The Khronos Group Inc.
+
+Files in this repository fall under one of these licenses:
+
+- `Apache-2.0`
+- `MIT`
+
+Note: With the exception of `parse_dependency.py`, which is based on an
+external file, files using the `MIT` license also fall under `Apache-2.0`.
+Example:
+
+```
+SPDX-License-Identifier: Apache-2.0 OR MIT
+```
+
+Full license text of these licenses is available at:
+
+  * Apache-2.0: https://opensource.org/licenses/Apache-2.0
+  * MIT: https://opensource.org/licenses/MIT
+````
+
 ### Apache-2.0
 
-Of MoltenVK 1.4.2 (LICENSE); SPIRV-Cross 6c09849fe88c (LICENSE); SPIRV-Tools 0d6fd73ca738 (LICENSE); Vulkan-Headers e3b1eec08173 (LICENSES/Apache-2.0.txt); cloud.google.com/go/auth v0.20.0 (LICENSE); cloud.google.com/go/auth/oauth2adapt v0.2.8 (LICENSE); cloud.google.com/go/storage v1.62.1 (LICENSE); github.com/containerd/cgroups/v3 v3.0.5 (LICENSE); github.com/containerd/fifo v1.1.0 (LICENSE); github.com/containerd/go-runc v1.1.0 (LICENSE); github.com/containerd/ttrpc v1.2.7 (LICENSE); github.com/google/btree v1.1.2 (LICENSE); github.com/google/subcommands v1.0.2-0.20190508160503-636abe8753b8 (LICENSE); google.golang.org/grpc v1.80.0 (LICENSE); k8s.io/api v0.32.3 (LICENSE); k8s.io/apimachinery v0.32.3 (LICENSE); k8s.io/client-go v0.32.3 (LICENSE); cel.dev/expr v0.25.1 (LICENSE); cloud.google.com/go v0.123.0 (LICENSE); cloud.google.com/go/compute/metadata v0.9.0 (LICENSE); cloud.google.com/go/iam v1.7.0 (LICENSE); cloud.google.com/go/monitoring v1.24.3 (LICENSE); github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp v1.31.0 (LICENSE); github.com/GoogleCloudPlatform/opentelemetry-operations-go/exporter/metric v0.55.0 (LICENSE); github.com/GoogleCloudPlatform/opentelemetry-operations-go/internal/resourcemapping v0.55.0 (LICENSE); github.com/cncf/xds/go v0.0.0-20251210132809-ee656c7534f5 (LICENSE); github.com/envoyproxy/protoc-gen-validate v1.3.0 (LICENSE); github.com/go-jose/go-jose/v4 v4.1.4 (LICENSE); github.com/go-logr/stdr v1.2.2 (LICENSE); github.com/go-openapi/jsonpointer v0.21.0 (LICENSE); github.com/go-openapi/jsonreference v0.20.2 (LICENSE); github.com/go-openapi/swag v0.23.0 (LICENSE); github.com/google/gnostic-models v0.6.8 (LICENSE); github.com/google/gofuzz v1.2.0 (LICENSE); github.com/google/s2a-go v0.1.9 (LICENSE.md); github.com/googleapis/enterprise-certificate-proxy v0.3.14 (LICENSE); github.com/moby/sys/mountinfo v0.7.2 (LICENSE); github.com/moby/sys/userns v0.1.0 (LICENSE); github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd (LICENSE); github.com/modern-go/reflect2 v1.0.2 (LICENSE); github.com/spiffe/go-spiffe/v2 v2.6.0 (LICENSE); go.opencensus.io v0.24.0 (LICENSE); go.opentelemetry.io/auto/sdk v1.2.1 (LICENSE); google.golang.org/genproto v0.0.0-20260319201613-d00831a3d3e7 (LICENSE); google.golang.org/genproto/googleapis/api v0.0.0-20260401024825-9d38bb4040a9 (LICENSE); google.golang.org/genproto/googleapis/rpc v0.0.0-20260401024825-9d38bb4040a9 (LICENSE); k8s.io/kube-openapi v0.0.0-20241105132330-32ad38e42d3f (LICENSE); k8s.io/utils v0.0.0-20241104100929-3ea5e8cea738 (LICENSE).
+Of Vulkan-Headers 1.4.357 (LICENSES/Apache-2.0.txt); MoltenVK 1.4.2 (LICENSE); SPIRV-Cross 6c09849fe88c (LICENSE); SPIRV-Tools 0d6fd73ca738 (LICENSE); Vulkan-Headers e3b1eec08173 (LICENSES/Apache-2.0.txt); cloud.google.com/go/auth v0.20.0 (LICENSE); cloud.google.com/go/auth/oauth2adapt v0.2.8 (LICENSE); cloud.google.com/go/storage v1.62.1 (LICENSE); github.com/containerd/cgroups/v3 v3.0.5 (LICENSE); github.com/containerd/fifo v1.1.0 (LICENSE); github.com/containerd/go-runc v1.1.0 (LICENSE); github.com/containerd/ttrpc v1.2.7 (LICENSE); github.com/google/btree v1.1.2 (LICENSE); github.com/google/subcommands v1.0.2-0.20190508160503-636abe8753b8 (LICENSE); google.golang.org/grpc v1.80.0 (LICENSE); k8s.io/api v0.32.3 (LICENSE); k8s.io/apimachinery v0.32.3 (LICENSE); k8s.io/client-go v0.32.3 (LICENSE); cel.dev/expr v0.25.1 (LICENSE); cloud.google.com/go v0.123.0 (LICENSE); cloud.google.com/go/compute/metadata v0.9.0 (LICENSE); cloud.google.com/go/iam v1.7.0 (LICENSE); cloud.google.com/go/monitoring v1.24.3 (LICENSE); github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp v1.31.0 (LICENSE); github.com/GoogleCloudPlatform/opentelemetry-operations-go/exporter/metric v0.55.0 (LICENSE); github.com/GoogleCloudPlatform/opentelemetry-operations-go/internal/resourcemapping v0.55.0 (LICENSE); github.com/cncf/xds/go v0.0.0-20251210132809-ee656c7534f5 (LICENSE); github.com/envoyproxy/protoc-gen-validate v1.3.0 (LICENSE); github.com/go-jose/go-jose/v4 v4.1.4 (LICENSE); github.com/go-logr/stdr v1.2.2 (LICENSE); github.com/go-openapi/jsonpointer v0.21.0 (LICENSE); github.com/go-openapi/jsonreference v0.20.2 (LICENSE); github.com/go-openapi/swag v0.23.0 (LICENSE); github.com/google/gnostic-models v0.6.8 (LICENSE); github.com/google/gofuzz v1.2.0 (LICENSE); github.com/google/s2a-go v0.1.9 (LICENSE.md); github.com/googleapis/enterprise-certificate-proxy v0.3.14 (LICENSE); github.com/moby/sys/mountinfo v0.7.2 (LICENSE); github.com/moby/sys/userns v0.1.0 (LICENSE); github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd (LICENSE); github.com/modern-go/reflect2 v1.0.2 (LICENSE); github.com/spiffe/go-spiffe/v2 v2.6.0 (LICENSE); go.opencensus.io v0.24.0 (LICENSE); go.opentelemetry.io/auto/sdk v1.2.1 (LICENSE); google.golang.org/genproto v0.0.0-20260319201613-d00831a3d3e7 (LICENSE); google.golang.org/genproto/googleapis/api v0.0.0-20260401024825-9d38bb4040a9 (LICENSE); google.golang.org/genproto/googleapis/rpc v0.0.0-20260401024825-9d38bb4040a9 (LICENSE); k8s.io/kube-openapi v0.0.0-20241105132330-32ad38e42d3f (LICENSE); k8s.io/utils v0.0.0-20241104100929-3ea5e8cea738 (LICENSE).
 
 ````text
                                  Apache License
@@ -509,6 +537,38 @@ Of MoltenVK 1.4.2 (LICENSE); SPIRV-Cross 6c09849fe88c (LICENSE); SPIRV-Tools 0d6
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
+````
+
+### MIT
+
+Of Vulkan-Headers 1.4.357 (LICENSES/MIT.txt); Vulkan-Headers e3b1eec08173 (LICENSES/MIT.txt).
+
+````text
+MIT License
+
+Copyright (c) 2015-2023 The Khronos Group Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+````
+
+### MIT
+
+Of venus-protocol 1.1.3 (vn_protocol_renderer_*.h).
+
+````text
+Copyright 2020 Google LLC
+Copyright 2022 Collabora Ltd.
+Copyright 2022 Google LLC
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ````
 
 ### MIT
@@ -1017,48 +1077,6 @@ the avoidance of doubt, this paragraph does not form part of the
 public licenses.
 
 Creative Commons may be contacted at creativecommons.org.
-````
-
-### Notice
-
-Of Vulkan-Headers e3b1eec08173 (LICENSE.md).
-
-````text
-Copyright 2015-2026 The Khronos Group Inc.
-
-Files in this repository fall under one of these licenses:
-
-- `Apache-2.0`
-- `MIT`
-
-Note: With the exception of `parse_dependency.py`, which is based on an
-external file, files using the `MIT` license also fall under `Apache-2.0`.
-Example:
-
-```
-SPDX-License-Identifier: Apache-2.0 OR MIT
-```
-
-Full license text of these licenses is available at:
-
-  * Apache-2.0: https://opensource.org/licenses/Apache-2.0
-  * MIT: https://opensource.org/licenses/MIT
-````
-
-### MIT
-
-Of Vulkan-Headers e3b1eec08173 (LICENSES/MIT.txt).
-
-````text
-MIT License
-
-Copyright (c) 2015-2023 The Khronos Group Inc.
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ````
 
 ### BSD-3-Clause
