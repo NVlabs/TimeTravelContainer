@@ -18,15 +18,17 @@ ownership.
 
 `creating`, `dehydrating`, `rehydrating`, and `restarting` are transient
 states. `failed` and `dead` report an interrupted or unrecoverable operation.
-Legacy `stopped` records are presented as `exited`.
+In a cluster, `corrupted` marks a branch whose live runtime, or the only copy
+of state it needs, was lost; only `rm` is permitted on it. Legacy `stopped`
+records are presented as `exited`.
 
 ## Operations and transitions
 
 | Command | Target scope | Transition |
 | --- | --- | --- |
 | `start FAMILY@BRANCH` | Branch | `created`/`exited` → `running` |
-| `pause FAMILY@BRANCH` | Branch | `running` → `paused` |
-| `resume FAMILY@BRANCH` | Branch | `paused` → `running` |
+| `pause TARGET` | Branch or family | `running` → `paused`; a family target pauses its running branches |
+| `resume TARGET` | Branch or family | `paused` → `running`; a family target resumes its paused branches |
 | `dehydrate TARGET` | Branch or family | `running`/`paused` → `dehydrating` → `dehydrated` |
 | `rehydrate FAMILY@BRANCH` | Branch | `dehydrated` → `rehydrating` → its pre-dehydration `running` or `paused` state |
 | `stop TARGET` | Branch or family | `running` → graceful exit/escalation → `exited`; `paused`/`dehydrated` → direct discard → `exited` |

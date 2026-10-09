@@ -1,13 +1,15 @@
 # TimeTravelContainer live container fork
 
-Status: implemented for the documented systrap and KVM scope; unsupported
-external resources are rejected by design.
+Status: implemented for the documented systrap and KVM scope, and since
+2026-09-26 on the native macOS HVF platform; unsupported external resources are
+rejected by design.
 
 The status and implementation notes in this document are current. Imperative
 language in the design and phase sections records the invariants used to build
 and review the implementation; it is not an uncompleted roadmap. Distributed
-fork and process-free dehydration are documented separately in
-[ttc_distributed_live_fork.md](ttc_distributed_live_fork.md) and
+fork and process-free dehydration are documented separately in the
+[snapshot-graph storage refactor](ttc_snapshot_graph_refactor.md), which
+superseded [ttc_distributed_live_fork.md](ttc_distributed_live_fork.md) and
 [ttc_userspace_extent_store.md](ttc_userspace_extent_store.md).
 
 Follow-on product, mount, volume, exec, attach/detach, image-management, and
@@ -42,7 +44,8 @@ latency rather than branch failure isolation.
    objects through the existing state object-graph machinery.
 5. Use an immutable image lower and a persistent `ttcvol` upper whose metadata
    roots fork in O(1); shared regular files split on first write using reflinks
-   or the explicitly enabled whole-file-copy fallback.
+   or, where they are unavailable, an automatic whole-file copy (an explicit
+   opt-in until `5de1eb4a3`, 2026-09-10).
 6. Reject unsupported resource creation in an eligible family. Retain a frozen
    pre-fork closure check as an invariant guard before mutation.
 7. Make failure atomic from the guest's perspective: failure may leave the
@@ -52,7 +55,10 @@ latency rather than branch failure isolation.
 ## Original local-fork non-goals
 
 These scoped the first local live-fork milestone. Persistence and cross-node
-fork were subsequently implemented by the documents linked above.
+fork were subsequently implemented by the documents linked above. The macOS HVF
+platform (2026-09-26) and GPU state with explicit fork semantics
+(`--gfx-fork`/`--nvproxy-fork`, 2026-09-30 and 2026-10-02; see
+[ttc_gpu_gfx_nvproxy.md](ttc_gpu_gfx_nvproxy.md)) came later.
 
 * Running branches of one family in different Sentry processes on one host.
 * Supporting ptrace or other gVisor platforms beyond systrap and KVM.
@@ -87,6 +93,12 @@ kernel metadata, pipe/socket buffers, and similar object data, but never
 saves every `MemoryFile`. Live fork needs a separate `Kernel.CloneMetadata()`
 path that invokes the state engine directly and supplies clone-specific
 contexts and completion hooks.
+
+(Superseded, 2026-10-02: `state.Clone` in `pkg/state/clone_unsafe.go` copies
+the graph in memory through the generated StateSave/StateLoad methods, with no
+encoding and no pipe (`b5abbf31a`); `Kernel.cloneStateGraph` uses it, and a
+batch fork's siblings copy one `state.Recording` of the first child
+(`e767d083c`).)
 
 ### Private application memory CoW
 
@@ -154,7 +166,11 @@ safely use the same `platform.Platform` concurrently.
 
 ## New top-level data structures
 
-Names are provisional, but ownership boundaries are not.
+Names are provisional, but ownership boundaries are not. (As built:
+`SandboxFamily` is in `runsc/boot/sandbox_family.go`, and
+`Kernel.LiveFork(ctx, LiveForkOptions) (*Kernel, error)`, `Kernel.LiveForkMany`,
+`LiveForkMetrics`, and `LiveForkResourceError` are in
+`pkg/sentry/kernel/live_fork.go`.)
 
 ```go
 // kernel package; not guest-visible.
@@ -219,6 +235,9 @@ TCP endpoints. All remaining package-global registries must still reject unless
 they can be proven Kernel-local.
 
 ### `pkg/state`
+
+(Superseded, 2026-10-02: `state.Clone` copies the graph without the wire
+format or a pipe; see [Object graph cloning](#object-graph-cloning).)
 
 Start without changing the wire format. Add a small `state.Clone` helper only
 if it materially simplifies error propagation between a streaming encoder and
@@ -302,6 +321,9 @@ whose physical backing is shared with another branch. On live fork:
 6. `breakCOWLocked` allocates new ranges, copies old bytes, replaces only this
    `regularFile.data` mapping, drops this branch's old reference, clears its CoW
    range, and invalidates other mappings of the file in this branch.
+
+(As built, the range set is `regularFile.cow`, which `prepareLiveFork` fills,
+and `copyOnWriteLocked` breaks it.)
 
 The cloned object graph preserves hard-link and FD aliasing: every reference in
 one branch points to that branch's `regularFile`; the other branch has a
@@ -414,6 +436,12 @@ ttc branches <sandbox>
 ttc pause|resume|destroy <sandbox>:<branch>
 ```
 
+(As built, the endpoints are `containerManager.ForkBranch` and
+`containerManager.ForkBranches` in `runsc/boot/controller.go`, and the CLI is
+`ttc fork CONTAINER@BRANCH [DEST...]`, `ttc ls --tree`, and
+`ttc pause|resume|rm TARGET`; see the
+[user guide](../user_guide/timetravelcontainer.md).)
+
 Do not claim OCI runtime compatibility for multiple branches until state
 directories and lifecycle semantics are designed. A later adapter can map a
 branch to an OCI-visible container ID while routing all operations to the same
@@ -442,7 +470,8 @@ bypassed its creation-time gate):
 | TTC virtual-NIC socket | Clone internal state; retain source proxy; reset external child TCP |
 | Host TCP/UDP/Unix socket outside the TTC proxy policy | Require a family-level live-fork waiver |
 | Writable or mutable gofer mount | Do not admit to an eligible family |
-| Host FD/device/external FUSE/GPU | Do not admit to an eligible family |
+| Host FD/device/external FUSE | Do not admit to an eligible family |
+| Virtual GPU (`--gfx`) or NVIDIA GPU (`--nvproxy`) | Admit only with `--gfx-fork`/`--nvproxy-fork` set to `device-lost` or `snapshot` (since 2026-09-30/10-02); otherwise require a family-level live-fork waiver |
 | In-sandbox `/dev/fuse` | Clone daemon, queues, filesystem state, and mmap cache |
 | AIO/io_uring/KCOV/packet mmap | Fail creation in an eligible family |
 | TTC-managed guest stdio | Clone |
@@ -467,7 +496,8 @@ The operation is serialized per source branch and follows this order:
 8. Allocate a child `Kernel` pre-seeded with the shared platform and memory-file
    context. It has no runnable task goroutines yet.
 9. Stream parent kernel metadata through `state.Save` -> `io.Pipe` ->
-   `state.Load(child)` using a clone-mode context.
+   `state.Load(child)` using a clone-mode context (since 2026-10-02,
+   `state.Clone` copies it without encoding).
 10. Clone-mode hooks acquire every child page reference, reattach explicitly
     shared immutable external objects, initialize runtime-only fields, and
     reject any object that escaped validation.
@@ -727,9 +757,12 @@ startup or teardown.
 
 An initial profile showed metadata dominating a bare-sandbox fork because the
 state wire codec performs many 1-10 byte operations and the prototype connected
-it directly to a synchronous `io.Pipe`. Live fork now places a bounded 64 KiB
-buffer at each side of the pipe; metadata remains streamed in memory without an
-unbounded full-state buffer or filesystem I/O.
+it directly to a synchronous `io.Pipe`. Live fork then placed a bounded 64 KiB
+buffer at each side of the pipe; metadata remained streamed in memory without an
+unbounded full-state buffer or filesystem I/O. (Superseded, 2026-10-02: a local
+live fork no longer encodes its metadata; `state.Clone` copies the graph
+directly, which cut a small Linux container's kernel metadata from 35-45 ms to
+13-19 ms (`b5abbf31a`).)
 
 One development-host snapshot (Intel Xeon Platinum 8488C, systrap, five bare
 forks) improved from about 9.25 ms/fork before buffering to 3.95 ms/fork after

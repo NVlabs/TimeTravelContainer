@@ -15,7 +15,10 @@ alone. Before marking them verified, rerun the complex stress workload under:
 
 - local systrap;
 - KVM;
-- an NFS-backed TTC data root;
+- an NFS-backed TTC data root (since 2026-09-27 a standalone daemon refuses
+  a root on a network filesystem unless started with
+  `--allow-network-filesystem-root`; a cluster's shared `TTC_ROOT` needs no
+  flag);
 - cooperating source and target daemons using remote fork; and
 - fork, pause/resume, dehydration/rehydration, daemon restart, and forced
   process-death combinations relevant to the change.

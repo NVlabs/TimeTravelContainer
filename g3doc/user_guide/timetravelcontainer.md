@@ -27,14 +27,18 @@ Docker, containerd, CRIU, KVM, and a containerd snapshotter are not required.
 TTC talks directly to OCI registries and stores image content under its own
 data root.
 
-The default `systrap` runtime needs no hardware virtualization. On a host that
-exposes a usable `/dev/kvm`, `ttc daemon start --platform=kvm` selects gVisor's
-KVM runtime for all containers owned by that daemon.
+On Linux, the default `systrap` runtime needs no hardware virtualization. On a
+host that exposes a usable `/dev/kvm`, `ttc daemon start --platform=kvm`
+selects gVisor's KVM runtime for all containers owned by that daemon. On macOS,
+the only runtime is `hvf`, which runs containers with Hypervisor.framework
+without booting a Linux VM.
 
 ## Host requirements
 
-TTC builds and runs on Linux x86-64 and ARM64. Build with the Bazel version in
-the repository's `.bazelversion` file (currently 8.3.1).
+TTC builds and runs on Linux x86-64 and ARM64, where it needs Linux 3.17 or
+newer (4.14.77 or newer for full network performance), and on Apple silicon
+Macs with macOS 15.0 or newer. Build with the Bazel version in the
+repository's `.bazelversion` file (currently 8.3.1).
 
 For a direct Debian or Ubuntu Bazel build, install the native and cross-build
 dependencies used by gVisor's canonical build image. In particular, `ttcd`
@@ -52,7 +56,9 @@ sudo apt-get install \
 `libc6-dev-i386` is needed on x86-64 hosts and may be omitted on ARM64. See
 `images/default/Dockerfile` for the canonical complete package list. A missing
 `bpf/bpf_endian.h` means `libbpf-dev` is absent; a missing `cc1plus` during an
-aarch64 VDSO build means the ARM64 cross-C++ package is incomplete.
+aarch64 VDSO build means the ARM64 cross-C++ package is incomplete. A macOS
+build uses Xcode's compilers and SDK; Bazel fetches everything else, MoltenVK
+among them.
 
 The normal rootless mode requires unprivileged user namespaces. Check the host
 before starting if desired:
@@ -70,15 +76,15 @@ so an apparently healthy daemon cannot defer this error until container launch.
 Directly launching `ttcd` performs the same preflight.
 
 The daemon also probes the node-local volume object store under `TTC_ROOT`
-(standalone) or `TTC_LOCAL_ROOT` (cluster mode) with `FICLONE`. Working
-reflinks are used automatically. When they are unavailable, TTC transparently
-copies a complete shared file on its first write after a fork. `ttc daemon
-status` reports the selected `volume_copy_mode`, data root, backing device, and
-filesystem type.
+(standalone) or `TTC_LOCAL_ROOT` (cluster mode) with `FICLONE`, or with APFS
+`clonefile` on macOS. Working reflinks are used automatically. When they are
+unavailable, TTC transparently copies a complete shared file on its first
+write after a fork. `ttc daemon status` reports the selected
+`volume_copy_mode`, data root, backing device, and filesystem type.
 
-For trusted local testing only, start the daemon with
-`--unsafe-no-host-isolation` to bypass the host user-namespace and chroot
-setup:
+For trusted local testing only, or inside another sandbox that forbids user
+namespaces, start the daemon with `--unsafe-no-host-isolation` to bypass the
+host user-namespace and chroot setup:
 
 ```shell
 ttc daemon start --unsafe-no-host-isolation
@@ -88,15 +94,17 @@ ttc run --rm busybox:1.36 echo hello
 macOS has no user namespaces. There `ttcd` instead confines itself, and every
 process it starts, with the macOS sandbox, Seatbelt: they keep all file and
 network access, but can open no devices, USB ones among them, and reach only the
-system services every process uses. `--unsafe-no-host-isolation` starts the
-daemon unconfined.
+system services every process uses. The GPU renderers of `--gfx` containers,
+which need the GPU, confine themselves to a narrower profile of their own
+instead. `--unsafe-no-host-isolation` starts the daemon unconfined, as it must
+inside another Seatbelt sandbox, where `ttcd` cannot apply its own.
 
 Isolation mode is fixed for the lifetime of that daemon. All ordinary commands
 inherit it, so do not repeat the flag on `run`, `exec`, or other operations.
 `ttc daemon status` reports `isolation_mode`, which is `rootless`, `seatbelt`
 on macOS, or `unsafe-no-host-isolation`, and `unsafe_no_host_isolation`. It
-also reports `runtime_platform`, which defaults to `systrap`. To use KVM
-instead:
+also reports `runtime_platform`, which defaults to `systrap`, and is `hvf` on
+macOS. To use KVM on Linux instead:
 
 ```shell
 test -r /dev/kvm && test -w /dev/kvm
@@ -141,8 +149,8 @@ make copy TARGETS="runsc/ttc runsc/ttcd" DESTINATION="$PWD/bin"
 ```
 
 This build path requires Docker only while compiling; Docker is not needed to
-run TTC. To build directly on the host with Bazel, from the gVisor repository
-root run:
+run TTC. It builds Linux binaries, also on a Mac. To build directly on the host
+with Bazel, as macOS binaries require, from the gVisor repository root run:
 
 ```shell
 bazel build //runsc/ttc:ttc //runsc/ttcd:ttcd
@@ -162,6 +170,9 @@ TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc"
 "$TTC" --help
 ```
 
+On macOS, `ttcd` starts only once signed with the Hypervisor entitlement, which
+Bazel's output lacks: install and sign it as below before `ttc daemon start`.
+
 ## Optional per-user installation
 
 Keep `ttc` and `ttcd` together so `daemon start` can locate and build-check its
@@ -174,6 +185,25 @@ install -m 0755 bazel-bin/runsc/ttc/ttc_/ttc \
 install -m 0755 bazel-bin/runsc/ttcd/ttcd_/ttcd \
   "$HOME/.local/bin/ttcd"
 ```
+
+On macOS, then sign the installed `ttcd` with the Hypervisor entitlement, which
+it checks as it starts:
+
+```shell
+codesign --force --sign - --entitlements runsc/hvf.entitlements \
+  "$HOME/.local/bin/ttcd"
+```
+
+`tools/ttc/install_macos.sh DIR` builds both binaries, installs them in `DIR`,
+and signs `ttcd`.
+
+Instead of building them, you can take both binaries from a daily
+[release](https://gitlab-master.nvidia.com/avr/TimeTravelContainer/-/releases),
+whose `ttc-linux-amd64.zip`, `ttc-linux-arm64.zip`, and `ttc-darwin-arm64.zip`
+each hold a `ttc` and `ttcd` to unpack side by side. The macOS `ttcd` is
+already signed, and its zip's `hvf.entitlements` signs it again if need be. On
+macOS, run `xattr -d com.apple.quarantine` on a zip that a browser downloaded
+before unpacking it.
 
 Add `$HOME/.local/bin` to `PATH` if necessary, then verify the installation:
 
@@ -211,7 +241,8 @@ The root must be on a local filesystem: `ttcd` refuses to start on NFS,
 Lustre, or another network filesystem, which does not keep the root's sockets,
 locks, and process state to one host, unless `ttc daemon start
 --allow-network-filesystem-root` insists. Unix socket paths are short, so the
-root's path may be at most 76 bytes long on macOS and 80 on Linux.
+root's path may be at most 76 bytes long on macOS and 80 on Linux, and that of
+a `--control-only` gateway (see below) 13 bytes less.
 
 Existing roots created before this format are deliberately not migrated; use
 a fresh directory. `TTC_DATA_ROOT`, `TTC_RUNTIME_DIR`, `--data-root`, runtime
@@ -239,12 +270,13 @@ local files are disposable caches or staging residue.
 The client locates the daemon by its root: `$TTC_LOCAL_ROOT/ttcd.sock` if
 `TTC_LOCAL_ROOT` is set, as on a node of a cluster, and otherwise
 `$TTC_ROOT/ttcd.sock`. `--daemon-socket` takes precedence for one invocation,
-except for `daemon start`. The client reads nothing else of either root. Help,
-shell completion, argument validation, and `ttc --version` are client-local and
-work without a daemon. Ordinary CLI operations require the client and daemon
-build IDs to match exactly; `daemon stop` remains available as the
-version-independent recovery operation. SDK and MCP clients negotiate the public
-API and features instead of asserting a CLI build ID.
+except for `daemon start`. The client uses nothing else of either root but
+`ttcd.log`, which `daemon start` opens for the daemon. Help, shell completion,
+and `ttc --version` are client-local and work without a daemon; the daemon
+validates each command's arguments. Ordinary CLI operations require the client
+and daemon build IDs to match exactly; `daemon stop` remains available as the
+version-independent recovery operation. SDK and MCP clients name `ttcd`'s API
+version, which must match exactly, instead of a CLI build ID.
 
 ## Images
 
@@ -282,10 +314,11 @@ sequences. `ttc pull -q` suppresses progress and prints only the digest.
 `--pull missing` is the fastest offline path after the first pull.
 
 `ttc load` reads a Docker-save or OCI archive from standard input by default;
-`-i/--input` names a daemon-host file. It restores every tag in the archive
-that matches the selected `--platform`. `ttc save` writes a Docker/OCI archive
-to standard output by default; `-o/--output` names a daemon-host file. Both
-commands also work as `ttc image load` and `ttc image save`:
+`-i/--input` names a file on the client's host. It restores every tag in the
+archive that matches the selected `--platform`. `ttc save` writes a Docker/OCI
+archive to standard output by default; `-o/--output` names a file on the
+client's host. Both commands also work as `ttc image load` and `ttc image
+save`:
 
 ```shell
 docker save tools:latest | ttc load
@@ -477,11 +510,13 @@ gateway, and its holder with it; use `ttc node stop` to retire a compute node.
 Run one gateway per cluster.
 
 HTTP control requests use the single TCP port named by `--listen` and
-`--advertise`; page-transfer listeners are ephemeral per operation. Cluster-wide paging, lease, transaction, and automatic-rebalance
-policy is created once, by the cluster's first node, and adopted by later ones;
-a node started with a different policy has the authority adopt it when it holds
-the authority. Node names, addresses, local memory targets, and
-capacity-provider hooks remain node-local settings.
+`--advertise`; page-transfer listeners are ephemeral per operation.
+Cluster-wide paging, lease, transaction, and automatic-rebalance policy is
+created once, by the cluster's first node, and adopted by later ones; a node
+started with a different policy has the authority adopt it when it holds the
+authority, but then fails to start while any node holds a live execution
+lease. Node names, addresses, local memory targets, and capacity-provider hooks
+remain node-local settings.
 
 Node names default to their hostnames. Admission checks connectivity in both
 directions between the candidate and every current member before it
@@ -652,12 +687,23 @@ Its persistent root filesystem, volumes, ancestry, and copy-on-write sharing
 with siblings are unchanged.
 
 TTC tracks page versions across the entire family. Memory that must survive
-without a resident owner is stored in immutable, content-addressed files of up
-to 1 MiB in the TTC data root. Resident sharing and write-time CoW remain
-4 KiB-granular. If an active peer still shares a page, TTC can keep that page
-resident; when the peer first writes, TTC preserves the old version for the
-dehydrated branch. Rehydration loads complete 1 MiB chunks on demand and
-installs their constituent pages with their existing CoW identities.
+without a resident owner is stored in immutable files of up to 1 MiB in the
+TTC data root. Resident sharing and write-time CoW remain 4 KiB-granular. If
+an active peer still shares a page, TTC can keep that page resident; when the
+peer first writes, TTC preserves the old version for the dehydrated branch.
+Rehydration loads complete 1 MiB chunks on demand and installs their
+constituent pages with their existing CoW identities.
+
+A standalone daemon defers that durable write while another branch of the
+family is live on the node: the dehydrated branch's capture stays in the
+family's Sentry, and JSON inspection reports its `storage_state` as
+`resident`. TTC makes the capture durable when the family's last live branch
+on the node is dehydrated, stopped, or removed, or exits; before the branch is
+forked; at `ttc wait --condition durable`; and when the daemon stops with
+`--dehydrate-all`. Until then, losing the runtime loses the capture as it
+loses a running branch: the branch becomes exited, and starting it boots it
+from its filesystem. A daemon of a cluster makes every dehydration durable at
+once.
 
 For a distributed child that still has a live source dependency, dehydration
 first makes each required chunk durable in the shared repository. It then
@@ -697,7 +743,7 @@ ttc restore --name recovered web-test-a.ttc
 Checkpoint accepts either a running or paused branch. TTC briefly creates a
 private, paused in-memory fork, resumes the source, and serializes the private
 snapshot. The potentially slow file write therefore does not keep a running
-source paused. The private branch is removed after the archive is complete and
+source paused. The private branch is removed once its state is saved and
 does not appear in the family tree. Consequently, the selected family must be
 live-fork eligible. If the private fork fails operationally, TTC leaves the
 source unchanged and returns the same diagnostic used by `ttc fork`.
@@ -853,15 +899,16 @@ TTC runs only its trusted copy helper while the branch's existing tasks remain
 paused.
 For a dehydrated branch, TTC mounts its persistent filesystem directly and
 does not rehydrate or change the branch state.
-For an exited branch, TTC launches a short-lived helper Sentry whose process is
-the donated TTC copy helper, mounts the immutable image lower plus the selected
-persistent `ttcvol` rootfs/volume branch, and exits when the copy completes.
-It neither launches the image entrypoint nor restores process memory. TTC
-rejects offline access to one exited child while another branch in the same
-family remains live, because two Sentries would otherwise cache one repository
-concurrently. A copy process temporarily owns host stream FDs; `ttcd` therefore
-serializes copy operations with lifecycle mutations such as fork, pause, stop,
-and branch removal.
+For an exited branch, as for a dehydrated one, TTC launches a short-lived
+helper Sentry whose process is the donated TTC copy helper, mounts the
+immutable image lower plus the selected persistent `ttcvol` rootfs/volume
+branch, and exits when the copy completes. It neither launches the image
+entrypoint nor restores process memory. Other branches of the family may
+remain live meanwhile. In a cluster, a dehydrated or exited branch whose state
+has been published to the shared root can only be copied from; rehydrate or
+start it to copy into it. A copy process temporarily owns host stream FDs;
+`ttcd` therefore serializes copy operations with lifecycle mutations such as
+fork, pause, stop, and branch removal.
 
 ## Commit, diff, and resource accounting
 
@@ -907,9 +954,10 @@ reported at TTC's immutable file-object boundary, while durable memory backing
 is reported from still-present sparse chunk objects.
 
 JSON inspection reports storage separately from lifecycle. `storage_state` is
-`local`, `publishing`, `shared`, `materializing`, or `error`; publication
-errors include retry details. This lets an orchestrator use a branch as soon
-as local capture finishes while independently waiting for shared durability:
+`local`, `resident`, `publishing`, `shared`, `materializing`, or `error`;
+publication errors include retry details. This lets an orchestrator use a
+branch as soon as local capture finishes while independently waiting for
+shared durability:
 
 ```shell
 ttc wait --condition durable web@test-b
@@ -957,9 +1005,10 @@ ttc volume inspect database
 
 `-v /work` creates an anonymous volume. The long form is
 `--mount type=volume,source=database,target=/var/lib/db,readonly`; omit
-`source` for an anonymous volume. A newly created volume is initialized from
-the image directory at its mount destination. Add `volume-nocopy` (or
-`nocopy` in `-v` syntax) to start empty. Image `VOLUME` declarations create
+`source` for an anonymous volume. A volume that a container's mount creates is
+initialized from the image directory at its mount destination;
+`ttc volume create` makes an empty one. Add `volume-nocopy` (or `nocopy` in
+`-v` syntax) to start empty. Image `VOLUME` declarations create
 anonymous volumes automatically when no explicit mount overrides them.
 
 Writes go directly to opaque regular files beneath the TTC data root. On live
@@ -969,9 +1018,10 @@ filesystem performs extent CoW. Stop/start reopens the same repository; there
 is no tar export/import. `ttc rm -v` also removes anonymous volumes, while
 named volumes remain until `ttc volume rm`.
 
-The daemon uses `FICLONE` when available and otherwise automatically selects
-whole-file copying on the first write after each fork. See the
-[disk-backed volume design](../proposals/ttc_disk_backed_volumes.md).
+The daemon uses `FICLONE` (on macOS, APFS `clonefile`) when available and
+otherwise automatically selects whole-file copying on the first write after
+each fork. See the
+[snapshot-graph storage design](../proposals/ttc_snapshot_graph_refactor.md).
 
 One named volume may have one writable container family at a time. TTC rejects
 a second writable attachment because separate Sentry namespace caches are not
@@ -1029,7 +1079,7 @@ the container. Both files and directories are supported.
 
 ## Networking and resource limits
 
-TTC exposes three network modes:
+TTC exposes three network modes; macOS provides only `none` and `ttc`:
 
 ```shell
 --network none       # loopback-only netstack; forkable and the default
@@ -1096,9 +1146,11 @@ curl http://127.0.0.1:8080/
 
 Accepted forms are `HOST_PORT:CONTAINER_PORT` and
 `HOST_IP:HOST_PORT:CONTAINER_PORT[/tcp]`. Host addresses and published ports are
-currently IPv4/TCP only. A published listener belongs to the daemon receiving
-the command and lasts until it is unpublished or that daemon stops. In a
-cluster, it routes new connections to the branch's current owner, so the same
+currently IPv4/TCP only. A standalone daemon records the binding with the
+container and recreates its listener whenever the branch runs again, including
+after a daemon restart. In a cluster, a published listener belongs to the
+daemon receiving the command and lasts until it is unpublished or that daemon
+stops. It routes new connections to the branch's current owner, so the same
 host address continues working after migration. Existing connections can be
 interrupted during migration. This does not create an all-node guest network
 or DNS service.
@@ -1114,9 +1166,10 @@ ttc port unpublish web@child 127.0.0.1:8082:80
 ```
 
 `publish`, `unpublish`, and `port ls` all require a full branch selector.
-Run `ttc port ls --json` against the publishing daemon to inspect its local
-listeners. Publish them again after a daemon restart. Publishing the same
-branch on another node creates an independent ingress listener there.
+In a cluster, run `ttc port ls --json` against the publishing daemon to
+inspect its local listeners, and publish them again after that daemon
+restarts. Publishing the same branch on another node creates an independent
+ingress listener there.
 
 Live-fork policy deliberately distinguishes internal from external flows:
 
@@ -1149,8 +1202,9 @@ not implement the Docker Engine network API, named networks, or inter-family
 virtual switching.
 
 PID and Sentry-enforced limits work without host cgroups where possible.
-Hard CPU and memory limits require a writable delegated cgroup-v2 subtree; TTC
-fails before start when the requested enforcement is unavailable.
+Hard CPU and memory limits require a writable delegated cgroup-v2 subtree,
+which macOS does not have; TTC fails before start when the requested
+enforcement is unavailable.
 
 ## Daemon operation and recovery
 
@@ -1163,12 +1217,14 @@ ttc daemon status
 ttc daemon stop
 ```
 
-One daemon uses one runtime platform and one isolation mode across every data
-root it serves. Start it without an option for systrap and normal rootless host
-isolation, use `ttc daemon start --platform=kvm` when `/dev/kvm` is available,
-or use
+One daemon uses one runtime platform and one isolation mode for all of its
+containers. On Linux, start it without an option for systrap and normal
+rootless host isolation, use `ttc daemon start --platform=kvm` when `/dev/kvm`
+is available, or use
 `ttc daemon start --unsafe-no-host-isolation` for trusted workloads on a host
-that cannot create an unprivileged user namespace. An explicit start request
+that cannot create an unprivileged user namespace. On macOS, the platform is
+`hvf`, and the daemon confines itself with Seatbelt unless started with
+`--unsafe-no-host-isolation`. An explicit start request
 does not reconfigure an already-running daemon; stop it first if you want to
 change modes. `daemon status` returns the active platform and isolation mode in
 JSON.
@@ -1177,7 +1233,7 @@ Durable mutation records can be inspected with `ttc daemon requests` after an
 interrupted operation.
 
 `ttc daemon stop` refuses to exit while any branch is running, paused,
-dehydrating, or rehydrating. Choose the desired policy explicitly:
+restarting, dehydrating, or rehydrating. Choose the desired policy explicitly:
 
 ```shell
 ttc daemon stop --dehydrate-all  # hibernate every live branch, then exit
@@ -1215,7 +1271,7 @@ bazel build //runsc/ttc:ttc //runsc/ttcd:ttcd \
   //runsc/ttc/test:e2e_image_matrix
 
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
-RUNSC="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
+TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
   "$PWD/runsc/ttc/test/e2e_image_matrix.sh"
 ```
 

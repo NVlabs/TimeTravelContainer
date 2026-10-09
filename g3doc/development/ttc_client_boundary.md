@@ -14,12 +14,13 @@ theirs, before creating runtime or storage state.
 
 The official CLI includes its build ID on daemon requests. A mismatch rejects
 every operation except the minimal `daemon stop` escape hatch. SDKs and MCP
-clients instead negotiate API version and the `features` returned by `ping`.
+clients instead send only the public API version, which must equal `ttcd`'s,
+and inspect the `features` returned by `ping`.
 
 ## Size and dependency qualification
 
-Measured on Linux/amd64 with the same repository Bazel configuration and
-stripped static output:
+Measured at the split (`13116fd32`, 2026-09-06) on Linux/amd64 with the same
+repository Bazel configuration and stripped static output:
 
 | Build | `ttc` size |
 | --- | ---: |
@@ -31,7 +32,9 @@ The split removes 93.26% of the client binary (14.84x smaller). A Bazel
 `//runsc/boot`, `//runsc/sandbox`, `//runsc/ttc/cmd`,
 `//runsc/ttc/bundle`, or `//runsc/ttc/images`. The client target depends only
 on its local client package, TTC version metadata, the Go standard library,
-and terminal support.
+and terminal support. Since `81e23dba4` (2026-09-16) it also depends on
+`//runsc/ttc/protocol`, the dependency-free wire contract and root layout it
+shares with `ttcd`.
 
 The end-to-end scripts stage matching `ttc` and `ttcd` siblings and export an
 explicit `TTC_ROOT`, and `TTC_LOCAL_ROOT` for a node of a cluster, which both

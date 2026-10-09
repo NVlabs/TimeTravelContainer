@@ -2,10 +2,10 @@
 
 ## Status and scope
 
-This document is the implementation plan for the next TTC data-root format. It
-consolidates the recent standalone-storage, distributed authority, remote
-paging, dehydration, reference-counting, and garbage-collection decisions into
-one design.
+This document is the implementation plan, now implemented, for the current TTC
+data-root format. It consolidates the recent standalone-storage, distributed
+authority, remote paging, dehydration, reference-counting, and
+garbage-collection decisions into one design.
 
 The refactor is intentionally incompatible with existing TTC data roots. It
 introduces standalone root format 2 and clustered root format 5. TTC will not
@@ -24,6 +24,18 @@ Those paths now contain short historical pointers instead of obsolete storage
 designs. The cluster-wide Raft control-plane principle remains: one Raft group
 governs the cluster, and bulk data never enters its log.
 
+> **Superseded in part (2026-09-29, `d5173e1e4`):** the cluster's authority is
+> no longer a Raft group. The node that holds it keeps its state as a log in
+> the shared root, one directory per epoch (`cluster/authority/<epoch>`); other
+> nodes keep no copy and send it their requests, and another node takes the
+> authority over, in a new epoch, when its holder stops or stalls. Where this
+> document says Raft, read the cluster authority, and for Raft terms, its
+> epochs. It keeps the same kinds of state, and bulk data still never enters
+> it, but voters, learners, quorum, and the port that multiplexed Raft with the
+> control plane are gone. See the cluster section of the
+> [user guide](../user_guide/timetravelcontainer.md) and the superseded
+> [Raft control-plane proposal](ttc_raft_control_plane.md).
+
 ## Milestone ledger
 
 This table records landed milestones. Completion is governed by the audited
@@ -33,7 +45,7 @@ or unverified phase gate.
 | Phase | Status | Landed milestones | Remaining gate |
 | --- | --- | --- | --- |
 | 0: specification and boundary | complete | Plan committed in `15705aec7`; strict root recognition and the destructive format boundary landed in `5de1eb4a3`. A two-node 100-cycle run/fork/exec/delete baseline records flat first/last-decile medians of 1.228/1.159 seconds after removing Raft replay history from authority reads. Local, NFS, nested, lifecycle, and residue baselines are recorded below. | Gate passed; Lustre remains an external-filesystem qualification item because no client or mount was available on the qualification hosts. |
-| 1: version/API/config cleanup | complete | Standalone format 2 and clustered format 5 are enforced; writable repositories moved behind repository format 3 in `90b336ae9`; reflink is optional with automatic whole-file fallback. Marked roots no longer synthesize omitted branch/filesystem/storage/eligibility metadata or search visible-name memory layouts. The client does not inspect either current or legacy root variables, including while launching its sibling daemon. The executable grammar, completion, SDKs, MCP, and protocol document agree on API 9 and storage schema `snapshot-graph-v2`; removed root/runtime options occur only in rejection tests and explanatory documentation. The stripped static client is 2.8 MiB and depends only on `//runsc/ttc/client`, versus the recorded 41.32 MiB monolith. | Gate passed. |
+| 1: version/API/config cleanup | complete | Standalone format 2 and clustered format 5 are enforced; writable repositories moved behind repository format 3 in `90b336ae9`; reflink is optional with automatic whole-file fallback. Marked roots no longer synthesize omitted branch/filesystem/storage/eligibility metadata or search visible-name memory layouts. The client does not inspect either current or legacy root variables, including while launching its sibling daemon. The executable grammar, completion, SDKs, MCP, and protocol document agree on API 9 (the daemon and CLI moved to API 10 in `ba1c3c256`, 2026-09-16, and the SDKs, MCP, and protocol document followed on 2026-10-09) and storage schema `snapshot-graph-v2`; removed root/runtime options occur only in rejection tests and explanatory documentation. The stripped static client is 2.8 MiB and depends only on `//runsc/ttc/client`, versus the recorded 41.32 MiB monolith. | Gate passed. |
 | 2: common graph | complete | Persistent IDs, bounded persistent radix/B-trees, WAL/checkpoints, explicit roots/pins, exact hierarchical references, cascading GC, physical-path-free inspection, and graph-native 1 MiB memory records are present. Root transactions are reopened at every possible journal prefix; generation switching is tested on both sides of the atomic head publication and fails closed on incomplete published state. Bulk installation validates exact physical lengths and reconciliation removes unpublished temporaries and uncommitted complete objects. A 1,000-step mutation/fork/checkpoint/reopen model independently recomputes every edge/root/pin count after each operation and drains all unreachable objects; it found and fixed duplicate-child undercounting. A second randomized graph-backed filesystem model exercises forks, whole-file CoW writes, hardlinks, open-unlink/reap, rename/name reuse, branch deletion/GC, and repository reopen, supplementing the focused path-copy, mmap-memory, xattr, whiteout, and crash tests. | Gate passed. |
 | 3: standalone filesystem/images | complete | Directory import (`2e3ec8092`), managed/rootfs repository graph conversion (`8da8fc220`), ancestry-independent direct lookup with authoritative diff roots (`edf392cb9`), and Sentry-safe descriptor-relative graph/object mutation (`2146eaff3`) have landed. A real commit/save/remove/load/recreate sequence preserved image labels, rootfs changes, and whiteout deletions. Selected whole-file CoW, hardlink/orphan, interrupted publication, and 131-cycle fork/delete/GC tests pass directly on NFSv4.2 with no `.nfs*` residue. TTC no longer overlays its persistent rootfs `/tmp` with anonymous tmpfs, so offline branch operations see it; `/dev/shm` and explicit tmpfs mounts remain memory-backed. The complete managed-volume matrix now verifies graph-backed rootfs, writable host views, detached directory and single-file `:copy` mounts, named volumes, checkpoint/restore, offline `cp`, nested forks, and zero tar persistence against the current physical layout. The public-image matrix passes with BusyBox, Alpine, Python, nginx, and Redis while exercising writable volumes, host views, tmpfs CoW, networking, branch deletion/name reuse, and daemon/console recovery. Strict-root qualification found and fixed initial published ports retaining the legacy empty spelling for `main` (`13d0f808c`). Logical filesystem WAL records, derived reference indexes, eager path-local GC, batched branch summaries, and durability-ordered graph publication now keep metadata mutation cost and live graph size bounded (`8933c2257`). Exact reclaimed bulk identities are now retired behind the same graph durability fence instead of waiting for a full-store scan; a 1,100-generation rename-replacement workload retained one live payload and a sub-megabyte current WAL. That workload also exposed and fixed the Sentry filter omission that killed the runtime on its first bounded graph checkpoint. A real `fuse-overlayfs` mount exposed and fixed missing `FUSE_DONT_MASK` negotiation and Linux negative-lookup semantics; its daemon, mount, reads, and divergent writes now survive live fork and dehydrate/rehydrate. Ordinary mutations now coalesce a bounded live metadata tail, reserve and publish whole-file objects in groups, and apply sorted multi-key B-tree edits by copying each touched node once. Explicit transient-subtree, replay/reference, repository, and real Rocky RPM tests cover the new path. | Gate passed. |
 | 4: standalone memory/lifecycle | complete | Dehydration writes cold state into 1 MiB graph objects with independent 4 KiB page identities and versions (`061371505`); direct graph reads (`a72e461e4`) and standalone graph-root rehydration (`1c570928f`) are active; live and dehydrated forks clone only radix-root references. Standalone control roots and persistent cold data are graph-only, including peer rehydration and dehydrated fork, and standalone no longer runs the clustered publication/cache layer (`0790edf2c`). Direct daemon/Sentry graph capture (`8d464de75`) removes the transient compatibility repository. Branch pointer replacement, crash-root reconciliation, empty-origin collection, and bounded WAL compaction landed in `6df3827e7`; capture payload buffering is bounded to one logical chunk in `a04462c29`. A real lifecycle run preserved a 24 MiB `/dev/shm` object and disk-backed `/tmp` across dehydrate/rehydrate and dehydrated fork, verified branch divergence, stopped paused and dehydrated branches without resuming them, and reclaimed every bulk object. Large final-release WALs now compact synchronously at the existing 8 MiB bound rather than waiting five minutes for maintenance. Cold-memory stats now traverse immutable graph identity rather than inferring usage from the compatibility chunk repository. New dehydration always requires the graph store; cluster publication readiness, export, cleanup, cold materialization, relay setup, and rehydration reject graphless or legacy-manifest records. The old cold-memory pack reader, inherited-chunk scanner, packed export/restore CLI, kernel loader, relay fields, and local/peer legacy restore branches have been removed; stopped-branch bootstrap is graph-backed too. The public-image matrix additionally passes daemon hard-restart reconciliation, active attached and detached exec sessions cloned through multiple forks, Sentry-managed secondary network namespaces, sockets, tmpfs CoW, PID limits, and bounded console state. Stable PageID reuse and bounded graph collection landed in `10c9d554f`; grouped radix construction landed in `7b4b70c56`. A 256-sibling run dirtied a distinct 4 KiB `/dev/shm` page in every child, dehydrated and rehydrated alternating siblings, verified every private value, and reclaimed every bulk object. | Gate passed. |
@@ -42,7 +54,7 @@ or unverified phase gate.
 | 7: peer data/publication | complete | Transaction-fenced peer memory and filesystem range services are active, target writes remain local, and publication/dependency byte accounting is exposed. Filesystem handoff and cold publication use origin-indexed graph roots; no flattened metadata-pack bootstrap remains. A migrated source remains a paused, transaction-fenced sparse provider until target independence. Memory reader replacement and filesystem materialization are asynchronous, status-observable operations; source release waits for both while unrelated controls and lease renewal remain live. Donated nonblocking streams retry `EAGAIN`, close with `shutdown` so blocked polls wake, and use `CLOEXEC` so systrap helpers cannot inherit authority. A three-voter source-loss test kills a node while 256 MiB remains demand-backed: the surviving quorum stops and marks only the dependent branch corrupted, retains an unrelated branch as executable, and permits terminal cleanup. Return-hop repository aliasing (`8f363e05c`) and inherited-dependency settlement (`bac918837`) make repeated A-to-B-to-A-to-B handoffs terminate without retaining obsolete source authority. Chained handoff now retains an upstream asynchronous page loader for as long as any downstream snapshot can fault it (`3658b4925`); without that ownership, destroying the intermediate source Kernel could cancel the only reader while its graph pages remained valid and pinned. The focused unit test and a 64-branch A-to-B-to-A retirement reproduce the ownership chain and pass. | Gate passed, including shaped-NFS multihop, source-loss fencing, drain restart, repeated migration, and chained-provider retirement. |
 | 8: distributed references/GC | complete | The cluster authority format has a monotonically fenced, expiring shared-GC coordinator lease. Shared snapshot readers take directory leases; retirement records permanent Raft fencing before physical deletion and rolls crash residue forward. The owner-ledger engine imports parent edges once, applies idempotent named roots/incoming edges, and cascades exact zero-count collection. Provider-to-shared publication establishes a baseline, applies the ordered mutation suffix, and changes routing only after the final barrier. The elected ledger is disposable node-local state: each new lease generation rebuilds it from committed shared manifests, cold roots, and incarnation-bound reference inventories from every live node. Inventories include all unreleased intent groups; claim acknowledgement and durable intent update share one serialization boundary. Candidate roots are recorded in Raft before publication and cannot be retired while a transaction can still publish them. Shared packs now expose canonical manifest enumeration and compact partially live data without changing object IDs. Cold filesystems are graph roots whose immutable origin packs preserve cross-generation CoW identity; flattened filesystem delta packs and manifest-parent chains are no longer used. Canonical repository restore identities survive multi-hop imports, while publication freezes every reachable volatile origin and transfers its ordered reference suffix before Raft redirects it to shared storage. Release intents remain durable and reserve their roots while a coordinator lease turns over; branch removal may continue, but node retirement is fenced until the successor coordinator consumes every pending release. Joining admission synchronously reconciles ready learners into the bounded voter set, and long-running fenced operations use their transactional deadlines instead of a shorter HTTP write timeout. Wide ledger transfers are committed through bounded, atomic journal chunks, and replay discards every import lacking its final commit record. Cold filesystem and memory fault relays now run independently of the control daemon. A shaped-NFS test published two successive generations, rehydrated them on different nodes, restarted the complete control plane, read previously untouched files and tmpfs pages, removed the live family without NFS tombstones, and recovered an offline Raft member that had already been removed from the active configuration. A three-voter crash test kills the elected coordinator, waits through Raft/lease turnover, rebuilds the ledger from durable claims, publishes a second-generation filesystem graph, forks it back across the cluster, validates memory and filesystem state, and removes the family successfully. A 64-branch cross-phase release run under the same NFS shaping exercised two batch forks, private-page divergence, 32 live migrations during retirement, final family removal, GC lease turnover, and full-cluster restart with zero graph-pack residue. | Gate passed. |
 | 9: elastic integration | complete | Existing scheduler/Raft groundwork predates this storage refactor. The lease heartbeat recognizes hidden imports and visible-before-placement publication through a nonterminal, target-incarnation-bound transaction. Completed history is retired after placement removal, node-local family state is reclaimed when unowned, and authority reads exclude replay-only history. Ordinary heartbeats compute an exact logical execution-grant set entirely from linearizable Raft state; they touch Sentry state only when a prior grant is revoked, so demand faults cannot starve lease renewal while revocations remain fail-closed. A 100-cycle two-node fork/exec/delete test retained zero transactions, placements, branches, and local family directories with flat latency. The three-node elastic lifecycle now covers join/promotion, A-to-B remote fork, runtime quarantine, B-to-C migration with quarantine preserved, scheduler-selected evacuation of A, execution-state validation after retirement, and family deletion during shared-GC lease turnover. Owner-local node stop renews in the current Raft term before cordoning, eliminating the former failover race. Raft renewals now derive `ready`/`pressured` in the same committed command as the memory sample; this fixed clustered nodes remaining ready above their target. A three-node, eight-branch stress retained independently dirtied tmpfs data, crossed the source target, moved a CoW-aware branch group across the accepting nodes, and validated every branch and its `/dev/shm` contents afterward. Resident accounting now enumerates linked and unlinked tmpfs/shmem files independently of task VMAs and deduplicates them against mapped pages by physical MemoryFile plus stable version. Fixed-size 256-version bitmaps bound the planner wire representation when concurrent sibling CoW faults interleave allocator sequences. The node incarnation identifies the exclusively locked local-root epoch rather than a daemon PID. Killing a drain after its durable intent, restarting the daemon, adopting its host-stopped Sentries, evacuating all eight branches, automatically stopping, deleting the retired local root, and executing every branch on its new owner passes. | Gate passed. |
-| 10: removal/qualification/docs | complete | The pathname-backed `application.mem` startup sweeper, packed remote/dehydration formats, pre-tiered promoted-repository namespace, and visible-branch-name memory-directory promotion have been deleted. New-format deletion no longer scans or removes obsolete packed snapshot names. The focused unit matrix, public-image matrix, standalone storage/TTY/FUSE/image round trips, 256-way hydration fan-out, distributed/elastic scripts, unprivileged Docker nesting, and TTC-in-TTC nesting pass. Complete-cluster restart no longer requires a particular service order: existing members remain available while quorum reforms, and a member removed while offline idempotently rejoins as a learner through its configured seed before admission. Immutable publication identities and the clustered restart/rehydration race test ensure a late publication cannot overwrite or unplace a newer execution incarnation (`a0f825799`, `d20ee608e`). Current 2.8 MiB `ttc` and 97 MiB `ttcd` static binaries are rebuilt under `/home/zizhengg/timetravel/bin` during final qualification. | Implementation and available-host qualification are complete. A real Lustre mount remains unavailable and is the sole external qualification item. |
+| 10: removal/qualification/docs | complete | The pathname-backed `application.mem` startup sweeper, packed remote/dehydration formats, pre-tiered promoted-repository namespace, and visible-branch-name memory-directory promotion have been deleted. New-format deletion no longer scans or removes obsolete packed snapshot names. The focused unit matrix, public-image matrix, standalone storage/TTY/FUSE/image round trips, 256-way hydration fan-out, distributed/elastic scripts, unprivileged Docker nesting, and TTC-in-TTC nesting pass. Complete-cluster restart no longer requires a particular service order: existing members remain available while quorum reforms, and a member removed while offline idempotently rejoins as a learner through its configured seed before admission. Immutable publication identities and the clustered restart/rehydration race test ensure a late publication cannot overwrite or unplace a newer execution incarnation (`a0f825799`, `d20ee608e`). The then-current 2.8 MiB `ttc` and 97 MiB `ttcd` static binaries were rebuilt under `/home/zizhengg/timetravel/bin` during final qualification (2026-09-13). | Implementation and available-host qualification are complete. A real Lustre mount remains unavailable and is the sole external qualification item. |
 
 ## Audited phase gates
 
@@ -332,6 +344,22 @@ request neither repeats target-local work nor loses the committed transition.
 This test also exposed and closed a migration-specific ordering hole: physical
 publication and a replayed Publish remain paused until Raft has committed the
 placement cutover.
+On 2026-10-09, two later defects were fixed. The filesystem B-tree batch
+builder had replaced any one-child inner node by its child, so leaves drifted
+to different depths; a Bazel build in an Ubuntu container grew its root
+filesystem's inode tree to 68 levels, past the 64-level walk limit, and every
+lookup failed. The builder now replaces only a one-child root, so every leaf
+stays at one depth; a tree whose leftmost or rightmost leaf is deeper than 16
+is rebuilt with its next write, and walks admit 256 levels so that older
+unbalanced volumes still open. Balanced mutations are journaled with a new
+operation, and older journal records replay unbalanced, as they were made
+(`0683afde6`). Separately, a repository's cache of branch pointers trusted a
+file's identity, size, and modification time, which another process's rewrite
+within one clock tick could preserve, so a Sentry's fence after a fork could
+write back its pre-fork pointer, whose working origin the fork had sealed.
+Writers now count pointer writes in the repository lock file, and the lock's
+holder forgets its cached pointers when another process wrote one since it
+last held the lock (`47841de04`).
 
 ## Goals
 
@@ -648,28 +676,31 @@ agreed boundaries:
 
 * `ttc` remains a thin client. CLI grammar, help, completion, and version
   output are local to the client. Only `ttcd` interprets `TTC_ROOT` or
-  `TTC_LOCAL_ROOT`; `ttc` uses them only to find the daemon's socket.
+  `TTC_LOCAL_ROOT`; `ttc` uses them only to find the daemon's socket and
+  startup log.
 * The daemon's root, `TTC_LOCAL_ROOT` on a node of a cluster and otherwise
   `TTC_ROOT`, holds the client/daemon Unix socket, with `--daemon-socket`
   taking precedence. Official client requests require an
   exact daemon build match, except the stable minimal `daemon stop` request.
   SDKs and MCP negotiate API features rather than build identity.
-* Cluster nodes use one multiplexed TCP listener for Raft and TTC peer/control
-  traffic. The trust model is an isolated high-performance private network,
+* Cluster nodes use one TCP listener for TTC peer/control traffic (until
+  2026-09-29 it also carried Raft); page-transfer listeners are ephemeral per
+  operation. The trust model is an isolated high-performance private network,
   optionally authenticated by `TTC_CLUSTER_TOKEN`; this phase does not add TLS.
 * `run`, `start`, `restore`, `rehydrate`, and `fork` accept optional `--node`.
   Omission delegates placement to the daemon. `--target` does not return.
-* `ttc node stop NODE` performs node retirement and accepts exactly one of
-  `--migrate-all`, `--dehydrate-all`, or `--stop-all`. Distributed
+* `ttc node stop NODE` performs node retirement and accepts at most one of
+  `--migrate-all`, `--dehydrate-all`, or `--stop-all`; without one it refuses
+  while the node still has work. Distributed
   `ttc daemon stop` supports the same policies for its local node.
 * Quarantine is an independent branch flag that may be set or cleared at any
   time. Placement and migration preserve it; it is not a separate fork mode or
   lineage type.
 * Every branch selector remains `CONTAINER@BRANCH`. `fork` takes one source
-  selector followed by one or more destination branch names in the same
-  family. Branch-level `rm`, `stop`, `pause`, `dehydrate`, and related commands
-  remain primary; explicitly family-wide variants expand into branch
-  transactions.
+  selector followed by destination branch names in the same family; with none,
+  it generates one name. Branch-level `rm`, `stop`, `pause`, `dehydrate`, and
+  related commands remain primary; explicitly family-wide variants expand into
+  branch transactions.
 * `exited` remains the sole terminated lifecycle name. `main` has no storage or
   lifecycle privilege over another branch and may be removed independently.
 
@@ -746,10 +777,16 @@ are quarantined and reported; they do not make unrelated families unusable.
 
 Clustered TTC has a common shared `TTC_ROOT` and one distinct
 `TTC_LOCAL_ROOT` per node. It retains one cluster-wide Raft group for small
-control-plane state. The logical snapshot graph is the same as standalone TTC;
+control-plane state (since 2026-09-29, the cluster authority's log in the
+shared root instead). The logical snapshot graph is the same as standalone TTC;
 only authority, routing, physical packing, and caching differ.
 
 ### Raft state
+
+(Since 2026-09-29 this is the state of the cluster authority. Membership is
+its registry of nodes, without voters; since `e7bfbc800` it also records the
+shared origins, so that an allocated origin that is neither volatile nor
+shared is dead.)
 
 Raft contains:
 
@@ -1116,9 +1153,15 @@ starting workers, joining Raft, or creating runtime processes:
 5. reject standalone version 1, clustered version 4, unknown versions, wrong
    roles, and mismatched cluster/node identities with a fresh-root diagnostic;
 6. reject every nonempty unmarked directory except an otherwise empty
-   filesystem root containing only `lost+found`;
+   filesystem root containing only `lost+found` (or the `ttcd.log` that the
+   starting client opened there);
 7. only then create missing roots, atomically install new markers, acquire
    exclusive local-root ownership, and initialize storage.
+
+Since 2026-09-27 (`4214bcab9`), startup also refuses a `TTC_LOCAL_ROOT` given
+to a standalone daemon, a daemon root too long for its Unix socket paths, and a
+daemon root on a network filesystem unless `--allow-network-filesystem-root`
+is given.
 
 An example diagnostic is:
 
@@ -1396,6 +1439,9 @@ Run standalone and distributed data roots on:
 Reflink and non-reflink results must be semantically identical. Tests monitor
 host open descriptors and prove forced removal closes guest-derived object
 descriptors before zero-count reclaim; there is no `.nfs*` exception in GC.
+Since 2026-09-27 a standalone root on NFS or Lustre needs
+`ttc daemon start --allow-network-filesystem-root`; a cluster's shared
+`TTC_ROOT` does not.
 
 ### Performance gates
 

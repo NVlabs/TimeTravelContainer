@@ -16,6 +16,12 @@ same-family remote imports, and Kernel-scoped global-resource audit. The
 user-facing status; dated measurements and resolved findings below remain as
 an engineering record rather than a claim of current certification.
 
+Status (2026-10): this audit was last reconciled in August 2026. It does not
+review the snapshot-graph storage format (2026-09), the native macOS HVF
+platform and `ttcd`'s Seatbelt confinement (2026-09), the cluster authority log
+that replaced Raft (2026-09-29), or the GPU devices `--gfx` and `--nvproxy`
+(2026-09/10).
+
 ## Executive assessment
 
 TTC is suitable for controlled integration-test workloads. Eligible families
@@ -235,8 +241,9 @@ systrap directfs and shared-filesystem variants.
   resource grant, not an implicit property of NAT-disabled `--network ttc`.
 - Live fork fails closed for unrecognized file descriptions, mappings,
   filesystems, and network stacks. Host/directfs/external-FUSE resources, queued
-  `SCM_RIGHTS`, AIO/io_uring and packet rings, host-bound Unix endpoints, and
-  unvalidated network configuration are rejected. The reviewed opt-in
+  `SCM_RIGHTS` (accepted since 2026-08-16 when every carried description is
+  forkable; see C1), AIO/io_uring and packet rings, host-bound Unix endpoints,
+  and unvalidated network configuration are rejected. The reviewed opt-in
   validators recursively cover epoll and internal Unix endpoint graphs and
   reject host-backed eventfd resources.
 - The systrap change tightens syscall-patch matching to an exact instruction
@@ -327,6 +334,13 @@ Recommended work:
 3. Benchmark independent sweeps of tasks, VMAs/PMAs, FDs, epoll edges, queued
    bytes, tmpfs extents, directory entries, and branch depth.
 
+Status (2026-10): since `b5abbf31a` (2026-10-02) `state.Clone` copies the
+graph in memory instead of encoding and decoding it. A batch fork
+(`Kernel.LiveForkMany`, since 2026-07-28) restores the siblings after the
+first while the source runs, since `e767d083c` by copying one recording of the
+first. The first child is still restored while the source is paused, and the
+copy still grows with the metadata graph.
+
 ### P1: the native image store has one long-held exclusive lock
 
 `openNativeStore` takes an exclusive `flock`. Pull keeps it across registry
@@ -379,6 +393,10 @@ The external 128 MiB fork command took about 80 ms while internal timing average
 metadata writes, and event recording account for the difference. The durability
 is valuable, but batch/benchmark users would benefit from a long-lived client or
 explicit multi-fork API that amortizes command setup and journal syncs.
+
+Status (2026-10): `ttc fork CONTAINER@BRANCH DEST...` makes several siblings
+from one source pause, and the SDKs and MCP server talk to `ttcd` directly
+rather than spawning `ttc`.
 
 ## Compatibility findings
 
@@ -434,7 +452,9 @@ explicit family waiver:
   writable sysfs, and nftables mutation fail when requested by an eligible
   guest; an in-sandbox `/dev/fuse` server and its mappings are cloned;
 * host/external-FUSE/device mappings retained after their FD closes;
-* TPU/GPU/device proxy state and private filesystem MemoryFiles; and
+* TPU/GPU/device proxy state and private filesystem MemoryFiles (since
+  2026-09-30/10-02, `--gfx` and `--nvproxy` GPUs are admitted with explicit
+  `--gfx-fork`/`--nvproxy-fork` semantics, `device-lost` or `snapshot`); and
 * any internal anonymous object or filesystem not implementing the live-fork
   contract is treated as an invariant violation.
 
@@ -479,6 +499,10 @@ than a normal per-command setting: one daemon serves all requests in one fixed
 mode and reports that mode through `daemon status`. Clients do not send or
 negotiate isolation mode, and normal commands require the user to start the
 daemon explicitly.
+
+On macOS, which has no user namespaces, `ttcd` instead confines itself and the
+processes it starts with Seatbelt (since `75dd20cd3`, 2026-09-27);
+`--unsafe-no-host-isolation` starts it unconfined.
 
 CPU and memory limit compatibility additionally depends on delegated cgroup v2.
 TTC fails closed when a requested hard limit cannot be enforced.
@@ -529,7 +553,8 @@ fifth, `ttc`:
 In `sandbox` mode, gVisor implements IP, TCP, UDP, ICMP, socket queues, and
 firewall behavior in userspace. Docker or CNI remains responsible for creating
 the veth/bridge topology, assigning addresses, NAT, and publishing ports. TTC
-does not use that topology for `--network ttc`: it creates `ttc0` at
+does not use that topology for `--network ttc`: it creates `eth0` (`ttc0`
+before 2026-10-01; `--interface-name` may rename it) at
 `10.0.2.15/24`, an in-process `10.0.2.2` gateway, optional IPv4 TCP/UDP host
 proxying, and rootless host TCP listeners for `-p`. `--ip` may replace the
 guest address and derives the gateway at `.2` in the selected `/24`;
@@ -559,7 +584,9 @@ This gives useful fail-soft semantics without pretending that one host TCP flow
 can be duplicated. It does not replay bytes arriving from outside during the
 pause window or preserve a child's external TCP session. Explicit branch port
 bindings provide stable public endpoints and are reconciled after daemon
-restart. NAT is presently IPv4 TCP/UDP; publication is IPv4 TCP only. Eligible
+restart (in a cluster, since `ba1c3c256`, 2026-09-16, they are node-local
+listeners that last until unpublished or their daemon stops). NAT is presently
+IPv4 TCP/UDP; publication is IPv4 TCP only. Eligible
 guests cannot mutate nftables until that interpreter is serializable. Host
 mode, external sandbox links, and plugin stacks require an explicit family-wide
 live-fork waiver instead of becoming a dynamic fork rejection.

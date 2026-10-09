@@ -14,12 +14,18 @@ non-forkable for its entire lifetime.
   workloads. It has not yet received the security review needed to serve as a
   production boundary for hostile multi-tenant workloads.
 - Active branches in one container family share a Sentry runtime process. A
-  runtime failure can therefore affect active peers in that family. Fully
-  dehydrated families are process-free.
+  runtime failure can therefore affect active peers in that family, and loses
+  the dehydrations that a standalone daemon keeps in that process until they
+  are made durable (`storage_state` `resident`). Fully dehydrated families are
+  process-free.
 - `--unsafe-no-host-isolation` is only for trusted workloads on hosts that
-  prohibit unprivileged user namespaces.
+  prohibit unprivileged user namespaces or, on macOS, where `ttcd` cannot
+  apply its Seatbelt sandbox, as inside another sandbox.
 - Containers use the host CPU architecture. TTC does not provide
   cross-architecture CPU emulation.
+- On macOS, TTC needs Apple Silicon and macOS 15.0 or newer, and runs on the
+  `hvf` platform. `--network=host`, hard memory and CPU limits, and
+  `--nvproxy` are unavailable there.
 
 ## Fork and lifecycle behavior
 
@@ -31,7 +37,7 @@ non-forkable for its entire lifetime.
   persistent state, and internal/runtime failures can also make an individual
   operation fail; these are operational errors, not workload-dependent
   eligibility decisions.
-- A dehydrated source is forkable without first becoming resident. Its children
+- A dehydrated source is forkable without first being rehydrated. Its children
   start from the durable sparse-memory and filesystem roots; the source remains
   dehydrated.
 - `--network=host` is intentionally outside TTC's branchable resource graph and
@@ -40,6 +46,12 @@ non-forkable for its entire lifetime.
   nftables creation paths fail at creation in an eligible family rather than
   poisoning it later. FUSE filesystems served through the guest's `/dev/fuse`
   are contained in the Sentry and are forkable.
+- A `--gfx` or `--nvproxy` family is eligible only with `--gfx-fork` or
+  `--nvproxy-fork`, which choose whether a fork of a GPU in use gives the child
+  a lost device (`device-lost`) or a copy of the GPU's state (`snapshot`);
+  otherwise it needs `--waive-live-fork`. `--nvproxy-fork=snapshot` copies
+  only CUDA's state, and so allows only the `compute` and `utility` driver
+  capabilities.
 - Internal virtual-network connections are copied. The source keeps external
   connections, while the child starts with external connections disconnected
   and no inherited published host ports.
@@ -71,8 +83,9 @@ non-forkable for its entire lifetime.
 ## Ecosystem coverage
 
 - TTC provides a Docker-style CLI, not the Docker Engine API. Docker Compose,
-  Swarm, named Docker networks, and general device or accelerator passthrough
-  are not currently implemented.
+  Swarm, named Docker networks, and general device passthrough are not
+  currently implemented. GPUs are available as a virtual Vulkan GPU (`--gfx`)
+  and, on Linux hosts with NVIDIA GPUs, as those GPUs for CUDA (`--nvproxy`).
 - Image signature, attestation, and content-trust policy are not yet
   implemented.
 - Cross-node fork assumes a trusted private network, a common shared TTC data
