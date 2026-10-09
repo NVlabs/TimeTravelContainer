@@ -152,36 +152,14 @@ host's NVIDIA GPUs for CUDA (on Linux). Most options are compatible with live
 forks; `--gfx-fork` and `--nvproxy-fork` choose what a fork does with a GPU in
 use, and `--waive-live-fork` gives up live forking to enable more options.
 
+Agent harnesses and other programs are recommended to drive TTC through the
+same CLI, reading its `--json` output; see
+[Driving TTC from programs](g3doc/user_guide/timetravelcontainer.md#driving-ttc-from-programs).
+
 The [end-user guide](g3doc/user_guide/timetravelcontainer.md) covers daemon
 operation, networking, volumes, host mounts, checkpoints, remote forks, shell
 completion, and recovery in detail. See also the
 [current limitations](g3doc/user_guide/ttc_limitations.md).
-
-## SDKs and agent integration
-
-The `ttcx` SDKs talk directly to a running `ttcd`; applications do not need to
-spawn or parse the `ttc` CLI. Each SDK returns structured stdout, stderr, and
-exit status and provides helpers for run, named exec sessions, batch or remote
-fork, pause/resume, dehydration, commit, resource accounting, filesystem diff,
-copy, checkpoint/restore, lifecycle control, and removal.
-
-- [Python](sdk/python/README.md)
-- [TypeScript](sdk/typescript/README.md)
-- [Rust](sdk/rust/README.md)
-- [MCP server](sdk/mcp/README.md) for coding agents and MCP clients
-- [Local daemon protocol](sdk/PROTOCOL.md) for additional language bindings
-
-For example, Python agents can branch a sandbox directly:
-
-```python
-from ttcx import Client
-
-ttc = Client("/path/to/ttc-root")
-ttc.fork("agent@main", "candidate").check()
-result = ttc.exec("agent@candidate", ["sh", "-lc", "make test"])
-result.check()
-print(result.stdout_text())
-```
 
 ## Development
 

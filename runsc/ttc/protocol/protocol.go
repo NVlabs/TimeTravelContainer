@@ -12,8 +12,8 @@ import (
 )
 
 // DaemonAPIVersion is the exact version of ttcd's API, which every request
-// names and ttcd requires. Official TTC clients also require an exact build
-// match; the SDKs (sdk/) name this version too, and must change with it.
+// names and ttcd requires. The client, ttc, also requires an exact build match:
+// the API is private to the two, which a release ships together.
 const DaemonAPIVersion = 10
 
 // StaleRouteRefusal begins a node's answer to a command routed to it by a

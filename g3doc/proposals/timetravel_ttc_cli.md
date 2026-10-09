@@ -767,7 +767,8 @@ and reason.
       `succeeded`, `failed`, or `abandoned` resolution for interrupted pending
       intents; resolution never re-executes the original mutation.
 - [x] Add a versioned framed local API. Official CLI requests require an exact
-      daemon build match; SDK and MCP clients negotiate API features.
+      daemon build match; SDK and MCP clients negotiate API features. (The SDK
+      and MCP clients were removed on 2026-10-09; programs use the CLI.)
 - [x] Keep direct runsc invocation exclusively behind the daemon API while
       preserving the branch-control boundary.
 

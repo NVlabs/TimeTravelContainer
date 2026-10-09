@@ -395,8 +395,9 @@ is valuable, but batch/benchmark users would benefit from a long-lived client or
 explicit multi-fork API that amortizes command setup and journal syncs.
 
 Status (2026-10): `ttc fork CONTAINER@BRANCH DEST...` makes several siblings
-from one source pause, and the SDKs and MCP server talk to `ttcd` directly
-rather than spawning `ttc`.
+from one source pause. The SDKs and MCP server, which talked to `ttcd` directly
+rather than spawning `ttc`, were removed on 2026-10-09: programs run the thin
+`ttc` client, whose process start costs a few milliseconds.
 
 ## Compatibility findings
 

@@ -9,15 +9,6 @@
 /repo.key
 # Generate webhook admission.
 /test/kubernetes/gvisor-injection-admission-webhook.yaml
-# TTC language SDK build products.
-/sdk/node_modules/
-/sdk/typescript/dist/
-/sdk/mcp/dist/
-/sdk/rust/target/
-/sdk/python/.pytest_cache/
-/sdk/python/src/*.egg-info/
-/sdk/python/**/__pycache__/
-
 # clangd compilation database
 /.cache/clangd
 /compile_commands.json

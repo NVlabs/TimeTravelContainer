@@ -275,8 +275,8 @@ except for `daemon start`. The client uses nothing else of either root but
 and `ttc --version` are client-local and work without a daemon; the daemon
 validates each command's arguments. Ordinary CLI operations require the client
 and daemon build IDs to match exactly; `daemon stop` remains available as the
-version-independent recovery operation. SDK and MCP clients name `ttcd`'s API
-version, which must match exactly, instead of a CLI build ID.
+version-independent recovery operation. Programs use the same client; see
+[Driving TTC from programs](#driving-ttc-from-programs).
 
 ## Images
 
@@ -1247,6 +1247,68 @@ later daemon start and may be rehydrated individually. In contrast, an
 unexpected `ttcd` crash does not terminate live Sentry sandboxes; after
 restarting the daemon, TTC reconciles those containers and their console/port
 sidecars.
+
+## Driving TTC from programs
+
+Programs, scripts, and coding agents drive TTC through the same `ttc` client
+as people do: they run it as a subprocess, with `TTC_ROOT`, or a node's
+`TTC_LOCAL_ROOT`, in its environment, and use the `ttc` of the daemon's
+release. The client is thin, so each operation costs a process start of a few
+milliseconds.
+
+Read JSON rather than tables. `ls --json`, `ps --format json`, `inspect`,
+`stats --json`, `diff --json`, `top --json`, `images --json`,
+`volume ls --json`, `port ls --json`, `node ls --json`, `exec ls --json`,
+`tty stat --json`, `daemon status`, and `daemon requests --json` print it, and
+`events --json --follow` and `tty watch --json` stream one JSON object per
+line. Later releases may add fields to these objects: ignore the ones you do
+not know.
+
+`ttc` exits with its command's status, and `ttc exec` with that of the process
+it ran; diagnostics go to standard error. `exec -i` gives the process standard
+input, `cp` reads or writes a tar stream for a `-` path, `load` reads an
+archive from standard input, and `save` writes one to standard output. A
+terminal session needs no terminal of the caller's: start it named and
+detached, as `ttc exec -dt --session repl agent@main bash`, then observe it with
+`ttc tty stat --json` or `tty watch`, and read its output with
+`ttc logs --exec repl agent@main`.
+
+A caller that loses a mutating command's answer, as when it crashes, can run
+the command again under the same request ID, 32 hexadecimal digits: `ttcd`
+runs a command of an ID once, and answers it again with its first result. If
+the daemon was interrupted while it ran, `ttcd` refuses the ID instead;
+`ttc daemon requests --json` and `ttc daemon request inspect ID` show what is
+known of it.
+
+```shell
+ttc --request-id 0123456789abcdef0123456789abcdef fork agent@main candidate
+```
+
+For example, in Python:
+
+```python
+import json
+import os
+import subprocess
+
+ROOT = os.path.expanduser("~/.local/share/ttc")
+
+
+def ttc(*args, check=True):
+    result = subprocess.run(["ttc", *args], capture_output=True, text=True,
+                            env={**os.environ, "TTC_ROOT": ROOT})
+    if check and result.returncode != 0:
+        raise RuntimeError(f"ttc {' '.join(args)}: {result.stderr.strip()}")
+    return result
+
+
+ttc("run", "-d", "--name", "agent", "ubuntu:26.04", "sleep", "infinity")
+ttc("fork", "agent@main", "candidate")
+test = ttc("exec", "agent@candidate", "sh", "-c", "exit 3", check=False)
+print("exit status", test.returncode)
+print(json.loads(ttc("stats", "--json", "agent@candidate").stdout))
+ttc("rm", "-f", "agent")
+```
 
 ## Shell completion
 

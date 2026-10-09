@@ -13,9 +13,10 @@ socket of the root. `ttcd` validates the roots, including that the socket is
 theirs, before creating runtime or storage state.
 
 The official CLI includes its build ID on daemon requests. A mismatch rejects
-every operation except the minimal `daemon stop` escape hatch. SDKs and MCP
-clients instead send only the public API version, which must equal `ttcd`'s,
-and inspect the `features` returned by `ping`.
+every operation except the minimal `daemon stop` escape hatch. Programs use
+the same client: the SDKs and MCP server that spoke the socket protocol
+themselves were removed on 2026-10-09, and the protocol is private to `ttc`
+and `ttcd`, which a release ships together.
 
 ## Size and dependency qualification
 

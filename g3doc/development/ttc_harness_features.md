@@ -32,7 +32,7 @@ memory, memory mappings, internal TCP and Unix sockets, pipes, epoll,
 | Capability | Status | Acceptance criteria |
 | --- | --- | --- |
 | TTY observation channel | verified | `ttc tty stat TARGET --session NAME --json` exposes saved/forked queue counters, exact blocked readers, readiness waiters, termios/foreground/flush generations, process-group identity, and the Sentry monotonic clock. `ttc tty watch` uses Sentry-side change notification, coalesces bursts at 10 ms, and emits complete JSON `S` frames plus heartbeats without polling or a runsc subprocess. Each new internal console receives a durable `session_epoch`; live fork and dehydration preserve it. Verified through local fork/dehydrate/rehydrate, SDK protocol tests, and 50 concurrently watched hot PTYs. |
-| Harness streaming and ancestry APIs | verified | TypeScript, Python, and Rust SDKs expose long-lived TTY/event/log/attach streams with ordered header/resize frames, flow-controlled stdin, explicit EOF, and cancellation distinct from daemon exit. TypeScript/Python callback failures become stream failures; Rust uses typed channel events. `ttc ls --json` exposes `parent`, so harnesses do not parse the human tree. MCP preserves the structured parentage. |
+| Harness streaming and ancestry APIs | verified | `ttc tty watch --json` and `ttc events --json --follow` stream one JSON object per line, `ttc logs --follow` and `ttc attach` stream output, and `ttc exec -i` and `attach` take flow-controlled stdin until EOF. `ttc ls --json` exposes `parent`, so harnesses do not parse the human tree. (Until 2026-10-09, TypeScript, Python, and Rust SDKs and an MCP server exposed these streams too; programs now run the CLI.) |
 | `ttc commit BRANCH IMAGE` | verified | Commit emits a runnable OCI image and accepts Docker-style author, message, pause, and `--change` options. `LABEL` changes and inherited OCI labels round-trip through `image inspect`. Verified on an NFS-backed data root, including `timetravel.usage` label round-trip. |
 | `ttc stats` | verified | Reports per-branch private and CoW-shared resident mapped memory, durable sparse-memory backing, and persistent file-object bytes, plus non-double-counted family totals, in human and stable JSON forms. It deliberately excludes the Sentry Go heap and unmapped cache rather than presenting estimates as branch ownership. Verified under systrap, KVM, NFS, live remote fork, and cold remote/local fork. |
 | Named durable exec sessions | verified | `ttc exec --session NAME -d` creates a reusable name; attach/logs/wait/kill work after client disconnect; retained output is bounded by the existing durable ring buffer. Verified on systrap, KVM, NFS, and while a resource-stress process was live. |
@@ -52,10 +52,10 @@ implementation ever resets them, it must instead expose a changed
 
 ## API compatibility
 
-Every machine-oriented command added here must have a stable JSON form and be
-available through the daemon protocol rather than requiring the SDKs to spawn
-`ttc`. Python, TypeScript, Rust, and MCP bindings must be updated before the
-feature is marked verified.
+Every machine-oriented command added here must have a stable JSON form, which
+programs read from the `ttc` CLI: later releases may add fields, but not
+change or remove them. Since 2026-10-09 there are no language bindings to
+update; the SDKs and MCP server were removed in favor of the CLI.
 
 ## Findings from complex regression runs
 
