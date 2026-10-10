@@ -791,7 +791,7 @@ func TestGetparamAndCaps(t *testing.T) {
 		{linux.VIRTGPU_PARAM_CAPSET_QUERY_FIX, 1, nil},
 		{linux.VIRTGPU_PARAM_RESOURCE_BLOB, 1, nil},
 		{linux.VIRTGPU_PARAM_HOST_VISIBLE, 1, nil},
-		{linux.VIRTGPU_PARAM_CROSS_DEVICE, 0, nil},
+		{linux.VIRTGPU_PARAM_CROSS_DEVICE, 1, nil},
 		{linux.VIRTGPU_PARAM_CONTEXT_INIT, 1, nil},
 		{linux.VIRTGPU_PARAM_SUPPORTED_CAPSET_IDS, 1 << linux.VIRTGPU_DRM_CAPSET_GFXSTREAM_VULKAN, nil},
 		{linux.VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME, 1, nil},
@@ -1037,6 +1037,10 @@ func TestBlobs(t *testing.T) {
 		t.Errorf("mapping a blob that is not mappable: %v, want EINVAL", err)
 	}
 
+	// A cross-device blob is a shareable one, as Mesa's Venus driver makes
+	// the memory that it exports as dma-bufs.
+	e.mustCreateBlob(file, linux.VIRTGPU_BLOB_FLAG_USE_SHAREABLE|linux.VIRTGPU_BLOB_FLAG_USE_CROSS_DEVICE, size)
+
 	for _, test := range []struct {
 		name  string
 		mem   uint32
@@ -1045,7 +1049,6 @@ func TestBlobs(t *testing.T) {
 		size  uint64
 		cmd   []byte
 	}{
-		{"cross-device", linux.VIRTGPU_BLOB_MEM_HOST3D, linux.VIRTGPU_BLOB_FLAG_USE_CROSS_DEVICE, 1, size, nil},
 		{"unknown flags", linux.VIRTGPU_BLOB_MEM_HOST3D, 16, 1, size, nil},
 		{"a guest handle of the host's memory", linux.VIRTGPU_BLOB_MEM_HOST3D, linux.VIRTGPU_BLOB_FLAG_CREATE_GUEST_HANDLE, 1, size, nil},
 		{"unknown memory", 4, 0, 1, size, nil},

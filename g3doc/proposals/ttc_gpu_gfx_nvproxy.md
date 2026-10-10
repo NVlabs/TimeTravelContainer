@@ -483,7 +483,9 @@ for unit tests:
     for a dma-buf's size.
 *   Differences from Linux: a classic resource's backing is the renderer's
     memory, like a blob's; no DRM sync objects; no fence events on the file
-    (`POLL_RINGS_MASK`); no cross-device resources (`CROSS_DEVICE` is 0).
+    (`POLL_RINGS_MASK`); cross-device resources (`CROSS_DEVICE` is 1, as
+    Mesa's Venus driver before 24.2 requires) without UUIDs, which only
+    other virtio devices, of which the Sentry has none, would use.
 *   sysfs presents a virtio-gpu PCI function `00ff:00:00.0` (1af4:1050, a
     domain unlikely to collide with mirrored host trees), its `virtio0`, and
     `drm/renderD128`, as Linux lays them out, which `drmGetDevices2` walks.
