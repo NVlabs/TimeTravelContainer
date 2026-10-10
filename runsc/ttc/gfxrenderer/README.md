@@ -180,4 +180,15 @@ within a second after.
 apps render with ANGLE on the GPU, that the screen records to video, and
 that both branches of a live fork run on, and installs and runs an APK.
 
+redroid 14's own Venus driver, redroid's build of Mesa 24.0.8, does not do:
+the device and the renderer serve it, as they serve Venus drivers before
+Mesa 24.2 (`CROSS_DEVICE`, and sync files that `venus/syncfd_unsafe.go`
+emulates), and SurfaceFlinger starts on it, but the build offers no
+`VK_ANDROID_external_memory_android_hardware_buffer`, without which ANGLE
+has no `EGL_ANDROID_image_native_buffer` and SurfaceFlinger composes no
+app's buffers. Android 14's Vulkan loader also offers ANGLE
+`VK_EXT_swapchain_maintenance1` on it, whose feature the driver refuses at
+`vkCreateDevice` unless ANGLE leaves it off
+(`debug.angle.feature_overrides_disabled=supportsSwapchainMaintenance1`).
+
 [scrcpy]: https://github.com/Genymobile/scrcpy

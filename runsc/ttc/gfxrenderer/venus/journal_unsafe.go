@@ -375,6 +375,7 @@ func registerJournal() {
 	})
 	handle(vn.VK_COMMAND_TYPE_vkCreateSemaphore_EXT, func(s *stream, cmd *vn.Command, args unsafe.Pointer) {
 		a := (*vn.Args_vkCreateSemaphore)(args)
+		stripSyncFDExport(a.PCreateInfo, vn.VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO, semaphoreHandleSyncFD)
 		info := (*vn.VkSemaphoreCreateInfo)(a.PCreateInfo)
 		timeline := false
 		if p := findStruct(info.PNext, vn.VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO); p != nil {

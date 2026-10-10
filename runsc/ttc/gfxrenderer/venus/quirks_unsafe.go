@@ -55,6 +55,7 @@ func (s *stream) initQuirks(pd *physicalDevice, hostExtensions map[string]bool) 
 	}
 	pd.initExternalMemory(hostExtensions)
 	pd.initModifiers(hostExtensions)
+	pd.initSyncFDs(hostExtensions)
 	// Trailing families that duplicate an earlier one.
 	pd.familyCount = uint32(len(pd.queueFamilies))
 	for pd.familyCount > 1 {
@@ -149,6 +150,8 @@ func deviceQuirks(pd *physicalDevice, info *vn.VkDeviceCreateInfo, names []unsaf
 		emulated[extImageDrmFormatModifier] = true
 		emulated[extQueueFamilyForeign] = true
 	}
+	emulated[extExternalSemaphoreFD] = pd.emulateSemaphoreFD
+	emulated[extExternalFenceFD] = pd.emulateFenceFD
 	kept := names[:0]
 	for _, name := range names {
 		if !emulated[goCString(name)] {

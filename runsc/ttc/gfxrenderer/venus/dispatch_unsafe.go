@@ -45,7 +45,7 @@ func init() {
 	registerTransport()
 	registerInstance()
 	registerDevice()
-	registerQueue()
+	registerSyncFDs()
 	registerMemory()
 	registerQuirks()
 	registerExternalMemory()

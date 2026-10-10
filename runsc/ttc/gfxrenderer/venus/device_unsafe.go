@@ -31,6 +31,10 @@ type device struct {
 	objects map[uint64]*object
 	// host is what the contexts that share the VkDevice share.
 	host *hostDevice
+	// retired are the device's fences that the guest reset while their
+	// signals were pending, which retiredMu guards: see syncfd_unsafe.go.
+	retiredMu sync.Mutex
+	retired   []vn.Handle
 }
 
 // hostDevice is what the contexts that share a VkDevice share.
@@ -264,6 +268,7 @@ func (s *stream) destroyHostDevice(dev *device) {
 	for _, q := range dev.queues {
 		q.releaseFences(s)
 	}
+	s.destroyRetiredFences(dev)
 	if dev.host.refs.Add(-1) != 0 {
 		return
 	}

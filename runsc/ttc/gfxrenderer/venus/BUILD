@@ -32,6 +32,7 @@ go_library(
         "server_unsafe.go",
         "shadow_unsafe.go",
         "stream_unsafe.go",
+        "syncfd_unsafe.go",
         "transport_unsafe.go",
         "venus.go",
     ],
