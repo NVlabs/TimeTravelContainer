@@ -1,0 +1,68 @@
+# Mesa's Zink, for TTC's GPU renderer
+
+On macOS, `ttcd`, which is TTC's GPU renderer there, renders for guests'
+virgl OpenGL drivers with Zink, Mesa's Gallium driver on Vulkan, on the
+MoltenVK that the Venus renderer links (see
+`runsc/ttc/gfxrenderer/virgl`). Bazel builds Zink, and what it needs of
+Mesa, from Mesa's release (`MODULE.bazel`, `@mesa`) with `tools/mesa.BUILD`.
+
+Mesa builds with meson, which Bazel cannot run. `gen_mesa_build.py` writes
+`tools/mesa.BUILD` from a meson build of Mesa: the same compilations, as
+`cc_library` targets, and Mesa's code generators, which are Python scripts,
+as genrules, which run them by `run.py` with Mako, MarkupSafe and PyYAML,
+which `MODULE.bazel` pins too. The libraries are those that Zink links:
+Zink itself, Gallium's auxiliary code, NIR and the compiler, Vulkan's
+utilities, and Mesa's utilities.
+
+`gallium_api` is what the renderer includes: Gallium's interface, Zink's,
+and virgl's protocol (`src/virtio/virtio-gpu`), which Mesa's guest driver
+shares.
+
+## Patches
+
+* `0001-zink-take-Vulkan-s-entry-points-from-an-embedder.patch`: Zink loads
+  Vulkan with `dlopen`; the renderer links MoltenVK, and gives Zink its
+  entry points instead, through which it also works around MoltenVK's lack
+  of robustness2's `nullDescriptor`, as the Venus renderer does.
+
+## Regenerating `tools/mesa.BUILD`
+
+Regenerate it for a new release of Mesa, or other libraries or options. On
+macOS, with the release's source in `$MESA` and a scratch directory `$Z`:
+
+```sh
+python3 -m venv $Z/venv
+$Z/venv/bin/pip install meson ninja mako pyyaml packaging
+# MoltenVK's headers, which Bazel fetched.
+MVK=$(bazel info output_base)/external/+_repo_rules+moltenvk
+PATH=$Z/venv/bin:$PATH meson setup $Z/build $MESA \
+  -Dbuildtype=release -Ddefault_library=static -Db_ndebug=true \
+  -Dplatforms=macos -Dgallium-drivers=zink -Dvulkan-drivers= -Dopengl=true \
+  -Dgles1=disabled -Dgles2=disabled -Dglx=disabled -Degl=disabled -Dgbm=disabled \
+  -Dllvm=disabled -Dvalgrind=disabled -Dlibunwind=disabled -Dzstd=disabled \
+  -Dxmlconfig=disabled -Dexpat=disabled -Dshader-cache=disabled \
+  -Dgallium-va=disabled -Dgallium-rusticl=false -Dbuild-tests=false -Dtools= \
+  -Dspirv-tools=disabled -Ddisplay-info=disabled -Dteflon=false \
+  -Dmoltenvk-dir=$MVK
+# The libraries, so that their generated sources exist.
+PATH=$Z/venv/bin:$PATH ninja -C $Z/build \
+  src/gallium/drivers/zink/libzink.a src/gallium/auxiliary/libgallium.a \
+  src/compiler/nir/libnir.a src/compiler/libcompiler.a \
+  src/vulkan/util/libvulkan_util.a src/util/libxmlconfig.a \
+  src/util/libmesa_util.a src/util/libmesa_util_simd.a \
+  src/util/blake3/libblake3.a src/c11/impl/libmesa_util_c11.a
+PATH=$Z/venv/bin:$PATH python3 tools/mesa/gen_mesa_build.py \
+  --source $MESA --build $Z/build --out tools/mesa.BUILD --version 26.2.4
+```
+
+`-Dplatforms=macos` matters: without it, MoltenVK's headers define
+Vulkan's platform macros after Mesa includes Vulkan's headers. `-Dopengl`
+builds NIR, which Mesa builds only for a driver of OpenGL or Vulkan.
+`-Dshader-cache=disabled` keeps Zink from writing a cache in the home
+directory, which the renderer's sandbox denies.
+
+Then check that the renderer builds and renders:
+
+```sh
+bazel test //runsc/ttc/gfxrenderer/virgl:virgl_test
+```

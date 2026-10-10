@@ -74,6 +74,69 @@ http_archive(
     urls = ["https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.2/MoltenVK-macos.tar"],
 )
 
+### Mesa
+# Zink, Mesa's Gallium driver on Vulkan, which the GPU renderer links on macOS
+# to render for guests' virgl drivers (tools/mesa.BUILD, tools/mesa/README.md).
+http_archive(
+    name = "mesa",
+    build_file = "//tools:mesa.BUILD",
+    patch_args = ["-p1"],
+    patches = ["//tools/mesa:0001-zink-take-Vulkan-s-entry-points-from-an-embedder.patch"],
+    sha256 = "bce5f7fbebb934373b86c999a064d52fb5065878dc57f287f95346648ec832e9",
+    strip_prefix = "mesa-26.2.4",
+    urls = ["https://archive.mesa3d.org/mesa-26.2.4.tar.xz"],
+)
+
+# Mako, MarkupSafe, and PyYAML, with which Mesa's code generators run.
+http_archive(
+    name = "mako",
+    build_file_content = """
+load("@rules_python//python:py_library.bzl", "py_library")
+py_library(
+    name = "mako",
+    srcs = glob(["mako/**/*.py"]),
+    imports = ["."],
+    visibility = ["//visibility:public"],
+    deps = ["@markupsafe"],
+)
+""",
+    sha256 = "d7904710b662996425a21627710c4777c45053146942cf8a7aebf757c92b8c27",
+    strip_prefix = "mako-1.4.1",
+    urls = ["https://files.pythonhosted.org/packages/2a/12/b5fa2353e2754cd67fb9f83793fa48ff42c213a5da7e719869d2301f6ab8/mako-1.4.1.tar.gz"],
+)
+
+http_archive(
+    name = "markupsafe",
+    build_file_content = """
+load("@rules_python//python:py_library.bzl", "py_library")
+py_library(
+    name = "markupsafe",
+    srcs = glob(["markupsafe/**/*.py"]),
+    imports = ["."],
+    visibility = ["//visibility:public"],
+)
+""",
+    sha256 = "722695808f4b6457b320fdc131280796bdceb04ab50fe1795cd540799ebe1698",
+    strip_prefix = "markupsafe-3.0.3/src",
+    urls = ["https://files.pythonhosted.org/packages/7e/99/7690b6d4034fffd95959cbe0c02de8deb3098cc577c67bb6a24fe5d7caa7/markupsafe-3.0.3.tar.gz"],
+)
+
+http_archive(
+    name = "pyyaml",
+    build_file_content = """
+load("@rules_python//python:py_library.bzl", "py_library")
+py_library(
+    name = "yaml",
+    srcs = glob(["yaml/**/*.py"]),
+    imports = ["."],
+    visibility = ["//visibility:public"],
+)
+""",
+    sha256 = "d76623373421df22fb4cf8817020cbb7ef15c725b9d5e45f17e189bfc384190f",
+    strip_prefix = "pyyaml-6.0.3/lib",
+    urls = ["https://files.pythonhosted.org/packages/05/8e/961c0007c59b8dd7729d542c61a4d537767a59645b82a0b521206e1e25c2/pyyaml-6.0.3.tar.gz"],
+)
+
 http_archive(
     name = "kythe_release",
     sha256 = "52a9c6e8111237043b8d0b6127637f0eb8d2ba3a776e4749b036e911ec3529ce",
