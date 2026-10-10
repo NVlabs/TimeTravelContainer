@@ -21,12 +21,9 @@ const (
 	bindSamplerView         = 1 << 3
 	bindVertexBuffer        = 1 << 4
 	bindQueryBuffer         = 1 << 15
-	targetBuffer            = 0
 	target2D                = 2
-	primTriangles           = 4
 	clearColor0             = 1 << 2
 	queryOcclusionCounter   = 0
-	queryStateDone          = 1
 )
 
 // stream encodes virgl's commands, as Mesa's virgl driver does.
@@ -354,6 +351,157 @@ DCL OUT[0], COLOR
 	// 255 * 0.0039 rounds to 254 or 255.
 	if p := f.pixel(4, height/2); p[0] != 0 || p[1] < 254 || p[2] != 0 {
 		t.Errorf("inside the triangle: %v, want %v", p, green)
+	}
+}
+
+// TestTransformFeedback captures a triangle's positions, which Zink cannot
+// here, appends a second capture, pauses, and draws what it captured.
+func TestTransformFeedback(t *testing.T) {
+	f := newFixture(t)
+	if !xfbEmulated {
+		t.Skip("the renderer emulates no transform feedback here")
+	}
+	const bindStreamOutput = 1 << 11
+	soMem := make([]byte, 2*3*16)
+	so, err := NewResource(7, ResourceArgs{Target: targetBuffer, Format: formatR8Unorm,
+		Bind: bindStreamOutput | bindVertexBuffer, Width: uint32(len(soMem)), Height: 1, Depth: 1, ArraySize: 1}, soMem, nil)
+	if err != nil {
+		t.Fatalf("NewResource: %v", err)
+	}
+	defer so.DecRef()
+	qMem := make([]byte, queryStateSize)
+	qres, err := NewResource(8, ResourceArgs{Target: targetBuffer, Format: formatR8Unorm,
+		Bind: bindQueryBuffer, Width: queryStateSize, Height: 1, Depth: 1, ArraySize: 1}, qMem, nil)
+	if err != nil {
+		t.Fatalf("NewResource: %v", err)
+	}
+	defer qres.DecRef()
+	f.c.Attach(so)
+	f.c.Attach(qres)
+
+	var s stream
+	f.setup(&s)
+	clearRed(&s)
+	// A vertex shader that captures OUT[0], its position, to buffer 0, of
+	// 4 dwords a vertex.
+	vs := f.id()
+	text := append([]byte(vertexShader), 0)
+	payload := []uint32{vs, stageVertex, uint32(len(text)), 300, 1, 4, 0, 0, 0, 4 << 10, 0}
+	s.cmd(cmdCreateObject, objectShader, append(payload, textDwords(text)...)...)
+	s.cmd(cmdBindShader, 0, vs, stageVertex)
+	target, q := f.id(), f.id()
+	s.cmd(cmdCreateObject, objectStreamoutTarget, target, so.ID(), 0, uint32(len(soMem)))
+	s.cmd(cmdCreateObject, objectQuery, q, queryPrimitivesEmitted, 0, qres.ID())
+	s.cmd(cmdSetStreamoutTargets, 0, 0, target)
+	s.cmd(cmdBeginQuery, 0, q)
+	drawTriangle(&s)
+	s.cmd(cmdEndQuery, 0, q)
+	s.cmd(cmdGetQueryResult, 0, q, 0)
+	// Resumed, the capture appends.
+	s.cmd(cmdSetStreamoutTargets, 0, 1, target)
+	drawTriangle(&s)
+	// Paused, it captures nothing: the buffer has room for two triangles.
+	s.cmd(cmdSetStreamoutTargets, 0, 0)
+	drawTriangle(&s)
+	f.submit(t, s)
+	f.c.Flush().Wait()
+	if err := f.c.Transfer(so, TransferArgs{W: uint32(len(soMem)), H: 1, D: 1}); err != nil {
+		t.Fatalf("Transfer: %v", err)
+	}
+	for v := 0; v < 6; v++ {
+		got := soMem[16*v : 16*v+16]
+		want := f.vbMem[16*(v%3) : 16*(v%3)+16]
+		if string(got) != string(want) {
+			t.Errorf("captured vertex %d: % x, want % x", v, got, want)
+		}
+	}
+	if state, n := binary.LittleEndian.Uint32(qMem), binary.LittleEndian.Uint64(qMem[8:]); state != queryStateDone || n != 1 {
+		t.Errorf("primitives emitted: state %d, %d primitives, want state %d, 1", state, n, queryStateDone)
+	}
+
+	// The vertices that the target captured, drawn from it.
+	s = nil
+	clearRed(&s)
+	s.cmd(cmdSetVertexBuffers, 0, 16, 0, so.ID())
+	s.cmd(cmdDrawVBO, 0, 0, 0, primTriangles, 0, 1, 0, 0, 0, 0, 0, 0xffffffff, target)
+	f.submit(t, s)
+	f.finish(t)
+	f.checkTriangle(t)
+}
+
+// TestTransformFeedbackOverflow captures two triangles to a target with
+// room for one: the target takes one, and the queries count the other.
+func TestTransformFeedbackOverflow(t *testing.T) {
+	f := newFixture(t)
+	if !xfbEmulated {
+		t.Skip("the renderer emulates no transform feedback here")
+	}
+	const bindStreamOutput = 1 << 11
+	newBuffer := func(id uint32, mem []byte, bind uint32) *Resource {
+		r, err := NewResource(id, ResourceArgs{Target: targetBuffer, Format: formatR8Unorm,
+			Bind: bind, Width: uint32(len(mem)), Height: 1, Depth: 1, ArraySize: 1}, mem, nil)
+		if err != nil {
+			t.Fatalf("NewResource: %v", err)
+		}
+		t.Cleanup(r.DecRef)
+		f.c.Attach(r)
+		return r
+	}
+	vbMem := append(append([]byte(nil), f.vbMem...), f.vbMem...)
+	vb := newBuffer(9, vbMem, bindVertexBuffer)
+	if err := f.c.Transfer(vb, TransferArgs{ToHost: true, W: uint32(len(vbMem)), H: 1, D: 1}); err != nil {
+		t.Fatalf("Transfer: %v", err)
+	}
+	// The buffer's room past a triangle holds a pattern, which no capture
+	// may write over.
+	soMem := make([]byte, 3*16+8)
+	for i := range soMem {
+		soMem[i] = 0x5a
+	}
+	so := newBuffer(10, soMem, bindStreamOutput)
+	if err := f.c.Transfer(so, TransferArgs{ToHost: true, W: uint32(len(soMem)), H: 1, D: 1}); err != nil {
+		t.Fatalf("Transfer: %v", err)
+	}
+	statsMem, overflowMem := make([]byte, queryStateSize), make([]byte, queryStateSize)
+	stats := newBuffer(11, statsMem, bindQueryBuffer)
+	overflow := newBuffer(12, overflowMem, bindQueryBuffer)
+
+	var s stream
+	f.setup(&s)
+	vs := f.id()
+	text := append([]byte(vertexShader), 0)
+	payload := []uint32{vs, stageVertex, uint32(len(text)), 300, 1, 4, 0, 0, 0, 4 << 10, 0}
+	s.cmd(cmdCreateObject, objectShader, append(payload, textDwords(text)...)...)
+	s.cmd(cmdBindShader, 0, vs, stageVertex)
+	s.cmd(cmdSetVertexBuffers, 0, 16, 0, vb.ID())
+	target, qStats, qOverflow := f.id(), f.id(), f.id()
+	s.cmd(cmdCreateObject, objectStreamoutTarget, target, so.ID(), 0, uint32(len(soMem)))
+	s.cmd(cmdCreateObject, objectQuery, qStats, querySOStatistics, 0, stats.ID())
+	s.cmd(cmdCreateObject, objectQuery, qOverflow, querySOOverflowPredicate, 0, overflow.ID())
+	s.cmd(cmdSetStreamoutTargets, 0, 0, target)
+	s.cmd(cmdBeginQuery, 0, qStats)
+	s.cmd(cmdBeginQuery, 0, qOverflow)
+	s.cmd(cmdDrawVBO, 0, 0, 6, primTriangles, 0, 1, 0, 0, 0, 0, 0, 0xffffffff, 0)
+	s.cmd(cmdEndQuery, 0, qStats)
+	s.cmd(cmdEndQuery, 0, qOverflow)
+	s.cmd(cmdGetQueryResult, 0, qStats, 0)
+	s.cmd(cmdGetQueryResult, 0, qOverflow, 0)
+	f.submit(t, s)
+	f.c.Flush().Wait()
+	if err := f.c.Transfer(so, TransferArgs{W: uint32(len(soMem)), H: 1, D: 1}); err != nil {
+		t.Fatalf("Transfer: %v", err)
+	}
+	if string(soMem[:48]) != string(f.vbMem) {
+		t.Errorf("captured % x, want % x", soMem[:48], f.vbMem)
+	}
+	if tail := soMem[48:]; string(tail) != "\x5a\x5a\x5a\x5a\x5a\x5a\x5a\x5a" {
+		t.Errorf("past the triangle that fits: % x", tail)
+	}
+	if n := binary.LittleEndian.Uint64(statsMem[8:]); n != 1 {
+		t.Errorf("primitives written: %d, want 1", n)
+	}
+	if n := binary.LittleEndian.Uint64(overflowMem[8:]); n != 1 {
+		t.Errorf("overflow: %d, want 1", n)
 	}
 }
 

@@ -14,6 +14,7 @@
 
 #include "pipe/p_defines.h"
 #include "pipe/p_screen.h"
+#include "pipe/p_state.h"
 #include "util/format/u_format.h"
 #include "virgl.h"
 #include "virgl_hw.h"
@@ -354,11 +355,24 @@ static PFN_vkVoidFunction VKAPI_CALL zink_gipa(VkInstance instance, const char *
    return quirk(name, fn);
 }
 
+bool ttc_virgl_xfb_emulated;
+uint32_t ttc_virgl_xfb_ubo, ttc_virgl_xfb_ssbo;
+
 int ttc_virgl_init(void) {
    zink_vk_get_instance_proc_addr = (void *)zink_gipa;
    zink_vk_get_device_proc_addr = (void *)zink_gdpa;
    ttc_virgl_screen = zink_create_screen(NULL, NULL);
-   return ttc_virgl_screen ? 0 : -1;
+   if (!ttc_virgl_screen)
+      return -1;
+   // MoltenVK has no transform feedback, which OpenGL ES 3.0 requires, and
+   // Android's HWUI with it: the renderer emulates it, in the slots of the
+   // vertex shader's state that it keeps for it.
+   const struct pipe_shader_caps *vs = &ttc_virgl_screen->shader_caps[MESA_SHADER_VERTEX];
+   ttc_virgl_xfb_emulated = ttc_virgl_screen->caps.max_stream_output_buffers == 0 &&
+                            vs->max_const_buffers >= 2 && vs->max_shader_buffers >= 8;
+   ttc_virgl_xfb_ubo = vs->max_const_buffers - 1;
+   ttc_virgl_xfb_ssbo = vs->max_shader_buffers - PIPE_MAX_SO_BUFFERS;
+   return 0;
 }
 
 static void set_format(struct virgl_supported_format_mask *mask, uint32_t format) {
@@ -423,7 +437,7 @@ void ttc_virgl_fill_caps(uint32_t set, void *out, uint32_t size) {
    v1->bset.seamless_cube_map = c->seamless_cube_map;
    v1->bset.occlusion_query = c->occlusion_query;
    v1->bset.timer_query = c->query_timestamp && c->query_time_elapsed;
-   v1->bset.streamout_pause_resume = c->stream_output_pause_resume;
+   v1->bset.streamout_pause_resume = c->stream_output_pause_resume || ttc_virgl_xfb_emulated;
    v1->bset.texture_multisample = c->texture_multisample;
    v1->bset.fragment_coord_conventions = c->fs_coord_origin_lower_left;
    v1->bset.depth_clip_disable = c->depth_clip_disable;
@@ -445,7 +459,8 @@ void ttc_virgl_fill_caps(uint32_t set, void *out, uint32_t size) {
 
    v1->glsl_level = c->glsl_feature_level;
    v1->max_texture_array_layers = c->max_texture_array_layers;
-   v1->max_streamout_buffers = c->max_stream_output_buffers;
+   v1->max_streamout_buffers =
+      ttc_virgl_xfb_emulated ? PIPE_MAX_SO_BUFFERS : c->max_stream_output_buffers;
    v1->max_dual_source_render_targets = c->max_dual_source_render_targets;
    v1->max_render_targets = c->max_render_targets;
    v1->max_samples = 1;
@@ -458,7 +473,9 @@ void ttc_virgl_fill_caps(uint32_t set, void *out, uint32_t size) {
    }
    v1->prim_mask = c->supported_prim_modes;
    v1->max_tbo_size = c->max_texel_buffer_elements;
-   v1->max_uniform_blocks = fs->max_const_buffers;
+   // Uniform buffers besides the default one, which is buffer 0, less the
+   // renderer's.
+   v1->max_uniform_blocks = fs->max_const_buffers - 1 - ttc_virgl_xfb_emulated;
    v1->max_viewports = c->max_viewports;
    v1->max_texture_gather_components = c->max_texture_gather_components;
    if (set == 1) {
@@ -528,7 +545,8 @@ void ttc_virgl_fill_caps(uint32_t set, void *out, uint32_t size) {
 
    v2->max_vertex_attrib_stride = c->max_vertex_attrib_stride;
    v2->max_shader_buffer_frag_compute = fs->max_shader_buffers;
-   v2->max_shader_buffer_other_stages = vs->max_shader_buffers;
+   v2->max_shader_buffer_other_stages =
+      vs->max_shader_buffers - (ttc_virgl_xfb_emulated ? PIPE_MAX_SO_BUFFERS : 0);
    v2->max_shader_image_frag_compute = fs->max_shader_images;
    v2->max_shader_image_other_stages = vs->max_shader_images;
    // Gallium has no cap of multisampled images: offer none.
@@ -553,6 +571,8 @@ void ttc_virgl_fill_caps(uint32_t set, void *out, uint32_t size) {
       v2->max_const_buffer_size[i] = sc->max_const_buffer0_size;
       v2->max_shader_storage_blocks[i] = sc->max_shader_buffers;
    }
+   if (ttc_virgl_xfb_emulated)
+      v2->max_shader_storage_blocks[0] -= PIPE_MAX_SO_BUFFERS;
    v2->max_combined_atomic_counters = c->max_combined_hw_atomic_counters;
    v2->max_combined_atomic_counter_buffers = c->max_combined_hw_atomic_counter_buffers;
    // virglrenderer's: the guest relies on the host's behaviors of every

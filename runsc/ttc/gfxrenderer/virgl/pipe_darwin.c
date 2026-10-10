@@ -12,6 +12,7 @@
 
 #include "compiler/glsl_types.h"
 #include "compiler/nir/nir.h"
+#include "compiler/nir/nir_builder.h"
 #include "nir/tgsi_to_nir.h"
 #include "pipe/p_context.h"
 #include "pipe/p_defines.h"
@@ -542,9 +543,104 @@ static void retype_inputs(nir_shader *nir, uint32_t sint_mask, uint32_t uint_mas
    }
 }
 
+// The parameters of a capture, in the vertex shader's uniform buffer
+// ttc_virgl_xfb_ubo: the draw's first vertex, the vertices of an instance
+// that it captures, and the vertices that fit the targets; then the
+// targets' offsets.
+enum { XFB_FIRST, XFB_PER_INSTANCE, XFB_MAX, XFB_OFFSETS = 4, XFB_PARAMS = 8 };
+
+// ssbo_var declares the shader buffer at binding, as tgsi_to_nir does.
+static void ssbo_var(nir_shader *nir, unsigned binding) {
+   nir_foreach_variable_with_modes(var, nir, nir_var_mem_ssbo) {
+      if (var->data.binding == binding)
+         return;
+   }
+   const struct glsl_type *type = glsl_array_type(glsl_uint_type(), 0, 0);
+   struct glsl_struct_field field = {.type = type, .name = "data", .location = -1};
+   nir_variable *var = nir_variable_create(nir, nir_var_mem_ssbo, type, "xfb");
+   var->data.binding = binding;
+   var->interface_type = glsl_interface_type(&field, 1, GLSL_INTERFACE_PACKING_STD430, false, "data");
+}
+
+// lower_xfb has a vertex shader capture its stream output, as Zink cannot
+// on MoltenVK, which has no transform feedback, and as ANGLE does on Vulkan
+// without it: at its end, the shader stores the outputs to the targets'
+// buffers, which are shader buffers, at its vertex's index among the
+// draw's, which it computes of the draw's parameters. tgsi_to_nir names
+// the variable of TGSI's output N "out_N".
+static void lower_xfb(nir_shader *nir, const struct pipe_stream_output_info *so) {
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_after_impl(impl));
+   nir_def *ubo = nir_imm_int(&b, ttc_virgl_xfb_ubo);
+   nir_def *params = nir_load_ubo(&b, 4, 32, ubo, nir_imm_int(&b, 0), .align_mul = 16,
+                                  .align_offset = 0, .range_base = 0, .range = 16);
+   nir_def *offsets = nir_load_ubo(&b, 4, 32, ubo, nir_imm_int(&b, 16), .align_mul = 16,
+                                   .align_offset = 0, .range_base = 16, .range = 16);
+   nir_def *per_instance = nir_channel(&b, params, XFB_PER_INSTANCE);
+   nir_def *vertex = nir_isub(&b, nir_load_vertex_id(&b), nir_channel(&b, params, XFB_FIRST));
+   nir_def *index = nir_iadd(&b, nir_imul(&b, nir_load_instance_id(&b), per_instance), vertex);
+   nir_push_if(&b, nir_iand(&b, nir_ult(&b, vertex, per_instance),
+                            nir_ult(&b, index, nir_channel(&b, params, XFB_MAX))));
+   for (unsigned i = 0; i < so->num_outputs; i++) {
+      const struct pipe_stream_output *o = &so->output[i];
+      char name[16];
+      snprintf(name, sizeof(name), "out_%u", o->register_index);
+      nir_variable *var = NULL;
+      nir_foreach_shader_out_variable(v, nir) {
+         if (v->name && !strcmp(v->name, name))
+            var = v;
+      }
+      if (!var || glsl_type_is_array(var->type))
+         continue;
+      nir_def *value = nir_load_var(&b, var);
+      if (o->start_component + o->num_components > value->num_components || !o->num_components)
+         continue;
+      value = nir_channels(&b, value, BITFIELD_RANGE(o->start_component, o->num_components));
+      nir_def *offset = nir_iadd(&b, nir_channel(&b, offsets, o->output_buffer),
+                                 nir_imul_imm(&b, index, so->stride[o->output_buffer] * 4));
+      offset = nir_iadd_imm(&b, offset, o->dst_offset * 4);
+      unsigned binding = ttc_virgl_xfb_ssbo + o->output_buffer;
+      ssbo_var(nir, binding);
+      nir_store_ssbo(&b, value, nir_imm_int(&b, binding), offset,
+                     .write_mask = BITFIELD_MASK(o->num_components), .align_mul = 4,
+                     .align_offset = 0);
+   }
+   nir_pop_if(&b, NULL);
+   nir->info.num_ubos = MAX2(nir->info.num_ubos, ttc_virgl_xfb_ubo + 1);
+   nir->info.num_ssbos = MAX2(nir->info.num_ssbos, ttc_virgl_xfb_ssbo + PIPE_MAX_SO_BUFFERS);
+   nir_progress(true, impl, nir_metadata_none);
+   nir_shader_gather_info(nir, impl);
+}
+
+bool ttc_virgl_xfb(uint32_t *ssbo) {
+   *ssbo = ttc_virgl_xfb_ssbo;
+   return ttc_virgl_xfb_emulated;
+}
+
+void ttc_virgl_set_xfb(struct pipe_context *pipe, const uint32_t *params,
+                       struct pipe_resource **targets) {
+   struct pipe_constant_buffer cb = {.user_buffer = params, .buffer_size = XFB_PARAMS * 4};
+   pipe->set_constant_buffer(pipe, MESA_SHADER_VERTEX, ttc_virgl_xfb_ubo, &cb);
+   struct pipe_shader_buffer sb[PIPE_MAX_SO_BUFFERS];
+   memset(sb, 0, sizeof(sb));
+   for (unsigned i = 0; i < PIPE_MAX_SO_BUFFERS; i++) {
+      if (targets[i]) {
+         sb[i].buffer = targets[i];
+         sb[i].buffer_size = targets[i]->width0;
+      }
+   }
+   pipe->set_shader_buffers(pipe, MESA_SHADER_VERTEX, ttc_virgl_xfb_ssbo, PIPE_MAX_SO_BUFFERS, sb,
+                            BITFIELD_MASK(PIPE_MAX_SO_BUFFERS));
+}
+
+void ttc_virgl_buffer_write(struct pipe_context *pipe, struct pipe_resource *res,
+                            uint32_t offset, const void *data, uint32_t size) {
+   pipe->buffer_subdata(pipe, res, PIPE_MAP_WRITE, offset, size, data);
+}
+
 void *ttc_virgl_create_shader(struct pipe_context *pipe, uint32_t stage, const void *tokens,
                               const uint32_t *so, uint32_t so_dwords, uint32_t shared_mem,
-                              uint32_t sint_mask, uint32_t uint_mask, char *err,
+                              uint32_t sint_mask, uint32_t uint_mask, bool xfb, char *err,
                               uint32_t errlen) {
    mesa_shader_stage s = ttc_virgl_stage(stage);
    if (s == MESA_SHADER_NONE) {
@@ -587,13 +683,21 @@ void *ttc_virgl_create_shader(struct pipe_context *pipe, uint32_t stage, const v
          o->stream = so[6 + 2 * i] & 3;
       }
    }
-   if (s == MESA_SHADER_VERTEX && (sint_mask | uint_mask)) {
+   // Zink, which has no transform feedback here, takes no stream output: a
+   // vertex shader with xfb captures its own.
+   struct pipe_stream_output_info stream_output = ss.stream_output;
+   if (ttc_virgl_xfb_emulated)
+      memset(&ss.stream_output, 0, sizeof(ss.stream_output));
+   xfb = xfb && ttc_virgl_xfb_emulated && stream_output.num_outputs;
+   if (s == MESA_SHADER_VERTEX && (sint_mask | uint_mask || xfb)) {
       nir_shader *nir = tgsi_to_nir(tokens, pipe->screen, false);
       if (!nir) {
          snprintf(err, errlen, "tgsi_to_nir failed");
          return NULL;
       }
       retype_inputs(nir, sint_mask, uint_mask);
+      if (xfb)
+         lower_xfb(nir, &stream_output);
       ss.type = PIPE_SHADER_IR_NIR;
       ss.ir.nir = nir;
    }
@@ -676,12 +780,6 @@ struct pipe_query *ttc_virgl_create_query(struct pipe_context *pipe, uint32_t ty
    return pipe->create_query(pipe, t, index);
 }
 
-struct pipe_stream_output_target *ttc_virgl_create_so_target(struct pipe_context *pipe,
-                                                             struct pipe_resource *res,
-                                                             uint32_t offset, uint32_t size) {
-   return pipe->create_stream_output_target(pipe, res, offset, size);
-}
-
 void ttc_virgl_delete_object(struct pipe_context *pipe, uint32_t type, uint32_t stage, void *obj) {
    switch (type) {
    case VIRGL_OBJECT_BLEND:
@@ -705,11 +803,6 @@ void ttc_virgl_delete_object(struct pipe_context *pipe, uint32_t type, uint32_t 
    case VIRGL_OBJECT_QUERY:
       pipe->destroy_query(pipe, obj);
       break;
-   case VIRGL_OBJECT_STREAMOUT_TARGET: {
-      struct pipe_stream_output_target *t = obj;
-      pipe_so_target_reference(&t, NULL);
-      break;
-   }
    case VIRGL_OBJECT_SHADER:
       switch (ttc_virgl_stage(stage)) {
       case MESA_SHADER_VERTEX:
@@ -1022,15 +1115,6 @@ void ttc_virgl_set_shader_images(struct pipe_context *pipe, uint32_t stage, uint
    pipe->set_shader_images(pipe, ttc_virgl_stage(stage), start, count, 0, iv);
 }
 
-void ttc_virgl_set_so_targets(struct pipe_context *pipe, uint32_t count,
-                              struct pipe_stream_output_target **targets, uint32_t append) {
-   unsigned offsets[PIPE_MAX_SO_BUFFERS];
-   for (uint32_t i = 0; i < count && i < PIPE_MAX_SO_BUFFERS; i++)
-      offsets[i] = (append >> i) & 1 ? (unsigned)-1 : 0;
-   pipe->set_stream_output_targets(pipe, MIN2(count, PIPE_MAX_SO_BUFFERS), targets, offsets,
-                                   MESA_PRIM_UNKNOWN);
-}
-
 void ttc_virgl_render_condition(struct pipe_context *pipe, struct pipe_query *q,
                                 bool condition, uint32_t mode) {
    pipe->render_condition(pipe, q, condition, mode);
@@ -1131,9 +1215,6 @@ int ttc_virgl_draw(struct pipe_context *pipe, const uint32_t *d, uint32_t n,
       indirect.draw_count = d[17];
       indirect.indirect_draw_count_offset = d[18];
       indirect.indirect_draw_count = draw->indirect_count;
-      ind = &indirect;
-   } else if (draw->count_from_so) {
-      indirect.count_from_stream_output = draw->count_from_so;
       ind = &indirect;
    }
    pipe->draw_vbo(pipe, &info, drawid, ind, &sc, 1);

@@ -102,9 +102,49 @@ const (
 	maxShaderTextBytes       = 16 << 20
 
 	// queryStateSize is the size of struct virgl_host_query_state, which a
-	// query's resource holds.
+	// query's resource holds, and queryStateDone its state once it holds
+	// the result.
 	queryStateSize = 16
+	queryStateDone = 1
+
+	// Gallium's primitives, and queries, as virgl numbers them: as
+	// Gallium did.
+	primPoints                 = 0
+	primLines                  = 1
+	primLineLoop               = 2
+	primLineStrip              = 3
+	primTriangles              = 4
+	primTriangleStrip          = 5
+	primTriangleFan            = 6
+	primQuads                  = 7
+	primQuadStrip              = 8
+	primPolygon                = 9
+	primLinesAdjacency         = 10
+	primLineStripAdjacency     = 11
+	primTrianglesAdjacency     = 12
+	primTriangleStripAdjacency = 13
+	primPatches                = 14
+	queryPrimitivesGenerated   = 5
+	queryPrimitivesEmitted     = 6
+	querySOStatistics          = 7
+	querySOOverflowPredicate   = 8
+	querySOOverflowAny         = 12
+	queryTypeI32               = 0
+	queryTypeU32               = 1
+	queryTypeI64               = 2
+	queryTypeU64               = 3
+	targetBuffer               = 0
 )
+
+// countedQuery reports whether the renderer counts the primitives of a
+// query of type qtype itself, where it emulates transform feedback.
+func countedQuery(qtype uint32) bool {
+	switch qtype {
+	case queryPrimitivesGenerated, queryPrimitivesEmitted, querySOStatistics, querySOOverflowPredicate, querySOOverflowAny:
+		return true
+	}
+	return false
+}
 
 // The most of what commands carry that the renderer takes: Gallium's
 // limits, and virglrenderer's.

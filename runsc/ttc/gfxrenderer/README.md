@@ -108,12 +108,12 @@ container sets it: the Venus driver that distributions package (Debian's
 Applications need no change: Vulkan ones find the GPU, and OpenGL ones that
 use Mesa's EGL on its surfaceless platform render on it by Zink. On macOS,
 Zink on MoltenVK has only OpenGL 2.1 and OpenGL ES 2.0, as MoltenVK has
-neither transform feedback nor geometry shaders, and applications that need
-more would fail rather than render in software (Mesa's llvmpipe has OpenGL
-4.6): there, Mesa's OpenGL drives the GPU with its virgl driver, which the
-renderer serves with Zink on the host (see [virgl](#virgl)), with the same
-versions, unless an application sets `MESA_LOADER_DRIVER_OVERRIDE=zink`, for
-Zink in the guest, or `LIBGL_ALWAYS_SOFTWARE=1`. Chromium renders on the GPU with ANGLE
+neither transform feedback nor geometry shaders: there, Mesa's OpenGL drives
+the GPU with its virgl driver, which the renderer serves with Zink on the
+host (see [virgl](#virgl)), with OpenGL 3.1 and OpenGL ES 3.1, unless an
+application sets `MESA_LOADER_DRIVER_OVERRIDE=zink`, for Zink in the guest,
+or `LIBGL_ALWAYS_SOFTWARE=1`, for Mesa's llvmpipe, which has OpenGL 4.6 in
+software. Chromium renders on the GPU with ANGLE
 on Vulkan (`--use-angle=vulkan`), which offers OpenGL ES 3, and llama.cpp's
 Vulkan backend computes on it. The driver has no window systems
 (`-Dplatforms=`), which would link libxcb and libwayland: X11 and Wayland
@@ -219,14 +219,36 @@ virgl's submissions use, signal once Zink's work before them is done, and
 queries' results are in the guest's memory by then.
 
 Guests need no configuration: Debian's Mesa reports `virgl (zink Vulkan
-1.4(Apple M5 Pro (MOLTENVK)))`, with OpenGL 2.1 and OpenGL ES 2.0, as Zink
-in the guest has, because MoltenVK has no transform feedback. Applications
-that need more fail rather than render in software: they can ask for
-Mesa's llvmpipe with `LIBGL_ALWAYS_SOFTWARE=1`. redroid's image in its own
-host mode (`androidboot.redroid_gpu_mode=host
-androidboot.redroid_gpu_node=/dev/dri/renderD128`) boots with
-SurfaceFlinger on it, but Android 14's HWUI requires OpenGL ES 3.0, and
-its apps abort.
+1.4(Apple M5 Pro (MOLTENVK)))`, with OpenGL 3.1 and OpenGL ES 3.1, more than
+Zink in the guest has, and redroid's image runs in its own host mode, with
+no file of TTC's: its Mesa's virgl driver renders SurfaceFlinger and apps,
+and its GBM allocates their buffers.
+
+```sh
+ttc create --name android --gfx --gfx-fork device-lost --cap-add ALL \
+  --network ttc --nat --entrypoint /init redroid/redroid:14.0.0_64only-latest \
+  qemu=1 androidboot.hardware=redroid androidboot.use_memfd=true \
+  androidboot.redroid_gpu_mode=host androidboot.redroid_gpu_node=/dev/dri/renderD128
+```
+
+The node names the render node, which redroid otherwise finds through
+debugfs, which TTC has none of; without debugfs, redroid offers apps no
+Vulkan. Applications that need more OpenGL than virgl has here fail rather
+than render in software: they can ask for Mesa's llvmpipe with
+`LIBGL_ALWAYS_SOFTWARE=1`.
+
+OpenGL 3.0 and OpenGL ES 3.0, which Android 14's HWUI requires, require
+transform feedback, which MoltenVK, and so Zink, has none of: the renderer
+emulates it, as ANGLE does on Vulkan without it. A vertex shader with a
+stream output captures it itself: at its end it stores its outputs to the
+targets' buffers, which the renderer binds as shader buffers, at its
+vertex's index among the draw's, which a uniform buffer of the draw's
+parameters gives. The renderer keeps those slots of the vertex shader's
+state from the guest, and counts the queries of transform feedback and of
+primitives generated on the CPU, which knows each draw's size. It captures
+what OpenGL ES 3.0 allows to: lists of points, lines and triangles, of no
+indexed draw; of OpenGL's indexed and strip draws, it captures nothing, and
+logs so.
 
 TGSI's shaders differ from what Zink's own frontends give it, in ways that
 MoltenVK refuses:

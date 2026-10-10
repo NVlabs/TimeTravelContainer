@@ -16,7 +16,6 @@ struct pipe_fence_handle;
 struct pipe_query;
 struct pipe_resource;
 struct pipe_sampler_view;
-struct pipe_stream_output_target;
 
 // The process's screen, on the Vulkan that the renderer links.
 int ttc_virgl_init(void);
@@ -72,11 +71,25 @@ void ttc_virgl_free_tokens(void *tokens);
 // err. so is the shader's stream output, the payload's dwords from its
 // count. A vertex shader's inputs of sint_mask are signed integers, and of
 // uint_mask unsigned, which TGSI's typeless inputs leave unsaid: Metal
-// requires the vertex formats' types.
+// requires the vertex formats' types. A vertex shader with xfb captures
+// its stream output as ttc_virgl_set_xfb says.
 void *ttc_virgl_create_shader(struct pipe_context *pipe, uint32_t stage, const void *tokens,
                               const uint32_t *so, uint32_t so_dwords, uint32_t shared_mem,
-                              uint32_t sint_mask, uint32_t uint_mask, char *err,
+                              uint32_t sint_mask, uint32_t uint_mask, bool xfb, char *err,
                               uint32_t errlen);
+// ttc_virgl_xfb reports whether the renderer emulates transform feedback,
+// and the shader buffer slots of its targets.
+bool ttc_virgl_xfb(uint32_t *ssbo);
+// ttc_virgl_set_xfb sets the parameters of the next draw's capture: the
+// draw's first vertex, the vertices of an instance that it captures, the
+// vertices that fit the targets, and the targets' offsets in bytes. targets
+// are the targets' buffers, or NULL.
+void ttc_virgl_set_xfb(struct pipe_context *pipe, const uint32_t *params,
+                       struct pipe_resource **targets);
+// ttc_virgl_buffer_write writes size bytes of data at offset of the buffer
+// res, which the caller checked.
+void ttc_virgl_buffer_write(struct pipe_context *pipe, struct pipe_resource *res,
+                            uint32_t offset, const void *data, uint32_t size);
 // ttc_virgl_format_int_class returns 1 if virgl's format is of signed
 // integers, 2 if of unsigned integers, and 0 otherwise.
 uint32_t ttc_virgl_format_int_class(uint32_t format);
@@ -87,9 +100,6 @@ struct pipe_sampler_view *ttc_virgl_create_sampler_view(struct pipe_context *pip
                                                        uint32_t swizzle);
 struct pipe_query *ttc_virgl_create_query(struct pipe_context *pipe, uint32_t type,
                                           uint32_t index);
-struct pipe_stream_output_target *ttc_virgl_create_so_target(struct pipe_context *pipe,
-                                                             struct pipe_resource *res,
-                                                             uint32_t offset, uint32_t size);
 void ttc_virgl_delete_object(struct pipe_context *pipe, uint32_t type, uint32_t stage, void *obj);
 void ttc_virgl_bind_object(struct pipe_context *pipe, uint32_t type, void *obj);
 void ttc_virgl_bind_shader(struct pipe_context *pipe, uint32_t stage, void *shader);
@@ -141,8 +151,6 @@ void ttc_virgl_set_atomic_buffers(struct pipe_context *pipe, uint32_t start, uin
 void ttc_virgl_set_shader_images(struct pipe_context *pipe, uint32_t stage, uint32_t start,
                                  uint32_t count, struct pipe_resource **res,
                                  const uint32_t *d);
-void ttc_virgl_set_so_targets(struct pipe_context *pipe, uint32_t count,
-                              struct pipe_stream_output_target **targets, uint32_t append);
 void ttc_virgl_render_condition(struct pipe_context *pipe, struct pipe_query *q,
                                 bool condition, uint32_t mode);
 
@@ -158,7 +166,6 @@ struct ttc_virgl_draw {
    uint32_t index_size, index_offset;
    struct pipe_resource *indirect;
    struct pipe_resource *indirect_count;
-   struct pipe_stream_output_target *count_from_so;
 };
 int ttc_virgl_draw(struct pipe_context *pipe, const uint32_t *d, uint32_t n,
                    const struct ttc_virgl_draw *draw);

@@ -36,6 +36,12 @@ var (
 var (
 	initOnce sync.Once
 	initErr  error
+
+	// xfbEmulated is whether the renderer emulates transform feedback,
+	// which Zink has none of here, and xfbSSBO the vertex shader's first
+	// shader buffer slot that it keeps for its targets.
+	xfbEmulated bool
+	xfbSSBO     uint32
 )
 
 // Init creates the process's Zink screen, on the Vulkan that the renderer
@@ -44,7 +50,11 @@ func Init() error {
 	initOnce.Do(func() {
 		if C.ttc_virgl_init() != 0 {
 			initErr = errors.New("Zink found no usable Vulkan device")
+			return
 		}
+		var ssbo C.uint32_t
+		xfbEmulated = bool(C.ttc_virgl_xfb(&ssbo))
+		xfbSSBO = uint32(ssbo)
 	})
 	return initErr
 }

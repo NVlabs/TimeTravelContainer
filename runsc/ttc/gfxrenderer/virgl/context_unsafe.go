@@ -15,6 +15,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"unsafe"
@@ -39,6 +40,9 @@ type Context struct {
 	// them.
 	inflight  int
 	destroyed bool
+	// loggedCapture is whether the context logged a draw whose transform
+	// feedback the renderer cannot capture.
+	loggedCapture bool
 }
 
 // subContext is a sub-context: a Gallium context, the guest's objects of
@@ -76,6 +80,13 @@ type subContext struct {
 	// SET_FRAMEBUFFER_STATE_NO_ATTACH, which guests send after each
 	// framebuffer, leaves as it is.
 	fbAttached bool
+
+	// The stream output targets bound, whose transform feedback the
+	// renderer captures itself (see prepareCapture), and the active queries
+	// that it counts itself, of primitives and of transform feedback.
+	soTargets      [maxStreamoutTargets]*object
+	soCount        int
+	countedQueries map[*object]struct{}
 
 	// The guest's vertex elements and vertex buffers, which draws bind:
 	// Gallium's vertex elements, not its vertex buffers, carry the
@@ -138,10 +149,20 @@ type object struct {
 	numTokens uint32
 	so        []uint32
 	shared    uint32
-	// A vertex shader's TGSI, and its variants, by their inputs' integer
-	// types (see bindVertexShader).
+	// A vertex shader's TGSI, and its variants (see bindVertexShader).
 	vsTokens unsafe.Pointer
-	variants map[uint64]unsafe.Pointer
+	variants map[variantKey]unsafe.Pointer
+	// A stream output target's range of its buffer, and the bytes and the
+	// vertices captured to it.
+	soOffset uint32
+	soSize   uint32
+	soFilled uint32
+	soVerts  uint32
+	// A query that the renderer counts itself, and its counts.
+	counted   bool
+	generated uint64
+	emitted   uint64
+	needed    uint64
 	// A query's type and the sub-context that created it.
 	qtype uint32
 	sub   *subContext
@@ -181,6 +202,8 @@ func (c *Context) newSubContext() (*subContext, error) {
 		objects: make(map[uint32]*object),
 		zombies: make(map[*object]struct{}),
 		held:    make(map[slot]*Resource),
+
+		countedQueries: make(map[*object]struct{}),
 	}
 	// Zink draws with the blend, rasterizer and depth-stencil-alpha states
 	// bound, which a guest that binds none would leave unbound: OpenGL's
@@ -405,6 +428,7 @@ func (c *Context) destroyObjectLocked(sub *subContext, h uint32) {
 // holds.
 func (c *Context) freeObjectLocked(sub *subContext, o *object) {
 	delete(sub.zombies, o)
+	delete(sub.countedQueries, o)
 	if o.variants != nil {
 		// o.ptr is one of them.
 		for _, v := range o.variants {
@@ -525,10 +549,17 @@ func (c *Context) lookup(h, typ uint32) (*object, error) {
 		return nil, nil
 	}
 	o := c.sub.objects[h]
-	if o == nil || o.typ != typ || o.ptr == nil && typ != objectVertexElements {
+	if o == nil || o.typ != typ || o.ptr == nil && !o.renderers() {
 		return nil, fmt.Errorf("no object %d of type %d", h, typ)
 	}
 	return o, nil
+}
+
+// renderers reports whether o is an object of the renderer's, with no
+// Gallium state: vertex elements, which draws make Gallium's of, stream
+// output targets, and queries that the renderer counts.
+func (o *object) renderers() bool {
+	return o.typ == objectVertexElements || o.typ == objectStreamoutTarget || o.counted
 }
 
 // mustLookup returns the sub-context's object h of type typ, which is not
@@ -904,16 +935,23 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		if n < 1 || n-1 > maxStreamoutTargets {
 			return errLen(n)
 		}
-		// Zink keeps references to the targets that it binds.
-		var targets [maxStreamoutTargets]*C.struct_pipe_stream_output_target
+		var targets [maxStreamoutTargets]*object
 		for i := 0; i < n-1; i++ {
 			o, err := c.lookup(d[1+i], objectStreamoutTarget)
 			if err != nil {
 				return err
 			}
-			targets[i] = (*C.struct_pipe_stream_output_target)(objPtr(o))
+			targets[i] = o
 		}
-		C.ttc_virgl_set_so_targets(pipe, C.uint32_t(n-1), &targets[0], C.uint32_t(d[0]))
+		// A target that the guest binds afresh, rather than to append to,
+		// is empty, as Gallium's offset of 0 makes it.
+		for i, o := range targets {
+			if o != nil && d[0]&(1<<i) == 0 {
+				o.soFilled, o.soVerts = 0, 0
+			}
+			c.rebind(sub, &sub.soTargets[i], o)
+		}
+		sub.soCount = n - 1
 		return nil
 
 	case cmdSetRenderCondition:
@@ -923,6 +961,10 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		o, err := c.lookup(d[0], objectQuery)
 		if err != nil {
 			return err
+		}
+		if o != nil && o.counted {
+			// OpenGL conditions rendering on occlusion queries.
+			return fmt.Errorf("a render condition of query type %d", o.qtype)
 		}
 		C.ttc_virgl_render_condition(pipe, (*C.struct_pipe_query)(objPtr(o)), C.bool(d[1]&1 != 0), C.uint32_t(d[2]))
 		c.rebind(sub, &sub.cond, o)
@@ -1023,9 +1065,15 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		if err != nil {
 			return err
 		}
-		if cmd == cmdBeginQuery {
+		switch {
+		case o.counted && cmd == cmdBeginQuery:
+			o.generated, o.emitted, o.needed = 0, 0, 0
+			sub.countedQueries[o] = struct{}{}
+		case o.counted:
+			delete(sub.countedQueries, o)
+		case cmd == cmdBeginQuery:
 			C.ttc_virgl_begin_query(pipe, (*C.struct_pipe_query)(o.ptr))
-		} else {
+		default:
 			C.ttc_virgl_end_query(pipe, (*C.struct_pipe_query)(o.ptr))
 		}
 		return nil
@@ -1037,6 +1085,10 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		o, err := c.mustLookup(d[0], objectQuery)
 		if err != nil {
 			return err
+		}
+		if o.counted {
+			c.countedResultLocked(o)
+			return nil
 		}
 		// Like virglrenderer's, a result that is not ready goes to the
 		// guest's memory once a fence finds that it is, whether the guest
@@ -1062,6 +1114,9 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		qbo, err := c.mustResource(d[1])
 		if err != nil {
 			return err
+		}
+		if o.counted {
+			return c.countedResultQBO(o, qbo, d[3], d[4], int32(d[5]))
 		}
 		return errnoErr(C.ttc_virgl_query_result_qbo(pipe, (*C.struct_pipe_query)(o.ptr), qbo.pipe, C.bool(d[2] != 0),
 			C.uint32_t(d[3]), C.uint32_t(d[4]), C.int32_t(d[5])))
@@ -1187,6 +1242,16 @@ func (c *Context) draw(d []uint32) error {
 		// and fragment shaders, which Zink cannot draw without.
 		return nil
 	}
+	if d[11] != 0 {
+		// A draw of the vertices that a stream output target captured, as
+		// glDrawTransformFeedback draws.
+		o, err := c.mustLookup(d[11], objectStreamoutTarget)
+		if err != nil {
+			return err
+		}
+		d = append([]uint32(nil), d...)
+		d[0], d[1], d[11] = 0, o.soVerts, 0
+	}
 	var draw C.struct_ttc_virgl_draw
 	if d[3] != 0 {
 		ib := sub.ib
@@ -1214,20 +1279,254 @@ func (c *Context) draw(d []uint32) error {
 		draw.indirect = r.pipe
 		draw.indirect_count = pipeOf(count)
 	}
-	if d[11] != 0 {
-		o, err := c.mustLookup(d[11], objectStreamoutTarget)
-		if err != nil {
-			return err
-		}
-		draw.count_from_so = (*C.struct_pipe_stream_output_target)(o.ptr)
-	}
+	indirect := draw.indirect != nil
+	cp := c.prepareCapture(d[2], d[0], d[1], d[4], d[3] != 0, indirect)
 	if err := c.bindVertexState(); err != nil {
 		return err
 	}
-	if err := c.bindVertexShader(); err != nil {
+	if err := c.bindVertexShader(cp != nil); err != nil {
 		return err
 	}
-	return errnoErr(C.ttc_virgl_draw(sub.pipe, ptr(d), C.uint32_t(n), &draw))
+	if cp != nil {
+		var res [maxStreamoutTargets]*C.struct_pipe_resource
+		old := make([]*Resource, maxStreamoutTargets)
+		for b := range res {
+			var r *Resource
+			if cp.strides[b] != 0 {
+				r = sub.soTargets[b].res
+			}
+			res[b] = pipeOf(r)
+			old[b] = sub.hold(slot{slotShaderBuffer, stageVertex, xfbSSBO + uint32(b)}, r)
+		}
+		C.ttc_virgl_set_xfb(sub.pipe, ptr(cp.params[:]), &res[0])
+		release(old...)
+	}
+	if err := errnoErr(C.ttc_virgl_draw(sub.pipe, ptr(d), C.uint32_t(n), &draw)); err != nil {
+		return err
+	}
+	c.countDraw(d[2], d[1], d[4], indirect, d, cp)
+	return nil
+}
+
+// capture is what a draw's transform feedback captures.
+type capture struct {
+	// params are the capture's parameters, ttc_virgl_set_xfb's.
+	params [8]uint32
+	// strides are those, in bytes, of the targets that the vertex shader
+	// captures to, and 0 for others.
+	strides [maxStreamoutTargets]uint32
+	// The vertices captured, and those that would have been had the
+	// targets room, which whole primitives, of vertices each, make.
+	written, wanted, vertices uint32
+}
+
+// prepareCapture returns the capture of a draw of mode, from the vertex
+// first, of count vertices and of instances, or nil if transform feedback
+// captures none. The renderer captures as OpenGL ES 3.0 allows: lists of
+// points, lines and triangles, and no indexed draws.
+func (c *Context) prepareCapture(mode, first, count, instances uint32, indexed, indirect bool) *capture {
+	sub := c.sub
+	vs := sub.shaders[stageVertex]
+	if sub.soCount == 0 || len(vs.so) == 0 || vs.so[0] == 0 || !xfbEmulated {
+		return nil
+	}
+	vertices := listVertices(mode)
+	if vertices == 0 || indexed || indirect {
+		if !c.loggedCapture {
+			c.loggedCapture = true
+			log.Printf("virgl: context %d: transform feedback of a draw of mode %d (indexed %v, indirect %v) captures nothing",
+				c.id, mode, indexed, indirect)
+		}
+		return nil
+	}
+	cp := &capture{vertices: vertices}
+	nso := int(vs.so[0])
+	for i := 0; i < nso && 5+2*i < len(vs.so); i++ {
+		if buf := vs.so[5+2*i] >> 13 & 7; buf < maxStreamoutTargets {
+			cp.strides[buf] = vs.so[1+buf] * 4
+		}
+	}
+	perInstance := count - count%vertices
+	wanted := uint64(perInstance) * uint64(instances)
+	fit := wanted
+	for b, stride := range cp.strides {
+		if stride == 0 {
+			continue
+		}
+		t := sub.soTargets[b]
+		if t == nil || b >= sub.soCount {
+			fit = 0
+			continue
+		}
+		fit = min(fit, uint64((t.soSize-t.soFilled)/stride))
+		cp.params[4+b] = t.soOffset + t.soFilled
+	}
+	fit -= fit % uint64(vertices)
+	cp.written, cp.wanted = uint32(fit), uint32(min(wanted, 1<<32-1))
+	cp.params[0], cp.params[1], cp.params[2] = first, perInstance, cp.written
+	return cp
+}
+
+// listVertices returns the vertices of each primitive of a list of
+// points, lines or triangles, and 0 for other modes.
+func listVertices(mode uint32) uint32 {
+	switch mode {
+	case primPoints:
+		return 1
+	case primLines:
+		return 2
+	case primTriangles:
+		return 3
+	}
+	return 0
+}
+
+// primitives returns the primitives of count vertices of mode, which
+// patches of patchVertices make of mode primPatches.
+func primitives(mode, count, patchVertices uint32) uint64 {
+	n := uint64(count)
+	sub := func(k uint64) uint64 {
+		if n < k {
+			return 0
+		}
+		return n - k
+	}
+	switch mode {
+	case primPoints:
+		return n
+	case primLines:
+		return n / 2
+	case primLineLoop:
+		if n < 2 {
+			return 0
+		}
+		return n
+	case primLineStrip:
+		return sub(1)
+	case primTriangles:
+		return n / 3
+	case primTriangleStrip, primTriangleFan:
+		return sub(2)
+	case primQuads:
+		return n / 4
+	case primQuadStrip:
+		return sub(2) / 2
+	case primPolygon:
+		if n < 3 {
+			return 0
+		}
+		return 1
+	case primLinesAdjacency:
+		return n / 4
+	case primLineStripAdjacency:
+		return sub(3)
+	case primTrianglesAdjacency:
+		return n / 6
+	case primTriangleStripAdjacency:
+		return sub(4) / 2
+	case primPatches:
+		if patchVertices == 0 {
+			return 0
+		}
+		return n / uint64(patchVertices)
+	}
+	return 0
+}
+
+// countDraw counts a draw, d, of mode, of count vertices and of instances,
+// whose capture is cp, for the active queries that the renderer counts,
+// and the targets that it captured to.
+func (c *Context) countDraw(mode, count, instances uint32, indirect bool, d []uint32, cp *capture) {
+	sub := c.sub
+	if cp != nil {
+		for b, stride := range cp.strides {
+			if stride != 0 && b < sub.soCount && sub.soTargets[b] != nil {
+				t := sub.soTargets[b]
+				t.soFilled += cp.written * stride
+				t.soVerts += cp.written
+			}
+		}
+	}
+	if len(sub.countedQueries) == 0 || indirect {
+		return
+	}
+	var patchVertices uint32
+	if len(d) >= 14 {
+		patchVertices = d[12]
+	}
+	generated := primitives(mode, count, patchVertices) * uint64(instances)
+	for q := range sub.countedQueries {
+		switch q.qtype {
+		case queryPrimitivesGenerated:
+			q.generated += generated
+		default:
+			if cp != nil {
+				q.emitted += uint64(cp.written / cp.vertices)
+				q.needed += uint64(cp.wanted / cp.vertices)
+			}
+		}
+	}
+}
+
+// countedResultLocked writes the result of a query that the renderer
+// counts to the guest's memory of its resource.
+func (c *Context) countedResultLocked(o *object) {
+	var state [queryStateSize]byte
+	binary.LittleEndian.PutUint32(state[0:], queryStateDone)
+	binary.LittleEndian.PutUint32(state[4:], 4)
+	binary.LittleEndian.PutUint64(state[8:], o.countedResult(0))
+	copy(o.res.backing, state[:])
+}
+
+// countedResult returns a counted query's result, or, for SO_STATISTICS,
+// its value index: the primitives written, or those that would have been.
+func (o *object) countedResult(index int32) uint64 {
+	switch o.qtype {
+	case queryPrimitivesGenerated:
+		return o.generated
+	case queryPrimitivesEmitted:
+		return o.emitted
+	case querySOStatistics:
+		if index == 1 {
+			return o.needed
+		}
+		return o.emitted
+	default: // the overflow predicates
+		if o.needed > o.emitted {
+			return 1
+		}
+		return 0
+	}
+}
+
+// countedResultQBO writes a counted query's result to the buffer qbo at
+// offset, as Gallium's get_query_result_resource does: of resultType, a
+// PIPE_QUERY_TYPE_*, and the value index, or its availability if index is
+// -1.
+func (c *Context) countedResultQBO(o *object, qbo *Resource, resultType, offset uint32, index int32) error {
+	value := uint64(1)
+	if index >= 0 {
+		value = o.countedResult(index)
+	}
+	var b [8]byte
+	size := uint32(4)
+	switch resultType {
+	case queryTypeI32:
+		binary.LittleEndian.PutUint32(b[:], uint32(min(value, 1<<31-1)))
+	case queryTypeU32:
+		binary.LittleEndian.PutUint32(b[:], uint32(min(value, 1<<32-1)))
+	case queryTypeI64, queryTypeU64:
+		binary.LittleEndian.PutUint64(b[:], value)
+		size = 8
+	default:
+		return fmt.Errorf("query result type %d", resultType)
+	}
+	width := uint32(C.ttc_virgl_resource_width(qbo.pipe, 0))
+	if C.ttc_virgl_resource_target(qbo.pipe) != targetBuffer || offset > width || size > width-offset {
+		return fmt.Errorf("a query result at %d of resource %d", offset, qbo.id)
+	}
+	C.ttc_virgl_buffer_write(c.sub.pipe, qbo.pipe, C.uint32_t(offset), unsafe.Pointer(&b[0]), C.uint32_t(size))
+	return nil
 }
 
 // bindVertexState binds a Gallium state of the guest's vertex elements, of
@@ -1366,8 +1665,14 @@ func (c *Context) createObject(typ uint32, d []uint32) error {
 			return fmt.Errorf("a query of resource %d, of %d bytes", d[3], len(r.backing))
 		}
 		o.qtype = d[1] & 0xffff
-		o.ptr = unsafe.Pointer(C.ttc_virgl_create_query(pipe, C.uint32_t(o.qtype), C.uint32_t(d[1]>>16)))
-		if o.ptr != nil {
+		if xfbEmulated && countedQuery(o.qtype) {
+			// Queries that Zink, which has no transform feedback here,
+			// cannot answer: the renderer counts their primitives itself.
+			o.counted = true
+		} else {
+			o.ptr = unsafe.Pointer(C.ttc_virgl_create_query(pipe, C.uint32_t(o.qtype), C.uint32_t(d[1]>>16)))
+		}
+		if o.ptr != nil || o.counted {
 			r.incRef()
 			o.res = r
 			o.sub = sub
@@ -1380,11 +1685,20 @@ func (c *Context) createObject(typ uint32, d []uint32) error {
 		if err != nil {
 			return err
 		}
-		o.ptr = unsafe.Pointer(C.ttc_virgl_create_so_target(pipe, r.pipe, C.uint32_t(d[2]), C.uint32_t(d[3])))
+		if !xfbEmulated {
+			return errors.New("no transform feedback")
+		}
+		width := uint32(C.ttc_virgl_resource_width(r.pipe, 0))
+		if C.ttc_virgl_resource_target(r.pipe) != targetBuffer || d[2] > width || d[3] > width-d[2] || d[2]%4 != 0 {
+			return fmt.Errorf("a stream output target at %d, of %d bytes, of resource %d", d[2], d[3], d[1])
+		}
+		r.incRef()
+		o.res = r
+		o.soOffset, o.soSize = d[2], d[3]
 	default:
 		return fmt.Errorf("creating object type %d", typ)
 	}
-	if o.ptr == nil && typ != objectSurface && typ != objectMSAASurface && typ != objectVertexElements {
+	if o.ptr == nil && typ != objectSurface && typ != objectMSAASurface && !o.renderers() {
 		return fmt.Errorf("Zink refused object %d of type %d", h, typ)
 	}
 	c.destroyObjectLocked(sub, h)
@@ -1451,7 +1765,7 @@ func (c *Context) createShader(d []uint32) error {
 	tgsi := C.ttc_virgl_translate_tgsi(ctext, C.uint32_t(o.numTokens), &errBuf[0], C.uint32_t(len(errBuf)))
 	if tgsi != nil {
 		o.ptr = C.ttc_virgl_create_shader(sub.pipe, C.uint32_t(o.stage), tgsi, ptr(o.so), C.uint32_t(len(o.so)),
-			C.uint32_t(o.shared), 0, 0, &errBuf[0], C.uint32_t(len(errBuf)))
+			C.uint32_t(o.shared), 0, 0, false, &errBuf[0], C.uint32_t(len(errBuf)))
 	}
 	if o.ptr == nil {
 		C.ttc_virgl_free_tokens(tgsi)
@@ -1465,23 +1779,30 @@ func (c *Context) createShader(d []uint32) error {
 	}
 	// Draws bind the vertex shader's variant of the vertex elements' types.
 	o.vsTokens = tgsi
-	o.variants = map[uint64]unsafe.Pointer{0: o.ptr}
+	o.variants = map[variantKey]unsafe.Pointer{{}: o.ptr}
 	return nil
 }
 
+// variantKey is a vertex shader's variant's: the inputs that are signed
+// and unsigned integers, and whether it captures its stream output.
+type variantKey struct {
+	sint, uint uint32
+	xfb        bool
+}
+
 // bindVertexShader binds the variant of the guest's vertex shader whose
-// inputs have the types of the vertex elements that feed them: TGSI's
-// inputs have no types, and Metal requires that shaders read integer
-// vertex formats as integers.
-func (c *Context) bindVertexShader() error {
+// inputs have the types of the vertex elements that feed them, and that
+// captures its stream output if xfb: TGSI's inputs have no types, and
+// Metal requires that shaders read integer vertex formats as integers.
+func (c *Context) bindVertexShader(xfb bool) error {
 	sub := c.sub
 	vs, ve := sub.shaders[stageVertex], sub.velems
-	key := uint64(ve.sintMask)<<32 | uint64(ve.uintMask)
+	key := variantKey{ve.sintMask, ve.uintMask, xfb}
 	v := vs.variants[key]
 	if v == nil {
 		var errBuf [256]C.char
 		v = C.ttc_virgl_create_shader(sub.pipe, stageVertex, vs.vsTokens, ptr(vs.so), C.uint32_t(len(vs.so)), 0,
-			C.uint32_t(ve.sintMask), C.uint32_t(ve.uintMask), &errBuf[0], C.uint32_t(len(errBuf)))
+			C.uint32_t(ve.sintMask), C.uint32_t(ve.uintMask), C.bool(xfb), &errBuf[0], C.uint32_t(len(errBuf)))
 		if v == nil {
 			return fmt.Errorf("a vertex shader of integer inputs %#x and %#x: %s", ve.sintMask, ve.uintMask, C.GoString(&errBuf[0]))
 		}

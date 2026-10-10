@@ -6,6 +6,7 @@
 #ifndef TTC_VIRGL_INT_H
 #define TTC_VIRGL_INT_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "compiler/shader_enums.h"
@@ -14,6 +15,13 @@
 struct pipe_screen;
 
 extern struct pipe_screen *ttc_virgl_screen;
+
+// The slots of the vertex shader's state that the renderer keeps for
+// transform feedback, which it emulates if Zink has none (pipe_darwin.c):
+// a uniform buffer of a draw's parameters, and four shader buffers, the
+// targets'.
+extern bool ttc_virgl_xfb_emulated;
+extern uint32_t ttc_virgl_xfb_ubo, ttc_virgl_xfb_ssbo;
 
 // ttc_virgl_pipe_format returns the Gallium format of a virgl format.
 enum pipe_format ttc_virgl_pipe_format(uint32_t format);
