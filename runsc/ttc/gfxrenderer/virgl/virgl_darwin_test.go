@@ -6,6 +6,7 @@
 package virgl
 
 import (
+	"bytes"
 	"encoding/binary"
 	"math"
 	"strings"
@@ -664,6 +665,62 @@ func TestInlineWriteAndRebind(t *testing.T) {
 	f.checkTriangle(t)
 }
 
+// A copy between a compressed format and a plain one of its blocks' size
+// copies blocks as texels, as glCopyImageSubData does, which the
+// capabilities offer.
+func TestCopyCompressedAndPlain(t *testing.T) {
+	const (
+		formatETC2RGB8   = 269
+		formatR32G32Uint = 194
+	)
+	f := newFixture(t)
+	// A 16x16 texture of 4x4 blocks of 8 bytes, and textures of their size.
+	blocks := make([]byte, 128)
+	for i := range blocks {
+		blocks[i] = byte(7*i + 1)
+	}
+	texture := func(id, format, w, h uint32, mem []byte) *Resource {
+		r, err := NewResource(id, ResourceArgs{Target: target2D, Format: format, Bind: bindSamplerView,
+			Width: w, Height: h, Depth: 1, ArraySize: 1}, mem, nil)
+		if err != nil {
+			t.Fatalf("NewResource: %v", err)
+		}
+		t.Cleanup(r.DecRef)
+		f.c.Attach(r)
+		return r
+	}
+	etc := texture(5, formatETC2RGB8, 16, 16, blocks)
+	plainMem, etc2Mem := make([]byte, 128), make([]byte, 128)
+	plain := texture(6, formatR32G32Uint, 4, 4, plainMem)
+	etc2 := texture(7, formatETC2RGB8, 16, 16, etc2Mem)
+	if err := f.c.Transfer(etc, TransferArgs{ToHost: true, W: 16, H: 16, D: 1}); err != nil {
+		t.Fatalf("Transfer: %v", err)
+	}
+	var s stream
+	s.cmd(cmdResourceCopyRegion, 0, plain.ID(), 0, 0, 0, 0, etc.ID(), 0, 0, 0, 0, 16, 16, 1)
+	s.cmd(cmdResourceCopyRegion, 0, etc2.ID(), 0, 0, 0, 0, plain.ID(), 0, 0, 0, 0, 4, 4, 1)
+	f.submit(t, s)
+	f.c.Flush().Wait()
+	for _, r := range []struct {
+		res  *Resource
+		w, h uint32
+		mem  []byte
+	}{{plain, 4, 4, plainMem}, {etc2, 16, 16, etc2Mem}} {
+		if err := f.c.Transfer(r.res, TransferArgs{W: r.w, H: r.h, D: 1}); err != nil {
+			t.Fatalf("Transfer: %v", err)
+		}
+		if !bytes.Equal(r.mem, blocks) {
+			t.Errorf("resource %d: % x, want % x", r.res.ID(), r.mem, blocks)
+		}
+	}
+	// Of the destination, the copy covers blocks, which must be within it.
+	s = nil
+	s.cmd(cmdResourceCopyRegion, 0, etc2.ID(), 0, 4, 0, 0, plain.ID(), 0, 0, 0, 0, 4, 4, 1)
+	if err := f.c.Submit(s.bytes()); err == nil {
+		t.Errorf("a copy past the destination's edge: no error")
+	}
+}
+
 func TestInvalidCommands(t *testing.T) {
 	f := newFixture(t)
 	for _, tc := range []struct {
@@ -687,6 +744,23 @@ func TestInvalidCommands(t *testing.T) {
 			s.cmd(cmdCreateObject, objectShader, 8, stageVertex, shaderOffsetContinuation|4, 300, 0, 0)
 		}},
 		{"invalid TGSI", func(s *stream) { s.shader(9, stageVertex, "VERT\nNOT TGSI\n", 1<<16) }},
+		// What Zink or Metal trapped on.
+		{"TGSI of an undeclared register", func(s *stream) {
+			s.shader(f.id(), stageVertex, "VERT\nDCL OUT[0], POSITION\n  0: MOV OUT[0], IN[0]\n  1: END\n", 1<<16)
+		}},
+		{"TGSI of another stage", func(s *stream) { s.shader(f.id(), stageVertex, greenShader, 1<<16) }},
+		{"blend factor of no factor", func(s *stream) {
+			s.cmd(cmdCreateObject, objectBlend, f.id(), 0, 0, 1|0xf<<27, 0, 0, 0, 0, 0, 0, 0)
+		}},
+		{"view in a format of another size", func(s *stream) {
+			s.cmd(cmdCreateObject, objectSamplerView, f.id(), f.rt.ID(), formatR32G32B32A32Float, 0, 0, 0|1<<3|2<<6|3<<9)
+		}},
+		{"texture as a vertex buffer", func(s *stream) { s.cmd(cmdSetVertexBuffers, 0, 16, 0, f.rt.ID()) }},
+		{"buffer as a color attachment", func(s *stream) {
+			surf := f.id()
+			s.cmd(cmdCreateObject, objectSurface, surf, f.vb.ID(), formatR8Unorm, 0, 15)
+			s.cmd(cmdSetFramebufferState, 0, 1, 0, surf)
+		}},
 	} {
 		var s stream
 		tc.s(&s)
@@ -698,6 +772,20 @@ func TestInvalidCommands(t *testing.T) {
 	var s stream
 	drawTriangle(&s)
 	f.submit(t, s)
+	// Zink draws no line loops, which guests' drivers convert, as the
+	// capabilities ask. Nor did the errors keep the context from rendering.
+	s = nil
+	f.setup(&s)
+	clearRed(&s)
+	s.cmd(cmdDrawVBO, 0, 0, 3, primLineLoop, 0, 1, 0, 0, 0, 0, 0, 0xffffffff, 0)
+	if err := f.c.Submit(s.bytes()); err == nil {
+		t.Errorf("line loop: no error")
+	}
+	s = nil
+	drawTriangle(&s)
+	f.submit(t, s)
+	f.finish(t)
+	f.checkTriangle(t)
 }
 
 func TestDestroyWithFenceInFlight(t *testing.T) {

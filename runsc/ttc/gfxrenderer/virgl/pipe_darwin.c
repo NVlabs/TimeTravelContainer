@@ -7,6 +7,7 @@
 // command's payload: virgl_protocol.h's offsets less one, its header's.
 
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -19,10 +20,13 @@
 #include "pipe/p_screen.h"
 #include "pipe/p_shader_tokens.h"
 #include "pipe/p_state.h"
+#include "tgsi/tgsi_parse.h"
+#include "tgsi/tgsi_sanity.h"
 #include "tgsi/tgsi_text.h"
 #include "util/format/u_format.h"
 #include "util/u_inlines.h"
 #include "util/u_math.h"
+#include "util/u_prim.h"
 #include "util/u_memory.h"
 #include "util/u_surface.h"
 #include "virgl.h"
@@ -111,11 +115,36 @@ static bool box_ok(const struct pipe_resource *res, unsigned level, const struct
           span_ok(box->z, box->depth, d);
 }
 
+static bool samples_ok(uint32_t n) {
+   return n <= 32 && (n & (n - 1)) == 0;
+}
+
+// buffer_range_ok reports whether size bytes from offset are within the
+// buffer res.
+static bool buffer_range_ok(const struct pipe_resource *res, uint64_t offset, uint64_t size) {
+   return res->target == PIPE_BUFFER && offset <= res->width0 && size <= res->width0 - offset;
+}
+
+// format_view_ok reports whether a texture of res's format may be viewed,
+// sampled, rendered to, or blitted, as format: as OpenGL's texture views
+// and Vulkan's require, and Metal asserts, of the same size class, and as
+// both colors or both depths.
+static bool format_view_ok(const struct pipe_resource *res, enum pipe_format format) {
+   if (format == PIPE_FORMAT_NONE)
+      return false;
+   if (res->target == PIPE_BUFFER || format == res->format)
+      return true;
+   return util_format_get_blocksize(format) == util_format_get_blocksize(res->format) &&
+          util_format_get_blockwidth(format) == util_format_get_blockwidth(res->format) &&
+          util_format_get_blockheight(format) == util_format_get_blockheight(res->format) &&
+          util_format_is_depth_or_stencil(format) == util_format_is_depth_or_stencil(res->format);
+}
+
 // resource_ok reports whether a virgl resource is valid, as virglrenderer's
 // check_resource_valid does, and Gallium's drivers assume.
 static bool resource_ok(const struct pipe_resource *t) {
    const struct pipe_screen *s = ttc_virgl_screen;
-   if (t->width0 == 0 || t->nr_samples > 32 || t->last_level > 15)
+   if (t->width0 == 0 || !samples_ok(t->nr_samples) || t->last_level > 15)
       return false;
    if (t->nr_samples > 1 && t->target != PIPE_TEXTURE_2D && t->target != PIPE_TEXTURE_2D_ARRAY)
       return false;
@@ -336,6 +365,20 @@ void ttc_virgl_fence_wait(struct pipe_fence_handle *fence) {
    ttc_virgl_screen->fence_reference(ttc_virgl_screen, &fence, NULL);
 }
 
+// The commands' enums are checked before Gallium sees them: drivers trust
+// theirs, and Zink traps on what is not a value of an enum.
+
+static bool blend_factor_ok(unsigned f) {
+   unsigned base = f & ~PIPE_BLENDFACTOR_INVERT_BIT;
+   return base >= PIPE_BLENDFACTOR_ONE && base <= PIPE_BLENDFACTOR_SRC1_ALPHA &&
+          f != (PIPE_BLENDFACTOR_INVERT_BIT | PIPE_BLENDFACTOR_SRC_ALPHA_SATURATE);
+}
+
+// sane_float returns f, or def if f is not a number or infinite.
+static float sane_float(float f, float def) {
+   return isfinite(f) ? f : def;
+}
+
 void *ttc_virgl_create_blend(struct pipe_context *pipe, const uint32_t *d) {
    struct pipe_blend_state s;
    memset(&s, 0, sizeof(s));
@@ -357,6 +400,17 @@ void *ttc_virgl_create_blend(struct pipe_context *pipe, const uint32_t *d) {
       s.rt[i].alpha_src_factor = (t >> 17) & 0x1f;
       s.rt[i].alpha_dst_factor = (t >> 22) & 0x1f;
       s.rt[i].colormask = (t >> 27) & 0xf;
+      struct pipe_rt_blend_state *rt = &s.rt[i];
+      if (i > s.max_rt || !rt->blend_enable) {
+         // Zink reads the factors of the targets that blend only.
+         rt->rgb_func = rt->alpha_func = PIPE_BLEND_ADD;
+         rt->rgb_src_factor = rt->alpha_src_factor = PIPE_BLENDFACTOR_ONE;
+         rt->rgb_dst_factor = rt->alpha_dst_factor = PIPE_BLENDFACTOR_ZERO;
+      } else if (rt->rgb_func > PIPE_BLEND_MAX || rt->alpha_func > PIPE_BLEND_MAX ||
+                 !blend_factor_ok(rt->rgb_src_factor) || !blend_factor_ok(rt->rgb_dst_factor) ||
+                 !blend_factor_ok(rt->alpha_src_factor) || !blend_factor_ok(rt->alpha_dst_factor)) {
+         return NULL;
+      }
    }
    return pipe->create_blend_state(pipe, &s);
 }
@@ -397,15 +451,18 @@ void *ttc_virgl_create_rasterizer(struct pipe_context *pipe, const uint32_t *d) 
    bit(bottom_edge_rule, 30);
    bit(force_persample_interp, 31);
 #undef bit
-   s.point_size = uif(d[2]);
+   s.point_size = sane_float(uif(d[2]), 1.0f);
    s.sprite_coord_enable = d[3];
    s.line_stipple_pattern = d[4] & 0xffff;
    s.line_stipple_factor = (d[4] >> 16) & 0xff;
    s.clip_plane_enable = (d[4] >> 24) & 0xff;
-   s.line_width = uif(d[5]);
-   s.offset_units = uif(d[6]);
-   s.offset_scale = uif(d[7]);
-   s.offset_clamp = uif(d[8]);
+   s.line_width = sane_float(uif(d[5]), 1.0f);
+   s.offset_units = sane_float(uif(d[6]), 0.0f);
+   s.offset_scale = sane_float(uif(d[7]), 0.0f);
+   s.offset_clamp = sane_float(uif(d[8]), 0.0f);
+   if (s.fill_front > PIPE_POLYGON_MODE_POINT || s.fill_back > PIPE_POLYGON_MODE_POINT ||
+       s.point_size < 0 || s.line_width < 0)
+      return NULL;
    return pipe->create_rasterizer_state(pipe, &s);
 }
 
@@ -446,9 +503,11 @@ void *ttc_virgl_create_sampler_state(struct pipe_context *pipe, const uint32_t *
    s.compare_func = (t >> 16) & 7;
    s.seamless_cube_map = (t >> 19) & 1;
    s.max_anisotropy = (t >> 20) & 0x1f;
-   s.lod_bias = uif(d[2]);
-   s.min_lod = uif(d[3]);
-   s.max_lod = uif(d[4]);
+   s.lod_bias = sane_float(uif(d[2]), 0.0f);
+   s.min_lod = sane_float(uif(d[3]), 0.0f);
+   s.max_lod = sane_float(uif(d[4]), 1000.0f);
+   if (s.max_lod < s.min_lod)
+      s.max_lod = s.min_lod;
    for (unsigned i = 0; i < 4; i++)
       s.border_color.ui[i] = d[5 + i];
    if (s.min_mip_filter > PIPE_TEX_MIPFILTER_NONE)
@@ -474,6 +533,9 @@ void *ttc_virgl_create_vertex_elements(struct pipe_context *pipe, const uint32_t
          return NULL;
       ve[i].src_format = format;
       ve[i].src_stride = strides[e[2]];
+      const struct pipe_caps *c = &pipe->screen->caps;
+      if (e[0] > c->max_vertex_element_src_offset || strides[e[2]] > c->max_vertex_attrib_stride)
+         return NULL;
    }
    return pipe->create_vertex_elements_state(pipe, count, ve);
 }
@@ -493,6 +555,12 @@ void *ttc_virgl_translate_tgsi(const char *text, uint32_t num_tokens, char *err,
    }
    if (!tgsi_text_translate(text, tokens, ntokens)) {
       snprintf(err, errlen, "invalid TGSI");
+      FREE(tokens);
+      return NULL;
+   }
+   // tgsi_to_nir trusts that registers are declared, as they are used.
+   if (!tgsi_sanity_check(tokens)) {
+      snprintf(err, errlen, "TGSI fails its sanity check");
       FREE(tokens);
       return NULL;
    }
@@ -652,6 +720,12 @@ void *ttc_virgl_create_shader(struct pipe_context *pipe, uint32_t stage, const v
       snprintf(err, errlen, "stage %u", stage);
       return NULL;
    }
+   // Zink compiles a shader of the stage that it creates it for, whatever
+   // its TGSI's.
+   if (tgsi_get_processor_type(tokens) != (unsigned)s) {
+      snprintf(err, errlen, "TGSI of a stage other than %u", stage);
+      return NULL;
+   }
    void *shader = NULL;
    if (s == MESA_SHADER_COMPUTE) {
       struct pipe_compute_state cs = {
@@ -730,6 +804,29 @@ void *ttc_virgl_create_shader(struct pipe_context *pipe, uint32_t stage, const v
    return shader;
 }
 
+// view_ok reports whether a view of target, of the layers and levels given,
+// may view the texture res, as OpenGL's texture views may.
+static bool view_ok(const struct pipe_resource *res, unsigned target, unsigned first_layer,
+                    unsigned last_layer, unsigned first_level, unsigned last_level) {
+   static const unsigned classes[PIPE_MAX_TEXTURE_TYPES] = {
+      [PIPE_BUFFER] = 1, [PIPE_TEXTURE_1D] = 2, [PIPE_TEXTURE_1D_ARRAY] = 2,
+      [PIPE_TEXTURE_2D] = 3, [PIPE_TEXTURE_2D_ARRAY] = 3, [PIPE_TEXTURE_CUBE] = 3,
+      [PIPE_TEXTURE_CUBE_ARRAY] = 3, [PIPE_TEXTURE_RECT] = 4, [PIPE_TEXTURE_3D] = 5,
+   };
+   if (target >= PIPE_MAX_TEXTURE_TYPES || classes[target] != classes[res->target])
+      return false;
+   if (first_level > last_level || last_level > res->last_level || first_layer > last_layer)
+      return false;
+   unsigned layers = res->target == PIPE_TEXTURE_3D ? 1 : res->array_size;
+   if (last_layer >= layers)
+      return false;
+   if (target == PIPE_TEXTURE_CUBE)
+      return first_layer + 6 <= layers;
+   if (target == PIPE_TEXTURE_CUBE_ARRAY)
+      return (last_layer - first_layer + 1) % 6 == 0;
+   return true;
+}
+
 struct pipe_sampler_view *ttc_virgl_create_sampler_view(struct pipe_context *pipe,
                                                        struct pipe_resource *res,
                                                        uint32_t format, uint32_t target,
@@ -738,7 +835,7 @@ struct pipe_sampler_view *ttc_virgl_create_sampler_view(struct pipe_context *pip
    struct pipe_sampler_view t;
    memset(&t, 0, sizeof(t));
    t.format = ttc_virgl_pipe_format(format);
-   if (t.format == PIPE_FORMAT_NONE)
+   if (!format_view_ok(res, t.format))
       return NULL;
    // A guest without texture views, or a view of a buffer, names no target.
    t.target = target ? target : res->target;
@@ -746,10 +843,13 @@ struct pipe_sampler_view *ttc_virgl_create_sampler_view(struct pipe_context *pip
    t.swizzle_g = (swizzle >> 3) & 7;
    t.swizzle_b = (swizzle >> 6) & 7;
    t.swizzle_a = (swizzle >> 9) & 7;
+   if (t.swizzle_r > PIPE_SWIZZLE_1 || t.swizzle_g > PIPE_SWIZZLE_1 ||
+       t.swizzle_b > PIPE_SWIZZLE_1 || t.swizzle_a > PIPE_SWIZZLE_1)
+      return NULL;
    if (res->target == PIPE_BUFFER) {
       t.target = PIPE_BUFFER;
-      unsigned size = util_format_get_blocksize(t.format);
-      if (val1 < val0 || size == 0)
+      uint64_t size = util_format_get_blocksize(t.format);
+      if (val1 < val0 || size == 0 || !buffer_range_ok(res, val0 * size, (val1 - val0 + 1ull) * size))
          return NULL;
       t.u.buf.offset = val0 * size;
       t.u.buf.size = (val1 - val0 + 1) * size;
@@ -758,6 +858,9 @@ struct pipe_sampler_view *ttc_virgl_create_sampler_view(struct pipe_context *pip
       t.u.tex.last_layer = (val0 >> 16) & 0xffff;
       t.u.tex.first_level = val1 & 0xff;
       t.u.tex.last_level = (val1 >> 8) & 0xff;
+      if (!view_ok(res, t.target, t.u.tex.first_layer, t.u.tex.last_layer, t.u.tex.first_level,
+                   t.u.tex.last_level))
+         return NULL;
    }
    return pipe->create_sampler_view(pipe, res, &t);
 }
@@ -781,6 +884,9 @@ struct pipe_query *ttc_virgl_create_query(struct pipe_context *pipe, uint32_t ty
                                           uint32_t index) {
    int t = query_type(type);
    if (t < 0)
+      return NULL;
+   // A pipeline statistic's index, or a vertex stream's.
+   if (index > (t == PIPE_QUERY_PIPELINE_STATISTICS_SINGLE ? PIPE_STAT_QUERY_CS_INVOCATIONS : 3))
       return NULL;
    return pipe->create_query(pipe, t, index);
 }
@@ -884,7 +990,7 @@ void ttc_virgl_bind_shader(struct pipe_context *pipe, uint32_t stage, void *shad
 int ttc_virgl_check_surface(struct pipe_resource *res, uint32_t format, uint32_t val0,
                             uint32_t val1) {
    enum pipe_format f = ttc_virgl_pipe_format(format);
-   if (f == PIPE_FORMAT_NONE)
+   if (!format_view_ok(res, f))
       return EINVAL;
    if (res->target == PIPE_BUFFER) {
       // virglrenderer's buffers' surfaces: first and last elements.
@@ -915,9 +1021,31 @@ static void surface(struct pipe_surface *dst, const struct ttc_virgl_surface *s)
    }
 }
 
-void ttc_virgl_set_framebuffer(struct pipe_context *pipe, uint32_t nr_cbufs,
-                               const struct ttc_virgl_surface *cbufs,
-                               const struct ttc_virgl_surface *zsbuf) {
+// attachment_ok reports whether s may be a framebuffer's attachment, of
+// color if bind is PIPE_BIND_RENDER_TARGET, or of depth and stencil:
+// Zink's attachments are images, which the screen renders to in the
+// surface's format.
+static bool attachment_ok(struct pipe_context *pipe, const struct ttc_virgl_surface *s,
+                          unsigned bind) {
+   if (!s->res)
+      return true;
+   enum pipe_format format = ttc_virgl_pipe_format(s->format);
+   unsigned samples = MAX2(s->res->nr_samples, s->nr_samples);
+   return s->res->target != PIPE_BUFFER && samples_ok(s->nr_samples) &&
+          util_format_is_depth_or_stencil(format) == (bind == PIPE_BIND_DEPTH_STENCIL) &&
+          pipe->screen->is_format_supported(pipe->screen, format, s->res->target, samples,
+                                            samples, bind);
+}
+
+int ttc_virgl_set_framebuffer(struct pipe_context *pipe, uint32_t nr_cbufs,
+                              const struct ttc_virgl_surface *cbufs,
+                              const struct ttc_virgl_surface *zsbuf) {
+   for (uint32_t i = 0; i < nr_cbufs && i < PIPE_MAX_COLOR_BUFS; i++) {
+      if (!attachment_ok(pipe, &cbufs[i], PIPE_BIND_RENDER_TARGET))
+         return EINVAL;
+   }
+   if (!attachment_ok(pipe, zsbuf, PIPE_BIND_DEPTH_STENCIL))
+      return EINVAL;
    struct pipe_framebuffer_state fb;
    memset(&fb, 0, sizeof(fb));
    uint32_t width = UINT32_MAX, height = UINT32_MAX;
@@ -937,10 +1065,15 @@ void ttc_virgl_set_framebuffer(struct pipe_context *pipe, uint32_t nr_cbufs,
    fb.width = width == UINT32_MAX ? 0 : width;
    fb.height = height == UINT32_MAX ? 0 : height;
    pipe->set_framebuffer_state(pipe, &fb);
+   return 0;
 }
 
-void ttc_virgl_set_framebuffer_no_attach(struct pipe_context *pipe, uint32_t width,
-                                         uint32_t height, uint32_t layers, uint32_t samples) {
+int ttc_virgl_set_framebuffer_no_attach(struct pipe_context *pipe, uint32_t width,
+                                        uint32_t height, uint32_t layers, uint32_t samples) {
+   const struct pipe_caps *c = &pipe->screen->caps;
+   if (width > c->max_texture_2d_size || height > c->max_texture_2d_size ||
+       layers > c->max_texture_array_layers || !samples_ok(samples))
+      return EINVAL;
    struct pipe_framebuffer_state fb;
    memset(&fb, 0, sizeof(fb));
    fb.width = width;
@@ -948,6 +1081,7 @@ void ttc_virgl_set_framebuffer_no_attach(struct pipe_context *pipe, uint32_t wid
    fb.layers = layers;
    fb.samples = samples;
    pipe->set_framebuffer_state(pipe, &fb);
+   return 0;
 }
 
 void ttc_virgl_set_viewports(struct pipe_context *pipe, uint32_t start, uint32_t count,
@@ -1000,15 +1134,18 @@ void ttc_virgl_set_constants(struct pipe_context *pipe, uint32_t stage, const ui
    pipe->set_constant_buffer(pipe, s, 0, &cb);
 }
 
-void ttc_virgl_set_uniform_buffer(struct pipe_context *pipe, uint32_t stage, uint32_t index,
-                                  struct pipe_resource *res, uint32_t offset, uint32_t size) {
+int ttc_virgl_set_uniform_buffer(struct pipe_context *pipe, uint32_t stage, uint32_t index,
+                                 struct pipe_resource *res, uint32_t offset, uint32_t size) {
    mesa_shader_stage s = ttc_virgl_stage(stage);
    if (!res) {
       pipe->set_constant_buffer(pipe, s, index, NULL);
-      return;
+      return 0;
    }
+   if (!buffer_range_ok(res, offset, size))
+      return EINVAL;
    struct pipe_constant_buffer cb = {.buffer = res, .buffer_offset = offset, .buffer_size = size};
    pipe->set_constant_buffer(pipe, s, index, &cb);
+   return 0;
 }
 
 void ttc_virgl_set_sampler_views(struct pipe_context *pipe, uint32_t stage, uint32_t start,
@@ -1055,7 +1192,7 @@ void ttc_virgl_set_sample_mask(struct pipe_context *pipe, uint32_t mask) {
 
 void ttc_virgl_set_min_samples(struct pipe_context *pipe, uint32_t n) {
    if (pipe->set_min_samples)
-      pipe->set_min_samples(pipe, n);
+      pipe->set_min_samples(pipe, CLAMP(n, 1, 32));
 }
 
 void ttc_virgl_set_tess_state(struct pipe_context *pipe, const uint32_t *d) {
@@ -1068,24 +1205,35 @@ void ttc_virgl_set_tess_state(struct pipe_context *pipe, const uint32_t *d) {
       pipe->set_tess_state(pipe, outer, inner);
 }
 
-void ttc_virgl_set_shader_buffers(struct pipe_context *pipe, uint32_t stage, uint32_t start,
-                                  uint32_t count, struct pipe_resource **res,
-                                  const uint32_t *offsets, const uint32_t *sizes) {
+int ttc_virgl_set_shader_buffers(struct pipe_context *pipe, uint32_t stage, uint32_t start,
+                                 uint32_t count, struct pipe_resource **res,
+                                 const uint32_t *offsets, const uint32_t *sizes) {
    struct pipe_shader_buffer sb[PIPE_MAX_SHADER_BUFFERS];
    memset(sb, 0, sizeof(sb));
+   for (uint32_t i = 0; i < count && i < PIPE_MAX_SHADER_BUFFERS; i++) {
+      if (res[i] && !buffer_range_ok(res[i], offsets[i], sizes[i]))
+         return EINVAL;
+   }
    for (uint32_t i = 0; i < count && i < PIPE_MAX_SHADER_BUFFERS; i++) {
       sb[i].buffer = res[i];
       sb[i].buffer_offset = offsets[i];
       sb[i].buffer_size = sizes[i];
    }
    pipe->set_shader_buffers(pipe, ttc_virgl_stage(stage), start, count, sb, ~0u);
+   return 0;
 }
 
-void ttc_virgl_set_atomic_buffers(struct pipe_context *pipe, uint32_t start, uint32_t count,
-                                  struct pipe_resource **res, const uint32_t *offsets,
-                                  const uint32_t *sizes) {
+int ttc_virgl_set_atomic_buffers(struct pipe_context *pipe, uint32_t start, uint32_t count,
+                                 struct pipe_resource **res, const uint32_t *offsets,
+                                 const uint32_t *sizes) {
    struct pipe_shader_buffer sb[PIPE_MAX_HW_ATOMIC_BUFFERS];
    memset(sb, 0, sizeof(sb));
+   if (start >= PIPE_MAX_HW_ATOMIC_BUFFERS || count > PIPE_MAX_HW_ATOMIC_BUFFERS - start)
+      return EINVAL;
+   for (uint32_t i = 0; i < count; i++) {
+      if (res[i] && !buffer_range_ok(res[i], offsets[i], sizes[i]))
+         return EINVAL;
+   }
    for (uint32_t i = 0; i < count && i < PIPE_MAX_HW_ATOMIC_BUFFERS; i++) {
       sb[i].buffer = res[i];
       sb[i].buffer_offset = offsets[i];
@@ -1093,11 +1241,12 @@ void ttc_virgl_set_atomic_buffers(struct pipe_context *pipe, uint32_t start, uin
    }
    if (pipe->set_hw_atomic_buffers)
       pipe->set_hw_atomic_buffers(pipe, start, count, sb);
+   return 0;
 }
 
-void ttc_virgl_set_shader_images(struct pipe_context *pipe, uint32_t stage, uint32_t start,
-                                 uint32_t count, struct pipe_resource **res,
-                                 const uint32_t *d) {
+int ttc_virgl_set_shader_images(struct pipe_context *pipe, uint32_t stage, uint32_t start,
+                                uint32_t count, struct pipe_resource **res,
+                                const uint32_t *d) {
    struct pipe_image_view iv[PIPE_MAX_SHADER_IMAGES];
    memset(iv, 0, sizeof(iv));
    for (uint32_t i = 0; i < count && i < PIPE_MAX_SHADER_IMAGES; i++) {
@@ -1108,16 +1257,24 @@ void ttc_virgl_set_shader_images(struct pipe_context *pipe, uint32_t stage, uint
       iv[i].format = ttc_virgl_pipe_format(e[0]);
       iv[i].access = e[1] & 0xffff;
       iv[i].shader_access = iv[i].access;
+      if (!format_view_ok(res[i], iv[i].format))
+         return EINVAL;
       if (res[i]->target == PIPE_BUFFER) {
          iv[i].u.buf.offset = e[2];
          iv[i].u.buf.size = e[3];
+         if (!buffer_range_ok(res[i], e[2], e[3]))
+            return EINVAL;
       } else {
          iv[i].u.tex.first_layer = e[2] & 0xffff;
          iv[i].u.tex.last_layer = (e[2] >> 16) & 0xffff;
          iv[i].u.tex.level = e[3];
+         if (!view_ok(res[i], res[i]->target, iv[i].u.tex.first_layer, iv[i].u.tex.last_layer,
+                      e[3], e[3]))
+            return EINVAL;
       }
    }
    pipe->set_shader_images(pipe, ttc_virgl_stage(stage), start, count, 0, iv);
+   return 0;
 }
 
 void ttc_virgl_render_condition(struct pipe_context *pipe, struct pipe_query *q,
@@ -1140,7 +1297,8 @@ int ttc_virgl_clear_texture(struct pipe_context *pipe, struct pipe_resource *res
    struct pipe_box box = {
       .x = d[2], .y = d[3], .z = d[4], .width = d[5], .height = d[6], .depth = d[7],
    };
-   if (box.width < 0 || box.height < 0 || box.depth < 0 || !box_ok(res, d[1], &box))
+   if (res->target == PIPE_BUFFER || box.width < 0 || box.height < 0 || box.depth < 0 ||
+       !box_ok(res, d[1], &box))
       return EINVAL;
    pipe->clear_texture(pipe, res, d[1], &box, &d[8]);
    return 0;
@@ -1173,20 +1331,27 @@ int ttc_virgl_clear_surface(struct pipe_context *pipe, const struct ttc_virgl_su
    return 0;
 }
 
-// buffer_range_ok reports whether size bytes from offset are within the
-// buffer res.
-static bool buffer_range_ok(const struct pipe_resource *res, uint64_t offset, uint64_t size) {
-   return res->target == PIPE_BUFFER && offset <= res->width0 && size <= res->width0 - offset;
-}
-
 int ttc_virgl_draw(struct pipe_context *pipe, const uint32_t *d, uint32_t n,
                    const struct ttc_virgl_draw *draw) {
-   if (d[2] >= MESA_PRIM_COUNT)
+   // Of the modes, Zink draws those of its supported_prim_modes, which the
+   // capabilities offer guests as prim_mask: their drivers convert the
+   // others, which Zink traps on.
+   if (d[2] >= MESA_PRIM_COUNT || !(pipe->screen->caps.supported_prim_modes & BITFIELD_BIT(d[2])))
       return EINVAL;
    struct pipe_draw_info info;
    memset(&info, 0, sizeof(info));
    struct pipe_draw_start_count_bias sc = {.start = d[0], .count = d[1], .index_bias = d[5]};
    info.mode = d[2];
+   // Whole primitives only, as Mesa's frontends draw them.
+   if (info.mode != MESA_PRIM_PATCHES && !u_trim_pipe_prim(info.mode, &sc.count) &&
+       !(n >= 20 && draw->indirect))
+      return 0;
+   if (info.mode == MESA_PRIM_PATCHES && n >= 14 && d[12])
+      sc.count -= sc.count % d[12];
+   if (d[3] && draw->index && draw->index_size &&
+       !buffer_range_ok(draw->index, draw->index_offset + (uint64_t)d[0] * draw->index_size,
+                        (uint64_t)d[1] * draw->index_size))
+      return EINVAL;
    if (d[3] && draw->index && draw->index_size) {
       info.index_size = draw->index_size;
       info.index.resource = draw->index;
@@ -1201,7 +1366,10 @@ int ttc_virgl_draw(struct pipe_context *pipe, const uint32_t *d, uint32_t n,
    info.start_instance = d[6];
    unsigned drawid = 0;
    if (n >= 14) {
-      if (pipe->set_patch_vertices && d[12])
+      // Vulkan's patches have at most 32 vertices.
+      if (info.mode == MESA_PRIM_PATCHES && (d[12] == 0 || d[12] > 32))
+         return EINVAL;
+      if (pipe->set_patch_vertices && info.mode == MESA_PRIM_PATCHES)
          pipe->set_patch_vertices(pipe, d[12]);
       drawid = d[13];
    }
@@ -1211,7 +1379,8 @@ int ttc_virgl_draw(struct pipe_context *pipe, const uint32_t *d, uint32_t n,
    if (n >= 20 && draw->indirect) {
       // A draw's arguments are at most 5 dwords; its count, 1.
       uint64_t stride = d[16] ? d[16] : 20;
-      if (!buffer_range_ok(draw->indirect, d[15], stride * MAX2(d[17], 1)) ||
+      if (d[15] % 4 != 0 || stride % 4 != 0 || stride < 16 ||
+          !buffer_range_ok(draw->indirect, d[15], stride * MAX2(d[17], 1)) ||
           (draw->indirect_count && !buffer_range_ok(draw->indirect_count, d[18], 4)))
          return EINVAL;
       indirect.buffer = draw->indirect;
@@ -1250,8 +1419,19 @@ int ttc_virgl_blit(struct pipe_context *pipe, struct pipe_resource *dst,
    info.src.format = ttc_virgl_pipe_format(d[14]);
    info.src.box = (struct pipe_box){.x = d[15], .y = d[16], .z = d[17], .width = d[18],
                                     .height = d[19], .depth = d[20]};
-   if (info.dst.format == PIPE_FORMAT_NONE || info.src.format == PIPE_FORMAT_NONE ||
+   if (dst->target == PIPE_BUFFER || src->target == PIPE_BUFFER ||
+       !format_view_ok(dst, info.dst.format) || !format_view_ok(src, info.src.format) ||
        !box_ok(dst, info.dst.level, &info.dst.box) || !box_ok(src, info.src.level, &info.src.box))
+      return EINVAL;
+   // What a blit may copy: color of color formats, depth and stencil of
+   // depth formats.
+   bool zs = info.mask & PIPE_MASK_ZS, color = info.mask & PIPE_MASK_RGBA;
+   if (info.filter > PIPE_TEX_FILTER_LINEAR || !info.mask || info.mask & ~PIPE_MASK_RGBAZS ||
+       zs == color ||
+       (zs && (!util_format_is_depth_or_stencil(info.dst.format) ||
+               !util_format_is_depth_or_stencil(info.src.format))) ||
+       (color && (util_format_is_depth_or_stencil(info.dst.format) ||
+                  util_format_is_depth_or_stencil(info.src.format))))
       return EINVAL;
    pipe->blit(pipe, &info);
    return 0;
@@ -1261,13 +1441,29 @@ int ttc_virgl_copy_region(struct pipe_context *pipe, struct pipe_resource *dst,
                           struct pipe_resource *src, const uint32_t *d) {
    struct pipe_box box = {.x = d[7], .y = d[8], .z = d[9], .width = d[10], .height = d[11],
                           .depth = d[12]};
+   if (box.width < 0 || box.height < 0 || box.depth < 0 || !box_ok(src, d[6], &box))
+      return EINVAL;
+   // The box is of the source's texels. A copy between a compressed format
+   // and a plain one of its blocks' size, which the capabilities offer,
+   // copies a block of one as a texel of the other: of the destination, it
+   // copies the blocks that the box touches.
+   unsigned sw = util_format_get_blockwidth(src->format), sh = util_format_get_blockheight(src->format);
+   unsigned dw = util_format_get_blockwidth(dst->format), dh = util_format_get_blockheight(dst->format);
    struct pipe_box to = {.x = d[2], .y = d[3], .z = d[4], .width = box.width, .height = box.height,
                          .depth = box.depth};
-   if (box.width < 0 || box.height < 0 || box.depth < 0 || !box_ok(src, d[6], &box) ||
-       !box_ok(dst, d[1], &to) || (dst->target == PIPE_BUFFER) != (src->target == PIPE_BUFFER) ||
-       util_format_get_blocksize(dst->format) != util_format_get_blocksize(src->format))
+   if (sw != dw || sh != dh) {
+      if ((sw > 1 || sh > 1) && (dw > 1 || dh > 1))
+         return EINVAL;
+      to.width = DIV_ROUND_UP(box.width, sw) * dw;
+      to.height = DIV_ROUND_UP(box.height, sh) * dh;
+   }
+   if (!box_ok(dst, d[1], &to) || (dst->target == PIPE_BUFFER) != (src->target == PIPE_BUFFER) ||
+       util_format_get_blocksize(dst->format) != util_format_get_blocksize(src->format) ||
+       util_format_get_num_planes(dst->format) != 1 || util_format_get_num_planes(src->format) != 1 ||
+       dst->nr_samples != src->nr_samples)
       return EINVAL;
-   pipe->resource_copy_region(pipe, dst, d[1], d[2], d[3], d[4], src, d[6], &box);
+   // Of the destination's offsets, those checked: its box's z is 16 bits.
+   pipe->resource_copy_region(pipe, dst, d[1], to.x, to.y, to.z, src, d[6], &box);
    return 0;
 }
 
@@ -1286,8 +1482,19 @@ int ttc_virgl_inline_write(struct pipe_context *pipe, struct pipe_resource *res,
 
 int ttc_virgl_launch_grid(struct pipe_context *pipe, const uint32_t *d,
                           struct pipe_resource *indirect) {
-   if (indirect && !buffer_range_ok(indirect, d[7], 12))
+   if (indirect && (d[7] % 4 != 0 || !buffer_range_ok(indirect, d[7], 12)))
       return EINVAL;
+   const struct pipe_compute_caps *cc = &pipe->screen->compute_caps;
+   uint64_t threads = 1;
+   for (unsigned i = 0; i < 3; i++) {
+      if (d[i] == 0 || d[i] > cc->max_block_size[i] || (!indirect && d[3 + i] > cc->max_grid_size[i]))
+         return EINVAL;
+      threads *= d[i];
+   }
+   if (threads > cc->max_threads_per_block)
+      return EINVAL;
+   if (!indirect && (!d[3] || !d[4] || !d[5]))
+      return 0;
    struct pipe_grid_info info;
    memset(&info, 0, sizeof(info));
    info.work_dim = 3;
@@ -1310,7 +1517,8 @@ void ttc_virgl_memory_barrier(struct pipe_context *pipe, uint32_t flags) {
 }
 
 void ttc_virgl_texture_barrier(struct pipe_context *pipe, uint32_t flags) {
-   if (pipe->texture_barrier)
+   flags &= PIPE_TEXTURE_BARRIER_SAMPLER | PIPE_TEXTURE_BARRIER_FRAMEBUFFER;
+   if (pipe->texture_barrier && flags)
       pipe->texture_barrier(pipe, flags);
 }
 

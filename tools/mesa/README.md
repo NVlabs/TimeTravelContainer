@@ -24,6 +24,10 @@ shares.
   Vulkan with `dlopen`; the renderer links MoltenVK, and gives Zink its
   entry points instead, through which it also works around MoltenVK's lack
   of robustness2's `nullDescriptor`, as the Venus renderer does.
+* `0002-tgsi-count-sanity-errors-whether-they-are-printed-or-not.patch`:
+  `tgsi_sanity_check` counted errors only where it printed them, and so
+  passed every shader; the renderer checks guests' TGSI with it, as
+  `tgsi_to_nir` dereferences the declarations of the registers used.
 
 ## Regenerating `tools/mesa.BUILD`
 

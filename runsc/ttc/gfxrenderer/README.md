@@ -209,8 +209,9 @@ driver on Vulkan, which ttcd links on the MoltenVK that the Venus renderer
 links (`tools/mesa/README.md`). virgl's commands are Gallium's calls, of
 Gallium's state objects and TGSI shaders, which Zink takes as they are:
 `virgl/context_unsafe.go` checks each command and resolves its handles, and
-`virgl/pipe_darwin.c` makes the call, as virglrenderer's vrend does on the
-host's OpenGL.
+`virgl/pipe_darwin.c` checks what Zink trusts of its fields and makes the
+call, as virglrenderer's vrend does on the host's OpenGL. A command that a
+guest's driver would not send, on which Zink could trap, ends its stream.
 
 A virgl context's classic resources are Gallium resources, and the
 renderer's shared memory, which the guest maps, is the guest's memory of

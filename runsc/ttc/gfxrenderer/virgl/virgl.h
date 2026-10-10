@@ -116,11 +116,11 @@ struct ttc_virgl_surface {
    uint32_t val0, val1;
    uint32_t nr_samples;
 };
-void ttc_virgl_set_framebuffer(struct pipe_context *pipe, uint32_t nr_cbufs,
-                               const struct ttc_virgl_surface *cbufs,
-                               const struct ttc_virgl_surface *zsbuf);
-void ttc_virgl_set_framebuffer_no_attach(struct pipe_context *pipe, uint32_t width,
-                                         uint32_t height, uint32_t layers, uint32_t samples);
+int ttc_virgl_set_framebuffer(struct pipe_context *pipe, uint32_t nr_cbufs,
+                              const struct ttc_virgl_surface *cbufs,
+                              const struct ttc_virgl_surface *zsbuf);
+int ttc_virgl_set_framebuffer_no_attach(struct pipe_context *pipe, uint32_t width,
+                                        uint32_t height, uint32_t layers, uint32_t samples);
 void ttc_virgl_set_viewports(struct pipe_context *pipe, uint32_t start, uint32_t count,
                              const uint32_t *d);
 void ttc_virgl_set_scissors(struct pipe_context *pipe, uint32_t start, uint32_t count,
@@ -129,8 +129,8 @@ void ttc_virgl_set_vertex_buffers(struct pipe_context *pipe, uint32_t count,
                                   struct pipe_resource **res, const uint32_t *offsets);
 void ttc_virgl_set_constants(struct pipe_context *pipe, uint32_t stage, const uint32_t *d,
                              uint32_t n);
-void ttc_virgl_set_uniform_buffer(struct pipe_context *pipe, uint32_t stage, uint32_t index,
-                                  struct pipe_resource *res, uint32_t offset, uint32_t size);
+int ttc_virgl_set_uniform_buffer(struct pipe_context *pipe, uint32_t stage, uint32_t index,
+                                 struct pipe_resource *res, uint32_t offset, uint32_t size);
 void ttc_virgl_set_sampler_views(struct pipe_context *pipe, uint32_t stage, uint32_t start,
                                  uint32_t count, struct pipe_sampler_view **views);
 void ttc_virgl_bind_samplers(struct pipe_context *pipe, uint32_t stage, uint32_t start,
@@ -142,15 +142,17 @@ void ttc_virgl_set_clip_state(struct pipe_context *pipe, const uint32_t *d);
 void ttc_virgl_set_sample_mask(struct pipe_context *pipe, uint32_t mask);
 void ttc_virgl_set_min_samples(struct pipe_context *pipe, uint32_t n);
 void ttc_virgl_set_tess_state(struct pipe_context *pipe, const uint32_t *d);
-void ttc_virgl_set_shader_buffers(struct pipe_context *pipe, uint32_t stage, uint32_t start,
-                                  uint32_t count, struct pipe_resource **res,
-                                  const uint32_t *offsets, const uint32_t *sizes);
-void ttc_virgl_set_atomic_buffers(struct pipe_context *pipe, uint32_t start, uint32_t count,
-                                  struct pipe_resource **res, const uint32_t *offsets,
-                                  const uint32_t *sizes);
-void ttc_virgl_set_shader_images(struct pipe_context *pipe, uint32_t stage, uint32_t start,
+// The setters that return int return 0, or an errno, of an invalid
+// binding, with the context's state unchanged.
+int ttc_virgl_set_shader_buffers(struct pipe_context *pipe, uint32_t stage, uint32_t start,
                                  uint32_t count, struct pipe_resource **res,
-                                 const uint32_t *d);
+                                 const uint32_t *offsets, const uint32_t *sizes);
+int ttc_virgl_set_atomic_buffers(struct pipe_context *pipe, uint32_t start, uint32_t count,
+                                 struct pipe_resource **res, const uint32_t *offsets,
+                                 const uint32_t *sizes);
+int ttc_virgl_set_shader_images(struct pipe_context *pipe, uint32_t stage, uint32_t start,
+                                uint32_t count, struct pipe_resource **res,
+                                const uint32_t *d);
 void ttc_virgl_render_condition(struct pipe_context *pipe, struct pipe_query *q,
                                 bool condition, uint32_t mode);
 

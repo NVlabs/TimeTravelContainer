@@ -10,7 +10,11 @@
 // virgl's commands are Gallium's calls, of Gallium's state objects and TGSI
 // shaders, which Zink takes as they are. The decoder (context_unsafe.go)
 // checks each command and resolves its handles; C (pipe_darwin.c) unpacks
-// its fields into Gallium's structs and calls Zink.
+// its fields into Gallium's structs, checks what Zink trusts of them, and
+// calls Zink. Gallium's drivers trust their callers, and Zink traps on
+// what no frontend sends, such as an enum's other values, a texture for a
+// buffer, or a primitive that it does not draw: a command that a guest's
+// driver would not send ends its stream, as in virglrenderer.
 package virgl
 
 // Capset is a capability set of virgl's.

@@ -384,6 +384,15 @@ func (c *Context) rebind(sub *subContext, s **object, o *object) {
 	}
 }
 
+// unhold undoes holds of slots of kind and stage from start, whose
+// previous holdings were old, where the call that would have replaced them
+// failed, and left Zink's state as it was.
+func (sub *subContext) unhold(kind, stage, start uint32, old []*Resource) {
+	for i, r := range old {
+		release(sub.hold(slot{kind, stage, start + uint32(i)}, r), r)
+	}
+}
+
 // hold records that Zink holds r in slot s, and returns what s held, which
 // the caller releases once the call that replaced it returned.
 func (sub *subContext) hold(s slot, r *Resource) *Resource {
@@ -517,6 +526,16 @@ func (c *Context) resource(h uint32) (*Resource, error) {
 		return nil, fmt.Errorf("resource %d is not the context's", h)
 	}
 	return r, nil
+}
+
+// buffer returns resource h, which is a buffer, or nil if h is 0: Zink
+// binds a texture of no VkBuffer as no buffer.
+func (c *Context) buffer(h uint32) (*Resource, error) {
+	r, err := c.resource(h)
+	if err == nil && r != nil && C.ttc_virgl_resource_target(r.pipe) != targetBuffer {
+		err = fmt.Errorf("resource %d is no buffer", h)
+	}
+	return r, err
 }
 
 // mustResource returns resource h, which is not 0.
@@ -680,15 +699,18 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 			return err
 		}
 		var zsbuf C.struct_ttc_virgl_surface
-		sub.fbAttached = zs != nil
+		attached := zs != nil
 		if zs != nil {
 			zsbuf = zs.surf
 		}
 		for _, cb := range cbufs {
-			sub.fbAttached = sub.fbAttached || cb.res != nil
+			attached = attached || cb.res != nil
 		}
 		// Zink keeps references to the framebuffer's resources.
-		C.ttc_virgl_set_framebuffer(pipe, C.uint32_t(d[0]), &cbufs[0], &zsbuf)
+		if err := errnoErr(C.ttc_virgl_set_framebuffer(pipe, C.uint32_t(d[0]), &cbufs[0], &zsbuf)); err != nil {
+			return err
+		}
+		sub.fbAttached = attached
 		return nil
 
 	case cmdSetFramebufferNoAttach:
@@ -700,9 +722,8 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		if sub.fbAttached {
 			return nil
 		}
-		C.ttc_virgl_set_framebuffer_no_attach(pipe, C.uint32_t(d[0]&0xffff), C.uint32_t(d[0]>>16),
-			C.uint32_t(d[1]&0xffff), C.uint32_t((d[1]>>16)&0xff))
-		return nil
+		return errnoErr(C.ttc_virgl_set_framebuffer_no_attach(pipe, C.uint32_t(d[0]&0xffff), C.uint32_t(d[0]>>16),
+			C.uint32_t(d[1]&0xffff), C.uint32_t((d[1]>>16)&0xff)))
 
 	case cmdSetVertexBuffers:
 		if n%3 != 0 || n/3 > maxVertexBuffers {
@@ -711,7 +732,7 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		count := n / 3
 		var vbs [maxVertexBuffers]vertexBuffer
 		for i := 0; i < count; i++ {
-			r, err := c.resource(d[3*i+2])
+			r, err := c.buffer(d[3*i+2])
 			if err != nil {
 				return err
 			}
@@ -735,7 +756,7 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		if n != 1 && n != 3 {
 			return errLen(n)
 		}
-		r, err := c.resource(d[0])
+		r, err := c.buffer(d[0])
 		if err != nil {
 			return err
 		}
@@ -768,8 +789,11 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 			return err
 		}
 		old := sub.hold(slot{slotConstantBuffer, d[0], d[1]}, r)
-		C.ttc_virgl_set_uniform_buffer(pipe, C.uint32_t(d[0]), C.uint32_t(d[1]), pipeOf(r),
-			C.uint32_t(d[2]), C.uint32_t(d[3]))
+		if err := errnoErr(C.ttc_virgl_set_uniform_buffer(pipe, C.uint32_t(d[0]), C.uint32_t(d[1]), pipeOf(r),
+			C.uint32_t(d[2]), C.uint32_t(d[3]))); err != nil {
+			sub.unhold(slotConstantBuffer, d[0], d[1], []*Resource{old})
+			return err
+		}
 		release(old)
 		return nil
 
@@ -882,8 +906,11 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 			return err
 		}
 		old := c.holdRange(slotShaderBuffer, d[0], d[1], res)
-		C.ttc_virgl_set_shader_buffers(pipe, C.uint32_t(d[0]), C.uint32_t(d[1]), C.uint32_t(count),
-			pipes(res), &offsets[0], &sizes[0])
+		if err := errnoErr(C.ttc_virgl_set_shader_buffers(pipe, C.uint32_t(d[0]), C.uint32_t(d[1]), C.uint32_t(count),
+			pipes(res), &offsets[0], &sizes[0])); err != nil {
+			sub.unhold(slotShaderBuffer, d[0], d[1], old)
+			return err
+		}
 		release(old...)
 		return nil
 
@@ -903,7 +930,10 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 			return err
 		}
 		old := c.holdRange(slotAtomicBuffer, 0, d[0], res)
-		C.ttc_virgl_set_atomic_buffers(pipe, C.uint32_t(d[0]), C.uint32_t(count), pipes(res), &offsets[0], &sizes[0])
+		if err := errnoErr(C.ttc_virgl_set_atomic_buffers(pipe, C.uint32_t(d[0]), C.uint32_t(count), pipes(res), &offsets[0], &sizes[0])); err != nil {
+			sub.unhold(slotAtomicBuffer, 0, d[0], old)
+			return err
+		}
 		release(old...)
 		return nil
 
@@ -927,7 +957,10 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 			res[i] = r
 		}
 		old := c.holdRange(slotShaderImage, d[0], d[1], res)
-		C.ttc_virgl_set_shader_images(pipe, C.uint32_t(d[0]), C.uint32_t(d[1]), C.uint32_t(count), pipes(res), ptr(d[2:]))
+		if err := errnoErr(C.ttc_virgl_set_shader_images(pipe, C.uint32_t(d[0]), C.uint32_t(d[1]), C.uint32_t(count), pipes(res), ptr(d[2:]))); err != nil {
+			sub.unhold(slotShaderImage, d[0], d[1], old)
+			return err
+		}
 		release(old...)
 		return nil
 
@@ -962,9 +995,9 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		if err != nil {
 			return err
 		}
-		if o != nil && o.counted {
+		if o != nil && o.counted || d[2] > renderCondByRegionNoWait {
 			// OpenGL conditions rendering on occlusion queries.
-			return fmt.Errorf("a render condition of query type %d", o.qtype)
+			return fmt.Errorf("a render condition of mode %d", d[2])
 		}
 		C.ttc_virgl_render_condition(pipe, (*C.struct_pipe_query)(objPtr(o)), C.bool(d[1]&1 != 0), C.uint32_t(d[2]))
 		c.rebind(sub, &sub.cond, o)
@@ -1241,6 +1274,13 @@ func (c *Context) draw(d []uint32) error {
 		// Like virglrenderer, drop draws without vertex elements or vertex
 		// and fragment shaders, which Zink cannot draw without.
 		return nil
+	}
+	for i := 0; i < len(sub.velems.elements)/4; i++ {
+		if vb := sub.velems.elements[4*i+2]; vb >= uint32(sub.numVBs) || sub.vbs[vb].res == nil {
+			// Nor without the vertex buffers that the elements read, which
+			// Gallium's frontends always bind.
+			return nil
+		}
 	}
 	if d[11] != 0 {
 		// A draw of the vertices that a stream output target captured, as
@@ -1641,6 +1681,10 @@ func (c *Context) createObject(typ uint32, d []uint32) error {
 		o.res = r
 		o.surf = C.struct_ttc_virgl_surface{res: r.pipe, format: C.uint32_t(d[2]), val0: C.uint32_t(d[3]), val1: C.uint32_t(d[4])}
 		if typ == objectMSAASurface {
+			if d[5] > 32 || d[5]&(d[5]-1) != 0 {
+				r.DecRef()
+				return fmt.Errorf("a surface of %d samples", d[5])
+			}
 			o.surf.nr_samples = C.uint32_t(d[5])
 		}
 	case objectSamplerView:

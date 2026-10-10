@@ -81,7 +81,10 @@ http_archive(
     name = "mesa",
     build_file = "//tools:mesa.BUILD",
     patch_args = ["-p1"],
-    patches = ["//tools/mesa:0001-zink-take-Vulkan-s-entry-points-from-an-embedder.patch"],
+    patches = [
+        "//tools/mesa:0001-zink-take-Vulkan-s-entry-points-from-an-embedder.patch",
+        "//tools/mesa:0002-tgsi-count-sanity-errors-whether-they-are-printed-or-not.patch",
+    ],
     sha256 = "bce5f7fbebb934373b86c999a064d52fb5065878dc57f287f95346648ec832e9",
     strip_prefix = "mesa-26.2.4",
     urls = ["https://archive.mesa3d.org/mesa-26.2.4.tar.xz"],

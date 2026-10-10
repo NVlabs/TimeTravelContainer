@@ -71,6 +71,7 @@ Bazel builds apply these patches to the components they name.
 | Component | Patch |
 |---|---|
 | Mesa | [tools/mesa/0001-zink-take-Vulkan-s-entry-points-from-an-embedder.patch](tools/mesa/0001-zink-take-Vulkan-s-entry-points-from-an-embedder.patch) |
+| Mesa | [tools/mesa/0002-tgsi-count-sanity-errors-whether-they-are-printed-or-not.patch](tools/mesa/0002-tgsi-count-sanity-errors-whether-they-are-printed-or-not.patch) |
 | Go standard library, runtime and toolchain | [tools/go_darwin_vm_hooks.patch](tools/go_darwin_vm_hooks.patch) |
 | Go standard library, runtime and toolchain | [tools/go_types_memoize.patch](tools/go_types_memoize.patch) |
 | google.golang.org/protobuf | [tools/protobuf.disable-binary-reading-on-init.patch](tools/protobuf.disable-binary-reading-on-init.patch) |

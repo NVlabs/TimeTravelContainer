@@ -134,6 +134,7 @@ const (
 	queryTypeI64               = 2
 	queryTypeU64               = 3
 	targetBuffer               = 0
+	renderCondByRegionNoWait   = 3
 )
 
 // countedQuery reports whether the renderer counts the primitives of a
