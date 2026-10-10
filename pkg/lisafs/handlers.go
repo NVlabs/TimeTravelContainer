@@ -177,10 +177,22 @@ func ChannelHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32
 		return 0, err
 	}
 
+	// The server keeps a copy of the client's end of the FD channel until the
+	// client sends its first request on the channel, by which time the client
+	// has received it: macOS may flush a Unix socket whose every reference is
+	// in a message in flight, and the client would then receive no FD on the
+	// channel.
+	fdSockCopy, err := unix.Dup(fdSock)
+	if err != nil {
+		unix.Close(fdSock)
+		ch.shutdown()
+		return 0, err
+	}
+
 	// Start servicing the channel in a separate goroutine.
 	c.activeWg.Add(1)
 	go func() {
-		if err := c.service(ch); err != nil {
+		if err := c.service(ch, fdSockCopy); err != nil {
 			// Don't log shutdown error which is expected during server shutdown.
 			if _, ok := err.(flipcall.ShutdownError); !ok {
 				log.Warningf("lisafs.Connection.service(channel = @%p): %v", ch, err)
