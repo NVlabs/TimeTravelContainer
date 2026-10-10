@@ -59,9 +59,10 @@ const (
 )
 
 // Messages from the Sentry to the renderers' broker, which starts renderers
-// for it. The broker answers with Reply.
+// for it. The broker answers StartRenderer with Reply.
 const (
 	MsgStartRenderer MsgType = iota + 200
+	MsgRendererReceived
 )
 
 // Messages from ttcd to the renderers' launcher, which starts renderers for
@@ -119,6 +120,8 @@ func (t MsgType) String() string {
 		return "FenceSignaled"
 	case MsgStartRenderer:
 		return "StartRenderer"
+	case MsgRendererReceived:
+		return "RendererReceived"
 	case MsgLaunchRenderer:
 		return "LaunchRenderer"
 	case MsgLaunchProbe:
@@ -257,6 +260,13 @@ type (
 	// Sentry's family, a Unix stream socket, on which the renderer sends
 	// Hello.
 	StartRenderer struct{}
+
+	// RendererReceived tells the broker that the Sentry received the
+	// descriptor that the reply to StartRenderer carried, which the broker
+	// keeps open until then: macOS may flush a Unix socket whose every
+	// reference is in a message in flight, so that its receiver reads the
+	// end of the connection at once, though its peer is open.
+	RendererReceived struct{}
 
 	// LaunchRenderer asks the launcher to start the renderer of a family,
 	// whose control connection, on which it takes ServeConnection, is the

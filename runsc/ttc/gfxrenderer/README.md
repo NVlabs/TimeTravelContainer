@@ -11,7 +11,11 @@ virtual GPU's in `g3doc/proposals/ttc_gpu_gfx_nvproxy.md`.
     Sentry asks for a branch's renderer, gives it the connections, on the
     control connection that is its fd 3, and starts it when the family has
     none. It exits once it serves no branch and keeps nothing for a fork's
-    children.
+    children. The broker keeps its copies of a connection's ends until the
+    renderer and the Sentry say that they received them: macOS may flush a
+    Unix socket whose every reference is in a message in flight, and the
+    renderer then read the end of a connection whose Sentry was there, as
+    one boot of redroid in about sixteen did.
 *   `probe` prints the renderer's capability sets as JSON. The Sentry needs
     them before any renderer runs.
 *   `launch` starts renderers for the ttcd connected to its fd 3
