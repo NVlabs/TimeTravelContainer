@@ -14,6 +14,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/venus/vk"
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/venus/vn"
+	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/virgl"
 )
 
 // object is an object of a context, by the ID that the context's guest gave
@@ -81,6 +82,17 @@ type resource struct {
 	fromCtx    *Context
 	fromMemory uint64
 	seq        uint64
+	// virgl is a virgl context's classic resource's Gallium resource,
+	// which holds a reference to mem.
+	virgl *virgl.Resource
+}
+
+// release releases the server's references to the resource's memory.
+func (r *resource) release() {
+	if r.virgl != nil {
+		r.virgl.DecRef()
+	}
+	r.mem.decRef()
 }
 
 // sharedMemory is shared memory that the renderer maps, and that the Sentry

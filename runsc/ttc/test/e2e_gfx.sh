@@ -5,9 +5,10 @@
 
 # Manual end-to-end coverage for the virtual GPU, --gfx: vulkaninfo, an
 # offscreen render's checksum (test/gfx/vkoffscreen.c), OpenGL ES by Zink
-# (test/gfx/gloffscreen.c), and forks with --gfx-fork=device-lost and
-# --gfx-fork=snapshot, in containers whose renderer is ttc-gfx-renderer on
-# the host's GPU, and whose Vulkan driver is the daemon's.
+# (test/gfx/gloffscreen.c), on macOS by Debian's virgl driver too, and forks
+# with --gfx-fork=device-lost and --gfx-fork=snapshot, in containers whose
+# renderer is ttc-gfx-renderer on the host's GPU, and whose Vulkan driver is
+# the daemon's.
 #
 # It needs:
 #   TTC and TTCD, the binaries;
@@ -173,6 +174,15 @@ case "$result" in
   *"renderer zink"*"$DEVICE"*"gloffscreen: ok checksum=$WANT_GL_CHECKSUM"*) ;;
   *) fail "gloffscreen: $result" ;;
 esac
+# On macOS, Debian's Mesa drives the GPU with its virgl driver by default,
+# which the renderer serves with Zink on the host: the same render.
+if [ "$(uname -s)" = Darwin ]; then
+  result=$(ttc exec "$NAME@main" /work/gloffscreen 2>&1) || fail "gloffscreen by virgl: $result"
+  case "$result" in
+    *"renderer virgl (zink"*"gloffscreen: ok checksum=$WANT_GL_CHECKSUM"*) ;;
+    *) fail "gloffscreen by virgl: $result" ;;
+  esac
+fi
 
 # Repeat the render: each run creates a context of the branch's renderer.
 for i in 1 2 3; do

@@ -35,6 +35,7 @@ go_library(
         "syncfd_unsafe.go",
         "transport_unsafe.go",
         "venus.go",
+        "virgl.go",
     ],
     bazel_cgo = True,
     stateify = False,
@@ -43,6 +44,7 @@ go_library(
         "//pkg/gfxproto",
         "//runsc/ttc/gfxrenderer/venus/vk",
         "//runsc/ttc/gfxrenderer/venus/vn",
+        "//runsc/ttc/gfxrenderer/virgl",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )

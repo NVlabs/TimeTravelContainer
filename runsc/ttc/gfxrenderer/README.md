@@ -3,8 +3,10 @@
 `ttc-gfx-renderer` (`runsc/ttcgfx`) renders what the virtual GPUs
 (`pkg/sentry/devices/virtgpu`) of a family's branches submit, with TTC's
 Venus renderer (`venus/`), for guests whose Vulkan driver is Mesa's Venus
-driver. The design is in `g3doc/proposals/ttc_venus_renderer.md`, and the
-virtual GPU's in `g3doc/proposals/ttc_gpu_gfx_nvproxy.md`.
+driver, and, on macOS, with its virgl renderer (`virgl/`), for guests whose
+OpenGL driver is Mesa's virgl driver. The design is in
+`g3doc/proposals/ttc_venus_renderer.md`, and the virtual GPU's in
+`g3doc/proposals/ttc_gpu_gfx_nvproxy.md`.
 
 *   `serve-family` renders for the branches of a family, a connection to each,
     speaking `pkg/gfxproto`. The daemon's broker (`ServeBroker`), which each
@@ -108,8 +110,10 @@ use Mesa's EGL on its surfaceless platform render on it by Zink. On macOS,
 Zink on MoltenVK has only OpenGL 2.1 and OpenGL ES 2.0, as MoltenVK has
 neither transform feedback nor geometry shaders, and applications that need
 more would fail rather than render in software (Mesa's llvmpipe has OpenGL
-4.6): there, OpenGL renders in software unless an application sets
-`MESA_LOADER_DRIVER_OVERRIDE=zink`. Chromium renders on the GPU with ANGLE
+4.6): there, Mesa's OpenGL drives the GPU with its virgl driver, which the
+renderer serves with Zink on the host (see [virgl](#virgl)), with the same
+versions, unless an application sets `MESA_LOADER_DRIVER_OVERRIDE=zink`, for
+Zink in the guest, or `LIBGL_ALWAYS_SOFTWARE=1`. Chromium renders on the GPU with ANGLE
 on Vulkan (`--use-angle=vulkan`), which offers OpenGL ES 3, and llama.cpp's
 Vulkan backend computes on it. The driver has no window systems
 (`-Dplatforms=`), which would link libxcb and libwayland: X11 and Wayland
@@ -194,5 +198,56 @@ app's buffers. Android 14's Vulkan loader also offers ANGLE
 `VK_EXT_swapchain_maintenance1` on it, whose feature the driver refuses at
 `vkCreateDevice` unless ANGLE leaves it off
 (`debug.angle.feature_overrides_disabled=supportsSwapchainMaintenance1`).
+
+## virgl
+
+On macOS the renderer also serves Mesa's virgl driver, the OpenGL driver for
+virtio-gpu that distributions' Mesa and Android images ship: it offers
+virgl's capability sets, 1 and 2, and executes the contexts of those, or of
+none, which guests create without asking for one, with Zink, Mesa's Gallium
+driver on Vulkan, which ttcd links on the MoltenVK that the Venus renderer
+links (`tools/mesa/README.md`). virgl's commands are Gallium's calls, of
+Gallium's state objects and TGSI shaders, which Zink takes as they are:
+`virgl/context_unsafe.go` checks each command and resolves its handles, and
+`virgl/pipe_darwin.c` makes the call, as virglrenderer's vrend does on the
+host's OpenGL.
+
+A virgl context's classic resources are Gallium resources, and the
+renderer's shared memory, which the guest maps, is the guest's memory of
+them: transfers copy between the two. Fences of the global timeline, which
+virgl's submissions use, signal once Zink's work before them is done, and
+queries' results are in the guest's memory by then.
+
+Guests need no configuration: Debian's Mesa reports `virgl (zink Vulkan
+1.4(Apple M5 Pro (MOLTENVK)))`, with OpenGL 2.1 and OpenGL ES 2.0, as Zink
+in the guest has, because MoltenVK has no transform feedback. Applications
+that need more fail rather than render in software: they can ask for
+Mesa's llvmpipe with `LIBGL_ALWAYS_SOFTWARE=1`. redroid's image in its own
+host mode (`androidboot.redroid_gpu_mode=host
+androidboot.redroid_gpu_node=/dev/dri/renderD128`) boots with
+SurfaceFlinger on it, but Android 14's HWUI requires OpenGL ES 3.0, and
+its apps abort.
+
+TGSI's shaders differ from what Zink's own frontends give it, in ways that
+MoltenVK refuses:
+
+*   TGSI's vertex inputs have no types, and Metal requires that shaders read
+    integer vertex formats as integers: draws bind a variant of the vertex
+    shader whose inputs have the types of the vertex elements bound, as
+    virglrenderer's vrend makes for OpenGL.
+*   Zink names SPIR-V's variables by TGSI's, which MoltenVK names Metal's
+    by, and Metal fails to compile a texture named `sampler`: the
+    renderer's Vulkan, for Zink, drops the names, which are for debuggers
+    only.
+
+Where MoltenVK still fails to create a pipeline, Zink binds none, and the
+renderer drops the draws that would use it, as virglrenderer drops draws
+that it cannot draw. The renderer's Vulkan for Zink logs only MoltenVK's
+errors, not the warning that MoltenVK logs of each of Zink's pipelines.
+
+The renderer does not clone virgl's contexts yet: `--gfx-fork=snapshot`
+fails while a branch has a virgl context or resource, and the child of a
+`--gfx-fork=device-lost` fork loses them, as it loses Venus's. On Linux the
+renderer offers no virgl capability sets yet.
 
 [scrcpy]: https://github.com/Genymobile/scrcpy

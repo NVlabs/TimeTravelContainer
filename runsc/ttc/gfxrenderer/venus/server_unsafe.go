@@ -19,6 +19,7 @@ import (
 	"gvisor.dev/gvisor/pkg/gfxproto"
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/venus/vk"
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/venus/vn"
+	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/virgl"
 )
 
 // Blob memory and flags, as VIRTGPU_BLOB_MEM_* and VIRTGPU_BLOB_FLAG_*.
@@ -38,6 +39,12 @@ type server struct {
 	mu        sync.Mutex
 	contexts  map[uint32]*Context
 	resources map[uint32]*resource
+	// virgl are the server's virgl contexts (see virgl.go).
+	virgl map[uint32]*virgl.Context
+
+	// lastFence is closed once the last fence that queueFence queued
+	// signaled. Only the server's goroutine uses it.
+	lastFence chan struct{}
 
 	// restoring is the snapshot that MsgRestoreData sent, for MsgRestore.
 	restoring []byte
@@ -62,6 +69,7 @@ func Serve(fd int) error {
 		lib:       lib,
 		contexts:  make(map[uint32]*Context),
 		resources: make(map[uint32]*resource),
+		virgl:     make(map[uint32]*virgl.Context),
 	}
 	defer s.release()
 	if err := conn.Send(gfxproto.MsgHello, 0, &gfxproto.Hello{Version: gfxproto.Version}, nil); err != nil {
@@ -138,13 +146,17 @@ func (s *server) handle(m *gfxproto.Message) error {
 			return err
 		}
 		errno := uint32(0)
+		createVirgl := false
 		s.mu.Lock()
 		switch {
-		case p.CapsetID != CapsetVenus && p.CapsetID != CapsetCrossDomain:
+		case p.CapsetID != CapsetVenus && p.CapsetID != CapsetCrossDomain && !isVirglCapset(p.CapsetID):
 			log.Printf("venus: context %d of capability set %d", p.CtxID, p.CapsetID)
 			errno = uint32(unix.EINVAL)
-		case s.contexts[p.CtxID] != nil:
+		case s.contexts[p.CtxID] != nil || s.virgl[p.CtxID] != nil:
 			errno = uint32(unix.EEXIST)
+		case isVirglCapset(p.CapsetID):
+			// Only the server's goroutine creates contexts.
+			createVirgl = true
 		default:
 			c := newContext(s, p.CtxID, string(name))
 			if p.CapsetID == CapsetCrossDomain {
@@ -153,6 +165,16 @@ func (s *server) handle(m *gfxproto.Message) error {
 			s.contexts[p.CtxID] = c
 		}
 		s.mu.Unlock()
+		if createVirgl {
+			if c, err := virgl.NewContext(p.CtxID); err != nil {
+				log.Printf("virgl: creating context %d (%s): %v", p.CtxID, name, err)
+				errno = uint32(unix.EINVAL)
+			} else {
+				s.mu.Lock()
+				s.virgl[p.CtxID] = c
+				s.mu.Unlock()
+			}
+		}
 		return s.reply(m, gfxproto.Reply{Errno: errno})
 
 	case gfxproto.MsgDestroyContext:
@@ -163,9 +185,14 @@ func (s *server) handle(m *gfxproto.Message) error {
 		s.mu.Lock()
 		c := s.contexts[p.CtxID]
 		delete(s.contexts, p.CtxID)
+		vc := s.virgl[p.CtxID]
+		delete(s.virgl, p.CtxID)
 		s.mu.Unlock()
 		if c != nil {
 			c.destroy()
+		}
+		if vc != nil {
+			vc.Destroy()
 		}
 
 	case gfxproto.MsgCreateResource:
@@ -174,13 +201,19 @@ func (s *server) handle(m *gfxproto.Message) error {
 			return err
 		}
 		// A classic resource is shared memory that the guest writes and the
-		// renderer reads as it is: transfers move nothing.
+		// renderer reads as it is: for Venus, transfers move nothing. A virgl
+		// context's is also a Gallium resource, which transfers copy to and
+		// from the memory.
 		mem, err := newSharedMemory(p.Size)
 		if err != nil {
 			log.Printf("venus: creating resource %d of %d bytes: %v", p.ResID, p.Size, err)
 			return nil
 		}
-		s.addResource(p.CtxID, &resource{id: p.ResID, size: p.Size, mapInfo: mapCacheCached, mem: mem})
+		r := &resource{id: p.ResID, size: p.Size, mapInfo: mapCacheCached, mem: mem}
+		if s.virglContext(p.CtxID) != nil {
+			r.virgl = newVirglResource(&p, mem)
+		}
+		s.addResource(p.CtxID, r)
 
 	case gfxproto.MsgCreateBlob:
 		var p gfxproto.CreateBlob
@@ -213,9 +246,13 @@ func (s *server) handle(m *gfxproto.Message) error {
 		s.mu.Lock()
 		r := s.resources[p.ResID]
 		c := s.contexts[p.CtxID]
+		vc := s.virgl[p.CtxID]
 		s.mu.Unlock()
 		if r != nil && c != nil {
 			c.attach(r)
+		}
+		if r != nil && r.virgl != nil && vc != nil {
+			vc.Attach(r.virgl)
 		}
 
 	case gfxproto.MsgDetachResource:
@@ -225,6 +262,9 @@ func (s *server) handle(m *gfxproto.Message) error {
 		}
 		if c := s.context(p.CtxID); c != nil {
 			c.detach(p.ResID)
+		}
+		if vc := s.virglContext(p.CtxID); vc != nil {
+			vc.Detach(p.ResID)
 		}
 
 	case gfxproto.MsgDestroyResource:
@@ -239,6 +279,10 @@ func (s *server) handle(m *gfxproto.Message) error {
 		for _, c := range s.contexts {
 			contexts = append(contexts, c)
 		}
+		virglContexts := make([]*virgl.Context, 0, len(s.virgl))
+		for _, c := range s.virgl {
+			virglContexts = append(virglContexts, c)
+		}
 		s.mu.Unlock()
 		if r == nil {
 			return nil
@@ -246,13 +290,22 @@ func (s *server) handle(m *gfxproto.Message) error {
 		for _, c := range contexts {
 			c.detach(p.ResID)
 		}
-		r.mem.decRef()
+		for _, c := range virglContexts {
+			c.Detach(p.ResID)
+		}
+		r.release()
 
 	case gfxproto.MsgSubmitCommand:
 		var p gfxproto.SubmitCommand
 		cmd, err := m.Decode(&p)
 		if err != nil {
 			return err
+		}
+		if vc := s.virglContext(p.CtxID); vc != nil {
+			if err := vc.Submit(cmd); err != nil {
+				log.Printf("virgl: context %d: submitting %d bytes: %v", p.CtxID, len(cmd), err)
+			}
+			return nil
 		}
 		c := s.context(p.CtxID)
 		if c == nil {
@@ -268,7 +321,14 @@ func (s *server) handle(m *gfxproto.Message) error {
 		if _, err := m.Decode(&p); err != nil {
 			return err
 		}
-		// The renderer reads classic resources where the guest writes them.
+		// Venus's renderer reads classic resources where the guest writes
+		// them; virgl's copies them to and from Gallium's resources.
+		s.mu.Lock()
+		r := s.resources[p.ResID]
+		s.mu.Unlock()
+		if r != nil && r.virgl != nil {
+			s.transferVirgl(p.CtxID, r, &p)
+		}
 
 	case gfxproto.MsgCreateFence:
 		var p gfxproto.CreateFence
@@ -276,8 +336,11 @@ func (s *server) handle(m *gfxproto.Message) error {
 			return err
 		}
 		if p.HasRing == 0 {
-			// The global timeline: what came before the fence is executed.
-			s.fenceSignaled(p.FenceID, 0, false, 0)
+			s.globalFence(p.FenceID)
+			return nil
+		}
+		if vc := s.virglContext(p.CtxID); vc != nil {
+			s.queueFence(p.FenceID, p.CtxID, true, p.Ring, []*virgl.Fence{vc.Flush()})
 			return nil
 		}
 		c := s.context(p.CtxID)
@@ -347,12 +410,16 @@ func (s *server) addResource(ctxID uint32, r *resource) {
 	old := s.resources[r.id]
 	s.resources[r.id] = r
 	c := s.contexts[ctxID]
+	vc := s.virgl[ctxID]
 	s.mu.Unlock()
 	if old != nil {
-		old.mem.decRef()
+		old.release()
 	}
 	if c != nil {
 		c.attach(r)
+	}
+	if vc != nil && r.virgl != nil {
+		vc.Attach(r.virgl)
 	}
 }
 
@@ -412,14 +479,19 @@ func (s *server) release() {
 	s.mu.Lock()
 	contexts := s.contexts
 	resources := s.resources
+	virglContexts := s.virgl
 	s.contexts = nil
 	s.resources = nil
+	s.virgl = nil
 	s.mu.Unlock()
 	for _, c := range contexts {
 		c.destroy()
 	}
+	for _, c := range virglContexts {
+		c.Destroy()
+	}
 	for _, r := range resources {
-		r.mem.decRef()
+		r.release()
 	}
 }
 
@@ -455,6 +527,14 @@ type pendingClone struct {
 // quiesced, for a fork's children, and returns its token.
 func (s *server) snapshot() ([]byte, error) {
 	s.mu.Lock()
+	virglState := len(s.virgl) != 0
+	for _, r := range s.resources {
+		virglState = virglState || r.virgl != nil
+	}
+	if virglState {
+		s.mu.Unlock()
+		return nil, errors.New("virgl's contexts and resources cannot fork yet")
+	}
 	contexts := make(map[uint32]*Context, len(s.contexts))
 	for id, c := range s.contexts {
 		contexts[id] = c
@@ -491,7 +571,7 @@ func (s *server) snapshot() ([]byte, error) {
 // of token: the clone itself if last, or another clone of it.
 func (s *server) restore(token []byte, last bool) error {
 	s.mu.Lock()
-	empty := len(s.contexts) == 0 && len(s.resources) == 0
+	empty := len(s.contexts) == 0 && len(s.resources) == 0 && len(s.virgl) == 0
 	s.mu.Unlock()
 	if !empty {
 		return fmt.Errorf("the renderer has contexts or resources")

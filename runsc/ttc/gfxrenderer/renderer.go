@@ -14,6 +14,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/gfxproto"
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/venus"
+	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/virgl"
 )
 
 // Probe returns the renderer's capability sets.
@@ -22,12 +23,23 @@ func Probe() ([]Capset, error) {
 	if err != nil {
 		return nil, err
 	}
-	return []Capset{
+	capsets := []Capset{
 		{ID: venus.CapsetVenus, Data: data},
 		// minigbm, Android's gralloc, allocates buffers with cross-domain
 		// contexts.
 		{ID: venus.CapsetCrossDomain, Data: venus.CrossDomainCapset()},
-	}, nil
+	}
+	if virgl.Available() {
+		// Mesa's virgl OpenGL driver's, which Zink renders for.
+		vcs, err := virgl.Capsets()
+		if err != nil {
+			log.Printf("rendering for no virgl guest: %v", err)
+		}
+		for _, c := range vcs {
+			capsets = append(capsets, Capset{ID: c.ID, MaxVersion: c.MaxVersion, Data: c.Data})
+		}
+	}
+	return capsets, nil
 }
 
 // ServeFamily serves the branches of a family, a connection to each, which
