@@ -583,6 +583,11 @@ static void lower_xfb(nir_shader *nir, const struct pipe_stream_output_info *so)
                             nir_ult(&b, index, nir_channel(&b, params, XFB_MAX))));
    for (unsigned i = 0; i < so->num_outputs; i++) {
       const struct pipe_stream_output *o = &so->output[i];
+      // An output must fit its vertex's stride, as OpenGL lays them out:
+      // the draw's checks of the targets' room count on it.
+      if (o->output_buffer >= PIPE_MAX_SO_BUFFERS ||
+          o->dst_offset + o->num_components > so->stride[o->output_buffer])
+         continue;
       char name[16];
       snprintf(name, sizeof(name), "out_%u", o->register_index);
       nir_variable *var = NULL;

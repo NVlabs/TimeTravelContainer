@@ -505,6 +505,55 @@ func TestTransformFeedbackOverflow(t *testing.T) {
 	}
 }
 
+// TestTransformFeedbackLayout gives a stream output an offset past its
+// vertex's stride, and a buffer past the targets', which no capture may
+// write.
+func TestTransformFeedbackLayout(t *testing.T) {
+	f := newFixture(t)
+	if !xfbEmulated {
+		t.Skip("the renderer emulates no transform feedback here")
+	}
+	const bindStreamOutput = 1 << 11
+	soMem := make([]byte, 64)
+	for i := range soMem {
+		soMem[i] = 0x5a
+	}
+	so, err := NewResource(13, ResourceArgs{Target: targetBuffer, Format: formatR8Unorm,
+		Bind: bindStreamOutput, Width: uint32(len(soMem)), Height: 1, Depth: 1, ArraySize: 1}, soMem, nil)
+	if err != nil {
+		t.Fatalf("NewResource: %v", err)
+	}
+	defer so.DecRef()
+	f.c.Attach(so)
+	if err := f.c.Transfer(so, TransferArgs{ToHost: true, W: uint32(len(soMem)), H: 1, D: 1}); err != nil {
+		t.Fatalf("Transfer: %v", err)
+	}
+	var s stream
+	f.setup(&s)
+	vs := f.id()
+	text := append([]byte(vertexShader), 0)
+	// Two outputs of a stride of 4 dwords: one at dword 3000, one to buffer
+	// 5.
+	payload := []uint32{vs, stageVertex, uint32(len(text)), 300, 2, 4, 0, 0, 0,
+		4<<10 | 3000<<16, 0, 4<<10 | 5<<13, 0}
+	s.cmd(cmdCreateObject, objectShader, append(payload, textDwords(text)...)...)
+	s.cmd(cmdBindShader, 0, vs, stageVertex)
+	target := f.id()
+	s.cmd(cmdCreateObject, objectStreamoutTarget, target, so.ID(), 0, 16)
+	s.cmd(cmdSetStreamoutTargets, 0, 0, target)
+	drawTriangle(&s)
+	f.submit(t, s)
+	f.c.Flush().Wait()
+	if err := f.c.Transfer(so, TransferArgs{W: uint32(len(soMem)), H: 1, D: 1}); err != nil {
+		t.Fatalf("Transfer: %v", err)
+	}
+	for i, b := range soMem {
+		if b != 0x5a {
+			t.Fatalf("byte %d of the target's buffer is %#x", i, b)
+		}
+	}
+}
+
 func TestCapsets(t *testing.T) {
 	if err := Init(); err != nil {
 		t.Skipf("Zink is unavailable: %v", err)
