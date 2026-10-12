@@ -219,3 +219,10 @@ TimeTravelContainer is licensed under the [Apache License 2.0](LICENSE). It is
 a modified version of [gVisor](https://github.com/google/gvisor).
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) names all
 third-party components TimeTravelContainer uses, with their respective licenses.
+
+The following subdirectories retain separate BSD-3-Clause licenses for code
+from The Go Authors:
+
+- `pkg/safecopy`: [BSD-3-Clause license](pkg/safecopy/LICENSE).
+- `pkg/sync`: [BSD-3-Clause license](pkg/sync/LICENSE).
+- `pkg/sentry/time`: [BSD-3-Clause license](pkg/sentry/time/LICENSE).

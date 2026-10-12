@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Description:
 #   This VDSO is a shared library that provides the same interfaces as the
 #   normal system VDSO (time, gettimeofday, clock_gettimeofday) but which uses

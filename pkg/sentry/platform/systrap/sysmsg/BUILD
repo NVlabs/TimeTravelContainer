@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 load("//tools:arch.bzl", "arch_genrule", "select_arch")
 load("//tools:defs.bzl", "cc_flags_supplier", "cc_toolchain", "go_library")
 load("build.bzl", "cc_pie_obj")

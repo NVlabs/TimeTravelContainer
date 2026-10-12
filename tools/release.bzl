@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Rule assembling the gVisor release binaries in their installed layout."""
 
 # SIDECARS maps each sidecar binary target to the filename that runsc expects

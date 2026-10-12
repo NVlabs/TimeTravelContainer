@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # The go_library rule is imported as a different name in this case,
 # in order to avoid automated tooling doing the wrong thing with the
 # operating-specific dependencies listed below.
