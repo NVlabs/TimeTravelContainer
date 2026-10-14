@@ -49,6 +49,9 @@ type FeatureSet struct {
 // HostXsaveABI is empty on architectures without x86 XSAVE.
 func HostXsaveABI() string { return "" }
 
+// HostCPUIDFeatures is empty on architectures without x86 CPUID.
+func HostCPUIDFeatures() string { return "" }
+
 // CPUImplementer is part of the processor signature.
 func (fs FeatureSet) CPUImplementer() uint8 {
 	return uint8(fs.cpuImplHex)

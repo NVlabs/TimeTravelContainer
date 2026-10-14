@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
@@ -489,6 +490,7 @@ func TestDaemonRequestOptionsUseServerDefaults(t *testing.T) {
 		runtimePlatform:       "kvm",
 		unsafeNoHostIsolation: true,
 		disableHostGSO:        true,
+		noCPUIDFaulting:       true,
 	}
 	opts := server.optionsFromRequest()
 	if got, want := opts.root, server.root; got != want {
@@ -511,6 +513,9 @@ func TestDaemonRequestOptionsUseServerDefaults(t *testing.T) {
 	}
 	if !opts.disableHostGSO {
 		t.Error("daemon host-GSO compatibility mode was not applied")
+	}
+	if !opts.disableSyscallPatching {
+		t.Error("a cluster without CPUID faulting kept syscall patching")
 	}
 }
 
@@ -2864,14 +2869,156 @@ func TestPrepareDaemonClusterRejectsPartialConfiguration(t *testing.T) {
 }
 
 func TestValidateClusterCPUEnforcement(t *testing.T) {
-	if err := validateClusterCPUEnforcement("systrap", false); err == nil || !strings.Contains(err.Error(), "CPUID faulting") {
+	if err := validateClusterCPUEnforcement("systrap", false, false); err == nil || !strings.Contains(err.Error(), "CPUID faulting") || !strings.Contains(err.Error(), "--experimental-no-cpuid-faulting") {
 		t.Fatalf("systrap without CPUID faulting: %v", err)
 	}
-	if err := validateClusterCPUEnforcement("systrap", true); err != nil {
+	if err := validateClusterCPUEnforcement("systrap", true, false); err != nil {
 		t.Fatalf("systrap with CPUID faulting: %v", err)
 	}
-	if err := validateClusterCPUEnforcement("kvm", false); err != nil {
+	if err := validateClusterCPUEnforcement("systrap", false, true); err != nil {
+		t.Fatalf("systrap without CPUID faulting in a cluster that waives it: %v", err)
+	}
+	if err := validateClusterCPUEnforcement("kvm", false, false); err != nil {
 		t.Fatalf("KVM without host CPUID faulting: %v", err)
+	}
+}
+
+func TestNoCPUIDFaultingOption(t *testing.T) {
+	opts := defaultDaemonClusterOptions()
+	if consumed, err := consumeDaemonCPUOption([]string{"--experimental-no-cpuid-faulting", "--node", "n1"}, &opts); consumed != 1 || err != nil || !opts.NoCPUIDFaulting {
+		t.Fatalf("consumed=%d err=%v waived=%v", consumed, err, opts.NoCPUIDFaulting)
+	}
+	if err := validateNoCPUIDFaultingOption(opts); err == nil || !strings.Contains(err.Error(), "compute nodes") {
+		t.Fatalf("standalone daemon with the option: %v", err)
+	}
+	opts.Configured = true
+	if err := validateNoCPUIDFaultingOption(opts); err != nil {
+		t.Fatalf("cluster node with the option: %v", err)
+	}
+	opts.ControlOnly = true
+	if err := validateNoCPUIDFaultingOption(opts); err == nil {
+		t.Fatal("control-only daemon accepted the option")
+	}
+}
+
+func TestCPUIDFaultingWaiverHoldsNodesToTheRecordedCPU(t *testing.T) {
+	if runtime.GOARCH != "amd64" {
+		t.Skip("x86 CPUID")
+	}
+	host, err := resolveDaemonCPUProfile("host", "", "systrap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waived, err := waiveCPUIDFaulting(host, "systrap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !waived.NoCPUIDFaulting || waived.CPUID != cpuid.HostCPUIDFeatures() || !slices.Equal(waived.Features, host.Features) {
+		t.Fatalf("waived profile=%+v", waived)
+	}
+	if err := validateDaemonCPUProfile(waived, "systrap"); err != nil {
+		t.Fatalf("the CPU the cluster records was refused: %v", err)
+	}
+	if err := validateDaemonCPUProfile(waived, "kvm"); err == nil || !strings.Contains(err.Error(), "systrap only") {
+		t.Fatalf("KVM node of a cluster without CPUID faulting: %v", err)
+	}
+	other := waived
+	other.CPUID += ";ffffff.0.eax=1"
+	if err := validateDaemonCPUProfile(other, "systrap"); err == nil || !strings.Contains(err.Error(), "ffffff.0.eax is 1 in the cluster, 0 here") {
+		t.Fatalf("another CPU: %v", err)
+	}
+	unrecorded := waived
+	unrecorded.CPUID = ""
+	if err := validateDaemonCPUProfile(unrecorded, "systrap"); err == nil || !strings.Contains(err.Error(), "invalid") {
+		t.Fatalf("waiver without a CPU: %v", err)
+	}
+	portable, err := resolveDaemonCPUProfile("portable", "", "systrap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := waiveCPUIDFaulting(portable, "systrap"); err == nil || !strings.Contains(err.Error(), "requires --cpu-profile host") {
+		t.Fatalf("portable profile: %v", err)
+	}
+	if _, err := waiveCPUIDFaulting(host, "kvm"); err == nil || !strings.Contains(err.Error(), "applies to systrap nodes") {
+		t.Fatalf("KVM node: %v", err)
+	}
+}
+
+func TestCPUIDDifferences(t *testing.T) {
+	got := cpuidDifferences("vendor=AuthenticAMD;1.0.ecx=1;7.0.ebx=20", "vendor=AuthenticAMD;1.0.ecx=3;7.1.eax=10")
+	want := []string{"1.0.ecx is 1 in the cluster, 3 here", "7.0.ebx is 20 in the cluster, 0 here", "7.1.eax is 0 in the cluster, 10 here"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("differences=%q, want %q", got, want)
+	}
+}
+
+func TestImmutableClusterConfigWaivesCPUIDFaulting(t *testing.T) {
+	root := t.TempDir()
+	if waived, err := clusterWaivesCPUIDFaulting(root, defaultDaemonClusterOptions()); err != nil || waived {
+		t.Fatalf("a cluster not yet created waives CPUID faulting: (%v, %v)", waived, err)
+	}
+	profile := daemonCPUProfile{Version: daemonCPUProfileVersion, Mode: "host", Features: []string{"sse", "sse2"}, NoCPUIDFaulting: true, CPUID: "vendor=TestVendor;1.0.edx=1"}
+	bootstrap := defaultDaemonClusterOptions()
+	bootstrap.CPUProfileSet, bootstrap.NoCPUIDFaulting, bootstrap.ResolvedCPU = true, true, profile
+	if pending, err := applyImmutableClusterConfig(root, &bootstrap); err != nil || pending != nil {
+		t.Fatalf("creating the cluster=(%+v, %v)", pending, err)
+	}
+	data, err := os.ReadFile(filepath.Join(root, ".ttc-cluster-config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored daemonImmutableClusterConfig
+	if err := json.Unmarshal(data, &stored); err != nil {
+		t.Fatal(err)
+	}
+	// A build that predates the waiver refuses all but version 2.
+	if stored.Version != daemonImmutableClusterConfigNoCPUIDFaultingVersion || !reflect.DeepEqual(stored.CPUProfile, profile) {
+		t.Fatalf("stored configuration=%+v", stored)
+	}
+	// A node that does not ask for it adopts it, as it adopts the profile.
+	join := defaultDaemonClusterOptions()
+	if _, err := applyImmutableClusterConfig(root, &join); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(join.ResolvedCPU, profile) {
+		t.Fatalf("joining node's profile=%+v, want %+v", join.ResolvedCPU, profile)
+	}
+	if waived, err := clusterWaivesCPUIDFaulting(root, defaultDaemonClusterOptions()); err != nil || !waived {
+		t.Fatalf("the cluster's waiver was not found: (%v, %v)", waived, err)
+	}
+	// One that asks for it adopts the CPU the cluster records, which
+	// validateDaemonCPUProfile holds it to.
+	again := bootstrap
+	again.ResolvedCPU.CPUID = "vendor=TestVendor;1.0.edx=3"
+	if pending, err := applyImmutableClusterConfig(root, &again); err != nil || pending != nil || !reflect.DeepEqual(again.ResolvedCPU, profile) {
+		t.Fatalf("node asking for the waiver=(%+v, %v), profile %+v", pending, err, again.ResolvedCPU)
+	}
+
+	// A cluster created requiring CPUID faulting cannot waive it later.
+	plain := t.TempDir()
+	first := defaultDaemonClusterOptions()
+	first.CPUProfileSet = true
+	first.ResolvedCPU = daemonCPUProfile{Version: daemonCPUProfileVersion, Mode: "host", Features: []string{"sse", "sse2"}}
+	if _, err := applyImmutableClusterConfig(plain, &first); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(filepath.Join(plain, ".ttc-cluster-config.json")); err != nil || !strings.Contains(string(data), `"version":2,`) || strings.Contains(string(data), "cpuid") {
+		t.Fatalf("configuration requiring CPUID faulting=(%s, %v)", data, err)
+	}
+	late := bootstrap
+	if _, err := applyImmutableClusterConfig(plain, &late); err == nil || !strings.Contains(err.Error(), "applies when a cluster is created") {
+		t.Fatalf("waiving CPUID faulting in an existing cluster: %v", err)
+	}
+
+	// A configuration whose version does not match its waiver is refused.
+	mismatched := t.TempDir()
+	stored.Version = daemonImmutableClusterConfigVersion
+	if err := writeDurableJSON(filepath.Join(mismatched, ".ttc-cluster-config.json"), stored); err != nil {
+		t.Fatal(err)
+	}
+	reread := defaultDaemonClusterOptions()
+	if _, err := applyImmutableClusterConfig(mismatched, &reread); err == nil || !strings.Contains(err.Error(), "unsupported immutable cluster configuration version 2") {
+		t.Fatalf("version 2 configuration that waives CPUID faulting: %v", err)
 	}
 }
 

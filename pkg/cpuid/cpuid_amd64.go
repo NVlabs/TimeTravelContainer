@@ -468,6 +468,96 @@ func HostXsaveABI() string {
 	return b.String()
 }
 
+// HostCPUIDFeatures returns, as a canonical string, the registers of the
+// host's own CPUID that enumerate what an application may execute. An
+// application of a systrap sandbox on a host without CPUID faulting reads
+// them itself instead of its sandbox's FeatureSet, including leaves no
+// FeatureSet models, such as leaf 7's later subleaves; hosts whose strings
+// are equal show it the same CPU.
+func HostCPUIDFeatures() string {
+	return cpuidFeatures(native)
+}
+
+// cpuidPlatformBits are the bits of the registers cpuidFeatures records that
+// report the hypervisor or speculation controls rather than instructions.
+// Hypervisors and microcode set them, so hosts with the same CPU may differ
+// in them.
+var cpuidPlatformBits = map[In]Out{
+	// The hypervisor bit.
+	{Eax: uint32(featureInfo)}: {Ecx: 1 << 31},
+	// SRBDS_CTRL, MD_CLEAR, RTM_ALWAYS_ABORT, TSX_FORCE_ABORT, and SPEC_CTRL
+	// through SPEC_CTRL_SSBD.
+	{Eax: uint32(extendedFeatureInfo)}: {Edx: 1<<9 | 1<<10 | 1<<11 | 1<<13 | 0x3f<<26},
+	// PSFD, IPRED_CTRL, RRSBA_CTRL, DDPD_U, BHI_CTRL, MCDT_NO,
+	// UC_LOCK_DISABLE and MONITOR_MITG_NO.
+	{Eax: uint32(extendedFeatureInfo), Ecx: 2}: {Edx: 0xff},
+	// AMD's speculation controls from IBPB on, PPIN and CPPC.
+	{Eax: uint32(addressSizes)}: {Ebx: 0xfffff000},
+	// AMD's SBPB, IBPB_BRTYPE and SRSO bits.
+	{Eax: uint32(extendedStart) + 0x21}: {Eax: 0x1f << 27},
+}
+
+// cpuidFeatures records the registers HostCPUIDFeatures does, read with
+// query, leaving out zeros.
+func cpuidFeatures(query func(In) Out) string {
+	var b strings.Builder
+	vendor := query(In{Eax: uint32(vendorID)})
+	id := vendorIDFromRegs(vendor.Ebx, vendor.Ecx, vendor.Edx)
+	fmt.Fprintf(&b, "vendor=%s", id[:])
+	record := func(in In, registers ...int) Out {
+		out := query(in)
+		ignore := cpuidPlatformBits[in]
+		values := [4]uint32{out.Eax &^ ignore.Eax, out.Ebx &^ ignore.Ebx, out.Ecx &^ ignore.Ecx, out.Edx &^ ignore.Edx}
+		for _, register := range registers {
+			if values[register] != 0 {
+				fmt.Fprintf(&b, ";%x.%x.%s=%x", in.Eax, in.Ecx, [4]string{"eax", "ebx", "ecx", "edx"}[register], values[register])
+			}
+		}
+		return out
+	}
+	const eax, ebx, ecx, edx = 0, 1, 2, 3
+	// Leaves 7 and 0x24 count their further subleaves in subleaf 0's EAX.
+	subleaves := func(leaf uint32) {
+		last := record(In{Eax: leaf}, eax, ebx, ecx, edx).Eax
+		for subleaf := uint32(1); subleaf <= last && subleaf < 32; subleaf++ {
+			record(In{Eax: leaf, Ecx: subleaf}, eax, ebx, ecx, edx)
+		}
+	}
+	// A leaf above the highest one returns another leaf's values on Intel.
+	maxBasic := vendor.Eax
+	if maxBasic >= uint32(featureInfo) {
+		record(In{Eax: uint32(featureInfo)}, ecx, edx)
+	}
+	if maxBasic >= uint32(extendedFeatureInfo) {
+		subleaves(uint32(extendedFeatureInfo))
+	}
+	if maxBasic >= uint32(xSaveInfo) {
+		record(In{Eax: uint32(xSaveInfo), Ecx: 1}, eax)
+	}
+	// PTWRITE is in leaf 0x14, Key Locker in leaf 0x19, and AVX10 in leaf
+	// 0x24.
+	if maxBasic >= 0x14 {
+		record(In{Eax: 0x14}, ebx)
+	}
+	if maxBasic >= 0x19 {
+		record(In{Eax: 0x19}, ebx)
+	}
+	if maxBasic >= 0x24 {
+		subleaves(0x24)
+	}
+	maxExtended := query(In{Eax: uint32(extendedFunctionInfo)}).Eax
+	if maxExtended >= uint32(extendedFeatures) {
+		record(In{Eax: uint32(extendedFeatures)}, ecx, edx)
+	}
+	if maxExtended >= uint32(addressSizes) {
+		record(In{Eax: uint32(addressSizes)}, ebx)
+	}
+	if maxExtended >= uint32(extendedStart)+0x21 {
+		record(In{Eax: uint32(extendedStart) + 0x21}, eax)
+	}
+	return b.String()
+}
+
 const (
 	// XCR0AmxCfgMask is the bits that enable xsave to operate on
 	// AMX TILECFG.

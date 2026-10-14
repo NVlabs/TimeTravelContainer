@@ -39,6 +39,15 @@ type daemonCPUProfile struct {
 	Mode     string   `json:"mode"`
 	Features []string `json:"features"`
 	XsaveABI string   `json:"xsave_abi,omitempty"`
+	// NoCPUIDFaulting is set in a cluster created with
+	// --experimental-no-cpuid-faulting, whose systrap nodes need no CPUID
+	// faulting. An application on a node without it reads the host's own
+	// CPUID instead of the profile, so every node must have exactly the
+	// CPUID registers CPUID records (cpuid.HostCPUIDFeatures). And as such an
+	// application may see FSGSBASE and write GS itself, every node runs
+	// systrap without syscall patching, whose fast path owns GS.
+	NoCPUIDFaulting bool   `json:"experimental_no_cpuid_faulting,omitempty"`
+	CPUID           string `json:"cpuid,omitempty"`
 }
 
 func hostCPUFeatureNames(runtimePlatform string) []string {
@@ -161,9 +170,78 @@ func validateXsaveCPUProfileContract(features []string) error {
 	return nil
 }
 
+// waiveCPUIDFaulting makes profile that of a cluster whose systrap nodes need
+// no CPUID faulting, recording this host's CPUID as the one every node must
+// have.
+func waiveCPUIDFaulting(profile daemonCPUProfile, runtimePlatform string) (daemonCPUProfile, error) {
+	if runtime.GOARCH != "amd64" {
+		return daemonCPUProfile{}, fmt.Errorf("--experimental-no-cpuid-faulting applies to x86-64 hosts, not %s", runtime.GOARCH)
+	}
+	if runtimePlatform != "systrap" {
+		return daemonCPUProfile{}, fmt.Errorf("--experimental-no-cpuid-faulting applies to systrap nodes; %s needs no CPUID faulting", runtimePlatform)
+	}
+	if profile.Mode != "host" {
+		return daemonCPUProfile{}, errors.New("--experimental-no-cpuid-faulting requires --cpu-profile host")
+	}
+	profile.NoCPUIDFaulting = true
+	profile.CPUID = cpuid.HostCPUIDFeatures()
+	return profile, nil
+}
+
+// cpuidDifferences names the registers whose values differ between want and
+// got, two cpuid.HostCPUIDFeatures strings.
+func cpuidDifferences(want, got string) []string {
+	parse := func(features string) map[string]string {
+		values := make(map[string]string)
+		for _, field := range strings.Split(features, ";") {
+			if name, value, ok := strings.Cut(field, "="); ok {
+				values[name] = value
+			}
+		}
+		return values
+	}
+	wantValues, gotValues := parse(want), parse(got)
+	var names []string
+	for name := range wantValues {
+		names = append(names, name)
+	}
+	for name := range gotValues {
+		if _, ok := wantValues[name]; !ok {
+			names = append(names, name)
+		}
+	}
+	slices.Sort(names)
+	var differences []string
+	for _, name := range names {
+		wantValue, gotValue := wantValues[name], gotValues[name]
+		if wantValue == gotValue {
+			continue
+		}
+		if wantValue == "" {
+			wantValue = "0"
+		}
+		if gotValue == "" {
+			gotValue = "0"
+		}
+		differences = append(differences, fmt.Sprintf("%s is %s in the cluster, %s here", name, wantValue, gotValue))
+	}
+	return differences
+}
+
 func validateDaemonCPUProfile(profile daemonCPUProfile, runtimePlatform string) error {
 	if profile.Version != daemonCPUProfileVersion || profile.Mode == "" || len(profile.Features) == 0 || !slices.IsSorted(profile.Features) {
 		return errors.New("invalid TTC CPU profile")
+	}
+	if profile.NoCPUIDFaulting != (profile.CPUID != "") || (profile.NoCPUIDFaulting && profile.Mode != "host") {
+		return errors.New("invalid TTC CPU profile")
+	}
+	if profile.NoCPUIDFaulting {
+		if runtimePlatform != "systrap" {
+			return fmt.Errorf("the cluster's nodes run without CPUID faulting, on systrap only; this node's platform is %s", runtimePlatform)
+		}
+		if host := cpuid.HostCPUIDFeatures(); host != profile.CPUID {
+			return fmt.Errorf("the cluster's nodes run without CPUID faulting, so they must have identical CPUs, and this host's CPUID differs: %s", strings.Join(cpuidDifferences(profile.CPUID, host), "; "))
+		}
 	}
 	host := make(map[string]struct{})
 	for _, feature := range hostCPUFeatureNames(runtimePlatform) {
@@ -187,9 +265,20 @@ func validateDaemonCPUProfile(profile daemonCPUProfile, runtimePlatform string) 
 	return nil
 }
 
-func validateClusterCPUEnforcement(runtimePlatform string, cpuidFaulting bool) error {
-	if runtimePlatform == "systrap" && !cpuidFaulting {
-		return errors.New("systrap cluster mode requires host CPUID faulting (ARCH_SET_CPUID); this host cannot enforce a migration-safe guest CPU profile")
+// validateNoCPUIDFaultingOption refuses --experimental-no-cpuid-faulting
+// outside a cluster's compute nodes.
+func validateNoCPUIDFaultingOption(opts daemonClusterOptions) error {
+	if opts.NoCPUIDFaulting && (!opts.Configured || opts.ControlOnly || opts.ControlHolder) {
+		return errors.New("--experimental-no-cpuid-faulting applies to a cluster's compute nodes")
+	}
+	return nil
+}
+
+// validateClusterCPUEnforcement refuses a systrap node whose host lacks CPUID
+// faulting, unless its cluster waives it.
+func validateClusterCPUEnforcement(runtimePlatform string, cpuidFaulting, waived bool) error {
+	if runtimePlatform == "systrap" && !cpuidFaulting && !waived {
+		return errors.New("systrap cluster mode requires host CPUID faulting (ARCH_SET_CPUID); this host cannot enforce a migration-safe guest CPU profile. A cluster of identical CPUs can do without it if it is created with --cpu-profile host --experimental-no-cpuid-faulting")
 	}
 	return nil
 }
@@ -230,6 +319,10 @@ func (p daemonCPUProfile) annotation() string {
 func consumeDaemonCPUOption(args []string, opts *daemonClusterOptions) (int, error) {
 	if len(args) == 0 {
 		return 0, nil
+	}
+	if args[0] == "--experimental-no-cpuid-faulting" {
+		opts.NoCPUIDFaulting = true
+		return 1, nil
 	}
 	set := func(name string, dst *string) (int, error) {
 		if args[0] == name {

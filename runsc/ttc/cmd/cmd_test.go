@@ -4615,6 +4615,16 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 	if got := (&runtimeBackend{root: "/runtime", runtimePlatform: "kvm"}).configuredRunscArgs(); !reflect.DeepEqual(got, wantKVM) {
 		t.Errorf("KVM runsc args=%q, want %q", got, wantKVM)
 	}
+	// A cluster whose nodes need no CPUID faulting runs systrap without
+	// syscall patching; KVM has none.
+	wantUnpatched := append(append([]string(nil), wantHardened...), "--systrap-disable-syscall-patching=true")
+	wantUnpatched[2] = "--platform=systrap"
+	if got := (&runtimeBackend{root: "/runtime", runtimePlatform: "systrap", disableSyscallPatching: true}).configuredRunscArgs(); !reflect.DeepEqual(got, wantUnpatched) {
+		t.Errorf("unpatched systrap runsc args=%q, want %q", got, wantUnpatched)
+	}
+	if got := (&runtimeBackend{root: "/runtime", runtimePlatform: "kvm", disableSyscallPatching: true}).configuredRunscArgs(); !reflect.DeepEqual(got, wantKVM) {
+		t.Errorf("KVM runsc args without syscall patching=%q, want %q", got, wantKVM)
+	}
 }
 
 // The cache a sandbox is allowed fits in the descriptors it will be given.

@@ -234,3 +234,41 @@ func TestWithoutFSGSBASE(t *testing.T) {
 		t.Fatalf("WithoutFSGSBASE removed unrelated features: %q", masked.FlagString())
 	}
 }
+
+func TestCPUIDFeaturesRecordFeatureRegisters(t *testing.T) {
+	leaves := map[In]Out{
+		// GenuineIntel, with leaves up to 0xd.
+		{Eax: 0}: {Eax: 0xd, Ebx: 0x756e6547, Ecx: 0x6c65746e, Edx: 0x49656e69},
+		// The signature and the APIC ID are not features, nor is the
+		// hypervisor bit.
+		{Eax: 1}: {Eax: 0x806f8, Ebx: 0x12345678, Ecx: 1<<31 | 1<<28, Edx: 1 << 25},
+		// One further subleaf; MD_CLEAR is a speculation control.
+		{Eax: 7}:           {Eax: 1, Ebx: 1 << 5, Edx: 1<<10 | 1<<23},
+		{Eax: 7, Ecx: 1}:   {Eax: 1 << 4},
+		{Eax: 7, Ecx: 2}:   {Edx: 1 << 8},
+		{Eax: 0xd, Ecx: 1}: {Eax: 0xf},
+		// Above the highest basic leaf.
+		{Eax: 0x14}:       {Ebx: 1 << 4},
+		{Eax: 0x80000000}: {Eax: 0x80000008},
+		{Eax: 0x80000001}: {Ecx: 1 << 5, Edx: 1 << 29},
+		// IBPB is a speculation control.
+		{Eax: 0x80000008}: {Ebx: 1<<0 | 1<<12},
+		// Above the highest extended leaf.
+		{Eax: 0x80000021}: {Eax: 1},
+	}
+	got := cpuidFeatures(func(in In) Out { return leaves[in] })
+	want := "vendor=GenuineIntel;1.0.ecx=10000000;1.0.edx=2000000;7.0.eax=1;7.0.ebx=20;7.0.edx=800000;7.1.eax=10;d.1.eax=f;80000001.0.ecx=20;80000001.0.edx=20000000;80000008.0.ebx=1"
+	if got != want {
+		t.Errorf("cpuidFeatures=%q, want %q", got, want)
+	}
+}
+
+func TestHostCPUIDFeatures(t *testing.T) {
+	got := HostCPUIDFeatures()
+	if !strings.HasPrefix(got, "vendor=") || !strings.Contains(got, ";1.0.edx=") {
+		t.Fatalf("HostCPUIDFeatures=%q, want the vendor and leaf 1", got)
+	}
+	if again := HostCPUIDFeatures(); again != got {
+		t.Fatalf("HostCPUIDFeatures changed from %q to %q", got, again)
+	}
+}

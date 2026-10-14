@@ -85,6 +85,9 @@ type options struct {
 	disableHostGSO        bool
 	daemonSocket          string
 	direct                bool
+	// disableSyscallPatching runs systrap without syscall patching, as a
+	// cluster whose nodes need no CPUID faulting does.
+	disableSyscallPatching bool
 }
 
 // Run executes ttc with args and returns a process exit status.
@@ -274,7 +277,8 @@ Commands:
   volume COMMAND                  Manage persistent volumes (create, ls, inspect, rm)
   completion SHELL                 Generate Bash, Zsh, or Fish completion
   daemon start [--platform systrap|kvm] [--cpu-profile portable|host|explicit]
-               [--cpu-features FEATURE,...] [--unsafe-no-host-isolation]
+               [--cpu-features FEATURE,...] [--experimental-no-cpuid-faulting]
+               [--unsafe-no-host-isolation]
                [--control-only]
                [--node NAME] [--listen ADDR] [--advertise HOST:PORT]
                [--memory-target SIZE]
@@ -6792,6 +6796,11 @@ type runtimeBackend struct {
 	nodeID                string
 	cancelClient          func()
 	clientCanceled        <-chan struct{}
+	// disableSyscallPatching runs systrap without syscall patching, whose
+	// fast path owns GS: in a cluster whose nodes need no CPUID faulting, an
+	// application may see FSGSBASE in the host's own CPUID and write GS
+	// itself, which systrap then keeps for it on every switch.
+	disableSyscallPatching bool
 	// clientGone is closed once the client's connection breaks.
 	clientGone <-chan struct{}
 	// archiveFile, if not nil, is the archive the client passed with its
@@ -12208,6 +12217,9 @@ func (b *runtimeBackend) configuredRunscArgsForNetworkConfig(networkMode string,
 	}
 	if b.disableHostGSO {
 		args = append(args, "--gso=false")
+	}
+	if b.disableSyscallPatching && runtimePlatform == "systrap" {
+		args = append(args, "--systrap-disable-syscall-patching=true")
 	}
 	if networkMode == "ttc" {
 		args = append(args, "--ttc-network-nat="+strconv.FormatBool(networkNAT))

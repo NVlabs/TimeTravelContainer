@@ -138,6 +138,21 @@ startup rather than allowing a later cross-CPU migration to corrupt userspace
 XSAVE buffers. This restriction applies to distributed systrap execution, not
 standalone TTC.
 
+A cluster of identical CPUs may run without CPUID faulting if it is created
+with `--cpu-profile=host --experimental-no-cpuid-faulting`: for example, one
+cluster per CPU generation on hosts whose kernels predate AMD's CPUID faulting
+(Linux 6.17), or whose CPUs lack it. The cluster records its first node's own
+CPUID feature registers, and every node, with or without CPUID faulting, must
+have exactly these, apart from the hypervisor bit and the speculation controls
+that microcode reports. A node whose CPUID differs is refused at startup, with
+the registers that differ. Applications on a node without CPUID faulting read
+the host's CPUID rather than the profile, and may see and use FSGSBASE, which
+systrap's syscall patching cannot coexist with; every node of such a cluster
+therefore runs systrap with syscall patching disabled, which makes system calls
+slower. Such a cluster runs systrap nodes only. The option is chosen when the
+cluster is created: nodes that join may repeat it or leave it out, and TTC
+builds that predate it refuse such a cluster.
+
 ## Compile
 
 The repository's Docker-based build wrapper can copy both binaries in one

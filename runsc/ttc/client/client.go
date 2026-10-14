@@ -414,6 +414,12 @@ Options:
   --cpu-profile portable|host|explicit
                                   Guest CPU contract (default: portable)
   --cpu-features NAME,...         Required with explicit profile; no default
+  --experimental-no-cpuid-faulting
+                                  Create a cluster whose systrap nodes need no
+                                  host CPUID faulting. Requires --cpu-profile
+                                  host; every node must then have identical
+                                  CPUID feature registers, and systrap runs
+                                  without syscall patching (default: false)
   --unsafe-no-host-isolation      Disable host isolation: user namespaces
                                   and chroots on Linux, the Seatbelt sandbox
                                   on macOS (default: false)

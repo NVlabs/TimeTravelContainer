@@ -336,6 +336,9 @@ type daemonServer struct {
 	sharedReferences      *sharedReferenceService
 	portIngress           *portIngressManager
 	stderr                io.Writer
+	// noCPUIDFaulting is set in a cluster whose systrap nodes need no CPUID
+	// faulting; they run systrap without syscall patching.
+	noCPUIDFaulting bool
 	// routeHints has the node of each family that a command was last routed
 	// to: see routingPlacements.
 	routeHints routeHints
@@ -480,7 +483,11 @@ type daemonClusterOptions struct {
 	CPUProfileMode      string
 	CPUFeatures         string
 	CPUProfileSet       bool
-	ResolvedCPU         daemonCPUProfile
+	// NoCPUIDFaulting asks for a cluster whose systrap nodes need no CPUID
+	// faulting (--experimental-no-cpuid-faulting). A node that does not ask
+	// adopts what its cluster was created with.
+	NoCPUIDFaulting bool
+	ResolvedCPU     daemonCPUProfile
 }
 
 func defaultDaemonClusterOptions() daemonClusterOptions {
@@ -2929,6 +2936,8 @@ func directBackend(opts options, stdin io.Reader, stdout, stderr io.Writer) *run
 		stdout:                stdout,
 		stderr:                stderr,
 		explicitInitStops:     new(atomic.Int32),
+		// A cluster whose nodes need no CPUID faulting runs them so.
+		disableSyscallPatching: opts.disableSyscallPatching,
 	}
 }
 
@@ -3958,6 +3967,7 @@ func (s *daemonServer) optionsFromRequest() options {
 	opts.runsc = s.runsc
 	opts.unsafeNoHostIsolation = runscNoHostIsolation(s.unsafeNoHostIsolation)
 	opts.disableHostGSO = s.disableHostGSO
+	opts.disableSyscallPatching = s.noCPUIDFaulting
 	opts.runtimePlatform = s.runtimePlatform
 	opts.cpuFeatures = s.cpuFeatures
 	opts.dataRoot = s.dataRoot
@@ -4125,6 +4135,10 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 			}
 			args = args[consumed:]
 		}
+	}
+	if err := validateNoCPUIDFaultingOption(clusterOpts); err != nil {
+		fmt.Fprintf(stderr, "ttcd: %v\n", err)
+		return 2
 	}
 	roots, err := daemonRootsFromEnvironment(clusterOpts.Configured)
 	if err != nil {
@@ -5135,8 +5149,14 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 	// A control holder creates none, and runs no guest on the cluster's CPU
 	// profile: whatever platform it names, it holds a cluster of KVM nodes on
 	// a host without CPUID faulting, or with a profile only KVM provides.
+	// A cluster of identical CPUs may waive CPUID faulting when it is created;
+	// validateDaemonCPUProfile then holds each node to the CPU it records.
 	if !opts.ControlHolder {
-		if err := validateClusterCPUEnforcement(runtimePlatform, hostSupportsCPUIDFaulting()); err != nil {
+		waived, err := clusterWaivesCPUIDFaulting(dataRoot, opts)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateClusterCPUEnforcement(runtimePlatform, hostSupportsCPUIDFaulting(), waived); err != nil {
 			return nil, err
 		}
 	}
@@ -5150,6 +5170,11 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 	resolvedCPU, err := resolveDaemonCPUProfile(opts.CPUProfileMode, opts.CPUFeatures, runtimePlatform)
 	if err != nil {
 		return nil, fmt.Errorf("resolving cluster CPU profile: %w", err)
+	}
+	if opts.NoCPUIDFaulting {
+		if resolvedCPU, err = waiveCPUIDFaulting(resolvedCPU, runtimePlatform); err != nil {
+			return nil, err
+		}
 	}
 	opts.ResolvedCPU = resolvedCPU
 	pendingClusterPolicy, err := applyImmutableClusterConfig(dataRoot, &opts)
@@ -5462,6 +5487,41 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 
 const daemonImmutableClusterConfigVersion = 2
 
+// daemonImmutableClusterConfigNoCPUIDFaultingVersion is the version of the
+// configuration of a cluster whose systrap nodes need no CPUID faulting. A
+// build that predates the waiver refuses it, rather than run such a cluster's
+// nodes with syscall patching and without comparing their CPUs.
+const daemonImmutableClusterConfigNoCPUIDFaultingVersion = 3
+
+func immutableClusterConfigVersion(profile daemonCPUProfile) int {
+	if profile.NoCPUIDFaulting {
+		return daemonImmutableClusterConfigNoCPUIDFaultingVersion
+	}
+	return daemonImmutableClusterConfigVersion
+}
+
+// clusterWaivesCPUIDFaulting reports whether the cluster of opts runs its
+// systrap nodes without CPUID faulting: opts asks for that, or the cluster
+// its shared root records was created so. It creates nothing, so that a node
+// refused for want of CPUID faulting does not create its cluster.
+func clusterWaivesCPUIDFaulting(sharedRoot string, opts daemonClusterOptions) (bool, error) {
+	if opts.NoCPUIDFaulting {
+		return true, nil
+	}
+	data, err := os.ReadFile(filepath.Join(sharedRoot, ".ttc-cluster-config.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var config daemonImmutableClusterConfig
+	if err := json.Unmarshal(data, &config); err != nil {
+		return false, fmt.Errorf("decoding immutable cluster configuration: %w", err)
+	}
+	return config.CPUProfile.NoCPUIDFaulting, nil
+}
+
 // daemonImmutableClusterConfig contains only cluster-wide policy. Addresses,
 // node names, local capacity and provisioning hooks are deliberately absent:
 // they belong to one node and may change as elastic workers join and leave.
@@ -5476,7 +5536,7 @@ type daemonImmutableClusterConfig struct {
 
 func immutableClusterConfigFromOptions(opts daemonClusterOptions) daemonImmutableClusterConfig {
 	return daemonImmutableClusterConfig{
-		Version: daemonImmutableClusterConfigVersion, PagingPolicy: opts.PagingPolicy,
+		Version: immutableClusterConfigVersion(opts.ResolvedCPU), PagingPolicy: opts.PagingPolicy,
 		LeaseDuration: opts.LeaseDuration, MaxTransactions: opts.MaxTransactions,
 		AutoRebalance: opts.AutoRebalance,
 		CPUProfile:    opts.ResolvedCPU,
@@ -5487,7 +5547,8 @@ func equalImmutableClusterConfig(a, b daemonImmutableClusterConfig) bool {
 	return a.Version == b.Version && a.PagingPolicy == b.PagingPolicy &&
 		a.LeaseDuration == b.LeaseDuration && a.MaxTransactions == b.MaxTransactions &&
 		a.AutoRebalance == b.AutoRebalance && a.CPUProfile.Version == b.CPUProfile.Version &&
-		a.CPUProfile.Mode == b.CPUProfile.Mode && slices.Equal(a.CPUProfile.Features, b.CPUProfile.Features) && a.CPUProfile.XsaveABI == b.CPUProfile.XsaveABI
+		a.CPUProfile.Mode == b.CPUProfile.Mode && slices.Equal(a.CPUProfile.Features, b.CPUProfile.Features) && a.CPUProfile.XsaveABI == b.CPUProfile.XsaveABI &&
+		a.CPUProfile.NoCPUIDFaulting == b.CPUProfile.NoCPUIDFaulting && a.CPUProfile.CPUID == b.CPUProfile.CPUID
 }
 
 func clusterRuntimePolicy(config daemonImmutableClusterConfig) cluster.ClusterRuntimePolicy {
@@ -5534,16 +5595,24 @@ func applyImmutableClusterConfig(sharedRoot string, opts *daemonClusterOptions) 
 	if err := json.Unmarshal(data, &got); err != nil {
 		return nil, fmt.Errorf("decoding immutable cluster configuration: %w", err)
 	}
-	if got.Version != daemonImmutableClusterConfigVersion {
+	if got.Version != immutableClusterConfigVersion(got.CPUProfile) {
 		return nil, fmt.Errorf("unsupported immutable cluster configuration version %d", got.Version)
 	}
 	if opts.CPUProfileSet && (got.CPUProfile.Mode != want.CPUProfile.Mode || !slices.Equal(got.CPUProfile.Features, want.CPUProfile.Features)) {
 		return nil, fmt.Errorf("requested CPU profile differs from immutable cluster profile %q", got.CPUProfile.Mode)
 	}
+	if opts.NoCPUIDFaulting && !got.CPUProfile.NoCPUIDFaulting {
+		return nil, errors.New("--experimental-no-cpuid-faulting applies when a cluster is created; this cluster's systrap nodes require CPUID faulting")
+	}
 	compareWant := want
 	if !opts.CPUProfileSet {
 		compareWant.CPUProfile = got.CPUProfile
 	}
+	// Whether the cluster waives CPUID faulting a node adopts; whether the
+	// node's CPU is the one the cluster records, validateDaemonCPUProfile
+	// judges.
+	compareWant.CPUProfile.NoCPUIDFaulting, compareWant.CPUProfile.CPUID = got.CPUProfile.NoCPUIDFaulting, got.CPUProfile.CPUID
+	compareWant.Version = immutableClusterConfigVersion(compareWant.CPUProfile)
 	var pending *daemonImmutableClusterConfig
 	if !equalImmutableClusterConfig(got, compareWant) {
 		pending = &compareWant
@@ -6623,6 +6692,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 		runtimePlatform:       runtimePlatform,
 		cpuProfileName:        cpuProfile.Mode,
 		cpuFeatures:           cpuProfile.annotation(),
+		noCPUIDFaulting:       cpuProfile.NoCPUIDFaulting,
 		unsafeNoHostIsolation: unsafeNoHostIsolation,
 		disableHostGSO:        kernelCompatibility.disableHostGSO,
 		hostKernelRelease:     kernelCompatibility.release,
@@ -6831,6 +6901,8 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 			cpuFeatures:           server.cpuFeatures,
 			unsafeNoHostIsolation: runscNoHostIsolation(server.unsafeNoHostIsolation),
 			disableHostGSO:        server.disableHostGSO,
+			// A cluster whose nodes need no CPUID faulting runs them so.
+			disableSyscallPatching: server.noCPUIDFaulting,
 		}, strings.NewReader(""), io.Discard, io.Discard)
 		clusterTargetBackend = targetBackend
 		server.configureVolumeBackend(targetBackend)
@@ -7588,6 +7660,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			"unsafe_no_host_isolation": s.unsafeNoHostIsolation,
 			"host_kernel_release":      s.hostKernelRelease,
 			"host_gso_enabled":         !s.disableHostGSO,
+			"host_cpuid_faulting":      hostSupportsCPUIDFaulting(),
 			"data_root":                s.dataRoot,
 			"shared_root":              s.dataRoot,
 			"local_root":               s.localRoot,
@@ -7599,6 +7672,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			clusterStatus := map[string]any{
 				"listen": s.clusterListen, "capabilities": s.clusterCapabilities,
 			}
+			clusterStatus["experimental_no_cpuid_faulting"] = s.noCPUIDFaulting
 			if s.clusterDirectory != nil {
 				if nodes, err := s.clusterDirectory.List(); err == nil {
 					clusterStatus["nodes"] = nodes
@@ -9520,6 +9594,9 @@ func startDaemonProcess(socket, runtimePlatform string, unsafeNoHostIsolation bo
 		if clusterOpts.CPUFeatures != "" {
 			commandArgs = append(commandArgs, "--cpu-features", clusterOpts.CPUFeatures)
 		}
+		if clusterOpts.NoCPUIDFaulting {
+			commandArgs = append(commandArgs, "--experimental-no-cpuid-faulting")
+		}
 		if unsafeNoHostIsolation {
 			commandArgs = append(commandArgs, "--unsafe-no-host-isolation")
 		}
@@ -9676,6 +9753,10 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 		opts.runtimePlatform = runtimePlatform
 		if clusterOpts.ControlOnly && opts.unsafeNoHostIsolation {
 			fmt.Fprintln(stderr, "ttc: --unsafe-no-host-isolation is not applicable to --control-only")
+			return 2
+		}
+		if err := validateNoCPUIDFaultingOption(clusterOpts); err != nil {
+			fmt.Fprintf(stderr, "ttc: %v\n", err)
 			return 2
 		}
 		args = args[:1]
