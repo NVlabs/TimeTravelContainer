@@ -2917,6 +2917,27 @@ func TestNoCPUIDFaultingOption(t *testing.T) {
 	}
 }
 
+func TestCPUProfileWithoutFaultingWarning(t *testing.T) {
+	portable := daemonCPUProfile{Mode: "portable"}
+	if got := cpuProfileWithoutFaultingWarning(portable, "systrap", false); !strings.Contains(got, "not the portable CPU profile") {
+		t.Errorf("portable profile on a systrap host without CPUID faulting: %q", got)
+	}
+	for _, test := range []struct {
+		profile  daemonCPUProfile
+		platform string
+		faulting bool
+	}{
+		{profile: portable, platform: "systrap", faulting: true},
+		{profile: portable, platform: "kvm", faulting: false},
+		{profile: daemonCPUProfile{Mode: "host"}, platform: "systrap", faulting: false},
+		{profile: daemonCPUProfile{Mode: "host", NoCPUIDFaulting: true}, platform: "systrap", faulting: false},
+	} {
+		if got := cpuProfileWithoutFaultingWarning(test.profile, test.platform, test.faulting); got != "" {
+			t.Errorf("%+v on %s, faulting %t: %q, want no warning", test.profile, test.platform, test.faulting, got)
+		}
+	}
+}
+
 func TestCPUTopologyOption(t *testing.T) {
 	for _, test := range []struct {
 		args     []string

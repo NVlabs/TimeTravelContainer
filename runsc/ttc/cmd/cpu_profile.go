@@ -69,6 +69,19 @@ func (p daemonCPUProfile) cpuTopologyMode() string {
 	return p.Topology
 }
 
+// cpuProfileWithoutFaultingWarning returns what a daemon says at start when
+// its applications read the host's own CPUID rather than its CPU profile: on
+// a systrap host without CPUID faulting, a profile other than the host's
+// shows only in /proc/cpuinfo and the auxiliary vector, while a library that
+// executes CPUID, as MKL and glibc's own dispatch do, finds the host's
+// features and uses them.
+func cpuProfileWithoutFaultingWarning(profile daemonCPUProfile, runtimePlatform string, cpuidFaulting bool) string {
+	if runtimePlatform != "systrap" || cpuidFaulting || profile.Mode == "host" || profile.NoCPUIDFaulting {
+		return ""
+	}
+	return fmt.Sprintf("this host has no CPUID faulting, so applications read its own CPUID, not the %s CPU profile, which only /proc/cpuinfo shows; libraries that execute CPUID use features outside the profile. use --cpu-profile host to make the profile the host's", profile.Mode)
+}
+
 // daemonCPUTopologyWarning is what a daemon says at start when its CPUs span
 // more than one memory node and --cpu-topology did not choose a topology.
 const daemonCPUTopologyWarning = "this daemon has access to multiple numa nodes, but --cpu-topology is not set explicitly. by default, numa and guest affinity are ignored. use --cpu-topology host or bind the daemon to a specific numa node with numactl or taskset."

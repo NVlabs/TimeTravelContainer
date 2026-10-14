@@ -4413,6 +4413,9 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	if cpuTopology.Mode == cputopology.Single && !topologyChosen && !clusterOpts.ControlHolder && !clusterOpts.ControlOnly && cputopology.AllowedNodeCount() > 1 {
 		fmt.Fprintln(stderr, "ttcd: warning: "+daemonCPUTopologyWarning)
 	}
+	if warning := cpuProfileWithoutFaultingWarning(cpuProfile, runtimePlatform, hostSupportsCPUIDFaulting()); warning != "" && !clusterOpts.ControlHolder && !clusterOpts.ControlOnly {
+		fmt.Fprintln(stderr, "ttcd: warning: "+warning)
+	}
 	if err := serveDaemonWithCluster(socket, runtimePlatform, cpuProfile, cpuTopology, access, unsafeNoHostIsolation, kernelCompatibility, daemonDataRoot, roots.local, daemonRoot, daemonRunsc, manager.Capability(), clusterRuntime, gfx, stdout, stderr); err != nil {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
 		if errors.Is(err, errLeaseSelfFenced) {
@@ -9832,7 +9835,7 @@ func reportDaemonStartupWarnings(stderr io.Writer, logPath string) {
 		return
 	}
 	for _, line := range strings.Split(string(log), "\n") {
-		if strings.Contains(line, "disabling host GSO") || strings.Contains(line, daemonCPUTopologyWarning) {
+		if strings.Contains(line, "disabling host GSO") || strings.Contains(line, daemonCPUTopologyWarning) || strings.Contains(line, "this host has no CPUID faulting") {
 			fmt.Fprintln(stderr, line)
 		}
 	}
