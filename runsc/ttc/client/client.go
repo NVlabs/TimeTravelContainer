@@ -1062,6 +1062,32 @@ func exchangeControl(socket string, req request, stdout, stderr io.Writer) int {
 	return status
 }
 
+// reportStartupWarnings repeats what a daemon that has just become ready
+// warned of in its log as it started, such as the topology of CPUs it was
+// not told how to show, or the isolation it was told to go without: the
+// user who starts it reads the terminal, not the log.
+func reportStartupWarnings(stderr io.Writer, logPath string) {
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		return
+	}
+	for _, line := range startupWarnings(string(data)) {
+		fmt.Fprintln(stderr, line)
+	}
+}
+
+// startupWarnings returns the warnings in the log of a daemon that has just
+// started.
+func startupWarnings(log string) []string {
+	var warnings []string
+	for line := range strings.SplitSeq(log, "\n") {
+		if strings.HasPrefix(line, "ttcd: warning: ") {
+			warnings = append(warnings, line)
+		}
+	}
+	return warnings
+}
+
 func startDaemon(socket string, args []string, stdout, stderr io.Writer) error {
 	executable, err := os.Executable()
 	if err != nil {
@@ -1115,6 +1141,7 @@ func startDaemon(socket string, args []string, stdout, stderr io.Writer) error {
 	deadline := time.Now().Add(daemonStartTimeout)
 	for time.Now().Before(deadline) {
 		if ready() {
+			reportStartupWarnings(stderr, logPath)
 			fmt.Fprintln(stdout, "ttcd started")
 			return nil
 		}
@@ -1130,6 +1157,7 @@ func startDaemon(socket string, args []string, stdout, stderr io.Writer) error {
 	// slow or wedged shared storage can otherwise make `daemon start` report
 	// failure while ttcd appears several seconds (or minutes) later.
 	if ready() {
+		reportStartupWarnings(stderr, logPath)
 		fmt.Fprintln(stdout, "ttcd started")
 		return nil
 	}

@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -40,6 +41,21 @@ func TestTerminateStartedDaemonKillsStartupSession(t *testing.T) {
 	}
 	if err := command.Process.Signal(syscall.Signal(0)); err == nil {
 		t.Fatal("failed daemon startup process survived cleanup")
+	}
+}
+
+func TestStartupWarningsAreTheDaemonsWarnings(t *testing.T) {
+	log := "ttcd: warning: this daemon has access to multiple numa nodes\n" +
+		"ttcd: warning: host Linux kernel 4.14.76 predates 4.14.77; disabling host GSO\n" +
+		"ttcd listening on /root/ttcd.sock\n" +
+		"some other line with ttcd: warning: in it\n"
+	got := startupWarnings(log)
+	want := []string{
+		"ttcd: warning: this daemon has access to multiple numa nodes",
+		"ttcd: warning: host Linux kernel 4.14.76 predates 4.14.77; disabling host GSO",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("startupWarnings() = %q, want %q", got, want)
 	}
 }
 
