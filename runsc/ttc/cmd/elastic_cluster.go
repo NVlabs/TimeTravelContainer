@@ -3342,6 +3342,9 @@ func (s *daemonServer) executeDistributedStats(request daemonRequest) (bool, int
 		merged.FilesystemUniqueBytes += local.FilesystemUniqueBytes
 		merged.DependentMemoryBytes += local.DependentMemoryBytes
 		merged.DependentFilesystemBytes += local.DependentFilesystemBytes
+		// Each runtime's applications have address spaces of their own.
+		merged.ApplicationMappedBytes += local.ApplicationMappedBytes
+		merged.ApplicationHugePageBytes += local.ApplicationHugePageBytes
 		// The extracted image cache is shared by every runtime on one node.
 		// Count it once per node, not once per physical Sentry.
 		if _, ok := imageAccounted[node]; !ok {
