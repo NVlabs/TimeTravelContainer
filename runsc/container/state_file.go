@@ -394,8 +394,14 @@ func (s *StateFile) load(v any, opts LoadOpts) error {
 	metaBytes, err := os.ReadFile(path)
 	if err != nil {
 		// Caller of this function relies on error code, we cannot return new error,
-		// but we need to provide a message with file name.
-		log.Warningf("Error loading state file %q: %v", path, err)
+		// but we need to provide a message with file name. A state file that
+		// does not exist is how a container that does not exist is found:
+		// ttcd looks for its family's runtime on a node that may have none.
+		if errors.Is(err, os.ErrNotExist) {
+			log.Debugf("Error loading state file %q: %v", path, err)
+		} else {
+			log.Warningf("Error loading state file %q: %v", path, err)
+		}
 		return err
 	}
 	return json.Unmarshal(metaBytes, &v)
