@@ -9231,3 +9231,28 @@ func TestRuntimeListsBranch(t *testing.T) {
 		t.Error("a runtime whose Sentry is gone runs the branch")
 	}
 }
+
+func TestTriggerBindMountSourcesLooksUpBindSources(t *testing.T) {
+	bundle := t.TempDir()
+	spec := specs.Spec{Mounts: []specs.Mount{
+		{Destination: "/a", Type: "bind", Source: filepath.Join(bundle, "missing-a")},
+		{Destination: "/b", Source: filepath.Join(bundle, "missing-b"), Options: []string{"rbind", "ro"}},
+		{Destination: "/proc", Type: "proc", Source: "proc"},
+	}}
+	data, err := json.Marshal(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundle, "config.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Missing sources and other mounts are passed over: runsc reports them.
+	triggerBindMountSources(bundle)
+	triggerBindMountSources(filepath.Join(bundle, "no-such-bundle"))
+	if got := bundleOf([]string{"create", "--bundle", bundle, "id"}); got != bundle {
+		t.Fatalf("bundleOf() = %q, want %q", got, bundle)
+	}
+	if got := bundleOf([]string{"start", "id"}); got != "" {
+		t.Fatalf("bundleOf() without a bundle = %q", got)
+	}
+}

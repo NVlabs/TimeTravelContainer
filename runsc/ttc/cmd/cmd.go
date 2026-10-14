@@ -12398,6 +12398,9 @@ func (b *runtimeBackend) runConfiguredCommandWithArgs(configured []string, args 
 // client stream, so their peer response must retain the launch diagnostic
 // instead of reducing every runtime failure to an opaque exit status.
 func (b *runtimeBackend) runConfiguredCommandWithArgsAndDiagnostic(configured []string, args ...string) (int, string, error) {
+	if bundle := bundleOf(args); bundle != "" {
+		triggerBindMountSources(bundle)
+	}
 	args = append(configured, args...)
 	stdout, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 	if err != nil {

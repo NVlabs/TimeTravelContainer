@@ -1128,7 +1128,10 @@ ttc run --rm \
 ```
 
 Such a bind is a shared external view, not a snapshot; later host changes may
-become visible in every branch.
+become visible in every branch. Its source may be under an autofs map, as
+`/home` is on many batch farms: ttcd looks each source up before it starts a
+sandbox, so that the map mounts it, which a sandbox, in a mount namespace of
+its own, cannot have done.
 
 An ordinary writable bind creates a persistent, branch-local writable layer
 over the live host path:

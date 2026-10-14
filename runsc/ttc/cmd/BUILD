@@ -13,6 +13,7 @@ go_library(
     # Its deps select the Darwin-only Seatbelt package.
     force_add_state_pkg = True,
     srcs = [
+        "automount.go",
         "capture_reuse.go",
         "carried.go",
         "catalog_claims.go",
