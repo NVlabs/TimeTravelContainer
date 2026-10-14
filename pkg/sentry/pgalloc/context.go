@@ -68,6 +68,10 @@ const (
 	// CtxSparseRestoreRefs stages restored object references until state load
 	// has completed successfully.
 	CtxSparseRestoreRefs
+
+	// CtxMemoryPolicy is a Context.Value key for the MemoryPolicy of the task
+	// that allocates memory, if its kernel shows the host's CPU topology.
+	CtxMemoryPolicy
 )
 
 // IsLiveForkClone returns true if ctx is loading an in-memory live fork.

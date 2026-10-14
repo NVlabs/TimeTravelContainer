@@ -201,6 +201,9 @@ go_library(
         "logical_page_set.go",
         "memacct_set.go",
         "memory_file_mutex.go",
+        "numa.go",
+        "numa_darwin.go",
+        "numa_linux_unsafe.go",
         "pgalloc.go",
         "pgalloc_unsafe.go",
         "remote_snapshot.go",
@@ -245,6 +248,7 @@ go_test(
     name = "pgalloc_test",
     size = "small",
     srcs = [
+        "numa_test.go",
         "pgalloc_64k_test.go",
         "pgalloc_test.go",
         "remote_snapshot_test.go",

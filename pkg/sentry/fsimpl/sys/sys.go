@@ -233,6 +233,10 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 			devChar[virtGPURenderDev] = gpu.devChar
 		}
 	}
+	if t := k.HostCPUTopology(); t != nil {
+		// The host's nodes, which also hold whatever devices RDMA shows.
+		systemSub["node"] = fs.newHostNodeDir(ctx, creds, t)
+	}
 	if len(pciDevices) > 0 {
 		busSub["pci"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
 			"devices": fs.newDir(ctx, creds, defaultSysDirMode, pciDevices),
@@ -286,7 +290,10 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 func cpuDir(ctx context.Context, fs *filesystem, creds *auth.Credentials) kernfs.Inode {
 	k := kernel.KernelFromContext(ctx)
 	maxCPUCores := k.ApplicationCores()
-	d := &cpusDir{fs: fs, owner: creds, cores: maxCPUCores}
+	d := &cpusDir{fs: fs, owner: creds, cores: maxCPUCores, inos: cpuInos}
+	if k.HostCPUTopology() != nil {
+		d.inos = hostCPUInos
+	}
 	children := map[string]kernfs.Inode{
 		"online":   fs.newCPUFile(ctx, creds, maxCPUCores, defaultSysMode),
 		"possible": fs.newCPUFile(ctx, creds, maxCPUCores, defaultSysMode),
@@ -295,7 +302,7 @@ func cpuDir(ctx context.Context, fs *filesystem, creds *auth.Credentials) kernfs
 	// Nothing else numbers this filesystem's inodes while it is made: the
 	// CPUs' are consecutive.
 	d.firstIno = fs.NextIno()
-	for i := uint(1); i < cpuInos*maxCPUCores; i++ {
+	for i := uint64(1); i < d.inos*uint64(maxCPUCores); i++ {
 		fs.NextIno()
 	}
 	d.InodeAttrs.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0755)
@@ -322,8 +329,19 @@ type cpusDir struct {
 	owner *auth.Credentials
 	cores uint
 	// firstIno is the inode number of cpu0's directory, whose inodes and each
-	// next CPU's are numbered cpuInos on.
+	// next CPU's are numbered inos on.
 	firstIno uint64
+	// inos is how many inodes a CPU's directory holds: cpuInos, or
+	// hostCPUInos under the host CPU topology. 0 is cpuInos.
+	inos uint64
+}
+
+// cpuInodes returns how many inodes a CPU's directory holds.
+func (d *cpusDir) cpuInodes() uint64 {
+	if d.inos == 0 {
+		return cpuInos
+	}
+	return d.inos
 }
 
 // Lookup implements kernfs.inodeDirectory.Lookup.
@@ -336,9 +354,12 @@ func (d *cpusDir) Lookup(ctx context.Context, name string) (kernfs.Inode, error)
 	if !ok || err != nil || cpu >= uint64(d.cores) || strconv.FormatUint(cpu, 10) != number {
 		return nil, linuxerr.ENOENT
 	}
+	ino := d.firstIno + cpu*d.cpuInodes()
+	if t := kernel.KernelFromContext(ctx).HostCPUTopology(); t != nil && d.cpuInodes() == hostCPUInos && cpu < uint64(len(t.CPUs)) {
+		return d.hostCPUDir(ctx, t, int(cpu), ino), nil
+	}
 	// For consistency with /proc/cpuinfo, pretend all CPUs are in the same
 	// socket and each CPU is a distinct core.
-	ino := d.firstIno + cpu*cpuInos
 	oneMask := oneCPUMask(uint(cpu), d.cores) + "\n"
 	fullMask := fullCPUMask(d.cores) + "\n"
 	return d.fs.newDirWithIno(ctx, d.owner, ino, map[string]kernfs.Inode{
@@ -357,7 +378,7 @@ func (d *cpusDir) IterDirents(ctx context.Context, mnt *vfs.Mount, cb vfs.IterDi
 		if err := cb.Handle(vfs.Dirent{
 			Name:    "cpu" + strconv.FormatInt(cpu, 10),
 			Type:    linux.DT_DIR,
-			Ino:     d.firstIno + uint64(cpu)*cpuInos,
+			Ino:     d.firstIno + uint64(cpu)*d.cpuInodes(),
 			NextOff: offset + 1,
 		}); err != nil {
 			return offset, err

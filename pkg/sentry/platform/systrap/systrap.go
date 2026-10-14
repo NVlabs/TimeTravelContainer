@@ -151,6 +151,38 @@ type platformContext struct {
 	// needToPullFullState indicates that the Sentry doesn't have a full
 	// state of the thread.
 	needToPullFullState bool
+
+	// hostCPU is sysmsg.ThreadContext.HostCPU as the context's last switch
+	// left it.
+	hostCPU atomic.Uint32
+}
+
+// LastHostCPU implements platform.HostCPUContext.LastHostCPU.
+func (c *platformContext) LastHostCPU() (cpu, node int32, ok bool) {
+	v := c.hostCPU.Load()
+	if v == sysmsg.HostCPUUnknown {
+		return 0, 0, false
+	}
+	// Linux's getcpu vDSO encoding; see arch/x86/include/asm/segment.h.
+	return int32(v & 0xfff), int32(v >> 12), true
+}
+
+// place confines the context's application thread to the host CPUs that
+// ctx's task may run on, if it is a platform.HostCPUPlacer.
+func (c *platformContext) place(ctx pkgcontext.Context) {
+	placer, ok := ctx.(platform.HostCPUPlacer)
+	if !ok {
+		return
+	}
+	id, mask := placer.HostCPUPlacement()
+	shared := c.sharedContext.shared
+	if id == c.sharedContext.placementID {
+		return
+	}
+	n := copy(shared.CPUMask[:], mask)
+	clear(shared.CPUMask[n:])
+	atomic.StoreUint32(&shared.PlacementID, id)
+	c.sharedContext.placementID = id
 }
 
 // PullFullState implements platform.Context.PullFullState.
@@ -185,6 +217,7 @@ func (c *platformContext) Switch(ctx pkgcontext.Context, mm platform.MemoryManag
 	}
 	c.sharedContext.shared.ThreadName = [linux.TASK_COMM_LEN]byte{}
 	copy(c.sharedContext.shared.ThreadName[:linux.TASK_COMM_LEN-1], name)
+	c.place(ctx)
 	guestGS := disableSyscallPatching
 	if !guestGS {
 		var err error
@@ -201,6 +234,10 @@ func (c *platformContext) Switch(ctx pkgcontext.Context, mm platform.MemoryManag
 
 restart:
 	isSyscall, needPatch, at, err := s.switchToApp(c, ac)
+	if c.sharedContext.placementID != 0 {
+		// Before CPUID emulation, which reports the CPU.
+		c.hostCPU.Store(atomic.LoadUint32(&c.sharedContext.shared.HostCPU))
+	}
 	if err != nil {
 		return nil, hostarch.NoAccess, err
 	}
@@ -389,10 +426,12 @@ func (p *Systrap) NewAddressSpace() (platform.AddressSpace, error) {
 
 // NewContext returns an interruptible platformContext.
 func (*Systrap) NewContext(ctx pkgcontext.Context) platform.Context {
-	return &platformContext{
+	c := &platformContext{
 		needRestoreFPState:  true,
 		needToPullFullState: false,
 	}
+	c.hostCPU.Store(sysmsg.HostCPUUnknown)
+	return c
 }
 
 // ConcurrencyCount implements platform.Platform.ConcurrencyCount.

@@ -61,6 +61,7 @@ go_library(
     deps = [
         "//pkg/abi/linux",
 		"//pkg/cpuid",
+		"//pkg/cputopology",
         "//pkg/hostarch",
 		"//pkg/log",
         "//pkg/memutil",

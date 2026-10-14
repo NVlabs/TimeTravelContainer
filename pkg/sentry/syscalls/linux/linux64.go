@@ -324,7 +324,7 @@ var AMD64 = &kernel.SyscallTable{
 		276: syscalls.Supported("tee", Tee),
 		277: syscalls.Supported("sync_file_range", SyncFileRange),
 		278: syscalls.ErrorWithEvent("vmsplice", linuxerr.ENOSYS, "", []string{"gvisor.dev/issue/138"}), // TODO(b/29354098)
-		279: syscalls.CapError("move_pages", linux.CAP_SYS_NICE, "", nil),                               // requires cap_sys_nice (mostly)
+		279: syscalls.PartiallySupported("move_pages", MovePages, "Only of the calling process; reports where pages are, but moves none.", nil),
 		280: syscalls.Supported("utimensat", Utimensat),
 		281: syscalls.Supported("epoll_pwait", EpollPwait),
 		282: syscalls.SupportedPoint("signalfd", Signalfd, PointSignalfd),
@@ -665,7 +665,7 @@ var ARM64 = &kernel.SyscallTable{
 		236: syscalls.PartiallySupported("get_mempolicy", GetMempolicy, "Stub implementation.", nil),
 		237: syscalls.PartiallySupported("set_mempolicy", SetMempolicy, "Stub implementation.", nil),
 		238: syscalls.CapError("migrate_pages", linux.CAP_SYS_NICE, "", nil),
-		239: syscalls.CapError("move_pages", linux.CAP_SYS_NICE, "", nil), // requires cap_sys_nice (mostly)
+		239: syscalls.PartiallySupported("move_pages", MovePages, "Only of the calling process; reports where pages are, but moves none.", nil),
 		240: syscalls.Supported("rt_tgsigqueueinfo", RtTgsigqueueinfo),
 		241: syscalls.ErrorWithEvent("perf_event_open", linuxerr.ENODEV, "No support for perf counters", nil),
 		242: syscalls.SupportedPoint("accept4", Accept4, PointAccept4),

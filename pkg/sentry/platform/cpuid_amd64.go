@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //go:build amd64
 // +build amd64
 
@@ -58,10 +61,14 @@ func TryCPUIDEmulate(ctx context.Context, mm MemoryManager, ac *arch.Context64) 
 		return false
 	}
 	fs := cpuid.FromContext(ctx)
-	out := fs.Function.Query(cpuid.In{
+	in := cpuid.In{
 		Eax: uint32(s.Regs.Rax),
 		Ecx: uint32(s.Regs.Rcx),
-	})
+	}
+	out := fs.Function.Query(in)
+	if view, ok := ctx.Value(cpuid.CtxCPUTopology).(cpuid.CPUTopologyView); ok {
+		out = view.Fix(fs, in, out)
+	}
 	s.Regs.Rax = uint64(out.Eax)
 	s.Regs.Rbx = uint64(out.Ebx)
 	s.Regs.Rcx = uint64(out.Ecx)

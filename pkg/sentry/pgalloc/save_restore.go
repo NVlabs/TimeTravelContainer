@@ -1120,7 +1120,7 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 			defer madviseWG.Done()
 			for i := range chunks {
 				chunk := &chunks[i]
-				f.madviseChunkMapping(chunk.mapping, chunkSize, chunk.huge)
+				f.adviseChunk(chunk.mapping, chunk.huge, chunk.node)
 				madviseEnd.Add(chunkSize)
 				select {
 				case madviseChan <- struct{}{}:

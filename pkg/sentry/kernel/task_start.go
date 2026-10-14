@@ -87,6 +87,11 @@ type TaskConfig struct {
 	// AllowedCPUMask contains the cpus that this task can run on.
 	AllowedCPUMask sched.CPUSet
 
+	// NumaPolicy and NumaNodeMask are the new task's memory policy, which a
+	// child inherits from its parent as in Linux.
+	NumaPolicy   linux.NumaPolicy
+	NumaNodeMask uint64
+
 	// UTSNamespace is the UTSNamespace of the new task.
 	UTSNamespace *UTSNamespace
 
@@ -232,6 +237,8 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 		k:               cfg.Kernel,
 		ptraceTracees:   make(map[*Task]struct{}),
 		allowedCPUMask:  cfg.AllowedCPUMask.Copy(),
+		numaPolicy:      cfg.NumaPolicy,
+		numaNodeMask:    cfg.NumaNodeMask,
 		ioUsage:         &usage.IO{},
 		niceness:        cfg.Niceness,
 		sched:           cfg.SchedPolicy,
@@ -424,6 +431,8 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 
 	t.mu.Lock()
 	t.cpu = atomicbitops.FromInt32(assignCPU(t.allowedCPUMask, ts.Root.tids[t]))
+	t.numaPolicyNow.Store(int32(t.numaPolicy))
+	t.numaNodeMaskNow.Store(t.numaNodeMask)
 
 	t.startTime = t.k.RealtimeClock().Now()
 

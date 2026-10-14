@@ -132,6 +132,10 @@ type Store struct {
 	// CPUFeatures is the daemon-owned, comma-separated guest CPU feature
 	// profile installed into every newly created or restored OCI spec.
 	CPUFeatures string
+	// CPUTopology is the daemon-owned guest CPU topology, as
+	// cputopology.Topology.Marshal formats it, installed into every newly
+	// created or restored OCI spec.
+	CPUTopology string
 	// ActiveRoot holds node-local mutable data for running workloads. Root is
 	// the durable catalog and immutable image store and may be a shared
 	// filesystem in cluster mode. Empty preserves the standalone layout.
@@ -1787,6 +1791,12 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		}
 		spec.Annotations[specutils.AnnotationCPUFeatures] = s.CPUFeatures
 	}
+	if s.CPUTopology != "" {
+		if spec.Annotations == nil {
+			spec.Annotations = make(map[string]string)
+		}
+		spec.Annotations[specutils.AnnotationCPUTopology] = s.CPUTopology
+	}
 	logAttributes, err := selectLogAttributes(opts.LogOptions, spec)
 	if err != nil {
 		return Prepared{}, err
@@ -2053,6 +2063,9 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 	}
 	if s.CPUFeatures != "" {
 		spec.Annotations[specutils.AnnotationCPUFeatures] = s.CPUFeatures
+	}
+	if s.CPUTopology != "" {
+		spec.Annotations[specutils.AnnotationCPUTopology] = s.CPUTopology
 	}
 	delete(spec.Annotations, specutils.AnnotationTTCMemoryFile)
 	if len(repositories) == 0 {

@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package proc
 
 import (
@@ -208,25 +211,31 @@ func (*statData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 		idleTicks = total - userTicks - sysTicks
 	}
 
-	fmt.Fprintf(buf, "cpu  %s\n", cpuStats{user: userTicks, system: sysTicks, idle: idleTicks})
+	if host := k.HostCPUStat(); host != nil {
+		// Under the host CPU topology, CPUs are the host's, and how they
+		// spend their time.
+		buf.Write(host)
+	} else {
+		fmt.Fprintf(buf, "cpu  %s\n", cpuStats{user: userTicks, system: sysTicks, idle: idleTicks})
 
-	// gVisor has no per-CPU accounting, so distribute the aggregate stats
-	// evenly across the application cores, assigning any remainder to cpu0.
-	// The per-CPU lines therefore sum back to the aggregate "cpu" line. This
-	// makes the aggregate statistic a reasonable approximation of the total CPU
-	// usage across all cores.
-	for c := uint(0); c < cores; c++ {
-		per := cpuStats{
-			user:   userTicks / uint64(cores),
-			system: sysTicks / uint64(cores),
-			idle:   idleTicks / uint64(cores),
+		// gVisor has no per-CPU accounting, so distribute the aggregate stats
+		// evenly across the application cores, assigning any remainder to
+		// cpu0. The per-CPU lines therefore sum back to the aggregate "cpu"
+		// line. This makes the aggregate statistic a reasonable approximation
+		// of the total CPU usage across all cores.
+		for c := uint(0); c < cores; c++ {
+			per := cpuStats{
+				user:   userTicks / uint64(cores),
+				system: sysTicks / uint64(cores),
+				idle:   idleTicks / uint64(cores),
+			}
+			if c == 0 {
+				per.user += userTicks % uint64(cores)
+				per.system += sysTicks % uint64(cores)
+				per.idle += idleTicks % uint64(cores)
+			}
+			fmt.Fprintf(buf, "cpu%d %s\n", c, per)
 		}
-		if c == 0 {
-			per.user += userTicks % uint64(cores)
-			per.system += sysTicks % uint64(cores)
-			per.idle += idleTicks % uint64(cores)
-		}
-		fmt.Fprintf(buf, "cpu%d %s\n", c, per)
 	}
 
 	// The total number of interrupts is dependent on the CPUs and PCI
@@ -286,6 +295,11 @@ func (*loadavgData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	// Column 1-3: CPU and IO utilization of the last 1, 5, and 10 minute periods.
 	// Column 4-5: currently running processes and the total number of processes.
 	// Column 6: the last process ID used.
+	if avg, ok := kernel.KernelFromContext(ctx).HostLoadavg(); ok {
+		// Under the host CPU topology, the host's load.
+		fmt.Fprintf(buf, "%s %d/%d %d\n", avg, 0, 0, 0)
+		return nil
+	}
 	fmt.Fprintf(buf, "%.2f %.2f %.2f %d/%d %d\n", 0.00, 0.00, 0.00, 0, 0, 0)
 	return nil
 }

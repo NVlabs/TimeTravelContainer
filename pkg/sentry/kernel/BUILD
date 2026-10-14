@@ -273,6 +273,7 @@ go_library(
         "cgroup_mutex.go",
         "cgroup_v2_mutex.go",
         "context.go",
+        "cpu_topology.go",
         "distributed_fork.go",
         "dehydrate.go",
         "fd_table.go",
@@ -381,6 +382,7 @@ go_library(
         "//pkg/context",
         "//pkg/coverage",
         "//pkg/cpuid",
+        "//pkg/cputopology",
         "//pkg/devutil",
         "//pkg/ebpf",
         "//pkg/errors",
@@ -463,6 +465,7 @@ go_test(
     name = "kernel_test",
     size = "small",
     srcs = [
+        "cpu_topology_test.go",
         "distributed_fork_test.go",
         "fd_table_test.go",
         "syslog_test.go",
@@ -473,6 +476,7 @@ go_test(
     deps = [
         "//pkg/abi",
         "//pkg/context",
+        "//pkg/cputopology",
         "//pkg/errors/linuxerr",
         "//pkg/hostarch",
         "//pkg/sentry/arch",

@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package sys
 
 import (
@@ -72,5 +75,25 @@ func TestOneCPUMask(t *testing.T) {
 		if got := oneCPUMask(test.i, test.cores); got != test.want {
 			t.Errorf("oneCPUMask(%d, %d): got %s, want %s", test.i, test.cores, got, test.want)
 		}
+	}
+}
+
+func TestCPUMaskString(t *testing.T) {
+	for _, cores := range []uint{1, 2, 4, 5, 32, 33, 36, 64, 65, 96, 256} {
+		all := make([]int, cores)
+		for i := range all {
+			all[i] = i
+		}
+		if got, want := cpuMaskString(all, cores), fullCPUMask(cores); got != want {
+			t.Errorf("cpuMaskString(all of %d): got %s, want %s", cores, got, want)
+		}
+		for _, i := range []uint{0, min(1, cores-1), cores / 2, cores - 1} {
+			if got, want := cpuMaskString([]int{int(i)}, cores), oneCPUMask(i, cores); got != want {
+				t.Errorf("cpuMaskString([%d], %d): got %s, want %s", i, cores, got, want)
+			}
+		}
+	}
+	if got, want := cpuMaskString([]int{0, 1, 2, 3, 48, 49, 95}, 96), "80000000,00030000,0000000f"; got != want {
+		t.Errorf("cpuMaskString(0-3,48-49,95 of 96): got %s, want %s", got, want)
 	}
 }

@@ -177,6 +177,16 @@ func sysmsgThreadRules(stubStart uintptr) []bpf.Instruction {
 					seccomp.AnyValue{},
 					seccomp.GreaterThan(stubStart), // rip
 				},
+				// For a context's placement; see sysmsg_lib.c:update_placement.
+				unix.SYS_SCHED_SETAFFINITY: seccomp.PerArg{
+					seccomp.EqualTo(0),
+					seccomp.AnyValue{},
+					seccomp.AnyValue{},
+					seccomp.AnyValue{},
+					seccomp.AnyValue{},
+					seccomp.AnyValue{},
+					seccomp.GreaterThan(stubStart), // rip
+				},
 			}),
 			Action: seccomp.Allow,
 		},

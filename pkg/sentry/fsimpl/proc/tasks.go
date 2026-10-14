@@ -25,6 +25,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
@@ -316,6 +317,19 @@ var _ dynamicInode = (*cpuInfoData)(nil)
 func (*cpuInfoData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	k := kernel.KernelFromContext(ctx)
 	features := k.FeatureSet()
+	if t := k.HostCPUTopology(); t != nil {
+		for i, cpu := range t.CPUs {
+			cpus, cores := t.PackageCounts(i)
+			features.WriteCPUInfoPlacedTo(uint(i), cpuid.CPUPlace{
+				Package:  uint32(cpu.Package),
+				Core:     uint32(cpu.Core),
+				Siblings: uint32(cpus),
+				Cores:    uint32(cores),
+				APICID:   cpu.APICID,
+			}, buf)
+		}
+		return nil
+	}
 	for i, max := uint(0), k.ApplicationCores(); i < max; i++ {
 		features.WriteCPUInfoTo(i, max, buf)
 	}

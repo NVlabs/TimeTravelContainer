@@ -134,6 +134,10 @@ const (
 	// AnnotationCPUFeatures is the annotation used to control cpu features
 	// that exposed to user apps.
 	AnnotationCPUFeatures = "dev.gvisor.internal.cpufeatures"
+
+	// AnnotationCPUTopology is the annotation that sets the CPU topology user
+	// apps see, as cputopology.Topology.Marshal formats it.
+	AnnotationCPUTopology = "dev.gvisor.internal.cputopology"
 )
 
 // LINT.ThenChange(:Features)
@@ -1219,6 +1223,7 @@ func Features() *features.Features {
 		annotations["dev.gvisor.internal.seccomp.cont"] = "RuntimeDefault"
 		annotations[AnnotationTPU] = ""
 		annotations[AnnotationCPUFeatures] = ""
+		annotations[AnnotationCPUTopology] = ""
 		// LINT.ThenChange(:features_annotations)
 		feat.Annotations = annotations
 
@@ -1236,6 +1241,7 @@ func Features() *features.Features {
 			"dev.gvisor.internal.seccomp.",
 			AnnotationTPU,
 			AnnotationCPUFeatures,
+			AnnotationCPUTopology,
 		)
 		// LINT.ThenChange(:features_annotations)
 

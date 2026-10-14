@@ -145,7 +145,7 @@ func (r daemonPortIngressRouter) Resolve(target selector) (selector, error) {
 }
 
 func (r daemonPortIngressRouter) serverStore() ttcbundle.Store {
-	return ttcbundle.Store{Root: r.server.dataRoot, ActiveRoot: r.server.localRoot, CPUFeatures: r.server.cpuFeatures}
+	return ttcbundle.Store{Root: r.server.dataRoot, ActiveRoot: r.server.localRoot, CPUFeatures: r.server.cpuFeatures, CPUTopology: r.server.cpuTopology}
 }
 
 func (r daemonPortIngressRouter) ResolveFamily(container string) (string, error) {

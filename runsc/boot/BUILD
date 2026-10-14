@@ -13,6 +13,7 @@ go_library(
     srcs = [
         "autosave.go",
         "compat.go",
+        "cpu_topology.go",
         "compat_amd64.go",
         "compat_arm64.go",
         "controller.go",
@@ -58,6 +59,7 @@ go_library(
         "//pkg/control/server",
         "//pkg/coverage",
         "//pkg/cpuid",
+        "//pkg/cputopology",
         "//pkg/devutil",
         "//pkg/errors/linuxerr",
         "//pkg/eventchannel",

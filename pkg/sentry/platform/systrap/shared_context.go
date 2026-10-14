@@ -66,6 +66,8 @@ type sharedContext struct {
 	kicked         bool
 	// The task associated with the context fell asleep.
 	sleeping bool
+	// placementID is the shared.PlacementID the Sentry last wrote.
+	placementID uint32
 }
 
 // String returns the ID of this shared context.

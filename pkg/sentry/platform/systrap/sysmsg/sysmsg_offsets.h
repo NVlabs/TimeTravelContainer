@@ -33,10 +33,13 @@
 
 // LINT.IfChange
 #define MAX_FPSTATE_LEN 3584
-// Note: To be explicit, 2^12 = 4096; if ALLOCATED_SIZEOF_THREAD_CONTEXT_STRUCT
+// Note: To be explicit, 2^13 = 8192; if ALLOCATED_SIZEOF_THREAD_CONTEXT_STRUCT
 //       is changed, make sure to change the code that relies on the bitshift.
-#define ALLOCATED_SIZEOF_THREAD_CONTEXT_STRUCT 4096
-#define THREAD_CONTEXT_STRUCT_BITSHIFT 12
+#define ALLOCATED_SIZEOF_THREAD_CONTEXT_STRUCT 8192
+#define THREAD_CONTEXT_STRUCT_BITSHIFT 13
+// PLACEMENT_CPU_MASK_WORDS is how many 64-bit words of host CPU mask a thread
+// context carries: enough for Linux's largest NR_CPUS, 8192.
+#define PLACEMENT_CPU_MASK_WORDS 128
 // LINT.ThenChange(sysmsg.go)
 
 // LINT.IfChange

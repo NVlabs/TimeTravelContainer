@@ -166,6 +166,9 @@ type Msg struct {
 	// sysmsg thread. It avoids a prctl syscall when the next guest context has
 	// the same name.
 	ThreadName [linux.TASK_COMM_LEN]byte
+	// PlacementID is the placement this sysmsg thread last confined itself
+	// to; see ThreadContext.PlacementID.
+	PlacementID uint32
 }
 
 // ContextState defines the reason the context has exited back to the sentry,
@@ -222,7 +225,15 @@ const (
 	// We over allocate the memory for it because:
 	//   - The next instances needs to align to 64 bytes for purposes of xsave.
 	//   - It's nice to align it to the page boundary.
-	AllocatedSizeofThreadContextStruct uintptr = 4096
+	AllocatedSizeofThreadContextStruct uintptr = 8192
+
+	// PlacementCPUMaskWords is how many 64-bit words of host CPU mask a
+	// ThreadContext carries: enough for Linux's largest NR_CPUS, 8192.
+	PlacementCPUMaskWords = 128
+
+	// HostCPUUnknown is ThreadContext.HostCPU before a stub thread records
+	// one.
+	HostCPUUnknown = ^uint32(0)
 )
 
 // ThreadContext contains the current context of the sysmsg thread. The struct
@@ -294,6 +305,17 @@ type ThreadContext struct {
 	// ThreadName is the guest thread name to expose through the host's
 	// /proc/[pid]/comm while this context is executing.
 	ThreadName [linux.TASK_COMM_LEN]byte
+	// HostCPU is, as Linux's getcpu vDSO reads it, (node << 12) | cpu of the
+	// host CPU that last ran the context, which a stub thread records as it
+	// gives a context with a placement back to the Sentry; or HostCPUUnknown.
+	HostCPU uint32
+	// PlacementID names CPUMask, the host CPUs the context may run on: a
+	// stub thread that takes the context confines itself to CPUMask first,
+	// unless the placement it confined itself to last has the same ID. Zero
+	// is no placement: the context runs wherever its stub thread does.
+	PlacementID uint32
+	// CPUMask is a Linux CPU mask of the host CPUs the context may run on.
+	CPUMask [PlacementCPUMaskWords]uint64
 }
 
 // StubError are values that represent known stub-thread failure modes.
@@ -331,6 +353,7 @@ func (m *Msg) Init(threadID uint32) {
 	m.ThreadID = threadID
 	m.Context = 0
 	m.ThreadName = [linux.TASK_COMM_LEN]byte{}
+	m.PlacementID = 0
 }
 
 // Init initializes the ThreadContext instance.
@@ -344,6 +367,8 @@ func (c *ThreadContext) Init(initialThreadID uint32) {
 	c.ThreadID = initialThreadID
 	c.LastThreadID = initialThreadID
 	c.ThreadName = [linux.TASK_COMM_LEN]byte{}
+	c.HostCPU = HostCPUUnknown
+	c.PlacementID = 0
 }
 
 // ConvertSysmsgErr converts m.Err to platform.ContextError.

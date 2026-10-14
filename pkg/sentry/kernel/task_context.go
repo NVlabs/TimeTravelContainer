@@ -125,6 +125,8 @@ func (t *Task) contextValue(key any, isTaskGoroutine bool) any {
 		return t.memCgID.Load()
 	case pgalloc.CtxMemoryFile:
 		return t.k.mf
+	case pgalloc.CtxMemoryPolicy:
+		return t.memoryPolicy()
 	case platform.CtxPlatform:
 		return t.k
 	case platform.CtxFileCoherence:
@@ -141,6 +143,8 @@ func (t *Task) contextValue(key any, isTaskGoroutine bool) any {
 		return t.k
 	case cpuid.CtxFeatureSet:
 		return t.k.featureSet
+	case cpuid.CtxCPUTopology:
+		return t.cpuTopologyView()
 	default:
 		return nil
 	}

@@ -29,7 +29,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/sched"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 var (
@@ -847,14 +846,15 @@ func Getcpu(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr,
 	node := args[1].Pointer()
 	// third argument to this system call is nowadays unused.
 
+	// Under the single CPU topology, every CPU is on node 0.
+	cpuNum, nodeNum := t.CPUNode()
 	if cpu != 0 {
-		if _, err := primitive.CopyInt32Out(t, cpu, t.CPU()); err != nil {
+		if _, err := primitive.CopyInt32Out(t, cpu, cpuNum); err != nil {
 			return 0, nil, err
 		}
 	}
-	// We always return node 0.
 	if node != 0 {
-		if _, err := t.MemoryManager().ZeroOut(t, node, 4, usermem.IOOpts{}); err != nil {
+		if _, err := primitive.CopyInt32Out(t, node, nodeNum); err != nil {
 			return 0, nil, err
 		}
 	}

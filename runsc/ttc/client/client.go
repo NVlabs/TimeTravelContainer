@@ -426,6 +426,13 @@ Options:
   --cpu-profile portable|host|explicit
                                   Guest CPU contract (default: portable)
   --cpu-features NAME,...         Required with explicit profile; no default
+  --cpu-topology single|host      CPUs and memory nodes guests see: single,
+                                  one socket and one node, their affinity
+                                  and memory policies ignored; or host, the
+                                  host's own, with affinity and memory
+                                  policies applied to the host's CPUs and
+                                  nodes (default: single; a cluster's node
+                                  takes its cluster's)
   --unsafe-access-host-group GROUP
                                   Share the daemon with the members of a Unix
                                   group, by name or ID: its root becomes

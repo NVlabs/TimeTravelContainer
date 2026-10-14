@@ -364,11 +364,12 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 						}
 					}
 					allocOpts := pgalloc.AllocOpts{
-						Kind:    usage.Anonymous,
-						MemCgID: memCgID,
-						Mode:    pgalloc.AllocateUncommitted,
-						Huge:    huge,
-						Dir:     allocDir,
+						Kind:      usage.Anonymous,
+						MemCgID:   memCgID,
+						Mode:      pgalloc.AllocateUncommitted,
+						Huge:      huge,
+						Dir:       allocDir,
+						Placement: placementOf(ctx, vma, allocAR.Start),
 					}
 					// If the allocation is hugepage-backed and
 					// callerIndirectCommit is true, the caller will commit every
@@ -534,6 +535,9 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 						Huge:       huge,
 						Dir:        allocDir,
 						ReaderFunc: reader.ReadToBlocks,
+						// A copy goes where the page that the faulting task
+						// writes would, not where the original is.
+						Placement: placementOf(ctx, vma, copyAR.Start),
 					})
 					if _, ok := err.(safecopy.BusError); ok {
 						// If we got SIGBUS during the copy, deliver SIGBUS to

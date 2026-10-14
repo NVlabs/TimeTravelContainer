@@ -102,6 +102,7 @@ go_library(
         "//pkg/abi/linux",
         "//pkg/atomicbitops",
         "//pkg/context",
+        "//pkg/cpuid",
         "//pkg/errors/linuxerr",
         "//pkg/fspath",
         "//pkg/hostarch",

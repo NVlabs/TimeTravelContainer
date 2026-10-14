@@ -1,0 +1,162 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+package pgalloc
+
+import (
+	"math/bits"
+
+	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
+)
+
+// NUMAPlacement asks for the pages of an allocation on one host memory node.
+//
+// A MemoryFile whose MemoryFileOpts.NUMANodes is not zero binds each chunk it
+// places on a node to that node (mbind(2) MPOL_PREFERRED on its mapping,
+// which for a shared memory file binds the file's pages, however they are
+// mapped), and serves an allocation that asks for a node from that node's
+// chunks only. The pages are then on the node whichever thread touches them
+// first, and stay there when the file is saved and loaded again, as a
+// checkpoint or a fork does, wherever the node exists.
+type NUMAPlacement struct {
+	// Valid is true if the allocation asks for Node.
+	Valid bool
+	// Node is the host memory node.
+	Node int
+}
+
+// MemoryPolicy is the memory policy of a task that allocates memory under a
+// host CPU topology, where it is on the host's memory nodes.
+type MemoryPolicy struct {
+	// Mode is the task's memory policy (set_mempolicy(2)), without mode
+	// flags, and Nodes the node mask of its nodes.
+	Mode  linux.NumaPolicy
+	Nodes uint64
+	// LocalNode is the memory node of the host CPU the task last ran on.
+	LocalNode int
+}
+
+// Placement returns where an allocation for the page at addr, as page index
+// idx, goes under the policy of mode and nodes, which a mapping's policy
+// (mbind(2)) gives or else p's: on the local node unless the policy says
+// otherwise, as Linux places a page on the node of the CPU that faults it.
+// Interleaving goes by huge page, the unit of allocation.
+func (p MemoryPolicy) Placement(mode linux.NumaPolicy, nodes uint64, idx uint64) NUMAPlacement {
+	mode &^= linux.MPOL_MODE_FLAGS
+	if mode == linux.MPOL_DEFAULT {
+		mode, nodes = p.Mode&^linux.MPOL_MODE_FLAGS, p.Nodes
+	}
+	local := NUMAPlacement{Valid: true, Node: p.LocalNode}
+	if nodes == 0 {
+		return local
+	}
+	switch mode {
+	case linux.MPOL_PREFERRED:
+		return NUMAPlacement{Valid: true, Node: bits.TrailingZeros64(nodes)}
+	case linux.MPOL_BIND:
+		if p.LocalNode < 64 && nodes&(1<<p.LocalNode) != 0 {
+			return local
+		}
+		return NUMAPlacement{Valid: true, Node: bits.TrailingZeros64(nodes)}
+	case linux.MPOL_INTERLEAVE:
+		n := idx % uint64(bits.OnesCount64(nodes))
+		for ; n > 0; n-- {
+			nodes &= nodes - 1
+		}
+		return NUMAPlacement{Valid: true, Node: bits.TrailingZeros64(nodes)}
+	}
+	return local
+}
+
+// placementNode returns the chunkInfo.node that opts asks for, or 0 if it asks
+// for none or f places no allocation.
+func (f *MemoryFile) placementNode(opts *AllocOpts) int32 {
+	p := opts.Placement
+	if !p.Valid || p.Node < 0 || p.Node >= f.opts.NUMANodes || f.backing != nil {
+		return 0
+	}
+	return int32(p.Node) + 1
+}
+
+// adviseChunk advises the host of the pages of the chunk mapped at addr: of
+// their size, and of the node they are bound to.
+func (f *MemoryFile) adviseChunk(addr uintptr, huge bool, node int32) {
+	f.madviseChunkMapping(addr, chunkSize, huge)
+	if node != 0 && int(node) <= f.opts.NUMANodes {
+		bindChunkMapping(addr, chunkSize, int(node-1))
+	}
+}
+
+// gapIterator is what the gap iterators of unfreeSet and unwasteSet have in
+// common.
+type gapIterator[G any] interface {
+	Ok() bool
+	Start() uint64
+	End() uint64
+	NextLargeEnoughGap(minSize uint64) G
+	PrevLargeEnoughGap(minSize uint64) G
+}
+
+// largeEnoughGapSet is what unfreeSet and unwasteSet have in common.
+type largeEnoughGapSet[G any] interface {
+	LowerBoundLargeEnoughGap(min, minSize uint64) G
+	UpperBoundLargeEnoughGap(max, minSize uint64) G
+}
+
+// findNodeGap returns length bytes of a gap of set that lie in a run of
+// consecutive chunks of chunks that are bound to node and of the given
+// hugeness, the first such in dir.
+func findNodeGap[G gapIterator[G], S largeEnoughGapSet[G]](set S, chunks []chunkInfo, node int32, huge bool, length uint64, dir Direction) (memmap.FileRange, bool) {
+	matches := func(i int) bool {
+		return i >= 0 && i < len(chunks) && chunks[i].node == node && chunks[i].huge == huge
+	}
+	if dir == BottomUp {
+		for i := 0; i < len(chunks); {
+			if !matches(i) {
+				i++
+				continue
+			}
+			j := i + 1
+			for matches(j) {
+				j++
+			}
+			lo, hi := uint64(i)*chunkSize, uint64(j)*chunkSize
+			gap := set.LowerBoundLargeEnoughGap(lo, length)
+			for ; gap.Ok() && gap.Start() < hi; gap = gap.NextLargeEnoughGap(length) {
+				if start, end := max(gap.Start(), lo), min(gap.End(), hi); end > start && end-start >= length {
+					return memmap.FileRange{Start: start, End: start + length}, true
+				}
+			}
+			if !gap.Ok() {
+				break
+			}
+			// No chunk before gap's has room.
+			i = max(j, int(gap.Start()/chunkSize))
+		}
+		return memmap.FileRange{}, false
+	}
+	for j := len(chunks); j > 0; {
+		if !matches(j - 1) {
+			j--
+			continue
+		}
+		i := j - 1
+		for matches(i - 1) {
+			i--
+		}
+		lo, hi := uint64(i)*chunkSize, uint64(j)*chunkSize
+		gap := set.UpperBoundLargeEnoughGap(hi-1, length)
+		for ; gap.Ok() && gap.End() > lo; gap = gap.PrevLargeEnoughGap(length) {
+			if start, end := max(gap.Start(), lo), min(gap.End(), hi); end > start && end-start >= length {
+				return memmap.FileRange{Start: end - length, End: end}, true
+			}
+		}
+		if !gap.Ok() {
+			break
+		}
+		// No chunk after gap's has room.
+		j = min(i, int((gap.End()+chunkSize-1)/chunkSize))
+	}
+	return memmap.FileRange{}, false
+}

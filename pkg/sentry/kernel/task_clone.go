@@ -320,6 +320,7 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 	}
 
 	schedPolicy, niceness := t.childSchedPolicy()
+	numaPolicy, numaNodeMask := t.NumaPolicy()
 	cfg := &TaskConfig{
 		Kernel:           t.k,
 		ThreadGroup:      tg,
@@ -333,6 +334,8 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 		SchedPolicy:      schedPolicy,
 		NetworkNamespace: netns,
 		AllowedCPUMask:   t.CPUMask(),
+		NumaPolicy:       numaPolicy,
+		NumaNodeMask:     numaNodeMask,
 		UTSNamespace:     utsns,
 		IPCNamespace:     ipcns,
 		CgroupNamespace:  cgroupns,

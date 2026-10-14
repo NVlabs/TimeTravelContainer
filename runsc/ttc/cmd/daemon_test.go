@@ -30,6 +30,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/cpuid"
+	"gvisor.dev/gvisor/pkg/cputopology"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
@@ -1009,6 +1010,21 @@ func TestReportDaemonStartupWarningsSurfacesHostGSOFallback(t *testing.T) {
 	var stderr bytes.Buffer
 	reportDaemonStartupWarnings(&stderr, logPath)
 	if diagnostic := stderr.String(); !strings.Contains(diagnostic, "disabling host GSO") || strings.Contains(diagnostic, "unrelated warning") {
+		t.Fatalf("surfaced startup warnings=%q", diagnostic)
+	}
+}
+
+func TestReportDaemonStartupWarningsSurfacesCPUTopologyWarning(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "ttcd.log")
+	log := "ttcd: warning: unrelated warning\n" +
+		"ttcd: warning: " + daemonCPUTopologyWarning + "\n" +
+		"ttcd listening\n"
+	if err := os.WriteFile(logPath, []byte(log), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	reportDaemonStartupWarnings(&stderr, logPath)
+	if diagnostic := stderr.String(); diagnostic != "ttcd: warning: "+daemonCPUTopologyWarning+"\n" {
 		t.Fatalf("surfaced startup warnings=%q", diagnostic)
 	}
 }
@@ -2898,6 +2914,110 @@ func TestNoCPUIDFaultingOption(t *testing.T) {
 	opts.ControlOnly = true
 	if err := validateNoCPUIDFaultingOption(opts); err == nil {
 		t.Fatal("control-only daemon accepted the option")
+	}
+}
+
+func TestCPUTopologyOption(t *testing.T) {
+	for _, test := range []struct {
+		args     []string
+		consumed int
+		want     string
+	}{
+		{args: []string{"--cpu-topology", "host", "--node", "n1"}, consumed: 2, want: "host"},
+		{args: []string{"--cpu-topology=Single"}, consumed: 1, want: "single"},
+	} {
+		opts := defaultDaemonClusterOptions()
+		if consumed, err := consumeDaemonCPUOption(test.args, &opts); consumed != test.consumed || err != nil || opts.CPUTopology != test.want || !opts.CPUTopologySet {
+			t.Errorf("%q: consumed=%d err=%v topology=%q set=%v", test.args, consumed, err, opts.CPUTopology, opts.CPUTopologySet)
+		}
+	}
+	for _, args := range [][]string{{"--cpu-topology", "numa"}, {"--cpu-topology"}, {"--cpu-topology="}} {
+		opts := defaultDaemonClusterOptions()
+		if _, err := consumeDaemonCPUOption(args, &opts); err == nil {
+			t.Errorf("%q accepted", args)
+		}
+	}
+	opts := defaultDaemonClusterOptions()
+	opts.CPUTopology, opts.CPUTopologySet = "host", true
+	if err := validateCPUTopologyOption(opts); err != nil {
+		t.Errorf("a daemon that runs containers: %v", err)
+	}
+	opts.ControlOnly = true
+	if err := validateCPUTopologyOption(opts); err == nil {
+		t.Error("a control-only daemon accepted --cpu-topology")
+	}
+}
+
+func TestResolveDaemonCPUTopology(t *testing.T) {
+	for _, mode := range []string{"", cputopology.Single} {
+		if got, err := resolveDaemonCPUTopology(mode, ""); err != nil || got.Mode != cputopology.Single || cpuTopologyAnnotation(got) != "" {
+			t.Errorf("resolveDaemonCPUTopology(%q) = (%+v, %v), want the single topology, which needs no annotation", mode, got, err)
+		}
+	}
+	if _, err := resolveDaemonCPUTopology("numa", ""); err == nil {
+		t.Error("an unknown topology was resolved")
+	}
+	host, err := resolveDaemonCPUTopology(cputopology.Host, "")
+	if err != nil {
+		t.Skipf("this host's CPU topology cannot be read: %v", err)
+	}
+	if parsed, err := cputopology.Parse(cpuTopologyAnnotation(host)); err != nil || parsed.Fingerprint() != host.Fingerprint() {
+		t.Errorf("the host topology's annotation parses as (%+v, %v)", parsed, err)
+	}
+	if _, err := resolveDaemonCPUTopology(cputopology.Host, host.Fingerprint()); err != nil {
+		t.Errorf("this host against its own fingerprint: %v", err)
+	}
+	if _, err := resolveDaemonCPUTopology(cputopology.Host, "host;0:another"); err == nil || !strings.Contains(err.Error(), "differs from the cluster's") {
+		t.Errorf("this host against another's fingerprint: %v", err)
+	}
+}
+
+func TestImmutableClusterConfigRecordsCPUTopology(t *testing.T) {
+	root := t.TempDir()
+	profile := daemonCPUProfile{Version: daemonCPUProfileVersion, Mode: "host", Features: []string{"sse", "sse2"}, Topology: cputopology.Host, TopologyFingerprint: "host;0:0.0.0.0.0/0/0"}
+	bootstrap := defaultDaemonClusterOptions()
+	bootstrap.CPUProfileSet, bootstrap.CPUTopology, bootstrap.CPUTopologySet, bootstrap.ResolvedCPU = true, cputopology.Host, true, profile
+	if _, err := applyImmutableClusterConfig(root, &bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(root, ".ttc-cluster-config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored daemonImmutableClusterConfig
+	if err := json.Unmarshal(data, &stored); err != nil {
+		t.Fatal(err)
+	}
+	// A build that predates the choice refuses it.
+	if stored.Version != daemonImmutableClusterConfigHostTopologyVersion || !reflect.DeepEqual(stored.CPUProfile, profile) {
+		t.Fatalf("stored configuration=%+v", stored)
+	}
+	// A node that does not choose adopts the cluster's topology.
+	join := defaultDaemonClusterOptions()
+	if _, err := applyImmutableClusterConfig(root, &join); err != nil {
+		t.Fatal(err)
+	}
+	if join.ResolvedCPU.cpuTopologyMode() != cputopology.Host || join.ResolvedCPU.TopologyFingerprint != profile.TopologyFingerprint {
+		t.Fatalf("joining node's profile=%+v", join.ResolvedCPU)
+	}
+	// One that chooses another is refused.
+	other := defaultDaemonClusterOptions()
+	other.CPUTopology, other.CPUTopologySet = cputopology.Single, true
+	if _, err := applyImmutableClusterConfig(root, &other); err == nil || !strings.Contains(err.Error(), "differs from this cluster's CPU topology") {
+		t.Fatalf("a node asking for the single topology: %v", err)
+	}
+	// A cluster recorded without a choice shows the single topology.
+	plain := t.TempDir()
+	first := defaultDaemonClusterOptions()
+	first.CPUProfileSet = true
+	first.ResolvedCPU = daemonCPUProfile{Version: daemonCPUProfileVersion, Mode: "host", Features: []string{"sse", "sse2"}}
+	if _, err := applyImmutableClusterConfig(plain, &first); err != nil {
+		t.Fatal(err)
+	}
+	host := defaultDaemonClusterOptions()
+	host.CPUTopology, host.CPUTopologySet = cputopology.Host, true
+	if _, err := applyImmutableClusterConfig(plain, &host); err == nil || !strings.Contains(err.Error(), "this cluster's CPU topology, single") {
+		t.Fatalf("a node asking for the host topology of a single-topology cluster: %v", err)
 	}
 }
 

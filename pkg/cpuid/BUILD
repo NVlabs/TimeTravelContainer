@@ -26,6 +26,7 @@ go_library(
         "native_amd64.s",
         "native_arm64.go",
         "static_amd64.go",
+        "topology_amd64.go",
     ],
     visibility = ["//:sandbox"],
     deps = [
@@ -42,6 +43,7 @@ go_test(
         "cpuid_test.go",
         "hwcap_host_darwin_arm64_test.go",
         "intersect_arm64_test.go",
+        "topology_amd64_test.go",
     ],
     library = ":cpuid",
     # NOTE: It seems that bazel code generation does not properly parse tags

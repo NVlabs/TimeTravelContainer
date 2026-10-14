@@ -153,6 +153,67 @@ slower. Such a cluster runs systrap nodes only. The option is chosen when the
 cluster is created: nodes that join may repeat it or leave it out, and TTC
 builds that predate it refuse such a cluster.
 
+## CPU topology and memory placement
+
+`ttc daemon start --cpu-topology single|host` chooses the CPU topology that
+containers see. It is independent of `--cpu-profile`, and fixed for the
+lifetime of the daemon, or of a cluster, whose first daemon records it.
+
+`single`, the default, shows one socket and one memory node, whose CPUs are
+those the daemon may run on, numbered from 0. TTC promises nothing about where
+a container's threads and memory are: it records their CPU affinities
+(`sched_setaffinity`) and memory policies (`set_mempolicy`, `mbind`) but does
+not apply them, and the host schedules the threads on any of the daemon's CPUs.
+On a host whose CPUs span more than one NUMA node, `ttc daemon start` without
+`--cpu-topology` warns:
+
+```text
+ttcd: warning: this daemon has access to multiple numa nodes, but --cpu-topology is not set explicitly. by default, numa and guest affinity are ignored. use --cpu-topology host or bind the daemon to a specific numa node with numactl or taskset.
+```
+
+To keep a `single` daemon's containers, and their memory, on one node, start
+it bound to that node; its sandboxes inherit the binding, and see only its
+CPUs:
+
+```shell
+numactl --cpunodebind=0 --membind=0 ttc daemon start
+```
+
+`host` shows the host's own CPUs, cores, packages and memory nodes, by their
+host numbers, in `/proc/cpuinfo`, `/sys/devices/system/cpu`,
+`/sys/devices/system/node` and, where the host has CPUID faulting, CPUID. A
+thread may run on the CPUs the daemon may run on, and an affinity confines it
+strictly to its CPUs: TTC never moves it elsewhere, even when they are busy and
+others idle. `getcpu` and `sched_getcpu` report the host CPU and node it runs
+on, and `/proc/stat` and `/proc/loadavg` report the host's CPU times and load,
+so that an application can choose where to run its threads by what other work
+leaves idle. Memory goes where Linux would put it: on the node of the CPU whose
+thread first touches it, unless `set_mempolicy` or `mbind` place it otherwise
+(`MPOL_PREFERRED`, `MPOL_BIND`, and `MPOL_INTERLEAVE` by huge page). A page
+copied on write after a fork goes to the node of the thread that writes it,
+while pages still shared stay where they are. Pages keep their nodes when a
+branch is checkpointed, dehydrated, rehydrated or forked. `get_mempolicy` with
+`MPOL_F_NODE|MPOL_F_ADDR` and `move_pages` report the node a page is on; TTC
+does not migrate pages, so `MPOL_MF_MOVE` and `move_pages` move none. The host
+topology needs the systrap platform.
+
+In a cluster, the first daemon's choice holds for every node, and a node that
+asks for the other is refused. Under `host`, every node must have the same
+CPUs, cores, packages and nodes, by the same numbers, which in practice means
+the same machine model, so that a branch forked or moved to another node finds
+its affinities and memory policies meaning what they meant; a node that differs
+is refused at startup. TTC builds that predate `--cpu-topology` refuse a
+cluster created with `host`. A branch keeps the topology it was created with:
+one saved under `single` and restored by a daemon showing `host` keeps
+`single`, and one saved under `host` and restored by a daemon showing `single`,
+or on a host numbered differently, keeps its CPU numbers, which then place
+nothing.
+
+Containers' memory is backed by huge pages where the host allows them: each
+sandbox keeps its memory in a file on a private tmpfs mounted with
+`huge=within_size`, so a host whose `shmem_enabled` is `never` still gives them
+2 MiB pages.
+
 ## Compile
 
 The repository's Docker-based build wrapper can copy both binaries in one

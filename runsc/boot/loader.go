@@ -791,6 +791,11 @@ func New(args Args) (*Loader, error) {
 		})
 	}
 
+	cpuTopology, err := sandboxCPUTopology(args.Spec, args.Conf)
+	if err != nil {
+		return nil, err
+	}
+
 	// Create kernel and platform.
 	p, err := createPlatform(args.Conf, args.NumCPU, args.Device, args.ID)
 	if err != nil {
@@ -941,6 +946,7 @@ func New(args Args) (*Loader, error) {
 		MaxFDLimit:           maxFDLimit,
 		MaxTasks:             maxTasks,
 		Cgroup2FSInit:        cgroup2fs.NewFilesystem,
+		CPUTopology:          cpuTopology,
 	}); err != nil {
 		return nil, fmt.Errorf("initializing kernel: %w", err)
 	}
@@ -1450,6 +1456,9 @@ func createMemoryFileFromFileWithOptions(appHugePages bool, hostTHP HostTHP, mem
 		DiskBackedFile:       diskBacked,
 		DisableIMAWorkAround: disableIMAWorkAround,
 		BackingProvider:      backingProvider,
+	}
+	if !diskBacked && backingProvider == nil {
+		mfopts.NUMANodes = applicationNUMANodes
 	}
 	if appHugePages {
 		switch hostTHP.ShmemEnabled {

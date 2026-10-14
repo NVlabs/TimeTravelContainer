@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"gvisor.dev/gvisor/pkg/cpuid"
+	"gvisor.dev/gvisor/pkg/cputopology"
 )
 
 const daemonCPUProfileVersion = 3
@@ -48,6 +49,49 @@ type daemonCPUProfile struct {
 	// systrap without syscall patching, whose fast path owns GS.
 	NoCPUIDFaulting bool   `json:"experimental_no_cpuid_faulting,omitempty"`
 	CPUID           string `json:"cpuid,omitempty"`
+	// Topology is the CPU topology a cluster's guests see,
+	// cputopology.Single or cputopology.Host, which the cluster's first
+	// daemon records with its CPU profile and which is chosen independently
+	// of it. A cluster recorded without one shows the single topology.
+	Topology string `json:"cpu_topology,omitempty"`
+	// TopologyFingerprint is, under the host topology, the fingerprint of the
+	// layout every node of the cluster must have (see
+	// cputopology.Topology.Fingerprint), so that a guest moved between nodes
+	// finds its CPU and node numbers meaning what they meant.
+	TopologyFingerprint string `json:"cpu_topology_fingerprint,omitempty"`
+}
+
+// cpuTopologyMode returns the CPU topology profile records.
+func (p daemonCPUProfile) cpuTopologyMode() string {
+	if p.Topology == "" {
+		return cputopology.Single
+	}
+	return p.Topology
+}
+
+// daemonCPUTopologyWarning is what a daemon says at start when its CPUs span
+// more than one memory node and --cpu-topology did not choose a topology.
+const daemonCPUTopologyWarning = "this daemon has access to multiple numa nodes, but --cpu-topology is not set explicitly. by default, numa and guest affinity are ignored. use --cpu-topology host or bind the daemon to a specific numa node with numactl or taskset."
+
+// resolveDaemonCPUTopology returns the topology a daemon's guests see under
+// mode. Under the host topology, it is the host's, which must have
+// fingerprint want, if want is not empty: a cluster's nodes all have one.
+func resolveDaemonCPUTopology(mode, want string) (cputopology.Topology, error) {
+	switch mode {
+	case "", cputopology.Single:
+		return cputopology.Topology{Mode: cputopology.Single}, nil
+	case cputopology.Host:
+	default:
+		return cputopology.Topology{}, fmt.Errorf("unknown CPU topology %q; it is single or host", mode)
+	}
+	host, err := cputopology.HostTopology()
+	if err != nil {
+		return cputopology.Topology{}, fmt.Errorf("reading the host CPU topology: %w", err)
+	}
+	if want != "" && host.Fingerprint() != want {
+		return cputopology.Topology{}, errors.New("this host's CPU topology differs from the cluster's: under the host topology every node has the same CPUs, cores, packages and memory nodes, by the same numbers")
+	}
+	return host, nil
 }
 
 func hostCPUFeatureNames(runtimePlatform string) []string {
@@ -274,6 +318,15 @@ func validateNoCPUIDFaultingOption(opts daemonClusterOptions) error {
 	return nil
 }
 
+// validateCPUTopologyOption refuses --cpu-topology for a daemon that runs no
+// guest: a cluster's control-only daemon.
+func validateCPUTopologyOption(opts daemonClusterOptions) error {
+	if opts.CPUTopologySet && (opts.ControlOnly || opts.ControlHolder) {
+		return errors.New("--cpu-topology applies to daemons that run containers, not to a cluster's control-only daemon")
+	}
+	return nil
+}
+
 // validateClusterCPUEnforcement refuses a systrap node whose host lacks CPUID
 // faulting, unless its cluster waives it.
 func validateClusterCPUEnforcement(runtimePlatform string, cpuidFaulting, waived bool) error {
@@ -316,6 +369,15 @@ func (p daemonCPUProfile) annotation() string {
 	return strings.Join(p.Features, ",")
 }
 
+// cpuTopologyAnnotation returns the annotation that shows guests t: none for
+// the single topology, which is a sandbox's own.
+func cpuTopologyAnnotation(t cputopology.Topology) string {
+	if t.Mode != cputopology.Host {
+		return ""
+	}
+	return t.Marshal()
+}
+
 func consumeDaemonCPUOption(args []string, opts *daemonClusterOptions) (int, error) {
 	if len(args) == 0 {
 		return 0, nil
@@ -348,6 +410,17 @@ func consumeDaemonCPUOption(args []string, opts *daemonClusterOptions) (int, err
 	if consumed, err := set("--cpu-features", &opts.CPUFeatures); consumed != 0 || err != nil {
 		opts.CPUProfileSet = consumed != 0
 		return consumed, err
+	}
+	if consumed, err := set("--cpu-topology", &opts.CPUTopology); consumed != 0 || err != nil {
+		if err != nil {
+			return consumed, err
+		}
+		opts.CPUTopology = strings.ToLower(strings.TrimSpace(opts.CPUTopology))
+		if opts.CPUTopology != cputopology.Single && opts.CPUTopology != cputopology.Host {
+			return 0, fmt.Errorf("unknown CPU topology %q; --cpu-topology is single or host", opts.CPUTopology)
+		}
+		opts.CPUTopologySet = true
+		return consumed, nil
 	}
 	return 0, nil
 }

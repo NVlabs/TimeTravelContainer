@@ -92,6 +92,15 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 		seccomp.EqualTo(0),
 		seccomp.EqualTo(0),
 	},
+	// mm reads the host memory node of an application page, under a host
+	// CPU topology, for get_mempolicy(2) and move_pages(2).
+	unix.SYS_GET_MEMPOLICY: seccomp.PerArg{
+		seccomp.AnyValue{},
+		seccomp.EqualTo(0),
+		seccomp.EqualTo(0),
+		seccomp.AnyValue{},
+		seccomp.EqualTo(linux.MPOL_F_NODE | linux.MPOL_F_ADDR),
+	},
 	unix.SYS_GETPID:    seccomp.MatchAll{},
 	unix.SYS_GETRANDOM: seccomp.MatchAll{},
 	unix.SYS_GETSOCKOPT: seccomp.Or{
@@ -194,6 +203,16 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 	unix.SYS_IO_SUBMIT:    seccomp.MatchAll{},
 	unix.SYS_LSEEK:        seccomp.MatchAll{},
 	unix.SYS_MADVISE:      seccomp.MatchAll{},
+	// pgalloc binds the chunks of a memory file to the host memory nodes
+	// that a host CPU topology places them on.
+	unix.SYS_MBIND: seccomp.PerArg{
+		seccomp.AnyValue{},
+		seccomp.AnyValue{},
+		seccomp.EqualTo(linux.MPOL_PREFERRED),
+		seccomp.AnyValue{},
+		seccomp.AnyValue{},
+		seccomp.EqualTo(0),
+	},
 	unix.SYS_MEMBARRIER: seccomp.PerArg{
 		seccomp.EqualTo(linux.MEMBARRIER_CMD_GLOBAL),
 		seccomp.EqualTo(0),

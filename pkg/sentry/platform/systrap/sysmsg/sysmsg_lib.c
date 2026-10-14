@@ -140,6 +140,36 @@ static void update_thread_name(struct sysmsg *sysmsg,
          sizeof(ctx->thread_name));
 }
 
+#if defined(__x86_64__)
+// read_host_cpu returns (node << 12) | cpu of the host CPU this thread runs
+// on, from the segment limit of the per-CPU GDT entry that Linux's getcpu
+// vDSO reads (__CPUNODE_SEG).
+static __inline__ uint32_t read_host_cpu(void) {
+  uint32_t p;
+  __asm__ __volatile__("lsl %1, %0" : "=r"(p) : "r"(0x7b));
+  return p;
+}
+#else
+static __inline__ uint32_t read_host_cpu(void) { return 0; }
+#endif
+
+// update_placement confines this stub thread to the host CPUs the context may
+// run on, unless the placement it confined itself to last was the context's.
+// The mask is in memory the application can write, so it can move only
+// itself, and only among the CPUs the sandbox may use.
+static void update_placement(struct sysmsg *sysmsg,
+                             struct thread_context *ctx) {
+  uint32_t id = atomic_load(&ctx->placement_id);
+  if (id == 0 || id == sysmsg->placement_id) {
+    return;
+  }
+  // A mask of no CPU the thread may use fails, and the context runs where the
+  // thread is; the Sentry never asks for one.
+  __syscall(__NR_sched_setaffinity, 0, sizeof(ctx->cpu_mask),
+            (long)ctx->cpu_mask, 0, 0, 0);
+  sysmsg->placement_id = id;
+}
+
 // The spinning queue is a queue of spinning threads. It solves the
 // fragmentation problem. The idea is to minimize the number of threads
 // processing requests. We can't control how system threads are scheduled, so
@@ -241,7 +271,15 @@ static bool spinning_queue_remove_first(uint64_t timeout) {
   return !spinning_queue_push(re_enqueue + 1);
 }
 
-struct thread_context *queue_get_context(struct sysmsg *sysmsg) {
+// PICKY_TICKS is how long, in rdtsc ticks, a spinning stub thread leaves a
+// context with another placement than its own for a thread that has it: one
+// that takes it must move to the context's CPUs first, which costs more than
+// the wait (a few microseconds at a few GHz).
+#define PICKY_TICKS 10000
+
+// queue_get_context takes the next context from the queue. If picky is true,
+// it leaves one with a placement other than the thread's.
+struct thread_context *queue_get_context(struct sysmsg *sysmsg, bool picky) {
   struct context_queue *queue = __export_context_queue_addr;
 
   // Indexes should not jump when start or end are overflowed.
@@ -256,6 +294,13 @@ struct thread_context *queue_get_context(struct sysmsg *sysmsg) {
     // We need to check the index to be sure that a ring buffer hasn't been
     // recycled.
     if ((v >> CQ_INDEX_SHIFT) != idx) continue;
+    if (picky && (v & CQ_CONTEXT_MASK) <= MAX_GUEST_CONTEXTS) {
+      uint32_t placement_id =
+          atomic_load(&thread_context_addr(v & CQ_CONTEXT_MASK)->placement_id);
+      if (placement_id != 0 && placement_id != sysmsg->placement_id) {
+        return NULL;
+      }
+    }
     if (!atomic_compare_exchange(&queue->ringbuffer[next], &v,
                                  INVALID_CONTEXT_ID)) {
       continue;
@@ -286,10 +331,11 @@ static struct thread_context *get_context_fast(struct sysmsg *sysmsg,
   if (!spinning_queue_push(0)) return NULL;
   atomic_store(&queue->used_fast_path, 1);
 
+  uint64_t spin_start = rdtsc();
   while (1) {
     struct thread_context *ctx;
 
-    ctx = queue_get_context(sysmsg);
+    ctx = queue_get_context(sysmsg, rdtsc() - spin_start < PICKY_TICKS);
     if (ctx) {
       spinning_queue_pop();
       return ctx;
@@ -325,6 +371,12 @@ static struct thread_context *get_context_fast(struct sysmsg *sysmsg,
 
 #define NR_IF_THREAD_IS_ACTIVE (~0)
 
+// fast_path_enabled_hint returns whether a thread that finds no context it
+// wants will spin for one, and so may leave one for a thread that wants it.
+static bool fast_path_enabled_hint(struct context_queue *queue) {
+  return atomic_load(&queue->fast_path_disabled) == 0;
+}
+
 static bool try_to_dec_threads_to_wakeup(struct context_queue *queue) {
   while (1) {
     uint32_t nr = atomic_load(&queue->num_threads_to_wakeup);
@@ -356,7 +408,7 @@ struct thread_context *get_context(struct sysmsg *sysmsg) {
 
     // Change sysmsg thread state just to indicate thread is not asleep.
     atomic_store(&sysmsg->state, THREAD_STATE_PREP);
-    ctx = queue_get_context(sysmsg);
+    ctx = queue_get_context(sysmsg, fast_path_enabled_hint(queue));
     if (ctx) {
       goto exit;
     }
@@ -381,7 +433,7 @@ struct thread_context *get_context(struct sysmsg *sysmsg) {
     // * A new thread isn't kicked, if the number of active threads are not less
     //   than a number of active contexts.
     if (nr_active_threads < nr_active_contexts) {
-      ctx = queue_get_context(sysmsg);
+      ctx = queue_get_context(sysmsg, false);
       if (ctx) {
         atomic_store(&sysmsg->state, THREAD_STATE_PREP);
         atomic_add(&queue->num_active_threads, 1);
@@ -395,7 +447,7 @@ struct thread_context *get_context(struct sysmsg *sysmsg) {
         continue;
       }
       // Mark this thread as being active only if it can get a context.
-      ctx = queue_get_context(sysmsg);
+      ctx = queue_get_context(sysmsg, false);
       if (ctx) {
         atomic_store(&sysmsg->state, THREAD_STATE_PREP);
         atomic_add(&queue->num_active_threads, 1);
@@ -416,6 +468,9 @@ struct thread_context *switch_context(struct sysmsg *sysmsg,
   struct context_queue *queue = __export_context_queue_addr;
 
   if (ctx) {
+    if (atomic_load(&ctx->placement_id) != 0) {
+      atomic_store(&ctx->host_cpu, read_host_cpu());
+    }
     atomic_sub(&queue->num_active_contexts, 1);
     atomic_store(&ctx->thread_id, INVALID_THREAD_ID);
     atomic_store(&ctx->last_thread_id, sysmsg->thread_id);
@@ -432,6 +487,7 @@ struct thread_context *switch_context(struct sysmsg *sysmsg,
   struct thread_context *next = get_context(sysmsg);
   if (next) {
     update_thread_name(sysmsg, next);
+    update_placement(sysmsg, next);
   }
   return next;
 }

@@ -405,7 +405,7 @@ func (t *Task) StateStatus() string {
 func (t *Task) CPUMask() sched.CPUSet {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.allowedCPUMask.Copy()
+	return t.cpuMaskLocked()
 }
 
 // SetCPUMask sets t's allowed CPU mask based on mask. It takes ownership of
@@ -420,6 +420,12 @@ func (t *Task) SetCPUMask(mask sched.CPUSet) error {
 
 	// Remove CPUs in mask above Kernel.applicationCores.
 	mask.ClearAbove(t.k.applicationCores)
+
+	// Under the host CPU topology, remove CPUs the sandbox may not use.
+	ht := t.k.hostTopology
+	if ht != nil {
+		mask = ht.confine(mask)
+	}
 
 	// Ensure that at least 1 CPU is still allowed.
 	if mask.NumCPUs() == 0 {
@@ -436,9 +442,15 @@ func (t *Task) SetCPUMask(mask sched.CPUSet) error {
 	t.tg.pidns.owner.mu.RUnlock()
 
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	t.allowedCPUMask = mask
+	t.placement = nil
 	t.cpu.Store(assignCPU(mask, rootTID))
+	t.mu.Unlock()
+	if ht != nil {
+		// Move the application thread now if it runs, as Linux does, rather
+		// than when it next enters the Sentry.
+		t.p.Interrupt()
+	}
 	return nil
 }
 
@@ -450,6 +462,10 @@ func (t *Task) CPU() int32 {
 
 	if t.k.useHostCores {
 		return int32(hostcpu.GetCPU())
+	}
+
+	if cpu, _, ok := t.hostCPU(); ok {
+		return cpu
 	}
 
 	return t.cpu.Load()
@@ -585,4 +601,6 @@ func (t *Task) SetNumaPolicy(policy linux.NumaPolicy, nodeMask uint64) {
 	defer t.mu.Unlock()
 	t.numaPolicy = policy
 	t.numaNodeMask = nodeMask
+	t.numaPolicyNow.Store(int32(policy))
+	t.numaNodeMaskNow.Store(nodeMask)
 }

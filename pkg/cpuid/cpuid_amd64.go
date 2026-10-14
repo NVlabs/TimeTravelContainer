@@ -373,6 +373,13 @@ func (fs FeatureSet) HasFeature(feature Feature) bool {
 // a minimal /proc/cpuinfo, it is missing some fields like "microcode" that are
 // not always printed in Linux. Several fields are simply made up.
 func (fs FeatureSet) WriteCPUInfoTo(cpu, numCPU uint, w io.Writer) {
+	// Pretend all CPUs are in the same socket, and each CPU is a distinct
+	// core (rather than a hyperthread).
+	fs.WriteCPUInfoPlacedTo(cpu, CPUPlace{Core: uint32(cpu), Siblings: uint32(numCPU), Cores: uint32(numCPU), APICID: uint32(cpu)}, w)
+}
+
+// WriteCPUInfoPlacedTo is WriteCPUInfoTo for a CPU at place.
+func (fs FeatureSet) WriteCPUInfoPlacedTo(cpu uint, place CPUPlace, w io.Writer) {
 	// Avoid many redundant calls here, since this can occasionally appear
 	// in the hot path. Read all basic information up front, see above.
 	ax, _, _, _ := fs.query(featureInfo)
@@ -397,12 +404,12 @@ func (fs FeatureSet) WriteCPUInfoTo(cpu, numCPU uint, w io.Writer) {
 	// 8192 KB is selected because it is a reasonable size that will be effectively usable on
 	// lightly loaded machines - most machines have 1-4MB of L3 cache per core.
 	fmt.Fprintf(w, "cache size\t: 8192 KB\n")
-	fmt.Fprintf(w, "physical id\t: 0\n") // Pretend all CPUs are in the same socket.
-	fmt.Fprintf(w, "siblings\t: %d\n", numCPU)
-	fmt.Fprintf(w, "core id\t\t: %d\n", cpu)
-	fmt.Fprintf(w, "cpu cores\t: %d\n", numCPU) // Pretend each CPU is a distinct core (rather than a hyperthread).
-	fmt.Fprintf(w, "apicid\t\t: %d\n", cpu)
-	fmt.Fprintf(w, "initial apicid\t: %d\n", cpu)
+	fmt.Fprintf(w, "physical id\t: %d\n", place.Package)
+	fmt.Fprintf(w, "siblings\t: %d\n", place.Siblings)
+	fmt.Fprintf(w, "core id\t\t: %d\n", place.Core)
+	fmt.Fprintf(w, "cpu cores\t: %d\n", place.Cores)
+	fmt.Fprintf(w, "apicid\t\t: %d\n", place.APICID)
+	fmt.Fprintf(w, "initial apicid\t: %d\n", place.APICID)
 	fmt.Fprintf(w, "fpu\t\t: yes\n")
 	fmt.Fprintf(w, "fpu_exception\t: yes\n")
 	fmt.Fprintf(w, "cpuid level\t: %d\n", uint32(xSaveInfo)) // Same as ax in vendorID.

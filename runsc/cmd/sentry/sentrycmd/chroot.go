@@ -125,8 +125,12 @@ func setupMinimalProcfs(chroot string) error {
 	if err := os.Symlink(procSubmountDir+"/self", filepath.Join(procRoot, "self")); err != nil {
 		return fmt.Errorf("error creating symlink %q -> %q: %w", filepath.Join(procRoot, "self"), procSubmountDir+"/self", err)
 	}
-	if err := os.Symlink(procSubmountDir+"/cpuinfo", filepath.Join(procRoot, "cpuinfo")); err != nil {
-		return fmt.Errorf("error creating symlink %q -> %q: %w", filepath.Join(procRoot, "cpuinfo"), procSubmountDir+"/cpuinfo", err)
+	// The host's CPU load, for a sandbox that shows the host's CPU topology
+	// (kernel.HostStatFiles), too.
+	for _, name := range []string{"cpuinfo", "stat", "loadavg"} {
+		if err := os.Symlink(procSubmountDir+"/"+name, filepath.Join(procRoot, name)); err != nil {
+			return fmt.Errorf("error creating symlink %q -> %q: %w", filepath.Join(procRoot, name), procSubmountDir+"/"+name, err)
+		}
 	}
 	if err := os.Chmod(procRoot, 0o111); err != nil {
 		return fmt.Errorf("error chmodding %q: %v", procRoot, err)

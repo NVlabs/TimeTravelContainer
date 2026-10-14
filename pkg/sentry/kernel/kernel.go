@@ -52,6 +52,7 @@ import (
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/cpuid"
+	"gvisor.dev/gvisor/pkg/cputopology"
 	"gvisor.dev/gvisor/pkg/devutil"
 	"gvisor.dev/gvisor/pkg/ebpf"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
@@ -74,7 +75,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/futex"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/ipc"
-	"gvisor.dev/gvisor/pkg/sentry/kernel/sched"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/loader"
@@ -219,6 +219,16 @@ type Kernel struct {
 	rootUTSNamespace     *UTSNamespace
 	rootIPCNamespace     *IPCNamespace
 	rootCgroupNamespace  *CgroupNamespace
+
+	// cpuTopology is the CPU topology k shows its tasks, cputopology.Single
+	// or cputopology.Host, and cpuTopologyFingerprint that of a host
+	// topology; "" in a kernel saved before there was a choice, which showed
+	// the single one.
+	cpuTopology            string
+	cpuTopologyFingerprint string
+
+	// hostTopology is the host topology k shows its tasks, or nil.
+	hostTopology *hostCPUTopology `state:"nosave"`
 
 	// futexes is the "root" futex.Manager, from which all others are forked.
 	// This is necessary to ensure that shared futexes are coherent across all
@@ -537,6 +547,7 @@ type Kernel struct {
 // older runtime that advertised a feature the current platform must hide.
 func (k *Kernel) afterLoad(gocontext.Context) {
 	k.featureSet = platform.SanitizeFeatureSet(k.Platform, k.featureSet)
+	k.restoreCPUTopology()
 }
 
 // InitKernelArgs holds arguments to Init.
@@ -565,6 +576,12 @@ type InitKernelArgs struct {
 	// no-op. If ApplicationCores is less than hostcpu.MaxPossibleCPU(), it
 	// will be overridden.
 	UseHostCores bool
+
+	// CPUTopology, if it is the host's (cputopology.Host), is shown to
+	// tasks: their CPU numbers are the host's, of which there are then
+	// ApplicationCores, and they are placed by their affinities and memory
+	// policies. Otherwise tasks see the single topology.
+	CPUTopology *cputopology.Topology
 
 	// ExtraAuxv contains additional auxiliary vector entries that are added to
 	// each process by the ELF loader.
@@ -664,6 +681,17 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 			log.Infof("Setting applicationCores to NumCPUs: %d", numCPUs)
 			k.applicationCores = numCPUs
 		}
+	}
+
+	k.cpuTopology = cputopology.Single
+	if t := args.CPUTopology; t != nil && t.Mode == cputopology.Host {
+		if k.useHostCores || k.HasCPUNumbers() {
+			return fmt.Errorf("the host CPU topology needs a platform whose application threads are host threads")
+		}
+		if err := k.setHostCPUTopology(*t); err != nil {
+			return fmt.Errorf("showing the host CPU topology: %w", err)
+		}
+		k.applicationCores = uint(len(t.CPUs))
 	}
 
 	k.extraAuxv = args.ExtraAuxv
@@ -1566,7 +1594,7 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 		Credentials:      newCreds,
 		NoNewPrivs:       args.NoNewPrivs,
 		NetworkNamespace: k.RootNetworkNamespace(),
-		AllowedCPUMask:   sched.NewFullCPUSet(k.applicationCores),
+		AllowedCPUMask:   k.defaultCPUMask(),
 		UTSNamespace:     args.UTSNamespace,
 		IPCNamespace:     args.IPCNamespace,
 		CgroupNamespace:  cgroupns,

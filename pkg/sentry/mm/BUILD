@@ -139,6 +139,7 @@ go_library(
         "metadata.go",
         "metadata_mutex.go",
         "mm.go",
+        "numa.go",
         "pma.go",
         "pma_set.go",
         "procfs.go",

@@ -522,13 +522,20 @@ type Task struct {
 	cleartid hostarch.Addr
 
 	// This is mostly a fake cpumask just for sched_set/getaffinity as we
-	// don't really control the affinity.
+	// don't really control the affinity. Under the host CPU topology, it is
+	// a mask of host CPUs, which confine the task's application thread.
 	//
 	// Invariant: allowedCPUMask.Size() ==
 	// sched.CPUMaskSize(Kernel.applicationCores).
 	//
 	// allowedCPUMask is protected by mu.
 	allowedCPUMask sched.CPUSet
+
+	// placement is allowedCPUMask as a platform.HostCPUPlacer placement, or
+	// nil if it has not been made since allowedCPUMask last changed.
+	//
+	// placement is protected by mu.
+	placement *taskPlacement `state:"nosave"`
 
 	// cpu is the fake cpu number returned by getcpu(2). cpu is ignored
 	// entirely if Kernel.useHostCores is true.
@@ -569,6 +576,11 @@ type Task struct {
 	// numaPolicy and numaNodeMask are protected by mu.
 	numaPolicy   linux.NumaPolicy
 	numaNodeMask uint64
+
+	// numaPolicyNow and numaNodeMaskNow are numaPolicy and numaNodeMask, for
+	// the memory manager to read as it allocates, with its locks held.
+	numaPolicyNow   atomicbitops.Int32  `state:"nosave"`
+	numaNodeMaskNow atomicbitops.Uint64 `state:"nosave"`
 
 	// netns is the task's network namespace. It has to be changed under mu
 	// so that GetNetworkNamespace can take a reference before it is
@@ -739,6 +751,8 @@ func (t *Task) afterLoad(gocontext.Context) {
 	t.rseqPreempted = true
 	t.futexWaiter = futex.NewWaiter()
 	t.p = t.k.Platform.NewContext(t.AsyncContext())
+	t.numaPolicyNow.Store(int32(t.numaPolicy))
+	t.numaNodeMaskNow.Store(t.numaNodeMask)
 }
 
 // copyScratchBufferLen is the length of Task.copyScratchBuffer.

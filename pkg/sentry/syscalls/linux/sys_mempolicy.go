@@ -12,10 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package linux
 
 import (
 	"fmt"
+	"math/bits"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
@@ -25,14 +29,19 @@ import (
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
-// We unconditionally report a single NUMA node. This also means that our
-// "nodemask_t" is a single unsigned long (uint64).
-const (
-	maxNodes        = 1
-	allowedNodemask = (1 << maxNodes) - 1
-)
+// nodesOf returns a node mask of the memory nodes that t's kernel shows, and
+// how many there are: under the single CPU topology, one; under the host's,
+// the host's, of which there are at most 64, so that our "nodemask_t" is a
+// single unsigned long (uint64) either way.
+func nodesOf(t *kernel.Task) (allowedNodemask uint64, maxNodes uint32) {
+	if all, _ := t.Kernel().HostNodes(); all != 0 {
+		return all, uint32(bits.Len64(all))
+	}
+	return 1, 1
+}
 
 func copyInNodemask(t *kernel.Task, addr hostarch.Addr, maxnode uint32) (uint64, error) {
+	allowedNodemask, _ := nodesOf(t)
 	// "nodemask points to a bit mask of node IDs that contains up to maxnode
 	// bits. The bit mask size is rounded to the next multiple of
 	// sizeof(unsigned long), but the kernel will use bits only up to maxnode.
@@ -114,6 +123,7 @@ func GetMempolicy(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (ui
 	nodeFlag := flags&linux.MPOL_F_NODE != 0
 	addrFlag := flags&linux.MPOL_F_ADDR != 0
 	memsAllowed := flags&linux.MPOL_F_MEMS_ALLOWED != 0
+	allowedNodemask, maxNodes := nodesOf(t)
 
 	// "EINVAL: The value specified by maxnode is less than the number of node
 	// IDs supported by the system." - get_mempolicy(2)
@@ -157,12 +167,20 @@ func GetMempolicy(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (ui
 			// get_mempolicy() will allocate a page as if the thread had
 			// performed a read (load) access to that address, and return the
 			// ID of the node where that page was allocated."
-			buf := t.CopyScratchBuffer(1)
-			_, err := t.CopyInBytes(addr, buf)
-			if err != nil {
-				return 0, nil, err
+			if t.Kernel().HostCPUTopology() != nil {
+				node, err := t.MemoryManager().PageNode(t, addr, true /* allocate */)
+				if err != nil {
+					return 0, nil, err
+				}
+				policy = linux.NumaPolicy(node)
+			} else {
+				buf := t.CopyScratchBuffer(1)
+				_, err := t.CopyInBytes(addr, buf)
+				if err != nil {
+					return 0, nil, err
+				}
+				policy = linux.MPOL_DEFAULT // maxNodes == 1
 			}
-			policy = linux.MPOL_DEFAULT // maxNodes == 1
 		}
 		if mode != 0 {
 			if _, err := policy.CopyOut(t, mode); err != nil {
@@ -199,7 +217,8 @@ func GetMempolicy(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (ui
 		if policy&^linux.MPOL_MODE_FLAGS != linux.MPOL_INTERLEAVE {
 			return 0, nil, linuxerr.EINVAL
 		}
-		policy = linux.MPOL_DEFAULT // maxNodes == 1
+		// The first node of the interleaving: 0 if maxNodes == 1.
+		policy = linux.NumaPolicy(bits.TrailingZeros64(nodemaskVal))
 	}
 	if mode != 0 {
 		if _, err := policy.CopyOut(t, mode); err != nil {
@@ -252,10 +271,77 @@ func Mbind(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 		return 0, nil, err
 	}
 
-	// Since we claim to have only a single node, all flags can be ignored
-	// (since all pages must already be on that single node).
+	// Under the single CPU topology, all flags can be ignored, since all
+	// pages must already be on its single node. Under the host topology, the
+	// policy places the pages allocated from now on; pages already allocated
+	// stay where they are, as if MPOL_MF_MOVE could move none.
 	err = t.MemoryManager().SetNumaPolicy(addr, length, mode, nodemaskVal)
 	return 0, nil, err
+}
+
+// MovePages implements the syscall move_pages(2), of the calling process
+// only, which moves no page: it reports where they are, on node 0 under the
+// single CPU topology.
+func MovePages(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	pid := args[0].Int()
+	count := args[1].Uint64()
+	pages := args[2].Pointer()
+	nodes := args[3].Pointer()
+	status := args[4].Pointer()
+	flags := args[5].Int()
+
+	if flags&^(linux.MPOL_MF_MOVE|linux.MPOL_MF_MOVE_ALL) != 0 {
+		return 0, nil, linuxerr.EINVAL
+	}
+	if flags&linux.MPOL_MF_MOVE_ALL != 0 && !t.HasRootCapability(linux.CAP_SYS_NICE) {
+		return 0, nil, linuxerr.EPERM
+	}
+	if pid != 0 && kernel.ThreadID(pid) != t.ThreadGroup().ID() {
+		// Moving another process's pages needs CAP_SYS_NICE, which nothing
+		// in a sandbox has over the host's memory.
+		return 0, nil, linuxerr.EPERM
+	}
+	host := t.Kernel().HostCPUTopology() != nil
+	const chunk = 512
+	var notMoved uintptr
+	for done := uint64(0); done < count; {
+		n := min(count-done, chunk)
+		addrs := make([]byte, 8*n)
+		if _, err := t.CopyInBytes(pages+hostarch.Addr(8*done), addrs); err != nil {
+			return 0, nil, err
+		}
+		want := make([]byte, 4*n)
+		if nodes != 0 {
+			if _, err := t.CopyInBytes(nodes+hostarch.Addr(4*done), want); err != nil {
+				return 0, nil, err
+			}
+		}
+		got := make([]byte, 4*n)
+		for i := uint64(0); i < n; i++ {
+			addr := hostarch.Addr(hostarch.ByteOrder.Uint64(addrs[8*i:]))
+			var v int32
+			node, err := t.MemoryManager().PageNode(t, addr, false /* allocate */)
+			switch {
+			case err == nil:
+				if host {
+					v = int32(node)
+				}
+				if nodes != 0 && int32(hostarch.ByteOrder.Uint32(want[4*i:])) != v {
+					notMoved++
+				}
+			case linuxerr.Equals(linuxerr.ENOENT, err):
+				v = -int32(linuxerr.ENOENT.Errno())
+			default:
+				v = -int32(linuxerr.EFAULT.Errno())
+			}
+			hostarch.ByteOrder.PutUint32(got[4*i:], uint32(v))
+		}
+		if _, err := t.CopyOutBytes(status+hostarch.Addr(4*done), got); err != nil {
+			return 0, nil, err
+		}
+		done += n
+	}
+	return notMoved, nil, nil
 }
 
 func copyInMempolicyNodemask(t *kernel.Task, modeWithFlags linux.NumaPolicy, nodemask hostarch.Addr, maxnode uint32) (linux.NumaPolicy, uint64, error) {

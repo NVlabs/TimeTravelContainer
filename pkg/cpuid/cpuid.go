@@ -46,6 +46,9 @@ const (
 	// CtxFeatureSet is the FeatureSet for the context.
 	CtxFeatureSet contextID = iota
 
+	// CtxCPUTopology is the CPUTopologyView of the task of the context.
+	CtxCPUTopology
+
 	// hardware capability bit vector.
 	_AT_HWCAP = 16
 	// hardware capability bit vector 2.
@@ -55,6 +58,30 @@ const (
 // anyContext represents context.Context.
 type anyContext interface {
 	Value(key any) any
+}
+
+// CPUPlace is where a CPU is in the topology /proc/cpuinfo shows.
+type CPUPlace struct {
+	// Package and Core are the numbers of the CPU's package (socket) and
+	// core.
+	Package, Core uint32
+	// Siblings and Cores are how many CPUs and cores its package has.
+	Siblings, Cores uint32
+	// APICID is the CPU's initial APIC ID.
+	APICID uint32
+}
+
+// CPUTopologyView is the CPU topology a task sees, for the CPUID leaves that
+// describe it: the single topology of one package of NumCPUs cores of one
+// thread each, whose APIC IDs are their numbers; or, if Host is true, the
+// host's own, as the host's CPUID reports it on the CPU of APICID.
+type CPUTopologyView struct {
+	Host bool
+	// CPU is the CPU the task runs on, of NumCPUs.
+	CPU, NumCPUs uint32
+	// APICID is the CPU's initial (x2)APIC ID; Core and Node, for AMD's
+	// leaf 0x8000001e, its core and memory node.
+	APICID, Core, Node uint32
 }
 
 // FromContext returns the FeatureSet from the context, if available.

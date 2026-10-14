@@ -716,7 +716,7 @@ func ImportMemoryFileMetadataForRemote(ctx context.Context, target *MemoryFile, 
 		}
 		for i := range chunks {
 			chunks[i].mapping = mapping + uintptr(i)*chunkSize
-			target.madviseChunkMapping(chunks[i].mapping, chunkSize, chunks[i].huge)
+			target.adviseChunk(chunks[i].mapping, chunks[i].huge, chunks[i].node)
 		}
 	}
 

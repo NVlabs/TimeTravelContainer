@@ -73,6 +73,9 @@ struct sysmsg {
   uint64_t debug;
   uint32_t thread_id;
   char thread_name[16];
+  // placement_id is the placement this thread last confined itself to; see
+  // thread_context.placement_id.
+  uint32_t placement_id;
 };
 
 enum context_state {
@@ -110,6 +113,16 @@ struct thread_context {
   uint64_t debug;
   uint64_t err;
   char thread_name[16];
+  // host_cpu is, as Linux's getcpu vDSO reads it from the GDT, (node << 12) |
+  // cpu of the host CPU that last ran the context, which a stub thread
+  // records as it gives a context with a placement back to the Sentry.
+  uint32_t host_cpu;
+  // placement_id names cpu_mask, the host CPUs the context may run on: a
+  // stub thread that takes the context confines itself to cpu_mask first,
+  // unless the placement it confined itself to last has the same ID. Zero is
+  // no placement: the context runs wherever its stub thread does.
+  uint32_t placement_id;
+  uint64_t cpu_mask[PLACEMENT_CPU_MASK_WORDS];
 };
 
 enum stub_error {

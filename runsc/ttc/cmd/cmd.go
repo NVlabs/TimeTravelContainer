@@ -81,6 +81,7 @@ type options struct {
 	localRoot             string
 	runtimePlatform       string
 	cpuFeatures           string
+	cpuTopology           string
 	unsafeNoHostIsolation bool
 	disableHostGSO        bool
 	daemonSocket          string
@@ -280,6 +281,7 @@ Commands:
   completion SHELL                 Generate Bash, Zsh, or Fish completion
   daemon start [--platform systrap|kvm] [--cpu-profile portable|host|explicit]
                [--cpu-features FEATURE,...] [--experimental-no-cpuid-faulting]
+               [--cpu-topology single|host]
                [--unsafe-no-host-isolation] [--unsafe-access-host-group GROUP]
                [--control-only]
                [--node NAME] [--listen ADDR] [--advertise HOST:PORT]
@@ -6800,6 +6802,7 @@ type runtimeBackend struct {
 	daemonSocket          string
 	runtimePlatform       string
 	cpuFeatures           string
+	cpuTopology           string
 	unsafeNoHostIsolation bool
 	disableHostGSO        bool
 	volumeCopyMode        ttcvolume.CopyMode
@@ -7014,7 +7017,7 @@ func environmentHasKey(env []string, key string) bool {
 }
 
 func (b *runtimeBackend) containerStore() ttcbundle.Store {
-	store := ttcbundle.Store{Root: b.dataRoot, ActiveRoot: b.activeDataRoot(), CPUFeatures: b.cpuFeatures}
+	store := ttcbundle.Store{Root: b.dataRoot, ActiveRoot: b.activeDataRoot(), CPUFeatures: b.cpuFeatures, CPUTopology: b.cpuTopology}
 	if b.root != "" {
 		store.TransientRoot = filepath.Join(b.root, transientBundleDirName)
 	}

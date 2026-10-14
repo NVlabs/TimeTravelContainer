@@ -34,6 +34,7 @@ import (
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/cputopology"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
@@ -312,11 +313,15 @@ func placementOptionConsumesValue(command, arg string) bool {
 }
 
 type daemonServer struct {
-	listener              net.Listener
-	socket                string
-	runtimePlatform       string
-	cpuProfileName        string
-	cpuFeatures           string
+	listener        net.Listener
+	socket          string
+	runtimePlatform string
+	cpuProfileName  string
+	cpuFeatures     string
+	// cpuTopologyMode is the CPU topology this daemon's guests see, and
+	// cpuTopology its annotation (see cpuTopologyAnnotation).
+	cpuTopologyMode       string
+	cpuTopology           string
 	unsafeNoHostIsolation bool
 	disableHostGSO        bool
 	hostKernelRelease     string
@@ -492,7 +497,12 @@ type daemonClusterOptions struct {
 	// faulting (--experimental-no-cpuid-faulting). A node that does not ask
 	// adopts what its cluster was created with.
 	NoCPUIDFaulting bool
-	ResolvedCPU     daemonCPUProfile
+	// CPUTopology is the CPU topology --cpu-topology chose, single or host,
+	// and CPUTopologySet whether it did: a daemon that does not choose shows
+	// the single topology, or a cluster's node the cluster's.
+	CPUTopology    string
+	CPUTopologySet bool
+	ResolvedCPU    daemonCPUProfile
 }
 
 func defaultDaemonClusterOptions() daemonClusterOptions {
@@ -2945,6 +2955,7 @@ func directBackend(opts options, stdin io.Reader, stdout, stderr io.Writer) *run
 		daemonSocket:          opts.daemonSocket,
 		runtimePlatform:       opts.runtimePlatform,
 		cpuFeatures:           opts.cpuFeatures,
+		cpuTopology:           opts.cpuTopology,
 		unsafeNoHostIsolation: opts.unsafeNoHostIsolation,
 		disableHostGSO:        opts.disableHostGSO,
 		clientTERM:            os.Getenv("TERM"),
@@ -3989,6 +4000,7 @@ func (s *daemonServer) optionsFromRequest() options {
 	opts.disableSyscallPatching = s.noCPUIDFaulting
 	opts.runtimePlatform = s.runtimePlatform
 	opts.cpuFeatures = s.cpuFeatures
+	opts.cpuTopology = s.cpuTopology
 	opts.dataRoot = s.dataRoot
 	opts.localRoot = s.localRoot
 	opts.daemonSocket = s.socket
@@ -4164,7 +4176,7 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 			args = args[consumed:]
 		}
 	}
-	if err := validateNoCPUIDFaultingOption(clusterOpts); err != nil {
+	if err := errors.Join(validateNoCPUIDFaultingOption(clusterOpts), validateCPUTopologyOption(clusterOpts)); err != nil {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
 		return 2
 	}
@@ -4383,7 +4395,25 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	if clusterRuntime != nil {
 		cpuProfile = clusterRuntime.cpuProfile
 	}
-	if err := serveDaemonWithCluster(socket, runtimePlatform, cpuProfile, access, unsafeNoHostIsolation, kernelCompatibility, daemonDataRoot, roots.local, daemonRoot, daemonRunsc, manager.Capability(), clusterRuntime, gfx, stdout, stderr); err != nil {
+	// A standalone daemon's guests see the topology it is started with; a
+	// cluster node's, the one its cluster records.
+	topologyMode, topologyChosen, topologyFingerprint := clusterOpts.CPUTopology, clusterOpts.CPUTopologySet, ""
+	if clusterRuntime != nil {
+		topologyMode, topologyFingerprint = cpuProfile.cpuTopologyMode(), cpuProfile.TopologyFingerprint
+		topologyChosen = topologyChosen || cpuProfile.Topology != ""
+	}
+	cpuTopology, err := resolveDaemonCPUTopology(topologyMode, topologyFingerprint)
+	if err == nil && cpuTopology.Mode == cputopology.Host && runtimePlatform != "systrap" && !clusterOpts.ControlHolder && !clusterOpts.ControlOnly {
+		err = fmt.Errorf("--cpu-topology host needs --platform systrap, whose application threads are host threads, not %s", runtimePlatform)
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "ttcd: configuring CPU topology: %v\n", err)
+		return 1
+	}
+	if cpuTopology.Mode == cputopology.Single && !topologyChosen && !clusterOpts.ControlHolder && !clusterOpts.ControlOnly && cputopology.AllowedNodeCount() > 1 {
+		fmt.Fprintln(stderr, "ttcd: warning: "+daemonCPUTopologyWarning)
+	}
+	if err := serveDaemonWithCluster(socket, runtimePlatform, cpuProfile, cpuTopology, access, unsafeNoHostIsolation, kernelCompatibility, daemonDataRoot, roots.local, daemonRoot, daemonRunsc, manager.Capability(), clusterRuntime, gfx, stdout, stderr); err != nil {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
 		if errors.Is(err, errLeaseSelfFenced) {
 			fmt.Fprintln(stderr, "ttcd: restarting to wait for the cluster; this node's sandboxes stay stopped until it answers")
@@ -5213,6 +5243,15 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 			return nil, err
 		}
 	}
+	if opts.CPUTopology == cputopology.Host {
+		host, err := resolveDaemonCPUTopology(cputopology.Host, "")
+		if err != nil {
+			return nil, err
+		}
+		resolvedCPU.Topology, resolvedCPU.TopologyFingerprint = cputopology.Host, host.Fingerprint()
+	} else if opts.CPUTopology == cputopology.Single {
+		resolvedCPU.Topology = cputopology.Single
+	}
 	opts.ResolvedCPU = resolvedCPU
 	pendingClusterPolicy, err := applyImmutableClusterConfig(dataRoot, &opts)
 	if err != nil {
@@ -5530,7 +5569,16 @@ const daemonImmutableClusterConfigVersion = 2
 // nodes with syscall patching and without comparing their CPUs.
 const daemonImmutableClusterConfigNoCPUIDFaultingVersion = 3
 
+// daemonImmutableClusterConfigHostTopologyVersion is the version of the
+// configuration of a cluster whose guests see the host's CPU topology, with or
+// without CPUID faulting. A build that predates the choice refuses it, rather
+// than show such a cluster's guests the single topology.
+const daemonImmutableClusterConfigHostTopologyVersion = 4
+
 func immutableClusterConfigVersion(profile daemonCPUProfile) int {
+	if profile.Topology == cputopology.Host {
+		return daemonImmutableClusterConfigHostTopologyVersion
+	}
 	if profile.NoCPUIDFaulting {
 		return daemonImmutableClusterConfigNoCPUIDFaultingVersion
 	}
@@ -5585,7 +5633,8 @@ func equalImmutableClusterConfig(a, b daemonImmutableClusterConfig) bool {
 		a.LeaseDuration == b.LeaseDuration && a.MaxTransactions == b.MaxTransactions &&
 		a.AutoRebalance == b.AutoRebalance && a.CPUProfile.Version == b.CPUProfile.Version &&
 		a.CPUProfile.Mode == b.CPUProfile.Mode && slices.Equal(a.CPUProfile.Features, b.CPUProfile.Features) && a.CPUProfile.XsaveABI == b.CPUProfile.XsaveABI &&
-		a.CPUProfile.NoCPUIDFaulting == b.CPUProfile.NoCPUIDFaulting && a.CPUProfile.CPUID == b.CPUProfile.CPUID
+		a.CPUProfile.NoCPUIDFaulting == b.CPUProfile.NoCPUIDFaulting && a.CPUProfile.CPUID == b.CPUProfile.CPUID &&
+		a.CPUProfile.Topology == b.CPUProfile.Topology && a.CPUProfile.TopologyFingerprint == b.CPUProfile.TopologyFingerprint
 }
 
 func clusterRuntimePolicy(config daemonImmutableClusterConfig) cluster.ClusterRuntimePolicy {
@@ -5641,6 +5690,9 @@ func applyImmutableClusterConfig(sharedRoot string, opts *daemonClusterOptions) 
 	if opts.NoCPUIDFaulting && !got.CPUProfile.NoCPUIDFaulting {
 		return nil, errors.New("--experimental-no-cpuid-faulting applies when a cluster is created; this cluster's systrap nodes require CPUID faulting")
 	}
+	if opts.CPUTopologySet && got.CPUProfile.cpuTopologyMode() != opts.CPUTopology {
+		return nil, fmt.Errorf("--cpu-topology %s differs from this cluster's CPU topology, %s, which its first daemon recorded", opts.CPUTopology, got.CPUProfile.cpuTopologyMode())
+	}
 	compareWant := want
 	if !opts.CPUProfileSet {
 		compareWant.CPUProfile = got.CPUProfile
@@ -5649,6 +5701,9 @@ func applyImmutableClusterConfig(sharedRoot string, opts *daemonClusterOptions) 
 	// node's CPU is the one the cluster records, validateDaemonCPUProfile
 	// judges.
 	compareWant.CPUProfile.NoCPUIDFaulting, compareWant.CPUProfile.CPUID = got.CPUProfile.NoCPUIDFaulting, got.CPUProfile.CPUID
+	// A node adopts its cluster's CPU topology; whether the host's layout is
+	// the one the cluster records, resolveDaemonCPUTopology judges.
+	compareWant.CPUProfile.Topology, compareWant.CPUProfile.TopologyFingerprint = got.CPUProfile.Topology, got.CPUProfile.TopologyFingerprint
 	compareWant.Version = immutableClusterConfigVersion(compareWant.CPUProfile)
 	var pending *daemonImmutableClusterConfig
 	if !equalImmutableClusterConfig(got, compareWant) {
@@ -6661,10 +6716,10 @@ func serveDaemon(socket, runtimePlatform string, unsafeNoHostIsolation bool, ker
 	if err != nil {
 		return err
 	}
-	return serveDaemonWithCluster(socket, runtimePlatform, profile, daemonAccess{}, unsafeNoHostIsolation, kernelCompatibility, dataRoot, dataRoot, root, runsc, volumeCapability, nil, gfxHost{unconfined: unsafeNoHostIsolation}, stdout, stderr)
+	return serveDaemonWithCluster(socket, runtimePlatform, profile, cputopology.Topology{Mode: cputopology.Single}, daemonAccess{}, unsafeNoHostIsolation, kernelCompatibility, dataRoot, dataRoot, root, runsc, volumeCapability, nil, gfxHost{unconfined: unsafeNoHostIsolation}, stdout, stderr)
 }
 
-func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPUProfile, access daemonAccess, unsafeNoHostIsolation bool, kernelCompatibility hostKernelCompatibility, dataRoot, localRoot, root, runsc string, volumeCapability ttcvolume.Capability, clusterRuntime *daemonClusterRuntime, gfx gfxHost, stdout, stderr io.Writer) (err error) {
+func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPUProfile, cpuTopology cputopology.Topology, access daemonAccess, unsafeNoHostIsolation bool, kernelCompatibility hostKernelCompatibility, dataRoot, localRoot, root, runsc string, volumeCapability ttcvolume.Capability, clusterRuntime *daemonClusterRuntime, gfx gfxHost, stdout, stderr io.Writer) (err error) {
 	snapshotGraph, err := ttcsnapshot.Open(filepath.Join(localRoot, "catalog", "snapshot-graph"))
 	if err != nil {
 		return fmt.Errorf("opening TTC snapshot graph: %w", err)
@@ -6734,6 +6789,8 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 		runtimePlatform:       runtimePlatform,
 		cpuProfileName:        cpuProfile.Mode,
 		cpuFeatures:           cpuProfile.annotation(),
+		cpuTopologyMode:       cpuTopology.Mode,
+		cpuTopology:           cpuTopologyAnnotation(cpuTopology),
 		noCPUIDFaulting:       cpuProfile.NoCPUIDFaulting,
 		access:                access,
 		unsafeNoHostIsolation: unsafeNoHostIsolation,
@@ -6942,6 +6999,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 			root: server.root, runsc: server.runsc, dataRoot: server.dataRoot, localRoot: server.localRoot,
 			runtimePlatform:       server.runtimePlatform,
 			cpuFeatures:           server.cpuFeatures,
+			cpuTopology:           server.cpuTopology,
 			unsafeNoHostIsolation: runscNoHostIsolation(server.unsafeNoHostIsolation),
 			disableHostGSO:        server.disableHostGSO,
 			// A cluster whose nodes need no CPUID faulting runs them so.
@@ -7714,6 +7772,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			"runtime_platform":         s.runtimePlatform,
 			"cpu_profile":              s.cpuProfileName,
 			"cpu_features":             strings.Split(s.cpuFeatures, ","),
+			"cpu_topology":             s.cpuTopologyMode,
 			"isolation_mode":           daemonIsolationMode(s.unsafeNoHostIsolation),
 			"unsafe_no_host_isolation": s.unsafeNoHostIsolation,
 			"host_kernel_release":      s.hostKernelRelease,
@@ -9672,6 +9731,9 @@ func startDaemonProcess(socket, runtimePlatform string, unsafeNoHostIsolation bo
 		if clusterOpts.NoCPUIDFaulting {
 			commandArgs = append(commandArgs, "--experimental-no-cpuid-faulting")
 		}
+		if clusterOpts.CPUTopologySet {
+			commandArgs = append(commandArgs, "--cpu-topology", clusterOpts.CPUTopology)
+		}
 		if unsafeNoHostIsolation {
 			commandArgs = append(commandArgs, "--unsafe-no-host-isolation")
 		}
@@ -9770,7 +9832,7 @@ func reportDaemonStartupWarnings(stderr io.Writer, logPath string) {
 		return
 	}
 	for _, line := range strings.Split(string(log), "\n") {
-		if strings.Contains(line, "disabling host GSO") {
+		if strings.Contains(line, "disabling host GSO") || strings.Contains(line, daemonCPUTopologyWarning) {
 			fmt.Fprintln(stderr, line)
 		}
 	}
@@ -9839,7 +9901,7 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 			fmt.Fprintln(stderr, "ttc: --unsafe-no-host-isolation is not applicable to --control-only")
 			return 2
 		}
-		if err := validateNoCPUIDFaultingOption(clusterOpts); err != nil {
+		if err := errors.Join(validateNoCPUIDFaultingOption(clusterOpts), validateCPUTopologyOption(clusterOpts)); err != nil {
 			fmt.Fprintf(stderr, "ttc: %v\n", err)
 			return 2
 		}

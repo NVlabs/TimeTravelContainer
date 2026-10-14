@@ -119,6 +119,12 @@ func (fs FeatureSet) WriteCPUInfoTo(cpu, numCPU uint, w io.Writer) {
 	fmt.Fprintf(w, "\n") // The /proc/cpuinfo file ends with an extra newline.
 }
 
+// WriteCPUInfoPlacedTo is WriteCPUInfoTo: arm64's /proc/cpuinfo does not
+// place CPUs.
+func (fs FeatureSet) WriteCPUInfoPlacedTo(cpu uint, _ CPUPlace, w io.Writer) {
+	fs.WriteCPUInfoTo(cpu, 0, w)
+}
+
 // archCheckHostCompatible is a noop on arm64.
 func (FeatureSet) archCheckHostCompatible(FeatureSet) error {
 	return nil

@@ -408,6 +408,24 @@ func (NoCPUNumbers) LastCPUNumber() int32 {
 	panic("context does not support last CPU number")
 }
 
+// HostCPUPlacer is implemented by the context.Context that Context.Switch is
+// given for a task whose application thread must run on certain host CPUs.
+type HostCPUPlacer interface {
+	// HostCPUPlacement returns, as a Linux CPU mask, the host CPUs where the
+	// task's application thread may run, and an ID that is the same for
+	// every equal mask; ID 0 is no placement, and the mask is then nil.
+	HostCPUPlacement() (id uint32, mask []uint64)
+}
+
+// HostCPUContext is implemented by a Context that confines its application
+// thread to the host CPUs HostCPUPlacer asks for, and knows where it ran.
+type HostCPUContext interface {
+	// LastHostCPU returns the host CPU, and its memory node, that last ran
+	// the context's application thread, as Linux's getcpu(2) reports them;
+	// or ok false if none has since the context was placed.
+	LastHostCPU() (cpu, node int32, ok bool)
+}
+
 // ContextError is one of the possible errors returned by Context.Switch().
 type ContextError struct {
 	// Err is the underlying error.

@@ -104,6 +104,9 @@ func attachedThread(flags uintptr, defaultAction seccomp.Action) (*thread, error
 				// For sysmsg threads. Look at sysmsg/sighandler.c for more details.
 				unix.SYS_RT_SIGRETURN: seccomp.MatchAll{},
 				unix.SYS_SCHED_YIELD:  seccomp.MatchAll{},
+				// For a context's placement; see
+				// sysmsg/sysmsg_lib.c:update_placement.
+				unix.SYS_SCHED_SETAFFINITY: seccomp.PerArg{seccomp.EqualTo(0)},
 				unix.SYS_FUTEX: seccomp.Or{
 					seccomp.PerArg{
 						seccomp.AnyValue{},

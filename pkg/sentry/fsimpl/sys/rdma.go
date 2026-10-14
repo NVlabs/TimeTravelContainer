@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package sys
 
 import (
@@ -113,6 +116,7 @@ func (fs *filesystem) newRDMASysfs(ctx context.Context, creds *auth.Credentials,
 	// synthesized /sys/bus/pci, so it is not a host escape hatch. The
 	// bus/<bus> entry each device sits on is created for pci_bus below.
 	cores := kernel.KernelFromContext(ctx).ApplicationCores()
+	host := kernel.KernelFromContext(ctx).HostCPUTopology() != nil
 	for _, n := range snap.PCINodes {
 		if err := checkRelPath(n.Path); err != nil {
 			return nil, err
@@ -126,14 +130,17 @@ func (fs *filesystem) newRDMASysfs(ctx context.Context, creds *auth.Credentials,
 		// CPU-affinity attributes (from pciAttrNames) need to be rewritten.
 		// gVisor presents just 1 NUMA node (over CPUs 0..cores-1) to the
 		// application. A "-1" numa_node (device on no node) is preserved.
-		if v, ok := d.files["numa_node"]; ok && strings.TrimSpace(v) != "-1" {
-			d.files["numa_node"] = "0\n"
-		}
-		if _, ok := d.files["local_cpus"]; ok {
-			d.files["local_cpus"] = fullCPUMask(cores) + "\n"
-		}
-		if _, ok := d.files["local_cpulist"]; ok {
-			d.files["local_cpulist"] = cpuListString(cores)
+		// Under the host CPU topology, they are the host's already.
+		if !host {
+			if v, ok := d.files["numa_node"]; ok && strings.TrimSpace(v) != "-1" {
+				d.files["numa_node"] = "0\n"
+			}
+			if _, ok := d.files["local_cpus"]; ok {
+				d.files["local_cpus"] = fullCPUMask(cores) + "\n"
+			}
+			if _, ok := d.files["local_cpulist"]; ok {
+				d.files["local_cpulist"] = cpuListString(cores)
+			}
 		}
 		// Root complexes (pciXXXX:YY) carry no subsystem link and sit on
 		// no parent bus; only function directories (BDFs) do.
