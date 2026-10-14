@@ -6131,6 +6131,72 @@ func selectAdmissionNodeExcluding(records []cluster.NodeRecord, local cluster.Ca
 	return selectAdmissionNode(eligible, local, now)
 }
 
+// selectAdmissionNodePreferring is selectAdmissionNodeExcluding, but the
+// least loaded of the preferred nodes that accept the work takes it before
+// any other.
+func selectAdmissionNodePreferring(records []cluster.NodeRecord, local cluster.Capabilities, now time.Time, excluded, preferred map[string]struct{}) (cluster.NodeRecord, error) {
+	var candidates []cluster.NodeRecord
+	for _, record := range records {
+		_, prefer := preferred[record.NodeID]
+		if _, skip := excluded[record.NodeID]; prefer && !skip {
+			candidates = append(candidates, record)
+		}
+	}
+	if len(candidates) != 0 {
+		if selected, err := selectAdmissionNode(candidates, local, now); err == nil {
+			return selected, nil
+		}
+	}
+	return selectAdmissionNodeExcluding(records, local, now, excluded)
+}
+
+// familyRuntimeNodes returns the nodes on which the families of the branches
+// that args starts or rehydrates have a runtime: a branch of theirs running,
+// paused or being made there. A branch admitted to one rejoins its family's
+// Sentry and shares again the memory it shared with its relatives; on
+// another node it holds all of it itself.
+func familyRuntimeNodes(dataRoot string, placements cluster.PlacementCatalog, args []string) map[string]struct{} {
+	if dataRoot == "" || placements == nil || len(args) < 2 {
+		return nil
+	}
+	switch args[0] {
+	case "start", "rehydrate", "restart":
+	default:
+		return nil
+	}
+	store := ttcbundle.Store{Root: dataRoot}
+	reader := newPlacementReader(placements)
+	nodes := make(map[string]struct{})
+	read := make(map[string]bool)
+	for _, arg := range args[1:] {
+		if at := strings.LastIndexByte(arg, '@'); at <= 0 || at == len(arg)-1 {
+			continue
+		}
+		selected, err := parseSelector(arg)
+		if err != nil || read[selected.container] {
+			continue
+		}
+		read[selected.container] = true
+		family, _ := findRoutedFamily(store, reader, selected, false)
+		if family.err != nil {
+			continue
+		}
+		records, err := placements.ListFamily(family.info.ID)
+		if err != nil {
+			continue
+		}
+		for _, record := range records {
+			switch record.State {
+			case cluster.PlacementRunning, cluster.PlacementPaused, cluster.PlacementMaterializing:
+				if record.OwnerNode != "" {
+					nodes[record.OwnerNode] = struct{}{}
+				}
+			}
+		}
+	}
+	return nodes
+}
+
 func (b *runtimeBackend) drainTargets(forced string) ([]cluster.NodeRecord, error) {
 	records, err := b.clusterNodes()
 	if err != nil {

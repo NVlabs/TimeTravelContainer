@@ -8263,6 +8263,23 @@ func TestSelectAdmissionNodeUsesCompatibleLeastLoadedCapacity(t *testing.T) {
 	if selected.NodeID != "node-b" {
 		t.Fatalf("selected excluded node %q, want node-b", selected.NodeID)
 	}
+	// A start or a rehydration goes to a node of its family, however loaded,
+	// while one accepts it.
+	family := map[string]struct{}{"node-b": {}}
+	loaded := []cluster.NodeRecord{record("node-a", 1<<30, 8<<30, 0), record("node-b", 6<<30, 8<<30, 0)}
+	if selected, err := selectAdmissionNodePreferring(loaded, local, now, nil, family); err != nil || selected.NodeID != "node-b" {
+		t.Fatalf("selected (%q, %v), want the family's node-b", selected.NodeID, err)
+	}
+	if selected, err := selectAdmissionNodePreferring(loaded, local, now, nil, nil); err != nil || selected.NodeID != "node-a" {
+		t.Fatalf("selected (%q, %v) for no family, want the least loaded node-a", selected.NodeID, err)
+	}
+	atTarget := []cluster.NodeRecord{record("node-a", 1<<30, 8<<30, 0), record("node-b", 8<<30, 8<<30, 0)}
+	if selected, err := selectAdmissionNodePreferring(atTarget, local, now, nil, family); err != nil || selected.NodeID != "node-a" {
+		t.Fatalf("selected (%q, %v) with the family's node at its target, want node-a", selected.NodeID, err)
+	}
+	if selected, err := selectAdmissionNodePreferring(loaded, local, now, family, family); err != nil || selected.NodeID != "node-a" {
+		t.Fatalf("selected (%q, %v) with the family's node excluded, want node-a", selected.NodeID, err)
+	}
 	// A node judges by its own record whether it still accepts what an entry
 	// daemon chose it for, as selection judged it.
 	if err := nodeAdmissionRefusal(record("node-a", 1<<30, 8<<30, 0), now); err != nil {

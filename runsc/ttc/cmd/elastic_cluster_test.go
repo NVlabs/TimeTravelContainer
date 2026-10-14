@@ -324,6 +324,56 @@ func TestDaemonCommandOwner(t *testing.T) {
 	}
 }
 
+// A start or a rehydration that no --node places prefers the nodes on which
+// its family runs: there the branch shares again the memory it shared with
+// its relatives.
+func TestFamilyRuntimeNodesOfAStartOrRehydration(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "web")
+	if err := os.MkdirAll(filepath.Join(containerDir, "bundle"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(containerDir, "bundle", "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+		ID: "web", Name: "web", BundleDir: filepath.Join(containerDir, "bundle"),
+		Branches: []ttcbundle.BranchInfo{{ID: "main"}, {ID: "paused"}, {ID: "kid"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	placements, err := cluster.OpenPlacementStore(filepath.Join(root, "cluster", "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range []cluster.PlacementRecord{
+		{FamilyID: "web", BranchID: "main", PhysicalContainer: "web", PhysicalBranch: "main", OwnerNode: "node-b", OwnerIncarnation: "boot-b", State: cluster.PlacementRunning},
+		{FamilyID: "web", BranchID: "paused", PhysicalContainer: "web", PhysicalBranch: "paused", OwnerNode: "node-c", OwnerIncarnation: "boot-c", State: cluster.PlacementPaused},
+		{FamilyID: "web", BranchID: "kid", State: cluster.PlacementUnplaced},
+	} {
+		if _, err := placements.Create(record, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, command := range []string{"rehydrate", "start", "restart"} {
+		nodes := familyRuntimeNodes(root, placements, []string{command, "web@kid"})
+		_, b := nodes["node-b"]
+		_, c := nodes["node-c"]
+		if len(nodes) != 2 || !b || !c {
+			t.Errorf("%s web@kid prefers %v, want node-b and node-c", command, nodes)
+		}
+	}
+	for _, args := range [][]string{
+		{"run", "-d", "--name", "other", "alpine"},
+		{"exec", "web@main", "true"},
+		{"rehydrate", "other@kid"},
+	} {
+		if nodes := familyRuntimeNodes(root, placements, args); len(nodes) != 0 {
+			t.Errorf("%v prefers %v, want none", args, nodes)
+		}
+	}
+}
+
 // A start or a rehydration claims an unplaced branch for a node before it
 // makes the branch run there. A command of the branch meanwhile waits for it,
 // rather than fail for its sake; one of a branch claimed long ago, which a

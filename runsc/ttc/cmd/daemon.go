@@ -7952,7 +7952,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 								writeError(fmt.Errorf("%w; reselecting cluster placement: %w", refusal, listErr))
 								return
 							}
-							selected, selectErr := selectAdmissionNodeExcluding(records, *s.clusterCapabilities, time.Now(), failedAdmissionNodes)
+							selected, selectErr := selectAdmissionNodePreferring(records, *s.clusterCapabilities, time.Now(), failedAdmissionNodes, s.familyRuntimeNodes(request.Args))
 							if selectErr != nil {
 								writeError(fmt.Errorf("%w; reselecting cluster placement: %w", refusal, selectErr))
 								return
@@ -7969,7 +7969,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 					writeError(fmt.Errorf("selecting cluster placement: %w", listErr))
 					return
 				}
-				selected, selectErr := selectAdmissionNode(records, *s.clusterCapabilities, time.Now())
+				selected, selectErr := selectAdmissionNodePreferring(records, *s.clusterCapabilities, time.Now(), nil, s.familyRuntimeNodes(request.Args))
 				if selectErr != nil {
 					writeError(selectErr)
 					return
@@ -8119,7 +8119,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 				writeError(fmt.Errorf("reselecting cluster placement after node %q refused the connection: %w", owner, listErr))
 				return
 			}
-			selected, selectErr := selectAdmissionNodeExcluding(records, *s.clusterCapabilities, time.Now(), failedAdmissionNodes)
+			selected, selectErr := selectAdmissionNodePreferring(records, *s.clusterCapabilities, time.Now(), failedAdmissionNodes, s.familyRuntimeNodes(request.Args))
 			if selectErr != nil {
 				writeError(fmt.Errorf("reselecting cluster placement after node %q refused the connection: %w", owner, selectErr))
 				return
@@ -8746,6 +8746,17 @@ func (h *routeHints) set(family, owner string) {
 		h.owner = make(map[string]string)
 	}
 	h.owner[family] = owner
+}
+
+// familyRuntimeNodes is familyRuntimeNodes of the catalog that routes the
+// server's commands: a start or rehydration placed automatically goes to one
+// of the nodes it returns, if one accepts it.
+func (s *daemonServer) familyRuntimeNodes(args []string) map[string]struct{} {
+	placements := cluster.PlacementCatalog(s.clusterPlacements)
+	if routing := s.routingPlacements(); routing != nil {
+		placements = routing
+	}
+	return familyRuntimeNodes(s.dataRoot, placements, args)
 }
 
 // routingPlacements returns the catalog to route a command by, or nil on a

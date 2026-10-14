@@ -580,10 +580,12 @@ ttc node ls
 ```
 
 New containers are admitted on the compatible ready node with the lowest
-normalized memory load, including outstanding placement reservations. `run`,
-`start`, `restore`, `rehydrate`, and `fork` accept an optional `--node`; without
-it, TTC chooses a compatible ready node. Commands naming an existing branch
-are routed to its current owner.
+normalized memory load, including outstanding placement reservations. A branch
+that `start` or `rehydrate` places goes instead to a node where its family
+already runs, if one accepts it: only there does it share memory with its
+relatives again. `run`, `start`, `restore`, `rehydrate`, and `fork` accept an
+optional `--node`; without it, TTC chooses a compatible ready node. Commands
+naming an existing branch are routed to its current owner.
 
 ```shell
 ttc run --node node-b -d --name build ubuntu:26.04 sleep infinity
