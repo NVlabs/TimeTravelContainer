@@ -6205,6 +6205,11 @@ type FamilyResourceStats struct {
 	ImageCacheBytes           uint64                      `json:"image_cache_bytes,omitempty"`
 	ImageCacheTotalBytes      uint64                      `json:"image_cache_total_bytes,omitempty"`
 	SnapshotGraph             *SnapshotGraphResourceStats `json:"snapshot_graph,omitempty"`
+	// ApplicationMappedBytes is how much memory the family's applications
+	// have mapped on this node, and ApplicationHugePageBytes how much of it
+	// the host maps with huge pages.
+	ApplicationMappedBytes   uint64 `json:"application_mapped_bytes,omitempty"`
+	ApplicationHugePageBytes uint64 `json:"application_huge_page_bytes,omitempty"`
 }
 
 type resourceStatsBackend interface {
@@ -6258,7 +6263,16 @@ func writeResourceStats(stdout io.Writer, stats FamilyResourceStats, jsonOutput 
 		fmt.Fprintf(table, "image cache\t-\t-\t-\t-\t-\t-\t-\t-\t%s / %s\n",
 			formatImageSize(int64(stats.ImageCacheBytes)), formatImageSize(int64(stats.ImageCacheTotalBytes)))
 	}
-	return table.Flush()
+	if err := table.Flush(); err != nil {
+		return err
+	}
+	if stats.ApplicationMappedBytes != 0 {
+		_, err := fmt.Fprintf(stdout, "application memory in huge pages: %s of %s (%d%%)\n",
+			formatImageSize(int64(stats.ApplicationHugePageBytes)), formatImageSize(int64(stats.ApplicationMappedBytes)),
+			stats.ApplicationHugePageBytes*100/stats.ApplicationMappedBytes)
+		return err
+	}
+	return nil
 }
 
 func runDiff(args []string, stdout, stderr io.Writer, b backend) error {
@@ -20129,6 +20143,9 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 		}
 	}
 
+	if mapped, huge, ok := b.applicationHugePages(resolved.container); ok {
+		result.ApplicationMappedBytes, result.ApplicationHugePageBytes = mapped, huge
+	}
 	output, residentErr := b.command("timetravel", resolved.container, "stats", resolved.branch)
 	if residentErr == nil {
 		var resident boot.FamilyResidentMemory

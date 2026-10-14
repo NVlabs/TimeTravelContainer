@@ -31,6 +31,7 @@ go_library(
         "graph_provider.go",
         "graph_references.go",
         "group_access.go",
+        "hugepages.go",
         "shared_references.go",
         "daemon.go",
         "daemon_layout.go",

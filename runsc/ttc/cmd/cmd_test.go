@@ -888,6 +888,38 @@ func TestStatsHumanOutputUsesPrintablePadding(t *testing.T) {
 	}
 }
 
+func TestStatsHumanOutputShowsHugePages(t *testing.T) {
+	stats := FamilyResourceStats{Container: "demo", ApplicationMappedBytes: 400_000_000, ApplicationHugePageBytes: 300_000_000}
+	var stdout bytes.Buffer
+	if err := writeResourceStats(&stdout, stats, false); err != nil {
+		t.Fatal(err)
+	}
+	if want := "application memory in huge pages: 300MB of 400MB (75%)\n"; !strings.HasSuffix(stdout.String(), want) {
+		t.Fatalf("human stats=%q, want it to end %q", stdout.String(), want)
+	}
+	stdout.Reset()
+	stats.ApplicationMappedBytes, stats.ApplicationHugePageBytes = 0, 0
+	if err := writeResourceStats(&stdout, stats, false); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stdout.String(), "huge pages") {
+		t.Fatalf("human stats of a family running nowhere here=%q", stdout.String())
+	}
+}
+
+func TestSmapsRollupOfThisProcess(t *testing.T) {
+	rss, huge, err := smapsRollup(os.Getpid())
+	if err != nil {
+		t.Skipf("no smaps_rollup: %v", err)
+	}
+	if rss == 0 || huge > rss {
+		t.Fatalf("rss=%d huge=%d", rss, huge)
+	}
+	if children := processChildren(); !slices.Contains(children[os.Getppid()], os.Getpid()) {
+		t.Fatalf("this process is not among its parent's children: %v", children[os.Getppid()])
+	}
+}
+
 func TestParseSelector(t *testing.T) {
 	tests := []struct {
 		input string
