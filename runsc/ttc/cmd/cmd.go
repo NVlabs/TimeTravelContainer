@@ -15068,6 +15068,21 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, logicalParent strin
 		}
 		result = append(result, Branch{ID: child.branch.ID, ParentID: logicalParent, Quarantined: child.branch.Quarantined, State: state, CreatedAt: createdAt, MemorySharing: "cow"})
 	}
+	// The children run before their placements exist, as a live fork's do,
+	// and are placed as theirs are. The reconciliation after the command
+	// looks for the runtimes of its family's placements, and a remote fork's
+	// branch, dehydrated, has none in the runtime its children run in: they
+	// had no placement, and each command of them was refused, "branch ...
+	// does not exist", until one placed their source in that runtime again.
+	placed := make([]ttcbundle.BranchInfo, 0, len(children))
+	for index, child := range children {
+		branch := child.branch
+		branch.State = result[index].State
+		placed = append(placed, branch)
+	}
+	if err := b.registerLocalForkPlacements(info, placed); err != nil {
+		return nil, fmt.Errorf("registering dehydrated fork placements: %w", err)
+	}
 	return result, nil
 }
 
