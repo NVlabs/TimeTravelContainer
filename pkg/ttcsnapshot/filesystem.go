@@ -237,6 +237,11 @@ func (s *Store) ApplyFilesystemAndReleasePins(origin SnapshotID, rootName string
 	return root, err
 }
 
+// maxFilesystemMutationBuilds bounds the builds of a filesystem mutation
+// that expands deferred objects: each build expands those that the ones
+// before it read, which the next finds expanded.
+const maxFilesystemMutationBuilds = 8
+
 // ApplyFilesystemAndReleasePinsReclaimed is
 // ApplyFilesystemAndReleasePins with the immutable bulk objects made
 // unreachable by the committed root replacement. Callers may delete the
@@ -254,6 +259,18 @@ func (s *Store) ApplyFilesystemAndReleasePinsReclaimed(origin SnapshotID, rootNa
 		return ObjectID{}, nil, err
 	}
 	mutation, logicalRoot, err := buildFilesystemMutationStore(s, origin, rootName, operations, releasePins, true)
+	// A mutation that expanded a deferred object, which the paths above did
+	// not reach, committed the expansion in records of its own, and drew its
+	// new objects' IDs after it. The replay of its journal record finds the
+	// expansion done, and draws them from where the record begins, as a
+	// mutation built again now does: one builds it again until it expands
+	// nothing.
+	for builds := 1; err == nil && mutation.expanded; builds++ {
+		if builds == maxFilesystemMutationBuilds {
+			return ObjectID{}, nil, fmt.Errorf("TTC filesystem mutation still expanded deferred objects after %d builds", builds)
+		}
+		mutation, logicalRoot, err = buildFilesystemMutationStore(s, origin, rootName, operations, releasePins, true)
+	}
 	if err != nil {
 		return ObjectID{}, nil, err
 	}

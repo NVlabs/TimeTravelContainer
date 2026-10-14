@@ -174,6 +174,9 @@ type graphMutation struct {
 	// bTreeBuilder.lends and collectFilesystemMutationGarbage.
 	lent map[ObjectID][]int
 	err  error
+	// expanded is set once the mutation has expanded a deferred object of
+	// the graph: see ApplyFilesystemAndReleasePinsReclaimed.
+	expanded bool
 }
 
 func newGraphMutation(store *Store, origin SnapshotID) (*graphMutation, error) {
@@ -188,7 +191,11 @@ func (mutation *graphMutation) object(id ObjectID) (Object, bool) {
 	if object, ok := mutation.objects[id]; ok {
 		return object, true
 	}
-	object, ok, nextOrdinal, err := mutation.store.resolveDeferredLockedAfter(id, mutation.snapshot.NextOrdinal)
+	if object, ok := mutation.store.state.Objects[id]; !ok || !object.Deferred {
+		return object, ok
+	}
+	mutation.expanded = true
+	object, ok, nextOrdinal, err := mutation.store.expandDeferredLockedAfter(id, mutation.snapshot.NextOrdinal)
 	if err != nil {
 		mutation.err = errors.Join(mutation.err, err)
 		return Object{}, false
@@ -452,17 +459,21 @@ func (builder *bTreeBuilder) apply(root ObjectID, edits []bTreeEdit) (ObjectID, 
 		if err != nil {
 			return ObjectID{}, err
 		}
-		if max(left, right) <= bTreeBalancedDepth {
+		// An older release's tree, unbalanced, is built anew, with the edits,
+		// and its nodes go once the new tree replaces it; but not while a
+		// node of it is still deferred: see edgeDepth.
+		rebuild := max(left, right) > bTreeBalancedDepth
+		if rebuild {
+			if keys, children, rebuild, err = builder.entries(root); err != nil {
+				return ObjectID{}, err
+			}
+		}
+		if !rebuild {
 			ids, minima, changed, err := builder.applyNode(root, edits, true)
 			if err != nil || !changed {
 				return root, err
 			}
 			return builder.buildUpper(ids, minima)
-		}
-		// An older release's tree, unbalanced: build it anew, with the
-		// edits. Its nodes go once the new tree replaces it.
-		if keys, children, err = builder.entries(root); err != nil {
-			return ObjectID{}, err
 		}
 	}
 	keys, children = applyEdits(keys, children, edits)
@@ -473,12 +484,23 @@ func (builder *bTreeBuilder) apply(root ObjectID, edits []bTreeEdit) (ObjectID, 
 // rightmost if last, which is every leaf's in a balanced tree. An unbalanced
 // one that older releases made by appending entries, as inode numbers are, or
 // prepending them, is deepest at an end.
+//
+// It expands no deferred node, and returns the depth of the first it meets:
+// the nodes a mutation finds deferred, it expands in records of their own,
+// which it then draws its new objects' IDs after. The replay of its journal
+// record finds those expansions done, and draws the IDs from where the record
+// begins: a mutation must expand nothing that
+// resolveFilesystemOperationPathsLocked did not expand before it. A tree's
+// edges are not on the paths of its edits, which that expands.
 func (builder *bTreeBuilder) edgeDepth(root ObjectID, last bool) (int, error) {
 	current := root
 	for depth := 1; depth <= bTreeMaxDepth; depth++ {
-		object, ok := builder.mutation.object(current)
+		object, ok := builder.mutation.rawObject(current)
 		if !ok {
 			return 0, fmt.Errorf("TTC B-tree node %s does not exist", current.key())
+		}
+		if object.Deferred {
+			return depth, nil
 		}
 		node, err := decodeBTreeNode(object, builder.kind)
 		if err != nil {
@@ -495,39 +517,45 @@ func (builder *bTreeBuilder) edgeDepth(root ObjectID, last bool) (int, error) {
 	return 0, errors.New("TTC B-tree exceeds maximum structural depth")
 }
 
-// entries returns the keys and values of the tree at root, in order.
-func (builder *bTreeBuilder) entries(root ObjectID) ([][]byte, []ObjectID, error) {
+// entries returns the keys and values of the tree at root, in order, and
+// whether it read them all: it expands no deferred node, and returns
+// complete false at the first it meets. See edgeDepth.
+func (builder *bTreeBuilder) entries(root ObjectID) ([][]byte, []ObjectID, bool, error) {
 	var keys [][]byte
 	var values []ObjectID
-	var visit func(ObjectID, int) error
-	visit = func(id ObjectID, depth int) error {
+	var visit func(ObjectID, int) (bool, error)
+	visit = func(id ObjectID, depth int) (bool, error) {
 		if depth >= bTreeMaxDepth {
-			return errors.New("TTC B-tree exceeds maximum structural depth")
+			return false, errors.New("TTC B-tree exceeds maximum structural depth")
 		}
-		object, ok := builder.mutation.object(id)
+		object, ok := builder.mutation.rawObject(id)
 		if !ok {
-			return fmt.Errorf("TTC B-tree node %s does not exist", id.key())
+			return false, fmt.Errorf("TTC B-tree node %s does not exist", id.key())
+		}
+		if object.Deferred {
+			return false, nil
 		}
 		node, err := decodeBTreeNode(object, builder.kind)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if node.leaf {
 			keys = append(keys, node.keys...)
 			values = append(values, node.children...)
-			return nil
+			return true, nil
 		}
 		for _, child := range node.children {
-			if err := visit(child, depth+1); err != nil {
-				return err
+			if complete, err := visit(child, depth+1); !complete || err != nil {
+				return false, err
 			}
 		}
-		return nil
+		return true, nil
 	}
-	if err := visit(root, 0); err != nil {
-		return nil, nil, err
+	complete, err := visit(root, 0)
+	if !complete || err != nil {
+		return nil, nil, false, err
 	}
-	return keys, values, nil
+	return keys, values, true, nil
 }
 
 // applyEdits returns keys and values, in order, with edits, sorted, applied.
