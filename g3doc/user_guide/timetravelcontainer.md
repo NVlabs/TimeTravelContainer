@@ -149,9 +149,10 @@ the registers that differ. Applications on a node without CPUID faulting read
 the host's CPUID rather than the profile, and may see and use FSGSBASE, which
 systrap's syscall patching cannot coexist with; every node of such a cluster
 therefore runs systrap with syscall patching disabled, which makes system calls
-slower. Such a cluster runs systrap nodes only. The option is chosen when the
-cluster is created: nodes that join may repeat it or leave it out, and TTC
-builds that predate it refuse such a cluster.
+slower: a patchable system call took 4.1 µs instead of 1.1 µs on an AMD EPYC
+7003 (Milan) host. Such a cluster runs systrap nodes only. The option is
+chosen when the cluster is created: nodes that join may repeat it or leave it
+out, and TTC builds that predate it refuse such a cluster.
 
 ## CPU topology and memory placement
 
@@ -335,7 +336,10 @@ ttc daemon start --node node-a \
 ```
 
 `TTC_LOCAL_ROOT` is required on cluster nodes, must differ from `TTC_ROOT`, and
-is exclusively locked to one daemon. It is the daemon's root, as `TTC_ROOT` is
+is exclusively locked to one daemon. Put it on a disk of the node itself, such
+as `/tmp` or a local SSD, not in a home directory on NFS: a node prepares there
+the root filesystem of each image it runs, and on NFS the first fork of an
+image to a node spent 7 s doing so, against 0.3 s on a local disk. It is the daemon's root, as `TTC_ROOT` is
 a standalone daemon's: the daemon's socket, log, sockets of its sandboxes,
 temporary files, and runtime state are there, and it must be on a local
 filesystem likewise. Active filesystems, console/exec buffers, caches, and
