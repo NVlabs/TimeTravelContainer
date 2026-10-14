@@ -6,9 +6,13 @@
 package cpuid
 
 import (
+	"bytes"
+	"context"
 	"slices"
 	"strings"
 	"testing"
+
+	"gvisor.dev/gvisor/pkg/state"
 )
 
 func TestIntersectMasksHWCap(t *testing.T) {
@@ -46,5 +50,28 @@ func TestCPUInfoListsOnlyGuestFeatures(t *testing.T) {
 	}
 	if !slices.Contains(features, "fp") || !slices.Contains(features, "asimd") || slices.Contains(features, "sve") {
 		t.Errorf("Features = %q, want fp and asimd, and not sve", features)
+	}
+}
+
+func TestFeatureSetStateRoundTripIncludesHWCap(t *testing.T) {
+	source := &FeatureSet{
+		hwCap:      hwCap{hwCap1: 0x123456789abcdef0, hwCap2: 0xfedcba9876543210},
+		cpuFreqMHz: 2400,
+		cpuImplHex: 0x61,
+		cpuArchDec: 8,
+		cpuVarHex:  2,
+		cpuPartHex: 0x23,
+		cpuRevDec:  1,
+	}
+	var image bytes.Buffer
+	if _, err := state.Save(context.Background(), &image, source); err != nil {
+		t.Fatalf("saving FeatureSet: %v", err)
+	}
+	restored := &FeatureSet{}
+	if _, err := state.Load(context.Background(), bytes.NewReader(image.Bytes()), restored); err != nil {
+		t.Fatalf("loading FeatureSet: %v", err)
+	}
+	if *restored != *source {
+		t.Fatalf("restored FeatureSet = %+v, want %+v", *restored, *source)
 	}
 }
