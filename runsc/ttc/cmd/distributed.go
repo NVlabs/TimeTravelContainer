@@ -2941,6 +2941,8 @@ func reserveRemoteTarget(ctx context.Context, targetNode string, lookup func(str
 }
 
 func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestination string, paused bool) (selector, error) {
+	ft := newForkTimer("source", targetNode+"/"+targetDestination)
+	defer ft.mark("return")
 	if b.distributedSource == nil {
 		return selector{}, errors.New("ttcd is not configured for distributed forks")
 	}
@@ -2980,6 +2982,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	if _, err := b.renewDistributedExecutionAuthority(); err != nil {
 		return selector{}, fmt.Errorf("renewing source execution authority: %w", err)
 	}
+	ft.mark("renew-authority")
 	if state := normalizeLifecycleState(sourceBranch.State); state == "dehydrated" || state == "dehydrating" {
 		if waited, err := b.awaitSharedDehydratedSource(sourceInfo, source, logicalSource, sourceBranch); err != nil {
 			return selector{}, err
@@ -2992,6 +2995,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	if err != nil {
 		return selector{}, err
 	}
+	ft.mark("capture-gate")
 	foregroundCaptureActive := true
 	defer func() {
 		if foregroundCaptureActive {
@@ -3018,6 +3022,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	if err != nil {
 		return selector{}, err
 	}
+	ft.mark("family-descriptor")
 	// Reserving the target, capturing the branch and restoring it there take
 	// seconds, and more for more memory; other commands on this node go on
 	// meanwhile, except on its family.
@@ -3026,6 +3031,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 		return selector{}, err
 	}
 	defer resumeLifecycle()
+	ft.mark("release-lifecycle-lock")
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	tx, err := reserveRemoteTarget(ctx, targetNode, b.distributedSource.directory.Lookup, func(ctx context.Context) (*cluster.Transaction, error) {
@@ -3040,6 +3046,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	if err != nil {
 		return selector{}, fmt.Errorf("reserving target node %s: %w", targetNode, err)
 	}
+	ft.mark("target-reserve")
 	var relay *distributedPageRelay
 	captured := false
 	committed := false
@@ -3074,6 +3081,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	relayBackend.stdout = io.Discard
 	relayBackend.stderr = io.Discard
 	relay = newDistributedPageRelay(listener, &relayBackend, source.container, transactionID)
+	ft.mark("page-relay")
 
 	dataPlaneMax := tx.Negotiated.PagingPolicy.TransferBytes
 	if tx.Negotiated.PagingPolicy.Prefetch == ttcpolicy.PrefetchAdaptive {
@@ -3097,6 +3105,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	if err != nil {
 		return selector{}, err
 	}
+	ft.mark("filesystem-origins")
 	var output []byte
 	if len(filesystemOrigins) == 0 {
 		output, err = b.command(args...)
@@ -3121,6 +3130,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 		return selector{}, err
 	}
 	captured = true
+	ft.mark("sentry-capture")
 	var session boot.DistributedForkSessionInfo
 	if err := json.Unmarshal(output, &session); err != nil {
 		return selector{}, fmt.Errorf("decoding source capture: %w", err)
@@ -3132,6 +3142,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	if err != nil {
 		return selector{}, fmt.Errorf("sealing distributed filesystem generation: %w", err)
 	}
+	ft.mark("prepare-filesystem")
 	internalMounts, err := b.portableDistributedInternalMounts(sourceInfo.ID)
 	if err != nil {
 		return selector{}, fmt.Errorf("capturing portable internal mounts: %w", err)
@@ -3140,6 +3151,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	if err != nil {
 		return selector{}, fmt.Errorf("capturing retained exec output: %w", err)
 	}
+	ft.mark("mounts-and-exec-logs")
 	descriptor := cluster.RemoteSessionDescriptor{
 		Address: session.Address, SnapshotToken: hex.EncodeToString(session.Token[:]),
 		MetadataBytes: session.MetadataBytes, StreamBytes: session.StreamBytes,
@@ -3151,10 +3163,12 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	if err != nil {
 		return selector{}, fmt.Errorf("restoring target node %s: %w", targetNode, err)
 	}
+	ft.mark("target-prepare")
 	tx, err = publishRemoteTarget(ctx, peer, transactionID, tx.Revision, paused)
 	if err != nil {
 		return selector{}, fmt.Errorf("publishing target node %s: %w", targetNode, err)
 	}
+	ft.mark("target-publish")
 	committed = true
 	monitorBackend := b.forBackground()
 	if tx.Negotiated.PagingPolicy.Push == ttcpolicy.PushDemandOnly {
@@ -4451,4 +4465,29 @@ func distributedSourceTerminalCommand(tx *cluster.Transaction) string {
 		return "distributed-complete"
 	}
 	return "distributed-cancel"
+}
+
+// forkTimer, a diagnostic, writes how long each phase of a remote fork took
+// to ttcd's log when TTC_FORK_TIMING is set.
+type forkTimer struct {
+	side, id    string
+	start, last time.Time
+}
+
+func newForkTimer(side, id string) *forkTimer {
+	if os.Getenv("TTC_FORK_TIMING") == "" {
+		return nil
+	}
+	now := time.Now()
+	return &forkTimer{side: side, id: id, start: now, last: now}
+}
+
+func (t *forkTimer) mark(phase string) {
+	if t == nil {
+		return
+	}
+	now := time.Now()
+	fmt.Fprintf(os.Stderr, "ttcd: fork-timing %s %s %-24s %9.1f ms (at %9.1f ms)\n", t.side, t.id, phase,
+		float64(now.Sub(t.last).Microseconds())/1000, float64(now.Sub(t.start).Microseconds())/1000)
+	t.last = now
 }

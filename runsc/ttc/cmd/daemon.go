@@ -1088,6 +1088,8 @@ func (r *daemonTargetRuntime) lockTarget(name string) func() {
 }
 
 func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transaction, family cluster.RemoteFamilyDescriptor) error {
+	ft := newForkTimer("target-reserve", tx.Identity.TransactionID)
+	defer ft.mark("return")
 	if r == nil || r.backend == nil || tx == nil {
 		return errors.New("distributed target runtime is unavailable")
 	}
@@ -1268,6 +1270,9 @@ func restoreLostItsPeer(err error) bool {
 
 func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transaction, session cluster.RemoteSessionDescriptor) error {
 	defer r.lockTarget(tx.Identity.TargetContainer)()
+	ft := newForkTimer("target", tx.Identity.TransactionID)
+	defer ft.mark("return")
+	ft.mark("lock")
 	info, targetBranch, peer, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TargetContainer, tx.Identity.TransactionID)
 	if err != nil {
 		return err
@@ -1283,6 +1288,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 	if err != nil {
 		return fmt.Errorf("materializing target image cache: %w", err)
 	}
+	ft.mark("image-root")
 	portableMounts := make([]ttcbundle.PortableInternalMount, len(session.InternalMounts))
 	for i, mount := range session.InternalMounts {
 		portableMounts[i] = ttcbundle.PortableInternalMount{
@@ -1292,10 +1298,12 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 	if err := r.backend.containerStore().InstallPortableInternalMountsOf(info, portableMounts); err != nil {
 		return fmt.Errorf("installing target-local internal mounts: %w", err)
 	}
+	ft.mark("internal-mounts")
 	filesystemConnections, filesystemAliases, err := r.backend.materializeDistributedFilesystemRoots(info, targetBranch.FilesystemBranch, session.FilesystemRoots, peer, false)
 	if err != nil {
 		return fmt.Errorf("materializing distributed filesystem metadata: %w", err)
 	}
+	ft.mark("filesystem-roots")
 	// materializeDistributedFilesystemRoots installs one-shot restore aliases in
 	// the active repository map. A later restore failure must not leave those
 	// foreign identities attached to an otherwise healthy peer runtime.
@@ -1409,6 +1417,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		}
 		return nil
 	}
+	ft.mark("bookkeeping")
 	runtimeCreated := false
 	var runtimeState struct {
 		Status string `json:"status"`
@@ -1630,8 +1639,10 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		}
 		// A metadata peer restored into a newly created empty Sentry is its
 		// physical loader branch, not an import into an already-running family.
+		ft.mark("runtime")
 		restoreArgs.Peer = peer && !runtimeCreated
 		err := restore(restoreArgs)
+		ft.mark("sentry-restore")
 		for attempt := 0; err != nil && restoreArgs.Peer && attempt < 3 && (restoreLostItsPeer(err) || !r.backend.runtimeRunsLiveBranch(info.ID)); attempt++ {
 			// The runtime's last live branch went after the import looked, as
 			// the restore went on beside it or before: the import replaces
@@ -1690,6 +1701,8 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 }
 
 func (r *daemonTargetRuntime) Publish(_ context.Context, tx *cluster.Transaction, paused bool) error {
+	ft := newForkTimer("target-publish", tx.Identity.TransactionID)
+	defer ft.mark("return")
 	defer r.lockTarget(tx.Identity.TargetContainer)()
 	info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TargetContainer, tx.Identity.TransactionID)
 	if err != nil {
