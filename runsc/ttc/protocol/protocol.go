@@ -16,6 +16,11 @@ import (
 // the API is private to the two, which a release ships together.
 const DaemonAPIVersion = 10
 
+// CopyPreparedInput says of a cp from '-' that its standard input is the
+// archive of a host path, as ttc and ttcd write one, rather than a tar stream
+// of the user's: the copy then names what it copies as a cp of the path would.
+const CopyPreparedInput = "--ttc-prepared-input"
+
 // StaleRouteRefusal begins a node's answer to a command routed to it by a
 // placement that another command has changed since: it moved the command's
 // branch, unplaced it, or claims it. The node refuses before it runs or

@@ -109,14 +109,21 @@ func rotateDaemonEventLog(path string, incoming, maxBytes int64, files int) erro
 	return closeErr
 }
 
-// recordCommandEvents records the events of a command, whose request
-// resolved the containers resolved names.
-func (s *daemonServer) recordCommandEvents(dataRoot string, args []string, status int, resolved *familySet) {
+// recordCommandEvents records the events of a command that requester asked
+// for, whose request resolved the containers resolved names.
+func (s *daemonServer) recordCommandEvents(dataRoot string, args []string, status int, resolved *familySet, requester *daemonRequester) {
 	if dataRoot == "" {
 		return
 	}
 	for _, event := range commandEvents(args, status) {
 		s.enrichConsoleRetentionEvent(dataRoot, &event, resolved)
+		if requester != nil {
+			if event.Attributes == nil {
+				event.Attributes = make(map[string]string)
+			}
+			event.Attributes["requester_uid"] = strconv.Itoa(requester.UID)
+			event.Attributes["requester"] = requesterName(*requester)
+		}
 		s.recordEvent(dataRoot, event)
 	}
 }

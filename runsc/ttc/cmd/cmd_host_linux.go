@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -179,32 +180,90 @@ func growPipe(pipe *os.File) {
 	_, _ = unix.FcntlInt(pipe.Fd(), unix.F_SETPIPE_SZ, 1<<20)
 }
 
-func checkDaemonPeer(conn net.Conn) error {
+// checkDaemonPeer names the client of conn, which access must admit.
+func checkDaemonPeer(conn net.Conn, access daemonAccess) (daemonPeer, error) {
 	unixConn, ok := conn.(*net.UnixConn)
 	if !ok {
-		return fmt.Errorf("non-Unix daemon connection %T", conn)
+		return daemonPeer{}, fmt.Errorf("non-Unix daemon connection %T", conn)
 	}
 	raw, err := unixConn.SyscallConn()
 	if err != nil {
-		return err
+		return daemonPeer{}, err
 	}
 	var credential *syscall.Ucred
-	var socketErr error
+	var groups []int
+	var socketErr, groupsErr error
 	if err := raw.Control(func(fd uintptr) {
 		credential, socketErr = syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
+		if socketErr == nil && credential != nil && access.shared && int(credential.Uid) != os.Geteuid() {
+			groups, groupsErr = peerGroups(int(fd), int(credential.Pid))
+		}
 	}); err != nil {
-		return err
+		return daemonPeer{}, err
 	}
 	if socketErr != nil {
-		return socketErr
+		return daemonPeer{}, socketErr
 	}
 	if credential == nil {
-		return errors.New("daemon peer credentials are unavailable")
+		return daemonPeer{}, errors.New("daemon peer credentials are unavailable")
 	}
-	if int(credential.Uid) != os.Geteuid() {
-		return fmt.Errorf("daemon peer UID %d does not match server UID %d", credential.Uid, os.Geteuid())
+	peer := daemonPeer{UID: int(credential.Uid), GID: int(credential.Gid), Groups: groups}
+	if !access.admits(peer) {
+		if groupsErr != nil {
+			return peer, fmt.Errorf("%w; reading its groups: %v", access.peerRefusal(peer), groupsErr)
+		}
+		return peer, access.peerRefusal(peer)
 	}
-	return nil
+	return peer, nil
+}
+
+// peerGroups returns the supplementary groups that the peer of the Unix
+// socket fd had when it connected, which SO_PEERGROUPS (Linux 4.13) tells,
+// or on an older kernel, those that process pid has now.
+func peerGroups(fd, pid int) ([]int, error) {
+	buffer := make([]uint32, 32)
+	for {
+		size := uint32(len(buffer) * 4)
+		_, _, errno := unix.Syscall6(unix.SYS_GETSOCKOPT, uintptr(fd), unix.SOL_SOCKET, unix.SO_PEERGROUPS, uintptr(unsafe.Pointer(&buffer[0])), uintptr(unsafe.Pointer(&size)), 0)
+		switch errno {
+		case 0:
+			groups := make([]int, size/4)
+			for i := range groups {
+				groups[i] = int(buffer[i])
+			}
+			return groups, nil
+		case unix.ERANGE:
+			buffer = make([]uint32, size/4+1)
+		case unix.ENOPROTOOPT:
+			return processGroups(pid)
+		default:
+			return nil, errno
+		}
+	}
+}
+
+// processGroups returns the supplementary groups of process pid.
+func processGroups(pid int) ([]int, error) {
+	status, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "status"))
+	if err != nil {
+		return nil, err
+	}
+	for _, line := range strings.Split(string(status), "\n") {
+		fields, ok := strings.CutPrefix(line, "Groups:")
+		if !ok {
+			continue
+		}
+		var groups []int
+		for _, field := range strings.Fields(fields) {
+			id, err := strconv.Atoi(field)
+			if err != nil {
+				return nil, fmt.Errorf("process %d's groups %q: %w", pid, fields, err)
+			}
+			groups = append(groups, id)
+		}
+		return groups, nil
+	}
+	return nil, fmt.Errorf("process %d's status names no groups", pid)
 }
 
 func setTTCCommandParentDeathSignal(command *exec.Cmd) {

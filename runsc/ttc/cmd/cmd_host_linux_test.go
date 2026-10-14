@@ -6,9 +6,12 @@
 package cmd
 
 import (
+	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -50,4 +53,71 @@ func TestAwaitExitWaitsInThePoller(t *testing.T) {
 	if err := child.Wait(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// The daemon names its client, and with a shared access, admits the owner
+// without reading its groups.
+func TestCheckDaemonPeerNamesTheClient(t *testing.T) {
+	server, client := connectedUnixPair(t)
+	defer client.Close()
+	defer server.Close()
+	peer, err := checkDaemonPeer(server, daemonAccess{shared: true, group: "proj", gid: 2147483000})
+	if err != nil || peer.UID != os.Geteuid() || peer.GID != os.Getegid() {
+		t.Fatalf("peer=(%+v, %v)", peer, err)
+	}
+}
+
+// SO_PEERGROUPS, and on an older kernel /proc, tell the client's groups.
+func TestPeerGroupsAreTheClientsGroups(t *testing.T) {
+	server, client := connectedUnixPair(t)
+	defer client.Close()
+	defer server.Close()
+	want, err := os.Getgroups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := server.(*net.UnixConn).SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var groups []int
+	var groupsErr error
+	if err := raw.Control(func(fd uintptr) {
+		groups, groupsErr = peerGroups(int(fd), os.Getpid())
+	}); err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(groups)
+	slices.Sort(want)
+	if groupsErr != nil || !slices.Equal(groups, want) {
+		t.Fatalf("peer groups=(%v, %v), want %v", groups, groupsErr, want)
+	}
+	process, err := processGroups(os.Getpid())
+	slices.Sort(process)
+	if err != nil || !slices.Equal(process, want) {
+		t.Fatalf("process groups=(%v, %v), want %v", process, err, want)
+	}
+}
+
+func connectedUnixPair(t *testing.T) (net.Conn, net.Conn) {
+	t.Helper()
+	listener, err := net.Listen("unix", filepath.Join(t.TempDir(), "s"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, _ := listener.Accept()
+		accepted <- conn
+	}()
+	client, err := net.Dial("unix", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := <-accepted
+	if server == nil {
+		t.Fatal("accepting the client failed")
+	}
+	return server, client
 }

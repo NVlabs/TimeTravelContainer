@@ -12,6 +12,7 @@ go_library(
     name = "copyhelper",
     srcs = ["helper.go"],
     visibility = [
+        "//runsc/ttc/client:__pkg__",
         "//runsc/ttc/cmd:__pkg__",
         "//runsc/ttc/copyguest/cmd:__pkg__",
     ],

@@ -209,32 +209,41 @@ func syncFileData(file *os.File) error {
 // growPipe does nothing: a Darwin pipe's buffer is not set.
 func growPipe(*os.File) {}
 
-func checkDaemonPeer(conn net.Conn) error {
+// checkDaemonPeer names the client of conn, which access must admit.
+func checkDaemonPeer(conn net.Conn, access daemonAccess) (daemonPeer, error) {
 	unixConn, ok := conn.(*net.UnixConn)
 	if !ok {
-		return fmt.Errorf("non-Unix daemon connection %T", conn)
+		return daemonPeer{}, fmt.Errorf("non-Unix daemon connection %T", conn)
 	}
 	raw, err := unixConn.SyscallConn()
 	if err != nil {
-		return err
+		return daemonPeer{}, err
 	}
 	var credential *unix.Xucred
 	var socketErr error
 	if err := raw.Control(func(fd uintptr) {
 		credential, socketErr = unix.GetsockoptXucred(int(fd), unix.SOL_LOCAL, unix.LOCAL_PEERCRED)
 	}); err != nil {
-		return err
+		return daemonPeer{}, err
 	}
 	if socketErr != nil {
-		return socketErr
+		return daemonPeer{}, socketErr
 	}
 	if credential == nil {
-		return fmt.Errorf("daemon peer credentials are unavailable")
+		return daemonPeer{}, fmt.Errorf("daemon peer credentials are unavailable")
 	}
-	if int(credential.Uid) != os.Geteuid() {
-		return fmt.Errorf("daemon peer UID %d does not match server UID %d", credential.Uid, os.Geteuid())
+	// The first of the peer's groups is its effective group.
+	peer := daemonPeer{UID: int(credential.Uid), GID: -1}
+	for i := 0; i < int(credential.Ngroups) && i < len(credential.Groups); i++ {
+		if i == 0 {
+			peer.GID = int(credential.Groups[i])
+		}
+		peer.Groups = append(peer.Groups, int(credential.Groups[i]))
 	}
-	return nil
+	if !access.admits(peer) {
+		return peer, access.peerRefusal(peer)
+	}
+	return peer, nil
 }
 
 // The child re-arms an EVFILT_PROC parent watcher during its own startup.

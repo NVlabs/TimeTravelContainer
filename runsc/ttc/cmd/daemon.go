@@ -198,6 +198,9 @@ type daemonRequest struct {
 	DistributedLeaf bool `json:"distributed_leaf,omitempty"`
 	// AutomaticPlacement says the entry daemon chose PlacementNode itself.
 	AutomaticPlacement bool `json:"automatic_placement,omitempty"`
+	// Requester is who asked for the request, which the daemon its client
+	// connected to says; see daemonRequester.
+	Requester *daemonRequester `json:"requester,omitempty"`
 }
 
 func (r daemonRequest) streamsClientFrames() bool {
@@ -339,6 +342,8 @@ type daemonServer struct {
 	// noCPUIDFaulting is set in a cluster whose systrap nodes need no CPUID
 	// faulting; they run systrap without syscall patching.
 	noCPUIDFaulting bool
+	// access says who may use the daemon besides its owner.
+	access daemonAccess
 	// routeHints has the node of each family that a command was last routed
 	// to: see routingPlacements.
 	routeHints routeHints
@@ -2938,6 +2943,7 @@ func directBackend(opts options, stdin io.Reader, stdout, stderr io.Writer) *run
 		explicitInitStops:     new(atomic.Int32),
 		// A cluster whose nodes need no CPUID faulting runs them so.
 		disableSyscallPatching: opts.disableSyscallPatching,
+		requester:              opts.requester,
 	}
 }
 
@@ -4090,6 +4096,7 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	runtimePlatform := defaultRuntimePlatform
 	unsafeNoHostIsolation := false
 	allowNetworkRoot := false
+	accessGroup := ""
 	clusterOpts := defaultDaemonClusterOptions()
 	for len(args) != 0 {
 		switch {
@@ -4116,6 +4123,14 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 			runtimePlatform = strings.TrimPrefix(args[0], "--platform=")
 			args = args[1:]
 		default:
+			if consumed, err := consumeDaemonAccessOption(args, &accessGroup); consumed != 0 || err != nil {
+				if err != nil {
+					fmt.Fprintf(stderr, "ttcd: %v\n", err)
+					return 2
+				}
+				args = args[consumed:]
+				continue
+			}
 			if consumed, err := consumeDaemonCPUOption(args, &clusterOpts); consumed != 0 || err != nil {
 				if err != nil {
 					fmt.Fprintf(stderr, "ttcd: %v\n", err)
@@ -4137,6 +4152,15 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	if err := validateNoCPUIDFaultingOption(clusterOpts); err != nil {
+		fmt.Fprintf(stderr, "ttcd: %v\n", err)
+		return 2
+	}
+	if accessGroup != "" && clusterOpts.ControlHolder {
+		fmt.Fprintf(stderr, "ttcd: %s applies to a daemon that clients connect to, not to a control holder\n", unsafeAccessHostGroupOption)
+		return 2
+	}
+	access, err := resolveDaemonAccess(accessGroup)
+	if err != nil {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
 		return 2
 	}
@@ -4229,7 +4253,7 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "ttcd: preparing TTC_LOCAL_ROOT: %v\n", err)
 			return 1
 		}
-		if err := serveControlOnlyDaemon(socket, roots.shared, control, stdout, stderr); err != nil {
+		if err := serveControlOnlyDaemon(socket, roots.shared, control, access, stdout, stderr); err != nil {
 			fmt.Fprintf(stderr, "ttcd: %v\n", err)
 			return 1
 		}
@@ -4346,7 +4370,7 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	if clusterRuntime != nil {
 		cpuProfile = clusterRuntime.cpuProfile
 	}
-	if err := serveDaemonWithCluster(socket, runtimePlatform, cpuProfile, unsafeNoHostIsolation, kernelCompatibility, daemonDataRoot, roots.local, daemonRoot, daemonRunsc, manager.Capability(), clusterRuntime, gfx, stdout, stderr); err != nil {
+	if err := serveDaemonWithCluster(socket, runtimePlatform, cpuProfile, access, unsafeNoHostIsolation, kernelCompatibility, daemonDataRoot, roots.local, daemonRoot, daemonRunsc, manager.Capability(), clusterRuntime, gfx, stdout, stderr); err != nil {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
 		if errors.Is(err, errLeaseSelfFenced) {
 			fmt.Fprintln(stderr, "ttcd: restarting to wait for the cluster; this node's sandboxes stay stopped until it answers")
@@ -5858,26 +5882,6 @@ func parseClusterPeer(value string) (nodeID, baseURL, serverName string, err err
 	return nodeID, "http://" + host, "", nil
 }
 
-func secureDaemonDirectory(dir string) error {
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return fmt.Errorf("creating socket directory: %w", err)
-	}
-	info, err := os.Stat(dir)
-	if err != nil {
-		return fmt.Errorf("checking socket directory: %w", err)
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("socket parent %q is not a directory", dir)
-	}
-	if stat, ok := info.Sys().(*syscall.Stat_t); ok && int(stat.Uid) != os.Geteuid() {
-		return fmt.Errorf("socket directory %q is owned by UID %d, not %d", dir, stat.Uid, os.Geteuid())
-	}
-	if info.Mode().Perm()&0077 != 0 {
-		return fmt.Errorf("the daemon's root %q, which holds its socket, has permissions %04o that allow access by other users; make it private with chmod 700", dir, info.Mode().Perm())
-	}
-	return nil
-}
-
 type countingDaemonWriter struct {
 	writer io.Writer
 	bytes  int64
@@ -5951,18 +5955,20 @@ type controlOnlyDaemonServer struct {
 	portIngress  *portIngressManager
 	portMu       sync.Mutex
 	stopOnce     sync.Once
+	// access says who may use the daemon besides its owner.
+	access daemonAccess
 }
 
 // serveControlOnlyDaemon exposes only the local Unix API. It never opens a TCP
 // listener and never registers a cluster node, so compute nodes cannot select
 // it for placement or initiate a connection to it. While no compute daemon
 // runs, it runs a control holder, which listens only on loopback.
-func serveControlOnlyDaemon(socket, sharedRoot string, control *controlOnlyCluster, stdout, stderr io.Writer) error {
+func serveControlOnlyDaemon(socket, sharedRoot string, control *controlOnlyCluster, access daemonAccess, stdout, stderr io.Writer) error {
 	if control == nil {
 		return errors.New("control-only cluster is unavailable")
 	}
 	dir := filepath.Dir(socket)
-	if err := secureDaemonDirectory(dir); err != nil {
+	if err := secureDaemonDirectory(dir, access, stderr); err != nil {
 		return err
 	}
 	startLock, err := os.OpenFile(socket+".start.lock", os.O_CREATE|os.O_RDWR, 0600)
@@ -5994,13 +6000,13 @@ func serveControlOnlyDaemon(socket, sharedRoot string, control *controlOnlyClust
 	}
 	defer listener.Close()
 	defer os.Remove(socket)
-	if err := os.Chmod(socket, 0600); err != nil {
+	if err := secureDaemonSocket(socket, access); err != nil {
 		return fmt.Errorf("securing daemon socket: %w", err)
 	}
 	if err := syscall.Flock(int(startLock.Fd()), syscall.LOCK_UN); err != nil {
 		return fmt.Errorf("unlocking daemon startup: %w", err)
 	}
-	server := &controlOnlyDaemonServer{listener: listener, cluster: control, root: sharedRoot, localRoot: dir}
+	server := &controlOnlyDaemonServer{listener: listener, cluster: control, root: sharedRoot, localRoot: dir, access: access}
 	mutationRoot, err := os.MkdirTemp(dir, ".ttc-control-mutations-")
 	if err != nil {
 		return fmt.Errorf("creating control-only mutation journal: %w", err)
@@ -6185,7 +6191,8 @@ func proxyDaemonArchiveFile(peer *cluster.Client, request daemonRequest, archive
 
 func (s *controlOnlyDaemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	defer conn.Close()
-	if err := checkDaemonPeer(conn); err != nil {
+	socketPeer, err := checkDaemonPeer(conn, s.access)
+	if err != nil {
 		if serverErrors != nil {
 			fmt.Fprintf(serverErrors, "ttcd: rejecting peer: %v\n", err)
 		}
@@ -6209,6 +6216,27 @@ func (s *controlOnlyDaemonServer) handle(conn net.Conn, serverErrors io.Writer) 
 		_ = writeDaemonFrame(conn, &writeMu, daemonFrameStderr, []byte("ttcd: "+err.Error()+"\n"))
 		_ = writeDaemonStatus(conn, &writeMu, 1)
 	}
+	// The compute daemons this daemon forwards the request to take who asked
+	// for it from the request, which they hear from their own user: what a
+	// member's request says of it, the header this daemon forwards does not.
+	requester := requesterOf(socketPeer, request.Requester)
+	request.Requester = &requester
+	if encoded, err := json.Marshal(&request); err == nil {
+		header = string(append(encoded, '\n'))
+	} else {
+		writeError(err)
+		return
+	}
+	if err := ownerOnlyRefusal(request, requester); err != nil {
+		writeError(err)
+		return
+	}
+	if request.Action == "command" {
+		if err := memberHostPathRefusal(request.Args, requester); err != nil {
+			writeError(err)
+			return
+		}
+	}
 	archiveFile, err := daemonRequestArchiveFile(request, files)
 	if err != nil {
 		writeError(err)
@@ -6228,8 +6256,9 @@ func (s *controlOnlyDaemonServer) handle(conn net.Conn, serverErrors io.Writer) 
 		payload, _ := json.Marshal(map[string]any{
 			"version": daemonAPIVersion, "build_id": version.Version(), "features": daemonAPIFeatures,
 			"pid": os.Getpid(), "role": "control-only", "control_only": true,
-			"shared_root": s.root,
-			"cluster":     map[string]any{"control_only": true, "repository_id": s.cluster.repositoryID, "seeds": seeds},
+			"shared_root":  s.root,
+			"access_group": s.access.status(),
+			"cluster":      map[string]any{"control_only": true, "repository_id": s.cluster.repositoryID, "seeds": seeds},
 		})
 		_ = writeDaemonFrame(conn, &writeMu, daemonFrameStdout, append(payload, '\n'))
 		_ = writeDaemonStatus(conn, &writeMu, 0)
@@ -6619,10 +6648,10 @@ func serveDaemon(socket, runtimePlatform string, unsafeNoHostIsolation bool, ker
 	if err != nil {
 		return err
 	}
-	return serveDaemonWithCluster(socket, runtimePlatform, profile, unsafeNoHostIsolation, kernelCompatibility, dataRoot, dataRoot, root, runsc, volumeCapability, nil, gfxHost{unconfined: unsafeNoHostIsolation}, stdout, stderr)
+	return serveDaemonWithCluster(socket, runtimePlatform, profile, daemonAccess{}, unsafeNoHostIsolation, kernelCompatibility, dataRoot, dataRoot, root, runsc, volumeCapability, nil, gfxHost{unconfined: unsafeNoHostIsolation}, stdout, stderr)
 }
 
-func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPUProfile, unsafeNoHostIsolation bool, kernelCompatibility hostKernelCompatibility, dataRoot, localRoot, root, runsc string, volumeCapability ttcvolume.Capability, clusterRuntime *daemonClusterRuntime, gfx gfxHost, stdout, stderr io.Writer) (err error) {
+func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPUProfile, access daemonAccess, unsafeNoHostIsolation bool, kernelCompatibility hostKernelCompatibility, dataRoot, localRoot, root, runsc string, volumeCapability ttcvolume.Capability, clusterRuntime *daemonClusterRuntime, gfx gfxHost, stdout, stderr io.Writer) (err error) {
 	snapshotGraph, err := ttcsnapshot.Open(filepath.Join(localRoot, "catalog", "snapshot-graph"))
 	if err != nil {
 		return fmt.Errorf("opening TTC snapshot graph: %w", err)
@@ -6649,7 +6678,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 		defer clusterRuntime.authority.Close()
 	}
 	dir := filepath.Dir(socket)
-	if err := secureDaemonDirectory(dir); err != nil {
+	if err := secureDaemonDirectory(dir, access, stderr); err != nil {
 		return err
 	}
 	startLock, err := os.OpenFile(socket+".start.lock", os.O_CREATE|os.O_RDWR, 0600)
@@ -6680,7 +6709,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 	}
 	defer listener.Close()
 	defer os.Remove(socket)
-	if err := os.Chmod(socket, 0600); err != nil {
+	if err := secureDaemonSocket(socket, access); err != nil {
 		return fmt.Errorf("securing daemon socket: %w", err)
 	}
 	if err := syscall.Flock(int(startLock.Fd()), syscall.LOCK_UN); err != nil {
@@ -6693,6 +6722,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 		cpuProfileName:        cpuProfile.Mode,
 		cpuFeatures:           cpuProfile.annotation(),
 		noCPUIDFaulting:       cpuProfile.NoCPUIDFaulting,
+		access:                access,
 		unsafeNoHostIsolation: unsafeNoHostIsolation,
 		disableHostGSO:        kernelCompatibility.disableHostGSO,
 		hostKernelRelease:     kernelCompatibility.release,
@@ -7574,7 +7604,8 @@ func maintainRepositories(dataRoot, localRoot, runtimeRoot, runsc string, public
 
 func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	defer conn.Close()
-	if err := checkDaemonPeer(conn); err != nil {
+	socketPeer, err := checkDaemonPeer(conn, s.access)
+	if err != nil {
 		if serverErrors != nil {
 			fmt.Fprintf(serverErrors, "ttcd: rejecting peer: %v\n", err)
 		}
@@ -7597,6 +7628,20 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	writeError := func(err error) {
 		_ = writeDaemonFrame(conn, &writeMu, daemonFrameStderr, []byte("ttcd: "+err.Error()+"\n"))
 		_ = writeDaemonStatus(conn, &writeMu, 1)
+	}
+	// What the daemons this daemon forwards the request to know of who asked
+	// for it, they take from the request.
+	requester := requesterOf(socketPeer, request.Requester)
+	request.Requester = &requester
+	if err := ownerOnlyRefusal(request, requester); err != nil {
+		writeError(err)
+		return
+	}
+	if request.Action == "command" {
+		if err := memberHostPathRefusal(request.Args, requester); err != nil {
+			writeError(err)
+			return
+		}
 	}
 	archiveFile, err := daemonRequestArchiveFile(request, files)
 	if err != nil {
@@ -7661,6 +7706,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			"host_kernel_release":      s.hostKernelRelease,
 			"host_gso_enabled":         !s.disableHostGSO,
 			"host_cpuid_faulting":      hostSupportsCPUIDFaulting(),
+			"access_group":             s.access.status(),
 			"data_root":                s.dataRoot,
 			"shared_root":              s.dataRoot,
 			"local_root":               s.localRoot,
@@ -7689,6 +7735,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	case "stop":
 		if request.ManageStop {
 			opts := s.optionsFromRequest()
+			opts.requester = &requester
 			backend := directBackend(opts, strings.NewReader(""), io.Discard,
 				daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStderr})
 			s.configureCommandBackend(backend)
@@ -8101,6 +8148,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	go receiveDaemonInput(reader, stdinWriter, request.Stdin, terminalInput)
 
 	opts := s.optionsFromRequest()
+	opts.requester = &requester
 	cleanArgs, leaseKey, takeover, err := daemonAttachStdinLease(opts, request.Args, request.Stdin)
 	if err != nil {
 		stdinReader.Close()
@@ -8378,7 +8426,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			}
 		}
 		if !forwarded {
-			s.recordCommandEvents(opts.dataRoot, request.Args, status, mutationBackend.resolvedFamilies)
+			s.recordCommandEvents(opts.dataRoot, request.Args, status, mutationBackend.resolvedFamilies, request.Requester)
 		}
 		if status == 0 && !forwarded {
 			// Publication runs outside the lifecycle lock. It may unplace a
@@ -8444,7 +8492,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	}
 	// What the command changed, it resolves anew after.
 	backend.claimedAuthority.discard()
-	s.recordCommandEvents(opts.dataRoot, request.Args, status, backend.resolvedFamilies)
+	s.recordCommandEvents(opts.dataRoot, request.Args, status, backend.resolvedFamilies, request.Requester)
 	if status == 0 {
 		if err := s.reclaimCompletedLifecycleTargets(backend, request.Args); err != nil {
 			fmt.Fprintf(backend.stderr, "ttcd: claiming completed rehydration placement: %v\n", err)
@@ -9567,7 +9615,7 @@ func exchangeDaemon(conn net.Conn, request daemonRequest, stdin io.Reader, stdou
 	}
 }
 
-func startDaemonProcess(socket, runtimePlatform string, unsafeNoHostIsolation bool, clusterOpts daemonClusterOptions) (string, <-chan error, error) {
+func startDaemonProcess(socket, runtimePlatform string, unsafeNoHostIsolation bool, accessGroup string, clusterOpts daemonClusterOptions) (string, <-chan error, error) {
 	if err := os.MkdirAll(filepath.Dir(socket), 0700); err != nil {
 		return "", nil, fmt.Errorf("creating daemon directory: %w", err)
 	}
@@ -9589,6 +9637,9 @@ func startDaemonProcess(socket, runtimePlatform string, unsafeNoHostIsolation bo
 		return "", nil, fmt.Errorf("ttc build %q does not match %s", version.Version(), strings.TrimSpace(string(output)))
 	}
 	commandArgs := []string{"--socket", socket}
+	if accessGroup != "" {
+		commandArgs = append(commandArgs, unsafeAccessHostGroupOption, accessGroup)
+	}
 	if !clusterOpts.ControlOnly {
 		commandArgs = append(commandArgs, "--platform", runtimePlatform, "--cpu-profile", clusterOpts.CPUProfileMode)
 		if clusterOpts.CPUFeatures != "" {
@@ -9707,9 +9758,18 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 		return 2
 	}
 	clusterOpts := defaultDaemonClusterOptions()
+	accessGroup := ""
 	if len(args) != 0 && args[0] == "start" {
 		startArgs := args[1:]
 		for len(startArgs) != 0 {
+			if consumed, err := consumeDaemonAccessOption(startArgs, &accessGroup); consumed != 0 || err != nil {
+				if err != nil {
+					fmt.Fprintf(stderr, "ttc: %v\n", err)
+					return 2
+				}
+				startArgs = startArgs[consumed:]
+				continue
+			}
 			switch {
 			case startArgs[0] == "--platform":
 				if len(startArgs) < 2 || startArgs[1] == "" {
@@ -9802,7 +9862,7 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 		if opts.unsafeNoHostIsolation {
 			fmt.Fprintln(stderr, "ttc: warning: "+daemonNoHostIsolationWarning)
 		}
-		logPath, processDone, err := startDaemonProcess(opts.daemonSocket, opts.runtimePlatform, opts.unsafeNoHostIsolation, clusterOpts)
+		logPath, processDone, err := startDaemonProcess(opts.daemonSocket, opts.runtimePlatform, opts.unsafeNoHostIsolation, accessGroup, clusterOpts)
 		if err != nil {
 			fmt.Fprintf(stderr, "ttc: %v\n", err)
 			return 1

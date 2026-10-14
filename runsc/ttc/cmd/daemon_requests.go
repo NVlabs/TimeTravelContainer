@@ -69,7 +69,7 @@ func runDaemonMutationList(dataRoot string, args []string, stdout, stderr io.Wri
 		return writeDaemonMutationJSON(stdout, records)
 	}
 	table := tabwriter.NewWriter(stdout, 0, 4, 2, 32, 0)
-	fmt.Fprintln(table, "REQUEST ID\tSTATE\tOUTCOME\tSTATUS\tCREATED\tCOMMAND")
+	fmt.Fprintln(table, "REQUEST ID\tSTATE\tOUTCOME\tSTATUS\tCREATED\tREQUESTER\tCOMMAND")
 	for _, record := range records {
 		status := "-"
 		if record.State == "completed" {
@@ -83,7 +83,7 @@ func runDaemonMutationList(dataRoot string, args []string, stdout, stderr io.Wri
 		if command == "" {
 			command = "<legacy record>"
 		}
-		fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\n", record.RequestID, record.State, outcome, status, record.CreatedAt.Format(time.RFC3339), command)
+		fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", record.RequestID, record.State, outcome, status, record.CreatedAt.Format(time.RFC3339), mutationRequesterName(record), command)
 	}
 	if err := table.Flush(); err != nil {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
@@ -125,7 +125,19 @@ func runDaemonMutationInspect(dataRoot string, args []string, stdout, stderr io.
 	if record.Note != "" {
 		fmt.Fprintf(stdout, "Note: %s\n", record.Note)
 	}
+	if record.Requester != nil {
+		fmt.Fprintf(stdout, "Requester: %s (UID %d)\n", requesterName(*record.Requester), record.Requester.UID)
+	}
 	return 0
+}
+
+// mutationRequesterName names who asked for record's request, which a record
+// written before ttcd recorded requesters does not say.
+func mutationRequesterName(record daemonMutationRecord) string {
+	if record.Requester == nil {
+		return "-"
+	}
+	return requesterName(*record.Requester)
 }
 
 func runDaemonMutationResolve(dataRoot string, args []string, stdout, stderr io.Writer) int {

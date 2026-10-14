@@ -1263,6 +1263,43 @@ unexpected `ttcd` crash does not terminate live Sentry sandboxes; after
 restarting the daemon, TTC reconciles those containers and their console/port
 sidecars.
 
+### Sharing a daemon with a group
+
+A daemon serves only the user it runs as, its owner. To share it with the
+members of a Unix group, such as a project's, start it with
+`--unsafe-access-host-group GROUP`, where GROUP is a group name or ID that
+the owner belongs to:
+
+```shell
+ttc daemon start --unsafe-access-host-group myproject
+```
+
+The daemon's root, `TTC_ROOT` or a cluster node's `TTC_LOCAL_ROOT`, becomes
+searchable by the group (mode 0710) and its socket usable by it (0660);
+nothing else in the root is. A member sets `TTC_ROOT` (and on a cluster node,
+`TTC_LOCAL_ROOT`) as the owner does, or passes `--daemon-socket`, and uses
+the daemon like the owner. Every container is the group's: a member can run,
+exec into, fork, migrate, stop, and remove any of them. A cluster's shared
+`TTC_ROOT` stays private: start each node and the gateway that members use
+with the option.
+
+The option is unsafe because a member's containers run as the owner. The
+daemon limits what a member can make it do as the owner: it opens no host
+path for a member, so a member cannot bind mount a host path, name an
+environment, label, or process file that `ttcd` would read, or have `ttcd`
+read or write a `cp`, checkpoint, restore, or image archive path. `ttc` reads
+a member's environment and label files and copies a member's files itself,
+with the member's own access. Only the owner can stop the daemon, stop or
+forget a cluster node, resolve an interrupted request, and restore a
+checkpoint, as a checkpoint's container may bind mount host paths. The daemon records
+who asked for each request in `ttc daemon requests`, as the requester of its
+events, and as `created_by` on each container. Run a shared daemon as a
+project account rather than a person's where you can.
+
+The option applies to the run it is given to: a daemon started without it
+makes its root private again. Members of the group must be able to search
+every directory above the root, about which the daemon warns.
+
 ## Driving TTC from programs
 
 Programs, scripts, and coding agents drive TTC through the same `ttc` client

@@ -88,6 +88,8 @@ type options struct {
 	// disableSyscallPatching runs systrap without syscall patching, as a
 	// cluster whose nodes need no CPUID faulting does.
 	disableSyscallPatching bool
+	// requester is who asked for the command, nil for the daemon's owner.
+	requester *daemonRequester
 }
 
 // Run executes ttc with args and returns a process exit status.
@@ -278,7 +280,7 @@ Commands:
   completion SHELL                 Generate Bash, Zsh, or Fish completion
   daemon start [--platform systrap|kvm] [--cpu-profile portable|host|explicit]
                [--cpu-features FEATURE,...] [--experimental-no-cpuid-faulting]
-               [--unsafe-no-host-isolation]
+               [--unsafe-no-host-isolation] [--unsafe-access-host-group GROUP]
                [--control-only]
                [--node NAME] [--listen ADDR] [--advertise HOST:PORT]
                [--memory-target SIZE]
@@ -883,7 +885,9 @@ func readKeyValueFiles(paths []string, kind string) ([]string, error) {
 	return values, nil
 }
 
-func collectEnvironment(fileNames, direct []string) ([]string, error) {
+// collectEnvironment collects a create's environment, filling a variable
+// that it names without a value with lookup.
+func collectEnvironment(fileNames, direct []string, lookup func(string) (string, bool)) ([]string, error) {
 	values, err := readKeyValueFiles(fileNames, "environment")
 	if err != nil {
 		return nil, err
@@ -895,7 +899,7 @@ func collectEnvironment(fileNames, direct []string) ([]string, error) {
 			return nil, fmt.Errorf("invalid environment variable %q", value)
 		}
 		if !hasValue {
-			if hostValue, ok := os.LookupEnv(name); ok {
+			if hostValue, ok := lookup(name); ok {
 				values[i] = name + "=" + hostValue
 			}
 		}
@@ -2028,7 +2032,11 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 			return err
 		}
 	}
-	envValues, err := collectEnvironment(envFiles, env)
+	requester := backendRequester(backend)
+	if err := memberFileRefusal(requester, envFiles, labelFiles); err != nil {
+		return err
+	}
+	envValues, err := collectEnvironment(envFiles, env, requester.environmentLookup())
 	if err != nil {
 		return err
 	}
@@ -2065,6 +2073,9 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	}
 	parsedMounts, err := parseMountRequests(volumes, mounts, tmpfsMounts)
 	if err != nil {
+		return err
+	}
+	if err := memberHostMountRefusal(requester, len(parsedMounts.host)); err != nil {
 		return err
 	}
 	logDriver, err := parseLogDriver(*logDriverValue, logOptions)
@@ -2311,7 +2322,11 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 			return err
 		}
 	}
-	envValues, err := collectEnvironment(envFiles, env)
+	requester := backendRequester(backend)
+	if err := memberFileRefusal(requester, envFiles, labelFiles); err != nil {
+		return err
+	}
+	envValues, err := collectEnvironment(envFiles, env, requester.environmentLookup())
 	if err != nil {
 		return err
 	}
@@ -2348,6 +2363,9 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	}
 	parsedMounts, err := parseMountRequests(volumes, mounts, tmpfsMounts)
 	if err != nil {
+		return err
+	}
+	if err := memberHostMountRefusal(requester, len(parsedMounts.host)); err != nil {
 		return err
 	}
 	logDriver, err := parseLogDriver(*logDriverValue, logOptions)
@@ -2836,6 +2854,9 @@ func runExec(args []string, stdout, stderr io.Writer, backend backend) error {
 		return err
 	}
 	usingProcess := *processPath != ""
+	if err := memberExecRefusal(backendRequester(backend), *processPath); err != nil {
+		return err
+	}
 	if (!usingProcess && fs.NArg() < 2) || (usingProcess && fs.NArg() != 1) {
 		return errors.New("usage: ttc exec [OPTIONS] CONTAINER@BRANCH COMMAND [ARG...] | ttc exec [OPTIONS] --process FILE CONTAINER@BRANCH")
 	}
@@ -6801,6 +6822,10 @@ type runtimeBackend struct {
 	// application may see FSGSBASE in the host's own CPUID and write GS
 	// itself, which systrap then keeps for it on every switch.
 	disableSyscallPatching bool
+	// requester is who asked for the command, nil for the daemon's owner: a
+	// member of the group the daemon is shared with may have it open no host
+	// path, and is recorded as the creator of the containers it asks for.
+	requester *daemonRequester
 	// clientGone is closed once the client's connection breaks.
 	clientGone <-chan struct{}
 	// archiveFile, if not nil, is the archive the client passed with its
@@ -8495,6 +8520,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 		AllocateSnapshotOrigins: filesystemOrigins,
 		SnapshotManagedVolume:   b.snapshotManagedVolume,
 		ClaimID:                 b.makingFamily.claimer(b),
+		CreatedBy:               b.containerCreator(),
 	})
 	if err != nil {
 		return containerRunResult{}, errors.Join(err, finishFilesystemOrigins(false))
@@ -8677,6 +8703,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 		AllocateSnapshotOrigins: filesystemOrigins,
 		SnapshotManagedVolume:   b.snapshotManagedVolume,
 		ClaimID:                 b.makingFamily.claimer(b),
+		CreatedBy:               b.containerCreator(),
 	})
 	if err != nil {
 		return "", errors.Join(err, finishFilesystemOrigins(false))

@@ -550,6 +550,13 @@ func (s Store) prepareBranchBundle(name, branchID, filesystemBranch string, dist
 	return temp, cleanup, nil
 }
 
+// ContainerCreator is the user who asked a daemon for a container: its owner,
+// or a member of the group the daemon is shared with.
+type ContainerCreator struct {
+	UID  int    `json:"uid"`
+	User string `json:"user,omitempty"`
+}
+
 // PrepareOptions describes an image-backed OCI bundle.
 type PrepareOptions struct {
 	SpecOptions
@@ -588,6 +595,8 @@ type PrepareOptions struct {
 	// Empty permits Store-only callers to probe either supported mode.
 	VolumeCopyMode ttcvolume.CopyMode
 	NodeID         string
+	// CreatedBy is the user who asked for the container.
+	CreatedBy *ContainerCreator
 	// AllocateSnapshotOrigins returns globally monotonic working origins in
 	// cluster mode. Nil selects the standalone repository-local allocator.
 	AllocateSnapshotOrigins func(count uint32) ([]ttcsnapshot.SnapshotID, error)
@@ -661,6 +670,9 @@ type RestoreOptions struct {
 	RestorePaused    bool
 	CheckpointBranch string
 	NodeID           string
+	// CreatedBy is the user who asked for the restore, rather than the one
+	// the checkpoint names.
+	CreatedBy *ContainerCreator
 	// AllocateSnapshotOrigins allocates the working origins of a clustered
 	// node's repositories, as PrepareOptions' does.
 	AllocateSnapshotOrigins func(uint32) ([]ttcsnapshot.SnapshotID, error)
@@ -915,6 +927,7 @@ type ContainerInfo struct {
 	OOMKilled                    bool                             `json:"oom_killed,omitempty"`
 	ExitError                    string                           `json:"exit_error,omitempty"`
 	CreatedAt                    time.Time                        `json:"created_at"`
+	CreatedBy                    *ContainerCreator                `json:"created_by,omitempty"`
 	StartedAt                    *time.Time                       `json:"started_at,omitempty"`
 	ExitedAt                     *time.Time                       `json:"exited_at,omitempty"`
 	DistributedForkTransactionID string                           `json:"distributed_fork_transaction_id,omitempty"`
@@ -1833,6 +1846,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		RootfsUpperCopyMode: opts.RootfsUpperCopyMode,
 		State:               "created",
 		CreatedAt:           time.Now().UTC(),
+		CreatedBy:           opts.CreatedBy,
 		NodeID:              opts.NodeID,
 	}
 	metadata.Branches = []BranchInfo{{ID: "main", NodeID: opts.NodeID, FilesystemBranch: ttcvolume.MainBranch, State: "created", StorageState: "local", CreatedAt: metadata.CreatedAt}}
@@ -2109,6 +2123,7 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 	metadata.OOMKilled = false
 	metadata.ExitError = ""
 	metadata.CreatedAt = now
+	metadata.CreatedBy = opts.CreatedBy
 	metadata.StartedAt = nil
 	metadata.ExitedAt = nil
 	metadata.Branches = []BranchInfo{{ID: "main", NodeID: opts.NodeID, FilesystemBranch: ttcvolume.MainBranch, State: "created", StorageState: "local", CreatedAt: now}}

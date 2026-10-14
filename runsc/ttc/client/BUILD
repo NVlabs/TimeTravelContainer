@@ -13,11 +13,13 @@ go_library(
     srcs = [
         "client.go",
         "host_darwin.go",
+        "host_files.go",
         "host_linux.go",
         "terminal.go",
     ],
     visibility = ["//runsc/ttc:__pkg__"],
     deps = [
+        "//runsc/ttc/copyhelper",
         "//runsc/ttc/protocol",
         "//runsc/version",
         "@org_golang_x_term//:go_default_library",
@@ -27,6 +29,9 @@ go_library(
 go_test(
     name = "client_test",
     size = "small",
-    srcs = ["client_test.go"],
+    srcs = [
+        "client_test.go",
+        "host_files_test.go",
+    ],
     library = ":client",
 )

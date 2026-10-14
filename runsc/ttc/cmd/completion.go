@@ -200,7 +200,7 @@ func completionCandidates(words []string, backend backend) ([]string, error) {
 			return []string{"request", "requests", "start", "status", "stop"}, nil
 		}
 		if rest[0] == "start" && len(rest) == 1 {
-			return []string{"--advertise", "--control-only", "--cpu-features", "--cpu-profile", "--experimental-no-cpuid-faulting", "--listen", "--memory-target", "--node", "--platform", "--unsafe-no-host-isolation"}, nil
+			return []string{"--advertise", "--control-only", "--cpu-features", "--cpu-profile", "--experimental-no-cpuid-faulting", "--listen", "--memory-target", "--node", "--platform", "--unsafe-access-host-group", "--unsafe-no-host-isolation"}, nil
 		}
 		if rest[0] == "start" && len(rest) == 2 && rest[1] == "--platform" {
 			return runtimePlatformCompletions(), nil

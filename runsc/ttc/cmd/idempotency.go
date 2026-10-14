@@ -35,6 +35,8 @@ type daemonMutationRecord struct {
 	CompletedAt time.Time `json:"completed_at,omitempty"`
 	Resolution  string    `json:"resolution,omitempty"`
 	Note        string    `json:"note,omitempty"`
+	// Requester is who asked for the request.
+	Requester *daemonRequester `json:"requester,omitempty"`
 }
 
 func newDaemonRequestID() (string, error) {
@@ -169,7 +171,7 @@ func beginDaemonMutation(dataRoot string, request daemonRequest) (daemonMutation
 	record = daemonMutationRecord{
 		Version: daemonMutationSchemaVersion, RequestID: request.RequestID,
 		Fingerprint: fingerprint, Command: append([]string(nil), request.Args...),
-		State: "pending", CreatedAt: time.Now().UTC(),
+		State: "pending", CreatedAt: time.Now().UTC(), Requester: request.Requester,
 	}
 	if err := journal.append(record); err != nil {
 		return daemonMutationRecord{}, false, fmt.Errorf("persisting daemon mutation intent: %w", err)

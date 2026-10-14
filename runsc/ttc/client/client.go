@@ -144,6 +144,15 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	args = normalizeEnvironmentImports(args)
 	args, err = normalizeHostPaths(args)
+	if err == nil {
+		args, err = readKeyValueFileOptions(args)
+	}
+	// ttcd opens no host path for a member of the group a daemon is shared
+	// with: ttc copies a member's files itself.
+	var finishCopy func(int) int
+	if err == nil && sharedDaemonMember(opts.socket) {
+		args, stdin, stdout, finishCopy, err = prepareMemberCopy(args, stdin, stdout, stderr)
+	}
 	if err != nil {
 		_ = closeCheckpoint()
 		_ = closeArchive()
@@ -161,6 +170,9 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "ttc: daemon transport: %v\n", err)
 		return 1
+	}
+	if finishCopy != nil {
+		status = finishCopy(status)
 	}
 	if closeErr != nil {
 		fmt.Fprintf(stderr, "ttc: closing image archive: %v\n", closeErr)
@@ -414,6 +426,14 @@ Options:
   --cpu-profile portable|host|explicit
                                   Guest CPU contract (default: portable)
   --cpu-features NAME,...         Required with explicit profile; no default
+  --unsafe-access-host-group GROUP
+                                  Share the daemon with the members of a Unix
+                                  group, by name or ID: its root becomes
+                                  searchable and its socket usable by the
+                                  group. A member can do through the daemon
+                                  what its user can, but open host paths,
+                                  stop it, restore checkpoints, or resolve
+                                  requests (default: none)
   --experimental-no-cpuid-faulting
                                   Create a cluster whose systrap nodes need no
                                   host CPUID faulting. Requires --cpu-profile

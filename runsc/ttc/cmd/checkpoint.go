@@ -845,6 +845,7 @@ func (b *runtimeBackend) restoreCheckpoint(source, name string) (id string, retE
 		RestorePaused:           manifest.RestorePaused,
 		CheckpointBranch:        manifest.SourceBranch,
 		NodeID:                  b.nodeID,
+		CreatedBy:               b.containerCreator(),
 		AllocateSnapshotOrigins: filesystemOrigins,
 	})
 	if err != nil {

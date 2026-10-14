@@ -25,12 +25,13 @@ import (
 	"gvisor.dev/gvisor/runsc/specutils"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/copyhelper"
+	"gvisor.dev/gvisor/runsc/ttc/protocol"
 )
 
 const (
 	copyContentsPAXKey   = "TTC.source-contents"
 	copyHelperArg        = "_cp-helper"
-	copyPreparedInputArg = "--ttc-prepared-input"
+	copyPreparedInputArg = protocol.CopyPreparedInput
 )
 
 // guestCopyHelper contains a Linux executable used for copy operations inside
