@@ -11,21 +11,41 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 )
 
 // maxNUMANodes is how many host memory nodes a node mask passed to the host
 // has room for: Linux's largest MAX_NUMNODES, 1024.
 const maxNUMANodes = 1024
 
-// bindChunkMapping binds the pages of the shared memory file mapped at addr
-// to the host memory node node, preferring it: the host falls back to other
-// nodes when it is full, as it does for a thread's own local node.
+// bindChunkMapping binds the pages of the shared memory file mapped at addr,
+// for length bytes, to the host memory node node, preferring it: the host
+// falls back to other nodes when it is full, as it does for a thread's own
+// local node.
 func bindChunkMapping(addr, length uintptr, node int) {
 	var mask [maxNUMANodes / 64]uint64
 	mask[node/64] |= 1 << (node % 64)
 	// Linux reads maxnode-1 bits of the mask; see mm/mempolicy.c:get_nodes().
 	if _, _, errno := unix.Syscall6(unix.SYS_MBIND, addr, length, uintptr(linux.MPOL_PREFERRED), uintptr(unsafe.Pointer(&mask[0])), maxNUMANodes+1, 0); errno != 0 {
 		log.Warningf("Binding MemoryFile chunk %#x to memory node %d failed: %v", addr, node, errno)
+	}
+}
+
+// bindFileRange binds the pages of fr of the shared memory file fd to the
+// host memory node node, as bindChunkMapping does, through a mapping of fr
+// alone: the binding is the file's, and outlives the mapping. Binding part of
+// a chunk's mapping would split it, and a file whose sparse units are bound
+// one by one, to nodes that alternate, could split the Sentry's mappings into
+// more than the host lets a process have (vm.max_map_count).
+func bindFileRange(fd uintptr, fr memmap.FileRange, node int) {
+	addr, _, errno := unix.Syscall6(unix.SYS_MMAP, 0, uintptr(fr.Length()), unix.PROT_NONE, unix.MAP_SHARED, fd, uintptr(fr.Start))
+	if errno != 0 {
+		log.Warningf("Mapping MemoryFile range %v to bind it to memory node %d failed: %v", fr, node, errno)
+		return
+	}
+	bindChunkMapping(addr, uintptr(fr.Length()), node)
+	if _, _, errno := unix.Syscall(unix.SYS_MUNMAP, addr, uintptr(fr.Length()), 0); errno != 0 {
+		log.Warningf("Failed to unmap mapping %#x of MemoryFile range %v: %v", addr, fr, errno)
 	}
 }
 

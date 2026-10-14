@@ -102,6 +102,11 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 			// AddressSpace.MapFile() on singleMapThreshold-aligned chunks so
 			// we can check ctx.Killed() reasonably frequently.
 			const singleMapThreshold = 1 << 30
+			if mf, ok := pma.file.(*pgalloc.MemoryFile); ok && mf.IsAsyncLoading() {
+				// Pages this maps that a remote fork or a restore has yet
+				// to load go where the task's own would.
+				mf.PlaceUnloaded(pseg.fileRangeOf(pmaMapAR), taskPlacement(ctx, pmaMapAR.Start))
+			}
 			if pmaMapAR.Length() <= singleMapThreshold {
 				if err := mm.as.MapFile(pmaMapAR.Start, pma.file, pseg.fileRangeOf(pmaMapAR), perms, platformEffect == memmap.PlatformEffectCommit); err != nil {
 					return err

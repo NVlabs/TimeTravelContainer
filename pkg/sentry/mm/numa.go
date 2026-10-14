@@ -4,6 +4,7 @@
 package mm
 
 import (
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -20,6 +21,16 @@ func placementOf(ctx context.Context, vma *vma, addr hostarch.Addr) pgalloc.NUMA
 		return pgalloc.NUMAPlacement{}
 	}
 	return policy.Placement(vma.numaPolicy, vma.numaNodemask, uint64(addr)>>hostarch.HugePageShift)
+}
+
+// taskPlacement returns where the pages of addr go by the memory policy of
+// the task of ctx alone, under a host CPU topology.
+func taskPlacement(ctx context.Context, addr hostarch.Addr) pgalloc.NUMAPlacement {
+	policy, ok := ctx.Value(pgalloc.CtxMemoryPolicy).(pgalloc.MemoryPolicy)
+	if !ok {
+		return pgalloc.NUMAPlacement{}
+	}
+	return policy.Placement(linux.MPOL_DEFAULT, 0, uint64(addr)>>hostarch.HugePageShift)
 }
 
 // PageNode returns the host memory node of the page at addr. If the page has

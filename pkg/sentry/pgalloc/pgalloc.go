@@ -1094,6 +1094,24 @@ type allocState struct {
 	recycled   bool
 	huge       bool
 	node       int32 // as chunkInfo.node
+	// numa is true if the allocation is either on node or, if node is 0, in
+	// chunks bound to no node: a chunk bound to a node holds only pages
+	// placed there.
+	numa bool
+}
+
+// newAllocState returns the state of an allocation of length bytes as opts
+// ask for.
+func (f *MemoryFile) newAllocState(length uint64, opts AllocOpts) allocState {
+	alloc := allocState{
+		length:     length,
+		opts:       opts,
+		willCommit: opts.Mode != AllocateUncommitted,
+		huge:       opts.Huge && f.opts.ExpectHugepages,
+		numa:       f.opts.NUMANodes != 0 && f.backing == nil,
+	}
+	alloc.node = f.placementNode(&alloc.opts)
+	return alloc
 }
 
 // Allocate returns a range of initially-zeroed pages of the given length, with
@@ -1110,13 +1128,7 @@ func (f *MemoryFile) Allocate(length uint64, opts AllocOpts) (memmap.FileRange, 
 		panic(fmt.Sprintf("invalid allocation length: %#x", length))
 	}
 
-	alloc := allocState{
-		length:     length,
-		opts:       opts,
-		willCommit: opts.Mode != AllocateUncommitted,
-		huge:       opts.Huge && f.opts.ExpectHugepages,
-	}
-	alloc.node = f.placementNode(&alloc.opts)
+	alloc := f.newAllocState(length, opts)
 
 	fr, err := f.findAllocatableAndMarkUsed(&alloc)
 	if err != nil {
@@ -1305,7 +1317,7 @@ func (f *MemoryFile) findAllocatableAndMarkUsed(alloc *allocState) (fr memmap.Fi
 			uwgap  unwasteGapIterator
 			nodeFR memmap.FileRange
 		)
-		if alloc.node != 0 {
+		if alloc.numa {
 			// Waste pages are committed already, wherever they are: only
 			// those of the node's chunks are on the node.
 			var ok bool
@@ -1319,7 +1331,7 @@ func (f *MemoryFile) findAllocatableAndMarkUsed(alloc *allocState) (fr memmap.Fi
 		}
 		if uwgap.Ok() {
 			alloc.recycled = true
-			if alloc.node != 0 {
+			if alloc.numa {
 				fr = nodeFR
 			} else if alloc.opts.Dir == BottomUp {
 				fr = memmap.FileRange{
@@ -1376,7 +1388,7 @@ retryFree:
 		ufgap  unfreeGapIterator
 		nodeFR memmap.FileRange
 	)
-	if alloc.node != 0 {
+	if alloc.numa {
 		var ok bool
 		if nodeFR, ok = findNodeGap(unfree, f.chunksLoad(), alloc.node, alloc.huge, alloc.length, alloc.opts.Dir); ok {
 			ufgap = unfree.FindGap(nodeFR.Start)
@@ -1395,7 +1407,7 @@ retryFree:
 		// Retry the allocation using new chunks.
 		goto retryFree
 	}
-	if alloc.node != 0 {
+	if alloc.numa {
 		fr = nodeFR
 	} else if alloc.opts.Dir == BottomUp {
 		fr = memmap.FileRange{
@@ -1443,7 +1455,7 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
 	if oldNrChunks != 0 {
 		// We can use free pages at the end of the current last chunk, if an
 		// allocation that asks for a node can (see findNodeGap).
-		if lastChunk := oldChunks[oldNrChunks-1]; lastChunk.huge == alloc.huge && (alloc.node == 0 || lastChunk.node == alloc.node) {
+		if lastChunk := oldChunks[oldNrChunks-1]; lastChunk.huge == alloc.huge && (!alloc.numa || lastChunk.node == alloc.node) {
 			if ufgap := unfree.FindGap(oldFileSize - 1); ufgap.Ok() {
 				tail = ufgap.Range().Length()
 			}

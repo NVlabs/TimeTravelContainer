@@ -79,6 +79,43 @@ func (f *MemoryFile) placementNode(opts *AllocOpts) int32 {
 	return int32(p.Node) + 1
 }
 
+// PlaceUnloaded asks for the pages of fr that an asynchronous load has yet to
+// start filling, with the rest of each sparse unit they are in, to go to p's
+// node: a page pulled into a remote fork, or loaded into a restored branch,
+// goes to the node of the task whose fault brings it in, as Linux puts a page
+// read from a file on the node of the task that faults it in. Pages loaded
+// or being loaded already stay where they are.
+func (f *MemoryFile) PlaceUnloaded(fr memmap.FileRange, p NUMAPlacement) {
+	node := f.placementNode(&AllocOpts{Placement: p})
+	if node == 0 || f.file == nil {
+		return
+	}
+	var loads []*asyncMemoryFileLoad
+	if amfl := f.asyncPageLoad.Load(); amfl != nil {
+		loads = append(loads, amfl)
+	}
+	if sparse := f.sparseAsyncLoads.Load(); sparse != nil {
+		loads = append(loads, *sparse...)
+	}
+	for _, amfl := range loads {
+		if fr.End <= amfl.minUnloaded.Load() {
+			continue
+		}
+		amfl.pf.mu.Lock()
+		for seg := amfl.unloaded.LowerBoundSegment(fr.Start); seg.Ok() && seg.Start() < fr.End; seg = seg.NextSegment() {
+			if ul := seg.ValuePtr(); ul.started || ul.placed {
+				continue
+			}
+			if seg.ValuePtr().unit == 0 {
+				seg = amfl.unloaded.Isolate(seg, fr)
+			}
+			seg.ValuePtr().placed = true
+			bindFileRange(f.file.Fd(), seg.Range(), int(node-1))
+		}
+		amfl.pf.mu.Unlock()
+	}
+}
+
 // adviseChunk advises the host of the pages of the chunk mapped at addr: of
 // their size, and of the node they are bound to.
 func (f *MemoryFile) adviseChunk(addr uintptr, huge bool, node int32) {

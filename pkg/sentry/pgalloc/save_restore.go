@@ -1506,6 +1506,10 @@ type aplUnloadedInfo struct {
 	// the first fault of a restored branch whose units lay in stream order
 	// loaded every unit of it.
 	unit uint64
+
+	// placed is true if the range is bound to a memory node already; see
+	// MemoryFile.PlaceUnloaded.
+	placed bool
 }
 
 type logicalChunkLoad struct {
@@ -3188,7 +3192,7 @@ func (aplUnloadedSetFunctions) ClearValue(ul *aplUnloadedInfo) {
 }
 
 func (aplUnloadedSetFunctions) Merge(fr1 memmap.FileRange, ul1 aplUnloadedInfo, fr2 memmap.FileRange, ul2 aplUnloadedInfo) (aplUnloadedInfo, bool) {
-	if ul1.off+fr1.Length() != ul2.off || ul1.logicalChunk != ul2.logicalChunk || ul1.unit != ul2.unit {
+	if ul1.off+fr1.Length() != ul2.off || ul1.logicalChunk != ul2.logicalChunk || ul1.unit != ul2.unit || ul1.placed != ul2.placed {
 		return aplUnloadedInfo{}, false
 	}
 	if ul1.started || ul2.started || len(ul1.waiters) != 0 || len(ul2.waiters) != 0 {
@@ -3206,6 +3210,7 @@ func (aplUnloadedSetFunctions) Split(fr memmap.FileRange, ul aplUnloadedInfo, sp
 		started:      ul.started,
 		logicalChunk: ul.logicalChunk,
 		unit:         ul.unit,
+		placed:       ul.placed,
 		// Setting cap(ul2.waiters) == len(ul2.waiters) makes ul2
 		// "copy-on-append", saving an allocation if ul2 is never appended-to.
 		// This is safe since existing elements in ul.waiters will never be

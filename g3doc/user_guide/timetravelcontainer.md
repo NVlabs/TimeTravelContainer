@@ -193,7 +193,11 @@ thread first touches it, unless `set_mempolicy` or `mbind` place it otherwise
 (`MPOL_PREFERRED`, `MPOL_BIND`, and `MPOL_INTERLEAVE` by huge page). A page
 copied on write after a fork goes to the node of the thread that writes it,
 while pages still shared stay where they are. Pages keep their nodes when a
-branch is checkpointed, dehydrated, rehydrated or forked. `get_mempolicy` with
+branch is checkpointed, dehydrated, rehydrated or forked on its node. A branch
+forked to another node pulls its pages as its threads touch them, and a page
+goes to the node of the thread whose touch pulls it in, with the rest of the
+megabyte pulled with it; pages pulled before any thread touches them go where
+the host puts them. `get_mempolicy` with
 `MPOL_F_NODE|MPOL_F_ADDR` and `move_pages` report the node a page is on; TTC
 does not migrate pages, so `MPOL_MF_MOVE` and `move_pages` move none. The host
 topology needs the systrap platform.

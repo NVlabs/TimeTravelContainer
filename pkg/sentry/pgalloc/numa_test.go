@@ -4,9 +4,14 @@
 package pgalloc
 
 import (
+	"bytes"
+	"os"
+	"strings"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 )
 
@@ -21,11 +26,7 @@ func newNUMATestMemoryFile(nodes int) *MemoryFile {
 // allocateOn allocates length bytes of f, as Allocate does, on node if valid.
 func allocateOn(t *testing.T, f *MemoryFile, length uint64, dir Direction, node int, valid bool) memmap.FileRange {
 	t.Helper()
-	alloc := allocState{
-		length: length,
-		opts:   AllocOpts{Dir: dir, Placement: NUMAPlacement{Valid: valid, Node: node}},
-	}
-	alloc.node = f.placementNode(&alloc.opts)
+	alloc := f.newAllocState(length, AllocOpts{Dir: dir, Placement: NUMAPlacement{Valid: valid, Node: node}})
 	fr, err := f.findAllocatableAndMarkUsed(&alloc)
 	if err != nil {
 		t.Fatalf("allocating %d bytes on node %d: %v", length, node, err)
@@ -90,13 +91,15 @@ func TestNUMAPlacementLargerThanAChunk(t *testing.T) {
 func TestNUMAPlacementUnplacedAndDisabled(t *testing.T) {
 	f := newNUMATestMemoryFile(2)
 	a := allocateOn(t, f, 2*page, BottomUp, 1, true)
-	// An allocation that asks for no node takes room on any.
-	if b := allocateOn(t, f, 2*page, BottomUp, 0, false); b.Start != a.End {
-		t.Errorf("an unplaced allocation is %v, want it after %v", b, a)
+	// An allocation that asks for no node takes room in chunks bound to
+	// none: a chunk bound to a node holds only pages placed there.
+	b := allocateOn(t, f, 2*page, BottomUp, 0, false)
+	if nodeOf(t, f, b) != 0 || b.Start/chunkSize == a.Start/chunkSize {
+		t.Errorf("an unplaced allocation is %v, in a chunk of node %d; want an unbound chunk", b, nodeOf(t, f, b)-1)
 	}
 	// A node the file does not have is none.
-	if fr := allocateOn(t, f, 2*page, BottomUp, 5, true); nodeOf(t, f, fr) != 2 {
-		t.Errorf("an allocation for a node the file does not place on is in chunk %d", fr.Start/chunkSize)
+	if fr := allocateOn(t, f, 2*page, BottomUp, 5, true); nodeOf(t, f, fr) != 0 || fr.Start != b.End {
+		t.Errorf("an allocation for a node the file does not place on is %v, want it after %v", fr, b)
 	}
 	off := newNUMATestMemoryFile(0)
 	if fr := allocateOn(t, off, 2*page, BottomUp, 1, true); nodeOf(t, off, fr) != 0 {
@@ -131,5 +134,79 @@ func TestMemoryPolicyPlacement(t *testing.T) {
 				t.Errorf("Placement() = %+v, want node %d (placed %t)", got, test.wantNode, test.wantPlaced)
 			}
 		})
+	}
+}
+
+// A sparse unit that a fault asks to place before it is loaded is bound once,
+// before its loader fills it.
+func TestPlaceUnloadedBindsAnUnloadedUnitOnce(t *testing.T) {
+	const pagesPerChunk = SparseChunkBytes / hostarch.PageSize
+	source, sourceFR := newRemoteTestMemoryFile(t, pagesPerChunk)
+	fillRemoteTestRange(t, source, sourceFR, bytes.Repeat([]byte{7}, int(sourceFR.Length())))
+	snapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: source, Range: sourceFR}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	pages, err := StartAsyncPagesFileLoadWithOpts(NewLoopbackRemoteReader(snapshot, SparseChunkBytes, 1, 2), nil, nil, AsyncPagesFileLoadOpts{DemandOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mf := newEmptyRemoteTestMemoryFile(t)
+	defer mf.Destroy()
+	// Node 0 exists on every host.
+	mf.opts.NUMANodes = 1
+	install := sparseTestInstall(1)
+	installation, err := mf.InstallSparseChunks([]SparseChunkInstall{install})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := installation.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	unit, ok := mf.SparseChunkRange(install.Object)
+	if !ok {
+		t.Fatal("installed chunk is not resident")
+	}
+	if err := mf.AttachSparseChunkPageLoad(pages, []RemoteLoadRange{{Target: unit, StreamOffset: 0}}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+	placed := func() bool {
+		amfl := (*mf.sparseAsyncLoads.Load())[0]
+		amfl.pf.mu.Lock()
+		defer amfl.pf.mu.Unlock()
+		seg := amfl.unloaded.FindSegment(unit.Start)
+		return seg.Ok() && seg.ValuePtr().placed && seg.Range() == unit
+	}
+	// The file's mappings, which a binding of part of one would split.
+	mappings := func() int {
+		maps, err := os.ReadFile("/proc/self/maps")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Count(string(maps), "ttc-remote-target-")
+	}
+	before := mappings()
+	// A page of the unit places all of it.
+	mf.PlaceUnloaded(memmap.FileRange{Start: unit.Start + hostarch.PageSize, End: unit.Start + 2*hostarch.PageSize}, NUMAPlacement{Valid: true, Node: 0})
+	if !placed() {
+		t.Fatal("the unit was not placed")
+	}
+	if after := mappings(); after != before {
+		t.Errorf("placing the unit made the file's %d mappings %d", before, after)
+	}
+	// Asking again changes nothing, and the unit loads as before.
+	mf.PlaceUnloaded(unit, NUMAPlacement{Valid: true, Node: 0})
+	dsts, err := mf.MapInternal(unit, hostarch.Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, unit.Length())
+	if _, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(got)), dsts); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, bytes.Repeat([]byte{7}, int(unit.Length()))) {
+		t.Fatal("the placed unit did not load its pages")
 	}
 }
