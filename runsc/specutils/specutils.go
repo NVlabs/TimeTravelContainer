@@ -138,6 +138,11 @@ const (
 
 // LINT.ThenChange(:Features)
 
+// MemoryFileTmpfsDir is where, in a sandbox's root, the tmpfs that holds its
+// application memory files is mounted, if config.Config.MemoryFileHugeTmpfs
+// asks for one.
+const MemoryFileTmpfsDir = "/memory-file"
+
 // ExePath must point to runsc binary, which is normally the same binary. It's
 // changed in tests that aren't linked in the same binary.
 var ExePath = hostExecutablePath()

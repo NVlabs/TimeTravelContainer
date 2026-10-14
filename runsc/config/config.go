@@ -376,6 +376,13 @@ type Config struct {
 	// AppHugePages enables support for application huge pages.
 	AppHugePages bool `flag:"app-huge-pages"`
 
+	// MemoryFileHugeTmpfs backs application memory with a file on a tmpfs
+	// that the sandbox mounts, with huge=within_size, in its own mount
+	// namespace, rather than with a memfd: the host's shmem_enabled, which
+	// decides whether a memfd gets transparent huge pages, is often never,
+	// while a tmpfs follows its own huge option.
+	MemoryFileHugeTmpfs bool `flag:"memory-file-huge-tmpfs"`
+
 	// NVProxy enables support for Nvidia GPUs.
 	NVProxy bool `flag:"nvproxy"`
 

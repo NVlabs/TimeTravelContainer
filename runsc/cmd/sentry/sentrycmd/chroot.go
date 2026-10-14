@@ -173,11 +173,35 @@ func setUpChroot(spec *specs.Spec, conf *config.Config) error {
 		return fmt.Errorf("error configuring chroot for RDMA sysfs: %w", err)
 	}
 
+	if conf.MemoryFileHugeTmpfs {
+		mountMemoryFileTmpfs(chroot)
+	}
+
 	if err := specutils.SafeMount("", chroot, "", unix.MS_REMOUNT|unix.MS_RDONLY|unix.MS_BIND, "", "/proc"); err != nil {
 		return fmt.Errorf("error remounting chroot in read-only: %v", err)
 	}
 
 	return sandboxsetup.PivotRoot(chroot)
+}
+
+// mountMemoryFileTmpfs mounts, at specutils.MemoryFileTmpfsDir in chroot, the
+// tmpfs on which the sandbox makes its application memory files. It is
+// mounted with huge=within_size: the host's shmem_enabled decides whether a
+// memfd gets transparent huge pages, and is often never, but not a tmpfs,
+// which follows its own option (unless shmem_enabled is deny). It is
+// executable, as application code runs from the memory file, and unlimited,
+// as the sandbox's memory limits apply to it as to a memfd. If it cannot be
+// mounted, the memory files are memfds, as they were.
+func mountMemoryFileTmpfs(chroot string) {
+	dir := filepath.Join(chroot, specutils.MemoryFileTmpfsDir)
+	if err := os.Mkdir(dir, 0700); err != nil {
+		log.Warningf("Application memory stays in memfds: creating %q: %v", dir, err)
+		return
+	}
+	if err := specutils.SafeMount("runsc-memory", dir, "tmpfs", unix.MS_NOSUID|unix.MS_NODEV, "huge=within_size,size=0,nr_inodes=0,mode=0700", "/proc"); err != nil {
+		log.Warningf("Application memory stays in memfds: mounting a huge-page tmpfs at %q: %v", dir, err)
+		_ = os.Remove(dir)
+	}
 }
 
 func tpuProxyUpdateChroot(hostRoot, chroot string, spec *specs.Spec, conf *config.Config) error {

@@ -4579,15 +4579,15 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 	if size, known := dentryCacheSize(); known {
 		dcache = []string{"--dcache=" + strconv.Itoa(size)}
 	}
-	wantHardened := append([]string{"--root", "/runtime", "--platform=" + defaultRuntimePlatform, "--panic-log=/runtime/sentry-panic.log", "--rootless=true", "--network=none", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}, dcache...)
+	wantHardened := append([]string{"--root", "/runtime", "--platform=" + defaultRuntimePlatform, "--panic-log=/runtime/sentry-panic.log", "--rootless=true", "--network=none", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory", "--memory-file-huge-tmpfs=true"}, dcache...)
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgs(); !reflect.DeepEqual(got, wantHardened) {
 		t.Errorf("hardened runsc args=%q, want %q", got, wantHardened)
 	}
-	wantHost := append([]string{"--root", "/runtime", "--platform=" + defaultRuntimePlatform, "--panic-log=/runtime/sentry-panic.log", "--rootless=true", "--network=host", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}, dcache...)
+	wantHost := append([]string{"--root", "/runtime", "--platform=" + defaultRuntimePlatform, "--panic-log=/runtime/sentry-panic.log", "--rootless=true", "--network=host", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory", "--memory-file-huge-tmpfs=true"}, dcache...)
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgsForNetwork("host"); !reflect.DeepEqual(got, wantHost) {
 		t.Errorf("host-network runsc args=%q, want %q", got, wantHost)
 	}
-	wantTTCNAT := append(append([]string{"--root", "/runtime", "--platform=" + defaultRuntimePlatform, "--panic-log=/runtime/sentry-panic.log", "--rootless=true", "--network=ttc", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}, dcache...), "--ttc-network-nat=true")
+	wantTTCNAT := append(append([]string{"--root", "/runtime", "--platform=" + defaultRuntimePlatform, "--panic-log=/runtime/sentry-panic.log", "--rootless=true", "--network=ttc", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory", "--memory-file-huge-tmpfs=true"}, dcache...), "--ttc-network-nat=true")
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgsForNetworkNAT("ttc", true); !reflect.DeepEqual(got, wantTTCNAT) {
 		t.Errorf("TTC NAT runsc args=%q, want %q", got, wantTTCNAT)
 	}
@@ -4597,7 +4597,7 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 	}
 	wantUnsafe := append([]string{
 		"--root", "/runtime", "--platform=" + defaultRuntimePlatform, "--panic-log=/runtime/sentry-panic.log", "--rootless=false", "--unsafe-no-host-isolation=true",
-		"--network=none", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory",
+		"--network=none", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory", "--memory-file-huge-tmpfs=true",
 	}, dcache...)
 	if got := (&runtimeBackend{root: "/runtime", unsafeNoHostIsolation: true}).configuredRunscArgs(); !reflect.DeepEqual(got, wantUnsafe) {
 		t.Errorf("unsafe runsc args=%q, want %q", got, wantUnsafe)

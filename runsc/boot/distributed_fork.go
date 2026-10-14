@@ -353,9 +353,9 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		if l.distributedMemoryFile == nil {
 			return nil, errors.New("distributed target has no reserved application memory file")
 		}
-		reservedMemoryFile := l.distributedMemoryFile
-		l.distributedMemoryFile = nil
-		targetMF, err = createMemoryFileFromFile(l.root.conf.AppHugePages, l.hostTHP, reservedMemoryFile, false)
+		reservedMemoryFile, reservedHuge := l.distributedMemoryFile, l.distributedMemoryFileHuge
+		l.distributedMemoryFile, l.distributedMemoryFileHuge = nil, false
+		targetMF, err = createMemoryFileFromFile(l.root.conf.AppHugePages, hugeTmpfsTHP(l.hostTHP, reservedHuge), reservedMemoryFile, false)
 		if err == nil {
 			p, err = l.restoredKernelPlatform()
 		}

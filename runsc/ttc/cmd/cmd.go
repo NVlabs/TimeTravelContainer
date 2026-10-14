@@ -12236,7 +12236,12 @@ func (b *runtimeBackend) configuredRunscArgsForNetworkConfig(networkMode string,
 		// TTC treats container identities as guest-only state and prioritizes
 		// compatibility with Docker images that use helpers such as sudo.
 		"--allow-suid=true",
-		"--overlay2=all:memory")
+		"--overlay2=all:memory",
+		// Application memory on a huge-page tmpfs of the sandbox's own: a
+		// memfd's pages are huge only where the host's shmem_enabled allows
+		// it, which is never on the hosts EDA tools run on, and without huge
+		// pages their large heaps lose a fifth of their speed to TLB misses.
+		"--memory-file-huge-tmpfs=true")
 	if size, known := dentryCacheSize(); known {
 		// One cache for the sandbox rather than one per mount, so that what it
 		// costs the gofer does not grow with the number of things mounted.

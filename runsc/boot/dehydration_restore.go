@@ -156,9 +156,9 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 		if l.distributedMemoryFile == nil {
 			return nil, errors.New("dehydration target has no reserved application memory file")
 		}
-		reservedMemoryFile := l.distributedMemoryFile
-		l.distributedMemoryFile = nil
-		mainMF, err = createMemoryFileFromFile(l.root.conf.AppHugePages, l.hostTHP, reservedMemoryFile, false)
+		reservedMemoryFile, reservedHuge := l.distributedMemoryFile, l.distributedMemoryFileHuge
+		l.distributedMemoryFile, l.distributedMemoryFileHuge = nil, false
+		mainMF, err = createMemoryFileFromFile(l.root.conf.AppHugePages, hugeTmpfsTHP(l.hostTHP, reservedHuge), reservedMemoryFile, false)
 		if err == nil {
 			p, err = l.restoredKernelPlatform()
 		}

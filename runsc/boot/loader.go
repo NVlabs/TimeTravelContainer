@@ -267,6 +267,10 @@ type Loader struct {
 	// to the restored Kernel in restoreDistributedFork or dehydration restore.
 	distributedMemoryFile *os.File
 
+	// distributedMemoryFileHuge is whether distributedMemoryFile is on the
+	// sandbox's huge-page tmpfs: see createApplicationMemoryFile.
+	distributedMemoryFileHuge bool
+
 	// restoring is set while a durable dehydration's restore, or a
 	// distributed fork's or migration's, installs a branch image into an
 	// unstarted sandbox, which holds mu for as long as that takes: in
@@ -828,14 +832,14 @@ func New(args Args) (*Loader, error) {
 	if specutils.TTCDistributedTarget(args.Spec) {
 		_, reusesPlatform := p.(platform.RestoreReuser)
 		if !reusesPlatform {
-			fd, err := memutil.CreateMemFD("ttc-reserved-application-memory", 0)
+			file, huge, err := createApplicationMemoryFile(args.Conf, "ttc-reserved-application-memory")
 			if err != nil {
 				return nil, fmt.Errorf("creating reserved application memory file: %w", err)
 			}
-			l.distributedMemoryFile = os.NewFile(uintptr(fd), "ttc-reserved-application-memory")
+			l.distributedMemoryFile, l.distributedMemoryFileHuge = file, huge
 		}
 	}
-	mf, err := createMemoryFileForPlatform(p, args.Conf.AppHugePages, args.HostTHP)
+	mf, err := createBootMemoryFileForPlatform(p, args.Conf, args.HostTHP)
 	if err != nil {
 		return nil, fmt.Errorf("creating memory file: %w", err)
 	}
@@ -1360,6 +1364,55 @@ func createMemoryFile(appHugePages bool, hostTHP HostTHP) (*pgalloc.MemoryFile, 
 		return nil, fmt.Errorf("error creating memfd: %w", err)
 	}
 	return createMemoryFileFromFile(appHugePages, hostTHP, os.NewFile(uintptr(memfd), memfileName), false)
+}
+
+// createBootMemoryFileForPlatform is createMemoryFileForPlatform for the
+// application memory file a sandbox makes as it boots, which can be on the
+// sandbox's huge-page tmpfs: see createApplicationMemoryFile.
+func createBootMemoryFileForPlatform(p platform.Platform, conf *config.Config, hostTHP HostTHP) (*pgalloc.MemoryFile, error) {
+	if _, ok := p.(memoryFileBackingPlatform); ok {
+		return createMemoryFileForPlatform(p, conf.AppHugePages, hostTHP)
+	}
+	file, huge, err := createApplicationMemoryFile(conf, "runsc-memory")
+	if err != nil {
+		return nil, err
+	}
+	return createMemoryFileFromFile(conf.AppHugePages, hugeTmpfsTHP(hostTHP, huge), file, false)
+}
+
+// createApplicationMemoryFile returns a new, empty application memory file,
+// and whether it is on the sandbox's huge-page tmpfs, which it is if conf
+// asks for one and the sandbox mounted it (see mountMemoryFileTmpfs), and
+// which it is otherwise a memfd. It must be called before the sandbox's
+// seccomp filters are installed, which need not allow opening the file.
+func createApplicationMemoryFile(conf *config.Config, name string) (*os.File, bool, error) {
+	if conf.MemoryFileHugeTmpfs {
+		var fs unix.Statfs_t
+		if err := unix.Statfs(specutils.MemoryFileTmpfsDir, &fs); err != nil || fs.Type != unix.TMPFS_MAGIC {
+			log.Infof("Application memory file %s is a memfd: no huge-page tmpfs at %s (%v)", name, specutils.MemoryFileTmpfsDir, err)
+		} else if fd, err := unix.Open(specutils.MemoryFileTmpfsDir, unix.O_TMPFILE|unix.O_RDWR|unix.O_CLOEXEC, 0600); err != nil {
+			log.Warningf("Application memory file %s is a memfd: creating it on the huge-page tmpfs at %s: %v", name, specutils.MemoryFileTmpfsDir, err)
+		} else {
+			log.Infof("Application memory file %s is on the huge-page tmpfs at %s", name, specutils.MemoryFileTmpfsDir)
+			return os.NewFile(uintptr(fd), name), true, nil
+		}
+	}
+	fd, err := memutil.CreateMemFD(name, 0)
+	if err != nil {
+		return nil, false, fmt.Errorf("error creating memfd: %w", err)
+	}
+	return os.NewFile(uintptr(fd), name), false, nil
+}
+
+// hugeTmpfsTHP returns hostTHP as it applies to an application memory file
+// on the sandbox's huge-page tmpfs, if huge is true: the file's pages are
+// huge within its size, as a memfd's are where the host's shmem_enabled is
+// within_size, unless the host denies or forces huge pages for every tmpfs.
+func hugeTmpfsTHP(hostTHP HostTHP, huge bool) HostTHP {
+	if huge && hostTHP.ShmemEnabled != "deny" && hostTHP.ShmemEnabled != "force" {
+		hostTHP.ShmemEnabled = "within_size"
+	}
+	return hostTHP
 }
 
 type memoryFileBackingPlatform interface {
