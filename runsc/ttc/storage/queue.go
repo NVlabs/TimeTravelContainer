@@ -263,10 +263,22 @@ func (q *Queue) cancel(container, branch, publicationID string) (committed bool,
 	if endAttempt := q.attempts[id]; endAttempt != nil {
 		endAttempt()
 	}
+	// A cancellation that cleans up itself holds the intent against the
+	// worker, which cleans up after the canceled intents it finds too, and
+	// may have finished this one since it was read.
+	cleanUp := false
+	if !inFlight && readErr == nil && intent.ID != "" {
+		if current, err := q.read(id + ".json"); err == nil {
+			intent, cleanUp = current, true
+			q.inFlight[id] = struct{}{}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			readErr = err
+		}
+	}
 	q.mu.Unlock()
 	// The worker owns cleanup once publication has started. It observes the
 	// durable cancellation fence before completing or retrying the intent.
-	if !inFlight && readErr == nil && intent.ID != "" {
+	if cleanUp {
 		if cleanupErr := q.publisher.Cleanup(intent); cleanupErr != nil {
 			readErr = cleanupErr
 			intent.Attempts++
@@ -278,6 +290,9 @@ func (q *Queue) cancel(container, branch, publicationID string) (committed bool,
 		} else if err := q.finishCancellation(id); err != nil {
 			readErr = err
 		}
+		q.mu.Lock()
+		delete(q.inFlight, id)
+		q.mu.Unlock()
 	}
 	if !inFlight && (readErr == nil || errors.Is(readErr, os.ErrNotExist)) && intent.ID == "" {
 		if err := os.Remove(q.path("canceled", id)); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -480,6 +495,18 @@ func (q *Queue) process() time.Duration {
 	next := time.Hour
 	for _, intent := range intents {
 		q.mu.Lock()
+		// A cancellation may hold the intent, or have finished it, since it
+		// was listed: act on it as it is now, read under the lock.
+		if _, active := q.inFlight[intent.ID]; active {
+			q.mu.Unlock()
+			continue
+		}
+		current, err := q.read(intent.ID + ".json")
+		if err != nil {
+			q.mu.Unlock()
+			continue
+		}
+		intent = current
 		if intent.RetryAt.After(now) {
 			q.mu.Unlock()
 			if delay := time.Until(intent.RetryAt); delay < next {
