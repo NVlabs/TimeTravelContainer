@@ -181,6 +181,7 @@ go_library(
         "//pkg/sync",
         "//pkg/sync/locking",
         "//pkg/usermem",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )
 

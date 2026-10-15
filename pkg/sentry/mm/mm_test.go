@@ -23,6 +23,7 @@ import (
 	"os"
 	"testing"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -902,6 +903,48 @@ func TestLiveForkCopiesA2MiBPageWhole(t *testing.T) {
 		t.Fatalf("the parent's owned page is %+v at %+v, want %+v at a new version", id, version, parentID)
 	}
 	checkHugePageContents(ctx, t, parent, base)
+}
+
+// noRoomAddressSpace refuses mappings, as a host that has no room for another
+// (vm.max_map_count) does, until it unmaps some.
+type noRoomAddressSpace struct {
+	platform.AddressSpace
+	full    bool
+	refused int
+}
+
+// MapFile implements platform.AddressSpace.MapFile.
+func (as *noRoomAddressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRange, at hostarch.AccessType, precommit bool) error {
+	if as.full {
+		as.refused++
+		return fmt.Errorf("stub syscall failed with %w", unix.ENOMEM)
+	}
+	return as.AddressSpace.MapFile(addr, f, fr, at, precommit)
+}
+
+// Unmap implements platform.AddressSpace.Unmap.
+func (as *noRoomAddressSpace) Unmap(addr hostarch.Addr, length uint64) {
+	as.full = false
+	as.AddressSpace.Unmap(addr, length)
+}
+
+// A fault on a host that has no room for another mapping, as small, scattered
+// pmas leave a host whose vm.max_map_count is low, unmaps the address space,
+// which faults then map again, rather than failing.
+func TestFaultMapsWhenTheHostRunsOutOfMappings(t *testing.T) {
+	ctx := contexttest.Context(t)
+	memMgr := testMemoryManager(ctx, t)
+	defer memMgr.DecUsers(ctx)
+	addr := populatedPrivateMapping(ctx, t, memMgr, hostarch.PageSize)
+	as := &noRoomAddressSpace{AddressSpace: memMgr.as, full: true}
+	memMgr.as = as
+	defer func() { memMgr.as = as.AddressSpace }()
+	if err := memMgr.HandleUserFault(ctx, addr, hostarch.Read, 0); err != nil {
+		t.Fatalf("a fault with no room for a mapping failed: %v", err)
+	}
+	if as.refused != 1 || as.full {
+		t.Fatalf("the host refused %d mappings and has room %t; want one refusal, then room", as.refused, !as.full)
+	}
 }
 
 // A remote fork's target installs a 2 MiB page whole, in an aligned 2 MiB

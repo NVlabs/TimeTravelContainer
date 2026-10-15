@@ -18,8 +18,10 @@
 package mm
 
 import (
+	"errors"
 	"fmt"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -108,7 +110,7 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 				mf.PlaceUnloaded(pseg.fileRangeOf(pmaMapAR), taskPlacement(ctx, pmaMapAR.Start))
 			}
 			if pmaMapAR.Length() <= singleMapThreshold {
-				if err := mm.as.MapFile(pmaMapAR.Start, pma.file, pseg.fileRangeOf(pmaMapAR), perms, platformEffect == memmap.PlatformEffectCommit); err != nil {
+				if err := mm.mapFileLocked(pmaMapAR.Start, pma.file, pseg.fileRangeOf(pmaMapAR), perms, platformEffect == memmap.PlatformEffectCommit); err != nil {
 					return err
 				}
 				if ctx.Killed() {
@@ -118,7 +120,7 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 				for windowStart := pmaMapAR.Start &^ (singleMapThreshold - 1); windowStart < pmaMapAR.End; windowStart += singleMapThreshold {
 					windowAR := hostarch.AddrRange{windowStart, windowStart + singleMapThreshold}
 					thisMapAR := pmaMapAR.Intersect(windowAR)
-					if err := mm.as.MapFile(thisMapAR.Start, pma.file, pseg.fileRangeOf(thisMapAR), perms, platformEffect == memmap.PlatformEffectCommit); err != nil {
+					if err := mm.mapFileLocked(thisMapAR.Start, pma.file, pseg.fileRangeOf(thisMapAR), perms, platformEffect == memmap.PlatformEffectCommit); err != nil {
 						return err
 					}
 					if ctx.Killed() {
@@ -130,6 +132,24 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 		pseg = pseg.NextSegment()
 	}
 	return nil
+}
+
+// mapFileLocked is mm.as.MapFile, but if the host has no room for another
+// mapping (ENOMEM), it unmaps all of the address space, which faults map
+// again, and tries once more. A platform that maps each pma with a host
+// mapping of its own runs out of them on a host whose vm.max_map_count is
+// low: copy-on-write that copies scattered 4 KiB pages leaves a pma for each,
+// and a fork's random writes over 1 GB of them took all 262144 of a host's,
+// failing its next fault with SIGSEGV.
+//
+// Preconditions: mm.activeMu must be locked.
+func (mm *MemoryManager) mapFileLocked(addr hostarch.Addr, f memmap.File, fr memmap.FileRange, at hostarch.AccessType, precommit bool) error {
+	err := mm.as.MapFile(addr, f, fr, at, precommit)
+	if errors.Is(err, unix.ENOMEM) {
+		mm.unmapASLocked(mm.applicationAddrRange())
+		err = mm.as.MapFile(addr, f, fr, at, precommit)
+	}
+	return err
 }
 
 // unmapASLocked removes all AddressSpace mappings for addresses in ar.
