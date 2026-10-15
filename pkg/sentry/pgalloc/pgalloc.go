@@ -464,6 +464,24 @@ func (f *MemoryFile) LogicalPageRanges(fr memmap.FileRange) []LogicalPageRange {
 //
 // The caller must retain references on sourceFR and targetFR for this call.
 func (f *MemoryFile) AdoptCOWIdentities(source *MemoryFile, sourceFR, targetFR memmap.FileRange) error {
+	return f.takeIdentities(source, sourceFR, targetFR, false)
+}
+
+// MoveIdentities replaces the fresh logical identities on targetFR with the
+// logical page identities and content versions of sourceFR: targetFR holds
+// what sourceFR does, moved there rather than copied to be written, as when a
+// huge page's worth of private pages are gathered into one huge page. The
+// pages of sourceFR keep theirs until they are freed. sourceFR and targetFR
+// must have equal, non-zero, page-aligned lengths.
+//
+// The caller must retain references on sourceFR and targetFR for this call.
+func (f *MemoryFile) MoveIdentities(source *MemoryFile, sourceFR, targetFR memmap.FileRange) error {
+	return f.takeIdentities(source, sourceFR, targetFR, true)
+}
+
+// takeIdentities implements AdoptCOWIdentities and, if keepVersions,
+// MoveIdentities.
+func (f *MemoryFile) takeIdentities(source *MemoryFile, sourceFR, targetFR memmap.FileRange, keepVersions bool) error {
 	if source == nil || !sourceFR.WellFormed() || !targetFR.WellFormed() ||
 		sourceFR.Length() == 0 || sourceFR.Length() != targetFR.Length() ||
 		!hostarch.IsPageAligned(sourceFR.Start) || !hostarch.IsPageAligned(sourceFR.End) ||
@@ -496,7 +514,7 @@ func (f *MemoryFile) AdoptCOWIdentities(source *MemoryFile, sourceFR, targetFR m
 	if cursor != targetFR.End {
 		return fmt.Errorf("target CoW identity range %v ends at %#x", targetFR, cursor)
 	}
-	if pages > math.MaxUint64-f.nextPageVersion {
+	if !keepVersions && pages > math.MaxUint64-f.nextPageVersion {
 		return fmt.Errorf("page version sequence exhausted for CoW range %v", targetFR)
 	}
 	f.logicalPages.RemoveFullRange(targetFR)
@@ -504,15 +522,21 @@ func (f *MemoryFile) AdoptCOWIdentities(source *MemoryFile, sourceFR, targetFR m
 	for _, run := range sourceRuns {
 		destStart := targetFR.Start + (run.Range.Start - sourceFR.Start)
 		dest := memmap.FileRange{Start: destStart, End: destStart + run.Range.Length()}
-		f.logicalPages.InsertRange(dest, logicalPageInfo{
+		info := logicalPageInfo{
 			Allocator:            run.First.Allocator,
 			FirstSequence:        run.First.Sequence,
 			VersionAllocator:     f.logicalAllocator,
 			FirstVersionSequence: nextVersion,
-		})
+		}
+		if keepVersions {
+			info.VersionAllocator, info.FirstVersionSequence = run.FirstVersion.Allocator, run.FirstVersion.Sequence
+		}
+		f.logicalPages.InsertRange(dest, info)
 		nextVersion += run.Range.Length() / hostarch.PageSize
 	}
-	f.nextPageVersion += pages
+	if !keepVersions {
+		f.nextPageVersion += pages
+	}
 	return nil
 }
 

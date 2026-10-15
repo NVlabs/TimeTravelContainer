@@ -217,7 +217,14 @@ nothing.
 Containers' memory is backed by huge pages where the host allows them: each
 sandbox keeps its memory in a file on a private tmpfs mounted with
 `huge=within_size`, so a host whose `shmem_enabled` is `never` still gives them
-2 MiB pages.
+2 MiB pages. A branch and its fork share their pages until one writes, and a
+write copies only the page it writes, so that they diverge no further than
+their writes do; the copies are small pages. Once a branch has written every
+page of a huge page's worth of its memory, the copies are gathered back into
+one huge page. A branch forked to another node, or rehydrated, maps the pages
+it pulls with small pages, and gathers them into huge pages as it writes them.
+`ttc stats` shows how much of the containers' memory the host maps with huge
+pages.
 
 ## Compile
 

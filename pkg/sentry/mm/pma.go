@@ -576,6 +576,18 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 					if err != nil && pseg.End() < ar.End {
 						return pstart, pseg.NextGap(), err
 					}
+					// The copy may have made private the last pages of the
+					// huge pages' worth of the address space that it is in.
+					if err == nil && !huge && mm.mf.HugepagesEnabled() {
+						last := copyAR.End - hostarch.PageSize
+						gathered := mm.gatherHugeLocked(ctx, vseg, copyAR.Start, &unmapAR, &pfdrs)
+						if last.HugeRoundDown() != copyAR.Start.HugeRoundDown() {
+							gathered = mm.gatherHugeLocked(ctx, vseg, last, &unmapAR, &pfdrs) || gathered
+						}
+						if gathered {
+							pseg = mm.pmas.FindSegment(last)
+						}
+					}
 					// Ensure pseg and pgap are correct for the next iteration
 					// of the loop.
 					pseg, pgap = pseg.NextNonEmpty()
@@ -744,6 +756,113 @@ func (mm *MemoryManager) adoptCOWIdentitiesLocked(pseg pmaIterator, ar hostarch.
 		}
 	}
 	return nil
+}
+
+// gatherHugeLocked moves the huge page's worth of the address space around
+// addr into one huge page, if every page of it is private memory that mm alone
+// holds, and reports whether it did. Copy-on-write copies a page at a time,
+// each where the allocator finds room, so a fork's random writes left it
+// mapped with small pages, which random accesses reached a third to a half
+// more slowly than the huge pages it shared before, even where it had since
+// copied every page.
+// Moving a page changes nothing in it, so each keeps its identity and its
+// content version: the fork diverges from its source no further than its
+// writes took it. A part of the address space shared with a fork, or not
+// entirely private, is left as it is.
+//
+// Preconditions:
+//   - mm.mappingMu must be locked.
+//   - mm.activeMu must be locked for writing.
+//   - vseg.Range().Contains(addr).
+//   - The caller unmaps *unmapAR from the AddressSpace and then releases
+//     *pfdrs.
+func (mm *MemoryManager) gatherHugeLocked(ctx context.Context, vseg vmaIterator, addr hostarch.Addr, unmapAR *hostarch.AddrRange, pfdrs **pendingFileDecRefs) bool {
+	vma := vseg.ValuePtr()
+	if !vma.private || vma.effectivePerms.Execute || vma.growsDown || vma.isStack {
+		return false
+	}
+	block := hostarch.AddrRange{Start: addr.HugeRoundDown()}
+	end, ok := block.Start.AddLength(hostarch.HugePageSize)
+	if !ok || !vseg.Range().IsSupersetOf(hostarch.AddrRange{Start: block.Start, End: end}) {
+		return false
+	}
+	block.End = end
+	first := mm.pmas.FindSegment(block.Start)
+	if !first.Ok() {
+		return false
+	}
+	// Walk from the block's start and stop at the first page that is not
+	// private, so that a block that scattered writes copy a page at a time
+	// costs little until its last page is copied.
+	covered := block.Start
+	inHugePage := true
+	var prevEnd uint64
+	for seg := first; covered < block.End; seg = seg.NextSegment() {
+		if !seg.Ok() || seg.Start() > covered {
+			return false
+		}
+		p := seg.ValuePtr()
+		if !p.private || p.needCOW {
+			return false
+		}
+		fr := seg.fileRangeOf(seg.Range().Intersect(block))
+		if !p.huge || (covered == block.Start && fr.Start%hostarch.HugePageSize != 0) || (covered != block.Start && fr.Start != prevEnd) {
+			// Copies are small pages, even where they happen to be
+			// contiguous.
+			inHugePage = false
+		}
+		prevEnd = fr.End
+		covered = seg.End()
+	}
+	if inHugePage {
+		return false
+	}
+	for seg := first; seg.Ok() && seg.Start() < block.End; seg = seg.NextSegment() {
+		if err := seg.getInternalMappingsLocked(); err != nil {
+			return false
+		}
+	}
+	reader := safemem.BlockSeqReader{Blocks: mm.internalMappingsLocked(first, block)}
+	fr, err := mm.mf.Allocate(hostarch.HugePageSize, pgalloc.AllocOpts{
+		Kind:       usage.Anonymous,
+		MemCgID:    pgalloc.MemoryCgroupIDFromContext(ctx),
+		Mode:       pgalloc.AllocateAndWritePopulate,
+		Huge:       true,
+		ReaderFunc: reader.ReadToBlocks,
+		Placement:  placementOf(ctx, vma, block.Start),
+	})
+	if err != nil || fr.Length() != hostarch.HugePageSize || fr.Start%hostarch.HugePageSize != 0 {
+		// Only a whole, aligned huge page is worth the move.
+		if fr.Length() != 0 {
+			mm.mf.DecRef(fr)
+		}
+		return false
+	}
+	for seg := first; seg.Ok() && seg.Start() < block.End; seg = seg.NextSegment() {
+		segAR := seg.Range().Intersect(block)
+		target := memmap.FileRange{
+			Start: fr.Start + uint64(segAR.Start-block.Start),
+			End:   fr.Start + uint64(segAR.End-block.Start),
+		}
+		if err := mm.mf.MoveIdentities(mm.mf, seg.fileRangeOf(segAR), target); err != nil {
+			mm.mf.DecRef(fr)
+			return false
+		}
+	}
+	for seg := first; seg.Ok() && seg.Start() < block.End; seg = seg.NextSegment() {
+		*pfdrs = appendPendingFileDecRef(*pfdrs, seg.ValuePtr().file, seg.fileRangeOf(seg.Range().Intersect(block)))
+	}
+	*unmapAR = joinAddrRanges(*unmapAR, block)
+	mm.pmas.Insert(mm.pmas.RemoveRange(block), block, pma{
+		file:           mm.mf,
+		off:            fr.Start,
+		translatePerms: hostarch.AnyAccess,
+		effectivePerms: vma.effectivePerms,
+		maxPerms:       vma.maxPerms,
+		private:        true,
+		huge:           true,
+	})
+	return true
 }
 
 func hugepageAligned(ar hostarch.AddrRange) hostarch.AddrRange {
