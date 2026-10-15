@@ -248,6 +248,7 @@ go_test(
     name = "pgalloc_test",
     size = "small",
     srcs = [
+        "huge_page_test.go",
         "numa_test.go",
         "pgalloc_64k_test.go",
         "pgalloc_test.go",

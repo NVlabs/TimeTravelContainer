@@ -378,12 +378,18 @@ func (f *MemoryFile) chunksLoad() []chunkInfo {
 	return *f.chunks.Load()
 }
 
-// assignLogicalPagesLocked assigns fresh, never-reused identities to fr.
+// assignLogicalPagesLocked assigns fresh, never-reused identities to fr, in
+// 2 MiB pages if huge and fr is aligned to them; see logicalPageInfo.Huge.
 //
 // Preconditions: f.mu must be locked and fr must contain newly allocated pages.
-func (f *MemoryFile) assignLogicalPagesLocked(fr memmap.FileRange) {
+func (f *MemoryFile) assignLogicalPagesLocked(fr memmap.FileRange, huge bool) {
+	huge = huge && hostarch.IsHugePageAligned(fr.Start) && hostarch.IsHugePageAligned(fr.End)
+	if huge {
+		f.nextLogicalPage = alignSequence(f.nextLogicalPage)
+		f.nextPageVersion = alignSequence(f.nextPageVersion)
+	}
 	pages := fr.Length() / hostarch.PageSize
-	if pages == 0 || pages > math.MaxUint64-f.nextLogicalPage || pages > math.MaxUint64-f.nextPageVersion {
+	if pages == 0 || pages > hugeSequenceBit-f.nextLogicalPage || pages > hugeSequenceBit-f.nextPageVersion {
 		panic(fmt.Sprintf("logical page sequence exhausted for allocation %v", fr))
 	}
 	f.logicalPages.InsertRange(fr, logicalPageInfo{
@@ -391,9 +397,72 @@ func (f *MemoryFile) assignLogicalPagesLocked(fr memmap.FileRange) {
 		FirstSequence:        f.nextLogicalPage,
 		VersionAllocator:     f.logicalAllocator,
 		FirstVersionSequence: f.nextPageVersion,
+		Huge:                 huge,
 	})
 	f.nextLogicalPage += pages
 	f.nextPageVersion += pages
+}
+
+// alignSequence returns the first sequence, from seq on, that a 2 MiB page can
+// start at; see logicalPageInfo.Huge.
+func alignSequence(seq uint64) uint64 {
+	if rem := seq % pagesPerHugePage; rem != 0 && seq <= math.MaxUint64-pagesPerHugePage {
+		return seq + pagesPerHugePage - rem
+	}
+	return seq
+}
+
+// HugePageAt returns the 2 MiB page that the page at off is part of, if it is
+// one of a 2 MiB page; see logicalPageInfo.Huge.
+func (f *MemoryFile) HugePageAt(off uint64) (memmap.FileRange, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if seg := f.logicalPages.FindSegment(off); !seg.Ok() || !seg.ValuePtr().Huge {
+		return memmap.FileRange{}, false
+	}
+	start := hostarch.HugePageRoundDown(off)
+	return memmap.FileRange{Start: start, End: start + hostarch.HugePageSize}, true
+}
+
+// SplitPartlyCoveredHugePages splits each 2 MiB page that fr covers in part
+// into its base pages, which keep their identities and versions, for a caller
+// that takes that part of it on its own; see splitHugePagesLocked.
+func (f *MemoryFile) SplitPartlyCoveredHugePages(fr memmap.FileRange) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.splitPartlyCoveredHugePagesLocked(fr)
+}
+
+// splitHugePagesLocked splits each 2 MiB page that fr is in, wholly or in
+// part, into its base pages, which keep their identities and versions: a 2 MiB
+// page that is freed in part, or that is written by one that maps only part of
+// it, stops being one page, as Linux splits a huge page that is unmapped or
+// written in part. Each base page is then copied, versioned and transferred on
+// its own.
+//
+// Preconditions: f.mu must be locked.
+func (f *MemoryFile) splitHugePagesLocked(fr memmap.FileRange) {
+	whole := memmap.FileRange{Start: hostarch.HugePageRoundDown(fr.Start), End: hostarch.MustHugePageRoundUp(fr.End)}
+	for seg := f.logicalPages.LowerBoundSegment(whole.Start); seg.Ok() && seg.Start() < whole.End; seg = seg.NextSegment() {
+		if !seg.ValuePtr().Huge {
+			continue
+		}
+		// whole is aligned to 2 MiB pages, so the pages around it stay whole.
+		seg = f.logicalPages.Isolate(seg, whole)
+		seg.ValuePtr().Huge = false
+	}
+}
+
+// splitPartlyCoveredHugePagesLocked splits the 2 MiB pages that fr covers in
+// part, at its ends; see splitHugePagesLocked.
+//
+// Preconditions: f.mu must be locked.
+func (f *MemoryFile) splitPartlyCoveredHugePagesLocked(fr memmap.FileRange) {
+	for _, edge := range []uint64{fr.Start, fr.End} {
+		if !hostarch.IsHugePageAligned(edge) {
+			f.splitHugePagesLocked(memmap.FileRange{Start: edge, End: edge + 1})
+		}
+	}
 }
 
 // ensureLogicalPagesLocked synthesizes identities when loading a checkpoint
@@ -408,7 +477,7 @@ func (f *MemoryFile) ensureLogicalPagesLocked() {
 	assignUsed := func(set *unfreeSet) {
 		for seg := set.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
 			if seg.ValuePtr().refs != 0 {
-				f.assignLogicalPagesLocked(seg.Range())
+				f.assignLogicalPagesLocked(seg.Range(), false)
 			}
 		}
 	}
@@ -460,28 +529,13 @@ func (f *MemoryFile) LogicalPageRanges(fr memmap.FileRange) []LogicalPageRange {
 // AdoptCOWIdentities replaces the fresh logical identities on targetFR with
 // the logical page identities from sourceFR and fresh content-version IDs.
 // This makes a physical CoW copy another version of the same logical pages.
+// A 2 MiB page that sourceFR holds whole stays one page, with one new version,
+// where it is copied to 2 MiB of targetFR that was allocated as one (see
+// AllocOpts.LogicalHugePages); the rest are base pages, each with its own.
 // sourceFR and targetFR must have equal, non-zero, page-aligned lengths.
 //
 // The caller must retain references on sourceFR and targetFR for this call.
 func (f *MemoryFile) AdoptCOWIdentities(source *MemoryFile, sourceFR, targetFR memmap.FileRange) error {
-	return f.takeIdentities(source, sourceFR, targetFR, false)
-}
-
-// MoveIdentities replaces the fresh logical identities on targetFR with the
-// logical page identities and content versions of sourceFR: targetFR holds
-// what sourceFR does, moved there rather than copied to be written, as when a
-// huge page's worth of private pages are gathered into one huge page. The
-// pages of sourceFR keep theirs until they are freed. sourceFR and targetFR
-// must have equal, non-zero, page-aligned lengths.
-//
-// The caller must retain references on sourceFR and targetFR for this call.
-func (f *MemoryFile) MoveIdentities(source *MemoryFile, sourceFR, targetFR memmap.FileRange) error {
-	return f.takeIdentities(source, sourceFR, targetFR, true)
-}
-
-// takeIdentities implements AdoptCOWIdentities and, if keepVersions,
-// MoveIdentities.
-func (f *MemoryFile) takeIdentities(source *MemoryFile, sourceFR, targetFR memmap.FileRange, keepVersions bool) error {
 	if source == nil || !sourceFR.WellFormed() || !targetFR.WellFormed() ||
 		sourceFR.Length() == 0 || sourceFR.Length() != targetFR.Length() ||
 		!hostarch.IsPageAligned(sourceFR.Start) || !hostarch.IsPageAligned(sourceFR.End) ||
@@ -514,30 +568,69 @@ func (f *MemoryFile) takeIdentities(source *MemoryFile, sourceFR, targetFR memma
 	if cursor != targetFR.End {
 		return fmt.Errorf("target CoW identity range %v ends at %#x", targetFR, cursor)
 	}
-	if !keepVersions && pages > math.MaxUint64-f.nextPageVersion {
+	// Aligning each 2 MiB page's version skips fewer than one version per
+	// base page.
+	if 2*pages+pagesPerHugePage > hugeSequenceBit-f.nextPageVersion {
 		return fmt.Errorf("page version sequence exhausted for CoW range %v", targetFR)
 	}
-	f.logicalPages.RemoveFullRange(targetFR)
-	nextVersion := f.nextPageVersion
+	// The pages that stay 2 MiB pages, as runs of the source's: those that
+	// it holds whole where targetFR is aligned as sourceFR is.
+	aligned := hostarch.HugePageOffset(sourceFR.Start) == hostarch.HugePageOffset(targetFR.Start)
+	var pieces []LogicalPageRange
 	for _, run := range sourceRuns {
-		destStart := targetFR.Start + (run.Range.Start - sourceFR.Start)
-		dest := memmap.FileRange{Start: destStart, End: destStart + run.Range.Length()}
-		info := logicalPageInfo{
-			Allocator:            run.First.Allocator,
-			FirstSequence:        run.First.Sequence,
-			VersionAllocator:     f.logicalAllocator,
-			FirstVersionSequence: nextVersion,
+		whole := memmap.FileRange{Start: hostarch.MustHugePageRoundUp(run.Range.Start), End: hostarch.HugePageRoundDown(run.Range.End)}
+		if !run.Huge || !aligned || whole.Start >= whole.End ||
+			(run.First.Sequence+(whole.Start-run.Range.Start)/hostarch.PageSize)%pagesPerHugePage != 0 || !f.isHugeLocked(memmap.FileRange{
+			Start: targetFR.Start + (whole.Start - sourceFR.Start),
+			End:   targetFR.Start + (whole.End - sourceFR.Start),
+		}) {
+			run.Huge = false
+			pieces = append(pieces, run)
+			continue
 		}
-		if keepVersions {
-			info.VersionAllocator, info.FirstVersionSequence = run.FirstVersion.Allocator, run.FirstVersion.Sequence
+		for _, piece := range []LogicalPageRange{
+			{Range: memmap.FileRange{Start: run.Range.Start, End: whole.Start}},
+			{Range: whole, Huge: true},
+			{Range: memmap.FileRange{Start: whole.End, End: run.Range.End}},
+		} {
+			if piece.Range.Length() == 0 {
+				continue
+			}
+			piece.First = run.First
+			piece.First.Sequence += (piece.Range.Start - run.Range.Start) / hostarch.PageSize
+			pieces = append(pieces, piece)
 		}
-		f.logicalPages.InsertRange(dest, info)
-		nextVersion += run.Range.Length() / hostarch.PageSize
 	}
-	if !keepVersions {
-		f.nextPageVersion += pages
+	f.logicalPages.RemoveFullRange(targetFR)
+	for _, piece := range pieces {
+		if piece.Huge {
+			f.nextPageVersion = alignSequence(f.nextPageVersion)
+		}
+		destStart := targetFR.Start + (piece.Range.Start - sourceFR.Start)
+		f.logicalPages.InsertRange(memmap.FileRange{Start: destStart, End: destStart + piece.Range.Length()}, logicalPageInfo{
+			Allocator:            piece.First.Allocator,
+			FirstSequence:        piece.First.Sequence,
+			VersionAllocator:     f.logicalAllocator,
+			FirstVersionSequence: f.nextPageVersion,
+			Huge:                 piece.Huge,
+		})
+		f.nextPageVersion += piece.Range.Length() / hostarch.PageSize
 	}
 	return nil
+}
+
+// isHugeLocked returns true if fr is in 2 MiB pages.
+//
+// Preconditions: f.mu must be locked.
+func (f *MemoryFile) isHugeLocked(fr memmap.FileRange) bool {
+	huge := true
+	cursor := fr.Start
+	f.logicalPages.VisitRange(fr, func(seg logicalPageIterator) bool {
+		huge = seg.Start() <= cursor && seg.ValuePtr().Huge
+		cursor = seg.End()
+		return huge
+	})
+	return huge && cursor >= fr.End
 }
 
 // logicalPageRangesLocked is LogicalPageRanges without locking.
@@ -559,6 +652,7 @@ func (f *MemoryFile) logicalPageRangesLocked(fr memmap.FileRange) []LogicalPageR
 				Allocator: info.VersionAllocator,
 				Sequence:  info.FirstVersionSequence + pageDelta,
 			},
+			Huge: info.Huge,
 		})
 		return true
 	})
@@ -647,9 +741,19 @@ func (id LogicalPageID) Chunk() (LogicalChunkID, uint8) {
 // +stateify savable
 type logicalPageInfo struct {
 	Allocator            LogicalAllocatorID
-	FirstSequence        uint64
+	FirstSequence        uint64 `state:".(uint64)"`
 	VersionAllocator     LogicalAllocatorID
 	FirstVersionSequence uint64
+	// Huge is true if the segment's pages are 2 MiB pages, each one page with
+	// one identity and one version, which a copy, a version and a transfer
+	// take whole. The segment's range is then aligned to them, and so are the
+	// sequences of each: a 2 MiB page's 512 base pages have consecutive
+	// sequences, starting at a multiple of 512, so that a 2 MiB page that is
+	// split into base pages (see splitHugePagesLocked) keeps every page's
+	// identity and version.
+	//
+	// Huge is saved in FirstSequence; see saveFirstSequence.
+	Huge bool `state:"nosave"`
 }
 
 // LogicalPageRange describes a contiguous run of backing pages with contiguous
@@ -658,6 +762,9 @@ type LogicalPageRange struct {
 	Range        memmap.FileRange
 	First        LogicalPageID
 	FirstVersion PageVersionID
+	// Huge is true if Range is in 2 MiB pages, which it may cover in part; see
+	// logicalPageInfo.Huge.
+	Huge bool
 }
 
 // memAcctInfo is the value type of MemoryFile.memAcct.
@@ -1026,6 +1133,13 @@ type AllocOpts struct {
 	// If Huge is true, the allocation should be hugepage-backed if possible.
 	Huge bool
 
+	// If LogicalHugePages is true, as well as Huge, each 2 MiB of a
+	// hugepage-backed allocation is one page, with one identity and one
+	// content version, that copy-on-write, transfers and captures take whole;
+	// see logicalPageInfo.Huge. Anonymous memory is allocated so. The pages
+	// of files, which writes reach in part, are not.
+	LogicalHugePages bool
+
 	// Dir indicates the direction in which offsets are allocated.
 	Dir Direction
 
@@ -1337,38 +1451,17 @@ func (f *MemoryFile) findAllocatableAndMarkUsed(alloc *allocState) (fr memmap.Fi
 	if alloc.willCommit || alloc.length <= maxRecycledUncommittedBytes {
 		// Try to recycle waste pages, since this avoids the overhead of
 		// decommitting and then committing them again.
-		var (
-			uwgap  unwasteGapIterator
-			nodeFR memmap.FileRange
-		)
+		var ok bool
 		if alloc.numa {
 			// Waste pages are committed already, wherever they are: only
 			// those of the node's chunks are on the node.
-			var ok bool
-			if nodeFR, ok = findNodeGap(unwaste, f.chunksLoad(), alloc.node, alloc.huge, alloc.length, alloc.opts.Dir); ok {
-				uwgap = unwaste.FindGap(nodeFR.Start)
-			}
-		} else if alloc.opts.Dir == BottomUp {
-			uwgap = unwaste.FirstLargeEnoughGap(alloc.length)
+			fr, ok = findNodeGap(unwaste, f.chunksLoad(), alloc.node, alloc.huge, alloc.length, alloc.opts.Dir)
 		} else {
-			uwgap = unwaste.LastLargeEnoughGap(alloc.length)
+			fr, ok = findGap(unwaste, alloc.huge, alloc.length, alloc.opts.Dir)
 		}
-		if uwgap.Ok() {
+		if ok {
 			alloc.recycled = true
-			if alloc.numa {
-				fr = nodeFR
-			} else if alloc.opts.Dir == BottomUp {
-				fr = memmap.FileRange{
-					Start: uwgap.Start(),
-					End:   uwgap.Start() + alloc.length,
-				}
-			} else {
-				fr = memmap.FileRange{
-					Start: uwgap.End() - alloc.length,
-					End:   uwgap.End(),
-				}
-			}
-			unwaste.Insert(uwgap, fr, unwasteInfo{})
+			unwaste.Insert(unwaste.FindGap(fr.Start), fr, unwasteInfo{})
 			// Update reference count for these pages from 0 to 1.
 			unfree.MutateFullRange(fr, func(ufseg unfreeIterator) bool {
 				uf := ufseg.ValuePtr()
@@ -1400,7 +1493,7 @@ func (f *MemoryFile) findAllocatableAndMarkUsed(alloc *allocState) (fr memmap.Fi
 				ma.wasteOrReleasing = false
 				return true
 			})
-			f.assignLogicalPagesLocked(fr)
+			f.assignLogicalPagesLocked(fr, alloc.huge && alloc.opts.LogicalHugePages)
 			return
 		}
 	}
@@ -1408,21 +1501,13 @@ func (f *MemoryFile) findAllocatableAndMarkUsed(alloc *allocState) (fr memmap.Fi
 	// No suitable waste pages or we can't use them.
 retryFree:
 	// Try to allocate free pages from existing chunks.
-	var (
-		ufgap  unfreeGapIterator
-		nodeFR memmap.FileRange
-	)
+	var ok bool
 	if alloc.numa {
-		var ok bool
-		if nodeFR, ok = findNodeGap(unfree, f.chunksLoad(), alloc.node, alloc.huge, alloc.length, alloc.opts.Dir); ok {
-			ufgap = unfree.FindGap(nodeFR.Start)
-		}
-	} else if alloc.opts.Dir == BottomUp {
-		ufgap = unfree.FirstLargeEnoughGap(alloc.length)
+		fr, ok = findNodeGap(unfree, f.chunksLoad(), alloc.node, alloc.huge, alloc.length, alloc.opts.Dir)
 	} else {
-		ufgap = unfree.LastLargeEnoughGap(alloc.length)
+		fr, ok = findGap(unfree, alloc.huge, alloc.length, alloc.opts.Dir)
 	}
-	if !ufgap.Ok() {
+	if !ok {
 		// Extend the file to create more chunks.
 		err = f.extendChunksLocked(alloc)
 		if err != nil {
@@ -1431,20 +1516,7 @@ retryFree:
 		// Retry the allocation using new chunks.
 		goto retryFree
 	}
-	if alloc.numa {
-		fr = nodeFR
-	} else if alloc.opts.Dir == BottomUp {
-		fr = memmap.FileRange{
-			Start: ufgap.Start(),
-			End:   ufgap.Start() + alloc.length,
-		}
-	} else {
-		fr = memmap.FileRange{
-			Start: ufgap.End() - alloc.length,
-			End:   ufgap.End(),
-		}
-	}
-	unfree.Insert(ufgap, fr, unfreeInfo{refs: 1})
+	unfree.Insert(unfree.FindGap(fr.Start), fr, unfreeInfo{refs: 1})
 	// These pages should all be known-decommitted; mark them
 	// unknown-commitment, since they can be concurrently committed by the
 	// allocation's users at any time until deallocation.
@@ -1459,7 +1531,7 @@ retryFree:
 		knownCommitted: false,
 		commitSeq:      f.commitSeq,
 	})
-	f.assignLogicalPagesLocked(fr)
+	f.assignLogicalPagesLocked(fr, alloc.huge && alloc.opts.LogicalHugePages)
 	return
 }
 
@@ -1646,6 +1718,9 @@ func (f *MemoryFile) Decommit(fr memmap.FileRange) {
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// A 2 MiB page that is decommitted in part splits into base pages, as
+	// Linux splits a huge page that MADV_DONTNEED frees in part.
+	f.splitPartlyCoveredHugePagesLocked(fr)
 	f.memAcct.MutateFullRange(fr, func(maseg memAcctIterator) bool {
 		ma := maseg.ValuePtr()
 		if ma.knownCommitted {
@@ -1719,6 +1794,10 @@ func (f *MemoryFile) HasUniqueRef(fr memmap.FileRange) bool {
 // versions, and a later capture that found a page by its version would take
 // those bytes for whatever the page holds by then.
 //
+// A 2 MiB page is owned whole: one that fr covers in part is split into base
+// pages first (see splitHugePagesLocked), and fr should cover all of a 2 MiB
+// page that its caller is to write as one.
+//
 // Preconditions: At least one reference must be held on all pages in fr.
 func (f *MemoryFile) OwnForWrite(fr memmap.FileRange) bool {
 	f.mu.Lock()
@@ -1731,31 +1810,38 @@ func (f *MemoryFile) OwnForWrite(fr memmap.FileRange) bool {
 }
 
 // renewPageVersionsLocked gives fr's pages new content versions, keeping their
-// logical identities. A page without an identity gets a new one.
+// logical identities. A 2 MiB page takes one new version; one that fr covers
+// in part is split into base pages first. A page without an identity gets a
+// new one.
 //
 // Preconditions: f.mu must be locked.
 func (f *MemoryFile) renewPageVersionsLocked(fr memmap.FileRange) {
-	if pages := fr.Length() / hostarch.PageSize; pages > math.MaxUint64-f.nextPageVersion {
+	if pages := fr.Length()/hostarch.PageSize + pagesPerHugePage; pages > hugeSequenceBit-f.nextPageVersion {
 		panic(fmt.Sprintf("page version sequence exhausted for %v", fr))
 	}
+	f.splitPartlyCoveredHugePagesLocked(fr)
 	runs := f.logicalPageRangesLocked(fr)
 	f.logicalPages.RemoveRange(fr)
 	cursor := fr.Start
 	for _, run := range runs {
 		if run.Range.Start != cursor {
-			f.assignLogicalPagesLocked(memmap.FileRange{Start: cursor, End: run.Range.Start})
+			f.assignLogicalPagesLocked(memmap.FileRange{Start: cursor, End: run.Range.Start}, false)
+		}
+		if run.Huge {
+			f.nextPageVersion = alignSequence(f.nextPageVersion)
 		}
 		f.logicalPages.InsertRange(run.Range, logicalPageInfo{
 			Allocator:            run.First.Allocator,
 			FirstSequence:        run.First.Sequence,
 			VersionAllocator:     f.logicalAllocator,
 			FirstVersionSequence: f.nextPageVersion,
+			Huge:                 run.Huge,
 		})
 		f.nextPageVersion += run.Range.Length() / hostarch.PageSize
 		cursor = run.Range.End
 	}
 	if cursor != fr.End {
-		f.assignLogicalPagesLocked(memmap.FileRange{Start: cursor, End: fr.End})
+		f.assignLogicalPagesLocked(memmap.FileRange{Start: cursor, End: fr.End}, false)
 	}
 }
 
@@ -1833,8 +1919,12 @@ func (f *MemoryFile) DecRef(fr memmap.FileRange) {
 			}
 			uf.refs--
 			if uf.refs == 0 {
-				// Mark these pages as waste.
+				// Mark these pages as waste. A 2 MiB page that is freed
+				// in part splits into base pages, as Linux splits a huge
+				// page that is unmapped in part; the rest keep their
+				// identities and versions.
 				wasteFR := ufseg.Range()
+				f.splitPartlyCoveredHugePagesLocked(wasteFR)
 				f.logicalPages.RemoveRange(wasteFR)
 				unwaste.RemoveFullRange(wasteFR)
 				haveWaste = true
@@ -3031,7 +3121,7 @@ func (logicalPageSetFunctions) ClearValue(val *logicalPageInfo) {
 }
 
 func (logicalPageSetFunctions) Merge(r1 memmap.FileRange, val1 logicalPageInfo, r2 memmap.FileRange, val2 logicalPageInfo) (logicalPageInfo, bool) {
-	if val1.Allocator != val2.Allocator || val1.VersionAllocator != val2.VersionAllocator {
+	if val1.Allocator != val2.Allocator || val1.VersionAllocator != val2.VersionAllocator || val1.Huge != val2.Huge {
 		return logicalPageInfo{}, false
 	}
 	pages := r1.Length() / hostarch.PageSize
@@ -3045,6 +3135,13 @@ func (logicalPageSetFunctions) Split(r memmap.FileRange, val logicalPageInfo, sp
 	pages := (splitAt - r.Start) / hostarch.PageSize
 	right.FirstSequence += pages
 	right.FirstVersionSequence += pages
+	if val.Huge && !hostarch.IsHugePageAligned(splitAt) {
+		// Every caller that works on part of a 2 MiB page splits it into
+		// base pages first (splitHugePagesLocked), so that only it and
+		// nothing around it stops being one page. Should one not, both
+		// sides are base pages, which they hold the identities of.
+		val.Huge, right.Huge = false, false
+	}
 	return val, right
 }
 

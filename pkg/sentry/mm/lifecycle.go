@@ -187,17 +187,27 @@ func (mm *MemoryManager) copyForLiveForkLocked(pseg pmaIterator) (liveForkPMAEnt
 		return liveForkPMAEntry{}, err
 	}
 	ar := pseg.Range()
+	pma := pseg.ValuePtr()
+	source, isMF := pma.file.(*pgalloc.MemoryFile)
+	if isMF {
+		// The children share the rest of a 2 MiB page that pseg maps in
+		// part, which therefore splits, as Linux splits a huge page that a
+		// fork copies the pinned part of.
+		source.SplitPartlyCoveredHugePages(pseg.fileRange())
+	}
 	reader := safemem.BlockSeqReader{Blocks: mm.internalMappingsLocked(pseg, ar)}
+	huge := mm.mf.HugepagesEnabled() && ar.IsHugePageAligned()
 	fr, err := mm.mf.Allocate(uint64(ar.Length()), pgalloc.AllocOpts{
-		Kind:       usage.Anonymous,
-		Mode:       pgalloc.AllocateAndWritePopulate,
-		ReaderFunc: reader.ReadToBlocks,
+		Kind:             usage.Anonymous,
+		Mode:             pgalloc.AllocateAndWritePopulate,
+		Huge:             huge,
+		LogicalHugePages: huge,
+		ReaderFunc:       reader.ReadToBlocks,
 	})
 	if err == nil && fr.Length() != uint64(ar.Length()) {
 		err = fmt.Errorf("copied %d of %d bytes", fr.Length(), ar.Length())
 	}
-	pma := pseg.ValuePtr()
-	if source, ok := pma.file.(*pgalloc.MemoryFile); err == nil && ok {
+	if err == nil && isMF {
 		err = mm.mf.AdoptCOWIdentities(source, pseg.fileRange(), fr)
 	}
 	if err != nil {

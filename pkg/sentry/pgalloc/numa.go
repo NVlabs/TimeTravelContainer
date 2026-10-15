@@ -4,9 +4,11 @@
 package pgalloc
 
 import (
+	"math"
 	"math/bits"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 )
 
@@ -141,9 +143,45 @@ type largeEnoughGapSet[G any] interface {
 	UpperBoundLargeEnoughGap(max, minSize uint64) G
 }
 
+// fitGap returns the length bytes of [start, end) that an allocation in dir
+// takes, aligned to huge pages if huge: a huge allocation that straddled two
+// huge pages would be backed by neither, and its 2 MiB pages (see
+// AllocOpts.LogicalHugePages) could not be.
+func fitGap(start, end uint64, huge bool, length uint64, dir Direction) (memmap.FileRange, bool) {
+	if huge {
+		start, end = hostarch.MustHugePageRoundUp(start), hostarch.HugePageRoundDown(end)
+	}
+	if end <= start || end-start < length {
+		return memmap.FileRange{}, false
+	}
+	if dir == BottomUp {
+		return memmap.FileRange{Start: start, End: start + length}, true
+	}
+	return memmap.FileRange{Start: end - length, End: end}, true
+}
+
+// findGap returns length bytes of a gap of set, the first such in dir that
+// fitGap finds room in.
+func findGap[G gapIterator[G], S largeEnoughGapSet[G]](set S, huge bool, length uint64, dir Direction) (memmap.FileRange, bool) {
+	if dir == BottomUp {
+		for gap := set.LowerBoundLargeEnoughGap(0, length); gap.Ok(); gap = gap.NextLargeEnoughGap(length) {
+			if fr, ok := fitGap(gap.Start(), gap.End(), huge, length, dir); ok {
+				return fr, true
+			}
+		}
+		return memmap.FileRange{}, false
+	}
+	for gap := set.UpperBoundLargeEnoughGap(math.MaxUint64, length); gap.Ok(); gap = gap.PrevLargeEnoughGap(length) {
+		if fr, ok := fitGap(gap.Start(), gap.End(), huge, length, dir); ok {
+			return fr, true
+		}
+	}
+	return memmap.FileRange{}, false
+}
+
 // findNodeGap returns length bytes of a gap of set that lie in a run of
 // consecutive chunks of chunks that are bound to node and of the given
-// hugeness, the first such in dir.
+// hugeness, the first such in dir that fitGap finds room in.
 func findNodeGap[G gapIterator[G], S largeEnoughGapSet[G]](set S, chunks []chunkInfo, node int32, huge bool, length uint64, dir Direction) (memmap.FileRange, bool) {
 	matches := func(i int) bool {
 		return i >= 0 && i < len(chunks) && chunks[i].node == node && chunks[i].huge == huge
@@ -161,8 +199,8 @@ func findNodeGap[G gapIterator[G], S largeEnoughGapSet[G]](set S, chunks []chunk
 			lo, hi := uint64(i)*chunkSize, uint64(j)*chunkSize
 			gap := set.LowerBoundLargeEnoughGap(lo, length)
 			for ; gap.Ok() && gap.Start() < hi; gap = gap.NextLargeEnoughGap(length) {
-				if start, end := max(gap.Start(), lo), min(gap.End(), hi); end > start && end-start >= length {
-					return memmap.FileRange{Start: start, End: start + length}, true
+				if fr, ok := fitGap(max(gap.Start(), lo), min(gap.End(), hi), huge, length, dir); ok {
+					return fr, true
 				}
 			}
 			if !gap.Ok() {
@@ -185,8 +223,8 @@ func findNodeGap[G gapIterator[G], S largeEnoughGapSet[G]](set S, chunks []chunk
 		lo, hi := uint64(i)*chunkSize, uint64(j)*chunkSize
 		gap := set.UpperBoundLargeEnoughGap(hi-1, length)
 		for ; gap.Ok() && gap.End() > lo; gap = gap.PrevLargeEnoughGap(length) {
-			if start, end := max(gap.Start(), lo), min(gap.End(), hi); end > start && end-start >= length {
-				return memmap.FileRange{Start: end - length, End: end}, true
+			if fr, ok := fitGap(max(gap.Start(), lo), min(gap.End(), hi), huge, length, dir); ok {
+				return fr, true
 			}
 		}
 		if !gap.Ok() {

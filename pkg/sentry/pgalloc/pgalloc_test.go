@@ -1052,6 +1052,52 @@ func TestFindAllocatable(t *testing.T) {
 			dir:     TopDown,
 			want:    chunkSize - 2*hugepage,
 		},
+		{
+			name:      "bottom-up huge allocation skips the unaligned start of a free gap",
+			chunkHuge: []bool{true},
+			existing: []existingSegment{
+				{0, hugepage + page, existingUsed},
+			},
+			length: hugepage,
+			huge:   true,
+			want:   2 * hugepage,
+		},
+		{
+			name:      "top-down huge allocation skips the unaligned end of a free gap",
+			chunkHuge: []bool{true},
+			existing: []existingSegment{
+				{chunkSize - hugepage - page, chunkSize, existingUsed},
+			},
+			length: hugepage,
+			huge:   true,
+			dir:    TopDown,
+			want:   chunkSize - 3*hugepage,
+		},
+		{
+			name:      "recycling bottom-up huge allocation recycles only aligned waste pages",
+			chunkHuge: []bool{true},
+			existing: []existingSegment{
+				{0, page, existingUsed},
+				{page, 2 * hugepage, existingWaste},
+			},
+			length:  hugepage,
+			huge:    true,
+			recycle: true,
+			want:    hugepage,
+		},
+		{
+			name:      "recycling top-down huge allocation recycles only aligned waste pages",
+			chunkHuge: []bool{true},
+			existing: []existingSegment{
+				{chunkSize - 2*hugepage, chunkSize - page, existingWaste},
+				{chunkSize - page, chunkSize, existingUsed},
+			},
+			length:  hugepage,
+			huge:    true,
+			recycle: true,
+			dir:     TopDown,
+			want:    chunkSize - 2*hugepage,
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			// Build the fake MemoryFile.

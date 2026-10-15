@@ -81,6 +81,23 @@ type memoryFileSaved struct {
 	chunks           []chunkInfo
 }
 
+// hugeSequenceBit marks, in the FirstSequence that a logicalPageInfo saves, a
+// segment of 2 MiB pages. logicalPageInfo saves the fields it saved before 2
+// MiB pages existed, so that images saved then still load, as base pages; no
+// sequence reaches the bit.
+const hugeSequenceBit = 1 << 63
+
+func (i *logicalPageInfo) saveFirstSequence() uint64 {
+	if i.Huge {
+		return i.FirstSequence | hugeSequenceBit
+	}
+	return i.FirstSequence
+}
+
+func (i *logicalPageInfo) loadFirstSequence(_ context.Context, seq uint64) {
+	i.FirstSequence, i.Huge = seq&^hugeSequenceBit, seq&hugeSequenceBit != 0
+}
+
 // SaveOpts provides options to MemoryFile.SaveTo().
 type SaveOpts struct {
 	// If PagesFile is not nil, then page contents will be written to PagesFile

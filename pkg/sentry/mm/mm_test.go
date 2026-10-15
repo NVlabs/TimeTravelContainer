@@ -769,103 +769,200 @@ func TestLiveForkCopyOnWriteWidensOnlyForSequentialRuns(t *testing.T) {
 	}
 }
 
-// A fork that has copied every page of a huge page's worth of its memory, a
-// write fault at a time, maps them with one huge page again, each keeping the
-// version its copy gave it; one that has copied all but one page still maps
-// small pages, and shares the last one. Copies are small pages wherever they
-// land, even when the copies of neighbouring pages are neighbours in the file.
-func TestLiveForkGathersAFullyCopiedHugePage(t *testing.T) {
-	const pages = hostarch.HugePageSize / hostarch.PageSize
-	// Odd pages up, then even pages down: copies of neighbouring pages are
-	// not neighbours in the file.
-	var scattered []uint64
-	for n := uint64(1); n < pages; n += 2 {
-		scattered = append(scattered, n)
+// hugePageFork returns a parent and its live fork, in a MemoryFile whose huge
+// memory is 2 MiB pages, which share the 2 MiB page that the parent maps at
+// the returned address, page n of which holds n.
+func hugePageFork(t *testing.T) (ctx context.Context, parent, child *MemoryManager, base hostarch.Addr) {
+	t.Helper()
+	ctx = contexttest.Context(t)
+	mf := newRemoteCloneMemoryFileWithOpts(t, pgalloc.MemoryFileOpts{
+		DelayedEviction:         pgalloc.DelayedEvictionDisabled,
+		DisableIMAWorkAround:    true,
+		DisableMemoryAccounting: true,
+		ExpectHugepages:         true,
+	})
+	t.Cleanup(mf.Destroy)
+	ctx = context.WithValues(ctx, map[any]any{pgalloc.CtxMemoryFile: mf})
+	parent = testMemoryManager(ctx, t)
+	t.Cleanup(func() { parent.DecUsers(ctx) })
+	// Two huge pages of address space hold one aligned huge page.
+	addr := populatedPrivateMapping(ctx, t, parent, 2*hostarch.HugePageSize)
+	base = addr.HugeRoundDown() + hostarch.HugePageSize
+	for n := 0; n < hugePagePages; n++ {
+		if _, err := parent.CopyOut(ctx, base+hostarch.Addr(n)*hostarch.PageSize, []byte{byte(n), byte(n >> 8)}, usermem.IOOpts{}); err != nil {
+			t.Fatalf("writing page %d: %v", n, err)
+		}
 	}
-	for n := uint64(pages - 2); n >= 2; n -= 2 {
-		scattered = append(scattered, n)
+	if _, ok := parent.mf.HugePageAt(fileOffsetAt(t, parent, base)); !ok {
+		t.Fatal("setup: the parent's huge memory is not a 2 MiB page")
 	}
-	// Downwards: they are, in one run of the file.
-	var downwards []uint64
-	for n := uint64(pages - 1); n >= 1; n-- {
-		downwards = append(downwards, n)
+	child, err := cloneMemoryManagerMetadata(ctx, parent)
+	if err != nil {
+		t.Fatalf("cloneMemoryManagerMetadata: %v", err)
 	}
-	for _, test := range []struct {
-		name  string
-		order []uint64
-	}{{"scattered", scattered}, {"downwards", downwards}} {
-		t.Run(test.name, func(t *testing.T) {
-			ctx := contexttest.Context(t)
-			mf := newRemoteCloneMemoryFileWithOpts(t, pgalloc.MemoryFileOpts{
-				DelayedEviction:         pgalloc.DelayedEvictionDisabled,
-				DisableIMAWorkAround:    true,
-				DisableMemoryAccounting: true,
-				ExpectHugepages:         true,
-			})
-			defer mf.Destroy()
-			ctx = context.WithValues(ctx, map[any]any{pgalloc.CtxMemoryFile: mf})
-			parent := testMemoryManager(ctx, t)
-			defer parent.DecUsers(ctx)
-			addr := populatedPrivateMapping(ctx, t, parent, 2*hostarch.HugePageSize)
-			base := addr.HugeRoundDown() + hostarch.HugePageSize
-			page := func(n uint64) hostarch.Addr { return base + hostarch.Addr(n*hostarch.PageSize) }
-			for n := uint64(0); n < pages; n++ {
-				if _, err := parent.CopyOut(ctx, page(n), []byte{byte(n), byte(n >> 8)}, usermem.IOOpts{}); err != nil {
-					t.Fatalf("writing page %d: %v", n, err)
-				}
-			}
-			child, err := cloneMemoryManagerMetadata(ctx, parent)
-			if err != nil {
-				t.Fatalf("cloneMemoryManagerMetadata: %v", err)
-			}
-			defer child.DecUsers(ctx)
-			version := func(n uint64) pgalloc.PageVersionID {
-				pseg := child.pmas.FindSegment(page(n))
-				_, v, ok := child.mf.LogicalPageVersionAt(pseg.fileRange().Start + uint64(page(n)-pseg.Start()))
-				if !ok {
-					t.Fatalf("no page identity for page %d", n)
-				}
-				return v
-			}
+	t.Cleanup(func() { child.DecUsers(ctx) })
+	return ctx, parent, child, base
+}
 
-			// No fault continues a run, so each copies one page.
-			copied := make(map[uint64]pgalloc.PageVersionID)
-			for _, n := range test.order {
-				if err := child.HandleUserFault(ctx, page(n), hostarch.Write, 0); err != nil {
-					t.Fatalf("write fault on page %d: %v", n, err)
-				}
-				copied[n] = version(n)
-			}
-			if pseg := child.pmas.FindSegment(page(1)); pseg.Range().Length() >= hostarch.HugePageSize || pseg.ValuePtr().huge {
-				t.Fatalf("with one page still shared, page 1 is in pma %v (huge %t)", pseg.Range(), pseg.ValuePtr().huge)
-			}
-			if !sharesPage(t, child, parent, page(0)) {
-				t.Fatal("the unwritten page was copied")
-			}
-			if err := child.HandleUserFault(ctx, page(0), hostarch.Write, 0); err != nil {
-				t.Fatalf("write fault on page 0: %v", err)
-			}
-			pseg := child.pmas.FindSegment(page(0))
-			if want := (hostarch.AddrRange{Start: base, End: base + hostarch.HugePageSize}); pseg.Range() != want || !pseg.ValuePtr().huge ||
-				pseg.fileRange().Start%hostarch.HugePageSize != 0 {
-				t.Fatalf("fully copied huge page is in pma %v (huge %t) at file offset %#x, want one huge pma %v at an aligned offset",
-					pseg.Range(), pseg.ValuePtr().huge, pseg.fileRange().Start, want)
-			}
-			for n := uint64(1); n < pages; n++ {
-				if got := version(n); got != copied[n] {
-					t.Fatalf("page %d's version is %+v after gathering, want %+v, as its copy left it", n, got, copied[n])
-				}
-			}
-			if sharesPage(t, child, parent, page(0)) {
-				t.Fatal("the last page written still shares the parent's version")
-			}
-			for n := uint64(0); n < pages; n++ {
-				buf := make([]byte, 2)
-				if _, err := child.CopyIn(ctx, page(n), buf, usermem.IOOpts{}); err != nil || buf[0] != byte(n) || buf[1] != byte(n>>8) {
-					t.Fatalf("page %d holds %v after gathering (err %v), want %v", n, buf, err, []byte{byte(n), byte(n >> 8)})
-				}
-			}
-		})
+const hugePagePages = hostarch.HugePageSize / hostarch.PageSize
+
+// fileOffsetAt returns the offset of the page that memMgr maps at addr.
+func fileOffsetAt(t testing.TB, memMgr *MemoryManager, addr hostarch.Addr) uint64 {
+	t.Helper()
+	pseg := memMgr.pmas.FindSegment(addr)
+	if !pseg.Ok() {
+		t.Fatalf("no pma at %#x", addr)
+	}
+	return pseg.fileRange().Start + uint64(addr-pseg.Start())
+}
+
+// pageVersion returns the identity and version of the page memMgr maps at
+// addr.
+func pageVersion(t testing.TB, memMgr *MemoryManager, addr hostarch.Addr) (pgalloc.LogicalPageID, pgalloc.PageVersionID) {
+	t.Helper()
+	id, version, ok := memMgr.mf.LogicalPageVersionAt(fileOffsetAt(t, memMgr, addr))
+	if !ok {
+		t.Fatalf("no page identity at %#x", addr)
+	}
+	return id, version
+}
+
+// checkHugePageContents checks that page n of the 2 MiB that memMgr maps at
+// base holds n.
+func checkHugePageContents(ctx context.Context, t testing.TB, memMgr *MemoryManager, base hostarch.Addr) {
+	t.Helper()
+	for n := 0; n < hugePagePages; n++ {
+		buf := make([]byte, 2)
+		if _, err := memMgr.CopyIn(ctx, base+hostarch.Addr(n)*hostarch.PageSize, buf, usermem.IOOpts{}); err != nil || buf[0] != byte(n) || buf[1] != byte(n>>8) {
+			t.Fatalf("page %d holds %v (err %v), want %v", n, buf, err, []byte{byte(n), byte(n >> 8)})
+		}
+	}
+}
+
+// A write to a 2 MiB page that a fork shares copies it whole into a new 2 MiB
+// page, which keeps its identity and takes one new version; the original
+// stays one page. The page it then holds alone, its other holder takes over
+// whole, writing it in place under one new version.
+func TestLiveForkCopiesA2MiBPageWhole(t *testing.T) {
+	ctx, parent, child, base := hugePageFork(t)
+	block := hostarch.AddrRange{Start: base, End: base + hostarch.HugePageSize}
+	parentOffset := fileOffsetAt(t, parent, base)
+	parentID, parentVersion := pageVersion(t, parent, base)
+
+	target := base + 7*hostarch.PageSize
+	if err := child.HandleUserFault(ctx, target, hostarch.Write, 0); err != nil {
+		t.Fatalf("child write fault: %v", err)
+	}
+	pseg := child.pmas.FindSegment(target)
+	if pseg.Range() != block || !pseg.ValuePtr().huge || !hostarch.IsHugePageAligned(pseg.fileRange().Start) {
+		t.Fatalf("the child's copy is pma %v (huge %t) at %#x, want one huge pma %v at an aligned offset", pseg.Range(), pseg.ValuePtr().huge, pseg.fileRange().Start, block)
+	}
+	if hp, ok := child.mf.HugePageAt(pseg.fileRange().Start); !ok || hp != pseg.fileRange() {
+		t.Fatalf("the child's copy %v is not one 2 MiB page (%v, %t)", pseg.fileRange(), hp, ok)
+	}
+	for _, n := range []hostarch.Addr{0, 7, hugePagePages - 1} {
+		addr := base + n*hostarch.PageSize
+		id, version := pageVersion(t, child, addr)
+		wantID, _ := pageVersion(t, parent, addr)
+		if id != wantID || sharesPage(t, child, parent, addr) {
+			t.Fatalf("the child's page %d is %+v at %+v; want the parent's identity %+v at a new version", n, id, version, wantID)
+		}
+	}
+	checkHugePageContents(ctx, t, child, base)
+	if _, ok := parent.mf.HugePageAt(parentOffset); !ok {
+		t.Fatal("the parent's page stopped being one 2 MiB page")
+	}
+	if id, version := pageVersion(t, parent, base); id != parentID || version != parentVersion {
+		t.Fatal("the child's copy changed the parent's page")
+	}
+
+	// The parent now holds its page alone.
+	if err := parent.HandleUserFault(ctx, base+3*hostarch.PageSize, hostarch.Write, 0); err != nil {
+		t.Fatalf("parent write fault: %v", err)
+	}
+	if got := fileOffsetAt(t, parent, base); got != parentOffset {
+		t.Fatalf("the parent copied a 2 MiB page it held alone, to %#x from %#x", got, parentOffset)
+	}
+	if pseg := parent.pmas.FindSegment(base); pseg.ValuePtr().needCOW || !pseg.Range().IsSupersetOf(block) {
+		t.Fatalf("the parent's page is in pma %v (needCOW %t), want an owned pma covering %v", pseg.Range(), pseg.ValuePtr().needCOW, block)
+	}
+	if _, ok := parent.mf.HugePageAt(parentOffset); !ok {
+		t.Fatal("taking over a whole 2 MiB page split it")
+	}
+	if id, version := pageVersion(t, parent, base); id != parentID || version == parentVersion {
+		t.Fatalf("the parent's owned page is %+v at %+v, want %+v at a new version", id, version, parentID)
+	}
+	checkHugePageContents(ctx, t, parent, base)
+}
+
+// A 2 MiB page that mprotect has split between pmas is still one page: a
+// write to either part copies it whole, and the copy keeps each part's
+// permissions.
+func TestLiveForkCopiesA2MiBPageMappedInPiecesWhole(t *testing.T) {
+	ctx, parent, child, base := hugePageFork(t)
+	half := base + hostarch.HugePageSize/2
+	if err := child.MProtect(half, hostarch.HugePageSize/2, hostarch.Read, false); err != nil {
+		t.Fatalf("MProtect: %v", err)
+	}
+	if err := child.HandleUserFault(ctx, base, hostarch.Write, 0); err != nil {
+		t.Fatalf("child write fault: %v", err)
+	}
+	first, second := child.pmas.FindSegment(base), child.pmas.FindSegment(half)
+	if first.Range() != (hostarch.AddrRange{Start: base, End: half}) || second.Range() != (hostarch.AddrRange{Start: half, End: base + hostarch.HugePageSize}) {
+		t.Fatalf("the child maps its copy with pmas %v and %v, want one for each half", first.Range(), second.Range())
+	}
+	if first.ValuePtr().needCOW || second.ValuePtr().needCOW || second.fileRange().Start != first.fileRange().End {
+		t.Fatalf("the halves map %v and %v (needCOW %t, %t), want one copy", first.fileRange(), second.fileRange(), first.ValuePtr().needCOW, second.ValuePtr().needCOW)
+	}
+	if !first.ValuePtr().effectivePerms.Write || second.ValuePtr().effectivePerms.Write || second.ValuePtr().maxPerms.Write != first.ValuePtr().maxPerms.Write {
+		t.Fatalf("the halves have permissions %v and %v, want the vmas' %v and %v", first.ValuePtr().effectivePerms, second.ValuePtr().effectivePerms, hostarch.ReadWrite, hostarch.Read)
+	}
+	if hp, ok := child.mf.HugePageAt(first.fileRange().Start); !ok || hp.Start != first.fileRange().Start {
+		t.Fatal("the child's copy is not one 2 MiB page")
+	}
+	if sharesPage(t, child, parent, half) {
+		t.Fatal("the read-only half still shares the parent's version")
+	}
+	checkHugePageContents(ctx, t, child, base)
+	checkHugePageContents(ctx, t, parent, base)
+}
+
+// A write to a 2 MiB page that the address space maps only in part copies
+// only the page written, as Linux copies a base page of a huge page that a
+// process maps in part; the original stays one page for those that hold all
+// of it, and splits once part of it is freed.
+func TestLiveForkCopiesBasePagesOfA2MiBPageMappedInPart(t *testing.T) {
+	ctx, parent, child, base := hugePageFork(t)
+	parentOffset := fileOffsetAt(t, parent, base)
+	half := base + hostarch.HugePageSize/2
+	if err := child.MUnmap(ctx, half, hostarch.HugePageSize/2); err != nil {
+		t.Fatalf("MUnmap: %v", err)
+	}
+	if _, ok := parent.mf.HugePageAt(parentOffset); !ok {
+		t.Fatal("a 2 MiB page that the parent still holds whole split")
+	}
+	if err := child.HandleUserFault(ctx, base, hostarch.Write, 0); err != nil {
+		t.Fatalf("child write fault: %v", err)
+	}
+	if got := child.pmas.FindSegment(base).Range().Length(); got != hostarch.PageSize {
+		t.Fatalf("a write to a 2 MiB page mapped in part copied %d bytes, want one page", got)
+	}
+	if !sharesPage(t, child, parent, base+hostarch.PageSize) {
+		t.Fatal("the page next to the written one was copied")
+	}
+	if _, ok := parent.mf.HugePageAt(parentOffset); !ok {
+		t.Fatal("copying a base page of a 2 MiB page split it")
+	}
+	// The parent unmaps the page that only it holds now: the 2 MiB page is
+	// freed in part.
+	if err := parent.MUnmap(ctx, base, hostarch.PageSize); err != nil {
+		t.Fatalf("MUnmap: %v", err)
+	}
+	if _, ok := parent.mf.HugePageAt(parentOffset + hostarch.PageSize); ok {
+		t.Fatal("a 2 MiB page freed in part is still one page")
+	}
+	if !sharesPage(t, child, parent, base+hostarch.PageSize) {
+		t.Fatal("splitting a 2 MiB page changed the versions of its pages")
 	}
 }
 

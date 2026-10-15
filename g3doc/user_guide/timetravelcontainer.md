@@ -217,14 +217,17 @@ nothing.
 Containers' memory is backed by huge pages where the host allows them: each
 sandbox keeps its memory in a file on a private tmpfs mounted with
 `huge=within_size`, so a host whose `shmem_enabled` is `never` still gives them
-2 MiB pages. A branch and its fork share their pages until one writes, and a
-write copies only the page it writes, so that they diverge no further than
-their writes do; the copies are small pages. Once a branch has written every
-page of a huge page's worth of its memory, the copies are gathered back into
-one huge page. A branch forked to another node, or rehydrated, maps the pages
-it pulls with small pages, and gathers them into huge pages as it writes them.
-`ttc stats` shows how much of the containers' memory the host maps with huge
-pages.
+2 MiB pages. Anonymous memory is allocated in 2 MiB pages, and TTC treats
+each as one page. A branch and its fork share it until one of them writes it,
+and the write copies all 2 MiB into a new 2 MiB page, so the memory stays in
+huge pages at every fork; a branch that holds a page alone writes it in place.
+As in Linux, a 2 MiB page that is unmapped or discarded in part splits into 4
+KiB pages; one that `mprotect` or `mremap` maps in pieces stays whole; and a
+write to one that a branch maps only in part copies only the 4 KiB it writes.
+Stacks, files and shared memory use 4 KiB pages, and a write copies only the
+page it writes. A branch forked to another node, or rehydrated, maps the
+pages it pulls with 4 KiB pages. `ttc stats` shows how much of the
+containers' memory the host maps with huge pages.
 
 ## Compile
 
