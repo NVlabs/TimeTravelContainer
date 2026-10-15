@@ -214,6 +214,10 @@ func (fs *filesystem) PrepareSave(ctx context.Context) error {
 		return fmt.Errorf("memory file for %q already exists in CtxMemoryFileMap", resourceID)
 	}
 	mfmap[resourceID] = fs.mf
+	// The image's inodes must match the repository it is restored against.
+	if err := fs.flushDiskWriteMetadataRaw(); err != nil {
+		return fmt.Errorf("flushing TTC volume metadata before save: %w", err)
+	}
 	fs.pruneDiskNamespaceForSave()
 	return nil
 }

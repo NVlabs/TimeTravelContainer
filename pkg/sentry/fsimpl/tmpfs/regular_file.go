@@ -1534,10 +1534,8 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 				return done, offset + done, io.ErrNoProgress
 			}
 		}
-		grew := false
 		if end := uint64(offset + done); end > f.size.Load() {
 			f.size.Store(end)
-			grew = true
 		}
 		f.inode.fs.adjustDiskBytes(oldSize, f.size.Load())
 		f.inode.touchCMtimeLocked()
@@ -1552,17 +1550,16 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 		if err := f.inode.fs.diskVolume.Repository.MarkDataDirty(f.diskIOObject); err != nil {
 			return done, offset + done, diskVolumeError("mark regular-file data dirty", err)
 		}
-		// A newly created or extended file must become visible to an immediate
-		// live-fork capture even if the writing task has exited but its FD-table
-		// teardown has not yet invoked OnClose/Release. UpdateAfterWrite only
-		// appends to the repository's bounded metadata batch; it does not fsync
-		// or publish a graph root here. BeginFork flushes that batch atomically.
-		// Same-size writes retain the normal close/fsync/fork coalescing path.
-		if grew {
-			if err := f.flushDiskMetadataLocked(); err != nil {
-				return done, offset + done, err
-			}
-		}
+		// The size and times this write changed are published with the
+		// file's other dirty metadata: when it is closed, released or
+		// synced, and before anything captures or observes the filesystem
+		// (a live fork, a dehydration, a save, or the daemon's publication
+		// for diff and stats; see flushDiskWriteMetadataRaw), even if the
+		// writing task has exited and its FD-table teardown has not yet
+		// closed the file. Publishing it here, after every write that grew
+		// the file, took the repository's lock and half a dozen host
+		// system calls each time, a quarter of the time a program spent
+		// writing files 4 KiB at a time.
 		status := fd.vfsfd.StatusFlags()
 		if opts.Flags&(linux.RWF_DSYNC|linux.RWF_SYNC) != 0 || status&(linux.O_DSYNC|linux.O_SYNC) != 0 {
 			dataOnly := opts.Flags&linux.RWF_SYNC == 0 && status&linux.O_SYNC == 0
