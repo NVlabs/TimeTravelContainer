@@ -144,6 +144,44 @@ func TestPrepareLiveForkPreservesPrivatePMAs(t *testing.T) {
 	}
 }
 
+// A write to a page that a live fork shares gives the file a page of its own,
+// which the file's translations must map again, but keeps the copies that
+// MAP_PRIVATE mappings made of the page, as Linux keeps them.
+func TestLiveForkPWritePreservesPrivatePMAs(t *testing.T) {
+	ctx := contexttest.Context(t)
+	fd, cleanup, err := newFileFD(ctx, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	defer fd.DecRef(ctx)
+	data := bytes.Repeat([]byte{'a'}, hostarch.PageSize)
+	if n, err := fd.PWrite(ctx, usermem.BytesIOSequence(data), 0, vfs.WriteOptions{}); err != nil || n != int64(len(data)) {
+		t.Fatalf("initial PWrite: n=%d err=%v", n, err)
+	}
+
+	rf := fd.Impl().(*regularFileFD).inode().impl.(*regularFile)
+	ms := &recordingMappingSpace{}
+	ar := hostarch.AddrRange{Start: 0x10000, End: 0x10000 + hostarch.PageSize}
+	if err := rf.AddMapping(ctx, ms, ar, 0, false /* writable */); err != nil {
+		t.Fatalf("AddMapping: %v", err)
+	}
+	defer rf.RemoveMapping(ctx, ms, ar, 0, false /* writable */)
+	mustPrepareLiveFork(t, rf, true /* share */)
+	ms.invalidated = false
+
+	data = bytes.Repeat([]byte{'b'}, hostarch.PageSize)
+	if n, err := fd.PWrite(ctx, usermem.BytesIOSequence(data), 0, vfs.WriteOptions{}); err != nil || n != int64(len(data)) {
+		t.Fatalf("CoW PWrite: n=%d err=%v", n, err)
+	}
+	if !ms.invalidated {
+		t.Fatal("CoW PWrite did not invalidate the file's translations")
+	}
+	if ms.opts.InvalidatePrivate {
+		t.Fatal("CoW PWrite discarded the private copies of the file's page")
+	}
+}
+
 func TestDiskVolumeAfterLoadCountsWritableMappings(t *testing.T) {
 	fs := &filesystem{diskVolume: &diskVolumeState{}}
 	rf := &regularFile{inode: inode{fs: fs}}

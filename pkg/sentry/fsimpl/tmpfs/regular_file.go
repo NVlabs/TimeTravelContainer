@@ -1833,7 +1833,11 @@ func (rw *regularFileReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64,
 	shared := rw.file.cow != nil && !rw.file.cow.IsEmptyRange(initialRange)
 	rw.file.dataMu.RUnlock()
 	if shared {
-		rw.file.mappings.Invalidate(initialRange, memmap.InvalidateOpts{InvalidatePrivate: true})
+		// The write gives the file pages of its own for those it shares
+		// (copyOnWriteLocked), which its translations must map again. The
+		// copies that MAP_PRIVATE mappings made of its pages stay theirs, as
+		// on Linux.
+		rw.file.mappings.Invalidate(initialRange, memmap.InvalidateOpts{})
 	}
 	rw.file.dataMu.Lock()
 	defer rw.file.dataMu.Unlock()
