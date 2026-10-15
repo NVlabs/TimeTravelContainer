@@ -350,7 +350,9 @@ ttc daemon start --node node-a \
 is exclusively locked to one daemon. Put it on a disk of the node itself, such
 as `/tmp` or a local SSD, not in a home directory on NFS: a node prepares there
 the root filesystem of each image it runs, and on NFS the first fork of an
-image to a node spent 7 s doing so, against 0.3 s on a local disk. It is the daemon's root, as `TTC_ROOT` is
+image to a node spent 7 s doing so, against 0.3 s on a local disk; a node
+begins as soon as it accepts the fork, while the source captures the branch.
+It is the daemon's root, as `TTC_ROOT` is
 a standalone daemon's: the daemon's socket, log, sockets of its sandboxes,
 temporary files, and runtime state are there, and it must be on a local
 filesystem likewise. Active filesystems, console/exec buffers, caches, and

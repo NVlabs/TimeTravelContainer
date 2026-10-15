@@ -1173,7 +1173,7 @@ func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transacti
 	// name. An older incarnation with the same logical name may therefore remain
 	// paused in this Sentry while it serves sparse pages to another node; neither
 	// incarnation blocks the other and authority placement selects the current one.
-	_, err := r.backend.containerStore().PrepareDistributedFork(ctx, ttcbundle.DistributedForkOptions{
+	prepared, err := r.backend.containerStore().PrepareDistributedFork(ctx, ttcbundle.DistributedForkOptions{
 		SourceContainer: tx.Identity.SourceContainer, TargetName: targetName,
 		SourcePhysicalBranch: tx.SourcePhysicalBranch,
 		TargetBranch:         tx.Identity.TargetBranch, VisibleBranch: tx.Identity.VisibleTargetBranch(),
@@ -1183,7 +1183,20 @@ func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transacti
 		AuthoritativeMigration: authoritativeMigration,
 		Source:                 &source, Spec: &spec, TargetID: targetID,
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	// Prepare first unpacks the root filesystem of the family's image on a
+	// node that has not run it: 0.3 s from the node's own disk, 7 s from
+	// NFS. Begin now, while the source captures the branch and its pages
+	// travel; Prepare's own call waits for this one under the image roots'
+	// lock and finds the root unpacked, and repeats it if this one failed.
+	go func(id string) {
+		if _, err := r.backend.containerStore().RefreshContainerImageRoot(context.WithoutCancel(ctx), id); err != nil {
+			fmt.Fprintf(os.Stderr, "ttcd: unpacking the image root of %q ahead of its fork: %v\n", id, err)
+		}
+	}(prepared.Container.ID)
+	return nil
 }
 
 // reusablePhysicalTarget returns one active physical Sentry for family on
