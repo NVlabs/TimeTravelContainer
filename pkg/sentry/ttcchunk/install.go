@@ -6,6 +6,7 @@ package ttcchunk
 import (
 	"bytes"
 	"cmp"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"slices"
@@ -151,6 +152,9 @@ func installManifest(mf *pgalloc.MemoryFile, manifest Manifest, kind usage.Memor
 			return InstallResult{}, fmt.Errorf("manifest resource %s does not match destination MemoryFile %s", run.ResourceID, mf.ResourceID())
 		}
 	}
+	if err := validateHugeRuns(manifest.Runs); err != nil {
+		return InstallResult{}, err
+	}
 	// The manifest contains all identity metadata
 	// required by InstallSparseChunks. Do not open object payloads here: for a
 	// cold remote restore that would eagerly fetch every 1 MiB chunk before the
@@ -161,10 +165,35 @@ func installManifest(mf *pgalloc.MemoryFile, manifest Manifest, kind usage.Memor
 	type objectInstall struct {
 		firstOldOffset uint64
 		install        pgalloc.SparseChunkInstall
+		// halves are the objects of the halves of a 2 MiB page, which a
+		// huge install installs whole.
+		halves [2]ID
 	}
 	objects := make(map[ID]int)
 	var ordered []objectInstall
-	for _, run := range manifest.Runs {
+	// units are the residency units of runs that are halves of 2 MiB
+	// pages, by run.
+	units := make(map[int]ID)
+	halves := make(map[ID][2]ID)
+	for index := 0; index < len(manifest.Runs); index++ {
+		run := manifest.Runs[index]
+		if run.Huge {
+			// The manifest lists the halves of a 2 MiB page together.
+			upper := manifest.Runs[index+1]
+			unit := hugePageUnitID(run.Object, upper.Object)
+			units[index], units[index+1] = unit, unit
+			if _, ok := objects[unit]; !ok {
+				objects[unit] = len(ordered)
+				halves[unit] = [2]ID{run.Object, upper.Object}
+				ordered = append(ordered, objectInstall{firstOldOffset: run.OldOffset, halves: halves[unit], install: pgalloc.SparseChunkInstall{
+					Object: pgalloc.SparseChunkObjectID(unit), Kind: kind, MemCgID: memCgID, Huge: true,
+					Runs:  []pgalloc.SparseChunkRun{{Position: 0, Pages: 2 * PagesPerChunk, Page: run.FirstPage, Version: run.FirstVersion}},
+					Parts: []pgalloc.SparseChunkObjectID{pgalloc.SparseChunkObjectID(run.Object), pgalloc.SparseChunkObjectID(upper.Object)},
+				}})
+			}
+			index++
+			continue
+		}
 		at, ok := objects[run.Object]
 		if !ok {
 			at = len(ordered)
@@ -200,35 +229,65 @@ func installManifest(mf *pgalloc.MemoryFile, manifest Manifest, kind usage.Memor
 		}
 	}()
 	newRanges := transaction.NewRanges()
-	for _, run := range manifest.Runs {
-		resident, ok := mf.SparseChunkRange(pgalloc.SparseChunkObjectID(run.Object))
+	for index, run := range manifest.Runs {
+		unit, start := run.Object, uint64(run.ObjectPage)*hostarch.PageSize
+		if run.Huge {
+			unit, start = units[index], run.FirstPage.Sequence/PagesPerChunk%2*SparseHalfBytes
+		}
+		resident, ok := mf.SparseChunkRange(pgalloc.SparseChunkObjectID(unit))
 		if !ok {
-			return InstallResult{}, fmt.Errorf("installed memory object %s has no resident range", run.Object)
+			return InstallResult{}, fmt.Errorf("installed memory object %s has no resident range", unit)
 		}
 		old := memmap.FileRange{Start: run.OldOffset, End: run.OldOffset + uint64(run.Pages)*hostarch.PageSize}
-		if err := relocation.AddRange(run.ResourceID, old, resident.Start+uint64(run.ObjectPage)*hostarch.PageSize); err != nil {
+		if err := relocation.AddRange(run.ResourceID, old, resident.Start+start); err != nil {
 			return InstallResult{}, err
 		}
 	}
-	objectIDs := make([]ID, 0, len(newRanges))
-	for object := range newRanges {
-		objectIDs = append(objectIDs, ID(object))
+	unitIDs := make([]ID, 0, len(newRanges))
+	for unit := range newRanges {
+		unitIDs = append(unitIDs, ID(unit))
 	}
-	slices.SortFunc(objectIDs, compareIDs)
-	allObjects := make([]ID, 0, len(objects))
+	slices.SortFunc(unitIDs, compareIDs)
+	// A 2 MiB page is read from its halves, one after the other.
+	var chunks []InstalledChunk
+	for _, unit := range unitIDs {
+		target := newRanges[pgalloc.SparseChunkObjectID(unit)]
+		if pair, ok := halves[unit]; ok {
+			middle := target.Start + SparseHalfBytes
+			chunks = append(chunks,
+				InstalledChunk{Object: pair[0], ResourceID: mf.ResourceID(), MemoryFile: mf, Target: memmap.FileRange{Start: target.Start, End: middle}},
+				InstalledChunk{Object: pair[1], ResourceID: mf.ResourceID(), MemoryFile: mf, Target: memmap.FileRange{Start: middle, End: target.End}})
+			continue
+		}
+		chunks = append(chunks, InstalledChunk{Object: unit, ResourceID: mf.ResourceID(), MemoryFile: mf, Target: target})
+	}
+	for i := range chunks {
+		chunks[i].StreamOffset = uint64(i) * pgalloc.SparseChunkBytes
+	}
+	allObjects := make([]ID, 0, len(objects)+len(halves))
 	for object := range objects {
+		if pair, ok := halves[object]; ok {
+			allObjects = append(allObjects, pair[0], pair[1])
+			continue
+		}
 		allObjects = append(allObjects, object)
 	}
 	slices.SortFunc(allObjects, compareIDs)
-	result := InstallResult{Relocation: relocation, Chunks: make([]InstalledChunk, len(objectIDs)), Objects: allObjects, transaction: transaction}
-	for i, object := range objectIDs {
-		result.Chunks[i] = InstalledChunk{
-			Object: object, ResourceID: mf.ResourceID(), MemoryFile: mf,
-			Target: newRanges[pgalloc.SparseChunkObjectID(object)], StreamOffset: uint64(i) * pgalloc.SparseChunkBytes,
-		}
-	}
+	allObjects = slices.Compact(allObjects)
 	committed = true
-	return result, nil
+	return InstallResult{Relocation: relocation, Chunks: chunks, Objects: allObjects, transaction: transaction}, nil
+}
+
+// hugePageUnitID is the residency unit of the 2 MiB page whose halves the
+// objects lower and upper hold.
+func hugePageUnitID(lower, upper ID) ID {
+	hash := sha256.New()
+	hash.Write([]byte("ttc-graph-2mib-page-v1\x00"))
+	hash.Write(lower[:])
+	hash.Write(upper[:])
+	var unit ID
+	copy(unit[:], hash.Sum(nil))
+	return unit
 }
 
 // InstallManifestSet installs an already-loaded manifest into its selected

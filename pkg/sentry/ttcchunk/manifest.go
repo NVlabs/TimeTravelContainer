@@ -19,12 +19,18 @@ import (
 
 const (
 	// A manifest of version 1 has every page at its slot in its object; one
-	// of version 2 says where each run's pages are.
+	// of version 2 says where each run's pages are; one of version 3 says
+	// too which runs are halves of 2 MiB pages, which builds that predate
+	// them refuse.
 	manifestVersionSlotted = 1
-	manifestVersion        = 2
+	manifestVersionPacked  = 2
+	manifestVersion        = 3
 	maxManifestStringBytes = 1 << 20
 	maxManifestRuns        = 1 << 32
 )
+
+// manifestRunHuge marks, in a run's flags, a half of a 2 MiB page.
+const manifestRunHuge = 1
 
 var manifestMagic = [16]byte{'T', 'T', 'C', 'M', 'E', 'M', 'M', 'A', 'N', 'I', 'F', 'E', 'S', 'T', 0, 1}
 
@@ -44,6 +50,12 @@ type ManifestRun struct {
 	// others follow it. A capture object holds each page at its slot, and a
 	// graph chunk may hold the pages of several logical chunks packed.
 	ObjectPage uint8
+	// Huge is true if the run is half of a 2 MiB page (see
+	// pgalloc.LogicalPageRange.Huge): its 256 base pages, at their slots of
+	// an Object of their own, from the page's first or 257th, at the offset
+	// of the 2 MiB page or 1 MiB past it. The run of its other half follows
+	// or precedes it.
+	Huge bool
 }
 
 // Manifest is an immutable branch memory root.
@@ -58,6 +70,9 @@ type StoredBinding struct {
 	Object  ID
 	// ObjectPage is the page of Object that holds the binding's page.
 	ObjectPage uint8
+	// Huge is true if the binding's page is a base page of a 2 MiB page,
+	// which Binding binds a base page of: see ManifestRun.Huge.
+	Huge bool
 }
 
 // capturedBinding is binding, carried by object of a capture, which holds each
@@ -103,7 +118,7 @@ func validateStoredBinding(stored StoredBinding) error {
 }
 
 func runCanAppend(run *ManifestRun, stored *StoredBinding) bool {
-	if run.Pages == PagesPerChunk || run.ResourceID != stored.Binding.ResourceID || run.References != stored.Binding.References || run.Object != stored.Object || run.Logical != stored.Binding.Chunk {
+	if run.Pages == PagesPerChunk || run.ResourceID != stored.Binding.ResourceID || run.References != stored.Binding.References || run.Object != stored.Object || run.Logical != stored.Binding.Chunk || run.Huge != stored.Huge {
 		return false
 	}
 	delta := uint64(run.Pages)
@@ -196,6 +211,7 @@ func newManifestRun(stored *StoredBinding) ManifestRun {
 		Pages:        1,
 		Object:       stored.Object,
 		ObjectPage:   stored.ObjectPage,
+		Huge:         stored.Huge,
 	}
 }
 
@@ -224,14 +240,22 @@ func EncodeManifest(manifest Manifest) ([]byte, error) {
 	if uint64(len(manifest.Runs)) > maxManifestRuns {
 		return nil, fmt.Errorf("memory manifest has %d runs", len(manifest.Runs))
 	}
-	// A manifest whose pages are all at their slots is written as version 1,
-	// which daemons predating packed chunks read too.
+	// A manifest is written in the oldest version that says what it holds:
+	// one whose pages are all at their slots as version 1, which daemons
+	// predating packed chunks read too, and one with no 2 MiB page as
+	// version 2.
 	version := uint32(manifestVersionSlotted)
 	for _, run := range manifest.Runs {
-		if run.ObjectPage != run.FirstSlot {
+		if run.Huge {
 			version = manifestVersion
 			break
 		}
+		if run.ObjectPage != run.FirstSlot {
+			version = manifestVersionPacked
+		}
+	}
+	if err := validateHugeRuns(manifest.Runs); err != nil {
+		return nil, err
 	}
 	data := append([]byte(nil), manifestMagic[:]...)
 	data = appendUint32(data, version)
@@ -265,12 +289,57 @@ func EncodeManifest(manifest Manifest) ([]byte, error) {
 		data = append(data, run.FirstSlot)
 		data = appendUint32(data, uint32(run.Pages))
 		data = append(data, run.Object[:]...)
-		if version == manifestVersion {
+		if version >= manifestVersionPacked {
 			data = append(data, run.ObjectPage)
+		}
+		if version >= manifestVersion {
+			var flags byte
+			if run.Huge {
+				flags |= manifestRunHuge
+			}
+			data = append(data, flags)
 		}
 	}
 	return data, nil
 }
+
+// validateHugeRuns checks that each run of runs that is half of a 2 MiB page
+// is one, beside the run of its other half.
+func validateHugeRuns(runs []ManifestRun) error {
+	for i := range runs {
+		run := &runs[i]
+		if !run.Huge {
+			continue
+		}
+		half := run.FirstPage.Sequence / PagesPerChunk % 2
+		if run.FirstSlot != 0 || run.Pages != PagesPerChunk || run.ObjectPage != 0 || run.FirstVersion.Sequence%PagesPerChunk != 0 ||
+			run.FirstVersion.Sequence/PagesPerChunk%2 != half || run.OldOffset%SparseHalfBytes != 0 || run.OldOffset/SparseHalfBytes%2 != half {
+			return fmt.Errorf("memory manifest run %d is no half of a 2 MiB page: %+v", i, *run)
+		}
+		if half == 1 {
+			continue
+		}
+		if i+1 == len(runs) {
+			return fmt.Errorf("memory manifest run %d, half of a 2 MiB page, has no other half", i)
+		}
+		upper := &runs[i+1]
+		if !upper.Huge || upper.ResourceID != run.ResourceID || upper.References != run.References || upper.Object == run.Object ||
+			upper.OldOffset != run.OldOffset+SparseHalfBytes || upper.FirstPage.Allocator != run.FirstPage.Allocator ||
+			upper.FirstPage.Sequence != run.FirstPage.Sequence+PagesPerChunk || upper.FirstVersion.Allocator != run.FirstVersion.Allocator ||
+			upper.FirstVersion.Sequence != run.FirstVersion.Sequence+PagesPerChunk {
+			return fmt.Errorf("memory manifest runs %d and %d are not the halves of a 2 MiB page", i, i+1)
+		}
+	}
+	for i := range runs {
+		if run := &runs[i]; run.Huge && run.FirstPage.Sequence/PagesPerChunk%2 == 1 && (i == 0 || !runs[i-1].Huge || runs[i-1].FirstPage.Sequence+PagesPerChunk != run.FirstPage.Sequence || runs[i-1].Object == run.Object) {
+			return fmt.Errorf("memory manifest run %d, half of a 2 MiB page, has no other half", i)
+		}
+	}
+	return nil
+}
+
+// SparseHalfBytes is the size of a half of a 2 MiB page, a manifest run's.
+const SparseHalfBytes = PagesPerChunk * hostarch.PageSize
 
 type manifestReader struct {
 	data []byte
@@ -322,7 +391,7 @@ func DecodeManifest(data []byte) (Manifest, error) {
 		return Manifest{}, errors.New("invalid TTC memory manifest header")
 	}
 	version, err := r.uint32()
-	if err != nil || (version != manifestVersion && version != manifestVersionSlotted) {
+	if err != nil || version < manifestVersionSlotted || version > manifestVersion {
 		return Manifest{}, fmt.Errorf("unsupported TTC memory manifest version %d", version)
 	}
 	pageSize, err := r.uint32()
@@ -388,12 +457,22 @@ func DecodeManifest(data []byte) (Manifest, error) {
 		}
 		copy(run.Object[:], value)
 		run.ObjectPage = run.FirstSlot
-		if version == manifestVersion {
+		if version >= manifestVersionPacked {
 			value, err = r.take(1)
 			if err != nil {
 				return Manifest{}, err
 			}
 			run.ObjectPage = value[0]
+		}
+		if version >= manifestVersion {
+			value, err = r.take(1)
+			if err != nil {
+				return Manifest{}, err
+			}
+			if value[0]&^manifestRunHuge != 0 {
+				return Manifest{}, fmt.Errorf("memory manifest run %d has unknown flags %#x", i, value[0])
+			}
+			run.Huge = value[0]&manifestRunHuge != 0
 		}
 	}
 	if r.off != len(data) {
@@ -431,6 +510,7 @@ func (m Manifest) Expand() []StoredBinding {
 				},
 				Object:     run.Object,
 				ObjectPage: run.ObjectPage + uint8(page),
+				Huge:       run.Huge,
 			})
 		}
 	}

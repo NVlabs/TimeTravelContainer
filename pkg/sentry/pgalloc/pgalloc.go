@@ -180,6 +180,10 @@ type MemoryFile struct {
 	// runtime-local and protected by mu.
 	sparseChunks map[SparseChunkObjectID]sparseResidentChunk `state:"nosave"`
 
+	// sparseParts counts, by object, the units in sparseChunks that are made
+	// of it (sparseResidentChunk.Parts). It is protected by mu.
+	sparseParts map[SparseChunkObjectID]int `state:"nosave"`
+
 	// reclaimedSparseChunks has the sparse chunks ReclaimUnusedSparseChunks
 	// released, since they were last installed: no user of the file held any
 	// of their pages. It is protected by mu.

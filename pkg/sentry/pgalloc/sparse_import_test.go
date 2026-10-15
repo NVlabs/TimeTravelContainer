@@ -6,6 +6,8 @@
 package pgalloc
 
 import (
+	"bytes"
+	"slices"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -476,6 +478,87 @@ func TestReclaimUnusedSparseChunks(t *testing.T) {
 	}
 	if reclaimed := mf.ReclaimedSparseChunks(); len(reclaimed) != 0 {
 		t.Fatalf("a reinstalled chunk is still reported reclaimed: %x", reclaimed)
+	}
+}
+
+// A unit made of parts, the halves of a 2 MiB page that an image holds
+// apart, reports them with it once it is reclaimed, but not a part that is a
+// resident unit too, or that one is made of.
+func TestReclaimUnusedSparseChunksReportsParts(t *testing.T) {
+	mf := newHugeRemoteTestMemoryFile(t)
+	defer mf.Destroy()
+	var allocator LogicalAllocatorID
+	allocator[0] = 1
+	lower := sparseTestInstall(2)
+	var unit, upper SparseChunkObjectID
+	unit[0], upper[0] = 9, 3
+	huge := SparseChunkInstall{
+		Object: unit, Kind: usage.Anonymous, Huge: true,
+		Runs: []SparseChunkRun{{
+			Position: 0, Pages: 2 * logicalPagesPerChunk,
+			Page: LogicalPageID{Allocator: allocator, Sequence: 16 * logicalPagesPerChunk}, Version: PageVersionID{Allocator: allocator, Sequence: 64 * logicalPagesPerChunk},
+		}},
+		Parts: []SparseChunkObjectID{lower.Object, upper},
+	}
+	install := func() {
+		t.Helper()
+		installation, err := mf.InstallSparseChunks([]SparseChunkInstall{huge, lower})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := installation.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reported := func() []SparseChunkObjectID {
+		reclaimed := mf.ReclaimedSparseChunks()
+		slices.SortFunc(reclaimed, func(a, b SparseChunkObjectID) int { return bytes.Compare(a[:], b[:]) })
+		return reclaimed
+	}
+	install()
+	hugeRange, ok := mf.SparseChunkRange(unit)
+	if !ok {
+		t.Fatal("the 2 MiB page is not resident")
+	}
+	// The lower half's own unit goes while the 2 MiB page is used, which is
+	// made of it.
+	mf.IncRef(hugeRange, 0)
+	if got := mf.ReclaimUnusedSparseChunks(); got != 1 {
+		t.Fatalf("reclaimed %d units, want the lower half's", got)
+	}
+	if got := reported(); len(got) != 0 {
+		t.Fatalf("reclaimed units report %x while the 2 MiB page made of them is resident", got)
+	}
+	mf.DecRef(hugeRange)
+	if got := mf.ReclaimUnusedSparseChunks(); got != 1 {
+		t.Fatalf("reclaimed %d units, want the 2 MiB page's", got)
+	}
+	if got, want := reported(), []SparseChunkObjectID{lower.Object, upper, unit}; !slices.Equal(got, want) {
+		t.Fatalf("reclaimed units report %x, want %x", got, want)
+	}
+	// Installed again, they are in use again; and the 2 MiB page's unit, gone
+	// while the lower half's is resident, reports the upper half only.
+	install()
+	if got := reported(); len(got) != 0 {
+		t.Fatalf("reinstalled units are still reported reclaimed: %x", got)
+	}
+	lowerRange, ok := mf.SparseChunkRange(lower.Object)
+	if !ok {
+		t.Fatal("the lower half is not resident")
+	}
+	mf.IncRef(lowerRange, 0)
+	if got := mf.ReclaimUnusedSparseChunks(); got != 1 {
+		t.Fatalf("reclaimed %d units, want the 2 MiB page's", got)
+	}
+	if got, want := reported(), []SparseChunkObjectID{upper, unit}; !slices.Equal(got, want) {
+		t.Fatalf("reclaimed units report %x, want %x", got, want)
+	}
+	mf.DecRef(lowerRange)
+	if got := mf.ReclaimUnusedSparseChunks(); got != 1 {
+		t.Fatalf("reclaimed %d units, want the lower half's", got)
+	}
+	if got, want := reported(), []SparseChunkObjectID{lower.Object, upper, unit}; !slices.Equal(got, want) {
+		t.Fatalf("reclaimed units report %x, want %x", got, want)
 	}
 }
 

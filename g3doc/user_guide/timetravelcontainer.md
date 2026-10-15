@@ -225,10 +225,9 @@ As in Linux, a 2 MiB page that is unmapped or discarded in part splits into 4
 KiB pages; one that `mprotect` or `mremap` maps in pieces stays whole; and a
 write to one that a branch maps only in part copies only the 4 KiB it writes.
 Stacks, files and shared memory use 4 KiB pages, and a write copies only the
-page it writes. A branch forked to another node pulls a 2 MiB page whole, in
-one piece, and maps it with a huge page; a rehydrated branch maps the pages
-it pulls with 4 KiB pages. `ttc stats` shows how much of the containers'
-memory the host maps with huge pages.
+page it writes. A branch forked to another node, or rehydrated, pulls a 2 MiB
+page whole and maps it with a huge page. `ttc stats` shows how much of the
+containers' memory the host maps with huge pages.
 
 ## Compile
 
@@ -787,11 +786,14 @@ with siblings are unchanged.
 
 TTC tracks page versions across the entire family. Memory that must survive
 without a resident owner is stored in immutable files of up to 1 MiB in the
-TTC data root. Resident sharing and write-time CoW remain 4 KiB-granular. If
-an active peer still shares a page, TTC can keep that page resident; when the
-peer first writes, TTC preserves the old version for the dehydrated branch.
-Rehydration loads complete 1 MiB chunks on demand and installs their
-constituent pages with their existing CoW identities.
+TTC data root. A 2 MiB page is stored whole, its two halves each in a file of
+its own, under its one identity and version, however little of it changed; 4
+KiB pages are packed together. If an active peer still shares a page, TTC can
+keep that page resident; when the peer first writes, TTC preserves the old
+version for the dehydrated branch. Rehydration loads complete 1 MiB chunks on
+demand, and a 2 MiB page whole, and installs their pages with their existing
+CoW identities. Images that builds before 2 MiB pages wrote are read as 4 KiB
+pages; those builds cannot read images that hold 2 MiB pages.
 
 A standalone daemon defers that durable write while another branch of the
 family is live on the node: the dehydrated branch's capture stays in the

@@ -327,7 +327,7 @@ func TestGraphCaptureWritesTheChunkEncoding(t *testing.T) {
 	if err := WriteGraphCapture(&stream, snapshot, bindings); err != nil {
 		t.Fatal(err)
 	}
-	groups, manifest, err := planGraphCapture(bindings)
+	groups, manifest, err := planGraphCapture(bindings, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -810,8 +810,8 @@ func TestGraphImportPacksNewPagesOfSeveralObjects(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version := binary.LittleEndian.Uint32(encoded[len(manifestMagic):]); version != manifestVersion {
-		t.Fatalf("a packed manifest encodes as version %d, want %d", version, manifestVersion)
+	if version := binary.LittleEndian.Uint32(encoded[len(manifestMagic):]); version != manifestVersionPacked {
+		t.Fatalf("a packed manifest encodes as version %d, want %d", version, manifestVersionPacked)
 	}
 	decoded, err := DecodeManifest(encoded)
 	if err != nil {
@@ -1423,7 +1423,7 @@ func TestPlanGraphCaptureKeepsItsOrder(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		groups, manifest, err := planGraphCapture(bindings)
+		groups, manifest, err := planGraphCapture(bindings, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1453,7 +1453,7 @@ func BenchmarkPlanGraphCapture(b *testing.B) {
 	bindings := captureBindings(1550, 1, true, 1)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, _, err := planGraphCapture(bindings); err != nil {
+		if _, _, err := planGraphCapture(bindings, nil); err != nil {
 			b.Fatal(err)
 		}
 	}

@@ -39,9 +39,9 @@ func WriteGraphCapture(w io.Writer, snapshot *pgalloc.RemoteSnapshot, bindings [
 	if w == nil || snapshot == nil {
 		return errors.New("graph memory capture requires a writer and snapshot")
 	}
-	// Objects hold base pages.
-	bindings = pgalloc.BasePageBindings(bindings)
-	groups, manifest, err := planGraphCapture(bindings)
+	// An object holds a half of a 2 MiB page, or base pages.
+	bindings, huge := expandHugeBindings(bindings)
+	groups, manifest, err := planGraphCapture(bindings, huge)
 	if err != nil {
 		return err
 	}
@@ -65,9 +65,9 @@ func WriteFilteredGraphCapture(stream io.ReadWriter, snapshot *pgalloc.RemoteSna
 	if stream == nil || snapshot == nil {
 		return errors.New("graph memory capture requires a stream and snapshot")
 	}
-	// Objects hold base pages.
-	bindings = pgalloc.BasePageBindings(bindings)
-	groups, manifest, err := planGraphCapture(bindings)
+	// An object holds a half of a 2 MiB page, or base pages.
+	bindings, huge := expandHugeBindings(bindings)
+	groups, manifest, err := planGraphCapture(bindings, huge)
 	if err != nil {
 		return err
 	}
@@ -214,6 +214,31 @@ type graphCaptureGroup struct {
 	// in slot order.
 	bindings []int32
 	used     [32]byte
+	// huge is true if the group is a half of a 2 MiB page, whose version
+	// sequences start from version, and holds nothing else.
+	huge    bool
+	version pgalloc.PageVersionID
+}
+
+// expandHugeBindings returns bindings with the binding of each 2 MiB page
+// replaced by those of its base pages, and for each binding it returns,
+// whether it is of a base page of a 2 MiB page (nil if none is).
+func expandHugeBindings(bindings []pgalloc.CapturedPageBinding) ([]pgalloc.CapturedPageBinding, []bool) {
+	expanded := pgalloc.BasePageBindings(bindings)
+	if len(expanded) == len(bindings) {
+		return bindings, nil
+	}
+	huge := make([]bool, 0, len(expanded))
+	for i := range bindings {
+		if bindings[i].Huge {
+			for k := 0; k < 2*PagesPerChunk; k++ {
+				huge = append(huge, true)
+			}
+		} else {
+			huge = append(huge, false)
+		}
+	}
+	return expanded, huge
 }
 
 func graphCaptureObjectID(sequence uint64) ID {
@@ -226,7 +251,11 @@ func graphCaptureObjectID(sequence uint64) ID {
 // planGraphCapture assigns transport-local object IDs using metadata only.
 // It performs no page reads, which lets the manifest precede a bounded stream
 // of one-chunk payloads. It returns the capture's objects and its manifest.
-func planGraphCapture(bindings []pgalloc.CapturedPageBinding) ([]graphCaptureGroup, Manifest, error) {
+//
+// huge, if not nil, marks the bindings of base pages of 2 MiB pages: each half
+// of one is an object of its own.
+func planGraphCapture(bindings []pgalloc.CapturedPageBinding, huge []bool) ([]graphCaptureGroup, Manifest, error) {
+	isHuge := func(index int32) bool { return huge != nil && huge[index] }
 	if len(bindings) > math.MaxInt32 {
 		return nil, Manifest{}, fmt.Errorf("a capture of %d pages", len(bindings))
 	}
@@ -319,9 +348,15 @@ func planGraphCapture(bindings []pgalloc.CapturedPageBinding) ([]graphCaptureGro
 			return nil, Manifest{}, fmt.Errorf("captured page %+v repeats version %+v", binding.Page, binding.Version)
 		}
 		previous = binding
+		// A half of a 2 MiB page is a group of its own: one with the
+		// version its pages start from.
+		hugeBinding := isHuge(index)
+		halfVersion := binding.Version
+		halfVersion.Sequence -= uint64(binding.Slot)
 		groupIndex := -1
 		for _, candidate := range chunkGroups {
-			if !hasBit(&groups[candidate].used, binding.Slot) {
+			group := &groups[candidate]
+			if group.huge == hugeBinding && (!hugeBinding || group.version == halfVersion) && !hasBit(&group.used, binding.Slot) {
 				groupIndex = candidate
 				break
 			}
@@ -329,7 +364,11 @@ func planGraphCapture(bindings []pgalloc.CapturedPageBinding) ([]graphCaptureGro
 		if groupIndex < 0 {
 			groupIndex = len(groups)
 			id := graphCaptureObjectID(uint64(groupIndex + 1))
-			groups = append(groups, graphCaptureGroup{id: id, logical: binding.Chunk})
+			group := graphCaptureGroup{id: id, logical: binding.Chunk, huge: hugeBinding}
+			if hugeBinding {
+				group.version = halfVersion
+			}
+			groups = append(groups, group)
 			chunkGroups = append(chunkGroups, groupIndex)
 		}
 		group := &groups[groupIndex]
@@ -338,7 +377,9 @@ func planGraphCapture(bindings []pgalloc.CapturedPageBinding) ([]graphCaptureGro
 		objects[index] = int32(groupIndex)
 	}
 	manifest, err := compactBindings(len(bindings), func(i int) StoredBinding {
-		return capturedBinding(bindings[i], groups[objects[i]].id)
+		stored := capturedBinding(bindings[i], groups[objects[i]].id)
+		stored.Huge = isHuge(int32(i))
+		return stored
 	})
 	if err != nil {
 		return nil, Manifest{}, err

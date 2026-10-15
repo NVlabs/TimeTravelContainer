@@ -1355,3 +1355,36 @@ func TestStaleOriginOrphansReadsBuildingFirst(t *testing.T) {
 		t.Fatalf("no locked origin gave orphans %v, %v", orphans, err)
 	}
 }
+
+// A prune drops an image's pages in the chunks the Sentry freed, and a 2 MiB
+// page whole once it freed either half: the other half may be in use still,
+// as base pages of another image's.
+func TestPruneDropsA2MiBPageWhole(t *testing.T) {
+	chunk := func(ordinal uint64) ttcsnapshot.ObjectID {
+		return ttcsnapshot.ObjectID{Snapshot: 1, Kind: ttcsnapshot.ObjectKindMemoryChunk, Ordinal: ordinal}
+	}
+	entries := []ttcsnapshot.MemoryPageEntry{
+		{Index: 0, Location: ttcsnapshot.MemoryPageLocation{Chunk: chunk(1)}},
+		{Index: 1, Location: ttcsnapshot.MemoryPageLocation{Chunk: chunk(2)}},
+	}
+	// 2 MiB pages from page indexes 512 and 1024, with halves in chunks 3
+	// and 4, and 5 and 6.
+	for page := uint64(1); page <= 2; page++ {
+		for k := uint64(0); k < pagesPerHugePage; k++ {
+			entries = append(entries, ttcsnapshot.MemoryPageEntry{
+				Index:    page*pagesPerHugePage + k,
+				Location: ttcsnapshot.MemoryPageLocation{Chunk: chunk(2*page + 1 + k/ttcsnapshot.PagesPerMemoryTable), Page: uint8(k % ttcsnapshot.PagesPerMemoryTable), Huge: true},
+				Huge:     true,
+			})
+		}
+	}
+	kept := keptImagePages(entries, map[ttcsnapshot.ObjectID]bool{chunk(2): true, chunk(4): true})
+	if len(kept) != 1+pagesPerHugePage || kept[0].Index != 0 {
+		t.Fatalf("the prune kept %d pages from %d, want page 0 and the 2 MiB page from 1024", len(kept), kept[0].Index)
+	}
+	for k, entry := range kept[1:] {
+		if entry.Index != 2*pagesPerHugePage+uint64(k) {
+			t.Fatalf("the prune kept page %d of the 2 MiB pages, want those from 1024", entry.Index)
+		}
+	}
+}

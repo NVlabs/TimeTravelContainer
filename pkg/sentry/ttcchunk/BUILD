@@ -36,10 +36,12 @@ go_test(
     srcs = [
         "chunk_test.go",
         "graph_test.go",
+        "huge_test.go",
     ],
     library = ":ttcchunk",
     deps = [
         "//pkg/hostarch",
+        "//pkg/safemem",
         "//pkg/sentry/checkpoint",
         "//pkg/sentry/memmap",
         "//pkg/sentry/pgalloc",

@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -253,6 +254,10 @@ type SparseChunkInstall struct {
 	// from position 0: it is installed in an aligned 2 MiB huge page, as a 2
 	// MiB page (see logicalPageInfo.Huge).
 	Huge bool
+	// Parts, if any, are the objects whose bytes make up the unit, which
+	// ReclaimedSparseChunks reports for it: the halves of a 2 MiB page that
+	// an image holds apart.
+	Parts []SparseChunkObjectID
 }
 
 // validHugeSparseChunkRuns reports whether runs name one 2 MiB page whole, as
@@ -273,6 +278,8 @@ type sparseResidentChunk struct {
 	// Runs are the unit's pages its installations used, as
 	// normalizeSparseChunkRuns leaves them.
 	Runs []SparseChunkRun
+	// Parts are SparseChunkInstall.Parts.
+	Parts []SparseChunkObjectID
 }
 
 // SparseChunkInstallation is a transactional set of new residency units.
@@ -425,7 +432,7 @@ func (i *SparseChunkInstallation) Abort() error {
 	i.releasePageLoads()
 	for object, fr := range i.newRanges {
 		i.mf.mu.Lock()
-		delete(i.mf.sparseChunks, object)
+		i.mf.deleteSparseChunkLocked(object)
 		i.mf.mu.Unlock()
 		i.mf.DecRef(fr)
 	}
@@ -659,7 +666,7 @@ func (f *MemoryFile) InstallSparseChunks(installs []SparseChunkInstall) (*Sparse
 				rollback()
 				return nil, fmt.Errorf("allocating sparse resident chunk: %w", err)
 			}
-			resident = sparseResidentChunk{Range: fr, Runs: runs}
+			resident = sparseResidentChunk{Range: fr, Runs: runs, Parts: slices.Clone(install.Parts)}
 			f.mu.Lock()
 			if f.sparseChunks == nil {
 				f.sparseChunks = make(map[SparseChunkObjectID]sparseResidentChunk)
@@ -685,6 +692,13 @@ func (f *MemoryFile) InstallSparseChunks(installs []SparseChunkInstall) (*Sparse
 			}
 			f.sparseChunks[install.Object] = resident
 			delete(f.reclaimedSparseChunks, install.Object)
+			for _, part := range resident.Parts {
+				if f.sparseParts == nil {
+					f.sparseParts = make(map[SparseChunkObjectID]int)
+				}
+				f.sparseParts[part]++
+				delete(f.reclaimedSparseChunks, part)
+			}
 			f.markSparseInstallingLocked(installation, install.Object)
 			f.mu.Unlock()
 			newRanges[install.Object] = fr
@@ -737,7 +751,7 @@ func (f *MemoryFile) adoptResidentSparseChunk(object SparseChunkObjectID) []*Asy
 	}
 	f.mu.Lock()
 	if current, ok := f.sparseChunks[object]; ok && current.Range == resident.Range {
-		delete(f.sparseChunks, object)
+		f.deleteSparseChunkLocked(object)
 		log.Warningf("Resident sparse chunk %x waits on a stopped page loader; installing it again", object)
 	}
 	f.mu.Unlock()
@@ -777,6 +791,29 @@ func (f *MemoryFile) markSparseInstallingLocked(installation *SparseChunkInstall
 	installation.objects = append(installation.objects, object)
 }
 
+// sparseChunkUsedLocked reports whether a resident unit is object, or is made
+// of it.
+//
+// Preconditions: f.mu is locked.
+func (f *MemoryFile) sparseChunkUsedLocked(object SparseChunkObjectID) bool {
+	_, ok := f.sparseChunks[object]
+	return ok || f.sparseParts[object] != 0
+}
+
+// deleteSparseChunkLocked forgets object's resident unit, if any.
+//
+// Preconditions: f.mu is locked.
+func (f *MemoryFile) deleteSparseChunkLocked(object SparseChunkObjectID) {
+	for _, part := range f.sparseChunks[object].Parts {
+		if f.sparseParts[part] <= 1 {
+			delete(f.sparseParts, part)
+		} else {
+			f.sparseParts[part]--
+		}
+	}
+	delete(f.sparseChunks, object)
+}
+
 // ReclaimUnusedSparseChunks releases residency units whose cache reference is
 // their only remaining reference. It returns the number of units released.
 // A unit an installation still commits stays, as the owners it restores are
@@ -809,11 +846,19 @@ func (f *MemoryFile) ReclaimUnusedSparseChunks() int {
 			return unique
 		})
 		if unique {
-			delete(f.sparseChunks, object)
+			f.deleteSparseChunkLocked(object)
 			if f.reclaimedSparseChunks == nil {
 				f.reclaimedSparseChunks = make(map[SparseChunkObjectID]struct{})
 			}
-			f.reclaimedSparseChunks[object] = struct{}{}
+			// What another unit is made of is in use still.
+			if !f.sparseChunkUsedLocked(object) {
+				f.reclaimedSparseChunks[object] = struct{}{}
+			}
+			for _, part := range resident.Parts {
+				if !f.sparseChunkUsedLocked(part) {
+					f.reclaimedSparseChunks[part] = struct{}{}
+				}
+			}
 			release = append(release, resident.Range)
 		}
 	}

@@ -69,12 +69,7 @@ func (b *runtimeBackend) pruneRetainedImage(containerID string, branch ttcbundle
 		if err != nil {
 			return err
 		}
-		keep := entries[:0]
-		for _, entry := range entries {
-			if !stale[entry.Location.Chunk] {
-				keep = append(keep, entry)
-			}
-		}
+		keep := keptImagePages(entries, stale)
 		dropped = dropped || len(keep) != len(entries)
 		kept[i] = keep
 	}
@@ -103,7 +98,7 @@ func (b *runtimeBackend) pruneRetainedImage(containerID string, branch ttcbundle
 			for ; begin < len(entries) && entries[begin].Index/ttcsnapshot.PagesPerMemoryTable*ttcsnapshot.PagesPerMemoryTable == index; begin++ {
 				entry := entries[begin]
 				table.Entries = append(table.Entries, ttcsnapshot.MemoryTableEntry{
-					Slot: uint8(entry.Index % ttcsnapshot.PagesPerMemoryTable), Location: entry.Location, Identity: entry.Identity,
+					Slot: uint8(entry.Index % ttcsnapshot.PagesPerMemoryTable), Location: entry.Location, Identity: entry.Identity, Huge: entry.Huge,
 				})
 			}
 			tables = append(tables, table)
@@ -187,6 +182,30 @@ func (p *prunedImageCounts) forget(key string) {
 	delete(p.counts, key)
 }
 
+// keptImagePages returns, in place, entries, the pages of an image in index
+// order, but those in stale chunks, and the 2 MiB pages a half of which is in
+// one: the Sentry frees a 2 MiB page whole, and a half of one that it does not
+// report is in use still as base pages of another image's.
+func keptImagePages(entries []ttcsnapshot.MemoryPageEntry, stale map[ttcsnapshot.ObjectID]bool) []ttcsnapshot.MemoryPageEntry {
+	staleHuge := make(map[uint64]bool)
+	for _, entry := range entries {
+		if entry.Huge && stale[entry.Location.Chunk] {
+			staleHuge[entry.Index/pagesPerHugePage] = true
+		}
+	}
+	keep := entries[:0]
+	for _, entry := range entries {
+		if !stale[entry.Location.Chunk] && !(entry.Huge && staleHuge[entry.Index/pagesPerHugePage]) {
+			keep = append(keep, entry)
+		}
+	}
+	return keep
+}
+
 // graphTablesPerPruneTransaction bounds the tables one transaction of a prune
 // maps, as graphTablesPerTransaction bounds an import's: 128 MiB of memory.
 const graphTablesPerPruneTransaction = 128
+
+// pagesPerHugePage is the number of page indexes of a 2 MiB page, whose
+// halves an image maps by two tables.
+const pagesPerHugePage = 2 * ttcsnapshot.PagesPerMemoryTable

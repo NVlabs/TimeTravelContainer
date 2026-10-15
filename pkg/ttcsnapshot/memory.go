@@ -29,6 +29,13 @@ import (
 // megabyte maps the same table as its source. A table that differs in one
 // page is a new table, whose other pages still share their bytes.
 //
+// A 2 MiB page, one page with one identity and version (see
+// pgalloc.LogicalPageRange.Huge), is described by the two tables of its page
+// indexes, each of which holds its half whole, in a chunk of its own, and
+// records the page's identity once (memoryTableFormatHugeHalf). They list its
+// base pages as a table of the first format would, the identities they derive
+// from it, marked Huge.
+//
 // Graphs written before tables existed map each page index, through a sixth
 // level of MemoryNode, to a Page object that records one page. Those trees are
 // read, and their pages shared, but never written.
@@ -61,25 +68,32 @@ func (identity MemoryPageIdentity) complete() bool {
 }
 
 // MemoryPageLocation is where a page's bytes are: page Page of the bulk memory
-// chunk Chunk. The zero location is nowhere.
+// chunk Chunk. The zero location is nowhere. Huge is true if the chunk is half
+// of a 2 MiB page, which holds the base page at its slot.
 type MemoryPageLocation struct {
 	Chunk ObjectID
 	Page  uint8
+	Huge  bool
 }
 
-// MemoryPageEntry is one page a memory tree maps.
+// MemoryPageEntry is one page a memory tree maps. Huge is true if it is a base
+// page of a 2 MiB page, whose identity it derives from.
 type MemoryPageEntry struct {
 	Index    uint64
 	Location MemoryPageLocation
 	Identity MemoryPageIdentity
+	Huge     bool
 }
 
 // MemoryTableEntry is one page of a table: its slot among the table's page
-// indexes, where its bytes are, and its identity.
+// indexes, where its bytes are, and its identity. Huge is true if it is a
+// base page of a 2 MiB page: a table of such entries is all 256 base pages of
+// one half of the page, each at its slot of the half's chunk.
 type MemoryTableEntry struct {
 	Slot     uint8
 	Location MemoryPageLocation
 	Identity MemoryPageIdentity
+	Huge     bool
 }
 
 // NewMemoryTable is a table to map in a memory tree: the tree's root name,
@@ -99,6 +113,17 @@ const (
 	memoryTableFormat     = 1
 	memoryTableHeaderSize = 1 + PagesPerMemoryTable/8
 	memoryTableEntrySize  = 1 + 1 + 16 + 8 + 16 + 8 + 8
+)
+
+// A table of a half of a 2 MiB page is the format byte, the half, and the
+// identity of the page, whose logical and version sequences are multiples of
+// 512: its base page i of the half is page i of the table's one child, with
+// sequences 256 * half + i more. Builds that predate 2 MiB pages refuse it.
+const (
+	memoryTableFormatHugeHalf = 2
+	memoryTableHugeHalfSize   = 1 + 1 + 16 + 8 + 16 + 8 + 8
+	// pagesPerHugePage is the number of base pages of a 2 MiB page.
+	pagesPerHugePage = 2 * PagesPerMemoryTable
 )
 
 func compareObjectIDs(a, b ObjectID) int {
@@ -126,6 +151,9 @@ func (e *memoryTableEncoder) encode(entries []MemoryTableEntry) ([]byte, []Edge,
 	if len(entries) == 0 || len(entries) > PagesPerMemoryTable {
 		return nil, nil, fmt.Errorf("a memory table of %d pages", len(entries))
 	}
+	if entries[0].Huge {
+		return e.encodeHugeHalf(entries)
+	}
 	chunks := e.chunks[:0]
 	for index, entry := range entries {
 		if index != 0 && entry.Slot <= entries[index-1].Slot {
@@ -136,6 +164,9 @@ func (e *memoryTableEncoder) encode(entries []MemoryTableEntry) ([]byte, []Edge,
 		}
 		if !entry.Identity.complete() {
 			return nil, nil, fmt.Errorf("memory table slot %d has an incomplete identity", entry.Slot)
+		}
+		if entry.Huge || entry.Location.Huge {
+			return nil, nil, fmt.Errorf("memory table slot %d is of a 2 MiB page, among pages that are not", entry.Slot)
 		}
 		// Most pages are in the chunk of the page before.
 		if len(chunks) == 0 || chunks[len(chunks)-1] != entry.Location.Chunk {
@@ -169,6 +200,37 @@ func (e *memoryTableEncoder) encode(entries []MemoryTableEntry) ([]byte, []Edge,
 	return data, children, nil
 }
 
+// encodeHugeHalf returns the data and children of the table of entries, the
+// base pages of a half of a 2 MiB page in slot order.
+func (e *memoryTableEncoder) encodeHugeHalf(entries []MemoryTableEntry) ([]byte, []Edge, error) {
+	first := &entries[0]
+	half := first.Identity.LogicalSequence / PagesPerMemoryTable % 2
+	if len(entries) != PagesPerMemoryTable || first.Identity.LogicalSequence%PagesPerMemoryTable != 0 ||
+		first.Identity.VersionSequence%PagesPerMemoryTable != 0 || first.Identity.VersionSequence/PagesPerMemoryTable%2 != half ||
+		first.Location.Chunk.Kind != ObjectKindMemoryChunk || first.Location.Chunk.validate() != nil || !first.Identity.complete() {
+		return nil, nil, fmt.Errorf("a memory table of %d pages of a 2 MiB page from %+v", len(entries), first.Identity)
+	}
+	for slot, entry := range entries {
+		want := *first
+		want.Slot, want.Location.Page, want.Location.Huge = uint8(slot), uint8(slot), true
+		want.Identity.LogicalSequence += uint64(slot)
+		want.Identity.VersionSequence += uint64(slot)
+		if entry != want {
+			return nil, nil, fmt.Errorf("memory table slot %d is not page %d of a half of a 2 MiB page: %+v", slot, slot, entry)
+		}
+	}
+	data := slices.Grow(e.data[:0], memoryTableHugeHalfSize)
+	data = append(data, memoryTableFormatHugeHalf, byte(half))
+	data = append(data, first.Identity.LogicalAllocator[:]...)
+	data = binary.BigEndian.AppendUint64(data, first.Identity.LogicalSequence-half*PagesPerMemoryTable)
+	data = append(data, first.Identity.VersionAllocator[:]...)
+	data = binary.BigEndian.AppendUint64(data, first.Identity.VersionSequence-half*PagesPerMemoryTable)
+	data = binary.BigEndian.AppendUint64(data, first.Identity.References)
+	children := append(e.children[:0], Edge{Slot: 0, Child: first.Location.Chunk})
+	e.data, e.children = data, children
+	return data, children, nil
+}
+
 // decodeMemoryTable returns the entries of table in ascending slot order.
 func decodeMemoryTable(table Object) ([]MemoryTableEntry, error) {
 	return appendMemoryTable(nil, table)
@@ -178,6 +240,9 @@ func decodeMemoryTable(table Object) ([]MemoryTableEntry, error) {
 // order.
 func appendMemoryTable(entries []MemoryTableEntry, table Object) ([]MemoryTableEntry, error) {
 	data := table.Data
+	if table.ID.Kind == ObjectKindMemoryTable && len(data) != 0 && data[0] == memoryTableFormatHugeHalf {
+		return appendHugeHalfTable(entries, table)
+	}
 	if table.ID.Kind != ObjectKindMemoryTable || len(data) < memoryTableHeaderSize || data[0] != memoryTableFormat {
 		return nil, fmt.Errorf("object %s is not a memory table", table.ID.key())
 	}
@@ -220,6 +285,37 @@ func appendMemoryTable(entries []MemoryTableEntry, table Object) ([]MemoryTableE
 			return nil, fmt.Errorf("memory table %s slot %d has an incomplete identity", table.ID.key(), slot)
 		}
 		entries = append(entries, entry)
+	}
+	return entries, nil
+}
+
+// appendHugeHalfTable appends to entries those of table, a table of a half of
+// a 2 MiB page, in ascending slot order.
+func appendHugeHalfTable(entries []MemoryTableEntry, table Object) ([]MemoryTableEntry, error) {
+	data := table.Data
+	if len(data) != memoryTableHugeHalfSize || data[1] > 1 || len(table.Children) != 1 || table.Children[0].Slot != 0 || table.Children[0].Child.Kind != ObjectKindMemoryChunk {
+		return nil, fmt.Errorf("object %s is not a table of a half of a 2 MiB page", table.ID.key())
+	}
+	half := uint64(data[1])
+	var page MemoryPageIdentity
+	copy(page.LogicalAllocator[:], data[2:18])
+	page.LogicalSequence = binary.BigEndian.Uint64(data[18:26])
+	copy(page.VersionAllocator[:], data[26:42])
+	page.VersionSequence = binary.BigEndian.Uint64(data[42:50])
+	page.References = binary.BigEndian.Uint64(data[50:58])
+	if !page.complete() || page.LogicalSequence%pagesPerHugePage != 0 || page.VersionSequence%pagesPerHugePage != 0 ||
+		page.LogicalSequence > math.MaxUint64-pagesPerHugePage || page.VersionSequence > math.MaxUint64-pagesPerHugePage {
+		return nil, fmt.Errorf("table %s has a 2 MiB page of identity %+v", table.ID.key(), page)
+	}
+	entries = slices.Grow(entries, PagesPerMemoryTable)
+	chunk := table.Children[0].Child
+	for slot := uint64(0); slot < PagesPerMemoryTable; slot++ {
+		identity := page
+		identity.LogicalSequence += half*PagesPerMemoryTable + slot
+		identity.VersionSequence += half*PagesPerMemoryTable + slot
+		entries = append(entries, MemoryTableEntry{
+			Slot: uint8(slot), Location: MemoryPageLocation{Chunk: chunk, Page: uint8(slot), Huge: true}, Identity: identity, Huge: true,
+		})
 	}
 	return entries, nil
 }
@@ -314,7 +410,7 @@ func visitMemoryPages(root ObjectID, lookup func(ObjectID) (Object, bool), visit
 				if err := checkChunk(page.Location.Chunk); err != nil {
 					return err
 				}
-				entry = MemoryPageEntry{Index: prefix | uint64(page.Slot), Location: page.Location, Identity: page.Identity}
+				entry = MemoryPageEntry{Index: prefix | uint64(page.Slot), Location: page.Location, Identity: page.Identity, Huge: page.Huge}
 				if err := visit(&entry); err != nil {
 					return err
 				}
@@ -426,6 +522,8 @@ type memoryPageRecord struct {
 	slot uint8
 	// page is the page of the chunk the place is.
 	page uint8
+	// huge is true if the chunk is half of a 2 MiB page.
+	huge bool
 	// allocator is the page's version allocator, and chunk the chunk of the
 	// place, as the index interns them.
 	allocator, chunk uint32
@@ -526,7 +624,7 @@ func memoryPageProbeOf(identity *MemoryPageIdentity, location MemoryPageLocation
 
 // location returns the place of record.
 func (index *memoryPageIndex) location(record *memoryPageRecord) MemoryPageLocation {
-	return MemoryPageLocation{Chunk: index.chunks.values[record.chunk], Page: record.page}
+	return MemoryPageLocation{Chunk: index.chunks.values[record.chunk], Page: record.page, Huge: record.huge}
 }
 
 // comparePage orders record against probe by their pages.
@@ -552,7 +650,16 @@ func (index *memoryPageIndex) compare(record *memoryPageRecord, probe *memoryPag
 	if c := compareObjectIDs(index.chunks.values[record.chunk], probe.location.Chunk); c != 0 {
 		return c
 	}
-	return cmp.Compare(record.page, probe.location.Page)
+	if c := cmp.Compare(record.page, probe.location.Page); c != 0 {
+		return c
+	}
+	if record.huge != probe.location.Huge {
+		if record.huge {
+			return 1
+		}
+		return -1
+	}
+	return 0
 }
 
 // samePage reports whether record is of probe's page.
@@ -608,7 +715,7 @@ func (index *memoryPageIndex) hold(identity *MemoryPageIdentity, location Memory
 		return
 	}
 	block.records = slices.Insert(block.records, at, memoryPageRecord{
-		slot: probe.slot, page: location.Page,
+		slot: probe.slot, page: location.Page, huge: location.Huge,
 		allocator: memoryIntern(&index.allocators, probe.versionAllocator), chunk: memoryIntern(&index.chunks, location.Chunk),
 		holders: 1, versionSequence: probe.versionSequence, references: probe.references,
 	})
@@ -769,11 +876,18 @@ func (s *Store) rebuildMemoryIndexesLocked() {
 
 // memoryPageLocationLocked returns where the graph holds the page with
 // identity in an origin reuse allows, choosing the least chunk when there are
-// several.
-func (s *Store) memoryPageLocationLocked(identity MemoryPageIdentity, reuse reuseFilter, origins map[SnapshotID]bool) (MemoryPageLocation, bool) {
+// several, and only in a half of a 2 MiB page if huge. A page that is not
+// huge is a base page wherever it is, as a table of the first format refers
+// to it, even in a half of a 2 MiB page: the base pages of a 2 MiB page that
+// was split keep its identities.
+func (s *Store) memoryPageLocationLocked(identity MemoryPageIdentity, huge bool, reuse reuseFilter, origins map[SnapshotID]bool) (MemoryPageLocation, bool) {
 	holdings := s.memoryPages.holdings(&identity)
 	for index := range holdings {
+		if huge && !holdings[index].huge {
+			continue
+		}
 		location := s.memoryPages.location(&holdings[index])
+		location.Huge = huge
 		// An origin's state is found by a formatted key: remember it for
 		// the many pages a capture looks up in the same few origins.
 		origin := location.Chunk.Snapshot
@@ -885,6 +999,17 @@ func (s *Store) HoldMemoryPages(pinPrefix string, identities []MemoryPageIdentit
 // transaction, so that none is collected before a capture's tables refer to
 // it; DeletePins removes the pins it returns.
 func (s *Store) HoldMemoryPagesReusing(pinPrefix string, identities []MemoryPageIdentity, reuse MemoryReuse) ([]MemoryPageLocation, []string, error) {
+	return s.HoldMemoryPagesOfReusing(pinPrefix, identities, nil, reuse)
+}
+
+// HoldMemoryPagesOfReusing is HoldMemoryPagesReusing, but finds a page that
+// huge marks, a base page of a 2 MiB page, only in the half of a 2 MiB page
+// that holds it: one stored so, which a 2 MiB page may share. Another page is
+// found as a base page wherever it is. huge is nil or as long as identities.
+func (s *Store) HoldMemoryPagesOfReusing(pinPrefix string, identities []MemoryPageIdentity, huge []bool, reuse MemoryReuse) ([]MemoryPageLocation, []string, error) {
+	if huge != nil && len(huge) != len(identities) {
+		return nil, nil, fmt.Errorf("%d memory pages, of which %d are marked", len(identities), len(huge))
+	}
 	if err := validateRootName(pinPrefix); err != nil {
 		return nil, nil, err
 	}
@@ -903,7 +1028,7 @@ func (s *Store) HoldMemoryPagesReusing(pinPrefix string, identities []MemoryPage
 		if !identity.complete() {
 			return nil, nil, fmt.Errorf("memory page %d has an incomplete identity", index)
 		}
-		location, ok := s.memoryPageLocationLocked(identity, allowed, origins)
+		location, ok := s.memoryPageLocationLocked(identity, huge != nil && huge[index], allowed, origins)
 		if !ok {
 			continue
 		}

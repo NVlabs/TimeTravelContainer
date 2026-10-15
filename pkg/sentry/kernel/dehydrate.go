@@ -545,7 +545,8 @@ func (k *Kernel) CaptureDehydration(ctx context.Context, opts DehydrationCapture
 		if err := buffered.Flush(); err != nil {
 			return fmt.Errorf("flushing dehydrated Kernel metadata: %w", err)
 		}
-		layout, err := memoryCapture.SnapshotLayout()
+		// A 2 MiB page is stored whole.
+		layout, err := memoryCapture.HugePageSnapshotLayout()
 		if err != nil {
 			return fmt.Errorf("resolving dehydration memory graph: %w", err)
 		}

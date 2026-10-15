@@ -47,6 +47,7 @@ go_test(
     size = "medium",
     srcs = [
 		"catalog_test.go",
+		"huge_memory_test.go",
 		"deferred_test.go",
 		"filesystem_json_test.go",
         "graph_binary_test.go",

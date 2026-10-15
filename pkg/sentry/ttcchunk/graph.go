@@ -118,6 +118,9 @@ type importedObject struct {
 	slots  []importedSlot
 	// missing has the slots whose pages the graph does not hold yet.
 	missing [slotBitmapBytes]byte
+	// huge is true if the object is a half of a 2 MiB page, whose pages are
+	// stored together, in a chunk of their own, or shared together.
+	huge bool
 }
 
 // slot returns the page in a slot the capture maps.
@@ -261,25 +264,43 @@ func importCapture(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, o
 		pages += len(object.slots)
 	}
 	identities := make([]ttcsnapshot.MemoryPageIdentity, 0, pages)
+	var huge []bool
 	for _, object := range objects {
 		for index := range object.slots {
 			identities = append(identities, object.slots[index].identity)
 		}
+		if object.huge && huge == nil {
+			huge = make([]bool, len(identities)-len(object.slots), pages)
+		}
+		if huge != nil {
+			for range object.slots {
+				huge = append(huge, object.huge)
+			}
+		}
 	}
-	locations, held, err := graph.HoldMemoryPagesReusing(rootPrefix+"/"+heldPinComponent, identities, reuse)
+	locations, held, err := graph.HoldMemoryPagesOfReusing(rootPrefix+"/"+heldPinComponent, identities, huge, reuse)
 	if err != nil {
 		return GraphImportResult{}, err
 	}
 	pins = held
 	for _, object := range objects {
+		found := locations[:len(object.slots)]
+		locations = locations[len(object.slots):]
+		if object.huge && !wholeHugeHalf(found) {
+			// A half of a 2 MiB page is shared only whole, from a half of
+			// one, and stored whole otherwise.
+			for index := range object.slots {
+				setBit(&object.missing, object.slots[index].number())
+			}
+			continue
+		}
 		for index := range object.slots {
 			slot := &object.slots[index]
-			if location := locations[0]; location.Chunk.IsZero() {
+			if location := found[index]; location.Chunk.IsZero() {
 				setBit(&object.missing, slot.number())
 			} else {
 				slot.location = location
 			}
-			locations = locations[1:]
 		}
 	}
 	if source.need != nil {
@@ -333,7 +354,7 @@ func importCapture(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, o
 			position := starts[index]
 			for index := range object.slots {
 				if slot := &object.slots[index]; hasBit(&object.missing, slot.number()) {
-					slot.location = ttcsnapshot.MemoryPageLocation{Chunk: chunks[position/PagesPerChunk], Page: uint8(position % PagesPerChunk)}
+					slot.location = ttcsnapshot.MemoryPageLocation{Chunk: chunks[position/PagesPerChunk], Page: uint8(position % PagesPerChunk), Huge: object.huge}
 					position++
 				}
 			}
@@ -494,8 +515,11 @@ func planCaptureImport(manifest Manifest, rootPrefix string) ([]*importedObject,
 		if !ok {
 			index = len(objects)
 			objectIndexes[run.Object] = index
-			objects = append(objects, &importedObject{id: run.Object, logical: run.Logical, resource: resourceIndexes[run.ResourceID]})
+			objects = append(objects, &importedObject{id: run.Object, logical: run.Logical, resource: resourceIndexes[run.ResourceID], huge: run.Huge})
 			capacities = append(capacities, 0)
+		} else if objects[index].huge || run.Huge {
+			// A half of a 2 MiB page is its object's only run.
+			return nil, nil, nil, fmt.Errorf("capture object %s holds a half of a 2 MiB page and more", run.Object)
 		} else if objects[index].logical != run.Logical {
 			return nil, nil, nil, fmt.Errorf("memory chunk %s has logical coordinates %+v and %+v", run.Object, objects[index].logical, run.Logical)
 		} else if objects[index].resource != resourceIndexes[run.ResourceID] {
@@ -592,7 +616,7 @@ func planCaptureTables(resources []*importedResource, mappings []importedMapping
 			newChunks = append(newChunks, nil)
 		}
 		slot := mapping.object.slot(mapping.slot)
-		entries[position] = ttcsnapshot.MemoryTableEntry{Slot: uint8(mapping.index % ttcsnapshot.PagesPerMemoryTable), Location: slot.location, Identity: slot.identity}
+		entries[position] = ttcsnapshot.MemoryTableEntry{Slot: uint8(mapping.index % ttcsnapshot.PagesPerMemoryTable), Location: slot.location, Identity: slot.identity, Huge: mapping.object.huge}
 		if hasBit(&mapping.object.missing, mapping.slot) && fresh[slot.location.Chunk] {
 			newChunks[len(newChunks)-1] = append(newChunks[len(newChunks)-1], slot.location.Chunk)
 			delete(fresh, slot.location.Chunk)
@@ -636,6 +660,21 @@ func (object *importedObject) missingPages(chunk Chunk) ([]Page, error) {
 	}
 	slices.SortFunc(pages, func(left, right Page) int { return cmp.Compare(left.Slot, right.Slot) })
 	return pages, nil
+}
+
+// wholeHugeHalf reports whether locations, those the graph holds the pages of
+// a half of a 2 MiB page in, in slot order, are all of one half of a 2 MiB
+// page, each at its slot.
+func wholeHugeHalf(locations []ttcsnapshot.MemoryPageLocation) bool {
+	if len(locations) != PagesPerChunk {
+		return false
+	}
+	for slot, location := range locations {
+		if !location.Huge || location.Chunk != locations[0].Chunk || int(location.Page) != slot {
+			return false
+		}
+	}
+	return true
 }
 
 func countBits(bitmap *[slotBitmapBytes]byte) int {
@@ -749,7 +788,7 @@ func BuildGraphManifest(graph ttcsnapshot.MemoryCatalog, roots []GraphMemoryRoot
 			if len(runs) > rootRuns && chunk == runChunk {
 				run := &runs[len(runs)-1]
 				delta := uint64(run.Pages)
-				if run.Pages != PagesPerChunk && run.References == identity.References && run.Logical == logical &&
+				if run.Pages != PagesPerChunk && run.References == identity.References && run.Logical == logical && run.Huge == entry.Huge &&
 					oldOffset == run.OldOffset+delta*hostarch.PageSize &&
 					page.Allocator == run.FirstPage.Allocator && page.Sequence == run.FirstPage.Sequence+delta &&
 					version.Allocator == run.FirstVersion.Allocator && version.Sequence == run.FirstVersion.Sequence+delta &&
@@ -767,7 +806,7 @@ func BuildGraphManifest(graph ttcsnapshot.MemoryCatalog, roots []GraphMemoryRoot
 			runs = append(runs, ManifestRun{
 				ResourceID: root.ResourceID, OldOffset: oldOffset, References: identity.References,
 				FirstPage: page, FirstVersion: version, Logical: logical, FirstSlot: slot, Pages: 1,
-				Object: residency, ObjectPage: entry.Location.Page,
+				Object: residency, ObjectPage: entry.Location.Page, Huge: entry.Huge,
 			})
 			runChunk = chunk
 			return nil
