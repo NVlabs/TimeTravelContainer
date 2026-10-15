@@ -1375,8 +1375,8 @@ func (rf *regularFile) preadDisk(ctx context.Context, dst usermem.IOSequence, of
 	if err != nil {
 		return 0, err, false
 	}
-	const maxBounce = 64 << 10
-	buf := make([]byte, min(dst.NumBytes(), int64(maxBounce)))
+	bounce, buf := getDiskBounceBuffer(dst.NumBytes())
+	defer diskBounceBufferPool.Put(bounce)
 	for dst.NumBytes() != 0 {
 		want := min(dst.NumBytes(), int64(len(buf)))
 		n, readErr := file.ReadAt(buf[:want], offset+done)
@@ -1505,8 +1505,8 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 			return 0, offset, err
 		}
 		defer f.diskIOMu.Unlock()
-		const maxBounce = 64 << 10
-		buf := make([]byte, min(srclen, int64(maxBounce)))
+		bounce, buf := getDiskBounceBuffer(srclen)
+		defer diskBounceBufferPool.Put(bounce)
 		var done int64
 		for src.NumBytes() != 0 {
 			want := min(src.NumBytes(), int64(len(buf)))
@@ -1618,8 +1618,8 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 // copyInToWithBounce copies src to dst without calling dst while src's
 // user-memory implementation may hold MemoryManager locks.
 func copyInToWithBounce(ctx context.Context, src usermem.IOSequence, dst safemem.Writer) (int64, error) {
-	const maxBounce = 64 << 10
-	buf := make([]byte, min(src.NumBytes(), maxBounce))
+	bounce, buf := getDiskBounceBuffer(src.NumBytes())
+	defer diskBounceBufferPool.Put(bounce)
 	var done int64
 	for src.NumBytes() != 0 {
 		want := min(src.NumBytes(), int64(len(buf)))
@@ -1728,6 +1728,28 @@ func getRegularFileReadWriter(file *regularFile, offset int64, memCgID uint32) *
 func putRegularFileReadWriter(rw *regularFileReadWriter) {
 	rw.file = nil
 	regularFileReadWriterPool.Put(rw)
+}
+
+// diskBounceBytes is the most that a read or write of a TTC volume's file
+// moves through a bounce buffer at a time.
+const diskBounceBytes = 64 << 10
+
+// diskBounceBufferPool holds bounce buffers of diskBounceBytes. Allocated for
+// each call, the buffers of a stream of 4 KiB writes and of the reads back
+// cost a fifth of the Sentry's time, in its garbage collector.
+var diskBounceBufferPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, diskBounceBytes)
+		return &buf
+	},
+}
+
+// getDiskBounceBuffer returns a bounce buffer, which the caller gives back
+// with diskBounceBufferPool.Put, and its first min(want, diskBounceBytes)
+// bytes.
+func getDiskBounceBuffer(want int64) (*[]byte, []byte) {
+	buf := diskBounceBufferPool.Get().(*[]byte)
+	return buf, (*buf)[:min(want, diskBounceBytes)]
 }
 
 // ReadToBlocks implements safemem.Reader.ReadToBlocks.
