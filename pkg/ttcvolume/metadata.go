@@ -384,7 +384,7 @@ func (r *Repository) commitMetadata(branch *Branch, state *branchMetadata, ops [
 		durabilityFence := len(r.pendingReclaims) >= reclaimBatchObjects || r.graph.CheckpointDue(reclaimJournalBytes)
 		r.dirtyMu.Unlock()
 		if durabilityFence {
-			if err := r.syncMetadataLocked(); err != nil {
+			if err := r.reclaimFenceLocked(); err != nil {
 				return fmt.Errorf("flushing bounded filesystem garbage: %w", err)
 			}
 		}

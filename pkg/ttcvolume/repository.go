@@ -3838,30 +3838,8 @@ func (r *Repository) syncMetadataLocked() error {
 		}
 	}
 	r.dirtyMu.Unlock()
-	// The graph WAL is now a durable proof that these immutable payloads are
-	// unreachable. Delete them directly by ID instead of scanning the complete
-	// object store; a crash before an unlink merely leaves harmless garbage for
-	// startup reconciliation.
-	r.dirtyMu.Lock()
-	reclaims := make([]ttcsnapshot.ObjectID, 0, len(r.pendingReclaims))
-	for _, id := range r.pendingReclaims {
-		reclaims = append(reclaims, id)
-	}
-	r.dirtyMu.Unlock()
-	slices.SortFunc(reclaims, ttcsnapshot.ObjectID.Compare)
-	for _, id := range reclaims {
-		if err := r.data.Remove(id); err != nil {
-			return fmt.Errorf("removing reclaimed repository object %s: %w", id, err)
-		}
-		if id.Kind == ttcsnapshot.ObjectKindFile {
-			if err := r.clearRemoteObjectPending(id.String()); err != nil {
-				return fmt.Errorf("removing reclaimed remote marker %s: %w", id, err)
-			}
-		}
-		r.dirtyMu.Lock()
-		delete(r.pendingReclaims, id.String())
-		delete(r.dirtyData, id.String())
-		r.dirtyMu.Unlock()
+	if err := r.removePendingReclaimsLocked(); err != nil {
+		return err
 	}
 	for _, id := range dirtyBranches {
 		r.dirtyMu.Lock()
@@ -3943,6 +3921,81 @@ func (r *Repository) syncMetadataLocked() error {
 	// churn alone permits an unbounded journal and multi-minute daemon restart.
 	// A checkpoint costs in proportion to the graph, so it comes once the
 	// journal outgrows the last one, and a restart replays at most as much.
+	if r.graph.CheckpointDue(reclaimJournalBytes) {
+		if err := r.graph.CheckpointExternallyCoordinated(); err != nil {
+			return fmt.Errorf("compacting repository snapshot journal: %w", err)
+		}
+	}
+	return nil
+}
+
+// removePendingReclaimsLocked deletes the payloads that a durable graph WAL
+// proves unreachable, directly by ID instead of scanning the complete object
+// store; a crash before an unlink merely leaves harmless garbage for startup
+// reconciliation.
+func (r *Repository) removePendingReclaimsLocked() error {
+	r.dirtyMu.Lock()
+	reclaims := make([]ttcsnapshot.ObjectID, 0, len(r.pendingReclaims))
+	for _, id := range r.pendingReclaims {
+		reclaims = append(reclaims, id)
+	}
+	r.dirtyMu.Unlock()
+	slices.SortFunc(reclaims, ttcsnapshot.ObjectID.Compare)
+	for _, id := range reclaims {
+		if err := r.data.Remove(id); err != nil {
+			return fmt.Errorf("removing reclaimed repository object %s: %w", id, err)
+		}
+		if id.Kind == ttcsnapshot.ObjectKindFile {
+			if err := r.clearRemoteObjectPending(id.String()); err != nil {
+				return fmt.Errorf("removing reclaimed remote marker %s: %w", id, err)
+			}
+		}
+		r.dirtyMu.Lock()
+		delete(r.pendingReclaims, id.String())
+		delete(r.dirtyData, id.String())
+		r.dirtyMu.Unlock()
+	}
+	return nil
+}
+
+// reclaimFenceLocked deletes the payloads that published metadata made
+// unreachable once the WAL proving it is durable, which takes the WAL and the
+// names of everything it can reach, as a guest fsync does (see
+// SyncBranchMetadata), and not the bytes of every file written since the last
+// fence, as the full fence syncs: a workload that wrote reports and deleted
+// them waited for the disk to persist what it was about to delete, 2.3 s of
+// the 5 s that writing, reading back and removing 2000 files of 512 KiB took.
+// Branch pointer summaries and other files' data are left to the next full
+// fence.
+func (r *Repository) reclaimFenceLocked() error {
+	if r.unsynced {
+		// A repository being made syncs nothing; the full fence knows how.
+		return r.syncMetadataLocked()
+	}
+	if err := r.flushAllMetadataBatchesLocked(); err != nil {
+		return fmt.Errorf("publishing repository metadata batches: %w", err)
+	}
+	if err := r.data.SyncNewNames(); err != nil {
+		return fmt.Errorf("syncing repository data object names: %w", err)
+	}
+	synced, err := r.syncNamesLocked()
+	if err != nil {
+		return err
+	}
+	if err := r.graph.Sync(); err != nil {
+		return fmt.Errorf("syncing repository snapshot graph: %w", err)
+	}
+	r.dirtyMu.Lock()
+	for _, name := range synced.files {
+		delete(r.dirtyFiles, name)
+	}
+	for _, name := range synced.directories {
+		delete(r.dirtyDirs, name)
+	}
+	r.dirtyMu.Unlock()
+	if err := r.removePendingReclaimsLocked(); err != nil {
+		return err
+	}
 	if r.graph.CheckpointDue(reclaimJournalBytes) {
 		if err := r.graph.CheckpointExternallyCoordinated(); err != nil {
 			return fmt.Errorf("compacting repository snapshot journal: %w", err)

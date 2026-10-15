@@ -58,6 +58,57 @@ func TestBranchSyncLeavesOtherFilesDataToTheFullFence(t *testing.T) {
 	}
 }
 
+// The fence that deletes garbage makes durable the WAL proving it unreachable,
+// and not the payloads of files still live, which the full fence syncs.
+func TestReclaimFenceLeavesLiveFilesDataToTheFullFence(t *testing.T) {
+	manager := openTestManager(t)
+	repo, err := manager.Create("reclaim-fence")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	live, err := repo.CreateRegular(MainBranch, RootInode, "live", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, repo, MainBranch, live, "not yet", 0)
+	liveInode, err := repo.Inode(MainBranch, live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for iteration := 0; iteration < reclaimBatchObjects+100; iteration++ {
+		ino, err := repo.CreateRegular(MainBranch, RootInode, "temporary", 0600, 0, 0)
+		if err != nil {
+			t.Fatalf("iteration %d create: %v", iteration, err)
+		}
+		if err := repo.Unlink(MainBranch, RootInode, "temporary"); err != nil {
+			t.Fatalf("iteration %d unlink: %v", iteration, err)
+		}
+		if err := repo.ReapOrphan(MainBranch, ino); err != nil {
+			t.Fatalf("iteration %d reap: %v", iteration, err)
+		}
+	}
+	repo.dirtyMu.Lock()
+	reclaiming := len(repo.pendingReclaims)
+	_, stillDirty := repo.dirtyData[liveInode.Object]
+	repo.dirtyMu.Unlock()
+	if reclaiming >= reclaimBatchObjects {
+		t.Fatalf("the automatic fence left %d objects to reclaim, want fewer than %d", reclaiming, reclaimBatchObjects)
+	}
+	if !stillDirty {
+		t.Fatal("the fence that deleted garbage synced a live file's payload; that is the full fence's job")
+	}
+	if err := repo.SyncMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	repo.dirtyMu.Lock()
+	remaining := len(repo.dirtyData)
+	repo.dirtyMu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("the full fence left %d dirty payloads", remaining)
+	}
+}
+
 // A new file has nothing to sync but its name until something opens it to
 // write: then, and not before, the next full fence syncs its payload.
 func TestFenceSyncsANewFileOnceOpenedToWrite(t *testing.T) {
