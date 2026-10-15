@@ -137,7 +137,7 @@ func TestPrepareMemberCopyLeavesStreamsToTTCD(t *testing.T) {
 }
 
 func TestSharedDaemonMemberOfOwnDaemon(t *testing.T) {
-	socket := filepath.Join(t.TempDir(), "ttcd.sock")
+	socket := filepath.Join(shortSocketDir(t), "ttcd.sock")
 	if sharedDaemonMember(socket) {
 		t.Fatal("a missing socket is another user's")
 	}
