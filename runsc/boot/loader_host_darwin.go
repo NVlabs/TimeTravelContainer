@@ -27,3 +27,13 @@ func waitForGoferDisconnect(goferFD int) error {
 		return nil
 	}
 }
+
+// isTmpfs reports that dir is on no tmpfs, which the host has none of.
+func isTmpfs(dir string) (bool, error) {
+	return false, nil
+}
+
+// openUnnamedFile fails: the host's files have names.
+func openUnnamedFile(dir string) (int, error) {
+	return -1, unix.ENOTSUP
+}

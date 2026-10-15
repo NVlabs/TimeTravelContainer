@@ -20,3 +20,18 @@ func waitForGoferDisconnect(goferFD int) error {
 	})
 	return err
 }
+
+// isTmpfs reports whether dir is on a tmpfs.
+func isTmpfs(dir string) (bool, error) {
+	var fs unix.Statfs_t
+	if err := unix.Statfs(dir, &fs); err != nil {
+		return false, err
+	}
+	return fs.Type == unix.TMPFS_MAGIC, nil
+}
+
+// openUnnamedFile opens a new file of no name in dir, for reading and
+// writing.
+func openUnnamedFile(dir string) (int, error) {
+	return unix.Open(dir, unix.O_TMPFILE|unix.O_RDWR|unix.O_CLOEXEC, 0600)
+}

@@ -1393,10 +1393,9 @@ func createBootMemoryFileForPlatform(p platform.Platform, conf *config.Config, h
 // seccomp filters are installed, which need not allow opening the file.
 func createApplicationMemoryFile(conf *config.Config, name string) (*os.File, bool, error) {
 	if conf.MemoryFileHugeTmpfs {
-		var fs unix.Statfs_t
-		if err := unix.Statfs(specutils.MemoryFileTmpfsDir, &fs); err != nil || fs.Type != unix.TMPFS_MAGIC {
+		if tmpfs, err := isTmpfs(specutils.MemoryFileTmpfsDir); err != nil || !tmpfs {
 			log.Infof("Application memory file %s is a memfd: no huge-page tmpfs at %s (%v)", name, specutils.MemoryFileTmpfsDir, err)
-		} else if fd, err := unix.Open(specutils.MemoryFileTmpfsDir, unix.O_TMPFILE|unix.O_RDWR|unix.O_CLOEXEC, 0600); err != nil {
+		} else if fd, err := openUnnamedFile(specutils.MemoryFileTmpfsDir); err != nil {
 			log.Warningf("Application memory file %s is a memfd: creating it on the huge-page tmpfs at %s: %v", name, specutils.MemoryFileTmpfsDir, err)
 		} else {
 			log.Infof("Application memory file %s is on the huge-page tmpfs at %s", name, specutils.MemoryFileTmpfsDir)
