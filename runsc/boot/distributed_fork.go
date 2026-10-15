@@ -293,10 +293,7 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		if uint64(len(encoded)) != args.MetadataBytes {
 			return nil, fmt.Errorf("distributed metadata size is %d, want %d", len(encoded), args.MetadataBytes)
 		}
-		metadata, err = ttcremote.UnmarshalSessionMetadata(encoded, ttcremote.SessionMetadataLimits{
-			MaxTotalBytes: args.MetadataBytes, MaxKernelBytes: args.MetadataBytes,
-			MaxAllocatorBytes: args.MetadataBytes, MaxLoadRanges: 1 << 20,
-		})
+		metadata, err = ttcremote.UnmarshalSessionMetadata(encoded, ttcremote.SessionMetadataLimitsFor(args.MetadataBytes))
 		if err != nil {
 			return nil, err
 		}
@@ -724,10 +721,7 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (_
 	if uint64(len(encoded)) != args.MetadataBytes {
 		return nil, fmt.Errorf("distributed peer metadata size is %d, want %d", len(encoded), args.MetadataBytes)
 	}
-	metadata, err := ttcremote.UnmarshalSessionMetadata(encoded, ttcremote.SessionMetadataLimits{
-		MaxTotalBytes: args.MetadataBytes, MaxKernelBytes: args.MetadataBytes,
-		MaxAllocatorBytes: args.MetadataBytes, MaxLoadRanges: 1 << 20,
-	})
+	metadata, err := ttcremote.UnmarshalSessionMetadata(encoded, ttcremote.SessionMetadataLimitsFor(args.MetadataBytes))
 	if err != nil {
 		return nil, err
 	}

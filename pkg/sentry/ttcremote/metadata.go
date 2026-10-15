@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
@@ -19,6 +20,7 @@ const (
 	sessionMetadataVersion = 2
 	sessionMetadataHeader  = 32
 	sessionMetadataDigest  = sha256.Size
+	sessionLoadRangeBytes  = 24
 	sessionBindingBytes    = 72
 )
 
@@ -47,6 +49,18 @@ type SessionMetadataLimits struct {
 	MaxKernelBytes    uint64
 	MaxAllocatorBytes uint64
 	MaxLoadRanges     uint32
+}
+
+// SessionMetadataLimitsFor returns the limits to decode an envelope of size
+// bytes under: no field larger than the envelope, and no more load ranges or
+// memory bindings than it has room for, so that what decoding allocates is
+// bounded by what the peer sent. A fixed count of 1<<20 refused the fork of
+// any family of more than 4 GiB, as an envelope binds each page.
+func SessionMetadataLimitsFor(size uint64) SessionMetadataLimits {
+	return SessionMetadataLimits{
+		MaxTotalBytes: size, MaxKernelBytes: size, MaxAllocatorBytes: size,
+		MaxLoadRanges: uint32(min(size/sessionLoadRangeBytes, math.MaxUint32)),
+	}
 }
 
 // MarshalBinary returns a deterministic, SHA-256-protected wire envelope.
@@ -156,7 +170,7 @@ func UnmarshalSessionMetadata(encoded []byte, limits SessionMetadataLimits) (*Se
 	if m.TargetBranchID, err = readString(); err != nil {
 		return nil, err
 	}
-	if kernelLen+allocatorLen+uint64(rangeCount)*24+uint64(bindingCount)*sessionBindingBytes != uint64(r.Len()) {
+	if kernelLen+allocatorLen+uint64(rangeCount)*sessionLoadRangeBytes+uint64(bindingCount)*sessionBindingBytes != uint64(r.Len()) {
 		return nil, errors.New("distributed metadata payload layout is inconsistent")
 	}
 	m.KernelMetadata = make([]byte, kernelLen)

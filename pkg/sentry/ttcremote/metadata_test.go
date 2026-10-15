@@ -5,6 +5,7 @@ package ttcremote
 
 import (
 	"bytes"
+	"encoding/binary"
 	"reflect"
 	"testing"
 
@@ -63,5 +64,33 @@ func TestSessionMetadataDecodeLimits(t *testing.T) {
 		MaxAllocatorBytes: 4096, MaxLoadRanges: 1,
 	}); err == nil {
 		t.Fatal("oversized Kernel metadata passed decode limits")
+	}
+}
+
+// A family of more than 4 GiB has more than 1<<20 pages, each bound in its
+// envelope: limits derived from the envelope's size admit it, and still
+// refuse counts it has no room for.
+func TestSessionMetadataLimitsForLargeEnvelopes(t *testing.T) {
+	const ranges = 1<<20 + 1
+	want := &SessionMetadata{FamilyID: "family-1", SourceBranchID: "main", TargetBranchID: "large"}
+	want.LoadRanges = make([]pgalloc.RemoteLoadRange, ranges)
+	for i := range want.LoadRanges {
+		start := uint64(i) * 2 * 4096
+		want.LoadRanges[i] = pgalloc.RemoteLoadRange{Target: memmap.FileRange{Start: start, End: start + 4096}, StreamOffset: uint64(i) * 4096}
+	}
+	encoded, err := want.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := UnmarshalSessionMetadata(encoded, SessionMetadataLimitsFor(uint64(len(encoded))))
+	if err != nil {
+		t.Fatalf("decoding %d load ranges: %v", ranges, err)
+	}
+	if len(got.LoadRanges) != ranges || got.LoadRanges[ranges-1] != want.LoadRanges[ranges-1] {
+		t.Fatalf("decoded %d load ranges, last %+v; want %d, last %+v", len(got.LoadRanges), got.LoadRanges[len(got.LoadRanges)-1], ranges, want.LoadRanges[ranges-1])
+	}
+	binary.BigEndian.PutUint32(encoded[28:32], uint32(len(encoded)/sessionLoadRangeBytes+1))
+	if _, err := UnmarshalSessionMetadata(encoded, SessionMetadataLimitsFor(uint64(len(encoded)))); err == nil {
+		t.Fatal("an envelope claiming more bindings than it has room for was decoded")
 	}
 }
