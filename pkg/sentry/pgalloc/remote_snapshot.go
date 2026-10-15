@@ -834,10 +834,11 @@ func (s *RemoteSnapshot) OutstandingStreamRanges(maxRange uint64) ([]RemotePushH
 	return ranges, nil
 }
 
-// AtomicPushRanges expands candidates to complete logical chunks when this
-// snapshot uses chunk-atomic remote residency. A chunk that a concurrent pull
-// has partially or completely acknowledged is omitted; logical-chunk demand
-// guarantees such a pull resolves the complete chunk.
+// AtomicPushRanges expands candidates to complete residency units (see
+// CapturedMemoryLayout.ChunkOrdered) when this snapshot uses chunk-atomic
+// remote residency. A unit that a concurrent pull has partially or completely
+// acknowledged is omitted; logical-chunk demand guarantees such a pull
+// resolves the complete unit.
 func (s *RemoteSnapshot) AtomicPushRanges(candidates []RemotePushHint, maxRange uint64) ([]RemotePushHint, error) {
 	if maxRange < hostarch.PageSize || !hostarch.IsPageAligned(maxRange) {
 		return nil, fmt.Errorf("invalid atomic remote range limit %d", maxRange)
@@ -863,7 +864,9 @@ func (s *RemoteSnapshot) AtomicPushRanges(candidates []RemotePushHint, maxRange 
 				continue
 			}
 			if chunk.Length > maxRange {
-				return nil, fmt.Errorf("logical chunk push length %d exceeds limit %d", chunk.Length, maxRange)
+				// A unit larger than a push, a 2 MiB page where pushes are
+				// smaller, is left for the target to pull.
+				continue
 			}
 			if _, ok := seen[chunk.StreamOffset]; ok {
 				continue
@@ -1310,7 +1313,8 @@ func (f *MemoryFile) AttachRemotePageLoad(pages *AsyncPagesFileLoad, ranges []Re
 				previousEnd = load.StreamOffset + load.Target.Length()
 				bytes += load.Target.Length()
 			}
-			if bytes > SparseChunkBytes || len(chunk.ranges) > pages.maxRanges {
+			// A unit is a logical chunk's base pages, or one 2 MiB page.
+			if bytes > hostarch.HugePageSize || len(chunk.ranges) > pages.maxRanges {
 				return fmt.Errorf("logical chunk %+v instance %d requires %d bytes and %d ranges; reader allows %d bytes and %d ranges", chunk.id, chunk.instance, bytes, len(chunk.ranges), pages.maxReadBytes, pages.maxRanges)
 			}
 		}
@@ -1493,7 +1497,8 @@ func (f *MemoryFile) AttachSparseChunkPageLoad(pages *AsyncPagesFileLoad, ranges
 				previousEnd = load.StreamOffset + load.Target.Length()
 				bytes += load.Target.Length()
 			}
-			if bytes > SparseChunkBytes || len(chunk.ranges) > pages.maxRanges {
+			// A unit is a logical chunk's base pages, or one 2 MiB page.
+			if bytes > hostarch.HugePageSize || len(chunk.ranges) > pages.maxRanges {
 				return fmt.Errorf("sparse logical chunk %+v requires %d bytes and %d ranges", chunk.id, bytes, len(chunk.ranges))
 			}
 		}

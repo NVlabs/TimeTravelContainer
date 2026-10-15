@@ -424,6 +424,17 @@ func (f *MemoryFile) HugePageAt(off uint64) (memmap.FileRange, bool) {
 	return memmap.FileRange{Start: start, End: start + hostarch.HugePageSize}, true
 }
 
+// IsHugePages reports whether fr is whole 2 MiB pages; see
+// logicalPageInfo.Huge.
+func (f *MemoryFile) IsHugePages(fr memmap.FileRange) bool {
+	if !hostarch.IsHugePageAligned(fr.Start) || !hostarch.IsHugePageAligned(fr.End) || fr.Length() == 0 {
+		return false
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.isHugeLocked(fr)
+}
+
 // SplitPartlyCoveredHugePages splits each 2 MiB page that fr covers in part
 // into its base pages, which keep their identities and versions, for a caller
 // that takes that part of it on its own; see splitHugePagesLocked.

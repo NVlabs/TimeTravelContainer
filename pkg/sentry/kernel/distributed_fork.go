@@ -209,7 +209,8 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 		if err != nil {
 			return err
 		}
-		layout, err := memoryCapture.SnapshotLayout()
+		// A 2 MiB page travels whole, and its target installs it whole.
+		layout, err := memoryCapture.HugePageSnapshotLayout()
 		if err != nil {
 			return fmt.Errorf("resolving sparse distributed-fork memory graph: %w", err)
 		}

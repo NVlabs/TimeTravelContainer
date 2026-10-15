@@ -33,6 +33,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/state"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -769,10 +770,10 @@ func TestLiveForkCopyOnWriteWidensOnlyForSequentialRuns(t *testing.T) {
 	}
 }
 
-// hugePageFork returns a parent and its live fork, in a MemoryFile whose huge
-// memory is 2 MiB pages, which share the 2 MiB page that the parent maps at
-// the returned address, page n of which holds n.
-func hugePageFork(t *testing.T) (ctx context.Context, parent, child *MemoryManager, base hostarch.Addr) {
+// hugePageParent returns a MemoryManager, in a MemoryFile whose huge memory is
+// 2 MiB pages, that maps a 2 MiB page at the returned address, page n of which
+// holds n.
+func hugePageParent(t *testing.T) (ctx context.Context, parent *MemoryManager, base hostarch.Addr) {
 	t.Helper()
 	ctx = contexttest.Context(t)
 	mf := newRemoteCloneMemoryFileWithOpts(t, pgalloc.MemoryFileOpts{
@@ -796,6 +797,14 @@ func hugePageFork(t *testing.T) (ctx context.Context, parent, child *MemoryManag
 	if _, ok := parent.mf.HugePageAt(fileOffsetAt(t, parent, base)); !ok {
 		t.Fatal("setup: the parent's huge memory is not a 2 MiB page")
 	}
+	return ctx, parent, base
+}
+
+// hugePageFork returns hugePageParent's parent and its live fork, which share
+// the 2 MiB page at the returned address.
+func hugePageFork(t *testing.T) (ctx context.Context, parent, child *MemoryManager, base hostarch.Addr) {
+	t.Helper()
+	ctx, parent, base = hugePageParent(t)
 	child, err := cloneMemoryManagerMetadata(ctx, parent)
 	if err != nil {
 		t.Fatalf("cloneMemoryManagerMetadata: %v", err)
@@ -893,6 +902,99 @@ func TestLiveForkCopiesA2MiBPageWhole(t *testing.T) {
 		t.Fatalf("the parent's owned page is %+v at %+v, want %+v at a new version", id, version, parentID)
 	}
 	checkHugePageContents(ctx, t, parent, base)
+}
+
+// A remote fork's target installs a 2 MiB page whole, in an aligned 2 MiB
+// page that it maps with one huge pma and reads in one piece of the stream,
+// and a write to it there copies it whole.
+func TestRelocatedDistributedForkKeeps2MiBPages(t *testing.T) {
+	ctx, parent, base := hugePageParent(t)
+	block := hostarch.AddrRange{Start: base, End: base + hostarch.HugePageSize}
+	parent.PrepareDistributedForkCOW()
+	capture := pgalloc.NewMemoryRangeCapture()
+	if err := parent.CaptureMemoryFileRanges(capture); err != nil {
+		t.Fatalf("CaptureMemoryFileRanges: %v", err)
+	}
+	layout, err := capture.HugePageSnapshotLayout()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if layout, err = layout.ChunkOrdered(); err != nil {
+		t.Fatal(err)
+	}
+	bound := false
+	for _, binding := range layout.Bindings {
+		bound = bound || (binding.Huge && binding.OldOffset == fileOffsetAt(t, parent, base))
+	}
+	if !bound {
+		t.Fatal("the capture does not bind the 2 MiB page whole")
+	}
+	parent.mf.MarkSavable()
+	var metadata bytes.Buffer
+	if _, err := state.Save(ctx, &metadata, parent); err != nil {
+		t.Fatalf("state.Save: %v", err)
+	}
+	snapshot, err := pgalloc.NewRemoteSnapshot(layout.Regions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+
+	targetMF := newRemoteCloneMemoryFileWithOpts(t, pgalloc.MemoryFileOpts{
+		DelayedEviction:         pgalloc.DelayedEvictionDisabled,
+		DisableIMAWorkAround:    true,
+		DisableMemoryAccounting: true,
+		ExpectHugepages:         true,
+	})
+	defer targetMF.Destroy()
+	installation, relocation, loads, err := targetMF.InstallRemoteBindings(layout.Bindings, usage.Anonymous, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := pgalloc.NewLoopbackRemoteReader(snapshot, hostarch.HugePageSize, hugePagePages, 4)
+	pages, err := pgalloc.StartAsyncPagesFileLoadWithOpts(reader, nil, nil, pgalloc.AsyncPagesFileLoadOpts{DemandOnly: true, LogicalChunkDemand: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		pages.Cancel()
+		_ = pages.Wait()
+	}()
+	if err := targetMF.AttachSparseChunkPageLoad(pages, loads, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+	references := pgalloc.NewSparseReferenceTransaction()
+	loadCtx := context.WithValues(ctx, map[any]any{
+		pgalloc.CtxMemoryFile:        targetMF,
+		pgalloc.CtxLiveForkClone:     true,
+		pgalloc.CtxSparseRelocation:  relocation,
+		pgalloc.CtxSparseRestoreRefs: references,
+	})
+	child := &MemoryManager{}
+	if _, err := state.Load(loadCtx, bytes.NewReader(metadata.Bytes()), child); err != nil {
+		t.Fatalf("state.Load: %v", err)
+	}
+	if err := references.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := installation.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	defer child.DecUsers(ctx)
+
+	pseg := child.pmas.FindSegment(base)
+	if !pseg.Ok() || !pseg.Range().IsSupersetOf(block) || !pseg.ValuePtr().huge || !targetMF.IsHugePages(pseg.fileRangeOf(block)) {
+		t.Fatalf("the target maps the 2 MiB page with pma %v (huge %t) of %v, want one huge pma of a 2 MiB page", pseg.Range(), pseg.ValuePtr().huge, pseg.fileRangeOf(block))
+	}
+	checkHugePageContents(ctx, t, child, base)
+	if err := child.HandleUserFault(ctx, base+7*hostarch.PageSize, hostarch.Write, 0); err != nil {
+		t.Fatalf("write fault: %v", err)
+	}
+	if pseg := child.pmas.FindSegment(base); pseg.Range() != block || pseg.ValuePtr().needCOW || !targetMF.IsHugePages(pseg.fileRange()) {
+		t.Fatalf("after a write, the target maps the page with pma %v (needCOW %t) of %v, want a whole 2 MiB page", pseg.Range(), pseg.ValuePtr().needCOW, pseg.fileRange())
+	}
+	checkHugePageContents(ctx, t, child, base)
 }
 
 // A 2 MiB page that mprotect has split between pmas is still one page: a

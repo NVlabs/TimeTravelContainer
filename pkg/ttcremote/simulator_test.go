@@ -13,7 +13,7 @@ func TestPolicyValidate(t *testing.T) {
 	if err := p.Validate(); err != nil {
 		t.Fatalf("DefaultPolicy.Validate(): %v", err)
 	}
-	if p.PageSize != 4<<10 || p.TransferBytes != 1<<20 || p.Prefetch != PrefetchNone ||
+	if p.PageSize != 4<<10 || p.TransferBytes != 2<<20 || p.Prefetch != PrefetchNone ||
 		p.Push != PushDemandOnly || p.Adaptive {
 		t.Fatalf("DefaultPolicy() = %+v, want fixed 1 MiB logical-chunk demand policy", p)
 	}

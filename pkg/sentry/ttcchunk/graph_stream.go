@@ -39,6 +39,8 @@ func WriteGraphCapture(w io.Writer, snapshot *pgalloc.RemoteSnapshot, bindings [
 	if w == nil || snapshot == nil {
 		return errors.New("graph memory capture requires a writer and snapshot")
 	}
+	// Objects hold base pages.
+	bindings = pgalloc.BasePageBindings(bindings)
 	groups, manifest, err := planGraphCapture(bindings)
 	if err != nil {
 		return err
@@ -63,6 +65,8 @@ func WriteFilteredGraphCapture(stream io.ReadWriter, snapshot *pgalloc.RemoteSna
 	if stream == nil || snapshot == nil {
 		return errors.New("graph memory capture requires a stream and snapshot")
 	}
+	// Objects hold base pages.
+	bindings = pgalloc.BasePageBindings(bindings)
 	groups, manifest, err := planGraphCapture(bindings)
 	if err != nil {
 		return err

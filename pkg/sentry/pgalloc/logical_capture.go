@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"cmp"
 	"fmt"
+	"math"
 	"reflect"
 	"slices"
 	"sort"
@@ -36,6 +37,61 @@ type CapturedPageBinding struct {
 	Version      PageVersionID
 	Chunk        LogicalChunkID
 	Slot         uint8
+	// Huge is true if the binding binds a 2 MiB page whole (see
+	// logicalPageInfo.Huge): OldOffset, Page, Version, Chunk and Slot are
+	// those of its first base page, which the others follow, and the packed
+	// stream holds its 2 MiB from StreamOffset.
+	Huge bool
+}
+
+// ValidHugePageBinding reports whether b binds a 2 MiB page as one can be:
+// at an aligned offset, with identities aligned as a 2 MiB page's are (see
+// logicalPageInfo.Huge).
+func ValidHugePageBinding(b *CapturedPageBinding) bool {
+	return b.Huge && hostarch.IsHugePageAligned(b.OldOffset) && hostarch.IsPageAligned(b.StreamOffset) &&
+		b.Page.Sequence%pagesPerHugePage == 0 && b.Version.Sequence%pagesPerHugePage == 0 &&
+		b.Page.Sequence <= math.MaxUint64-pagesPerHugePage && b.Version.Sequence <= math.MaxUint64-pagesPerHugePage
+}
+
+// Length returns the number of bytes that b binds.
+func (b *CapturedPageBinding) Length() uint64 {
+	if b.Huge {
+		return hostarch.HugePageSize
+	}
+	return hostarch.PageSize
+}
+
+// BasePageBindings returns bindings with the binding of each 2 MiB page
+// replaced by those of its base pages, for a consumer that takes base pages
+// only. It returns bindings itself if they bind no 2 MiB page.
+func BasePageBindings(bindings []CapturedPageBinding) []CapturedPageBinding {
+	huge := 0
+	for i := range bindings {
+		if bindings[i].Huge {
+			huge++
+		}
+	}
+	if huge == 0 {
+		return bindings
+	}
+	result := make([]CapturedPageBinding, 0, len(bindings)+huge*(pagesPerHugePage-1))
+	for _, binding := range bindings {
+		if !binding.Huge {
+			result = append(result, binding)
+			continue
+		}
+		binding.Huge = false
+		for k := uint64(0); k < pagesPerHugePage; k++ {
+			page := binding
+			page.OldOffset += k * hostarch.PageSize
+			page.StreamOffset += k * hostarch.PageSize
+			page.Page.Sequence += k
+			page.Version.Sequence += k
+			page.Chunk, page.Slot = page.Page.Chunk()
+			result = append(result, page)
+		}
+	}
+	return result
 }
 
 // CapturedMemoryLayout is the exact branch-reachable byte layout pinned for a
@@ -47,10 +103,13 @@ type CapturedMemoryLayout struct {
 }
 
 // ChunkOrdered returns an equivalent layout whose packed stream keeps every
-// logical 1 MiB chunk contiguous. Physical MemoryFile offsets are unrelated to
-// logical page allocation order after CoW, so the ordinary address-ordered
-// layout cannot provide this property. Live remote readers require it to load
-// and publish a chunk atomically.
+// residency unit contiguous: each 2 MiB page, and the base pages of each
+// logical 1 MiB chunk that InstallRemoteBindings installs together. Physical
+// MemoryFile offsets are unrelated to logical page allocation order after
+// CoW, so the ordinary address-ordered layout cannot provide this property.
+// Live remote readers require it to load and publish a unit atomically, and
+// its regions name their units, so that a snapshot of them pushes whole units
+// (see RemoteSnapshot.AtomicPushRanges).
 func (l CapturedMemoryLayout) ChunkOrdered() (CapturedMemoryLayout, error) {
 	// Sort indexes, and move each 100-byte binding once.
 	order := make([]int32, len(l.Bindings))
@@ -59,6 +118,14 @@ func (l CapturedMemoryLayout) ChunkOrdered() (CapturedMemoryLayout, error) {
 	}
 	slices.SortFunc(order, func(a, b int32) int {
 		left, right := &l.Bindings[a], &l.Bindings[b]
+		// 2 MiB pages come first, so that they leave the base pages of
+		// each logical chunk together.
+		if left.Huge != right.Huge {
+			if left.Huge {
+				return -1
+			}
+			return 1
+		}
 		if c := bytes.Compare(left.Chunk.Allocator[:], right.Chunk.Allocator[:]); c != 0 {
 			return c
 		}
@@ -94,6 +161,17 @@ func (l CapturedMemoryLayout) ChunkOrdered() (CapturedMemoryLayout, error) {
 	ordered := CapturedMemoryLayout{Bindings: bindings}
 	var previousPage LogicalPageID
 	var previousVersion PageVersionID
+	var streamOffset uint64
+	// The residency units, as InstallRemoteBindings forms them: a 2 MiB
+	// page alone; base pages by logical chunk, in a further instance of the
+	// chunk from a page whose slot the current one holds.
+	type unit struct {
+		chunk    LogicalChunkID
+		instance uint32
+	}
+	instances := make(map[LogicalChunkID]uint32)
+	slots := make(map[unit][logicalPagesPerChunk / 64]uint64)
+	hugeInstance := uint32(1 << 31)
 	for i := range ordered.Bindings {
 		binding := &ordered.Bindings[i]
 		file := files[binding.ResourceID]
@@ -111,17 +189,33 @@ func (l CapturedMemoryLayout) ChunkOrdered() (CapturedMemoryLayout, error) {
 		}
 		previousPage = binding.Page
 		previousVersion = binding.Version
-		binding.StreamOffset = uint64(i) * hostarch.PageSize
-		page := memmap.FileRange{Start: binding.OldOffset, End: binding.OldOffset + hostarch.PageSize}
+		key := unit{chunk: binding.Chunk}
+		if binding.Huge {
+			key.instance = hugeInstance
+			hugeInstance++
+		} else {
+			key.instance = instances[binding.Chunk]
+			if used := slots[key]; used[binding.Slot/64]&(uint64(1)<<(binding.Slot%64)) != 0 {
+				key.instance++
+				instances[binding.Chunk] = key.instance
+			}
+			used := slots[key]
+			used[binding.Slot/64] |= uint64(1) << (binding.Slot % 64)
+			slots[key] = used
+		}
+		binding.StreamOffset = streamOffset
+		streamOffset += binding.Length()
+		page := memmap.FileRange{Start: binding.OldOffset, End: binding.OldOffset + binding.Length()}
 		if len(ordered.Regions) != 0 {
 			last := &ordered.Regions[len(ordered.Regions)-1]
-			if last.File == file && last.Range.End == page.Start {
+			if last.File == file && last.Range.End == page.Start && last.LogicalChunk == key.chunk && last.LogicalChunkInstance == key.instance {
 				last.Range.End = page.End
 				continue
 			}
 		}
 		ordered.Regions = append(ordered.Regions, RemoteSnapshotRegion{
 			ID: RemoteRegionID(len(ordered.Regions) + 1), File: file, Range: page,
+			LogicalChunked: true, LogicalChunk: key.chunk, LogicalChunkInstance: key.instance,
 		})
 	}
 	return ordered, nil
@@ -267,10 +361,18 @@ func (c *MemoryRangeCapture) Ranges() []CapturedMemoryRange {
 	return result
 }
 
-// Bindings resolves all recorded ranges to page identities. It fails if any
-// byte in a recorded range is no longer backed by an allocated logical page;
-// callers must keep the source Kernel paused until a snapshot pins the ranges.
+// Bindings resolves all recorded ranges to page identities, a binding for each
+// base page. It fails if any byte in a recorded range is no longer backed by
+// an allocated logical page; callers must keep the source Kernel paused until
+// a snapshot pins the ranges.
 func (c *MemoryRangeCapture) Bindings() ([]CapturedPageBinding, error) {
+	return c.bindings(false)
+}
+
+// bindings is Bindings, but with one binding for each 2 MiB page that the
+// recorded ranges hold whole, if huge, whose References is the most that any
+// of its base pages has.
+func (c *MemoryRangeCapture) bindings(huge bool) ([]CapturedPageBinding, error) {
 	var result []CapturedPageBinding
 	streamRanges := make(map[*MemoryFile][]struct {
 		range_ memmap.FileRange
@@ -297,6 +399,23 @@ func (c *MemoryRangeCapture) Bindings() ([]CapturedPageBinding, error) {
 		// page is at or after the previous page's.
 		ranges := streamRanges[mf]
 		index := 0
+		// The 2 MiB pages that the recorded ranges hold whole, in order, and
+		// the index in result of the binding of each that has one yet.
+		var hugePages []memmap.FileRange
+		if huge {
+			for _, captured := range ranges {
+				for _, run := range mf.LogicalPageRanges(captured.range_) {
+					if !run.Huge {
+						continue
+					}
+					for start := hostarch.MustHugePageRoundUp(run.Range.Start); start < hostarch.HugePageRoundDown(run.Range.End); start += hostarch.HugePageSize {
+						hugePages = append(hugePages, memmap.FileRange{Start: start, End: start + hostarch.HugePageSize})
+					}
+				}
+			}
+		}
+		hugeBindings := make(map[uint64]int)
+		hugeIndex := 0
 		for _, referenced := range referencedCapturedRanges(c.ranges[mf]) {
 			capturedRange := referenced.range_
 			cursor := capturedRange.Start
@@ -304,17 +423,47 @@ func (c *MemoryRangeCapture) Bindings() ([]CapturedPageBinding, error) {
 				if run.Range.Start != cursor {
 					return nil, fmt.Errorf("captured MemoryFile range %v has no logical page at offset %#x", capturedRange, cursor)
 				}
-				for off := run.Range.Start; off < run.Range.End; off += hostarch.PageSize {
+				for off := run.Range.Start; off < run.Range.End; {
 					for index < len(ranges) && ranges[index].range_.End <= off {
 						index++
 					}
 					if index == len(ranges) || ranges[index].range_.Start > off {
 						return nil, fmt.Errorf("captured MemoryFile offset %#x has no packed stream range", off)
 					}
-					streamOffset := ranges[index].start + off - ranges[index].range_.Start
+					for hugeIndex < len(hugePages) && hugePages[hugeIndex].End <= off {
+						hugeIndex++
+					}
 					pageDelta := (off - run.Range.Start) / hostarch.PageSize
 					pageID := LogicalPageID{Allocator: run.First.Allocator, Sequence: run.First.Sequence + pageDelta}
 					versionID := PageVersionID{Allocator: run.FirstVersion.Allocator, Sequence: run.FirstVersion.Sequence + pageDelta}
+					if hugeIndex < len(hugePages) && hugePages[hugeIndex].Start <= off {
+						// The 2 MiB page is bound once, by its first base
+						// page, however its references cover it.
+						page := hugePages[hugeIndex]
+						if i, ok := hugeBindings[page.Start]; ok {
+							result[i].References = max(result[i].References, referenced.references)
+						} else {
+							first := (off - page.Start) / hostarch.PageSize
+							pageID.Sequence -= first
+							versionID.Sequence -= first
+							chunkID, slot := pageID.Chunk()
+							hugeBindings[page.Start] = len(result)
+							result = append(result, CapturedPageBinding{
+								ResourceID:   mf.ResourceID(),
+								OldOffset:    page.Start,
+								StreamOffset: ranges[index].start + page.Start - ranges[index].range_.Start,
+								References:   referenced.references,
+								Page:         pageID,
+								Version:      versionID,
+								Chunk:        chunkID,
+								Slot:         slot,
+								Huge:         true,
+							})
+						}
+						off = min(page.End, run.Range.End)
+						continue
+					}
+					streamOffset := ranges[index].start + off - ranges[index].range_.Start
 					chunkID, slot := pageID.Chunk()
 					result = append(result, CapturedPageBinding{
 						ResourceID:   mf.ResourceID(),
@@ -326,6 +475,7 @@ func (c *MemoryRangeCapture) Bindings() ([]CapturedPageBinding, error) {
 						Chunk:        chunkID,
 						Slot:         slot,
 					})
+					off += hostarch.PageSize
 				}
 				cursor = run.Range.End
 			}
@@ -338,10 +488,22 @@ func (c *MemoryRangeCapture) Bindings() ([]CapturedPageBinding, error) {
 }
 
 // SnapshotLayout returns the regions and page bindings needed to pin exactly
-// this capture. It does not acquire references; pass Regions to
-// NewRemoteSnapshot or NewRemoteSnapshots while the source remains paused.
+// this capture, a binding for each base page. It does not acquire references;
+// pass Regions to NewRemoteSnapshot or NewRemoteSnapshots while the source
+// remains paused.
 func (c *MemoryRangeCapture) SnapshotLayout() (CapturedMemoryLayout, error) {
-	bindings, err := c.Bindings()
+	return c.snapshotLayout(false)
+}
+
+// HugePageSnapshotLayout is SnapshotLayout, but with one binding for each 2
+// MiB page that the capture holds whole, for a consumer that installs 2 MiB
+// pages whole.
+func (c *MemoryRangeCapture) HugePageSnapshotLayout() (CapturedMemoryLayout, error) {
+	return c.snapshotLayout(true)
+}
+
+func (c *MemoryRangeCapture) snapshotLayout(huge bool) (CapturedMemoryLayout, error) {
+	bindings, err := c.bindings(huge)
 	if err != nil {
 		return CapturedMemoryLayout{}, err
 	}

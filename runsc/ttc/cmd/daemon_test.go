@@ -3362,6 +3362,8 @@ func TestDiscardRetiredLocalAuthority(t *testing.T) {
 
 func TestAdaptivePrefetchControllerHysteresis(t *testing.T) {
 	policy := ttcpolicy.DefaultPolicy()
+	// A window that can grow: the default starts at the 2 MiB maximum.
+	policy.TransferBytes = 1 << 20
 	policy.MaxConcurrency = 4
 	policy.MaxOutstandingBytes = 8 << 20
 	controller := newAdaptivePrefetchController(policy)
@@ -3392,6 +3394,8 @@ func TestAdaptivePrefetchControllerHysteresis(t *testing.T) {
 
 func TestAdaptivePrefetchControllerShrinksRandomFaults(t *testing.T) {
 	policy := ttcpolicy.DefaultPolicy()
+	// A window that can grow: the default starts at the 2 MiB maximum.
+	policy.TransferBytes = 1 << 20
 	policy.MaxConcurrency = 4
 	controller := newAdaptivePrefetchController(policy)
 	now := time.Unix(2000, 0)
@@ -3411,6 +3415,8 @@ func TestAdaptivePrefetchControllerShrinksRandomFaults(t *testing.T) {
 
 func TestAdaptivePrefetchControllerAccumulatesLocalitySamples(t *testing.T) {
 	policy := ttcpolicy.DefaultPolicy()
+	// A window that can grow: the default starts at the 2 MiB maximum.
+	policy.TransferBytes = 1 << 20
 	policy.MaxConcurrency = 4
 	controller := newAdaptivePrefetchController(policy)
 	now := time.Unix(3000, 0)

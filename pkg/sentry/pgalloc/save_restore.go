@@ -2068,7 +2068,26 @@ func (apfl *AsyncPagesFileLoad) TryInstallRemotePagesState(streamOffset uint64, 
 				return RemotePageInstallInstalled, nil
 			}
 		}
-		return RemotePageInstallBusy, fmt.Errorf("pushed range [%#x,%#x) is not one logical chunk", streamOffset, streamEnd)
+		// The range is no unit still to load. If no unit still to load
+		// overlaps it, the target has loaded what it holds, or reused a
+		// resident unit for it: it needs nothing more of it. Otherwise it is
+		// not a unit of the target's, whose pulls load it, as when a target
+		// without huge pages installs a 2 MiB page as base pages.
+		for amfl := apfl.amfls.Front(); amfl != nil; amfl = amfl.Next() {
+			amfl.f.mu.Lock()
+			apfl.mu.Lock()
+			pending := false
+			for ulseg := amfl.unloaded.FirstSegment(); ulseg.Ok() && !pending; ulseg = ulseg.NextSegment() {
+				ul := ulseg.ValuePtr()
+				pending = streamOffset < ul.off+ulseg.Range().Length() && ul.off < streamEnd
+			}
+			apfl.mu.Unlock()
+			amfl.f.mu.Unlock()
+			if pending {
+				return RemotePageInstallBusy, nil
+			}
+		}
+		return RemotePageInstallResolved, nil
 	}
 	for amfl := apfl.amfls.Front(); amfl != nil; amfl = amfl.Next() {
 		amfl.f.mu.Lock()
@@ -2191,13 +2210,18 @@ func (f *MemoryFile) IsAsyncLoading() bool {
 }
 
 // AsyncLoadingMapUnit returns the maximum address-space mapping unit that
-// should be used while demand-only page loading is active. Mapping a larger
-// PMA range calls MapInternal for that entire range and accidentally turns one
-// guest fault into an eager remote load. The unit follows the current runtime
-// prefetch window, while the async reader remains free to split or coalesce
-// network requests independently.
-func (f *MemoryFile) AsyncLoadingMapUnit() uint64 {
+// should be used around the page at off while demand-only page loading is
+// active. Mapping a larger PMA range calls MapInternal for that entire range
+// and accidentally turns one guest fault into an eager remote load. The unit
+// follows the current runtime prefetch window, while the async reader remains
+// free to split or coalesce network requests independently. A sparse load's
+// is its residency unit's: a 2 MiB page's, mapped whole so that the host maps
+// it with one huge page, or a logical chunk's.
+func (f *MemoryFile) AsyncLoadingMapUnit(off uint64) uint64 {
 	if loads := f.sparseAsyncLoads.Load(); loads != nil && len(*loads) != 0 {
+		if _, ok := f.HugePageAt(off); ok {
+			return hostarch.HugePageSize
+		}
 		return SparseChunkBytes
 	}
 	amfl := f.asyncPageLoad.Load()

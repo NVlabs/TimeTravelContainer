@@ -22,10 +22,17 @@ import (
 // not claim to hash page contents; their domain prefix keeps the two identity
 // schemes distinct. The returned ranges read directly from the capture's
 // packed TCP stream.
+//
+// A 2 MiB page is a unit of its own, installed in an aligned 2 MiB huge page
+// as one page (see logicalPageInfo.Huge), and read in one piece; a file
+// without huge pages installs its base pages instead.
 func (f *MemoryFile) InstallRemoteBindings(bindings []CapturedPageBinding, kind usage.MemoryKind, memCgID uint32) (*SparseChunkInstallation, *SparseRelocation, []RemoteLoadRange, error) {
 	type chunkInstance struct {
 		id       LogicalChunkID
 		instance uint32
+	}
+	if !f.HugepagesEnabled() {
+		bindings = BasePageBindings(bindings)
 	}
 	orderedBindings := append([]CapturedPageBinding(nil), bindings...)
 	sort.Slice(orderedBindings, func(i, j int) bool { return orderedBindings[i].StreamOffset < orderedBindings[j].StreamOffset })
@@ -33,10 +40,20 @@ func (f *MemoryFile) InstallRemoteBindings(bindings []CapturedPageBinding, kind 
 	current := make(map[LogicalChunkID]chunkInstance)
 	used := make(map[chunkInstance][4]uint64)
 	var chunks []chunkInstance
+	// As CapturedMemoryLayout.ChunkOrdered numbers them.
+	hugeInstance := uint32(1 << 31)
 	for _, binding := range orderedBindings {
 		chunk, slot := binding.Page.Chunk()
-		if binding.ResourceID.Ok() || binding.Chunk != chunk || binding.Slot != slot || binding.References == 0 {
+		if binding.ResourceID.Ok() || binding.Chunk != chunk || binding.Slot != slot || binding.References == 0 ||
+			(binding.Huge && !ValidHugePageBinding(&binding)) {
 			return nil, nil, nil, fmt.Errorf("invalid live sparse binding %+v", binding)
+		}
+		if binding.Huge {
+			key := chunkInstance{id: chunk, instance: hugeInstance}
+			hugeInstance++
+			chunks = append(chunks, key)
+			byChunk[key] = []CapturedPageBinding{binding}
+			continue
 		}
 		key, ok := current[chunk]
 		if !ok {
@@ -60,6 +77,24 @@ func (f *MemoryFile) InstallRemoteBindings(bindings []CapturedPageBinding, kind 
 	for _, key := range chunks {
 		chunk := key.id
 		pages := byChunk[key]
+		if binding := pages[0]; binding.Huge {
+			hash := sha256.New()
+			hash.Write([]byte("ttc-live-2mib-page-version-v1\x00"))
+			var encoded [8]byte
+			hash.Write(binding.Page.Allocator[:])
+			binary.BigEndian.PutUint64(encoded[:], binding.Page.Sequence)
+			hash.Write(encoded[:])
+			hash.Write(binding.Version.Allocator[:])
+			binary.BigEndian.PutUint64(encoded[:], binding.Version.Sequence)
+			hash.Write(encoded[:])
+			install := SparseChunkInstall{Kind: kind, MemCgID: memCgID, Huge: true, Runs: []SparseChunkRun{{
+				Position: 0, Pages: pagesPerHugePage, Page: binding.Page, Version: binding.Version,
+			}}}
+			copy(install.Object[:], hash.Sum(nil))
+			installs = append(installs, install)
+			objectBindings[install.Object] = pages
+			continue
+		}
 		sort.Slice(pages, func(i, j int) bool { return pages[i].Slot < pages[j].Slot })
 		hash := sha256.New()
 		hash.Write([]byte("ttc-live-page-versions-v1\x00"))
@@ -107,12 +142,13 @@ func (f *MemoryFile) InstallRemoteBindings(bindings []CapturedPageBinding, kind 
 		}
 		_, isNew := newRanges[install.Object]
 		for _, binding := range objectBindings[install.Object] {
+			// A 2 MiB page's slot is 0.
 			target := resident.Start + uint64(binding.Slot)*hostarch.PageSize
-			if err := relocation.Add(binding.ResourceID, binding.OldOffset, target); err != nil {
+			if err := relocation.AddRange(binding.ResourceID, memmap.FileRange{Start: binding.OldOffset, End: binding.OldOffset + binding.Length()}, target); err != nil {
 				return nil, nil, nil, err
 			}
 			if isNew {
-				load := RemoteLoadRange{Target: memmap.FileRange{Start: target, End: target + hostarch.PageSize}, StreamOffset: binding.StreamOffset, logicalChunk: chunkLoad}
+				load := RemoteLoadRange{Target: memmap.FileRange{Start: target, End: target + binding.Length()}, StreamOffset: binding.StreamOffset, logicalChunk: chunkLoad}
 				loads = append(loads, load)
 				chunkLoad.ranges = append(chunkLoad.ranges, load)
 			}
@@ -206,12 +242,30 @@ func normalizeSparseChunkRuns(runs []SparseChunkRun) ([]SparseChunkRun, error) {
 	return normalized, nil
 }
 
-// SparseChunkInstall describes one immutable 1 MiB residency unit.
+// SparseChunkInstall describes one immutable 1 MiB residency unit, or one 2
+// MiB page.
 type SparseChunkInstall struct {
 	Object  SparseChunkObjectID
 	Runs    []SparseChunkRun
 	Kind    usage.MemoryKind
 	MemCgID uint32
+	// Huge is true if the unit is one 2 MiB page, which Runs' one run names
+	// from position 0: it is installed in an aligned 2 MiB huge page, as a 2
+	// MiB page (see logicalPageInfo.Huge).
+	Huge bool
+}
+
+// validHugeSparseChunkRuns reports whether runs name one 2 MiB page whole, as
+// a huge SparseChunkInstall's must.
+func validHugeSparseChunkRuns(runs []SparseChunkRun) bool {
+	if len(runs) != 1 {
+		return false
+	}
+	run := runs[0]
+	return run.Position == 0 && run.Pages == pagesPerHugePage &&
+		run.Page.Allocator != (LogicalAllocatorID{}) && run.Version.Allocator != (LogicalAllocatorID{}) &&
+		run.Page.Sequence%pagesPerHugePage == 0 && run.Version.Sequence%pagesPerHugePage == 0 &&
+		run.Page.Sequence <= math.MaxUint64-pagesPerHugePage && run.Version.Sequence <= math.MaxUint64-pagesPerHugePage
 }
 
 type sparseResidentChunk struct {
@@ -525,26 +579,39 @@ func (f *MemoryFile) InstallSparseChunks(installs []SparseChunkInstall) (*Sparse
 			return nil, fmt.Errorf("sparse chunk object %x is repeated", install.Object)
 		}
 		seen[install.Object] = struct{}{}
-		for _, run := range install.Runs {
-			if !run.valid() {
+		runs := install.Runs
+		if install.Huge {
+			if !validHugeSparseChunkRuns(runs) {
 				rollback()
-				return nil, fmt.Errorf("invalid sparse chunk run %+v", run)
+				return nil, fmt.Errorf("invalid 2 MiB sparse page %+v", runs)
 			}
-		}
-		runs, err := normalizeSparseChunkRuns(append([]SparseChunkRun(nil), install.Runs...))
-		if err != nil {
-			rollback()
-			return nil, fmt.Errorf("sparse chunk object %x: %w", install.Object, err)
-		}
-		if len(runs) == 0 {
-			rollback()
-			return nil, fmt.Errorf("sparse chunk object %x has no pages", install.Object)
+		} else {
+			for _, run := range install.Runs {
+				if !run.valid() {
+					rollback()
+					return nil, fmt.Errorf("invalid sparse chunk run %+v", run)
+				}
+			}
+			var err error
+			runs, err = normalizeSparseChunkRuns(append([]SparseChunkRun(nil), install.Runs...))
+			if err != nil {
+				rollback()
+				return nil, fmt.Errorf("sparse chunk object %x: %w", install.Object, err)
+			}
+			if len(runs) == 0 {
+				rollback()
+				return nil, fmt.Errorf("sparse chunk object %x has no pages", install.Object)
+			}
 		}
 		installation.loads = append(installation.loads, f.adoptResidentSparseChunk(install.Object)...)
 
 		f.mu.Lock()
 		resident, exists := f.sparseChunks[install.Object]
-		if exists {
+		if exists && install.Huge {
+			// A 2 MiB page is resident whole.
+			f.markSparseInstallingLocked(installation, install.Object)
+			f.mu.Unlock()
+		} else if exists {
 			f.markSparseInstallingLocked(installation, install.Object)
 			// One immutable chunk can back branches that each use a different
 			// subset of its pages. Its whole 1 MiB is read into the resident
@@ -583,7 +650,11 @@ func (f *MemoryFile) InstallSparseChunks(installs []SparseChunkInstall) (*Sparse
 			f.mu.Unlock()
 		} else {
 			f.mu.Unlock()
-			fr, err := f.Allocate(SparseChunkBytes, AllocOpts{Kind: install.Kind, MemCgID: install.MemCgID})
+			length, opts := uint64(SparseChunkBytes), AllocOpts{Kind: install.Kind, MemCgID: install.MemCgID}
+			if install.Huge {
+				length, opts.Huge, opts.LogicalHugePages = hostarch.HugePageSize, true, true
+			}
+			fr, err := f.Allocate(length, opts)
 			if err != nil {
 				rollback()
 				return nil, fmt.Errorf("allocating sparse resident chunk: %w", err)
@@ -599,8 +670,18 @@ func (f *MemoryFile) InstallSparseChunks(installs []SparseChunkInstall) (*Sparse
 				rollback()
 				return nil, fmt.Errorf("concurrent sparse chunk installation is unsupported")
 			}
-			for _, run := range runs {
-				f.setSparseIdentitiesLocked(fr.Start, run, uint16(run.Position), uint16(run.Position)+run.Pages)
+			if install.Huge && hostarch.IsHugePageAligned(fr.Start) {
+				// Its identities are a 2 MiB page's, as its allocation's were.
+				f.logicalPages.RemoveFullRange(fr)
+				f.logicalPages.InsertRange(fr, logicalPageInfo{
+					Allocator: runs[0].Page.Allocator, FirstSequence: runs[0].Page.Sequence,
+					VersionAllocator: runs[0].Version.Allocator, FirstVersionSequence: runs[0].Version.Sequence,
+					Huge: true,
+				})
+			} else {
+				for _, run := range runs {
+					f.setSparseIdentitiesLocked(fr.Start, run, uint16(run.Position), uint16(run.Position)+run.Pages)
+				}
 			}
 			f.sparseChunks[install.Object] = resident
 			delete(f.reclaimedSparseChunks, install.Object)

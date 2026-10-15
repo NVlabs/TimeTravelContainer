@@ -17,12 +17,18 @@ import (
 )
 
 const (
-	sessionMetadataVersion = 2
+	// sessionMetadataVersion 3 added each binding's flags: version 2's
+	// bindings were all of base pages.
+	sessionMetadataVersion = 3
 	sessionMetadataHeader  = 32
 	sessionMetadataDigest  = sha256.Size
 	sessionLoadRangeBytes  = 24
-	sessionBindingBytes    = 72
+	sessionBindingBytes    = 80
 )
+
+// sessionBindingHuge marks, in a binding's flags, the binding of a 2 MiB page;
+// see pgalloc.CapturedPageBinding.Huge.
+const sessionBindingHuge = 1
 
 var sessionMetadataMagic = [4]byte{'T', 'T', 'C', 'M'}
 
@@ -108,6 +114,13 @@ func (m *SessionMetadata) MarshalBinary() ([]byte, error) {
 		}
 		body.Write(binding.Version.Allocator[:])
 		if err := binary.Write(&body, binary.BigEndian, binding.Version.Sequence); err != nil {
+			return nil, err
+		}
+		var flags uint64
+		if binding.Huge {
+			flags |= sessionBindingHuge
+		}
+		if err := binary.Write(&body, binary.BigEndian, flags); err != nil {
 			return nil, err
 		}
 	}
@@ -214,7 +227,13 @@ func UnmarshalSessionMetadata(encoded []byte, limits SessionMetadataLimits) (*Se
 		if err := binary.Read(r, binary.BigEndian, &binding.Version.Sequence); err != nil {
 			return nil, err
 		}
-		if binding.References == 0 || binding.Page.Allocator == (pgalloc.LogicalAllocatorID{}) || binding.Version.Allocator == (pgalloc.LogicalAllocatorID{}) {
+		var flags uint64
+		if err := binary.Read(r, binary.BigEndian, &flags); err != nil {
+			return nil, err
+		}
+		binding.Huge = flags&sessionBindingHuge != 0
+		if binding.References == 0 || binding.Page.Allocator == (pgalloc.LogicalAllocatorID{}) || binding.Version.Allocator == (pgalloc.LogicalAllocatorID{}) ||
+			flags&^sessionBindingHuge != 0 || (binding.Huge && !pgalloc.ValidHugePageBinding(binding)) {
 			return nil, errors.New("distributed metadata contains invalid memory binding")
 		}
 		binding.Chunk, binding.Slot = binding.Page.Chunk()

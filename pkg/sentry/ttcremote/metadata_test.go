@@ -5,6 +5,7 @@ package ttcremote
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"reflect"
 	"testing"
@@ -20,6 +21,8 @@ func TestSessionMetadataRoundTripAndIntegrity(t *testing.T) {
 	versionAllocator[0] = 2
 	page := pgalloc.LogicalPageID{Allocator: allocator, Sequence: 7}
 	chunk, slot := page.Chunk()
+	hugePage := pgalloc.LogicalPageID{Allocator: allocator, Sequence: 512}
+	hugeChunk, hugeSlot := hugePage.Chunk()
 	want := &SessionMetadata{
 		FamilyID:          "family-1",
 		SourceBranchID:    "main",
@@ -33,6 +36,9 @@ func TestSessionMetadataRoundTripAndIntegrity(t *testing.T) {
 		MemoryBindings: []pgalloc.CapturedPageBinding{{
 			OldOffset: 0x2000, StreamOffset: 0x1000, References: 2, Page: page,
 			Version: pgalloc.PageVersionID{Allocator: versionAllocator, Sequence: 9}, Chunk: chunk, Slot: slot,
+		}, {
+			OldOffset: 0x400000, StreamOffset: 0x2000, References: 1, Page: hugePage,
+			Version: pgalloc.PageVersionID{Allocator: versionAllocator, Sequence: 1024}, Chunk: hugeChunk, Slot: hugeSlot, Huge: true,
 		}},
 	}
 	encoded, err := want.MarshalBinary()
@@ -92,5 +98,53 @@ func TestSessionMetadataLimitsForLargeEnvelopes(t *testing.T) {
 	binary.BigEndian.PutUint32(encoded[28:32], uint32(len(encoded)/sessionLoadRangeBytes+1))
 	if _, err := UnmarshalSessionMetadata(encoded, SessionMetadataLimitsFor(uint64(len(encoded)))); err == nil {
 		t.Fatal("an envelope claiming more bindings than it has room for was decoded")
+	}
+}
+
+// A binding of a 2 MiB page must name one: at an aligned offset, with
+// identities aligned as a 2 MiB page's are. Flags it does not know are
+// refused.
+func TestSessionMetadataRefusesInvalidHugeBindings(t *testing.T) {
+	var allocator pgalloc.LogicalAllocatorID
+	allocator[0] = 1
+	valid := pgalloc.CapturedPageBinding{
+		OldOffset: 2 << 20, References: 1, Huge: true,
+		Page:    pgalloc.LogicalPageID{Allocator: allocator, Sequence: 512},
+		Version: pgalloc.PageVersionID{Allocator: allocator, Sequence: 1024},
+	}
+	limits := SessionMetadataLimits{MaxTotalBytes: 1 << 20, MaxKernelBytes: 1 << 10, MaxAllocatorBytes: 1 << 10, MaxLoadRanges: 10}
+	for _, test := range []struct {
+		name   string
+		mutate func(*pgalloc.CapturedPageBinding)
+		ok     bool
+	}{
+		{"valid", func(*pgalloc.CapturedPageBinding) {}, true},
+		{"unaligned offset", func(b *pgalloc.CapturedPageBinding) { b.OldOffset += 4096 }, false},
+		{"unaligned page", func(b *pgalloc.CapturedPageBinding) { b.Page.Sequence++ }, false},
+		{"unaligned version", func(b *pgalloc.CapturedPageBinding) { b.Version.Sequence += 256 }, false},
+	} {
+		binding := valid
+		test.mutate(&binding)
+		metadata := &SessionMetadata{MemoryBindings: []pgalloc.CapturedPageBinding{binding}}
+		encoded, err := metadata.MarshalBinary()
+		if err != nil {
+			t.Fatalf("%s: %v", test.name, err)
+		}
+		if _, err := UnmarshalSessionMetadata(encoded, limits); (err == nil) != test.ok {
+			t.Errorf("%s: decoding returned %v, want ok %t", test.name, err, test.ok)
+		}
+	}
+	metadata := &SessionMetadata{MemoryBindings: []pgalloc.CapturedPageBinding{valid}}
+	encoded, err := metadata.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The flags are the last 8 bytes of the binding, before the digest.
+	flags := len(encoded) - sessionMetadataDigest - 8
+	encoded[flags] |= 0x80
+	digest := sha256.Sum256(encoded[:len(encoded)-sessionMetadataDigest])
+	copy(encoded[len(encoded)-sessionMetadataDigest:], digest[:])
+	if _, err := UnmarshalSessionMetadata(encoded, limits); err == nil {
+		t.Error("a binding with unknown flags was decoded")
 	}
 }

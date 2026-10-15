@@ -454,7 +454,7 @@ func TestAttachRemotePageLoad(t *testing.T) {
 	if pages.HasDurableBacking() {
 		t.Fatal("live reader unexpectedly reported durable backing")
 	}
-	if got := target.AsyncLoadingMapUnit(); got != 0 {
+	if got := target.AsyncLoadingMapUnit(0); got != 0 {
 		t.Fatalf("background-load map unit=%d, want default cap", got)
 	}
 
@@ -541,7 +541,7 @@ func TestDemandOnlyRemotePageLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 	pages.MemoryFilesDone()
-	if got := target.AsyncLoadingMapUnit(); got != hostarch.PageSize {
+	if got := target.AsyncLoadingMapUnit(0); got != hostarch.PageSize {
 		t.Fatalf("demand-only map unit=%d, want one page", got)
 	}
 
@@ -799,7 +799,7 @@ func TestLogicalChunkDemandLoadsWholeChunk(t *testing.T) {
 		t.Fatal(err)
 	}
 	pages.MemoryFilesDone()
-	if got := target.AsyncLoadingMapUnit(); got != hostarch.PageSize {
+	if got := target.AsyncLoadingMapUnit(0); got != hostarch.PageSize {
 		t.Fatalf("logical chunk map unit=%d, want one page for discontiguous-safe mappings", got)
 	}
 	fault := memmap.FileRange{Start: targetFR.Start + 137*hostarch.PageSize, End: targetFR.Start + 138*hostarch.PageSize}
@@ -904,8 +904,10 @@ func TestLogicalChunkPushInstallsWholeChunkAtomically(t *testing.T) {
 		pages.Cancel()
 		_ = pages.Wait()
 	}()
-	if result, err := pages.TryInstallRemotePagesState(0, want[:hostarch.PageSize]); err == nil || result != RemotePageInstallBusy {
-		t.Fatalf("partial logical push result=%v err=%v, want busy error", result, err)
+	// Part of a unit still to load is busy; the push's connection, which an
+	// error drops, carries on.
+	if result, err := pages.TryInstallRemotePagesState(0, want[:hostarch.PageSize]); err != nil || result != RemotePageInstallBusy {
+		t.Fatalf("partial logical push result=%v err=%v, want busy", result, err)
 	}
 	if result, err := pages.TryInstallRemotePagesState(0, want[:SparseChunkBytes]); err != nil || result != RemotePageInstallInstalled {
 		t.Fatalf("whole logical push result=%v err=%v, want installed", result, err)
@@ -915,6 +917,10 @@ func TestLogicalChunkPushInstallsWholeChunkAtomically(t *testing.T) {
 	}
 	if result, err := pages.TryInstallRemotePagesState(0, want[:SparseChunkBytes]); err != nil || result != RemotePageInstallResolved {
 		t.Fatalf("repeated logical push result=%v err=%v, want resolved", result, err)
+	}
+	// A range that is no unit, of pages already loaded, is resolved too.
+	if result, err := pages.TryInstallRemotePagesState(hostarch.PageSize, want[hostarch.PageSize:2*hostarch.PageSize]); err != nil || result != RemotePageInstallResolved {
+		t.Fatalf("push of loaded pages result=%v err=%v, want resolved", result, err)
 	}
 	if result, err := pages.TryInstallRemotePagesState(SparseChunkBytes, want[SparseChunkBytes:]); err != nil || result != RemotePageInstallInstalled {
 		t.Fatalf("second logical push result=%v err=%v, want installed", result, err)
@@ -1292,7 +1298,7 @@ func TestDemandOnlyRemotePageLoadForwardPrefetch(t *testing.T) {
 		t.Fatal(err)
 	}
 	pages.MemoryFilesDone()
-	if got := target.AsyncLoadingMapUnit(); got != 4*hostarch.PageSize {
+	if got := target.AsyncLoadingMapUnit(0); got != 4*hostarch.PageSize {
 		t.Fatalf("forward-prefetch map unit=%d, want four pages", got)
 	}
 
@@ -1350,7 +1356,7 @@ func TestDemandOnlyRemotePageLoadFixedWindowAndPolicySwitch(t *testing.T) {
 		t.Fatal(err)
 	}
 	pages.MemoryFilesDone()
-	if got := target.AsyncLoadingMapUnit(); got != 4*hostarch.PageSize {
+	if got := target.AsyncLoadingMapUnit(0); got != 4*hostarch.PageSize {
 		t.Fatalf("fixed-window map unit=%d, want four pages", got)
 	}
 	fault := func(page uint64) {
@@ -1371,7 +1377,7 @@ func TestDemandOnlyRemotePageLoadFixedWindowAndPolicySwitch(t *testing.T) {
 	if err := pages.SetPrefetchWindow(0, 0); err != nil {
 		t.Fatal(err)
 	}
-	if got := target.AsyncLoadingMapUnit(); got != hostarch.PageSize {
+	if got := target.AsyncLoadingMapUnit(0); got != hostarch.PageSize {
 		t.Fatalf("disabled-prefetch map unit=%d, want one page", got)
 	}
 	fault(7)

@@ -42,13 +42,14 @@ type Policy struct {
 	Adaptive            bool           `json:"adaptive"`
 }
 
-// DefaultPolicy uses the same 1 MiB unit as persistent sparse memory chunks.
-// A fault installs its complete stable logical chunk, so separate positional
-// prefetch is unnecessary in the default policy.
+// DefaultPolicy transfers up to 2 MiB at a time, a 2 MiB page whole, as a
+// fault installs a 2 MiB page, or the base pages of a 1 MiB logical chunk,
+// complete. Separate positional prefetch is unnecessary in the default
+// policy.
 func DefaultPolicy() Policy {
 	return Policy{
 		PageSize:            4 << 10,
-		TransferBytes:       1 << 20,
+		TransferBytes:       2 << 20,
 		Prefetch:            PrefetchNone,
 		Push:                PushDemandOnly,
 		MaxOutstandingBytes: 64 << 20,

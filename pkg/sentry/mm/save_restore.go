@@ -152,16 +152,20 @@ func (mm *MemoryManager) afterLoad(ctx goContext.Context) {
 			// A PMA segment is allowed to split at restore time: each child
 			// retains identical mapping semantics but names one contiguous run
 			// in the family MemoryFile. This is required when adjacent source
-			// pages reuse independently resident sparse chunks.
+			// pages reuse independently resident sparse chunks. A run of 2 MiB
+			// pages that the address space maps at an aligned address is huge
+			// memory, and any other run is not, wherever the source's was.
 			current := pseg
 			for i, relocated := range runs {
 				if i+1 < len(runs) {
 					split := current.Start() + hostarch.Addr(relocated.Length())
 					left, right := mm.pmas.Split(current, split)
 					left.ValuePtr().off = relocated.Start
+					left.ValuePtr().huge = left.Range().IsHugePageAligned() && mf.IsHugePages(relocated)
 					current = right
 				} else {
 					current.ValuePtr().off = relocated.Start
+					current.ValuePtr().huge = current.Range().IsHugePageAligned() && mf.IsHugePages(relocated)
 				}
 			}
 			pseg = current.NextSegment()

@@ -75,7 +75,7 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 		// materialize untouched pages. Follow the active prefetch window so
 		// transfer granularity remains a policy choice. Ordinary background
 		// checkpoint restore retains its historical 32 MiB cap.
-		if unit := mf.AsyncLoadingMapUnit(); unit != 0 {
+		if unit := mf.AsyncLoadingMapUnit(pseg.ValuePtr().off + uint64(max(ar.Start, pseg.Start())-pseg.Start())); unit != 0 {
 			setMapUnit(unit)
 		} else {
 			setMapUnit(32 << 20)

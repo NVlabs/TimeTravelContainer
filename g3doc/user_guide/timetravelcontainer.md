@@ -195,9 +195,9 @@ copied on write after a fork goes to the node of the thread that writes it,
 while pages still shared stay where they are. Pages keep their nodes when a
 branch is checkpointed, dehydrated, rehydrated or forked on its node. A branch
 forked to another node pulls its pages as its threads touch them, and a page
-goes to the node of the thread whose touch pulls it in, with the rest of the
-megabyte pulled with it; pages pulled before any thread touches them go where
-the host puts them. `get_mempolicy` with
+goes to the node of the thread whose touch pulls it in, with the rest of its
+2 MiB page or megabyte pulled with it; pages pulled before any thread touches
+them go where the host puts them. `get_mempolicy` with
 `MPOL_F_NODE|MPOL_F_ADDR` and `move_pages` report the node a page is on; TTC
 does not migrate pages, so `MPOL_MF_MOVE` and `move_pages` move none. The host
 topology needs the systrap platform.
@@ -225,9 +225,10 @@ As in Linux, a 2 MiB page that is unmapped or discarded in part splits into 4
 KiB pages; one that `mprotect` or `mremap` maps in pieces stays whole; and a
 write to one that a branch maps only in part copies only the 4 KiB it writes.
 Stacks, files and shared memory use 4 KiB pages, and a write copies only the
-page it writes. A branch forked to another node, or rehydrated, maps the
-pages it pulls with 4 KiB pages. `ttc stats` shows how much of the
-containers' memory the host maps with huge pages.
+page it writes. A branch forked to another node pulls a 2 MiB page whole, in
+one piece, and maps it with a huge page; a rehydrated branch maps the pages
+it pulls with 4 KiB pages. `ttc stats` shows how much of the containers'
+memory the host maps with huge pages.
 
 ## Compile
 
