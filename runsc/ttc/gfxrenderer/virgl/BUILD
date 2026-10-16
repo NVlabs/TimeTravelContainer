@@ -11,6 +11,7 @@ package(
 go_library(
     name = "virgl",
     srcs = [
+        "clone_unsafe.go",
         "context_unsafe.go",
         "formats_darwin.c",
         "pipe_darwin.c",

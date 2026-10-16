@@ -527,14 +527,6 @@ type pendingClone struct {
 // quiesced, for a fork's children, and returns its token.
 func (s *server) snapshot() ([]byte, error) {
 	s.mu.Lock()
-	virglState := len(s.virgl) != 0
-	for _, r := range s.resources {
-		virglState = virglState || r.virgl != nil
-	}
-	if virglState {
-		s.mu.Unlock()
-		return nil, errors.New("virgl's contexts and resources cannot fork yet")
-	}
 	contexts := make(map[uint32]*Context, len(s.contexts))
 	for id, c := range s.contexts {
 		contexts[id] = c
@@ -543,6 +535,10 @@ func (s *server) snapshot() ([]byte, error) {
 	for id, r := range s.resources {
 		resources[id] = r
 	}
+	virglContexts := make(map[uint32]*virgl.Context, len(s.virgl))
+	for id, c := range s.virgl {
+		virglContexts[id] = c
+	}
 	s.mu.Unlock()
 	resume, err := quiesce(contexts)
 	if err != nil {
@@ -550,7 +546,7 @@ func (s *server) snapshot() ([]byte, error) {
 	}
 	defer resume()
 	start := time.Now()
-	st, err := cloneContexts(contexts, resources)
+	st, err := cloneContexts(contexts, resources, virglContexts)
 	if err != nil {
 		return nil, err
 	}
@@ -563,7 +559,7 @@ func (s *server) snapshot() ([]byte, error) {
 	clones.mu.Lock()
 	clones.m[token] = &pendingClone{st: st}
 	clones.mu.Unlock()
-	log.Printf("venus: cloned %d contexts and %d resources for a fork in %v", len(st.contexts), len(st.resources), time.Since(start))
+	log.Printf("venus: cloned %d contexts, %d of virgl's, and %d resources for a fork in %v", len(st.contexts), len(st.virgl), len(st.resources), time.Since(start))
 	return []byte(token), nil
 }
 
@@ -590,7 +586,7 @@ func (s *server) restore(token []byte, last bool) error {
 	st := pc.st
 	if !last {
 		var err error
-		if st, err = cloneContexts(pc.st.contexts, pc.st.resources); err != nil {
+		if st, err = cloneContexts(pc.st.contexts, pc.st.resources, pc.st.virgl); err != nil {
 			return err
 		}
 	}

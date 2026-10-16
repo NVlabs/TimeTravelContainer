@@ -41,6 +41,22 @@ func (r *Resource) ID() uint32 {
 // DecRef releases a reference to r.
 func (r *Resource) DecRef() {}
 
+// IncRef takes a reference to r.
+func (r *Resource) IncRef() {}
+
+// Backing returns the guest's memory of r.
+func (r *Resource) Backing() []byte {
+	return nil
+}
+
+// Clone fails: see Available.
+func (r *Resource) Clone(backing []byte, release func()) (*Resource, error) {
+	return nil, errUnavailable
+}
+
+// Sync waits for the copies of resources' clones.
+func Sync() {}
+
 // Transfer fails: see Available.
 func Transfer(r *Resource, a TransferArgs) error {
 	return errUnavailable
@@ -83,3 +99,8 @@ func (f *Fence) Wait() {}
 
 // Destroy destroys the context.
 func (c *Context) Destroy() {}
+
+// Clone fails: see Available.
+func (c *Context) Clone(resource func(*Resource) (*Resource, error)) (*Context, error) {
+	return nil, errUnavailable
+}

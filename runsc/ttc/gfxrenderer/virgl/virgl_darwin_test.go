@@ -100,6 +100,8 @@ type fixture struct {
 	vb     *Resource
 	vbMem  []byte
 	nextID uint32
+	// mems are, of a clone's fixture, the memory of its resources, by ID.
+	mems map[uint32][]byte
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -241,6 +243,24 @@ func TestTriangle(t *testing.T) {
 // shader, and Zink crashed binding no pipeline.
 func TestTexture(t *testing.T) {
 	f := newFixture(t)
+	var s stream
+	texel := f.textured(t, &s)
+	drawTriangle(&s)
+	f.submit(t, s)
+	f.finish(t)
+	if p := f.pixel(4, height/2); p != texel {
+		t.Errorf("inside the triangle: %v, want the texel %v", p, texel)
+	}
+	if p := f.pixel(width-4, height/2); p != red {
+		t.Errorf("outside the triangle: %v, want %v", p, red)
+	}
+}
+
+// textured encodes a draw of the triangle in the texel of a texture, which
+// it returns, on red, and leaves the draw's state with the sampler, the
+// sampler view, and the first vertex shader destroyed.
+func (f *fixture) textured(t *testing.T, s *stream) [4]byte {
+	t.Helper()
 	texel := [4]byte{10, 200, 30, 255}
 	texMem := make([]byte, 2*2*4)
 	for i := 0; i < 4; i++ {
@@ -251,14 +271,13 @@ func TestTexture(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewResource: %v", err)
 	}
-	defer tex.DecRef()
+	t.Cleanup(tex.DecRef)
 	f.c.Attach(tex)
 	if err := f.c.Transfer(tex, TransferArgs{ToHost: true, W: 2, H: 2, D: 1}); err != nil {
 		t.Fatalf("Transfer: %v", err)
 	}
-	var s stream
-	h := f.setup(&s)
-	clearRed(&s)
+	h := f.setup(s)
+	clearRed(s)
 	vs, fs := f.id(), f.id()
 	s.shader(vs, stageVertex, `VERT
 DCL IN[0]
@@ -287,20 +306,12 @@ DCL SVIEW[0], 2D, FLOAT
 	s.cmd(cmdCreateObject, objectSamplerState, samp, clampToEdge|clampToEdge<<3|clampToEdge<<6|mipNone<<11, 0, 0, 0, 0, 0, 0, 0)
 	s.cmd(cmdSetSamplerViews, 0, stageFragment, 0, view)
 	s.cmd(cmdBindSamplerStates, 0, stageFragment, 0, samp)
-	drawTriangle(&s)
+	drawTriangle(s)
 	// The guest may destroy what is bound.
 	s.cmd(cmdDestroyObject, 0, samp)
 	s.cmd(cmdDestroyObject, 0, view)
 	s.cmd(cmdDestroyObject, 0, h.vs)
-	drawTriangle(&s)
-	f.submit(t, s)
-	f.finish(t)
-	if p := f.pixel(4, height/2); p != texel {
-		t.Errorf("inside the triangle: %v, want the texel %v", p, texel)
-	}
-	if p := f.pixel(width-4, height/2); p != red {
-		t.Errorf("outside the triangle: %v, want %v", p, red)
-	}
+	return texel
 }
 
 // TestIntegerVertexFormat feeds a vertex shader 8-bit unsigned integers,
@@ -663,6 +674,162 @@ func TestInlineWriteAndRebind(t *testing.T) {
 	f.c.Detach(vb.ID())
 	f.finish(t)
 	f.checkTriangle(t)
+}
+
+// clone returns a fixture of a clone of f's context, whose resources are
+// copies of f's, of memory of their own, as the renderer makes for a fork's
+// child.
+func (f *fixture) clone(t *testing.T) *fixture {
+	t.Helper()
+	cf := &fixture{nextID: f.nextID, mems: make(map[uint32][]byte)}
+	c, err := f.c.Clone(func(r *Resource) (*Resource, error) {
+		mem := append([]byte(nil), r.Backing()...)
+		cr, err := r.Clone(mem, nil)
+		if err != nil {
+			return nil, err
+		}
+		cf.mems[r.ID()] = mem
+		switch r {
+		case f.rt:
+			cf.rt, cf.rtMem = cr, mem
+		case f.vb:
+			cf.vb, cf.vbMem = cr, mem
+		}
+		// The fixture holds a reference of its own.
+		cr.IncRef()
+		t.Cleanup(cr.DecRef)
+		return cr, nil
+	})
+	if err != nil {
+		t.Fatalf("Clone: %v", err)
+	}
+	Sync()
+	t.Cleanup(c.Destroy)
+	cf.c = c
+	return cf
+}
+
+// A context's clone, a fork's child's, draws with the context's state on
+// copies of its resources, and neither sees what the other draws then.
+func TestClone(t *testing.T) {
+	f := newFixture(t)
+	var s stream
+	f.setup(&s)
+	clearRed(&s)
+	f.submit(t, s)
+	cf := f.clone(t)
+	// The clone draws on the copy of the target that the parent cleared.
+	s = nil
+	drawTriangle(&s)
+	cf.submit(t, s)
+	cf.finish(t)
+	cf.checkTriangle(t)
+	f.finish(t)
+	if p := f.pixel(4, height/2); p != red {
+		t.Errorf("the parent's target where its clone drew: %v, want %v", p, red)
+	}
+	// The parent draws, and clears, as before.
+	s = nil
+	drawTriangle(&s)
+	f.submit(t, s)
+	f.finish(t)
+	f.checkTriangle(t)
+	s = nil
+	s.cmd(cmdClear, 0, clearColor0, f32(0), f32(0), f32(1), f32(1), 0, 0, 0)
+	f.submit(t, s)
+	f.finish(t)
+	cf.finish(t)
+	cf.checkTriangle(t)
+}
+
+// A clone samples its copy of a texture, with the sampler and sampler view
+// that the guest destroyed while they were bound.
+func TestCloneTexture(t *testing.T) {
+	f := newFixture(t)
+	var s stream
+	texel := f.textured(t, &s)
+	f.submit(t, s)
+	cf := f.clone(t)
+	s = nil
+	clearRed(&s)
+	drawTriangle(&s)
+	cf.submit(t, s)
+	cf.finish(t)
+	if p := cf.pixel(4, height/2); p != texel {
+		t.Errorf("inside the triangle: %v, want the texel %v", p, texel)
+	}
+	if p := cf.pixel(width-4, height/2); p != red {
+		t.Errorf("outside the triangle: %v, want %v", p, red)
+	}
+}
+
+// A query that is active when a context is cloned counts, in the clone,
+// what the clone draws from then on, and in the context what it does.
+func TestCloneQuery(t *testing.T) {
+	f := newFixture(t)
+	qMem := make([]byte, queryStateSize)
+	qres, err := NewResource(3, ResourceArgs{Target: targetBuffer, Format: formatR8Unorm,
+		Bind: bindQueryBuffer, Width: queryStateSize, Height: 1, Depth: 1, ArraySize: 1}, qMem, nil)
+	if err != nil {
+		t.Fatalf("NewResource: %v", err)
+	}
+	defer qres.DecRef()
+	f.c.Attach(qres)
+	var s stream
+	f.setup(&s)
+	clearRed(&s)
+	q := f.id()
+	s.cmd(cmdCreateObject, objectQuery, q, queryOcclusionCounter, 0, qres.ID())
+	s.cmd(cmdBeginQuery, 0, q)
+	f.submit(t, s)
+	cf := f.clone(t)
+	end := func(f *fixture, draw bool, mem []byte) uint64 {
+		t.Helper()
+		var s stream
+		if draw {
+			drawTriangle(&s)
+		}
+		s.cmd(cmdEndQuery, 0, q)
+		s.cmd(cmdGetQueryResult, 0, q, 0)
+		f.submit(t, s)
+		f.c.Flush().Wait()
+		if state := binary.LittleEndian.Uint32(mem); state != queryStateDone {
+			t.Fatalf("query state %d, want %d", state, queryStateDone)
+		}
+		return binary.LittleEndian.Uint64(mem[8:])
+	}
+	// Half the left half: 1024 pixels, give or take its edge's.
+	if samples := end(cf, true, cf.mems[qres.ID()]); samples < 900 || samples > 1200 {
+		t.Errorf("%d samples passed in the clone", samples)
+	}
+	if samples := end(f, false, qMem); samples != 0 {
+		t.Errorf("%d samples passed in the parent, which drew nothing", samples)
+	}
+}
+
+// A clone has the context's sub-contexts, with the current one current.
+func TestCloneSubContexts(t *testing.T) {
+	f := newFixture(t)
+	var s stream
+	s.cmd(cmdCreateSubCtx, 0, 1)
+	s.cmd(cmdSetSubCtx, 0, 1)
+	h := f.setup(&s)
+	s.cmd(cmdDestroyObject, 0, h.blend)
+	f.submit(t, s)
+	cf := f.clone(t)
+	s = nil
+	clearRed(&s)
+	drawTriangle(&s)
+	cf.submit(t, s)
+	cf.finish(t)
+	cf.checkTriangle(t)
+	// Its sub-context 0 has none of sub-context 1's state.
+	s = nil
+	s.cmd(cmdSetSubCtx, 0, 0)
+	s.cmd(cmdBindShader, 0, h.fs, stageFragment)
+	if err := cf.c.Submit(s.bytes()); err == nil {
+		t.Errorf("the clone's sub-context 0 bound sub-context 1's shader")
+	}
 }
 
 // A copy between a compressed format and a plain one of its blocks' size

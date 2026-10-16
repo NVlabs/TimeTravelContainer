@@ -223,10 +223,11 @@ Guests need no configuration: Debian's Mesa reports `virgl (zink Vulkan
 1.4(Apple M5 Pro (MOLTENVK)))`, with OpenGL 3.1 and OpenGL ES 3.1, more than
 Zink in the guest has, and redroid's image runs in its own host mode, with
 no file of TTC's: its Mesa's virgl driver renders SurfaceFlinger and apps,
-and its GBM allocates their buffers.
+and its GBM allocates their buffers. With `--gfx-fork=snapshot`, it forks
+live, as its Venus driver's Android does.
 
 ```sh
-ttc create --name android --gfx --gfx-fork device-lost --cap-add ALL \
+ttc create --name android --gfx --gfx-fork snapshot --cap-add ALL \
   --network ttc --nat --entrypoint /init redroid/redroid:14.0.0_64only-latest \
   qemu=1 androidboot.hardware=redroid androidboot.use_memfd=true \
   androidboot.redroid_gpu_mode=host androidboot.redroid_gpu_node=/dev/dri/renderD128
@@ -268,9 +269,16 @@ renderer drops the draws that would use it, as virglrenderer drops draws
 that it cannot draw. The renderer's Vulkan for Zink logs only MoltenVK's
 errors, not the warning that MoltenVK logs of each of Zink's pipelines.
 
-The renderer does not clone virgl's contexts yet: `--gfx-fork=snapshot`
-fails while a branch has a virgl context or resource, and the child of a
-`--gfx-fork=device-lost` fork loses them, as it loses Venus's. On Linux the
-renderer offers no virgl capability sets yet.
+A live fork with `--gfx-fork=snapshot` clones a branch's virgl contexts, as
+it clones Venus's (`virgl/clone_unsafe.go`): a clone's sub-contexts are
+Gallium contexts of their own, in which it creates the parent's objects
+again, of what the commands that created them carried, compiles their
+shaders again, which Zink's cache of live shaders finds compiled, and binds
+and sets what the parent's state holds, of what the decoder keeps of it.
+Its resources are copies of the parent's memory and contents. A query that
+is active when the branch forks is begun again, and counts what the child
+does from the fork on. The child of a `--gfx-fork=device-lost` fork loses
+virgl's contexts, as it loses Venus's. On Linux the renderer offers no virgl
+capability sets yet.
 
 [scrcpy]: https://github.com/Genymobile/scrcpy

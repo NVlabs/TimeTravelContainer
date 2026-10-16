@@ -15,6 +15,7 @@ import (
 
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/venus/vk"
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/venus/vn"
+	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/virgl"
 )
 
 // A live fork of a branch whose GPU is in use clones the branch's contexts
@@ -37,12 +38,17 @@ import (
 //
 // The guest is stopped while the renderer clones its state, which waits for
 // the GPU to be idle, and for the rings to execute what the guest wrote.
+//
+// virgl's contexts clone themselves (see the virgl package's
+// clone_unsafe.go), with the clones of the server's resources, which are
+// copies of their memory and of their Gallium resources' contents.
 
 // cloneState is a clone of a branch's contexts and resources, which a fork's
 // children adopt.
 type cloneState struct {
 	contexts  map[uint32]*Context
 	resources map[uint32]*resource
+	virgl     map[uint32]*virgl.Context
 }
 
 // release destroys a clone that no child adopted.
@@ -50,8 +56,11 @@ func (st *cloneState) release() {
 	for _, c := range st.contexts {
 		c.destroy()
 	}
+	for _, c := range st.virgl {
+		c.Destroy()
+	}
 	for _, r := range st.resources {
-		r.mem.decRef()
+		r.release()
 	}
 }
 
@@ -92,26 +101,33 @@ func quiesce(contexts map[uint32]*Context) (func(), error) {
 	return resume, nil
 }
 
-// cloneContexts clones contexts and the resources that they use, which must
-// be quiescent.
-func cloneContexts(contexts map[uint32]*Context, resources map[uint32]*resource) (*cloneState, error) {
+// cloneContexts clones contexts, virgl's contexts virglContexts, and the
+// resources that they use, which must be quiescent.
+func cloneContexts(contexts map[uint32]*Context, resources map[uint32]*resource, virglContexts map[uint32]*virgl.Context) (*cloneState, error) {
 	st := &cloneState{
 		contexts:  make(map[uint32]*Context),
 		resources: make(map[uint32]*resource),
+		virgl:     make(map[uint32]*virgl.Context),
 	}
 	cl := &cloner{
-		st:      st,
-		parents: contexts,
-		shm:     make(map[*sharedMemory]*sharedMemory),
-		devices: make(map[*device]*device),
-		copiers: make(map[*hostDevice]*copyBatch),
+		st:         st,
+		parents:    contexts,
+		shm:        make(map[*sharedMemory]*sharedMemory),
+		devices:    make(map[*device]*device),
+		copiers:    make(map[*hostDevice]*copyBatch),
+		virgl:      make(map[*virgl.Resource]*virgl.Resource),
+		virglAlone: make(map[*virgl.Resource]*virgl.Resource),
 	}
 	defer cl.release()
 
 	// Every device that the contexts use is idle: the clone copies what
-	// it wrote.
+	// it wrote. virgl's contexts write the results of the queries that
+	// their guests asked for to the memory that the clone copies.
 	for _, c := range contexts {
 		cl.waitIdle(c)
+	}
+	for _, c := range virglContexts {
+		c.Flush().Wait()
 	}
 
 	ids := make([]uint32, 0, len(contexts))
@@ -143,7 +159,15 @@ func cloneContexts(contexts map[uint32]*Context, resources map[uint32]*resource)
 			st.release()
 			return nil, err
 		}
-		cl.addResource(&resource{id: r.id, size: r.size, mapInfo: r.mapInfo, mem: mem})
+		cr := &resource{id: r.id, size: r.size, mapInfo: r.mapInfo, mem: mem}
+		if r.virgl != nil {
+			if cr.virgl, err = cl.cloneVirgl(r.virgl, mem); err != nil {
+				mem.decRef()
+				st.release()
+				return nil, fmt.Errorf("cloning virgl's resource %d: %w", r.id, err)
+			}
+		}
+		cl.addResource(cr)
 	}
 
 	// The contexts' mutable objects, the binding of memory to their
@@ -184,7 +208,50 @@ func cloneContexts(contexts map[uint32]*Context, resources map[uint32]*resource)
 		st.release()
 		return nil, err
 	}
+	for id, c := range virglContexts {
+		cc, err := c.Clone(cl.virglResource)
+		if err != nil {
+			st.release()
+			return nil, fmt.Errorf("cloning virgl's context %d: %w", id, err)
+		}
+		st.virgl[id] = cc
+	}
+	// The child's work follows the copies of virgl's resources.
+	virgl.Sync()
 	return st, nil
+}
+
+// cloneVirgl returns the clone of virgl's resource r, whose guest's memory
+// is mem, the copy of r's, and which the clone's resource holds.
+func (cl *cloner) cloneVirgl(r *virgl.Resource, mem *sharedMemory) (*virgl.Resource, error) {
+	mem.incRef()
+	c, err := r.Clone(mem.data, mem.decRef)
+	if err != nil {
+		mem.decRef()
+		return nil, err
+	}
+	cl.virgl[r] = c
+	return c, nil
+}
+
+// virglResource returns, with a reference, the clone of virgl's resource r,
+// which a virgl context uses: the clone of the server's resource, or, of
+// one that the guest destroyed, which only contexts hold, a copy of its
+// own.
+func (cl *cloner) virglResource(r *virgl.Resource) (*virgl.Resource, error) {
+	c := cl.virgl[r]
+	if c == nil {
+		c = cl.virglAlone[r]
+	}
+	if c == nil {
+		var err error
+		if c, err = r.Clone(append([]byte(nil), r.Backing()...), nil); err != nil {
+			return nil, err
+		}
+		cl.virglAlone[r] = c
+	}
+	c.IncRef()
+	return c, nil
 }
 
 // cloneStep is what a context did that a fork's child does again.
@@ -213,11 +280,20 @@ type cloner struct {
 	// replays executes the commands that the child executes again, in the
 	// context that it replays into.
 	replays map[*Context]*stream
+	// virgl maps the Gallium resources of the server's resources to the
+	// clones of the clone's resources, which hold them, and virglAlone
+	// those of resources that only virgl's contexts hold to their copies,
+	// with a reference of the cloner's.
+	virgl      map[*virgl.Resource]*virgl.Resource
+	virglAlone map[*virgl.Resource]*virgl.Resource
 }
 
 func (cl *cloner) release() {
 	for _, s := range cl.replays {
 		s.release()
+	}
+	for _, r := range cl.virglAlone {
+		r.DecRef()
 	}
 }
 
@@ -877,6 +953,9 @@ func (srv *server) adopt(st *cloneState) {
 	for id, c := range st.contexts {
 		c.srv = srv
 		srv.contexts[id] = c
+	}
+	for id, c := range st.virgl {
+		srv.virgl[id] = c
 	}
 	srv.mu.Unlock()
 	for _, c := range st.contexts {

@@ -241,6 +241,21 @@ uint32_t ttc_virgl_resource_height(struct pipe_resource *res, uint32_t level) {
    return u_minify(res->height0, level);
 }
 
+void ttc_virgl_resource_copy(struct pipe_context *pipe, struct pipe_resource *dst,
+                             struct pipe_resource *src) {
+   for (unsigned level = 0; level <= src->last_level; level++) {
+      int64_t w, h, d;
+      level_extent(src, level, &w, &h, &d);
+      if (src->target == PIPE_TEXTURE_1D_ARRAY) {
+         // Zink's copies take a 1D array's layers as a 2D array's.
+         d = h;
+         h = 1;
+      }
+      struct pipe_box box = {.x = 0, .y = 0, .z = 0, .width = w, .height = h, .depth = d};
+      pipe->resource_copy_region(pipe, dst, level, 0, 0, 0, src, level, &box);
+   }
+}
+
 // transfer copies box between res and data, whose rows are stride bytes
 // apart and whose layers layer_stride.
 static int transfer(struct pipe_context *pipe, struct pipe_resource *res, bool to_host,
@@ -569,6 +584,10 @@ void *ttc_virgl_translate_tgsi(const char *text, uint32_t num_tokens, char *err,
 
 void ttc_virgl_free_tokens(void *tokens) {
    FREE(tokens);
+}
+
+void *ttc_virgl_dup_tokens(const void *tokens) {
+   return tgsi_dup_tokens(tokens);
 }
 
 uint32_t ttc_virgl_format_int_class(uint32_t format) {

@@ -30,6 +30,10 @@ void ttc_virgl_resource_unref(struct pipe_resource *res);
 uint32_t ttc_virgl_resource_target(struct pipe_resource *res);
 uint32_t ttc_virgl_resource_width(struct pipe_resource *res, uint32_t level);
 uint32_t ttc_virgl_resource_height(struct pipe_resource *res, uint32_t level);
+// ttc_virgl_resource_copy copies every level and layer of src to dst, a
+// resource of src's parameters, on the GPU.
+void ttc_virgl_resource_copy(struct pipe_context *pipe, struct pipe_resource *dst,
+                             struct pipe_resource *src);
 
 // Transfers between a resource and the guest's memory of it, data, of size
 // bytes, from which the transfer reads (to_host) or into which it writes.
@@ -67,6 +71,9 @@ void *ttc_virgl_create_vertex_elements(struct pipe_context *pipe, const uint32_t
 void *ttc_virgl_translate_tgsi(const char *text, uint32_t num_tokens, char *err,
                                uint32_t errlen);
 void ttc_virgl_free_tokens(void *tokens);
+// ttc_virgl_dup_tokens returns a copy of tokens, which
+// ttc_virgl_free_tokens frees.
+void *ttc_virgl_dup_tokens(const void *tokens);
 // ttc_virgl_create_shader returns a shader of tokens, or NULL, and why in
 // err. so is the shader's stream output, the payload's dwords from its
 // count. A vertex shader's inputs of sint_mask are signed integers, and of

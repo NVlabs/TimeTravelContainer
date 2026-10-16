@@ -83,6 +83,7 @@ func Capsets() ([]Capset, error) {
 // the guest's memory of it, which transfers copy to and from.
 type Resource struct {
 	id      uint32
+	args    ResourceArgs
 	pipe    *C.struct_pipe_resource
 	backing []byte
 	release func()
@@ -101,9 +102,41 @@ func NewResource(id uint32, a ResourceArgs, backing []byte, release func()) (*Re
 	if p == nil {
 		return nil, fmt.Errorf("Zink refused resource %d %+v", id, a)
 	}
-	r := &Resource{id: id, pipe: p, backing: backing, release: release}
+	r := &Resource{id: id, args: a, pipe: p, backing: backing, release: release}
 	r.refs.Store(1)
 	return r, nil
+}
+
+// Clone returns a copy of r for a fork's child: a resource of r's
+// parameters and contents, whose guest's memory is backing, and which calls
+// release as NewResource's does. What wrote r must be done; Sync waits for
+// the copy.
+func (r *Resource) Clone(backing []byte, release func()) (*Resource, error) {
+	c, err := NewResource(r.id, r.args, backing, release)
+	if err != nil {
+		return nil, err
+	}
+	t := &transferContext
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if err := t.createLocked(); err != nil {
+		// The caller releases backing, as if NewResource had failed.
+		c.release = nil
+		c.DecRef()
+		return nil, err
+	}
+	C.ttc_virgl_resource_copy(t.pipe, c.pipe, r.pipe)
+	return c, nil
+}
+
+// Backing returns the guest's memory of r.
+func (r *Resource) Backing() []byte {
+	return r.backing
+}
+
+// IncRef takes a reference to r, which DecRef releases.
+func (r *Resource) IncRef() {
+	r.incRef()
 }
 
 // ID returns the resource's ID.
@@ -143,10 +176,25 @@ func transfer(pipe *C.struct_pipe_context, r *Resource, a TransferArgs) error {
 }
 
 // transferContext is the renderer's own Gallium context, for the transfers
-// of no virgl context's.
-var transferContext struct {
+// of no virgl context's, and the copies of clones.
+var transferContext ownContext
+
+// ownContext is a Gallium context of the renderer's own.
+type ownContext struct {
 	mu   sync.Mutex
 	pipe *C.struct_pipe_context
+}
+
+// createLocked creates the context if it has none.
+//
+// Preconditions: t.mu is locked.
+func (t *ownContext) createLocked() error {
+	if t.pipe == nil {
+		if t.pipe = C.ttc_virgl_context_create(); t.pipe == nil {
+			return errNoContext
+		}
+	}
+	return nil
 }
 
 // Transfer executes a transfer between r and the guest's memory of it, for
@@ -155,13 +203,25 @@ func Transfer(r *Resource, a TransferArgs) error {
 	t := &transferContext
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.pipe == nil {
-		if t.pipe = C.ttc_virgl_context_create(); t.pipe == nil {
-			return errNoContext
-		}
+	if err := t.createLocked(); err != nil {
+		return err
 	}
 	err := transfer(t.pipe, r, a)
 	// Contexts' later work follows the transfer on the GPU's queue.
 	C.ttc_virgl_flush_async(t.pipe)
 	return err
+}
+
+// Sync waits until the copies of the resources that Clone returned are
+// done.
+func Sync() {
+	t := &transferContext
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.pipe == nil {
+		return
+	}
+	if h := C.ttc_virgl_flush(t.pipe); h != nil {
+		C.ttc_virgl_fence_wait(h)
+	}
 }
