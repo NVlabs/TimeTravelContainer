@@ -383,6 +383,8 @@ func New(opts platform.Options) (*Systrap, error) {
 		initSysmsgThreadPriority()
 
 		initSeccompNotify()
+
+		deaths.watch()
 	})
 	if stubErr != nil {
 		mf.Destroy()
@@ -421,7 +423,12 @@ func (*Systrap) MaxUserAddress() hostarch.Addr {
 
 // NewAddressSpace returns a new subprocess.
 func (p *Systrap) NewAddressSpace() (platform.AddressSpace, error) {
-	return newSubprocess(globalPool.source.createStub, p.memoryFile, true)
+	s, err := newSubprocess(globalPool.source.createStub, p.memoryFile, true)
+	if err != nil {
+		return nil, err
+	}
+	deaths.add(s)
+	return s, nil
 }
 
 // NewContext returns an interruptible platformContext.

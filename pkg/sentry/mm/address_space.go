@@ -37,6 +37,13 @@ func (mm *MemoryManager) AddressSpace() platform.AddressSpace {
 	return mm.as
 }
 
+// UsesAddressSpace returns true if as is mm's AddressSpace.
+func (mm *MemoryManager) UsesAddressSpace(as platform.AddressSpace) bool {
+	mm.activeMu.RLock()
+	defer mm.activeMu.RUnlock()
+	return mm.as == as
+}
+
 // mapASLocked maps addresses in ar into mm.as.
 //
 // Preconditions:

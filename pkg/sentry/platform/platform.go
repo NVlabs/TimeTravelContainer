@@ -549,6 +549,16 @@ type CheckpointCoherence interface {
 	FlushForCheckpoint(ctx context.Context) error
 }
 
+// AddressSpaceDeathNotifier is optionally implemented by Platforms whose
+// AddressSpaces are host processes of their own, which the host may kill
+// apart from the Sentry, as its out-of-memory killer does.
+type AddressSpaceDeathNotifier interface {
+	// NotifyAddressSpaceDeath has f called with each AddressSpace in use
+	// whose host process dies, until stop is called. f is called on a
+	// goroutine of the Platform's, and must not block.
+	NotifyAddressSpaceDeath(f func(AddressSpace)) (stop func())
+}
+
 // AddressSpaceIO supports IO through the memory mappings installed in an
 // AddressSpace.
 //

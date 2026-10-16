@@ -263,6 +263,7 @@ proto_library(
 go_library(
     name = "kernel",
     srcs = [
+        "address_space_death.go",
         "aio.go",
         "atomicptr_bucket_slice_unsafe.go",
         "atomicptr_bucket_unsafe.go",
@@ -508,6 +509,23 @@ go_test(
         "//pkg/sentry/time",
         "//pkg/sentry/usage",
         "//pkg/state",
+    ],
+)
+
+go_test(
+    name = "address_space_death_test",
+    size = "small",
+    srcs = ["address_space_death_test.go"],
+    deps = [
+        ":kernel",
+        "//pkg/abi/linux",
+        "//pkg/sentry/fsimpl/testutil",
+        "//pkg/sentry/fsimpl/tmpfs",
+        "//pkg/sentry/kernel/auth",
+        "//pkg/sentry/limits",
+        "//pkg/sentry/platform",
+        "//pkg/sentry/syscalls/linux",
+        "//pkg/sentry/vfs",
     ],
 )
 

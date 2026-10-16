@@ -39,7 +39,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/platform/systrap/sysmsg"
 	"gvisor.dev/gvisor/pkg/sentry/platform/systrap/usertrap"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
-	"gvisor.dev/gvisor/pkg/sighandling"
 )
 
 var (
@@ -248,6 +247,19 @@ func handlePtraceSyscallRequestError(req any, format string, values ...any) {
 // syscallThread without using ptrace. Look at the description of syscallThread
 // to get more details about its limitations.
 func (s *subprocess) handlePtraceSyscallRequest(req any) {
+	defer func() {
+		if r := recover(); r != nil {
+			if !stubDied(s, r) {
+				panic(r)
+			}
+			switch req := req.(type) {
+			case requestThread:
+				req.thread <- nil
+			case requestStub:
+				req.done <- nil
+			}
+		}
+	}()
 	s.syscallThreadMu.Lock()
 	defer s.syscallThreadMu.Unlock()
 	runtime.LockOSThread()
@@ -353,7 +365,12 @@ func (s *subprocess) handlePtraceSyscallRequest(req any) {
 // parent of all other stub processes, but only one filter can be installed
 // with SECCOMP_FILTER_FLAG_NEW_LISTENER.
 func newSubprocess(create func() (*thread, error), memoryFile *pgalloc.MemoryFile, seccompNotify bool) (*subprocess, error) {
-	if sp := globalPool.fetchAvailable(); sp != nil {
+	for sp := globalPool.fetchAvailable(); sp != nil; sp = globalPool.fetchAvailable() {
+		if !sp.alive() {
+			// Its stub was killed while it was pooled.
+			sp.release()
+			continue
+		}
 		sp.subprocessRefs.InitRefs()
 		sp.usertrap = usertrap.New()
 		return sp, nil
@@ -518,10 +535,10 @@ func (s *subprocess) unmap() {
 // globalPool. This has the added benefit of reducing creation time for new
 // subprocesses.
 func (s *subprocess) Release() {
-	if !s.alive() {
-		return
+	deaths.remove(s)
+	if s.alive() {
+		s.unmap()
 	}
-	s.unmap()
 	s.DecRef(s.release)
 }
 
@@ -640,14 +657,10 @@ func (t *thread) unexpectedStubExit() {
 	status := unix.WaitStatus(msg)
 	if status.Signaled() && status.Signal() == unix.SIGKILL {
 		// SIGKILL can be only sent by a user or OOM-killer. In both
-		// these cases, we don't need to panic. There is no reasons to
-		// think that something wrong in gVisor.
+		// these cases, there is no reason to think that something is
+		// wrong in gVisor. The tasks the stub ran die for it, and not the
+		// Sentry: the operation's caller recovers (see stubDied).
 		log.Warningf("The ptrace stub process %v has been killed by SIGKILL.", t.tgid)
-		err := sighandling.KillItself()
-		if err != nil {
-			t.dumpAndPanic(fmt.Sprintf(
-				"failed to kill the process %d:%d: %v", t.tgid, t.tid, err))
-		}
 	}
 	t.dumpAndPanic(fmt.Sprintf("wait failed: the process %d:%d exited: %x (err %v)", t.tgid, t.tid, msg, err))
 }
@@ -1086,7 +1099,15 @@ func initSysmsgThreadPriority() {
 
 // createSysmsgThread creates a new sysmsg thread.
 // The thread starts processing any available context in the context queue.
-func (s *subprocess) createSysmsgThread() error {
+func (s *subprocess) createSysmsgThread() (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if !stubDied(s, r) {
+				panic(r)
+			}
+			err = errDeadSubprocess
+		}
+	}()
 	// Create a new seccomp process.
 	var r requestThread
 	r.thread = make(chan *thread)

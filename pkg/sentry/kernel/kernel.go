@@ -172,6 +172,11 @@ type Kernel struct {
 	// Protected by extMu.
 	timePausedByStartPaused bool `state:"nosave"`
 
+	// stopAddressSpaceDeaths stops the Platform from telling the started
+	// Kernel of each AddressSpace whose host process dies; see
+	// watchAddressSpaceDeaths.
+	stopAddressSpaceDeaths func() `state:"nosave"`
+
 	// All of the following fields are immutable unless otherwise specified.
 
 	// Platform is the platform that is used to execute tasks in the created
@@ -1680,6 +1685,7 @@ func (k *Kernel) startLocked(resumeTime bool) error {
 	}
 
 	k.started = true
+	k.watchAddressSpaceDeaths()
 	k.cpuClockTickTimer = time.NewTimer(linux.ClockTick)
 	k.runningTasksMu.Lock()
 	k.cpuClockTickerRunning = true
@@ -2559,6 +2565,10 @@ func (k *Kernel) releaseLoaded(clocks sentrytime.Clocks) {
 // Precondition: This should only be called after the kernel is fully
 // initialized, e.g. after k.Start() has been called.
 func (k *Kernel) Release() {
+	if k.stopAddressSpaceDeaths != nil {
+		k.stopAddressSpaceDeaths()
+		k.stopAddressSpaceDeaths = nil
+	}
 	k.stopCPUClockTicker()
 	ctx := k.SupervisorContext()
 	k.releaseCgroupMounts(ctx)
