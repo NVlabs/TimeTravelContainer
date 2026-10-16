@@ -179,13 +179,15 @@ func TestPlaceUnloadedBindsAnUnloadedUnitOnce(t *testing.T) {
 		seg := amfl.unloaded.FindSegment(unit.Start)
 		return seg.Ok() && seg.ValuePtr().placed && seg.Range() == unit
 	}
-	// The file's mappings, which a binding of part of one would split.
+	// The file's mappings, which a binding of part of one would split. Those
+	// of earlier tests' files, which go once their releasers have ended, do
+	// not count.
 	mappings := func() int {
 		maps, err := os.ReadFile("/proc/self/maps")
 		if err != nil {
 			t.Fatal(err)
 		}
-		return strings.Count(string(maps), "ttc-remote-target-")
+		return strings.Count(string(maps), " "+mf.File().Name()+" (deleted)\n")
 	}
 	before := mappings()
 	// A page of the unit places all of it.
