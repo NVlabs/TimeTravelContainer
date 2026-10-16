@@ -205,14 +205,20 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 			return fmt.Errorf("capturing distributed-fork kernel memory graph: %w", err)
 		}
 		k.mf.MarkSavable()
-		allocatorMetadata, _, _, err := pgalloc.ExportMemoryFileMetadataForRemote(ctx, k.mf)
-		if err != nil {
-			return err
-		}
 		// A 2 MiB page travels whole, and its target installs it whole.
 		layout, err := memoryCapture.HugePageSnapshotLayout()
 		if err != nil {
 			return fmt.Errorf("resolving sparse distributed-fork memory graph: %w", err)
+		}
+		// The target installs the pages the bindings name. Only a capture
+		// without any needs the family's allocator, whose export holds the
+		// family MemoryFile's lock while it serializes all of it, and first
+		// evicts every branch's evictable file cache.
+		var allocatorMetadata []byte
+		if len(layout.Bindings) == 0 {
+			if allocatorMetadata, _, _, err = pgalloc.ExportMemoryFileMetadataForRemote(ctx, k.mf); err != nil {
+				return err
+			}
 		}
 		layout, err = layout.ChunkOrdered()
 		if err != nil {

@@ -483,6 +483,11 @@ func TestDistributedForkRepeatedImportSharesMemoryFile(t *testing.T) {
 		parent.Release()
 		t.Fatal(err)
 	}
+	// The target installs the pages the bindings name: the capture has no use
+	// for the family's allocator.
+	if len(capture.MemoryBindings) == 0 || len(capture.AllocatorMetadata) != 0 {
+		t.Errorf("the capture has %d bindings and %d bytes of allocator metadata, want bindings only", len(capture.MemoryBindings), len(capture.AllocatorMetadata))
+	}
 	targetMF := newRemoteKernelMemoryFile(t)
 	children := make([]*kernel.Kernel, 0, 2)
 	for i, id := range []string{"remote-one", "remote-two"} {
