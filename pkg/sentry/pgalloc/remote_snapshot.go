@@ -543,6 +543,9 @@ func exportMemoryFileMetadataForRemote(ctx context.Context, source *MemoryFile, 
 	}
 	collectUsed(&source.unfreeSmall)
 	collectUsed(&source.unfreeHuge)
+	// The saved state has no set of its own for home waste.
+	unmergeHomeWaste := source.mergeHomeWasteLocked()
+	defer unmergeHomeWaste()
 	if _, err := state.Save(ctx, &metadata, &memoryFileSaved{
 		unwasteSmall:     &source.unwasteSmall,
 		unwasteHuge:      &source.unwasteHuge,
@@ -744,9 +747,10 @@ func ImportMemoryFileMetadataForRemote(ctx context.Context, target *MemoryFile, 
 	target.memAcct.MoveFrom(saved.memAcct)
 	target.knownCommittedBytes = knownCommitted
 	target.chunks.Store(&chunks)
+	target.loadHomesLocked()
 	// The source's waste pages, which the export took as they were, are waste
 	// here too, for the releaser to release.
-	if target.unwasteSmall.FirstLargeEnoughGap(1).Ok() || target.unwasteHuge.FirstLargeEnoughGap(1).Ok() {
+	if target.unwasteSmall.FirstLargeEnoughGap(1).Ok() || target.unwasteHuge.FirstLargeEnoughGap(1).Ok() || target.unwasteHome.FirstLargeEnoughGap(1).Ok() {
 		target.haveWaste = true
 		target.releaseCond.Signal()
 	}

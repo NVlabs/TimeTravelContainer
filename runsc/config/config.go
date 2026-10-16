@@ -383,6 +383,13 @@ type Config struct {
 	// while a tmpfs follows its own huge option.
 	MemoryFileHugeTmpfs bool `flag:"memory-file-huge-tmpfs"`
 
+	// MemoryHomes places each address space's private pages in the
+	// application memory file in the order of their addresses (see
+	// pgalloc.MemoryFile.ReserveHome), so that systrap maps adjacent private
+	// pages with one host mapping, however the application faults or copies
+	// them. It applies to the systrap platform only.
+	MemoryHomes bool `flag:"memory-homes"`
+
 	// NVProxy enables support for Nvidia GPUs.
 	NVProxy bool `flag:"nvproxy"`
 

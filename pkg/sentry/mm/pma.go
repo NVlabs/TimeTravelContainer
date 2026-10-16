@@ -127,6 +127,25 @@ func (mm *MemoryManager) getPMAsLocked(ctx context.Context, vseg vmaIterator, ar
 type faultRemap struct {
 	ar      hostarch.AddrRange
 	decRefs *pendingFileDecRefs
+
+	// inserted spans the pmas that the fault inserted: pages it allocated,
+	// copied or translated. Pages they merge with are mapped already, and
+	// mapping them again would drop their host page tables; see
+	// mapASWindowLocked.
+	inserted hostarch.AddrRange
+}
+
+// noteInserted records in remap, if any, that the fault inserted pmas for ar.
+func (remap *faultRemap) noteInserted(ar hostarch.AddrRange) {
+	if remap == nil {
+		return
+	}
+	if remap.inserted.Length() == 0 {
+		remap.inserted = ar
+		return
+	}
+	remap.inserted.Start = min(remap.inserted.Start, ar.Start)
+	remap.inserted.End = max(remap.inserted.End, ar.End)
 }
 
 // release drops the references remap held.
@@ -333,6 +352,13 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 					// application page faults (that trap into the sentry) by
 					// creating AddressSpace mappings in advance.
 					allocAR := optAR.Intersect(hugeMaskAR)
+					if mm.homeOwner != 0 {
+						// A home holds one block of addresses; a later
+						// iteration of this loop allocates the rest.
+						if end := homeBlockEnd(allocAR.Start); end < allocAR.End {
+							allocAR.End = end
+						}
+					}
 					// Don't back stacks with huge pages due to low utilization
 					// and because they're often fragmented by copy-on-write.
 					mayHuge := mm.mf.HugepagesEnabled() && !vma.growsDown && !vma.isStack
@@ -381,7 +407,7 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 					if callerIndirectCommit && (huge || allocAR.Length() == hostarch.PageSize) {
 						allocOpts.Mode = pgalloc.AllocateCallerIndirectCommit
 					}
-					fr, err := mm.mf.Allocate(uint64(allocAR.Length()), allocOpts)
+					fr, err := mm.allocatePrivateLocked(allocAR, allocOpts)
 					if err != nil {
 						return pstart, pgap, err
 					}
@@ -391,6 +417,7 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 						}
 					}
 					mm.addRSSLocked(allocAR)
+					remap.noteInserted(allocAR)
 					pseg, pgap = mm.pmas.Insert(pgap, allocAR, pma{
 						file:           mm.mf,
 						off:            fr.Start,
@@ -448,6 +475,7 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 						}
 						mm.addRSSLocked(newpmaAR)
 						t.File.IncRef(t.FileRange(), memCgID)
+						remap.noteInserted(newpmaAR)
 						// This is valid because memmap.Mappable.Translate is
 						// required to return Translations in increasing
 						// Translation.Source order.
@@ -479,8 +507,28 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 					addr := max(pseg.Start(), ar.Start)
 					if block, page, ok := mm.hugePageBlockLocked(pseg, addr); ok {
 						if seg, ok := mm.breakHugePageCOWLocked(ctx, block, page, addr, memCgID, allocDir, &unmapAR, &pfdrs); ok {
+							remap.noteInserted(block)
 							pstart = pmaIterator{} // iterators invalidated
 							pseg, pgap = seg, pmaGapIterator{}
+							continue
+						}
+					}
+					// A page that mm alone holds, as one a fork shared until
+					// the fork copied it, is mm's to write, as Linux reuses a
+					// page that only the writer maps: take the pages written
+					// over in place, though other pages of their pma are still
+					// shared, rather than copy them. They take new versions,
+					// as a copy would.
+					if oldpma.private {
+						ownAR := pseg.Range().Intersect(ar)
+						if mm.mf.OwnForWrite(pseg.fileRangeOf(ownAR)) {
+							pseg = mm.pmas.Isolate(pseg, ownAR)
+							owned := pseg.ValuePtr()
+							owned.needCOW = false
+							owned.effectivePerms = vma.effectivePerms
+							owned.maxPerms = vma.maxPerms
+							pstart = pmaIterator{} // iterators invalidated
+							pseg, pgap = pseg.NextNonEmpty()
 							continue
 						}
 					}
@@ -546,7 +594,7 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 					// Copy contents.
 					huge := mm.mf.HugepagesEnabled() && copyAR.IsHugePageAligned()
 					reader := safemem.BlockSeqReader{Blocks: mm.internalMappingsLocked(pseg, copyAR)}
-					fr, err := mm.mf.Allocate(uint64(copyAR.Length()), pgalloc.AllocOpts{
+					fr, err := mm.allocatePrivateLocked(copyAR, pgalloc.AllocOpts{
 						Kind:       usage.Anonymous,
 						MemCgID:    memCgID,
 						Mode:       pgalloc.AllocateAndWritePopulate,
@@ -579,6 +627,7 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 						pfdrs = appendPendingCOWFileDecRef(pfdrs, seg.ValuePtr().file, seg.fileRangeOf(seg.Range().Intersect(copyAR)))
 					}
 					// Insert merges the copy with its neighbors if it can.
+					remap.noteInserted(copyAR)
 					pseg = mm.pmas.Insert(mm.pmas.RemoveRange(copyAR), copyAR, pma{
 						file:           mm.mf,
 						off:            fr.Start,
@@ -645,6 +694,7 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 							newpma.needCOW = true
 						}
 						t.File.IncRef(t.FileRange(), memCgID)
+						remap.noteInserted(newpmaAR)
 						pseg = mm.pmas.Insert(pgap, newpmaAR, newpma)
 						pgap = pseg.NextGap()
 					}
@@ -851,7 +901,7 @@ func (mm *MemoryManager) breakHugePageCOWLocked(ctx context.Context, block hosta
 	}
 	reader := safemem.BlockSeqReader{Blocks: mm.internalMappingsLocked(first, block)}
 	huge := mm.mf.HugepagesEnabled()
-	fr, err := mm.mf.Allocate(hostarch.HugePageSize, pgalloc.AllocOpts{
+	fr, err := mm.allocatePrivateLocked(block, pgalloc.AllocOpts{
 		Kind:             usage.Anonymous,
 		MemCgID:          memCgID,
 		Mode:             pgalloc.AllocateAndWritePopulate,

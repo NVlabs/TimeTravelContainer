@@ -12264,6 +12264,11 @@ func (b *runtimeBackend) configuredRunscArgsForNetworkConfig(networkMode string,
 		// costs the gofer does not grow with the number of things mounted.
 		args = append(args, "--dcache="+strconv.Itoa(size))
 	}
+	if runtimePlatform == "systrap" {
+		// Private pages in address order: systrap maps each run with one
+		// host mapping, of which the host allows a process only so many.
+		args = append(args, "--memory-homes=true")
+	}
 	if b.disableHostGSO {
 		args = append(args, "--gso=false")
 	}

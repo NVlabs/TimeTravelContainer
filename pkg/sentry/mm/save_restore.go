@@ -139,6 +139,9 @@ func (mm *MemoryManager) afterLoad(ctx goContext.Context) {
 		panic("MemoryManager restore context has no platform")
 	}
 	mm.mf = pgalloc.MemoryFileFromContext(ctx)
+	// A restored or forked address space reserves homes of its own; the pages
+	// it restores stay where they are.
+	mm.initHomes()
 	if pgalloc.SparseRelocationFromContext(ctx) != nil {
 		for pseg := mm.pmas.FirstSegment(); pseg.Ok(); {
 			mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile)

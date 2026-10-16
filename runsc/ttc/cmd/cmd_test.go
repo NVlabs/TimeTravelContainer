@@ -4611,6 +4611,10 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 	if size, known := dentryCacheSize(); known {
 		dcache = []string{"--dcache=" + strconv.Itoa(size)}
 	}
+	// On systrap, private pages go in address order.
+	if defaultRuntimePlatform == "systrap" {
+		dcache = append(dcache, "--memory-homes=true")
+	}
 	wantHardened := append([]string{"--root", "/runtime", "--platform=" + defaultRuntimePlatform, "--panic-log=/runtime/sentry-panic.log", "--rootless=true", "--network=none", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory", "--memory-file-huge-tmpfs=true"}, dcache...)
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgs(); !reflect.DeepEqual(got, wantHardened) {
 		t.Errorf("hardened runsc args=%q, want %q", got, wantHardened)
@@ -4642,14 +4646,19 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 	if got := (&runtimeBackend{root: "/runtime", disableHostGSO: true}).configuredRunscArgs(); !reflect.DeepEqual(got, wantOldKernel) {
 		t.Errorf("old-kernel runsc args=%q, want %q", got, wantOldKernel)
 	}
-	wantKVM := append([]string(nil), wantHardened...)
+	var wantKVM []string
+	for _, arg := range wantHardened {
+		if arg != "--memory-homes=true" {
+			wantKVM = append(wantKVM, arg)
+		}
+	}
 	wantKVM[2] = "--platform=kvm"
 	if got := (&runtimeBackend{root: "/runtime", runtimePlatform: "kvm"}).configuredRunscArgs(); !reflect.DeepEqual(got, wantKVM) {
 		t.Errorf("KVM runsc args=%q, want %q", got, wantKVM)
 	}
 	// A cluster whose nodes need no CPUID faulting runs systrap without
 	// syscall patching; KVM has none.
-	wantUnpatched := append(append([]string(nil), wantHardened...), "--systrap-disable-syscall-patching=true")
+	wantUnpatched := append(append([]string(nil), wantKVM...), "--memory-homes=true", "--systrap-disable-syscall-patching=true")
 	wantUnpatched[2] = "--platform=systrap"
 	if got := (&runtimeBackend{root: "/runtime", runtimePlatform: "systrap", disableSyscallPatching: true}).configuredRunscArgs(); !reflect.DeepEqual(got, wantUnpatched) {
 		t.Errorf("unpatched systrap runsc args=%q, want %q", got, wantUnpatched)

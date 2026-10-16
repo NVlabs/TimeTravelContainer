@@ -45,6 +45,22 @@ func (mm *MemoryManager) AddressSpace() platform.AddressSpace {
 //   - ar must be page-aligned.
 //   - pseg == mm.pmas.LowerBoundSegment(ar.Start).
 func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar hostarch.AddrRange, platformEffect memmap.MMapPlatformEffect) error {
+	return mm.mapASWindowLocked(ctx, pseg, ar, platformEffect, hostarch.AddrRange{})
+}
+
+// mapASWindowLocked is mapASLocked, but maps nothing outside window, unless
+// window is empty.
+//
+// A fault that inserted pmas maps only what it inserted and the pages it
+// faulted (see HandleUserFault): a pma it inserted may merge with pmas mapped
+// already, as an address space's private pages do whatever order they come in
+// (see allocatePrivateLocked), and a platform that maps whole pmas (MapUnit 0)
+// would map those again, which drops their host page tables and makes the
+// application fault on each of their pages once more. The host merges the
+// new mapping with theirs.
+//
+// Preconditions: as for mapASLocked; window, if not empty, contains ar.
+func (mm *MemoryManager) mapASWindowLocked(ctx context.Context, pseg pmaIterator, ar hostarch.AddrRange, platformEffect memmap.MMapPlatformEffect, window hostarch.AddrRange) error {
 	if platformEffect == memmap.PlatformEffectCommit && ar.Length() > (1<<30) {
 		// FIXME(b/445932215, b/445939339): Don't precommit very large ranges
 		// via platform.AddressSpace.MapFile() for now, since holding locks
@@ -82,6 +98,9 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 		} else {
 			setMapUnit(32 << 20)
 		}
+	}
+	if window.Length() != 0 {
+		mapAR = mapAR.Intersect(window)
 	}
 	if checkInvariants {
 		if !mapAR.IsSupersetOf(ar) {

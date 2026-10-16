@@ -85,8 +85,13 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 	// anymore.
 	mm.activeMu.DowngradeLock()
 
-	// Map the faulted page into the active AddressSpace.
-	if err := mm.mapASLocked(ctx, pseg, ar, memmap.PlatformEffectDefault); err != nil {
+	// Map the faulted page into the active AddressSpace: only it and what the
+	// fault inserted, if it inserted pmas (see mapASWindowLocked).
+	var window hostarch.AddrRange
+	if inserted := remap.inserted; inserted.Length() != 0 {
+		window = hostarch.AddrRange{Start: min(inserted.Start, ar.Start), End: max(inserted.End, ar.End)}
+	}
+	if err := mm.mapASWindowLocked(ctx, pseg, ar, memmap.PlatformEffectDefault, window); err != nil {
 		mm.unmapASLocked(remap.ar)
 		mm.activeMu.RUnlock()
 		return err

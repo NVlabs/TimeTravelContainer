@@ -67,6 +67,15 @@ type MemoryManager struct {
 	// mf is immutable.
 	mf *pgalloc.MemoryFile `state:"nosave"`
 
+	// homeOwner owns mm's homes (see allocatePrivateLocked), or is zero if mf
+	// has none. It is immutable.
+	homeOwner pgalloc.HomeOwner `state:"nosave"`
+
+	// homes holds, for each block of homeBlockSize of mm's addresses, the
+	// homes that mm reserved for it, the first first. It is protected by
+	// activeMu.
+	homes map[uint64][]memmap.FileRange `state:"nosave"`
+
 	// haveASIO is the cached result of p.SupportsAddressSpaceIO(). Aside from
 	// eliminating an indirect call in the hot I/O path, this makes
 	// MemoryManager.asioEnabled() a leaf function, allowing it to be inlined.

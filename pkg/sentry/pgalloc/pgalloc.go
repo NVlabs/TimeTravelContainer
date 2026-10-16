@@ -198,6 +198,20 @@ type MemoryFile struct {
 	// subreleased is protected by mu.
 	subreleased map[uint64]uint64
 
+	// unwasteHome tracks the waste of home chunks, as unwasteSmall tracks
+	// that of other small chunks; see home.go. It is protected by mu.
+	unwasteHome unwasteSet
+
+	// homes holds the state of each home chunk, by chunk index; freeHomes
+	// holds the indexes of those with neither an owner nor pages. They are
+	// protected by mu.
+	homes     map[uint64]*homeChunk
+	freeHomes []uint64
+
+	// releasingHome is the range of a home chunk that the releaser is
+	// releasing, with mu unlocked, if any. It is protected by mu.
+	releasingHome memmap.FileRange
+
 	// These fields are used for memory accounting.
 	//
 	// Memory accounting is based on identifying the set of committed pages.
@@ -903,6 +917,10 @@ type MemoryFileOpts struct {
 	// NUMANodes is how many host memory nodes an allocation may ask for its
 	// pages to be placed on (AllocOpts.Placement); 0 places none.
 	NUMANodes int
+
+	// MaxHomes is how many home chunks (see ReserveHome) the file may have at
+	// once; 0 gives it none.
+	MaxHomes int
 }
 
 // DelayedEvictionType is the type of MemoryFileOpts.DelayedEviction.
@@ -1006,6 +1024,7 @@ func (f *MemoryFile) initFields() {
 	fullFR := memmap.FileRange{0, math.MaxUint64}
 	f.unwasteSmall.InsertRange(fullFR, unwasteInfo{})
 	f.unwasteHuge.InsertRange(fullFR, unwasteInfo{})
+	f.unwasteHome.InsertRange(fullFR, unwasteInfo{})
 	f.releaseCond.L = &f.mu
 	f.releaserIdle.L = &f.mu
 	f.unfreeSmall.InsertRange(fullFR, unfreeInfo{})
@@ -1573,6 +1592,27 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
 		}
 	}
 	incNrChunks := (alloc.length + chunkMask - tail) / chunkSize
+	if err := f.appendChunksLocked(incNrChunks, alloc.huge, alloc.node); err != nil {
+		return err
+	}
+
+	// Mark void pages free.
+	unfree.RemoveFullRange(memmap.FileRange{
+		Start: oldNrChunks * chunkSize,
+		End:   (oldNrChunks + incNrChunks) * chunkSize,
+	})
+	return nil
+}
+
+// appendChunksLocked extends the file by incNrChunks chunks of the given
+// hugeness and node (as chunkInfo.huge and chunkInfo.node), and maps them.
+// Their pages stay void in both unfree sets; the caller makes them free.
+//
+// Preconditions: f.mu must be locked.
+func (f *MemoryFile) appendChunksLocked(incNrChunks uint64, huge bool, node int32) error {
+	oldChunks := f.chunksLoad()
+	oldNrChunks := uint64(len(oldChunks))
+	oldFileSize := oldNrChunks * chunkSize
 	incFileSize := incNrChunks * chunkSize
 	newNrChunks := oldNrChunks + incNrChunks
 	if newNrChunks > maxChunks || newNrChunks < oldNrChunks /* overflow */ {
@@ -1592,7 +1632,7 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
 	)
 	if f.backing != nil {
 		var err error
-		backingMappings, err = f.backing.Grow(oldFileSize, newFileSize, alloc.huge)
+		backingMappings, err = f.backing.Grow(oldFileSize, newFileSize, huge)
 		if err != nil {
 			return err
 		}
@@ -1615,11 +1655,11 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
 			return errno
 		}
 		mapStart = m
-		if alloc.node == 0 {
-			f.madviseChunkMapping(mapStart, uintptr(incFileSize), alloc.huge)
+		if node == 0 {
+			f.madviseChunkMapping(mapStart, uintptr(incFileSize), huge)
 		} else {
 			for addr := mapStart; addr < mapStart+uintptr(incFileSize); addr += chunkSize {
-				f.adviseChunk(addr, alloc.huge, alloc.node)
+				f.adviseChunk(addr, huge, node)
 			}
 		}
 	}
@@ -1629,8 +1669,8 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
 	copy(newChunks, oldChunks)
 	m := mapStart
 	for i := oldNrChunks; i < newNrChunks; i++ {
-		newChunks[i].huge = alloc.huge
-		newChunks[i].node = alloc.node
+		newChunks[i].huge = huge
+		newChunks[i].node = node
 		if f.backing != nil {
 			newChunks[i].mapping = backingMappings[i-oldNrChunks]
 		} else if f.file != nil {
@@ -1639,13 +1679,6 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
 		}
 	}
 	f.chunks.Store(&newChunks)
-
-	// Mark void pages free.
-	unfree.RemoveFullRange(memmap.FileRange{
-		Start: oldNrChunks * chunkSize,
-		End:   newNrChunks * chunkSize,
-	})
-
 	return nil
 }
 
@@ -1926,6 +1959,9 @@ func (f *MemoryFile) DecRef(fr memmap.FileRange) {
 		if chunk.huge {
 			unwaste = &f.unwasteHuge
 			unfree = &f.unfreeHuge
+		} else if chunk.isHome() {
+			// Home waste is recycled only into its slots.
+			unwaste = &f.unwasteHome
 		}
 		unfree.MutateFullRange(chunkFR, func(ufseg unfreeIterator) bool {
 			uf := ufseg.ValuePtr()
@@ -2003,9 +2039,9 @@ func (f *MemoryFile) releaserMain() {
 			}
 			f.releaseCond.Wait() // releases f.mu while waiting
 		}
-		if fr, huge, ok := f.nextReleaseLocked(); ok {
+		if fr, kind, ok := f.nextReleaseLocked(); ok {
 			f.releasing = true
-			f.releaseLocked(fr, huge)
+			f.releaseLocked(fr, kind)
 			f.releasing = false
 			f.releaserIdle.Broadcast()
 			continue
@@ -2025,12 +2061,21 @@ func (f *MemoryFile) releaserMain() {
 // time than anything else.
 const releaserPause = 10 * time.Millisecond
 
+// releaseKind is the kind of chunk that a range the releaser releases is in.
+type releaseKind int
+
+const (
+	releaseSmall releaseKind = iota
+	releaseHuge
+	releaseHome
+)
+
 // nextReleaseLocked takes the range of waste that the releaser releases next
-// out of the waste sets, and returns it and whether it is hugepage-backed. ok
-// is false if there is no waste.
+// out of the waste sets, and returns it and the kind of chunk it is in. ok is
+// false if there is no waste.
 //
 // Preconditions: f.mu must be locked.
-func (f *MemoryFile) nextReleaseLocked() (fr memmap.FileRange, huge, ok bool) {
+func (f *MemoryFile) nextReleaseLocked() (fr memmap.FileRange, kind releaseKind, ok bool) {
 	// Huge pages are relatively rare and expensive due to fragmentation and
 	// the cost of compaction. Fragmentation is expected to increase over
 	// time. Most allocations are done upwards, with the main exception being
@@ -2047,7 +2092,7 @@ func (f *MemoryFile) nextReleaseLocked() (fr memmap.FileRange, huge, ok bool) {
 	// would otherwise keep the large runs, the bulk of the waste, from being
 	// released at all.
 	for _, minLength := range []uint64{hostarch.HugePageSize, 1} {
-		for i, unwaste := range []*unwasteSet{&f.unwasteSmall, &f.unwasteHuge} {
+		for i, unwaste := range []*unwasteSet{&f.unwasteSmall, &f.unwasteHuge, &f.unwasteHome} {
 			if uwgap := unwaste.LastLargeEnoughGap(minLength); uwgap.Ok() {
 				fr := uwgap.Range()
 				// Linux serializes fallocate()s on shmem files, so limit the
@@ -2057,11 +2102,11 @@ func (f *MemoryFile) nextReleaseLocked() (fr memmap.FileRange, huge, ok bool) {
 					fr.Start = fr.End - maxReleasingBytes
 				}
 				unwaste.Insert(uwgap, fr, unwasteInfo{})
-				return fr, i == 1, true
+				return fr, releaseKind(i), true
 			}
 		}
 	}
-	return memmap.FileRange{}, false, false
+	return memmap.FileRange{}, releaseSmall, false
 }
 
 // holdReleaserLocked keeps the releaser from starting a release until
@@ -2088,7 +2133,7 @@ func (f *MemoryFile) unholdReleaserLocked() {
 }
 
 // Preconditions: f.mu must be locked; it may be unlocked and reacquired.
-func (f *MemoryFile) releaseLocked(fr memmap.FileRange, huge bool) {
+func (f *MemoryFile) releaseLocked(fr memmap.FileRange, kind releaseKind) {
 	defer func() {
 		maseg := f.memAcct.LowerBoundSegmentSplitBefore(fr.Start)
 		for maseg.Ok() && maseg.Start() < fr.End {
@@ -2108,13 +2153,29 @@ func (f *MemoryFile) releaseLocked(fr memmap.FileRange, huge bool) {
 		}
 	}()
 
-	if !huge {
+	switch kind {
+	case releaseSmall:
 		// Decommit the range being released, then mark the released range as
 		// freed.
 		f.mu.Unlock()
 		f.decommitOrManuallyZero(fr)
 		f.mu.Lock()
 		f.unfreeSmall.RemoveFullRange(fr)
+		return
+	case releaseHome:
+		// Released home pages are free slots of their home: they stay void
+		// in unfreeSmall, out of Allocate's reach. AllocateAt does not take
+		// them while they are being released.
+		f.releasingHome = fr
+		f.mu.Unlock()
+		f.decommitOrManuallyZero(fr)
+		f.mu.Lock()
+		f.releasingHome = memmap.FileRange{}
+		// The range may span adjacent homes.
+		for i := fr.Start / chunkSize; i*chunkSize < fr.End; i++ {
+			f.homes[i].pages -= fr.Intersect(chunkRange(i)).Length() / hostarch.PageSize
+			f.spareHomeIfEmptyLocked(i)
+		}
 		return
 	}
 
@@ -3000,6 +3061,9 @@ func (f *MemoryFile) stringLocked() string {
 	fmt.Fprintf(&b, "unwasteSmall:\n%s", &f.unwasteSmall)
 	if f.opts.ExpectHugepages {
 		fmt.Fprintf(&b, "unwasteHuge:\n%s", &f.unwasteHuge)
+	}
+	if len(f.homes) != 0 {
+		fmt.Fprintf(&b, "unwasteHome (%d homes, %d spare):\n%s", len(f.homes), len(f.freeHomes), &f.unwasteHome)
 	}
 	fmt.Fprintf(&b, "unfreeSmall:\n%s", &f.unfreeSmall)
 	if f.opts.ExpectHugepages {

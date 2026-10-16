@@ -795,6 +795,7 @@ func New(args Args) (*Loader, error) {
 	if err != nil {
 		return nil, err
 	}
+	setApplicationMemoryHomes(args.Conf)
 
 	// Create kernel and platform.
 	p, err := createPlatform(args.Conf, args.NumCPU, args.Device, args.ID)
@@ -1458,6 +1459,7 @@ func createMemoryFileFromFileWithOptions(appHugePages bool, hostTHP HostTHP, mem
 	}
 	if !diskBacked && backingProvider == nil {
 		mfopts.NUMANodes = applicationNUMANodes
+		mfopts.MaxHomes = applicationMaxHomes
 	}
 	if appHugePages {
 		switch hostTHP.ShmemEnabled {

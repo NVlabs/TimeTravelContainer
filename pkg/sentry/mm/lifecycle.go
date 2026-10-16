@@ -38,7 +38,7 @@ func NewMemoryManager(p platform.Platform, mf *pgalloc.MemoryFile) (*MemoryManag
 	if err != nil {
 		return nil, err
 	}
-	return &MemoryManager{
+	mm := &MemoryManager{
 		p:           p,
 		mf:          mf,
 		haveASIO:    p.SupportsAddressSpaceIO(),
@@ -47,7 +47,9 @@ func NewMemoryManager(p platform.Platform, mf *pgalloc.MemoryFile) (*MemoryManag
 		auxv:        arch.Auxv{},
 		dumpability: atomicbitops.FromInt32(int32(UserDumpable)),
 		aioManager:  aioManager{contexts: make(map[uint64]*AIOContext)},
-	}, nil
+	}
+	mm.initHomes()
+	return mm, nil
 }
 
 // SetMmapLayout initializes mm's layout from the given arch.Context64.
@@ -295,6 +297,9 @@ func (mm *MemoryManager) Fork(ctx context.Context) (*MemoryManager, error) {
 		aioManager:        aioManager{contexts: make(map[uint64]*AIOContext)},
 		vdsoSigReturnAddr: mm.vdsoSigReturnAddr,
 	}
+	// The child shares mm's pages where they are, in mm's homes; its own
+	// copies go to homes of its own.
+	mm2.initHomes()
 
 	// Copy vmas.
 	dontforks := false
@@ -488,6 +493,10 @@ func (mm *MemoryManager) DecUsers(ctx context.Context) {
 		_, droppedIDs = mm.unmapLocked(ctx, ar, droppedIDs)
 	}
 	mm.mappingMu.Unlock()
+
+	mm.activeMu.Lock()
+	mm.disownHomesLocked()
+	mm.activeMu.Unlock()
 
 	for _, id := range droppedIDs {
 		id.DecRef(ctx)

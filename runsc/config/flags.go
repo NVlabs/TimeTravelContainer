@@ -133,6 +133,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 
 	// Flags that control sandbox runtime behavior: MM related.
 	flagSet.Bool("app-huge-pages", true, "enable use of huge pages for application memory; requires /sys/kernel/mm/transparent_hugepage/shmem_enabled = advise")
+	flagSet.Bool("memory-homes", false, "on systrap, place each address space's private pages in the application memory file in the order of their addresses, so that the host maps adjacent ones with one mapping")
 	flagSet.Bool("memory-file-huge-tmpfs", false, "back application memory with a file on a huge=within_size tmpfs the sandbox mounts in its own mount namespace, so that it gets huge pages where the host's shmem_enabled is never")
 
 	// Flags that control sandbox runtime behavior: FS related.

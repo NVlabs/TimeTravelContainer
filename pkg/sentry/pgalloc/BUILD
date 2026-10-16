@@ -195,8 +195,10 @@ go_library(
         "dma_pin.go",
         "evictable_range.go",
         "evictable_range_set.go",
+        "home.go",
         "host_ops_darwin.go",
         "host_ops_linux.go",
+        "host_ops_linux_unsafe.go",
         "logical_capture.go",
         "logical_page_set.go",
         "memacct_set.go",
@@ -248,6 +250,7 @@ go_test(
     name = "pgalloc_test",
     size = "small",
     srcs = [
+        "home_test.go",
         "huge_page_test.go",
         "numa_test.go",
         "pgalloc_64k_test.go",

@@ -1086,6 +1086,9 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 	f.memAcct.MoveFrom(mfs.memAcct)
 	chunks := mfs.chunks
 	f.chunks.Store(&chunks)
+	f.mu.Lock()
+	f.loadHomesLocked()
+	f.mu.Unlock()
 	mfTimeline.Reached("metadata loaded")
 	log.Infof("MemoryFile(%p): loaded metadata in %s", f, time.Duration(gohacks.Nanotime()-timeMetadataStart))
 

@@ -20,6 +20,23 @@ import (
 // topology it shows, if it does; see pgalloc.NUMAPlacement.
 var applicationNUMANodes int
 
+// applicationMaxHomes is how many home chunks the application memory files
+// may have (pgalloc.MemoryFileOpts.MaxHomes), or 0 if they place private
+// pages as they like; see config.Config.MemoryHomes.
+var applicationMaxHomes int
+
+// maxApplicationHomes is applicationMaxHomes where homes are on: 16 TiB of
+// file offsets, which cost no memory.
+const maxApplicationHomes = 16384
+
+// setApplicationMemoryHomes sets applicationMaxHomes for conf.
+func setApplicationMemoryHomes(conf *config.Config) {
+	applicationMaxHomes = 0
+	if conf.MemoryHomes && conf.Platform == "systrap" {
+		applicationMaxHomes = maxApplicationHomes
+	}
+}
+
 // sandboxCPUTopology returns the host CPU topology that spec asks the sandbox
 // to show its applications, or nil for the single topology, and makes it this
 // process's sandbox's: that of the kernels it loads from checkpoints, of its

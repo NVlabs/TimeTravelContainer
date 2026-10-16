@@ -554,8 +554,8 @@ func TestReleaserReleasesLargeRunsFirst(t *testing.T) {
 		{chunkSize - page, chunkSize},
 		{hugepage + page, hugepage + 2*page},
 	} {
-		if fr, huge, ok := f.nextReleaseLocked(); !ok || huge || fr != want {
-			t.Fatalf("nextReleaseLocked() = %v, %t, %t, want %v, false, true", fr, huge, ok, want)
+		if fr, kind, ok := f.nextReleaseLocked(); !ok || kind != releaseSmall || fr != want {
+			t.Fatalf("nextReleaseLocked() = %v, %d, %t, want %v, %d, true", fr, kind, ok, want, releaseSmall)
 		}
 	}
 	if fr, _, ok := f.nextReleaseLocked(); ok {
