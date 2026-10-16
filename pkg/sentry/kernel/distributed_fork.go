@@ -401,21 +401,21 @@ type DistributedForkLoadOptions struct {
 }
 
 // LoadDistributedFork reconstructs a Kernel from portable metadata and a
-// remote page reader. It consumes targetMF and reader on both success and
-// failure.
+// remote page reader. The Kernel takes an owner of targetMF of its own; the
+// caller keeps its own, as a peer import loads into the family's MemoryFile.
+// It consumes reader on both success and failure.
 func LoadDistributedFork(ctx context.Context, p platform.Platform, targetMF *pgalloc.MemoryFile, kernelMetadata, allocatorMetadata []byte, loadRanges []pgalloc.RemoteLoadRange, bindings []pgalloc.CapturedPageBinding, reader stateio.AsyncReader, opts DistributedForkLoadOptions) (*Kernel, error) {
 	if p == nil || targetMF == nil || reader == nil || opts.Clocks == nil || opts.ChildBranchID == "" {
 		if reader != nil {
 			_ = reader.Close()
-		}
-		if targetMF != nil {
-			targetMF.Destroy()
 		}
 		return nil, fmt.Errorf("distributed fork load is missing required target state")
 	}
 	if len(bindings) != 0 {
 		return loadRelocatedDistributedFork(p, targetMF, kernelMetadata, loadRanges, bindings, reader, opts)
 	}
+	// The Kernel's owner, which the failures below release.
+	targetMF.IncOwner()
 	if err := pgalloc.ImportMemoryFileMetadataForRemote(ctx, targetMF, allocatorMetadata); err != nil {
 		_ = reader.Close()
 		targetMF.Destroy()

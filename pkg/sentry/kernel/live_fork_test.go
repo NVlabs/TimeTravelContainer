@@ -526,6 +526,17 @@ func TestDistributedForkRepeatedImportSharesMemoryFile(t *testing.T) {
 		child.Release()
 	}
 	parent.Release()
+	// Each import took an owner of its own: once they and the caller let go,
+	// the file is destroyed.
+	targetMF.Destroy()
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("the target MemoryFile outlived its owners")
+			}
+		}()
+		targetMF.IncOwner()
+	}()
 }
 
 func TestPortableDistributedForkCaptureManySharesPages(t *testing.T) {

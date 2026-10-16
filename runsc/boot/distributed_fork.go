@@ -428,7 +428,6 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	if err != nil {
 		return nil, err
 	}
-	targetMFOwned = false
 	fdmapOwned = false // Load/CompleteRestore owns or consumes these descriptors.
 	loadOpts := kernel.DistributedForkLoadOptions{
 		Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: args.TargetBranchID,
