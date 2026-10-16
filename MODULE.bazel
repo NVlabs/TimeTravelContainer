@@ -87,7 +87,14 @@ http_archive(
     ],
     sha256 = "bce5f7fbebb934373b86c999a064d52fb5065878dc57f287f95346648ec832e9",
     strip_prefix = "mesa-26.2.4",
-    urls = ["https://archive.mesa3d.org/mesa-26.2.4.tar.xz"],
+    # Mesa's own host serves a connection some 15 KiB/s, which took an hour
+    # of the release's 69 MB: distributions' mirrors of it come first,
+    # Gentoo's, and Fedora's, by its SHA-512, which keeps it for good.
+    urls = [
+        "https://distfiles.gentoo.org/distfiles/87/mesa-26.2.4.tar.xz",
+        "https://src.fedoraproject.org/repo/pkgs/mesa/mesa-26.2.4.tar.xz/sha512/42e793561661a567e72c7324d071ab9f82d3a9f1e000827ed989b8d5fcc2cd16e50c02808d43465b3135c25a3cad77649ba0bf9e35d95b848f8fc8d8b9ce327c/mesa-26.2.4.tar.xz",
+        "https://archive.mesa3d.org/mesa-26.2.4.tar.xz",
+    ],
 )
 
 # Mako, MarkupSafe, and PyYAML, with which Mesa's code generators run.

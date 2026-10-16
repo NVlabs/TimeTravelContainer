@@ -29,6 +29,20 @@ shares.
   passed every shader; the renderer checks guests' TGSI with it, as
   `tgsi_to_nir` dereferences the declarations of the registers used.
 
+## The release's mirrors
+
+`MODULE.bazel` fetches the release from distributions' mirrors before
+`archive.mesa3d.org`, which serves a connection some 15 KiB/s: Gentoo's,
+`distfiles/XX/mesa-VERSION.tar.xz`, where `XX` is the first byte, in hex,
+of the BLAKE2b of the file's name, and Fedora's lookaside cache, by the
+file's SHA-512. A new release names its own, once both serve the SHA-256
+of Mesa's:
+
+```sh
+python3 -c "import hashlib; print(hashlib.blake2b(b'mesa-VERSION.tar.xz').hexdigest()[:2])"
+shasum -a 512 mesa-VERSION.tar.xz
+```
+
 ## Regenerating `tools/mesa.BUILD`
 
 Regenerate it for a new release of Mesa, or other libraries or options. On
