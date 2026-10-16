@@ -346,6 +346,35 @@ func (t *SparseReferenceTransaction) AddAllocation(mf *MemoryFile, fr memmap.Fil
 	t.allocations = append(t.allocations, sparsePendingReference{mf: mf, range_: fr, memCgID: memCgID})
 }
 
+// CheckHeldBy returns an error unless s holds every page t stages a reference
+// to. A restore in the Sentry that made s takes the pages its state refers to
+// where they are, and s, which holds the pages the capture found the state to
+// reach, kept those from being freed and reused since: a page outside s may
+// have been.
+func (t *SparseReferenceTransaction) CheckHeldBy(s *RemoteSnapshot) error {
+	if t == nil || t.done {
+		return fmt.Errorf("sparse restore reference transaction is unavailable")
+	}
+	if len(t.references) == 0 {
+		return nil
+	}
+	if s == nil {
+		return fmt.Errorf("restored state refers to MemoryFile range %v, but no snapshot holds pages", t.references[0].range_)
+	}
+	held, err := s.heldRanges()
+	if err != nil {
+		return err
+	}
+	for _, reference := range t.references {
+		ranges := held[reference.mf]
+		i := sort.Search(len(ranges), func(i int) bool { return ranges[i].End > reference.range_.Start })
+		if i == len(ranges) || ranges[i].Start > reference.range_.Start || ranges[i].End < reference.range_.End {
+			return fmt.Errorf("restored state refers to MemoryFile range %v, which the capture does not hold", reference.range_)
+		}
+	}
+	return nil
+}
+
 // Commit installs every staged reference.
 func (t *SparseReferenceTransaction) Commit() error {
 	if t == nil || t.done {

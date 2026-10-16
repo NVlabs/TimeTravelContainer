@@ -29,6 +29,7 @@ import (
 	_ "gvisor.dev/gvisor/pkg/sentry/syscalls/linux"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
+	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -251,6 +252,62 @@ func TestLiveForkTwoKernelsSharePlatformAndMemoryFile(t *testing.T) {
 	child.Pause()
 	parent.Release()
 	child.Release()
+}
+
+// A dehydration holds the pages its branch reaches, and none that only a live
+// sibling holds, which the sibling writes in place and frees while the
+// capture waits. The capture still restores.
+func TestDehydrationHoldsOnlyItsBranchsPages(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	child, err := parent.LiveFork(parent.SupervisorContext(), kernel.LiveForkOptions{
+		Clocks: sentrytime.NewCalibratedClocks(),
+	})
+	if err != nil {
+		parent.Release()
+		t.Fatalf("LiveFork: %v", err)
+	}
+	if err := parent.StartPaused(); err != nil {
+		t.Fatalf("parent.StartPaused: %v", err)
+	}
+	if err := child.StartPaused(); err != nil {
+		t.Fatalf("child.StartPaused: %v", err)
+	}
+	parent.Unpause()
+	child.Unpause()
+	parent.Pause()
+	child.Pause()
+	// A page the parent holds alone, as one it wrote after the fork.
+	mf := parent.MemoryFile()
+	own, err := mf.Allocate(hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
+	if err != nil {
+		t.Fatalf("Allocate: %v", err)
+	}
+	dehydrated, err := child.CaptureDehydration(child.SupervisorContext(), kernel.DehydrationCaptureOptions{BranchID: "dehydrated"})
+	if err != nil {
+		t.Fatalf("CaptureDehydration: %v", err)
+	}
+	child.Release()
+	if !mf.HasUniqueRef(own) {
+		t.Error("the dehydration holds a page only its live sibling refers to")
+	}
+	mf.DecRef(own)
+	restored, err := kernel.LoadDehydration(parent.SupervisorContext(), parent.Platform, dehydrated, kernel.DehydrationLoadOptions{
+		Clocks: sentrytime.NewCalibratedClocks(), BranchID: "dehydrated",
+	})
+	if err != nil {
+		t.Fatalf("LoadDehydration: %v", err)
+	}
+	if err := restored.StartPaused(); err != nil {
+		t.Fatalf("starting the rehydrated branch: %v", err)
+	}
+	restored.Release()
+	parent.Release()
 }
 
 func TestLiveForkFlushesPlatformExecutionCaches(t *testing.T) {

@@ -244,6 +244,24 @@ func NewRemoteSnapshot(regions []RemoteSnapshotRegion) (*RemoteSnapshot, error) 
 // reference per destination. This makes sibling fan-out add only release
 // bitmaps and transport state to the source pause path.
 func NewRemoteSnapshots(regions []RemoteSnapshotRegion, count int) ([]*RemoteSnapshot, error) {
+	return newRemoteSnapshots(regions, count, true)
+}
+
+// NewRemoteSnapshotReservation is NewRemoteSnapshot for a holder that sends
+// none of its pages, such as a dehydrated branch's capture, which keeps them
+// until the branch is restored or its pages are stored. It is not told of
+// copy-on-write breaks in its pages, which only steer a sender's pushes: each
+// notice scans the snapshot's regions, a cost every write of the live
+// branches sharing its MemoryFiles would pay for as long as the holder waits.
+func NewRemoteSnapshotReservation(regions []RemoteSnapshotRegion) (*RemoteSnapshot, error) {
+	snapshots, err := newRemoteSnapshots(regions, 1, false)
+	if err != nil {
+		return nil, err
+	}
+	return snapshots[0], nil
+}
+
+func newRemoteSnapshots(regions []RemoteSnapshotRegion, count int, notifyCOW bool) ([]*RemoteSnapshot, error) {
 	if len(regions) == 0 {
 		return nil, errors.New("remote snapshots require at least one region")
 	}
@@ -341,6 +359,9 @@ func NewRemoteSnapshots(regions []RemoteSnapshotRegion, count int) ([]*RemoteSna
 	}
 	for _, s := range snapshots {
 		s.owners = shared.owners
+		if !notifyCOW {
+			continue
+		}
 		for _, file := range shared.owners {
 			file.registerRemoteSnapshot(s)
 		}
@@ -455,6 +476,35 @@ func (s *RemoteSnapshot) RetainGraphPageLoads() (bool, error) {
 		return false, errors.New("remote snapshot closed, or a loader of its pages released, while retaining page loads")
 	}
 	return true, nil
+}
+
+// heldRanges returns, for each MemoryFile, the ranges whose pages s holds,
+// sorted and with adjacent ranges merged.
+func (s *RemoteSnapshot) heldRanges() (map[*MemoryFile][]memmap.FileRange, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.pagesReleased != 0 {
+		return nil, errors.New("remote snapshot no longer holds all of its pages")
+	}
+	held := make(map[*MemoryFile][]memmap.FileRange)
+	for i := range s.regions {
+		region := &s.regions[i]
+		held[region.File] = append(held[region.File], region.Range)
+	}
+	for file, ranges := range held {
+		// Regions of one MemoryFile do not overlap; see NewRemoteSnapshots.
+		sort.Slice(ranges, func(i, j int) bool { return ranges[i].Start < ranges[j].Start })
+		merged := ranges[:1]
+		for _, fr := range ranges[1:] {
+			if last := &merged[len(merged)-1]; last.End == fr.Start {
+				last.End = fr.End
+			} else {
+				merged = append(merged, fr)
+			}
+		}
+		held[file] = merged
+	}
+	return held, nil
 }
 
 // PageLoads returns the loaders s keeps alive for pages still loading; see

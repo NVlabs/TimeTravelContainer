@@ -1721,6 +1721,71 @@ func TestRemoteSnapshotAcquireReleaseRace(t *testing.T) {
 	}
 }
 
+// A reservation holds its pages as a snapshot does, but is not told of
+// copy-on-write breaks in them, which only a sender's pushes use.
+func TestRemoteSnapshotReservationIsNotToldOfCOW(t *testing.T) {
+	mf, fr := newRemoteTestMemoryFile(t, 2)
+	reservation, err := NewRemoteSnapshotReservation([]RemoteSnapshotRegion{{ID: 1, File: mf, Range: fr}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mf.HasUniqueRef(fr) {
+		t.Fatal("the reservation does not hold its pages")
+	}
+	snapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: mf, Range: fr}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mf.NotifyRemoteCOW(fr)
+	if got := snapshot.Stats().PushEnqueued; got != 1 {
+		t.Errorf("the snapshot was told of %d copy-on-write breaks, want 1", got)
+	}
+	if got := reservation.Stats().PushEnqueued; got != 0 {
+		t.Errorf("the reservation was told of %d copy-on-write breaks, want 0", got)
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := reservation.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !mf.HasUniqueRef(fr) {
+		t.Fatal("closing the reservation did not release its pages")
+	}
+}
+
+// A restore's references are held by a snapshot only if its regions, adjacent
+// ones together, cover each of them.
+func TestSparseReferenceTransactionCheckHeldBy(t *testing.T) {
+	mf, fr := newRemoteTestMemoryFile(t, 4)
+	page := uint64(hostarch.PageSize)
+	reservation, err := NewRemoteSnapshotReservation([]RemoteSnapshotRegion{
+		{ID: 1, File: mf, Range: memmap.FileRange{fr.Start + page, fr.Start + 2*page}},
+		{ID: 2, File: mf, Range: memmap.FileRange{fr.Start, fr.Start + page}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reservation.Close()
+	for _, test := range []struct {
+		name string
+		fr   memmap.FileRange
+		held bool
+	}{
+		{"one region", memmap.FileRange{fr.Start + page, fr.Start + 2*page}, true},
+		{"two adjacent regions", memmap.FileRange{fr.Start, fr.Start + 2*page}, true},
+		{"past the regions", memmap.FileRange{fr.Start + page, fr.Start + 3*page}, false},
+		{"outside the regions", memmap.FileRange{fr.Start + 3*page, fr.End}, false},
+	} {
+		references := NewSparseReferenceTransaction()
+		references.Add(mf, test.fr, 0)
+		if err := references.CheckHeldBy(reservation); (err == nil) != test.held {
+			t.Errorf("%s: CheckHeldBy = %v, want held = %t", test.name, err, test.held)
+		}
+		references.Abort()
+	}
+}
+
 func TestNewRemoteSnapshotRejectsOverlap(t *testing.T) {
 	mf, fr := newRemoteTestMemoryFile(t, 2)
 	_, err := NewRemoteSnapshot([]RemoteSnapshotRegion{

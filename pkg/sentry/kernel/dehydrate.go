@@ -31,9 +31,9 @@ import (
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
 
-// DehydrationCapture is a metadata-only saved Kernel whose page ownership is
-// retained by compact range reservations. The MemoryFiles remain the source of
-// truth, so restoring this image preserves page sharing with live siblings.
+// DehydrationCapture is a metadata-only saved Kernel whose pages stay where
+// they are in its MemoryFiles, held by a reservation of the pages the branch
+// reaches, so restoring this image preserves page sharing with live siblings.
 //
 // Close must be called if the capture is discarded instead of restored.
 type DehydrationCapture struct {
@@ -48,22 +48,26 @@ type DehydrationCapture struct {
 	// sparseRegions are what SparseSnapshot was made from, so that a parked
 	// snapshot can be made again for another export. See ParkSparseSnapshot.
 	sparseRegions []pgalloc.RemoteSnapshotRegion
-	reservations  []*pgalloc.RemoteSnapshot
-	emptyOwners   []*pgalloc.MemoryFile
-	consumed      bool
-	metadataFile  *os.File
+	// reservation holds the pages of sparseRegions until the capture is
+	// restored or closed. It holds no others: one a live sibling sharing the
+	// MemoryFiles holds alone stays the sibling's to write in place and to
+	// free.
+	reservation *pgalloc.RemoteSnapshot
+	// owners are the MemoryFiles of MemoryImages, in order, each with an
+	// owner reference of the capture's.
+	owners       []*pgalloc.MemoryFile
+	consumed     bool
+	metadataFile *os.File
 }
 
 // DurableDehydrationMemory describes one MemoryFile in a process-independent
 // dehydration image. The first entry always describes application memory;
 // remaining entries are ordered by ResourceID and describe private tmpfs-like
-// MemoryFiles. Snapshot is process-local and omitted from serialized metadata.
+// MemoryFiles. StreamBytes counts the bytes of the file's pages the branch
+// reaches.
 type DurableDehydrationMemory struct {
-	ResourceID        checkpoint.ResourceID     `json:"resource_id"`
-	AllocatorMetadata []byte                    `json:"allocator_metadata"`
-	LoadRanges        []pgalloc.RemoteLoadRange `json:"load_ranges"`
-	StreamBytes       uint64                    `json:"stream_bytes"`
-	Snapshot          *pgalloc.RemoteSnapshot   `json:"-"`
+	ResourceID  checkpoint.ResourceID `json:"resource_id"`
+	StreamBytes uint64                `json:"stream_bytes"`
 }
 
 // DurableDehydrationMetadata is sufficient to reconstruct a Kernel in a new
@@ -138,21 +142,15 @@ func (k *Kernel) WithDehydrationFilesystemResources(ctx context.Context, targetB
 	})
 }
 
-// MemoryFiles returns the MemoryFiles whose pages d holds, each with an
-// ownership reference of the caller's, which it releases with Destroy.
+// MemoryFiles returns the MemoryFiles d refers to, each with an ownership
+// reference of the caller's, which it releases with Destroy.
 func (d *DehydrationCapture) MemoryFiles() []*pgalloc.MemoryFile {
 	if d == nil || d.consumed {
 		return nil
 	}
-	var files []*pgalloc.MemoryFile
-	for _, reservation := range d.reservations {
-		for _, file := range reservation.MemoryFiles() {
-			if slices.Contains(files, file) {
-				file.Destroy()
-				continue
-			}
-			files = append(files, file)
-		}
+	files := slices.Clone(d.owners)
+	for _, file := range files {
+		file.IncOwner()
 	}
 	return files
 }
@@ -168,9 +166,11 @@ func (d *DehydrationCapture) LendPageLoads(targets ...*Kernel) {
 	if d == nil || d.consumed || len(targets) == 0 {
 		return
 	}
-	snapshots := append([]*pgalloc.RemoteSnapshot(nil), d.reservations...)
-	if d.SparseSnapshot != nil {
-		snapshots = append(snapshots, d.SparseSnapshot)
+	var snapshots []*pgalloc.RemoteSnapshot
+	for _, snapshot := range []*pgalloc.RemoteSnapshot{d.reservation, d.SparseSnapshot} {
+		if snapshot != nil {
+			snapshots = append(snapshots, snapshot)
+		}
 	}
 	for _, target := range targets {
 		for _, snapshot := range snapshots {
@@ -188,18 +188,18 @@ func (d *DehydrationCapture) Close() error {
 	}
 	d.consumed = true
 	var result error
-	for _, reservation := range d.reservations {
-		result = errors.Join(result, reservation.Close())
+	if d.reservation != nil {
+		result = errors.Join(result, d.reservation.Close())
+		d.reservation = nil
 	}
 	if d.SparseSnapshot != nil {
 		result = errors.Join(result, d.SparseSnapshot.Close())
 		d.SparseSnapshot = nil
 	}
-	for _, mf := range d.emptyOwners {
+	for _, mf := range d.owners {
 		mf.Destroy()
 	}
-	d.reservations = nil
-	d.emptyOwners = nil
+	d.owners = nil
 	if d.metadataFile != nil {
 		result = errors.Join(result, d.metadataFile.Close())
 		d.metadataFile = nil
@@ -296,31 +296,19 @@ func SyncAndDropDehydrationCache(captures []*DehydrationCapture) error {
 		if capture == nil || capture.consumed {
 			return errors.New("dehydration capture is unavailable")
 		}
-		reservations = append(reservations, capture.reservations...)
+		if capture.reservation != nil {
+			reservations = append(reservations, capture.reservation)
+		}
 	}
 	return pgalloc.SyncAndDropSnapshotCache(reservations)
 }
 
-func (d *DehydrationCapture) reserveMemoryFile(ctx context.Context, resourceID checkpoint.ResourceID, mf *pgalloc.MemoryFile) error {
-	allocatorMetadata, regions, loads, snapshots, err := pgalloc.ExportMemoryFileMetadataAndSnapshotsForRemote(ctx, mf, 1)
-	if err != nil {
-		return err
-	}
-	image := DurableDehydrationMemory{
-		ResourceID: resourceID, AllocatorMetadata: allocatorMetadata, LoadRanges: loads,
-	}
-	if len(regions) == 0 {
-		mf.IncOwner()
-		d.emptyOwners = append(d.emptyOwners, mf)
-		d.MemoryImages = append(d.MemoryImages, image)
-		return nil
-	}
-	reservation := snapshots[0]
-	image.StreamBytes = reservation.StreamBytes()
-	image.Snapshot = reservation
-	d.reservations = append(d.reservations, reservation)
-	d.MemoryImages = append(d.MemoryImages, image)
-	return nil
+// addMemoryFile describes mf, whose resource is resourceID, in d's image, and
+// makes d one of its owners.
+func (d *DehydrationCapture) addMemoryFile(resourceID checkpoint.ResourceID, mf *pgalloc.MemoryFile) {
+	mf.IncOwner()
+	d.owners = append(d.owners, mf)
+	d.MemoryImages = append(d.MemoryImages, DurableDehydrationMemory{ResourceID: resourceID})
 }
 
 // RetainGraphPageLoads keeps d's pages that are still loading from the
@@ -331,12 +319,10 @@ func (d *DehydrationCapture) RetainGraphPageLoads() (bool, error) {
 	if d == nil || d.consumed {
 		return false, errors.New("dehydration capture is unavailable")
 	}
-	for _, reservation := range d.reservations {
-		if retained, err := reservation.RetainGraphPageLoads(); err != nil || !retained {
-			return false, err
-		}
+	if d.reservation == nil {
+		return true, nil
 	}
-	return true, nil
+	return d.reservation.RetainGraphPageLoads()
 }
 
 // ownPageLoad makes k an owner of load, which loads pages k may read, unless it
@@ -366,15 +352,10 @@ func (k *Kernel) adoptPageLoad(load *pgalloc.AsyncPagesFileLoad) {
 }
 
 // DurableMetadata returns the process-independent description represented by
-// d. Process-local snapshot pointers are removed.
+// d.
 func (d *DehydrationCapture) DurableMetadata() DurableDehydrationMetadata {
-	memories := make([]DurableDehydrationMemory, len(d.MemoryImages))
-	for i, memory := range d.MemoryImages {
-		memory.Snapshot = nil
-		memories[i] = memory
-	}
 	return DurableDehydrationMetadata{
-		Version: durableDehydrationVersion, KernelMetadata: append([]byte(nil), d.KernelMetadata...), Memories: memories,
+		Version: durableDehydrationVersion, KernelMetadata: append([]byte(nil), d.KernelMetadata...), Memories: slices.Clone(d.MemoryImages),
 	}
 }
 
@@ -385,8 +366,9 @@ func (d *DehydrationCapture) DurableMetadata() DurableDehydrationMetadata {
 // durable only when the last live branch of its family on the node goes. An
 // open view is told of every copy-on-write break in the MemoryFiles it reads,
 // and each notice scans its regions, so while it waited it taxed every write
-// the family's live branches made. The capture's reservations keep the pages
-// themselves, so the view can be made again from the same regions.
+// the family's live branches made. The capture's reservation, which is not
+// told of them, keeps the pages themselves, so the view can be made again from
+// the same regions.
 func (d *DehydrationCapture) ParkSparseSnapshot() error {
 	if d == nil || d.consumed {
 		return errors.New("dehydration capture is unavailable")
@@ -459,8 +441,8 @@ func (d *DehydrationCapture) PublishGraphStream(stream io.ReadWriter, filtered b
 	return nil
 }
 
-// CaptureDehydration serializes Kernel metadata and pins each used allocator
-// range once. Page bytes remain in their existing MemoryFiles and are not
+// CaptureDehydration serializes Kernel metadata and holds the pages the
+// branch reaches. Page bytes remain in their existing MemoryFiles and are not
 // copied into the metadata stream.
 //
 // Preconditions: k must remain paused throughout this call.
@@ -524,18 +506,14 @@ func (k *Kernel) CaptureDehydration(ctx context.Context, opts DehydrationCapture
 		for _, mf := range image.PrivateMemoryFiles {
 			mf.MarkSavable()
 		}
-		if err := image.reserveMemoryFile(ctx, checkpoint.ResourceID{}, k.mf); err != nil {
-			return fmt.Errorf("reserving application memory: %w", err)
-		}
+		image.addMemoryFile(checkpoint.ResourceID{}, k.mf)
 		privateIDs := make([]checkpoint.ResourceID, 0, len(image.PrivateMemoryFiles))
 		for id := range image.PrivateMemoryFiles {
 			privateIDs = append(privateIDs, id)
 		}
 		sort.Slice(privateIDs, func(i, j int) bool { return privateIDs[i].String() < privateIDs[j].String() })
 		for _, id := range privateIDs {
-			if err := image.reserveMemoryFile(ctx, id, image.PrivateMemoryFiles[id]); err != nil {
-				return fmt.Errorf("reserving private memory file %q: %w", id, err)
-			}
+			image.addMemoryFile(id, image.PrivateMemoryFiles[id])
 		}
 		var metadata bytes.Buffer
 		buffered := bufio.NewWriterSize(&metadata, 64<<10)
@@ -549,6 +527,21 @@ func (k *Kernel) CaptureDehydration(ctx context.Context, opts DehydrationCapture
 		layout, err := memoryCapture.HugePageSnapshotLayout()
 		if err != nil {
 			return fmt.Errorf("resolving dehydration memory graph: %w", err)
+		}
+		// The capture holds the pages its branch reaches, and no others, so
+		// that while it waits the family's live branches still write in place
+		// the pages they hold alone, and free them.
+		reservation, err := pgalloc.NewRemoteSnapshotReservation(layout.Regions)
+		if err != nil {
+			return fmt.Errorf("reserving dehydration memory: %w", err)
+		}
+		image.reservation = reservation
+		streamBytes := make(map[*pgalloc.MemoryFile]uint64)
+		for _, region := range layout.Regions {
+			streamBytes[region.File] += region.Range.Length()
+		}
+		for i, mf := range image.owners {
+			image.MemoryImages[i].StreamBytes = streamBytes[mf]
 		}
 		sparseSnapshot, err := pgalloc.NewRemoteSnapshot(layout.Regions)
 		if err != nil {
@@ -606,10 +599,12 @@ func LoadDehydration(ctx context.Context, p platform.Platform, image *Dehydratio
 	child := &Kernel{Platform: p}
 	child.SetMemoryFile(image.MemoryFile)
 	child.initRuntimeFields()
+	references := pgalloc.NewSparseReferenceTransaction()
 	loadCtx := context.WithValues(child.SupervisorContext(), map[any]any{
 		pgalloc.CtxMemoryFile:              image.MemoryFile,
 		pgalloc.CtxMemoryFileMap:           image.PrivateMemoryFiles,
 		pgalloc.CtxLiveForkClone:           true,
+		pgalloc.CtxSparseRestoreRefs:       references,
 		vfs.CtxLiveForkFilesystemResources: image.FilesystemResources,
 		vfs.CtxLiveForkChildBranchID:       opts.BranchID,
 		devutil.CtxDevGoferClientProvider:  child,
@@ -623,7 +618,17 @@ func LoadDehydration(ctx context.Context, p platform.Platform, image *Dehydratio
 		metadata = durable.KernelMetadata
 	}
 	if _, err := state.LoadWithOptions(loadCtx, bufio.NewReaderSize(bytes.NewReader(metadata), 64<<10), child, state.LoadOptions{NoStats: true}); err != nil {
+		references.Abort()
 		return nil, fmt.Errorf("loading dehydrated Kernel metadata: %w", err)
+	}
+	// A page the state refers to that the capture did not hold may have been
+	// freed and reused since.
+	if err := references.CheckHeldBy(image.reservation); err != nil {
+		references.Abort()
+		return nil, fmt.Errorf("loading dehydrated Kernel metadata: %w", err)
+	}
+	if err := references.Commit(); err != nil {
+		return nil, err
 	}
 	ownersTransferred = true
 	// The saved VVAR page may have been updated between metadata capture and
@@ -656,8 +661,8 @@ func LoadDehydration(ctx context.Context, p platform.Platform, image *Dehydratio
 	child.Pause()
 	// Pages the capture kept loading from the snapshot graph are the child's
 	// to read now; see RetainGraphPageLoads.
-	for _, reservation := range image.reservations {
-		for _, load := range reservation.PageLoads() {
+	if image.reservation != nil {
+		for _, load := range image.reservation.PageLoads() {
 			child.ownPageLoad(load)
 		}
 	}
