@@ -461,6 +461,7 @@ func TestRuntimeLossRecordsHowEachBranchEnded(t *testing.T) {
 		{name: "killed", loss: RuntimeLoss{}, wantMain: KilledExitStatus, wantChild: KilledExitStatus, wantError: RuntimeExitedUnexpectedly},
 		{name: "out of memory", loss: RuntimeLoss{OOMKilled: true}, wantMain: KilledExitStatus, wantChild: KilledExitStatus, wantOOM: true},
 		{name: "main exited first", loss: RuntimeLoss{ExitStatuses: map[string]int{"main": 3}, OOMKilled: true}, wantMain: 3, wantChild: KilledExitStatus},
+		{name: "main's init killed for memory", loss: RuntimeLoss{ExitStatuses: map[string]int{"main": KilledExitStatus}, OOMKilled: true}, wantMain: KilledExitStatus, wantChild: KilledExitStatus, wantOOM: true},
 		{name: "all exited", loss: RuntimeLoss{ExitStatuses: map[string]int{"main": 0, "child": 1}}, wantMain: 0, wantChild: 1},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -514,6 +515,37 @@ func TestRuntimeLossRecordsHowEachBranchEnded(t *testing.T) {
 				t.Errorf("restarted family keeps its last end: status %v, OOMKilled %v, ExitError %q", got.ExitStatus, got.OOMKilled, got.ExitError)
 			}
 		})
+	}
+}
+
+// A family whose init the out-of-memory killer took says so, as Docker does,
+// though the host killed that process alone and not the family's runtime.
+func TestRecordBranchExitRecordsOutOfMemory(t *testing.T) {
+	for _, oomKilled := range []bool{false, true} {
+		root := t.TempDir()
+		containerDir := filepath.Join(root, "containers", "example")
+		bundleDir := filepath.Join(containerDir, "bundle")
+		if err := os.MkdirAll(bundleDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		info := ContainerInfo{
+			ID: "example", Name: "example", BundleDir: bundleDir, State: "running",
+			Branches: []BranchInfo{{ID: "main", State: "running"}},
+		}
+		if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &info); err != nil {
+			t.Fatal(err)
+		}
+		store := Store{Root: root}
+		if err := store.RecordBranchExit("example", "main", KilledExitStatus, oomKilled); err != nil {
+			t.Fatalf("RecordBranchExit: %v", err)
+		}
+		got, err := store.LoadContainer("example")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.State != "exited" || got.ExitStatus == nil || *got.ExitStatus != KilledExitStatus || got.OOMKilled != oomKilled {
+			t.Errorf("family = %s with status %v, OOMKilled %v; want exited with %d, OOMKilled %v", got.State, got.ExitStatus, got.OOMKilled, KilledExitStatus, oomKilled)
+		}
 	}
 }
 

@@ -20321,13 +20321,20 @@ func (b *runtimeBackend) completeWaitedInitExit(target selector, status uint32) 
 
 func (b *runtimeBackend) recordWaitState(target selector, status uint32) {
 	store := b.containerStore()
+	oomKilled := false
 	if info, err := store.LoadContainer(target.container); err == nil {
 		if err := b.stopPublishedPortsForBranch(info, target.branch); err != nil && b.stderr != nil {
 			fmt.Fprintf(b.stderr, "ttc: warning: stopping published ports for exited %s: %v\n", target, err)
 		}
+		// The host's out-of-memory killer may kill the process that ran the
+		// family's cgroup out of memory, its stub, rather than the family's
+		// runtime: an init it killed is reported as Docker reports a
+		// container's.
+		ws := syscall.WaitStatus(status)
+		oomKilled = ws.Signaled() && ws.Signal() == syscall.SIGKILL && runtimeCgroupOOMKilled(info.BundleDir)
 	}
 	exitStatus := waitStatusExitCode(status)
-	if err := store.RecordBranchExit(target.container, target.branch, exitStatus); err != nil && b.stderr != nil {
+	if err := store.RecordBranchExit(target.container, target.branch, exitStatus, oomKilled); err != nil && b.stderr != nil {
 		fmt.Fprintf(b.stderr, "ttc: warning: recording branch exit state for %s: %v\n", target, err)
 	}
 }

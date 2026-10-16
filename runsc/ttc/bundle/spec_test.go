@@ -2596,7 +2596,7 @@ func TestStoreBranchLifecycleDoesNotDependOnMain(t *testing.T) {
 	if err := store.UpdateBranchState("demo", "child", "running"); err != nil {
 		t.Fatalf("rehydrating child: %v", err)
 	}
-	if err := store.RecordBranchExit("demo", "main", 137); err == nil {
+	if err := store.RecordBranchExit("demo", "main", 137, false); err == nil {
 		t.Fatal("recording removed main exit succeeded")
 	}
 	got, err = store.LoadContainer("demo")

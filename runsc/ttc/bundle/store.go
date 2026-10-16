@@ -5546,8 +5546,9 @@ func (s Store) StopBranch(name, branchID string, exitStatus int) error {
 
 // RecordBranchExit records one branch's termination without treating it as a
 // family-wide exit. exitStatus is retained on the family only when no other
-// surviving branch remains runnable or recoverable.
-func (s Store) RecordBranchExit(name, branchID string, exitStatus int) error {
+// surviving branch remains runnable or recoverable, and with it oomKilled,
+// which says the out-of-memory killer killed the branch's init.
+func (s Store) RecordBranchExit(name, branchID string, exitStatus int, oomKilled bool) error {
 	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
 		now := time.Now().UTC()
 		found := false
@@ -5570,6 +5571,9 @@ func (s Store) RecordBranchExit(name, branchID string, exitStatus int) error {
 		if info.State == "exited" {
 			info.ExitStatus = &exitStatus
 			info.ExitedAt = &now
+			// Both the console follower and a waiting client may record the
+			// exit; either may know it was for memory.
+			info.OOMKilled = info.OOMKilled || oomKilled
 		}
 		return true, nil
 	})
@@ -5651,14 +5655,19 @@ func (s Store) ReconcileNodeRuntimeUnavailable(name, nodeID string, loss Runtime
 		}
 		// The family's exit is main's, as a container's is its init's.
 		if info.State == "exited" && changed {
+			mainStatus := -1
 			for _, branch := range info.Branches {
 				if branch.ID == "main" && branch.ExitStatus != nil {
 					status := *branch.ExitStatus
 					info.ExitStatus = &status
+					mainStatus = status
 				}
 			}
 			info.ExitedAt = &now
-			info.OOMKilled = mainKilled && loss.OOMKilled
+			// The out-of-memory killer killed main's init either with the
+			// runtime or, as the host prefers, by itself; see
+			// RecordBranchExit.
+			info.OOMKilled = loss.OOMKilled && mainStatus == KilledExitStatus
 			if mainKilled && !loss.OOMKilled {
 				info.ExitError = RuntimeExitedUnexpectedly
 			}
