@@ -12268,6 +12268,10 @@ func (b *runtimeBackend) configuredRunscArgsForNetworkConfig(networkMode string,
 		// Private pages in address order: systrap maps each run with one
 		// host mapping, of which the host allows a process only so many.
 		args = append(args, "--memory-homes=true")
+		// A family that runs out of memory loses the process holding the
+		// most, and goes on: the host would kill that process's stub, which
+		// frees none of its memory, and go on killing others.
+		args = append(args, "--sentry-oom-kill=true")
 	}
 	if b.disableHostGSO {
 		args = append(args, "--gso=false")
@@ -20326,12 +20330,13 @@ func (b *runtimeBackend) recordWaitState(target selector, status uint32) {
 		if err := b.stopPublishedPortsForBranch(info, target.branch); err != nil && b.stderr != nil {
 			fmt.Fprintf(b.stderr, "ttc: warning: stopping published ports for exited %s: %v\n", target, err)
 		}
-		// The host's out-of-memory killer may kill the process that ran the
-		// family's cgroup out of memory, its stub, rather than the family's
-		// runtime: an init it killed is reported as Docker reports a
+		// The Sentry, or the host's out-of-memory killer, may kill the
+		// process that ran the family out of memory rather than the family's
+		// runtime: an init killed so is reported as Docker reports a
 		// container's.
 		ws := syscall.WaitStatus(status)
-		oomKilled = ws.Signaled() && ws.Signal() == syscall.SIGKILL && runtimeCgroupOOMKilled(info.BundleDir)
+		oomKilled = ws.Signaled() && ws.Signal() == syscall.SIGKILL &&
+			(status&ttcconsole.OOMKilledStatus != 0 || runtimeCgroupOOMKilled(info.BundleDir))
 	}
 	exitStatus := waitStatusExitCode(status)
 	if err := store.RecordBranchExit(target.container, target.branch, exitStatus, oomKilled); err != nil && b.stderr != nil {

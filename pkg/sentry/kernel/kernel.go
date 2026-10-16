@@ -177,6 +177,11 @@ type Kernel struct {
 	// watchAddressSpaceDeaths.
 	stopAddressSpaceDeaths func() `state:"nosave"`
 
+	// memoryLimiter keeps the started Kernel's processes within the memory
+	// limit SetMemoryLimit set, if any. A Kernel saved and loaded gets its
+	// own when it starts.
+	memoryLimiter *memoryLimiter `state:"nosave"`
+
 	// All of the following fields are immutable unless otherwise specified.
 
 	// Platform is the platform that is used to execute tasks in the created
@@ -1686,6 +1691,7 @@ func (k *Kernel) startLocked(resumeTime bool) error {
 
 	k.started = true
 	k.watchAddressSpaceDeaths()
+	k.limitMemory()
 	k.cpuClockTickTimer = time.NewTimer(linux.ClockTick)
 	k.runningTasksMu.Lock()
 	k.cpuClockTickerRunning = true
@@ -2569,6 +2575,7 @@ func (k *Kernel) Release() {
 		k.stopAddressSpaceDeaths()
 		k.stopAddressSpaceDeaths = nil
 	}
+	k.unlimitMemory()
 	k.stopCPUClockTicker()
 	ctx := k.SupervisorContext()
 	k.releaseCgroupMounts(ctx)

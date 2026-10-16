@@ -137,6 +137,13 @@ type Boot struct {
 	// execFD is the host file descriptor used for program execution.
 	execFD int
 
+	// memoryCurrentFD, memoryStatFD and memorySwapCurrentFD are the
+	// memory.current, memory.stat and memory.swap.current files of the
+	// sandbox's cgroup, which the Sentry reads to keep within its limit.
+	memoryCurrentFD     int
+	memoryStatFD        int
+	memorySwapCurrentFD int
+
 	// applyCaps determines if capabilities defined in the spec should be applied
 	// to the process.
 	applyCaps bool
@@ -291,6 +298,9 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.Var(&b.stdioFDs, "stdio-fds", "list of FDs containing sandbox stdin, stdout, and stderr in that order")
 	f.Var(&b.passFDs, "pass-fd", "mapping of host to guest FDs. They must be in M:N format. M is the host and N the guest descriptor.")
 	f.IntVar(&b.execFD, "exec-fd", -1, "host file descriptor used for program execution.")
+	f.IntVar(&b.memoryCurrentFD, "memory-current-fd", -1, "the sandbox cgroup's memory.current file")
+	f.IntVar(&b.memoryStatFD, "memory-stat-fd", -1, "the sandbox cgroup's memory.stat file")
+	f.IntVar(&b.memorySwapCurrentFD, "memory-swap-current-fd", -1, "the sandbox cgroup's memory.swap.current file")
 	f.Var(&b.goferFilestoreFDs, "gofer-filestore-fds", "FDs to the regular files that will back the overlayfs or tmpfs mount if a gofer mount is to be overlaid.")
 	f.Var(&b.ttcVolumeFDs, "ttc-volume-fds", "ordered TTC managed-volume repository directory FDs")
 	f.IntVar(&b.gfxFD, "ttc-gfx-fd", -1, "the Sentry's connection to the GPU renderers' broker")
@@ -670,6 +680,9 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		StdioFDs:            b.stdioFDs.GetArray(),
 		PassFDs:             b.passFDs.GetArray(),
 		ExecFD:              b.execFD,
+		MemoryCurrentFD:     b.memoryCurrentFD,
+		MemoryStatFD:        b.memoryStatFD,
+		MemorySwapCurrentFD: b.memorySwapCurrentFD,
 		GoferFilestoreFDs:   b.goferFilestoreFDs.GetArray(),
 		GoferMountConfs:     b.goferMountConfs.GetArray(),
 		NumCPU:              b.cpuNum,

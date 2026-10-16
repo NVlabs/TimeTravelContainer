@@ -308,6 +308,7 @@ func (console *followedConsole) close() {
 func copyPushedConsole(console *followedConsole) error {
 	reader := bufio.NewReaderSize(console.output, 64<<10)
 	eof := map[byte]bool{}
+	oomKilled := false
 	for {
 		header := make([]byte, ttcconsole.HeaderSize)
 		if _, err := io.ReadFull(reader, header); err != nil {
@@ -335,11 +336,17 @@ func copyPushedConsole(console *followedConsole) error {
 			return fmt.Errorf("reading pushed console frame: %w", err)
 		}
 		switch stream := header[0]; stream {
+		case boot.ConsolePushOOMKilled:
+			oomKilled = true
 		case boot.ConsolePushExit:
 			if size != 4 {
 				return fmt.Errorf("pushed wait status of %d bytes", size)
 			}
-			return ttcconsole.WriteWaitStatus(console.follow.WaitStatus, binary.BigEndian.Uint32(frame[ttcconsole.HeaderSize:]))
+			status := binary.BigEndian.Uint32(frame[ttcconsole.HeaderSize:])
+			if oomKilled {
+				status |= ttcconsole.OOMKilledStatus
+			}
+			return ttcconsole.WriteWaitStatus(console.follow.WaitStatus, status)
 		case boot.ConsolePushError:
 			return errors.New(string(frame[ttcconsole.HeaderSize:]))
 		default:

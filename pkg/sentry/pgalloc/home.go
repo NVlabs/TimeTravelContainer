@@ -276,6 +276,7 @@ func (f *MemoryFile) markHomeUsedLocked(fr memmap.FileRange, opts AllocOpts, hug
 		f.memAcct.InsertRange(freeFR, memAcctInfo{
 			kind: opts.Kind, memCgID: opts.MemCgID, commitSeq: f.commitSeq,
 		})
+		f.accountLocked(int64(freeFR.Length()))
 	}
 	f.assignLogicalPagesLocked(fr, huge && opts.LogicalHugePages)
 	if node != 0 {

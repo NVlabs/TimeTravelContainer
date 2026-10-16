@@ -190,6 +190,7 @@ go_library(
         "apfl_mutex.go",
         "apfs_mutex.go",
         "apl_unloaded_set.go",
+        "commit_limit.go",
         "context.go",
         "debug.go",
         "dma_pin.go",
@@ -250,6 +251,7 @@ go_test(
     name = "pgalloc_test",
     size = "small",
     srcs = [
+        "commit_limit_test.go",
         "home_test.go",
         "huge_page_test.go",
         "numa_test.go",

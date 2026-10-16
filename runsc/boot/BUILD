@@ -27,6 +27,7 @@ go_library(
         "loader.go",
         "loader_host_darwin.go",
         "loader_host_linux.go",
+        "memory_limit.go",
         "mount_hints.go",
         "network.go",
         "nvproxy.go",

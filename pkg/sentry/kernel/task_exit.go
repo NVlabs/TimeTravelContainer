@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package kernel
 
 // This file implements the task exit cycle:
@@ -893,6 +896,12 @@ func (t *Task) ExitStatus() linux.WaitStatus {
 	sh := t.tg.signalLock()
 	defer sh.mu.Unlock()
 	return t.exitStatus
+}
+
+// OOMKilled returns true if tg was killed to keep its family within its memory
+// limit; see SetMemoryLimit.
+func (tg *ThreadGroup) OOMKilled() bool {
+	return tg.oomKilled.Load()
 }
 
 // ExitStatus returns the exit status that would be returned by a consuming

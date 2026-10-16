@@ -437,6 +437,10 @@ const (
 	ConsolePushExit byte = 3
 	// ConsolePushError carries why the push ended without it.
 	ConsolePushError byte = 4
+	// ConsolePushOOMKilled, before ConsolePushExit, says the process was
+	// killed to keep its family within its memory limit (see
+	// kernel.SetMemoryLimit), as Linux's out-of-memory killer kills one.
+	ConsolePushOOMKilled byte = 5
 )
 
 // BranchSignalArgs selects signal recipients inside one live branch.
@@ -3716,10 +3720,13 @@ func (f *SandboxFamily) PushConsole(id, cid, execID, consoleID string, output io
 	go func() {
 		defer done()
 		defer output.Close()
-		status, err := f.pushConsole(b, id, cid, execID, consoleID, output)
+		status, oomKilled, err := f.pushConsole(b, id, cid, execID, consoleID, output)
 		if err != nil {
 			_ = writeConsoleFrame(output, ConsolePushError, []byte(err.Error()))
 			return
+		}
+		if oomKilled {
+			_ = writeConsoleFrame(output, ConsolePushOOMKilled, nil)
 		}
 		var encoded [4]byte
 		binary.BigEndian.PutUint32(encoded[:], status)
@@ -3728,7 +3735,7 @@ func (f *SandboxFamily) PushConsole(id, cid, execID, consoleID string, output io
 	return nil
 }
 
-func (f *SandboxFamily) pushConsole(b *sandboxBranch, id, cid, execID, consoleID string, output io.Writer) (uint32, error) {
+func (f *SandboxFamily) pushConsole(b *sandboxBranch, id, cid, execID, consoleID string, output io.Writer) (uint32, bool, error) {
 	var tg *kernel.ThreadGroup
 	if execID == "" {
 		if id == "" || id == f.LoaderBranchID() {
@@ -3736,7 +3743,7 @@ func (f *SandboxFamily) pushConsole(b *sandboxBranch, id, cid, execID, consoleID
 		}
 		var err error
 		if tg, err = branchThreadGroup(b.k, cid, 0); err != nil {
-			return 0, err
+			return 0, false, err
 		}
 	} else {
 		f.mu.Lock()
@@ -3746,7 +3753,7 @@ func (f *SandboxFamily) pushConsole(b *sandboxBranch, id, cid, execID, consoleID
 		}
 		f.mu.Unlock()
 		if tg == nil {
-			return 0, fmt.Errorf("exec session %q with console %q does not exist in branch %q", execID, consoleID, id)
+			return 0, false, fmt.Errorf("exec session %q with console %q does not exist in branch %q", execID, consoleID, id)
 		}
 	}
 	exited := make(chan struct{})
@@ -3804,7 +3811,7 @@ func (f *SandboxFamily) pushConsole(b *sandboxBranch, id, cid, execID, consoleID
 	for !streams[0].eof || !streams[1].eof {
 		progress, err := drain(false)
 		if err != nil {
-			return 0, err
+			return 0, false, err
 		}
 		if progress {
 			continue
@@ -3813,7 +3820,7 @@ func (f *SandboxFamily) pushConsole(b *sandboxBranch, id, cid, execID, consoleID
 			break
 		}
 		if err := f.waitConsolePush(b, consoleID, kernel.InternalConsoleReadiness{Stdout: !streams[0].eof, Stderr: !streams[1].eof}, exited); err != nil {
-			return 0, err
+			return 0, false, err
 		}
 	}
 	<-exited
@@ -3834,10 +3841,10 @@ func (f *SandboxFamily) pushConsole(b *sandboxBranch, id, cid, execID, consoleID
 	}
 	for !streams[0].eof || !streams[1].eof {
 		if _, err := drain(true); err != nil {
-			return 0, err
+			return 0, false, err
 		}
 	}
-	return status, nil
+	return status, tg.OOMKilled(), nil
 }
 
 func closed(ch <-chan struct{}) bool {

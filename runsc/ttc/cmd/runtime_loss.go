@@ -15,6 +15,7 @@ import (
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
+	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
 )
 
 // consoleFollowerExitWait bounds how long finding a runtime gone waits for its
@@ -121,6 +122,7 @@ func (b *runtimeBackend) lostRuntimeWaitStatus(target selector) (uint32, bool) {
 // it.
 func (b *runtimeBackend) observeRuntimeLoss(container ttcbundle.ContainerInfo) ttcbundle.RuntimeLoss {
 	loss := ttcbundle.RuntimeLoss{ExitStatuses: make(map[string]int)}
+	sentryOOMKilled := false
 	store := b.containerStore()
 	for _, branch := range container.Branches {
 		if b.nodeID != "" && container.BranchNodeID(branch.ID) != b.nodeID {
@@ -136,9 +138,12 @@ func (b *runtimeBackend) observeRuntimeLoss(container ttcbundle.ContainerInfo) t
 		waitForConsoleFollowerExit(paths.Lock, consoleFollowerExitWait)
 		if status, found, err := readConsoleWaitStatus(paths.WaitStatus); err == nil && found {
 			loss.ExitStatuses[branch.ID] = waitStatusExitCode(status)
+			// The Sentry killed main's init to keep the family within its
+			// memory limit.
+			sentryOOMKilled = sentryOOMKilled || (branch.ID == "main" && status&ttcconsole.OOMKilledStatus != 0)
 		}
 	}
-	loss.OOMKilled = runtimeCgroupOOMKilled(container.BundleDir)
+	loss.OOMKilled = sentryOOMKilled || runtimeCgroupOOMKilled(container.BundleDir)
 	return loss
 }
 

@@ -11,6 +11,12 @@ import (
 	"strings"
 )
 
+// OOMKilledStatus, in a recorded wait status, says that the Sentry killed the
+// process to keep its family within its memory limit, as Linux's
+// out-of-memory killer kills one. A Linux wait status has no bit so high; the
+// rest of the status is the process's, SIGKILL's.
+const OOMKilledStatus = 1 << 16
+
 // WriteWaitStatus atomically records a Linux wait status for a console
 // follower. Both the follower and ttcd use this helper: a synchronous wait may
 // observe process exit before the follower has installed its copy, but the two

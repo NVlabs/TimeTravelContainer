@@ -4611,9 +4611,10 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 	if size, known := dentryCacheSize(); known {
 		dcache = []string{"--dcache=" + strconv.Itoa(size)}
 	}
-	// On systrap, private pages go in address order.
+	// On systrap, private pages go in address order, and the Sentry keeps
+	// the family within its memory limit.
 	if defaultRuntimePlatform == "systrap" {
-		dcache = append(dcache, "--memory-homes=true")
+		dcache = append(dcache, "--memory-homes=true", "--sentry-oom-kill=true")
 	}
 	wantHardened := append([]string{"--root", "/runtime", "--platform=" + defaultRuntimePlatform, "--panic-log=/runtime/sentry-panic.log", "--rootless=true", "--network=none", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory", "--memory-file-huge-tmpfs=true"}, dcache...)
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgs(); !reflect.DeepEqual(got, wantHardened) {
@@ -4648,7 +4649,7 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 	}
 	var wantKVM []string
 	for _, arg := range wantHardened {
-		if arg != "--memory-homes=true" {
+		if arg != "--memory-homes=true" && arg != "--sentry-oom-kill=true" {
 			wantKVM = append(wantKVM, arg)
 		}
 	}
@@ -4658,7 +4659,7 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 	}
 	// A cluster whose nodes need no CPUID faulting runs systrap without
 	// syscall patching; KVM has none.
-	wantUnpatched := append(append([]string(nil), wantKVM...), "--memory-homes=true", "--systrap-disable-syscall-patching=true")
+	wantUnpatched := append(append([]string(nil), wantKVM...), "--memory-homes=true", "--sentry-oom-kill=true", "--systrap-disable-syscall-patching=true")
 	wantUnpatched[2] = "--platform=systrap"
 	if got := (&runtimeBackend{root: "/runtime", runtimePlatform: "systrap", disableSyscallPatching: true}).configuredRunscArgs(); !reflect.DeepEqual(got, wantUnpatched) {
 		t.Errorf("unpatched systrap runsc args=%q, want %q", got, wantUnpatched)

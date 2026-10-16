@@ -793,6 +793,33 @@ func (s *Sandbox) ProcfsDump() ([]procfs.ProcessProcfsDump, error) {
 	return procfsDump, nil
 }
 
+// donateMemoryCgroupFiles donates the memory.current, memory.stat and, if
+// swap is accounted, memory.swap.current files of the cgroup v2 at path, so
+// that the Sentry may keep within the cgroup's limit (see
+// kernel.SetMemoryLimit).
+func donateMemoryCgroupFiles(donations *donation.Agency, path string) error {
+	var files []*os.File
+	for _, name := range []string{"memory.current", "memory.stat", "memory.swap.current"} {
+		f, err := os.Open(filepath.Join(path, name))
+		if err != nil {
+			if name == "memory.swap.current" && errors.Is(err, os.ErrNotExist) {
+				break
+			}
+			for _, f := range files {
+				_ = f.Close()
+			}
+			return err
+		}
+		files = append(files, f)
+	}
+	donations.DonateAndClose("memory-current-fd", files[0])
+	donations.DonateAndClose("memory-stat-fd", files[1])
+	if len(files) == 3 {
+		donations.DonateAndClose("memory-swap-current-fd", files[2])
+	}
+	return nil
+}
+
 // NewCGroup returns the sandbox's Cgroup, or an error if it does not have one.
 func (s *Sandbox) NewCGroup() (cgroup.Cgroup, error) {
 	return cgroup.NewFromPid(s.Pid.Load(), false /* useSystemd */)
@@ -1452,6 +1479,11 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		}
 		if memLimit < mem {
 			mem = memLimit
+		}
+		if conf.SentryOOMKill && conf.Platform == "systrap" {
+			if err := donateMemoryCgroupFiles(&donations, s.CgroupJSON.Cgroup.MakePath("memory")); err != nil {
+				log.Warningf("The host will keep sandbox %q within its memory limit, as the Sentry cannot read its cgroup: %v", s.ID, err)
+			}
 		}
 	}
 	cmd.Args = append(cmd.Args, "--total-memory", strconv.FormatUint(mem, 10))

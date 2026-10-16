@@ -390,6 +390,13 @@ type Config struct {
 	// them. It applies to the systrap platform only.
 	MemoryHomes bool `flag:"memory-homes"`
 
+	// SentryOOMKill has the Sentry keep its processes within the memory and
+	// swap limit of the sandbox's cgroup (cgroup v2), as the host's
+	// out-of-memory killer would, by killing the process holding the most
+	// memory before the cgroup runs out (see kernel.SetMemoryLimit). It
+	// applies to the systrap platform only.
+	SentryOOMKill bool `flag:"sentry-oom-kill"`
+
 	// NVProxy enables support for Nvidia GPUs.
 	NVProxy bool `flag:"nvproxy"`
 

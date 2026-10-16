@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package kernel
 
 import (
@@ -259,10 +262,12 @@ type ThreadGroup struct {
 	// tty is protected by the signal mutex.
 	tty *TTY
 
-	// oomScoreAdj is the thread group's OOM score adjustment. This is
-	// currently not used but is maintained for consistency.
-	// TODO(gvisor.dev/issue/1967)
+	// oomScoreAdj is the thread group's OOM score adjustment, which weighs it
+	// as a memoryLimiter's victim.
 	oomScoreAdj atomicbitops.Int32
+
+	// oomKilled is true if a memoryLimiter killed the thread group.
+	oomKilled atomicbitops.Bool `state:"nosave"`
 
 	// isChildSubreaper and hasChildSubreaper correspond to Linux's
 	// signal_struct::is_child_subreaper and has_child_subreaper.

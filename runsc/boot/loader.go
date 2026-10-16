@@ -470,6 +470,12 @@ type Args struct {
 	PassFDs []FDMapping
 	// ExecFD is the host file descriptor used for program execution.
 	ExecFD int
+	// MemoryCurrentFD, MemoryStatFD and MemorySwapCurrentFD are the
+	// memory.current, memory.stat and memory.swap.current files of the
+	// sandbox's cgroup, or -1; see Config.SentryOOMKill.
+	MemoryCurrentFD     int
+	MemoryStatFD        int
+	MemorySwapCurrentFD int
 	// GoferFilestoreFDs are FDs to the regular files that will back the tmpfs or
 	// overlayfs mount for certain gofer mounts.
 	GoferFilestoreFDs []int
@@ -796,6 +802,7 @@ func New(args Args) (*Loader, error) {
 		return nil, err
 	}
 	setApplicationMemoryHomes(args.Conf)
+	limitSandboxMemory(&args)
 
 	// Create kernel and platform.
 	p, err := createPlatform(args.Conf, args.NumCPU, args.Device, args.ID)

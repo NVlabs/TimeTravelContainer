@@ -249,6 +249,15 @@ type MemoryFile struct {
 	ongoingCommitScan   atomic.Bool
 	isSaving            bool
 
+	// accountedBytes is the span of memAcct, the bytes of pages that may be
+	// committed: those in use, and those freed but not yet released.
+	// commitLimit, if not 0, is the most of them a family may have without
+	// overCommitLimit being true; see SetCommitLimit. accountedBytes and
+	// commitLimit are protected by mu.
+	accountedBytes  uint64
+	commitLimit     uint64
+	overCommitLimit atomic.Bool
+
 	// evictable maps EvictableMemoryUsers to eviction state.
 	//
 	// evictable is protected by mu.
@@ -1565,6 +1574,7 @@ retryFree:
 		knownCommitted: false,
 		commitSeq:      f.commitSeq,
 	})
+	f.accountLocked(int64(fr.Length()))
 	f.assignLogicalPagesLocked(fr, alloc.huge && alloc.opts.LogicalHugePages)
 	return
 }
@@ -2149,6 +2159,7 @@ func (f *MemoryFile) releaseLocked(fr memmap.FileRange, kind releaseKind) {
 					usage.MemoryAccounting.Dec(malen, ma.kind, ma.memCgID)
 				}
 			}
+			f.accountLocked(-int64(maseg.Range().Length()))
 			maseg = f.memAcct.Remove(maseg).NextSegment()
 		}
 	}()

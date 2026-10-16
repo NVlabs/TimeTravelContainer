@@ -148,6 +148,16 @@ func (app *runApp) execute(t *Task) taskRunState {
 		return (*runInterrupt)(nil)
 	}
 
+	// A family that may be over its memory limit runs no application code,
+	// which could use memory already allocated for it, until it is within
+	// the limit; see SetMemoryLimit.
+	if t.k.mf.OverCommitLimit() {
+		t.k.waitForMemory(t)
+		if t.interrupted() {
+			return (*runInterrupt)(nil)
+		}
+	}
+
 	// Execute any task work callbacks before returning to user space.
 	if t.taskWorkCount.Load() > 0 {
 		t.taskWorkMu.Lock()

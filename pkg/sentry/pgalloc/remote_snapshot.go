@@ -796,6 +796,7 @@ func ImportMemoryFileMetadataForRemote(ctx context.Context, target *MemoryFile, 
 	target.subreleased = saved.subreleased
 	target.memAcct.MoveFrom(saved.memAcct)
 	target.knownCommittedBytes = knownCommitted
+	target.recountAccountedLocked()
 	target.chunks.Store(&chunks)
 	target.loadHomesLocked()
 	// The source's waste pages, which the export took as they were, are waste
