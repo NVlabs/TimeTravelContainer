@@ -1,7 +1,8 @@
 # Address-ordered private memory under systrap
 
-Status: phase 1, homes and placement, is implemented (2026-10-17), but for the
-Sentry's address reservation (goal 1). Phases 2 to 4 are designs.
+Status: implemented (2026-10-18): homes and placement, the Sentry's address
+reservation, folding, collapse, and restored memory at its slots. Where the
+implementation departs from the design below, the section says so.
 
 ## Problem
 
@@ -168,6 +169,13 @@ as guest physical memory within the CPU's physical address bits
 (`pkg/sentry/platform/kvm/physical_map.go:57`), and a large reservation needs
 checking there. KVM does not need homes at all (goal 2 holds there already).
 
+Implemented as `MemoryFileOpts.ReserveMappings`, on wherever homes are: the
+file reserves the largest of 64 TiB down to 64 GiB that the host has room for,
+at its first growth, and maps growths, a checkpoint's load and a remote fork's
+import there (`pgalloc/mapping_reservation.go`); chunks past it are mapped
+apart, as before. A family whose Sentry held 19 to 32 mappings of its memory
+file in the local suite (`vmacheck`) holds one.
+
 ### Limits
 
 - At most `maxHomes` homes at once, by default the smaller of 16,384 (16 TiB of
@@ -284,6 +292,12 @@ Per batch of at most 2 MiB, under the address space's `activeMu`:
    mappings.
 5. Release the old pages and merge the pmas.
 
+Implemented as `pgalloc.MemoryFile.MovePages`, which does steps 1 and 2, and
+`mm.MemoryManager.FoldStep`, with one change of order: the range is unmapped
+from the stub before it is copied, not after, since the application writes its
+pages through its own mappings without the Sentry's locks, and a write during
+the copy would be lost.
+
 ### When
 
 - After a branch is removed: fold checks for the address spaces of the branches
@@ -300,6 +314,22 @@ Folds run in a background goroutine per memory file, with a copy budget
 (default 1 GiB/s across the Sentry). They stop while a branch is saved, live
 forked or captured, and resume after.
 
+Implemented (`kernel/fold.go`) as a goroutine per started Kernel on a file with
+homes, which folds the address spaces of its tasks when asked, 50 ms after,
+so that a burst of releases makes one pass, at up to 1 GiB/s. An address space
+that releases its pages asks every Kernel on its memory file: that covers a
+branch's removal and a guest process's exit without recording who forked whom.
+A capture or remote snapshot that closes asks through the file
+(`SetFoldNotify`). A residency unit's release asks nothing: what holds a unit's
+pages besides the cache is what restored them. The pma-count trigger is not
+implemented; the ENOMEM one asks for a fold rather than folding in the fault,
+which holds `activeMu` and could wait for a fork that holds the folds back.
+Folds are held back while `quiescePausedAnd` runs, which every save, live fork,
+dehydration capture and remote-fork capture runs in, and not for the whole of a
+pause, as a base branch may stay paused for long. An address space is folded
+only if it may have something to fold: it placed a page in a layer or out of
+its homes, forked or was forked, was loaded, or moved pages with `mremap`.
+
 ## Collapse
 
 A block whose 512 pages of a 2 MiB range are all private, in one home, at their
@@ -312,6 +342,29 @@ khugepaged does, and it keeps memory that an allocator splits from staying in
 default also refills discarded pages with zeroes, which would undo the
 application's frees.
 
+Implemented (`pgalloc.MemoryFile.CollapseHuge`, `mm/collapse.go`) with
+`MADV_COLLAPSE` alone, through a temporary mapping of the range at a
+2 MiB-aligned address, touched first: the host collapses only what it may map as
+a huge page there, and Linux 6.1 maps the huge page into the mapping only where
+that has a page table already, failing the call (EINVAL) otherwise though it
+collapsed the range. A host without `MADV_COLLAPSE` (before 6.1: the advice
+fails even for no range) turns collapse off; a range the host refuses is
+dropped, and one without a free huge page (ENOMEM, EAGAIN, EBUSY) is asked again
+on later passes, eight times at most. A range keeps its pages' identities if
+they are a 2 MiB page's already (consecutive from a multiple of 512, as pages
+allocated afresh at their slots are; see "Restored memory"), and takes one new
+version. The fold steps collapse candidates: the 2 MiB of a page placed in a
+home that fills its slots, of a write that takes pages over in place, of a
+fold's block, and of a 2 MiB page freed in part in place (`MADV_DONTNEED`), once
+each has waited 10 s, as khugepaged scans every 10 s, so that a short-lived
+process's memory is not copied into huge pages just before it goes. A range is
+collapsed only if every page is in memory (`mincore`), so that no page the
+application discarded is filled; a range that waits for one to be written again,
+which the Sentry does not see, is looked at again every 10 s, as khugepaged
+scans, 4096 ranges at most per address space. Linux 7.0 and 6.1 (the farm's
+hosts) collapse both a huge tmpfs's pages and a memfd's, whatever
+`shmem_enabled` says.
+
 ## Lifecycles
 
 | Lifecycle | What happens |
@@ -323,14 +376,14 @@ application's frees.
 | Pause, unpause | Nothing. |
 | `ttc stop`, `ttc start` | New kernel and address spaces. A start beside live peers restores through residency units (see below). |
 | Remote fork, source | The capture's snapshots hold references (`remote_snapshot.go:242`), so the source's pages are public until acknowledged; its writes go to layers, and fold checks run on release. |
-| Remote fork, migration target, cold or durable rehydrate, `ttc restore`, start beside peers | Pages arrive in 1 MiB or 2 MiB residency units at allocator-chosen offsets (`sparse_import.go:658`), held by the residency cache, so they stay public until reclaimed; writes copy into homes. See "Restored memory". |
+| Remote fork, migration target, cold or durable rehydrate, `ttc restore`, start beside peers | Pages arrive in 1 MiB or 2 MiB residency units, held by the residency cache, so they stay public until reclaimed; writes copy into homes. Units go to their slots in homes of their identities' window, which the restored address spaces adopt. See "Restored memory". |
 | Local rehydrate (same memory file) | Pages come back at their old offsets (`dehydrate.go:589`), which were slots of now-orphaned homes; the restored address spaces adopt the homes whose slots match their addresses. |
 | Dehydration capture | Holds a reference on every page of the memory file (`dehydrate.go:304`), so all pages are public while it lives; writes by live branches go to layers until it is released. |
 | Checkpoint archive (format 2) | A dehydration of a hidden fork, then a cold restore: as above. |
 | Legacy `checkpoint-branch` (`SaveTo`/`LoadFrom`) | Same offsets; home marks are saved; owners are rebuilt by adoption. |
 | nvproxy, rdmaproxy, tpuproxy pins | Pinned pages hold extra references, so they never move; live-fork copies of DMA-pinned pages go to an orphan home. |
 | GPU device memory | Not in the memory file (`LiveForkUnsharedFile`); unaffected. |
-| Residency unit reclaim, image prune | Unaffected in the first version (units are not homes). |
+| Residency unit reclaim, image prune | A reclaimed unit's slots are free again; a home of units left with no page and no owner is spared. |
 | Nested TTC | An inner Sentry's memory file is a shared mapping in the outer one, so public: unaffected. |
 | KVM | Homes off in the first version: KVM has no per-pma host mappings. |
 | macOS (HVF, platform backing) | Homes off: GuestRAM allocates frames per file offset. |
@@ -354,6 +407,30 @@ then repeat within a home's lifetime when a slot is freed and reused; versions
 still never repeat, and every consumer keys pages by identity and version
 (dedup, bindings, units), so this needs auditing before it is adopted.
 
+Implemented so that identities never repeat, which the audit then needs not
+cover (`pgalloc/home.go`):
+
+- A home has up to four windows of identities, each a chunk's worth, aligned,
+  taken from the file's sequence. A page allocated afresh at a slot takes the
+  slot's identity in the first window in which no page took that slot afresh
+  before; a page placed by a copy, a fold or a restore is given its identity by
+  its caller. A slot taken afresh more often than four times takes an identity
+  of no slot, as a page out of homes does. A region freed and taken again whole
+  stays in one window, so that its logical chunks are whole.
+- A restore installs a unit whose pages are at the positions their identities
+  give (`unitSlots`) at those slots in a home of its window: one of the homes,
+  without an owner, that hold units of that window, or a new one. The units of
+  an address space's block, from one window, are then in address order, and
+  the address space adopts their home when it folds (see "Target"); a unit
+  that packs pages of several logical chunks goes anywhere, as before.
+- A restore does not need the restoring address space's addresses: a slot is
+  an address's offset in its block, whatever the home.
+
+A 512 MiB buffer written at random, dehydrated and rehydrated, took 511 stub
+mappings before, one per unit, and takes one. A restored branch whose pages
+come from several windows of a block, as a fork's that wrote sparsely does,
+alternates between their homes, unit by unit or finer.
+
 ## Remaining exceptions
 
 - Device proxies mirror a pinned range into the Sentry one discontiguous piece
@@ -375,14 +452,16 @@ still never repeat, and every consumer keys pages by identity and version
 4. Collapse rebuilds only fully present 2 MiB ranges, without refilling discarded
    pages.
 5. Restored memory keeps today's units in phases 1-3; identities from slots
-   come last, after an audit.
+   come last, after an audit. (Implemented in phase 4 so that identities never
+   repeat; see "Restored memory".)
 6. Homes on systrap only at first.
 
 ## Risks to verify
 
 - The host refuses a huge page over a 2 MiB range that already holds a page
   (shmem large-folio insertion), on the farm's 6.1 kernel.
-- `MADV_COLLAPSE` on tmpfs in 6.1.
+- `MADV_COLLAPSE` in 6.1: verified on the farm (6.1.62), for a huge tmpfs and
+  a memfd, through an aligned mapping that has a page table (see "Collapse").
 - Kernel memory for shared NUMA policies: one range per 2 MiB of homes, only with
   `--cpu-topology host`.
 - The Sentry's address reservation alongside the Go runtime's.
@@ -407,16 +486,33 @@ still never repeat, and every consumer keys pages by identity and version
   - a fork-and-exec-heavy build.
 - **Overhead**: fault latency, fold CPU and memory bandwidth, and file size.
 
+The stress suite `vmacheck` counts real host mappings: a process writes a
+buffer at random, and the stub's mappings over it are counted, after it reads
+every page, against what goal 2 promises, through a fork that writes all,
+writes while a fork shares, the fork's removal, a parent's removal with
+adoption, a guest fork, a dehydration and rehydration, and (with 2 MiB pages)
+frees in part and collapse; and the Sentry's mappings of its memory file,
+against goal 1. Locally (Linux 7.0) and on the farm (Linux 6.1.62, hardened,
+with a huge tmpfs, 1 GiB and 2 GiB buffers), every count where the pages are
+written alike is one per block and the Sentry's is one; before folding, the
+same steps left 65,467 to 86,067 stub mappings and 19 to 32 Sentry ones. On
+the farm, a page freed in each 2 MiB splits every huge page of the buffer, and
+once the pages are written again, collapse maps all of it with huge pages
+again (1,048,576 and 2,097,152 kB). Its cluster counterpart, `c29`, counts a
+remote fork's: a 256 MiB buffer written at random takes one stub mapping on
+the target node, where it took 128 before phase 4, one per residency unit.
+
 ## Phases
 
 1. Homes and placement (pgalloc homes, `AllocateAt`, the huge-page and NUMA
    rules, the Sentry's address reservation; mm placement with layers and
    limits). This alone keeps fresh memory and a fork's copies address-ordered,
-   which covers the measured case. Implemented but for the Sentry's address
-   reservation: a 1200 MB fork rewriting 4 KiB pages after a remote fork went
-   from up to 246,000 host mappings and 4.7-9.9 us per access to 633 mappings
-   and 48 ns per access within 15 s.
+   which covers the measured case. Implemented: a 1200 MB fork rewriting 4 KiB
+   pages after a remote fork went from up to 246,000 host mappings and
+   4.7-9.9 us per access to 633 mappings and 48 ns per access within 15 s; the
+   Sentry's address reservation came with phase 2's commits.
 2. Folding (`MoveIdentities`, the fold engine and its triggers, adoption), for
    loops that discard either side and for bases that keep writing.
-3. Collapse.
-4. Restored memory: identities from slots, units placed at slots.
+   Implemented.
+3. Collapse. Implemented.
+4. Restored memory: identities from slots, units placed at slots. Implemented.
