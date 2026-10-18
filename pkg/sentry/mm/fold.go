@@ -4,6 +4,8 @@
 package mm
 
 import (
+	"time"
+
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -67,6 +69,15 @@ type foldState struct {
 	block  hostarch.AddrRange
 	target memmap.FileRange
 	pieces []foldPiece
+
+	// collapse holds the aligned 2 MiB ranges that may be collapsed into 2
+	// MiB pages, by start; see collapse.go.
+	collapse map[hostarch.Addr]collapseCandidate
+
+	// collapsing is true once the current pass has listed the candidates for
+	// collapse it visits, and unvisited are those it has yet to.
+	collapsing bool
+	unvisited  []hostarch.Addr
 }
 
 // markFoldableLocked notes that mm may have private pages to fold.
@@ -82,13 +93,45 @@ func (mm *MemoryManager) markFoldableLocked() {
 // through all of mm's addresses: a later call starts over, if mm may have
 // private pages to fold then.
 func (mm *MemoryManager) FoldStep(limit uint64) (uint64, bool) {
+	mm.mappingMu.RLock()
+	defer mm.mappingMu.RUnlock()
 	mm.activeMu.Lock()
 	defer mm.activeMu.Unlock()
 	fs := &mm.fold
-	if mm.homeOwner == 0 || !fs.foldable || mm.users.Load() == 0 {
+	if mm.homeOwner == 0 || mm.users.Load() == 0 {
 		return 0, true
 	}
 	var moved uint64
+	// Candidates for collapse are few. Those that have yet to wait
+	// collapseAge, or wait for discarded pages to be written again, stay, for
+	// a later pass: see CollapseWaiting.
+	if !fs.collapsing {
+		fs.collapsing = true
+		fs.unvisited = fs.unvisited[:0]
+		for start, c := range fs.collapse {
+			if time.Since(c.since) >= collapseAge {
+				fs.unvisited = append(fs.unvisited, start)
+			}
+		}
+	}
+	for len(fs.unvisited) != 0 {
+		if moved >= limit {
+			return moved, false
+		}
+		start := fs.unvisited[0]
+		fs.unvisited = fs.unvisited[1:]
+		collapsed, wait := mm.collapseLocked(hostarch.AddrRange{Start: start, End: start + hostarch.HugePageSize})
+		if collapsed {
+			moved += hostarch.HugePageSize
+		}
+		if !wait {
+			delete(fs.collapse, start)
+		}
+	}
+	if !fs.foldable {
+		fs.collapsing = false
+		return moved, true
+	}
 	for planned := 0; moved < limit && planned < maxFoldBlocksPerStep; {
 		if len(fs.pieces) == 0 && fs.block.Length() == 0 {
 			block, ok := mm.nextFoldBlockLocked(fs.cursor)
@@ -96,6 +139,7 @@ func (mm *MemoryManager) FoldStep(limit uint64) (uint64, bool) {
 				fs.cursor = 0
 				fs.foldable = fs.residue
 				fs.residue = false
+				fs.collapsing = false
 				return moved, true
 			}
 			mm.planFoldLocked(block)
@@ -305,6 +349,7 @@ func (mm *MemoryManager) finishFoldLocked() {
 	}
 	mm.pmas.MergeInsideRange(block)
 	mm.pmas.MergeOutsideRange(block)
+	mm.noteCollapsibleBlockLocked(block)
 	b := uint64(block.Start) / homeBlockSize
 	homes := mm.homes[b]
 	if len(homes) < 2 {

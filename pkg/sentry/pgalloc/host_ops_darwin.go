@@ -33,5 +33,8 @@ func reserveAddressRange() (base, length uintptr) { return 0, 0 }
 // releaseAddressRange does nothing, as reserveAddressRange reserves nothing.
 func releaseAddressRange(base, length uintptr) {}
 
+// collapseFileRange collapses nothing: a platform backing has no home chunks.
+func collapseFileRange(uintptr, memmap.FileRange) error { return errNoHostCollapse }
+
 // populateHugeFileRange does nothing: a platform backing has no home chunks.
 func populateHugeFileRange(uintptr, memmap.FileRange, bool) error { return nil }

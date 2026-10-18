@@ -521,7 +521,11 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 					// as a copy would.
 					if oldpma.private {
 						ownAR := pseg.Range().Intersect(ar)
-						if mm.mf.OwnForWrite(pseg.fileRangeOf(ownAR)) {
+						if ownFR := pseg.fileRangeOf(ownAR); mm.mf.OwnForWrite(ownFR) {
+							if mm.homeOwner != 0 {
+								// Its 2 MiB may be all mm's now.
+								mm.noteCollapsibleLocked(ownAR, ownFR)
+							}
 							pseg = mm.pmas.Isolate(pseg, ownAR)
 							owned := pseg.ValuePtr()
 							owned.needCOW = false

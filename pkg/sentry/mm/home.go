@@ -50,6 +50,9 @@ func (mm *MemoryManager) allocatePrivateLocked(ar hostarch.AddrRange, opts pgall
 					// Out of the first home, until a fold.
 					mm.markFoldableLocked()
 				}
+				if err == nil && !opts.Huge {
+					mm.noteCollapsibleLocked(ar, fr)
+				}
 				return fr, err
 			}
 		}
@@ -63,6 +66,9 @@ func (mm *MemoryManager) allocatePrivateLocked(ar hostarch.AddrRange, opts pgall
 					mm.markFoldableLocked()
 				}
 				if fr, err := mm.mf.AllocateAt(slots(home), opts); !errors.Is(err, pgalloc.ErrSlotsInUse) {
+					if err == nil && !opts.Huge {
+						mm.noteCollapsibleLocked(ar, fr)
+					}
 					return fr, err
 				}
 			}

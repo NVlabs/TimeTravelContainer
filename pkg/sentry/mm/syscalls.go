@@ -1207,7 +1207,7 @@ func (mm *MemoryManager) Decommit(addr hostarch.Addr, length uint64) error {
 						// psegAR.Start is not hugepage-aligned.
 						if psegAR.End <= firstHugeEnd {
 							// All of psegAR falls within a single huge page.
-							mm.mf.Decommit(pseg.fileRangeOf(psegAR))
+							mm.decommitInPlaceLocked(pseg, psegAR)
 							pseg = pseg.NextSegment()
 							continue
 						}
@@ -1218,11 +1218,11 @@ func (mm *MemoryManager) Decommit(addr hostarch.Addr, length uint64) error {
 							// would make two separate calls to
 							// MemoryFile.Decommit() for the first and last
 							// huge pages respectively.
-							mm.mf.Decommit(pseg.fileRangeOf(psegAR))
+							mm.decommitInPlaceLocked(pseg, psegAR)
 							pseg = pseg.NextSegment()
 							continue
 						}
-						mm.mf.Decommit(pseg.fileRangeOf(hostarch.AddrRange{psegAR.Start, firstHugeEnd}))
+						mm.decommitInPlaceLocked(pseg, hostarch.AddrRange{psegAR.Start, firstHugeEnd})
 						psegAR.Start = firstHugeEnd
 					}
 					// Drop whole huge pages between psegAR.Start (which after the above
@@ -1244,7 +1244,7 @@ func (mm *MemoryManager) Decommit(addr hostarch.Addr, length uint64) error {
 					}
 					if lastWholeHugeEnd != psegAR.End {
 						// psegAR.End is not hugepage-aligned.
-						mm.mf.Decommit(pseg.fileRangeOf(hostarch.AddrRange{lastWholeHugeEnd, psegAR.End}))
+						mm.decommitInPlaceLocked(pseg, hostarch.AddrRange{lastWholeHugeEnd, psegAR.End})
 						pseg = pseg.NextSegment()
 					}
 					continue
@@ -1281,6 +1281,16 @@ func (mm *MemoryManager) Decommit(addr hostarch.Addr, length uint64) error {
 		return linuxerr.ENOMEM
 	}
 	return nil
+}
+
+// decommitInPlaceLocked decommits the pages that pseg maps at ar, part of a
+// huge page that mm keeps allocated, and notes their 2 MiB as a candidate for
+// collapse once they are written again.
+//
+// Preconditions: mm.activeMu must be locked for writing.
+func (mm *MemoryManager) decommitInPlaceLocked(pseg pmaIterator, ar hostarch.AddrRange) {
+	mm.mf.Decommit(pseg.fileRangeOf(ar))
+	mm.noteDecommittedLocked(ar)
 }
 
 // madviseMutateVMAs is similar to mm.vmas.MutateRange(), but:

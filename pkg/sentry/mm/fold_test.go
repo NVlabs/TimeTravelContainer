@@ -5,9 +5,11 @@ package mm
 
 import (
 	"testing"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -196,5 +198,88 @@ func TestFoldLeavesSharedPages(t *testing.T) {
 	parent.activeMu.RUnlock()
 	if !foldable {
 		t.Error("the parent left pages out of their home but no longer asks to fold")
+	}
+}
+
+// A 2 MiB page freed in part splits into base pages at their slots. Once the
+// freed page is written again, its 2 MiB is whole and the address space's
+// alone, and a fold step collapses it into a 2 MiB page again, mapped by one
+// pma, with what it held.
+func TestCollapseRefilled2MiBPage(t *testing.T) {
+	defer func(age time.Duration) { collapseAge = age }(collapseAge)
+	var collapsed []memmap.FileRange
+	defer pgalloc.SetCollapseHostForTest(func(_ uintptr, fr memmap.FileRange) error {
+		collapsed = append(collapsed, fr)
+		return nil
+	})()
+	ctx, memMgr := homeTestMemoryManager(t, true)
+	defer memMgr.DecUsers(ctx)
+	addr := mapPrivate(ctx, t, memMgr, 4*hostarch.HugePageSize)
+	start := addr.MustHugeRoundUp()
+	ar := hostarch.AddrRange{Start: start, End: start + hostarch.HugePageSize}
+	const pages = hostarch.HugePageSize / hostarch.PageSize
+	for page := 0; page < pages; page++ {
+		if _, err := memMgr.CopyOut(ctx, start+hostarch.Addr(page)*hostarch.PageSize, []byte{1}, usermem.IOOpts{}); err != nil {
+			t.Fatalf("writing page %d: %v", page, err)
+		}
+	}
+	fr := memmap.FileRange{Start: fileOffsetAt(t, memMgr, start)}
+	fr.End = fr.Start + hostarch.HugePageSize
+	if !memMgr.mf.IsHugePages(fr) {
+		t.Fatalf("the written 2 MiB at %#x is not a 2 MiB page", start)
+	}
+	const freed = 7
+	if err := memMgr.Decommit(start+freed*hostarch.PageSize, hostarch.PageSize); err != nil {
+		t.Fatalf("Decommit: %v", err)
+	}
+	if memMgr.mf.IsHugePages(fr) {
+		t.Fatal("a 2 MiB page freed in part is still one")
+	}
+	// Its 2 MiB waits for the freed page to be written again: collapsing it
+	// now would fill that page with zeroes.
+	collapseAge = 0
+	foldAll(t, memMgr)
+	if len(collapsed) != 0 {
+		t.Fatalf("collapsed %v with a page freed", collapsed)
+	}
+	if !memMgr.CollapseWaiting() {
+		t.Fatal("the freed 2 MiB does not wait to be collapsed")
+	}
+	if _, err := memMgr.CopyOut(ctx, start+freed*hostarch.PageSize, []byte{2}, usermem.IOOpts{}); err != nil {
+		t.Fatalf("writing the freed page again: %v", err)
+	}
+	if off := fileOffsetAt(t, memMgr, start+freed*hostarch.PageSize); off != fr.Start+freed*hostarch.PageSize {
+		t.Fatalf("the page written again is at %#x, not at its slot %#x", off, fr.Start+freed*hostarch.PageSize)
+	}
+	// A candidate waits collapseAge first, as a short-lived process's memory
+	// goes before it is worth collapsing.
+	collapseAge = time.Hour
+	foldAll(t, memMgr)
+	if len(collapsed) != 0 || !memMgr.CollapseWaiting() {
+		t.Fatalf("collapsed %v before its candidate waited", collapsed)
+	}
+	collapseAge = 0
+	foldAll(t, memMgr)
+	if len(collapsed) != 1 || collapsed[0] != fr {
+		t.Fatalf("collapsed %v, want %v", collapsed, fr)
+	}
+	if !memMgr.mf.IsHugePages(fr) {
+		t.Error("the refilled 2 MiB is not a 2 MiB page")
+	}
+	if n := countPMAs(memMgr, ar); n != 1 {
+		t.Errorf("the collapsed 2 MiB is mapped by %d pmas, want 1", n)
+	}
+	for page := 0; page < pages; page++ {
+		var b [1]byte
+		if _, err := memMgr.CopyIn(ctx, start+hostarch.Addr(page)*hostarch.PageSize, b[:], usermem.IOOpts{}); err != nil {
+			t.Fatalf("reading page %d: %v", page, err)
+		}
+		want := byte(1)
+		if page == freed {
+			want = 2
+		}
+		if b[0] != want {
+			t.Fatalf("page %d holds %d, want %d", page, b[0], want)
+		}
 	}
 }

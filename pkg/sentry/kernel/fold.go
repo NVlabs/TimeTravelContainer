@@ -33,6 +33,12 @@ const (
 	// foldDelay is how long a Kernel waits, once asked to fold, before it
 	// does: a burst of releases, as of a branch's processes, makes one pass.
 	foldDelay = 50 * time.Millisecond
+
+	// collapseRetry is how long a Kernel waits, after a pass that left
+	// candidates for collapse waiting for discarded pages to be written again,
+	// before it looks at them again, as Linux's khugepaged sleeps between
+	// scans.
+	collapseRetry = 10 * time.Second
 )
 
 // kernelFolds is where a Kernel's folds are.
@@ -67,6 +73,11 @@ type kernelFolds struct {
 	//
 	// +checklocks:mu
 	stopped bool
+
+	// retrying is true while a pass is set to start after collapseRetry.
+	//
+	// +checklocks:mu
+	retrying bool
 }
 
 // foldKernels holds the started Kernels that fold, by application MemoryFile.
@@ -193,6 +204,7 @@ func (k *Kernel) foldLoop() {
 		k.folds.mu.Unlock()
 		start := time.Now()
 		var moved uint64
+		waiting := false
 		for _, m := range k.memoryManagers() {
 			for {
 				n, done, ok := k.foldStep(m)
@@ -208,8 +220,28 @@ func (k *Kernel) foldLoop() {
 					break
 				}
 			}
+			waiting = waiting || m.CollapseWaiting()
+		}
+		if waiting {
+			k.retryFolds()
 		}
 	}
+}
+
+// retryFolds asks k to fold again after collapseRetry.
+func (k *Kernel) retryFolds() {
+	k.folds.mu.Lock()
+	defer k.folds.mu.Unlock()
+	if k.folds.retrying || k.folds.stopped {
+		return
+	}
+	k.folds.retrying = true
+	time.AfterFunc(collapseRetry, func() {
+		k.folds.mu.Lock()
+		k.folds.retrying = false
+		k.folds.mu.Unlock()
+		k.requestFolds()
+	})
 }
 
 // foldStep runs one fold step of m, once no holdFolds is in effect. ok is

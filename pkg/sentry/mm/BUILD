@@ -131,6 +131,7 @@ go_library(
         "aio_context_state.go",
         "aio_manager_mutex.go",
         "aio_mappable_refs.go",
+        "collapse.go",
         "debug.go",
         "fold.go",
         "home.go",
