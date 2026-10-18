@@ -13,7 +13,6 @@ import (
 	"sort"
 	"sync"
 
-	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
@@ -756,16 +755,11 @@ func ImportMemoryFileMetadataForRemote(ctx context.Context, target *MemoryFile, 
 		return fmt.Errorf("sizing remote target MemoryFile: %w", err)
 	}
 	if len(chunks) != 0 {
-		mapping, _, errno := unix.Syscall6(
-			unix.SYS_MMAP,
-			0,
-			uintptr(fileSize),
-			unix.PROT_READ|unix.PROT_WRITE,
-			unix.MAP_SHARED,
-			target.file.Fd(),
-			0)
-		if errno != 0 {
-			return fmt.Errorf("mapping remote target MemoryFile: %w", errno)
+		target.mu.Lock()
+		mapping, err := target.mapChunksLocked(0, fileSize)
+		target.mu.Unlock()
+		if err != nil {
+			return fmt.Errorf("mapping remote target MemoryFile: %w", err)
 		}
 		for i := range chunks {
 			chunks[i].mapping = mapping + uintptr(i)*chunkSize

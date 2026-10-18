@@ -1119,16 +1119,9 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 		if err := f.file.Truncate(int64(fileSize)); err != nil {
 			return fmt.Errorf("failed to truncate MemoryFile: %w", err)
 		}
-		m, _, errno := unix.Syscall6(
-			unix.SYS_MMAP,
-			0,
-			uintptr(fileSize),
-			unix.PROT_READ|unix.PROT_WRITE,
-			unix.MAP_SHARED,
-			f.file.Fd(),
-			0)
-		if errno != 0 {
-			return fmt.Errorf("failed to mmap MemoryFile: %w", errno)
+		m, err := f.mapChunksLocked(0, fileSize)
+		if err != nil {
+			return fmt.Errorf("failed to mmap MemoryFile: %w", err)
 		}
 		mfTimeline.Reached("mmaped chunks")
 		for i := range chunks {

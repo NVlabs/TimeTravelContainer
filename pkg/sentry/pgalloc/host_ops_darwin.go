@@ -26,5 +26,12 @@ func commitHostFile(int, memmap.FileRange) error { return nil }
 // Returning EOPNOTSUPP selects MemoryFile's mandatory manual-zero fallback.
 func decommitHostFile(int, memmap.FileRange) error { return unix.EOPNOTSUPP }
 
+// reserveAddressRange reserves nothing: a platform backing maps its chunks
+// itself.
+func reserveAddressRange() (base, length uintptr) { return 0, 0 }
+
+// releaseAddressRange does nothing, as reserveAddressRange reserves nothing.
+func releaseAddressRange(base, length uintptr) {}
+
 // populateHugeFileRange does nothing: a platform backing has no home chunks.
 func populateHugeFileRange(uintptr, memmap.FileRange, bool) error { return nil }

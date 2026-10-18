@@ -212,6 +212,11 @@ type MemoryFile struct {
 	// releasing, with mu unlocked, if any. It is protected by mu.
 	releasingHome memmap.FileRange
 
+	// reservation is the address range in which the file's chunks are mapped,
+	// if MemoryFileOpts.ReserveMappings; see mapChunksLocked. It is protected
+	// by mu.
+	reservation mappingReservation
+
 	// These fields are used for memory accounting.
 	//
 	// Memory accounting is based on identifying the set of committed pages.
@@ -930,6 +935,14 @@ type MemoryFileOpts struct {
 	// MaxHomes is how many home chunks (see ReserveHome) the file may have at
 	// once; 0 gives it none.
 	MaxHomes int
+
+	// ReserveMappings has the file map its chunks in an address range
+	// reserved for them, each at the range's start plus its offset, so that
+	// the host merges the mappings of adjacent chunks: the process then holds
+	// a mapping of the file per run of chunks with the same advice and node,
+	// however many chunks the file has, as it has with many home chunks. The
+	// range costs no memory. It is ignored with a BackingProvider.
+	ReserveMappings bool
 }
 
 // DelayedEvictionType is the type of MemoryFileOpts.DelayedEviction.
@@ -1153,11 +1166,17 @@ func (f *MemoryFile) releaserDestroyLocked() {
 	chunks := f.chunksLoad()
 	for i := range chunks {
 		chunk := &chunks[i]
-		_, _, errno := unix.Syscall(unix.SYS_MUNMAP, chunk.mapping, chunkSize, 0)
-		if errno != 0 {
-			log.Warningf("Failed to unmap mapping %#x for MemoryFile chunk %d: %v", chunk.mapping, i, errno)
+		if !f.reservation.contains(chunk.mapping) {
+			_, _, errno := unix.Syscall(unix.SYS_MUNMAP, chunk.mapping, chunkSize, 0)
+			if errno != 0 {
+				log.Warningf("Failed to unmap mapping %#x for MemoryFile chunk %d: %v", chunk.mapping, i, errno)
+			}
 		}
 		chunk.mapping = 0
+	}
+	if f.reservation.length != 0 {
+		releaseAddressRange(f.reservation.base, f.reservation.length)
+		f.reservation = mappingReservation{}
 	}
 }
 
@@ -1653,16 +1672,9 @@ func (f *MemoryFile) appendChunksLocked(incNrChunks uint64, huge bool, node int3
 		if err := f.file.Truncate(int64(newFileSize)); err != nil {
 			return err
 		}
-		m, _, errno := unix.Syscall6(
-			unix.SYS_MMAP,
-			0,
-			uintptr(incFileSize),
-			unix.PROT_READ|unix.PROT_WRITE,
-			unix.MAP_SHARED,
-			f.file.Fd(),
-			uintptr(oldFileSize))
-		if errno != 0 {
-			return errno
+		m, err := f.mapChunksLocked(oldFileSize, incFileSize)
+		if err != nil {
+			return err
 		}
 		mapStart = m
 		if node == 0 {
