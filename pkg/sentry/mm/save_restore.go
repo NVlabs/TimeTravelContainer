@@ -140,8 +140,9 @@ func (mm *MemoryManager) afterLoad(ctx goContext.Context) {
 	}
 	mm.mf = pgalloc.MemoryFileFromContext(ctx)
 	// A restored or forked address space reserves homes of its own; the pages
-	// it restores stay where they are.
+	// it restores stay where they are, until a fold.
 	mm.initHomes()
+	mm.fold.foldable = mm.homeOwner != 0
 	if pgalloc.SparseRelocationFromContext(ctx) != nil {
 		for pseg := mm.pmas.FirstSegment(); pseg.Ok(); {
 			mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile)

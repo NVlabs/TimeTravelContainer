@@ -172,6 +172,11 @@ func (mm *MemoryManager) mapASWindowLocked(ctx context.Context, pseg pmaIterator
 func (mm *MemoryManager) mapFileLocked(addr hostarch.Addr, f memmap.File, fr memmap.FileRange, at hostarch.AccessType, precommit bool) error {
 	err := mm.as.MapFile(addr, f, fr, at, precommit)
 	if errors.Is(err, unix.ENOMEM) {
+		// A fold may make fewer mappings of what mm maps.
+		if mm.homeOwner != 0 {
+			mm.fold.foldable = true
+			requestFolds(mm.mf)
+		}
 		mm.unmapASLocked(mm.applicationAddrRange())
 		err = mm.as.MapFile(addr, f, fr, at, precommit)
 	}

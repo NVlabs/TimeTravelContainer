@@ -76,6 +76,10 @@ type MemoryManager struct {
 	// activeMu.
 	homes map[uint64][]memmap.FileRange `state:"nosave"`
 
+	// fold is where mm's folds are; see FoldStep. It is protected by
+	// activeMu.
+	fold foldState `state:"nosave"`
+
 	// haveASIO is the cached result of p.SupportsAddressSpaceIO(). Aside from
 	// eliminating an indirect call in the hot I/O path, this makes
 	// MemoryManager.asioEnabled() a leaf function, allowing it to be inlined.

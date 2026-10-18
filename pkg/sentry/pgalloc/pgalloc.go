@@ -217,6 +217,10 @@ type MemoryFile struct {
 	// by mu.
 	reservation mappingReservation
 
+	// foldNotify is called when others' references on the file's pages go;
+	// see SetFoldNotify. It is protected by mu.
+	foldNotify func() `state:"nosave"`
+
 	// These fields are used for memory accounting.
 	//
 	// Memory accounting is based on identifying the set of committed pages.

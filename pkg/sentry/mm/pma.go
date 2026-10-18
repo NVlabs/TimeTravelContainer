@@ -1194,6 +1194,8 @@ func Unpin(prs []PinnedRange) {
 //   - mm.pmas.IsEmptyRange(newAR).
 //   - oldAR and newAR must be page-aligned.
 func (mm *MemoryManager) movePMAsLocked(oldAR, newAR hostarch.AddrRange) {
+	// The pages keep their offsets, out of the new addresses' slots.
+	mm.markFoldableLocked()
 	if checkInvariants {
 		if !oldAR.WellFormed() || oldAR.Length() == 0 || !oldAR.IsPageAligned() {
 			panic(fmt.Sprintf("invalid oldAR: %v", oldAR))

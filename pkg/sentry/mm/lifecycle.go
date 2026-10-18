@@ -120,6 +120,10 @@ func (mm *MemoryManager) prepareLiveFork(key uint64) (*LiveForkPMASnapshot, erro
 
 	mm.activeMu.Lock()
 	defer mm.activeMu.Unlock()
+	// Once the fork goes, mm may hold alone pages it shares with it now.
+	if mm.homeOwner != 0 {
+		mm.markFoldableLocked()
+	}
 
 	var snapshot *LiveForkPMASnapshot
 	if key != 0 {
@@ -349,6 +353,12 @@ func (mm *MemoryManager) Fork(ctx context.Context) (*MemoryManager, error) {
 	defer mm2.activeMu.NestedUnlock(activeLockForked)
 	if dontforks {
 		defer mm.pmas.MergeInsideRange(mm.applicationAddrRange())
+	}
+	// Once either goes, the other may hold alone pages in homes that are not
+	// its own, or copies in layers.
+	if mm.homeOwner != 0 {
+		mm.markFoldableLocked()
+		mm2.markFoldableLocked()
 	}
 	srcvseg := mm.vmas.FirstSegment()
 	dstpgap := mm2.pmas.FirstGap()

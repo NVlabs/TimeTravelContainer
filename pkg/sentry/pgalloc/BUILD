@@ -196,6 +196,7 @@ go_library(
         "dma_pin.go",
         "evictable_range.go",
         "evictable_range_set.go",
+        "fold.go",
         "home.go",
         "host_ops_darwin.go",
         "host_ops_linux.go",
@@ -253,6 +254,7 @@ go_test(
     size = "small",
     srcs = [
         "commit_limit_test.go",
+        "fold_test.go",
         "home_test.go",
         "huge_page_test.go",
         "mapping_reservation_test.go",

@@ -182,6 +182,10 @@ type Kernel struct {
 	// own when it starts.
 	memoryLimiter *memoryLimiter `state:"nosave"`
 
+	// folds is where the started Kernel's folds of its address spaces are;
+	// see fold.go.
+	folds kernelFolds `state:"nosave"`
+
 	// All of the following fields are immutable unless otherwise specified.
 
 	// Platform is the platform that is used to execute tasks in the created
@@ -808,6 +812,9 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 }
 
 func (k *Kernel) quiescePausedAnd(ctx context.Context, f func() error) error {
+	// What f reads of where k's address spaces' pages are must stay true.
+	defer k.holdFolds()()
+
 	// Do not allow other Kernel methods to affect it while it's being saved.
 	k.extMu.Lock()
 	defer k.extMu.Unlock()
@@ -1692,6 +1699,7 @@ func (k *Kernel) startLocked(resumeTime bool) error {
 	k.started = true
 	k.watchAddressSpaceDeaths()
 	k.limitMemory()
+	k.startFolds()
 	k.cpuClockTickTimer = time.NewTimer(linux.ClockTick)
 	k.runningTasksMu.Lock()
 	k.cpuClockTickerRunning = true
@@ -2576,6 +2584,7 @@ func (k *Kernel) Release() {
 		k.stopAddressSpaceDeaths = nil
 	}
 	k.unlimitMemory()
+	k.stopFolds()
 	k.stopCPUClockTicker()
 	ctx := k.SupervisorContext()
 	k.releaseCgroupMounts(ctx)

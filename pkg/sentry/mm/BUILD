@@ -132,6 +132,7 @@ go_library(
         "aio_manager_mutex.go",
         "aio_mappable_refs.go",
         "debug.go",
+        "fold.go",
         "home.go",
         "io.go",
         "io_list.go",
@@ -190,6 +191,7 @@ go_test(
     name = "mm_test",
     size = "small",
     srcs = [
+        "fold_test.go",
         "home_test.go",
         "mm_test.go",
     ],

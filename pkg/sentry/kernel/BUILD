@@ -282,6 +282,7 @@ go_library(
         "fd_table_refs.go",
         "fd_table_unsafe.go",
         "file_hash.go",
+        "fold.go",
         "fs_context.go",
         "internal_console.go",
         "fs_context_mutex.go",

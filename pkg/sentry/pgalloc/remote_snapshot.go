@@ -1170,6 +1170,12 @@ func (s *RemoteSnapshot) Close() error {
 	for _, release := range pending {
 		release.file.DecRef(release.range_)
 	}
+	if len(pending) != 0 {
+		// Address spaces may now hold alone pages the snapshot held.
+		for _, file := range s.owners {
+			file.notifyFold()
+		}
+	}
 	s.active.Wait()
 	if lastView {
 		s.shared.active.Wait()

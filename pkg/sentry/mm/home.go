@@ -44,8 +44,12 @@ func (mm *MemoryManager) allocatePrivateLocked(ar hostarch.AddrRange, opts pgall
 			return memmap.FileRange{Start: home.Start + off, End: home.Start + off + uint64(ar.Length())}
 		}
 		homes := mm.homes[block]
-		for _, home := range homes {
+		for i, home := range homes {
 			if fr, err := mm.mf.AllocateAt(slots(home), opts); !errors.Is(err, pgalloc.ErrSlotsInUse) {
+				if i != 0 {
+					// Out of the first home, until a fold.
+					mm.markFoldableLocked()
+				}
 				return fr, err
 			}
 		}
@@ -55,11 +59,15 @@ func (mm *MemoryManager) allocatePrivateLocked(ar hostarch.AddrRange, opts pgall
 					mm.homes = make(map[uint64][]memmap.FileRange)
 				}
 				mm.homes[block] = append(homes, home)
+				if len(homes) != 0 {
+					mm.markFoldableLocked()
+				}
 				if fr, err := mm.mf.AllocateAt(slots(home), opts); !errors.Is(err, pgalloc.ErrSlotsInUse) {
 					return fr, err
 				}
 			}
 		}
+		mm.markFoldableLocked()
 	}
 	return mm.mf.Allocate(uint64(ar.Length()), opts)
 }
@@ -80,4 +88,9 @@ func (mm *MemoryManager) disownHomesLocked() {
 		}
 	}
 	mm.homes = nil
+	mm.fold = foldState{}
+	if mm.homeOwner != 0 {
+		// Others may now hold alone the pages they shared with mm.
+		requestFolds(mm.mf)
+	}
 }
