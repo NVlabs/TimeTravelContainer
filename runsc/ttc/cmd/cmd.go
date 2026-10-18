@@ -4333,7 +4333,7 @@ type branchRootfsSize struct {
 // a family's branches that this node runs, for a listing on another node.
 func runRootfsSizesLocal(args []string, stdout io.Writer, backend backend) error {
 	if len(args) < 2 {
-		return errors.New("usage: ttc _rootfs-sizes-local CONTAINER BRANCH...")
+		return errors.New("usage: ttc _rootfs-sizes-local CONTAINER BRANCH [BRANCH ...]")
 	}
 	sizes := make(map[string]branchRootfsSize, len(args)-1)
 	for _, branch := range args[1:] {
@@ -11401,7 +11401,7 @@ func (b *runtimeBackend) remoteProcesses(node, family string, branches []Inspect
 // they could not be listed.
 func runProcessesLocal(args []string, stdout io.Writer, backend backend) error {
 	if len(args) < 2 {
-		return errors.New("usage: ttc _processes-local CONTAINER BRANCH...")
+		return errors.New("usage: ttc _processes-local CONTAINER BRANCH [BRANCH ...]")
 	}
 	lister, ok := backend.(interface {
 		processesOfBranches(container string, branches []string) map[string]branchProcesses

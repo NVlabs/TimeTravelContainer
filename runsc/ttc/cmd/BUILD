@@ -20,7 +20,7 @@ go_library(
         "checkpoint.go",
         "cmd.go",
         "cmd_host_darwin.go",
-        "cmd_host_linux.go",
+        "cmd_host_linux_unsafe.go",
         "completion.go",
         "console_followers.go",
         "control_holder.go",

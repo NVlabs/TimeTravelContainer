@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"fmt"
 	"slices"
-	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
@@ -16,6 +15,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
@@ -207,10 +207,11 @@ type netConfSet struct {
 	owner *auth.Credentials
 	kind  netConfKind
 	// inos are the inode numbers of the settings' files, and vals the
-	// settings, in the order of netConfNames[kind]. vals are accessed
-	// atomically.
-	inos []uint64
-	vals []int32
+	// settings, in the order of netConfNames[kind]. vals are protected by
+	// valsMu.
+	inos   []uint64
+	valsMu sync.Mutex `state:"nosave"`
+	vals   []int32
 }
 
 func (fs *filesystem) newNetConfSet(ctx context.Context, root *auth.Credentials, kind netConfKind, overrides map[string]int32) kernfs.Inode {
@@ -284,7 +285,10 @@ var _ vfs.WritableDynamicBytesSource = (*netConfFile)(nil)
 
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (f *netConfFile) Generate(ctx context.Context, buf *bytes.Buffer) error {
-	_, err := fmt.Fprintf(buf, "%d\n", atomic.LoadInt32(&f.set.vals[f.index]))
+	f.set.valsMu.Lock()
+	val := f.set.vals[f.index]
+	f.set.valsMu.Unlock()
+	_, err := fmt.Fprintf(buf, "%d\n", val)
 	return err
 }
 
@@ -299,6 +303,8 @@ func (f *netConfFile) Write(ctx context.Context, _ *vfs.FileDescription, src use
 	if err != nil || n == 0 {
 		return 0, err
 	}
-	atomic.StoreInt32(&f.set.vals[f.index], buf[0])
+	f.set.valsMu.Lock()
+	f.set.vals[f.index] = buf[0]
+	f.set.valsMu.Unlock()
 	return n, nil
 }

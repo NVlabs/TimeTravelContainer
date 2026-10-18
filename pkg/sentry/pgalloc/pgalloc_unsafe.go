@@ -27,6 +27,11 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 )
 
+// mappingSlice returns the length bytes that the process maps at addr.
+func mappingSlice(addr, length uintptr) []byte {
+	return unsafe.Slice((*byte)(unsafe.Pointer(addr)), length)
+}
+
 // Preconditions: The FileRange represented by c is a superset of fr.
 func (c *chunkInfo) sliceAt(fr memmap.FileRange) []byte {
 	return unsafe.Slice((*byte)(unsafe.Pointer(c.mapping+uintptr(fr.Start&chunkMask))), fr.Length())

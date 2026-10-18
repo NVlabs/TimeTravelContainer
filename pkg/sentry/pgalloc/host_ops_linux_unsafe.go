@@ -6,8 +6,6 @@
 package pgalloc
 
 import (
-	"unsafe"
-
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
@@ -36,12 +34,13 @@ func populateHugeFileRange(fd uintptr, fr memmap.FileRange, adviseHuge bool) err
 			log.Warningf("madvise(%#x, %d, MADV_HUGEPAGE) failed: %s", addr, length, errno)
 		}
 	}
-	if tryPopulateMadv(safemem.BlockFromSafePointer(unsafe.Pointer(addr), int(length))) {
+	mapped := mappingSlice(addr, length)
+	if tryPopulateMadv(safemem.BlockFromSafeSlice(mapped)) {
 		return nil
 	}
 	// Touch each huge page instead.
-	for off := uintptr(0); off < length; off += hostarch.HugePageSize {
-		*(*byte)(unsafe.Pointer(addr + off)) = 0
+	for off := 0; off < len(mapped); off += hostarch.HugePageSize {
+		mapped[off] = 0
 	}
 	return nil
 }

@@ -5259,13 +5259,14 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 			return nil, err
 		}
 	}
-	if opts.CPUTopology == cputopology.Host {
+	switch opts.CPUTopology {
+	case cputopology.Host:
 		host, err := resolveDaemonCPUTopology(cputopology.Host, "")
 		if err != nil {
 			return nil, err
 		}
 		resolvedCPU.Topology, resolvedCPU.TopologyFingerprint = cputopology.Host, host.Fingerprint()
-	} else if opts.CPUTopology == cputopology.Single {
+	case cputopology.Single:
 		resolvedCPU.Topology = cputopology.Single
 	}
 	opts.ResolvedCPU = resolvedCPU
