@@ -690,7 +690,9 @@ func (f *MemoryFile) InstallSparseChunks(installs []SparseChunkInstall) (*Sparse
 			if install.Huge {
 				length, opts.Huge, opts.LogicalHugePages = hostarch.HugePageSize, true, true
 			}
-			fr, err := f.Allocate(length, opts)
+			// What an address space restores is in address order, as it was
+			// when it was saved, where the unit's pages are at their slots.
+			fr, err := f.allocateUnit(runs, length, opts)
 			if err != nil {
 				rollback()
 				return nil, fmt.Errorf("allocating sparse resident chunk: %w", err)

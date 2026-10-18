@@ -265,6 +265,7 @@ go_test(
         "pgalloc_test.go",
         "remote_snapshot_test.go",
         "save_restore_test.go",
+        "slot_identity_test.go",
         "sparse_import_test.go",
     ],
     library = ":pgalloc",

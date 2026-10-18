@@ -203,10 +203,13 @@ type MemoryFile struct {
 	unwasteHome unwasteSet
 
 	// homes holds the state of each home chunk, by chunk index; freeHomes
-	// holds the indexes of those with neither an owner nor pages. They are
-	// protected by mu.
+	// holds the indexes of those with neither an owner nor pages; unitHomes
+	// holds, for each window of logical pages, the indexes of the home chunks
+	// that hold residency units of it (see allocateUnit). They are protected
+	// by mu.
 	homes     map[uint64]*homeChunk
 	freeHomes []uint64
+	unitHomes map[unitWindow][]uint64
 
 	// releasingHome is the range of a home chunk that the releaser is
 	// releasing, with mu unlocked, if any. It is protected by mu.
@@ -1226,6 +1229,11 @@ type AllocOpts struct {
 
 	// Placement asks for the allocation's pages on a host memory node.
 	Placement NUMAPlacement
+
+	// callerIdentities is true if the caller gives the pages their
+	// identities, as a fold or an installation of residency units does: in a
+	// home, they are not pages allocated afresh (see homeIdentitiesLocked).
+	callerIdentities bool
 }
 
 // Direction is the type of AllocOpts.Dir.

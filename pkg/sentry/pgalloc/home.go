@@ -67,6 +67,99 @@ type homeChunk struct {
 	// node its pages are bound to, or 0 if they are bound to none. It is nil
 	// until a page of the chunk is placed on a node.
 	nodes []int32
+
+	// windows are the windows of identities that the chunk's pages allocated
+	// afresh take, the first windowCount of them; see homeIdentitiesLocked.
+	windows     [maxSlotWindows]slotWindow
+	windowCount int
+
+	// unit, if hasUnit, is the window of the residency units that the chunk
+	// holds at their slots; see unitSlots.
+	unit    unitWindow
+	hasUnit bool
+}
+
+// Identities from slots.
+//
+// A page allocated afresh in a home takes its identity from its slot: the
+// home's window plus the slot's index. A logical chunk of pages, 256
+// consecutive identities, is then 1 MiB of consecutive slots, and so of
+// consecutive addresses of the address space that placed them; a copy keeps
+// its original's identity, at the same slot of another home. A residency unit,
+// a logical chunk restored from an image, is installed at its slots in a home
+// of its own window (see unitSlots), so that what an address space restores is
+// in address order too. A slot taken afresh again takes its identity in the
+// home's next window, so that identities never repeat; a region freed and
+// taken again whole stays in one window. See
+// g3doc/proposals/ttc_address_ordered_memory.md.
+
+// pagesPerChunk is how many base pages a chunk holds: the length of a window.
+const pagesPerChunk = chunkSize / hostarch.PageSize
+
+// maxSlotWindows is how many windows a home has at most: a slot taken afresh
+// more often than that takes an identity of no slot.
+const maxSlotWindows = 4
+
+// slotWindow is a window of identities of a home: start is the first logical
+// page sequence, that of the home's first slot, and fresh holds the slots that
+// pages allocated afresh took in it.
+type slotWindow struct {
+	start uint64
+	fresh unwasteSet
+}
+
+// unitWindow is a window of logical pages.
+type unitWindow struct {
+	allocator LogicalAllocatorID
+	window    uint64
+}
+
+// homeIdentitiesLocked gives fr, pages of home chunk i allocated afresh, the
+// identities of their slots, in 2 MiB pages if huge, and new versions: those of
+// the first of the home's windows in which no page took them afresh before, or
+// identities of no slot, as pages out of homes take, if there is none.
+//
+// Preconditions: f.mu must be locked.
+func (f *MemoryFile) homeIdentitiesLocked(i uint64, fr memmap.FileRange, huge bool) {
+	hc := f.homes[i]
+	var w *slotWindow
+	for k := 0; k < maxSlotWindows; k++ {
+		if k == hc.windowCount {
+			if pagesPerChunk > hugeSequenceBit-f.nextLogicalPage {
+				panic(fmt.Sprintf("logical page sequence exhausted for a window for %v", fr))
+			}
+			start := (f.nextLogicalPage + pagesPerChunk - 1) / pagesPerChunk * pagesPerChunk
+			f.nextLogicalPage = start + pagesPerChunk
+			hc.windows[k].start = start
+			hc.windowCount++
+		}
+		if hc.windows[k].fresh.IsEmptyRange(fr) {
+			w = &hc.windows[k]
+			break
+		}
+	}
+	if w == nil {
+		f.assignLogicalPagesLocked(fr, huge)
+		return
+	}
+	w.fresh.InsertRange(fr, unwasteInfo{})
+	huge = huge && hostarch.IsHugePageAligned(fr.Start) && hostarch.IsHugePageAligned(fr.End)
+	pages := fr.Length() / hostarch.PageSize
+	if huge {
+		f.nextPageVersion = alignSequence(f.nextPageVersion)
+	}
+	if pages > hugeSequenceBit-f.nextPageVersion {
+		panic(fmt.Sprintf("page version sequence exhausted for %v", fr))
+	}
+	f.logicalPages.RemoveRange(fr)
+	f.logicalPages.InsertRange(fr, logicalPageInfo{
+		Allocator:            f.logicalAllocator,
+		FirstSequence:        w.start + (fr.Start-i*chunkSize)/hostarch.PageSize,
+		VersionAllocator:     f.logicalAllocator,
+		FirstVersionSequence: f.nextPageVersion,
+		Huge:                 huge,
+	})
+	f.nextPageVersion += pages
 }
 
 // ErrSlotsInUse is returned by AllocateAt when a page of the range it is
@@ -92,25 +185,37 @@ func (f *MemoryFile) ReserveHome(owner HomeOwner) (memmap.FileRange, error) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	i, err := f.reserveHomeLocked(owner)
+	if err != nil {
+		return memmap.FileRange{}, err
+	}
+	return chunkRange(i), nil
+}
+
+// reserveHomeLocked reserves a home chunk for owner, which may be zero, and
+// returns its index.
+//
+// Preconditions: f.mu must be locked; f.HomesEnabled().
+func (f *MemoryFile) reserveHomeLocked(owner HomeOwner) (uint64, error) {
 	if n := len(f.freeHomes); n != 0 {
 		i := f.freeHomes[n-1]
 		f.freeHomes = f.freeHomes[:n-1]
 		f.homes[i].owner = owner
-		return chunkRange(i), nil
+		return i, nil
 	}
 	if len(f.homes) >= f.opts.MaxHomes {
-		return memmap.FileRange{}, errNoHome
+		return 0, errNoHome
 	}
 	i := uint64(len(f.chunksLoad()))
 	// Its pages stay void in both unfree sets: free slots.
 	if err := f.appendChunksLocked(1, false /* huge */, homeChunkNode); err != nil {
-		return memmap.FileRange{}, err
+		return 0, err
 	}
 	if f.homes == nil {
 		f.homes = make(map[uint64]*homeChunk)
 	}
 	f.homes[i] = &homeChunk{owner: owner}
-	return chunkRange(i), nil
+	return i, nil
 }
 
 // DisownHome gives up owner's ownership of the home chunk home. A home with
@@ -132,9 +237,102 @@ func (f *MemoryFile) DisownHome(owner HomeOwner, home memmap.FileRange) {
 //
 // Preconditions: f.mu must be locked.
 func (f *MemoryFile) spareHomeIfEmptyLocked(i uint64) {
-	if hc := f.homes[i]; hc.owner == 0 && hc.pages == 0 {
-		f.freeHomes = append(f.freeHomes, i)
+	hc := f.homes[i]
+	if hc.owner != 0 || hc.pages != 0 {
+		return
 	}
+	// Spared, it starts over.
+	for k := range hc.windows[:hc.windowCount] {
+		hc.windows[k].fresh.RemoveAll()
+	}
+	hc.windowCount = 0
+	if hc.hasUnit {
+		homes := f.unitHomes[hc.unit]
+		for j, home := range homes {
+			if home == i {
+				homes = append(homes[:j], homes[j+1:]...)
+				break
+			}
+		}
+		if len(homes) == 0 {
+			delete(f.unitHomes, hc.unit)
+		} else {
+			f.unitHomes[hc.unit] = homes
+		}
+		hc.hasUnit = false
+	}
+	f.freeHomes = append(f.freeHomes, i)
+}
+
+// unitSlots returns the window of the residency unit of length bytes whose
+// pages runs name, and the offset of the unit's slots in a home of that
+// window, if the unit's pages are at the slots their identities give: the
+// page at each position has the identity of the unit's first slot plus the
+// position, and that first slot starts a unit of length bytes.
+func unitSlots(runs []SparseChunkRun, length uint64) (unitWindow, uint64, bool) {
+	if len(runs) == 0 {
+		return unitWindow{}, 0, false
+	}
+	first := runs[0]
+	if first.Page.Sequence < uint64(first.Position) {
+		return unitWindow{}, 0, false
+	}
+	base := first.Page.Sequence - uint64(first.Position)
+	for _, run := range runs[1:] {
+		if run.Page.Allocator != first.Page.Allocator || run.Page.Sequence < uint64(run.Position) || run.Page.Sequence-uint64(run.Position) != base {
+			return unitWindow{}, 0, false
+		}
+	}
+	if base%(length/hostarch.PageSize) != 0 {
+		return unitWindow{}, 0, false
+	}
+	window := base / pagesPerChunk * pagesPerChunk
+	return unitWindow{allocator: first.Page.Allocator, window: window}, (base - window) * hostarch.PageSize, true
+}
+
+// allocateUnit allocates length bytes for a residency unit whose pages runs
+// name, as Allocate does with opts: at the unit's slots in a home of its
+// window, where its pages' identities give their slots (see unitSlots) and the
+// file has a home to spare, and as Allocate would otherwise. Its caller gives
+// the pages their identities.
+func (f *MemoryFile) allocateUnit(runs []SparseChunkRun, length uint64, opts AllocOpts) (memmap.FileRange, error) {
+	key, off, ok := unitSlots(runs, length)
+	if !ok || !f.HomesEnabled() {
+		return f.Allocate(length, opts)
+	}
+	opts.callerIdentities = true
+	at := func(i uint64) memmap.FileRange {
+		return memmap.FileRange{Start: i*chunkSize + off, End: i*chunkSize + off + length}
+	}
+	f.mu.Lock()
+	homes := append([]uint64(nil), f.unitHomes[key]...)
+	f.mu.Unlock()
+	for _, i := range homes {
+		fr, err := f.AllocateAt(at(i), opts)
+		if err == nil || !errors.Is(err, ErrSlotsInUse) {
+			return fr, err
+		}
+	}
+	f.mu.Lock()
+	i, err := f.reserveHomeLocked(0)
+	if err == nil {
+		hc := f.homes[i]
+		hc.unit, hc.hasUnit = key, true
+		if f.unitHomes == nil {
+			f.unitHomes = make(map[unitWindow][]uint64)
+		}
+		f.unitHomes[key] = append(f.unitHomes[key], i)
+	}
+	f.mu.Unlock()
+	if err == nil {
+		if fr, err := f.AllocateAt(at(i), opts); err == nil {
+			return fr, nil
+		}
+		f.mu.Lock()
+		f.spareHomeIfEmptyLocked(i)
+		f.mu.Unlock()
+	}
+	return f.Allocate(length, opts)
 }
 
 // HomeOf returns the home chunk that off is in, and its owner (zero if it has
@@ -278,7 +476,11 @@ func (f *MemoryFile) markHomeUsedLocked(fr memmap.FileRange, opts AllocOpts, hug
 		})
 		f.accountLocked(int64(freeFR.Length()))
 	}
-	f.assignLogicalPagesLocked(fr, huge && opts.LogicalHugePages)
+	if opts.ReaderFunc == nil && !opts.callerIdentities {
+		f.homeIdentitiesLocked(i, fr, huge && opts.LogicalHugePages)
+	} else {
+		f.assignLogicalPagesLocked(fr, huge && opts.LogicalHugePages)
+	}
 	if node != 0 {
 		if hc.nodes == nil {
 			hc.nodes = make([]int32, chunkSize/hostarch.HugePageSize)

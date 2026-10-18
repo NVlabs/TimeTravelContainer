@@ -67,7 +67,7 @@ func (f *MemoryFile) MovePages(src, dst memmap.FileRange) error {
 	// both places.
 	f.splitPartlyCoveredHugePagesLocked(src)
 	huge := hostarch.HugePageOffset(src.Start) == hostarch.HugePageOffset(dst.Start) && f.isHugeLocked(src)
-	opts := AllocOpts{Huge: huge, LogicalHugePages: huge}
+	opts := AllocOpts{Huge: huge, LogicalHugePages: huge, callerIdentities: true}
 	if seg := f.memAcct.FindSegment(src.Start); seg.Ok() {
 		opts.Kind, opts.MemCgID = seg.ValuePtr().kind, seg.ValuePtr().memCgID
 	}
