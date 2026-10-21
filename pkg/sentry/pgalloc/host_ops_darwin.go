@@ -37,4 +37,6 @@ func releaseAddressRange(base, length uintptr) {}
 func collapseFileRange(uintptr, memmap.FileRange) error { return errNoHostCollapse }
 
 // populateHugeFileRange does nothing: a platform backing has no home chunks.
-func populateHugeFileRange(uintptr, memmap.FileRange, bool) error { return nil }
+func populateHugeFileRange(uintptr, memmap.FileRange, bool, safemem.ReaderFunc) (uint64, bool, error) {
+	return 0, false, nil
+}

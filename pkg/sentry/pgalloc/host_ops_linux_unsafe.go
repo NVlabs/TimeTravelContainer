@@ -94,12 +94,17 @@ func collapseError(errno unix.Errno) error {
 // pages, through a mapping of fr alone, advised MADV_HUGEPAGE if adviseHuge,
 // so that the host backs it with huge pages where the Sentry's own mapping of
 // fr would get small ones; see MemoryFile.AllocateAt. The host aligns a shared
-// memory mapping to huge pages.
-func populateHugeFileRange(fd uintptr, fr memmap.FileRange, adviseHuge bool) error {
+// memory mapping to huge pages. If reader is not nil, it then fills fr with
+// what reader reads, through the same mapping: the Sentry's own mapping of fr
+// has no page table entries for the pages, and copying through it would fault
+// on each base page. It returns how many bytes reader filled, and the error
+// that committing fr met, or else reader's; committed is false if committing
+// failed.
+func populateHugeFileRange(fd uintptr, fr memmap.FileRange, adviseHuge bool, reader safemem.ReaderFunc) (filled uint64, committed bool, err error) {
 	length := uintptr(fr.Length())
 	addr, _, errno := unix.Syscall6(unix.SYS_MMAP, 0, length, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED, fd, uintptr(fr.Start))
 	if errno != 0 {
-		return errno
+		return 0, false, errno
 	}
 	defer func() {
 		if _, _, errno := unix.Syscall(unix.SYS_MUNMAP, addr, length, 0); errno != 0 {
@@ -112,12 +117,15 @@ func populateHugeFileRange(fd uintptr, fr memmap.FileRange, adviseHuge bool) err
 		}
 	}
 	mapped := mappingSlice(addr, length)
-	if tryPopulateMadv(safemem.BlockFromSafeSlice(mapped)) {
-		return nil
+	if !tryPopulateMadv(safemem.BlockFromSafeSlice(mapped)) {
+		// Touch each huge page instead.
+		for off := 0; off < len(mapped); off += hostarch.HugePageSize {
+			mapped[off] = 0
+		}
 	}
-	// Touch each huge page instead.
-	for off := 0; off < len(mapped); off += hostarch.HugePageSize {
-		mapped[off] = 0
+	if reader == nil {
+		return 0, true, nil
 	}
-	return nil
+	filled, err = safemem.ReadFullToBlocks(reader, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(mapped)))
+	return filled, true, err
 }

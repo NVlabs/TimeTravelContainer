@@ -406,21 +406,24 @@ func (f *MemoryFile) AllocateAt(fr memmap.FileRange, opts AllocOpts) (memmap.Fil
 	for _, hugeFR := range bind {
 		bindFileRange(f.file.Fd(), hugeFR, int(node-1))
 	}
-	if err := f.populateHome(fr, opts, huge, waste); err != nil {
+	n, filled, err := f.populateHome(fr, opts, huge, waste)
+	if err != nil && !filled {
 		f.DecRef(fr)
 		return memmap.FileRange{}, err
 	}
 	if opts.ReaderFunc == nil {
 		return fr, nil
 	}
-	dsts, mappingLease, err := f.MapInternalWithLease(fr, hostarch.Write)
-	if err != nil {
-		f.DecRef(fr)
-		return memmap.FileRange{}, err
-	}
-	n, err := safemem.ReadFullToBlocks(opts.ReaderFunc, dsts)
-	if mappingLease != nil {
-		mappingLease.Release()
+	if !filled {
+		dsts, mappingLease, mapErr := f.MapInternalWithLease(fr, hostarch.Write)
+		if mapErr != nil {
+			f.DecRef(fr)
+			return memmap.FileRange{}, mapErr
+		}
+		n, err = safemem.ReadFullToBlocks(opts.ReaderFunc, dsts)
+		if mappingLease != nil {
+			mappingLease.Release()
+		}
 	}
 	if un := uint64(hostarch.Addr(n).RoundDown()); un < fr.Length() {
 		// Free what the reader did not fill.
@@ -519,29 +522,33 @@ func (f *MemoryFile) markHomeUsedLocked(fr memmap.FileRange, opts AllocOpts, hug
 }
 
 // populateHome commits what AllocateAt commits of fr, which it has just
-// marked used, and zeroes its waste parts.
-func (f *MemoryFile) populateHome(fr memmap.FileRange, opts AllocOpts, huge bool, waste []memmap.FileRange) error {
+// marked used, and zeroes its waste parts. If it commits a 2 MiB page through
+// a mapping of its own and opts has a ReaderFunc, it fills the page through
+// that mapping too: filled is true then, n is how many bytes the ReaderFunc
+// filled, and err is its error.
+func (f *MemoryFile) populateHome(fr memmap.FileRange, opts AllocOpts, huge bool, waste []memmap.FileRange) (n uint64, filled bool, err error) {
 	if f.file == nil {
-		return nil
+		return 0, false, nil
 	}
 	if huge && len(waste) == 0 {
 		// A 2 MiB page whose slots were all free: commit a huge page.
-		if err := populateHugeFileRange(f.file.Fd(), fr, f.opts.AdviseHugepage); err != nil {
-			return err
+		n, committed, err := populateHugeFileRange(f.file.Fd(), fr, f.opts.AdviseHugepage, opts.ReaderFunc)
+		if !committed || opts.ReaderFunc != nil {
+			return n, committed, err
 		}
 	}
 	if len(waste) != 0 {
 		for _, wasteFR := range waste {
 			dsts, lease, err := f.MapInternalWithLease(wasteFR, hostarch.Write)
 			if err != nil {
-				return err
+				return 0, false, err
 			}
 			_, err = safemem.ZeroSeq(dsts)
 			if lease != nil {
 				lease.Release()
 			}
 			if err != nil {
-				return err
+				return 0, false, err
 			}
 		}
 	}
@@ -552,7 +559,7 @@ func (f *MemoryFile) populateHome(fr memmap.FileRange, opts AllocOpts, huge bool
 		for start := fr.Start; start < fr.End; start = hostarch.HugePageRoundDown(start) + hostarch.HugePageSize {
 			dsts, lease, err := f.MapInternalWithLease(memmap.FileRange{Start: start, End: start + hostarch.PageSize}, hostarch.Write)
 			if err != nil {
-				return err
+				return 0, false, err
 			}
 			dsts.Head().ToSlice()[0] = 0
 			if lease != nil {
@@ -564,15 +571,15 @@ func (f *MemoryFile) populateHome(fr memmap.FileRange, opts AllocOpts, huge bool
 	case AllocateUncommitted, AllocateCallerIndirectCommit:
 	case AllocateAndCommit:
 		if !huge {
-			return f.commitFile(fr)
+			return 0, false, f.commitFile(fr)
 		}
 	case AllocateAndWritePopulate:
 		if huge {
-			return nil
+			return 0, false, nil
 		}
 		dsts, lease, err := f.MapInternalWithLease(fr, hostarch.Write)
 		if err != nil {
-			return err
+			return 0, false, err
 		}
 		if canPopulate() {
 			for rem := dsts; !rem.IsEmpty() && tryPopulate(rem.Head()); rem = rem.Tail() {
@@ -584,7 +591,7 @@ func (f *MemoryFile) populateHome(fr memmap.FileRange, opts AllocOpts, huge bool
 	default:
 		panic(fmt.Sprintf("unknown AllocOpts.Mode %d", opts.Mode))
 	}
-	return nil
+	return 0, false, nil
 }
 
 // subtractRanges returns the parts of fr outside holes, which are sorted, do
