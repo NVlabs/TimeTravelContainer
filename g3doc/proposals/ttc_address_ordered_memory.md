@@ -2,7 +2,9 @@
 
 Status: implemented (2026-10-18): homes and placement, the Sentry's address
 reservation, folding, collapse, and restored memory at its slots. Where the
-implementation departs from the design below, the section says so.
+implementation departs from the design below, the section says so. Measured
+against the code before it, and fixed where it cost more (2026-10-21); see
+"Performance".
 
 ## Problem
 
@@ -131,7 +133,10 @@ Sentry must decide which the host backs with transparent huge pages without
 - A 2 MiB page is populated through a temporary mapping of its 2 MiB range with
   the advice that allows a huge page, then unmapped, as `bindFileRange` already
   does for NUMA binding (`numa_linux_unsafe.go:40`). That costs three system
-  calls per 2 MiB page, against zeroing 2 MiB.
+  calls per 2 MiB page, against zeroing 2 MiB. A copy into a 2 MiB page
+  (copy-on-write, a fold) is written through that mapping too, which has the
+  page's table entries: the Sentry's own mapping has none, and a copy through
+  it faulted on each base page, which doubled the copy's cost.
 - The stub's mappings carry no advice, so on the huge-page tmpfs the stub's
   first touch of an empty 2 MiB range would get a huge page. That is right for a
   2 MiB page and wrong for a range of 4 KiB pages. So the first 4 KiB page placed
@@ -176,6 +181,13 @@ import there (`pgalloc/mapping_reservation.go`); chunks past it are mapped
 apart, as before. A family whose Sentry held 19 to 32 mappings of its memory
 file in the local suite (`vmacheck`) holds one.
 
+The host keeps the page tables of the Sentry's mapping of pages once the pages
+are gone, and an address space spreads its pages over its home by their
+addresses: a home that processes held one after another kept up to 2 MiB of
+them, and a build left the Sentry 21 MB of page tables where it left 2 MB
+without homes. A home that is spared, with neither owner nor pages, is mapped
+afresh, which drops them (`remapSparedHomeLocked`): the build leaves 0.7 MB.
+
 ### Limits
 
 - At most `maxHomes` homes at once, by default the smaller of 16,384 (16 TiB of
@@ -217,8 +229,14 @@ merge into large pmas that are mapped already: mapping them again with
 `MAP_FIXED` drops their host page tables, so the application faults on each of
 their pages again. Measured locally before this rule, a fork rewriting 1200 MB
 at random took passes of 700 ns per access long after the copies were done. The
-host merges the new mapping with its neighbours. A fault on a pma that exists
-but is not mapped (after a fork or a restore) still maps all of it.
+host merges the new mapping with its neighbours. A fault that inserts nothing,
+on a pma that exists but is not mapped (after a fork or a restore), maps the
+2 MiB around the page it faulted, as much as an allocation makes. Every other
+mapping of an address space with homes maps only what its caller made usable, as
+a small `mmap` that is populated (`mapASExactLocked`): first implemented in the
+fault alone, the rule left those mapping whole pmas, as much as all of a
+compiler's memory at a time, and a build mapped 1.9 billion pages where it
+mapped 9.3 million without homes (see Performance).
 
 ### Writes take over pages held alone
 
@@ -315,20 +333,43 @@ Folds run in a background goroutine per memory file, with a copy budget
 forked or captured, and resume after.
 
 Implemented (`kernel/fold.go`) as a goroutine per started Kernel on a file with
-homes, which folds the address spaces of its tasks when asked, 50 ms after,
-so that a burst of releases makes one pass, at up to 1 GiB/s. An address space
-that releases its pages asks every Kernel on its memory file: that covers a
-branch's removal and a guest process's exit without recording who forked whom.
-A capture or remote snapshot that closes asks through the file
-(`SetFoldNotify`). A residency unit's release asks nothing: what holds a unit's
-pages besides the cache is what restored them. The pma-count trigger is not
-implemented; the ENOMEM one asks for a fold rather than folding in the fault,
-which holds `activeMu` and could wait for a fork that holds the folds back.
-Folds are held back while `quiescePausedAnd` runs, which every save, live fork,
-dehydration capture and remote-fork capture runs in, and not for the whole of a
-pause, as a base branch may stay paused for long. An address space is folded
-only if it may have something to fold: it placed a page in a layer or out of
-its homes, forked or was forked, was loaded, or moved pages with `mremap`.
+homes, which folds the address spaces of its tasks when asked, 50 ms after, so
+that a burst of releases makes one pass, at up to 1 GiB/s. An address space that
+releases its pages asks for folds of its fork group, the address spaces that
+forks and live forks made from one another (`MM.FoldGroup`), which alone shared
+its pages, in every Kernel on its memory file: that covers a branch's removal
+and a guest process's exit. A save keeps no fork groups: an address space
+restored from one, and those forked or live-forked from it, are of no known
+group, so that their releases ask for folds of all, as every release did at
+first, and they fold when all are asked. A candidate for collapse asks for a
+pass once it has waited (`FoldRetryHook`). Pages that `mremap` moved fold when
+their group is next asked: they keep their offsets, contiguous, and folding them
+at once copied a compiler's growing buffers just before it exited. A capture or
+remote snapshot that closes asks through the file (`SetFoldNotify`). A residency
+unit's release asks nothing: what holds a unit's pages besides the cache is what
+restored them. The pma-count trigger is not implemented; the ENOMEM one asks for
+a fold rather than folding in the fault, which holds `activeMu` and could wait
+for a fork that holds the folds back. Folds are held back while
+`quiescePausedAnd` runs, which every save, live fork, dehydration capture and
+remote-fork capture runs in, and not for the whole of a pause, as a base branch
+may stay paused for long. An address space is folded only if it may have
+something to fold: it placed a page in a layer or out of its homes, forked or
+was forked, was loaded, or moved pages with `mremap`. A fold step counts a piece
+that it looks at and leaves, as one that a fork still shares, as a page moved,
+against its budget and the rate, and an address space whose last two passes
+moved nothing and left such pieces waits 10 s (`foldResidueWait`) before the
+next, however soon it is asked again; the Kernel asks again once that has
+passed. One such pass is common: a fork may share what a fold had yet to move,
+as when a live fork follows a branch's removal at once, and waiting after one
+held a source's fold back through a loop of live forks, whose writes then took
+20% longer. First implemented, every release asked for folds, and looking at a
+piece was free: while a fork and its source wrote, a process's exit anywhere in
+the family made a pass that walked tens of thousands of shared pieces, holding
+the address space's lock, and the writes took three times as long (see
+Performance). Fork groups alone left part of that cost where the source itself
+forks: while a live fork rewrote a quarter of 1 GiB and its source forked and
+execed 1,000 processes, each exec asked their group to fold, and the fork's
+writes took 20% longer than before homes, 4% with the wait.
 
 ## Collapse
 
@@ -501,6 +542,86 @@ once the pages are written again, collapse maps all of it with huge pages
 again (1,048,576 and 2,097,152 kB). Its cluster counterpart, `c29`, counts a
 remote fork's: a 256 MiB buffer written at random takes one stub mapping on
 the target node, where it took 128 before phase 4, one per residency unit.
+
+## Performance
+
+Measured against the commit before homes (cb48999fb), on the same workloads: the
+command sweep, every everyday command ten times; a build of Lua and SQLite in
+the work-build image; and a process that writes 1 GiB at random, forks 200
+processes and execs 300, is live-forked five times, the fork and its source each
+rewriting a quarter while both live, and is dehydrated, rehydrated, read and
+rewritten. Each number is the median of three rounds: locally (Linux 7.0) with
+base pages, and on the farm (Linux 6.1.62, hardened sandboxes on a huge tmpfs)
+with 2 MiB pages. Memory is the memory file's committed blocks plus the
+Sentry's and the stubs' private memory and page tables; CPU is theirs.
+
+The first measurement found five regressions, fixed since: mapping whole merged
+pmas (see "Faults map what they insert"), with which the build took 25% longer;
+folds that every release asked for (see "When"), with which a fork's writes took
+3.5 times as long; the Sentry's page tables of spared homes (see "The Sentry's
+mapping"), 18 MB after the build; copies into 2 MiB pages through the Sentry's
+own mapping (see "Host huge pages inside a home"), 40% longer; and, in the
+fixes' first form, candidates for collapse that no pass looked at. A later
+workload, a live fork whose source forks, found that fork groups still left
+passes over what the fork shares, one each time a child of the source execs; an
+address space whose passes keep leaving such pages, moving nothing, now puts off
+the next (see "When").
+
+| | local, before | local, homes | farm, before | farm, homes |
+|---|---|---|---|---|
+| Build | 122.2 s | 123.2 s | 152.9 s | 156.0 s |
+| Its CPU | 95.3 s | 98.0 s | 131.4 s | 140.5 s |
+| Memory once built | 24.8 MB | 23.7 MB | 77.5 MB | 37.7 MB |
+| The Sentry's page tables then | 2.2 MB | 0.7 MB | 2.6 MB | 0.7 MB |
+| Fork's write, live forks | 1.91 s | 2.22 s | 0.63 s | 0.66 s |
+| Source's write, live forks | 2.29 s | 2.27 s | 0.040 s | 0.038 s |
+| CPU over the live forks | 35.7 s | 31.3 s | 10.8 s | 11.1 s |
+| Read once the forks are gone | 3.14 s | 1.35 s | 0.006 s | 0.005 s |
+| 200 forks, each writing 16 pages | 0.47 s | 0.44 s | 4.50 s | 4.67 s |
+| 300 execs | 0.62 s | 0.53 s | 1.02 s | 0.89 s |
+| First write of 1 GiB | 0.52 s | 0.49 s | 0.29 s | 0.32 s |
+| Dehydrate | 8.24 s | 5.07 s | 5.35 s | 4.42 s |
+| Its image | 1185 MB | 1076 MB | 1043 MB | 1042 MB |
+| Rehydrate | 1.98 s | 0.96 s | 0.30 s | 0.54 s |
+| Read what it restored | 9.30 s | 3.66 s | 0.78 s | 0.56 s |
+| Rewrite what it restored | 8.94 s | 10.6 s | 0.66 s | 0.68 s |
+| Remove a branch | 1.41 s | 0.39 s | 0.02 s | 0.03 s |
+| Remove the rehydrated family | 0.11 s | 0.39 s | 0.35 s | 0.34 s |
+
+The table was measured before restored address spaces asked all address spaces
+to fold and before the wait after idle passes (see "When"). Seven rounds of the
+memory workload locally, with base pages and with 2 MiB pages, show no
+difference between the builds with and without those two changes larger than
+the spread between rounds of one build.
+
+A live fork whose source forks, measured locally: a 1 GiB process, live-forked
+three times, forks and execs 1,000 processes while each fork rewrites a quarter
+of its memory. Its forks and execs take 98 s where they took 292 s, as its pmas
+stay merged, and each fork copies them; the sandbox's CPU is 148 s where it was
+375 s; the forks' writes take 12.5 s where they took 12.0 s (4% longer), and the
+source's writes after them 6.8 s where they took 6.6 s.
+
+Every everyday command's median is within 10% of before. What still costs:
+
+- With base pages, a copy on write at random and the rewrite of restored memory
+  take up to 19% longer, and removing a rehydrated family 0.28 s longer. Copies
+  at their slots, in random order, leave pgalloc's sets of references, versions
+  and accounting in pieces, where the allocator's sequential offsets kept them
+  merged.
+- With 2 MiB pages, a rehydration commits each restored 2 MiB page through a
+  mapping of its own as it installs it, where before a huge chunk's pages were
+  committed by their first write: 0.24 s more per GiB, which reading the memory
+  afterwards saves. A first write, and a copy on write, cost a temporary
+  mapping per 2 MiB page: a first write takes 11% longer, and 200 forks that
+  each write 16 pages 4%.
+- A live fork's writes while its source forks take 4% longer: the cost of copies
+  above, and a pass over what the fork shares every 10 s.
+
+Two changes would remove most of these, and are proposed, not built: a second
+view of home chunks in the Sentry's reserved range, without the advice against
+huge pages, through which the Sentry reads and writes 2 MiB pages; and tables of
+each home's pages in place of segment sets, whose cost would not depend on the
+order of writes.
 
 ## Phases
 
