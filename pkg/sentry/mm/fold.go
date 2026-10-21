@@ -6,6 +6,7 @@ package mm
 import (
 	"time"
 
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -26,22 +27,64 @@ import (
 // its content being the same. See
 // g3doc/proposals/ttc_address_ordered_memory.md.
 
-// FoldRequestHook is called, if set, with a MemoryFile whose address spaces
-// may have private pages to fold: when an address space releases its pages,
-// which others may then hold alone, and when the host has no room for another
-// of an address space's mappings.
-var FoldRequestHook func(*pgalloc.MemoryFile)
+// FoldRequestHook is called, if set, when address spaces on a MemoryFile may
+// have private pages to fold: when an address space releases its pages, which
+// others of its fork group may then hold alone, and when the host has no room
+// for another of an address space's mappings. group is the fork group of the
+// address spaces that may (see MemoryManager.FoldGroup), or 0 if any may.
+var FoldRequestHook func(mf *pgalloc.MemoryFile, group uint64)
 
-// requestFolds calls FoldRequestHook with mf.
-func requestFolds(mf *pgalloc.MemoryFile) {
+// FoldRetryHook is called, if set, with a MemoryFile whose address spaces
+// have candidates for collapse that have yet to wait collapseAge, so that a
+// fold pass looks at them once they have.
+var FoldRetryHook func(*pgalloc.MemoryFile)
+
+// requestFolds calls FoldRequestHook with mf and group.
+func requestFolds(mf *pgalloc.MemoryFile, group uint64) {
 	if hook := FoldRequestHook; hook != nil && mf != nil {
+		hook(mf, group)
+	}
+}
+
+// requestFoldsLater calls FoldRetryHook with mf.
+func requestFoldsLater(mf *pgalloc.MemoryFile) {
+	if hook := FoldRetryHook; hook != nil && mf != nil {
 		hook(mf)
 	}
+}
+
+// foldGroups numbers fork groups; see FoldGroup.
+var foldGroups atomicbitops.Uint64
+
+// newFoldGroup returns a new fork group.
+func newFoldGroup() uint64 {
+	return foldGroups.Add(1)
+}
+
+// FoldGroup returns mm's fork group: the address spaces that forks and live
+// forks made from one another. Only they share private pages with mm, and
+// only their releases may leave mm holding alone pages it shared. It is 0,
+// any, for an address space restored from a save and those made from it: a
+// save keeps no fork groups, and such an address space may share pages with
+// any other restored with it. Its releases ask every address space to fold,
+// and it folds when all are asked to.
+func (mm *MemoryManager) FoldGroup() uint64 {
+	return mm.foldGroup
 }
 
 // maxFoldBlocksPerStep is how many blocks a FoldStep plans at most, so that it
 // holds an address space's activeMu briefly however little it moves.
 const maxFoldBlocksPerStep = 8
+
+// foldResidueWait is how long an address space waits, after two passes in a
+// row that moved nothing and left pages that others held, before a pass looks
+// at them again, however often it is asked to: what a live fork shares with
+// its source changes only as they write, and a pass holds the address space's
+// activeMu while it plans and looks. A live fork rewriting a quarter of 1 GiB
+// while its source forked and execed took 20% longer than before homes without
+// it, as each exec asked their group to fold, and 4% with it. One such pass is
+// common, and says little: a fork may share what a fold had yet to move.
+var foldResidueWait = 10 * time.Second
 
 // foldPiece is a range of an address space's private pages that a fold moves,
 // and the file range that the address space's pma mapped it to when the fold
@@ -60,6 +103,16 @@ type foldState struct {
 
 	// residue is true if the current pass left pages out of their home.
 	residue bool
+
+	// moved is how many bytes the current pass moved; idle is how many
+	// passes in a row moved nothing and left pages out of their home, and
+	// idleAt when the last of them ended. deferred is true if a pass was
+	// asked for that waits for foldResidueWait after idleAt; see
+	// FoldDeferred.
+	moved    uint64
+	idle     int
+	idleAt   time.Time
+	deferred bool
 
 	// cursor is where the next step starts.
 	cursor hostarch.Addr
@@ -89,9 +142,12 @@ func (mm *MemoryManager) markFoldableLocked() {
 
 // FoldStep moves at most about limit bytes of mm's private pages to their
 // slots in the homes that hold most of them, from where its last call
-// stopped. It returns how many bytes it moved, and true once it has been
+// stopped. It returns how much work it did, counting the bytes it moved and
+// a page for each range it looked at but left, and true once it has been
 // through all of mm's addresses: a later call starts over, if mm may have
-// private pages to fold then.
+// private pages to fold then, and foldResidueWait has passed since the last
+// pass if the last two moved nothing and left pages that others held (see
+// FoldDeferred).
 func (mm *MemoryManager) FoldStep(limit uint64) (uint64, bool) {
 	mm.mappingMu.RLock()
 	defer mm.mappingMu.RUnlock()
@@ -132,12 +188,28 @@ func (mm *MemoryManager) FoldStep(limit uint64) (uint64, bool) {
 		fs.collapsing = false
 		return moved, true
 	}
+	if fs.cursor == 0 && fs.block.Length() == 0 {
+		// A pass starts.
+		if fs.idle >= 2 && time.Since(fs.idleAt) < foldResidueWait {
+			fs.deferred = true
+			fs.collapsing = false
+			return moved, true
+		}
+		fs.deferred = false
+		fs.moved = 0
+	}
 	for planned := 0; moved < limit && planned < maxFoldBlocksPerStep; {
 		if len(fs.pieces) == 0 && fs.block.Length() == 0 {
 			block, ok := mm.nextFoldBlockLocked(fs.cursor)
 			if !ok {
 				fs.cursor = 0
 				fs.foldable = fs.residue
+				if fs.residue && fs.moved == 0 {
+					fs.idle++
+					fs.idleAt = time.Now()
+				} else {
+					fs.idle = 0
+				}
 				fs.residue = false
 				fs.collapsing = false
 				return moved, true
@@ -152,6 +224,16 @@ func (mm *MemoryManager) FoldStep(limit uint64) (uint64, bool) {
 		mm.finishFoldLocked()
 	}
 	return moved, false
+}
+
+// FoldDeferred returns true if a pass that mm was asked for waits for
+// foldResidueWait to pass since its last, which, as the one before it, moved
+// nothing and left pages that others held, so that a pass must be asked for
+// again then.
+func (mm *MemoryManager) FoldDeferred() bool {
+	mm.activeMu.RLock()
+	defer mm.activeMu.RUnlock()
+	return mm.fold.deferred
 }
 
 // nextFoldBlockLocked returns the first block of homeBlockSize, from the one
@@ -275,15 +357,23 @@ func (mm *MemoryManager) forEachPrivatePieceLocked(ar hostarch.AddrRange, fn fun
 
 // foldPiecesLocked moves the planned pieces, at most about limit bytes of
 // them, into the slots of the fold's target that are free, and returns how
-// many bytes it moved.
+// much work it did, as FoldStep counts it: looking at a piece that something
+// else still holds costs about as much as moving a page, and while a fork
+// lives, most of its pieces are such.
 //
 // Preconditions: mm.activeMu must be locked for writing.
 func (mm *MemoryManager) foldPiecesLocked(limit uint64) uint64 {
 	fs := &mm.fold
-	var moved uint64
-	for len(fs.pieces) != 0 && moved < limit {
+	var done uint64
+	for len(fs.pieces) != 0 && done < limit {
 		piece := fs.pieces[0]
 		fs.pieces = fs.pieces[1:]
+		if !mm.mf.Movable(piece.src) {
+			// What a page still holds stays.
+			fs.residue = true
+			done += hostarch.PageSize
+			continue
+		}
 		slots := memmap.FileRange{Start: fs.target.Start + uint64(piece.ar.Start-fs.block.Start)}
 		slots.End = slots.Start + piece.src.Length()
 		free := mm.mf.FreeSlots(slots)
@@ -296,13 +386,17 @@ func (mm *MemoryManager) foldPiecesLocked(limit uint64) uint64 {
 			src := memmap.FileRange{Start: piece.src.Start + delta, End: piece.src.Start + delta + dst.Length()}
 			ar := hostarch.AddrRange{Start: piece.ar.Start + hostarch.Addr(delta), End: piece.ar.Start + hostarch.Addr(delta+dst.Length())}
 			if mm.movePrivateLocked(ar, src, dst) {
-				moved += dst.Length()
+				done += dst.Length()
+				fs.moved += dst.Length()
 			} else {
 				fs.residue = true
 			}
 		}
+		if len(free) == 0 {
+			done += hostarch.PageSize
+		}
 	}
-	return moved
+	return done
 }
 
 // movePrivateLocked moves the private pages that mm maps at ar to src, if mm

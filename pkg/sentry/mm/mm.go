@@ -80,6 +80,10 @@ type MemoryManager struct {
 	// activeMu.
 	fold foldState `state:"nosave"`
 
+	// foldGroup is mm's fork group, or 0 for any; see FoldGroup. It is set
+	// before mm is used, and immutable after.
+	foldGroup uint64 `state:"nosave"`
+
 	// haveASIO is the cached result of p.SupportsAddressSpaceIO(). Aside from
 	// eliminating an indirect call in the hot I/O path, this makes
 	// MemoryManager.asioEnabled() a leaf function, allowing it to be inlined.

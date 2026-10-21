@@ -96,7 +96,8 @@ func (mm *MemoryManager) disownHomesLocked() {
 	mm.homes = nil
 	mm.fold = foldState{}
 	if mm.homeOwner != 0 {
-		// Others may now hold alone the pages they shared with mm.
-		requestFolds(mm.mf)
+		// Others of its fork group may now hold alone the pages they shared
+		// with mm.
+		requestFolds(mm.mf, mm.foldGroup)
 	}
 }

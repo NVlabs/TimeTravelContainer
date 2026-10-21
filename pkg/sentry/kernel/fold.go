@@ -15,10 +15,12 @@ import (
 // Folds of a Kernel's address spaces; see mm.MemoryManager.FoldStep.
 //
 // A started Kernel whose application MemoryFile has home chunks folds its
-// address spaces when asked: when an address space on the file releases its
-// pages, which others may then hold alone, and when a capture's references on
-// the file's pages go. A Kernel's folds wait while something reads where its
-// address spaces' pages are, as a capture, fork or save does
+// address spaces when asked: those of a fork group when an address space of
+// the group releases its pages, which others of it may then hold alone (see
+// mm.MemoryManager.FoldGroup), and all when an address space of no known
+// group, as one restored from a save, releases its pages, or a capture's
+// references on the file's pages go. A Kernel's folds wait while something
+// reads where its address spaces' pages are, as a capture, fork or save does
 // (quiescePausedAnd).
 
 const (
@@ -37,7 +39,8 @@ const (
 	// collapseRetry is how long a Kernel waits, after a pass that left
 	// candidates for collapse waiting for discarded pages to be written again,
 	// before it looks at them again, as Linux's khugepaged sleeps between
-	// scans.
+	// scans; and after a pass that address spaces put off, as they looked at
+	// pages that others held a moment before (mm.MemoryManager.FoldDeferred).
 	collapseRetry = 10 * time.Second
 )
 
@@ -59,10 +62,16 @@ type kernelFolds struct {
 	// +checklocks:mu
 	stepping bool
 
-	// pending is true if a fold pass is asked for and not yet started.
+	// pending is true if a fold pass is asked for and not yet started: of
+	// all of the Kernel's address spaces if all is true, and else of those
+	// of the fork groups in groups.
 	//
 	// +checklocks:mu
 	pending bool
+	// +checklocks:mu
+	all bool
+	// +checklocks:mu
+	groups map[uint64]struct{}
 
 	// running is true while the Kernel's fold goroutine runs.
 	//
@@ -90,19 +99,34 @@ var foldKernels struct {
 
 func init() {
 	mm.FoldRequestHook = requestFolds
+	mm.FoldRetryHook = retryFoldsOf
 }
 
-// requestFolds asks each started Kernel whose application MemoryFile is mf to
-// fold its address spaces.
-func requestFolds(mf *pgalloc.MemoryFile) {
+// foldKernelsOf returns the started Kernels whose application MemoryFile is
+// mf.
+func foldKernelsOf(mf *pgalloc.MemoryFile) []*Kernel {
 	foldKernels.mu.Lock()
+	defer foldKernels.mu.Unlock()
 	kernels := make([]*Kernel, 0, len(foldKernels.kernels[mf]))
 	for k := range foldKernels.kernels[mf] {
 		kernels = append(kernels, k)
 	}
-	foldKernels.mu.Unlock()
-	for _, k := range kernels {
-		k.requestFolds()
+	return kernels
+}
+
+// requestFolds asks each started Kernel whose application MemoryFile is mf to
+// fold its address spaces of fork group group, or all if group is 0.
+func requestFolds(mf *pgalloc.MemoryFile, group uint64) {
+	for _, k := range foldKernelsOf(mf) {
+		k.requestFolds(group)
+	}
+}
+
+// retryFoldsOf has each started Kernel whose application MemoryFile is mf
+// fold its address spaces after collapseRetry.
+func retryFoldsOf(mf *pgalloc.MemoryFile) {
+	for _, k := range foldKernelsOf(mf) {
+		k.retryFolds()
 	}
 }
 
@@ -130,11 +154,11 @@ func (k *Kernel) startFolds() {
 		kernels = make(map[*Kernel]struct{})
 		foldKernels.kernels[k.mf] = kernels
 		mf := k.mf
-		mf.SetFoldNotify(func() { requestFolds(mf) })
+		mf.SetFoldNotify(func() { requestFolds(mf, 0) })
 	}
 	kernels[k] = struct{}{}
 	foldKernels.mu.Unlock()
-	k.requestFolds()
+	k.requestFolds(0)
 }
 
 // stopFolds undoes startFolds.
@@ -176,14 +200,23 @@ func (k *Kernel) holdFolds() func() {
 	}
 }
 
-// requestFolds asks k to fold its address spaces.
-func (k *Kernel) requestFolds() {
+// requestFolds asks k to fold its address spaces of fork group group, or all
+// if group is 0.
+func (k *Kernel) requestFolds(group uint64) {
 	k.folds.mu.Lock()
 	defer k.folds.mu.Unlock()
 	if k.folds.stopped || k.folds.cond == nil {
 		return
 	}
 	k.folds.pending = true
+	if group == 0 {
+		k.folds.all = true
+	} else if !k.folds.all {
+		if k.folds.groups == nil {
+			k.folds.groups = make(map[uint64]struct{})
+		}
+		k.folds.groups[group] = struct{}{}
+	}
 	if !k.folds.running {
 		k.folds.running = true
 		go k.foldLoop() // S/R-SAFE: holdFolds keeps it from moving pages while k is saved.
@@ -201,11 +234,16 @@ func (k *Kernel) foldLoop() {
 			return
 		}
 		k.folds.pending = false
+		all, groups := k.folds.all, k.folds.groups
+		k.folds.all, k.folds.groups = false, nil
 		k.folds.mu.Unlock()
 		start := time.Now()
 		var moved uint64
 		waiting := false
 		for _, m := range k.memoryManagers() {
+			if _, ok := groups[m.FoldGroup()]; !all && !ok {
+				continue
+			}
 			for {
 				n, done, ok := k.foldStep(m)
 				if !ok {
@@ -220,7 +258,7 @@ func (k *Kernel) foldLoop() {
 					break
 				}
 			}
-			waiting = waiting || m.CollapseWaiting()
+			waiting = waiting || m.CollapseWaiting() || m.FoldDeferred()
 		}
 		if waiting {
 			k.retryFolds()
@@ -240,7 +278,7 @@ func (k *Kernel) retryFolds() {
 		k.folds.mu.Lock()
 		k.folds.retrying = false
 		k.folds.mu.Unlock()
-		k.requestFolds()
+		k.requestFolds(0)
 	})
 }
 

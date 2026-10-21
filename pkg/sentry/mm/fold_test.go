@@ -4,6 +4,7 @@
 package mm
 
 import (
+	"bytes"
 	"testing"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/state"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
@@ -201,6 +203,38 @@ func TestFoldLeavesSharedPages(t *testing.T) {
 	}
 }
 
+// Two passes in a row that moved nothing and left pages that a fork shares
+// put off the next for foldResidueWait, however soon it is asked for, and it
+// says so, so that it is asked for again then. One such pass does not.
+func TestFoldWaitsAfterLeavingSharedPages(t *testing.T) {
+	ctx, parent := homeTestMemoryManager(t, false)
+	defer parent.DecUsers(ctx)
+	const pages = 32
+	addr := mapPrivate(ctx, t, parent, pages*hostarch.PageSize)
+	writePagesInRandomOrder(ctx, t, parent, addr, pages, 1)
+	child, err := cloneMemoryManagerMetadata(ctx, parent)
+	if err != nil {
+		t.Fatalf("cloneMemoryManagerMetadata: %v", err)
+	}
+	defer child.DecUsers(ctx)
+	// Copies of the even pages go to a layer: the child shares what their
+	// slots hold.
+	writePages(ctx, t, parent, addr, 0, pages, 2)
+	for pass := 1; pass <= 2; pass++ {
+		if n, done := parent.FoldStep(1 << 30); n == 0 || !done || parent.FoldDeferred() {
+			t.Fatalf("pass %d did %d bytes of work, done %t, put off %t; want it to look at the copies and leave them", pass, n, done, parent.FoldDeferred())
+		}
+	}
+	if n, done := parent.FoldStep(1 << 30); n != 0 || !done || !parent.FoldDeferred() {
+		t.Errorf("a third pass asked for at once did %d bytes of work, done %t, put off %t; want it put off", n, done, parent.FoldDeferred())
+	}
+	defer func(wait time.Duration) { foldResidueWait = wait }(foldResidueWait)
+	foldResidueWait = 0
+	if n, _ := parent.FoldStep(1 << 30); n == 0 || parent.FoldDeferred() {
+		t.Errorf("a pass asked for once foldResidueWait passed did %d bytes of work, put off %t; want it to look again", n, parent.FoldDeferred())
+	}
+}
+
 // A 2 MiB page freed in part splits into base pages at their slots. Once the
 // freed page is written again, its 2 MiB is whole and the address space's
 // alone, and a fold step collapses it into a 2 MiB page again, mapped by one
@@ -281,5 +315,57 @@ func TestCollapseRefilled2MiBPage(t *testing.T) {
 		if b[0] != want {
 			t.Fatalf("page %d holds %d, want %d", page, b[0], want)
 		}
+	}
+}
+
+// A live fork's clone is of its source's fork group, and a new address space
+// of a group of its own. An address space that releases its pages asks only
+// its group to fold: only its group shared pages with it. An address space
+// restored from a save, and its fork, are of group 0, any, as a save keeps no
+// groups, and ask every group.
+func TestFoldGroups(t *testing.T) {
+	ctx, parent := homeTestMemoryManager(t, false)
+	defer parent.DecUsers(ctx)
+	other := testMemoryManager(ctx, t)
+	defer other.DecUsers(ctx)
+	if parent.FoldGroup() == 0 || other.FoldGroup() == parent.FoldGroup() {
+		t.Fatalf("new address spaces are of groups %d and %d, want a group each", parent.FoldGroup(), other.FoldGroup())
+	}
+	child, err := cloneMemoryManagerMetadata(ctx, parent)
+	if err != nil {
+		t.Fatalf("cloneMemoryManagerMetadata: %v", err)
+	}
+	if child.FoldGroup() != parent.FoldGroup() {
+		t.Errorf("a live fork's clone is of group %d, want its source's, %d", child.FoldGroup(), parent.FoldGroup())
+	}
+	var asked []uint64
+	defer func(hook func(*pgalloc.MemoryFile, uint64)) { FoldRequestHook = hook }(FoldRequestHook)
+	FoldRequestHook = func(_ *pgalloc.MemoryFile, group uint64) { asked = append(asked, group) }
+	child.DecUsers(ctx)
+	if len(asked) != 1 || asked[0] != parent.FoldGroup() {
+		t.Errorf("the released clone asked groups %v to fold, want its own, %d", asked, parent.FoldGroup())
+	}
+
+	parent.mf.MarkSavable()
+	var metadata bytes.Buffer
+	if _, err := state.Save(ctx, &metadata, parent); err != nil {
+		t.Fatalf("state.Save: %v", err)
+	}
+	restored := &MemoryManager{}
+	if _, err := state.Load(ctx, &metadata, restored); err != nil {
+		t.Fatalf("state.Load: %v", err)
+	}
+	fork, err := restored.Fork(ctx)
+	if err != nil {
+		t.Fatalf("Fork: %v", err)
+	}
+	if restored.FoldGroup() != 0 || fork.FoldGroup() != 0 {
+		t.Errorf("a restored address space and its fork are of groups %d and %d, want 0, any", restored.FoldGroup(), fork.FoldGroup())
+	}
+	asked = nil
+	fork.DecUsers(ctx)
+	restored.DecUsers(ctx)
+	if len(asked) != 2 || asked[0] != 0 || asked[1] != 0 {
+		t.Errorf("the released restored address space and its fork asked groups %v to fold, want 0, any, each", asked)
 	}
 }

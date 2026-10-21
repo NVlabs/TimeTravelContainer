@@ -143,6 +143,9 @@ func (mm *MemoryManager) afterLoad(ctx goContext.Context) {
 	// it restores stay where they are, until a fold.
 	mm.initHomes()
 	mm.fold.foldable = mm.homeOwner != 0
+	// A save keeps no fork groups: an address space restored from one stays
+	// of group 0, any (see FoldGroup). One that a live fork made took its
+	// source's in loadPmas.
 	if pgalloc.SparseRelocationFromContext(ctx) != nil {
 		for pseg := mm.pmas.FirstSegment(); pseg.Ok(); {
 			mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile)
@@ -290,6 +293,8 @@ func (mm *MemoryManager) loadPmas(ctx goContext.Context, saved []pmaFlatSegment)
 	if snapshot == nil {
 		panic(fmt.Sprintf("live-fork PMA snapshot %d was not provided", mm.liveForkPMAKey))
 	}
+	// mm shares its source's pages: they are of one fork group.
+	mm.foldGroup = snapshot.group
 	pgap := mm.pmas.FirstGap()
 	for _, entry := range snapshot.entries {
 		pma := entry.pma

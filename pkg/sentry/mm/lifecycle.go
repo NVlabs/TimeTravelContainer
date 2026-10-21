@@ -47,6 +47,7 @@ func NewMemoryManager(p platform.Platform, mf *pgalloc.MemoryFile) (*MemoryManag
 		auxv:        arch.Auxv{},
 		dumpability: atomicbitops.FromInt32(int32(UserDumpable)),
 		aioManager:  aioManager{contexts: make(map[uint64]*AIOContext)},
+		foldGroup:   newFoldGroup(),
 	}
 	mm.initHomes()
 	return mm, nil
@@ -86,6 +87,10 @@ func (mm *MemoryManager) PrepareLiveFork() {
 // references; the primary child must be loaded before the source resumes.
 type LiveForkPMASnapshot struct {
 	entries []liveForkPMAEntry
+
+	// group is the fork group of the address space the snapshot is of,
+	// which the address spaces made from it join; see FoldGroup.
+	group uint64
 }
 
 type liveForkPMAEntry struct {
@@ -127,7 +132,7 @@ func (mm *MemoryManager) prepareLiveFork(key uint64) (*LiveForkPMASnapshot, erro
 
 	var snapshot *LiveForkPMASnapshot
 	if key != 0 {
-		snapshot = &LiveForkPMASnapshot{}
+		snapshot = &LiveForkPMASnapshot{group: mm.foldGroup}
 	}
 	// A device's DMA uses pages that a driver pinned, which copy-on-write
 	// would take from their process: see pgalloc.MemoryFile.PinForDMA.
@@ -292,6 +297,7 @@ func (mm *MemoryManager) Fork(ctx context.Context) (*MemoryManager, error) {
 		// MLockNone, both of which are zero values. vma.mlockMode is reset
 		// when copied below.
 		captureInvalidations: true,
+		foldGroup:            mm.foldGroup,
 		argv:                 mm.argv,
 		envv:                 mm.envv,
 		auxv:                 append(arch.Auxv(nil), mm.auxv...),

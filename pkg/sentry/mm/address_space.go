@@ -199,7 +199,7 @@ func (mm *MemoryManager) mapFileLocked(addr hostarch.Addr, f memmap.File, fr mem
 		// A fold may make fewer mappings of what mm maps.
 		if mm.homeOwner != 0 {
 			mm.fold.foldable = true
-			requestFolds(mm.mf)
+			requestFolds(mm.mf, mm.foldGroup)
 		}
 		mm.unmapASLocked(mm.applicationAddrRange())
 		err = mm.as.MapFile(addr, f, fr, at, precommit)

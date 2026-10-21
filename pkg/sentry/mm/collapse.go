@@ -46,7 +46,8 @@ func (mm *MemoryManager) noteCollapsibleLocked(ar hostarch.AddrRange, fr memmap.
 		noted = true
 	}
 	if noted {
-		requestFolds(mm.mf)
+		// It is collapsed once it has waited collapseAge.
+		requestFoldsLater(mm.mf)
 	}
 }
 
@@ -88,7 +89,8 @@ func (mm *MemoryManager) noteCollapsibleBlockLocked(block hostarch.AddrRange) {
 		}
 	}
 	if noted {
-		requestFolds(mm.mf)
+		// It is collapsed once it has waited collapseAge.
+		requestFoldsLater(mm.mf)
 	}
 }
 
@@ -206,10 +208,16 @@ func (mm *MemoryManager) noteDecommittedLocked(ar hostarch.AddrRange) {
 	if mm.homeOwner == 0 || !mm.mf.MayCollapse() {
 		return
 	}
+	noted := false
 	for start := ar.Start.HugeRoundDown(); start < ar.End; start += hostarch.HugePageSize {
 		if len(mm.fold.collapse) < maxWaitingCollapses {
 			mm.noteCollapseLocked(start)
+			noted = true
 		}
+	}
+	if noted {
+		// A pass looks at them once they have waited collapseAge.
+		requestFoldsLater(mm.mf)
 	}
 }
 
