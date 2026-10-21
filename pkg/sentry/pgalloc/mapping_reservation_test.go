@@ -6,6 +6,7 @@
 package pgalloc
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -102,4 +103,88 @@ func TestReserveMappings(t *testing.T) {
 			}
 		}
 	}
+}
+
+// vmPTE returns how many KiB of page tables this process has.
+func vmPTE(t *testing.T) uint64 {
+	t.Helper()
+	status, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(status), "\n") {
+		var kib uint64
+		if n, _ := fmt.Sscanf(line, "VmPTE: %d kB", &kib); n == 1 {
+			return kib
+		}
+	}
+	t.Fatal("no VmPTE in /proc/self/status")
+	return 0
+}
+
+// The host keeps the page tables of a mapping after its pages are gone. A
+// home that is spared, having lost its owner and its pages, is mapped afresh,
+// which drops the page tables of the file's mapping of it; its slots read and
+// write as before once taken again.
+func TestSparedHomeDropsPageTables(t *testing.T) {
+	file, err := os.CreateTemp("", "ttc-spared-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(file.Name()); err != nil {
+		t.Fatal(err)
+	}
+	mf, err := NewMemoryFile(file, MemoryFileOpts{
+		DelayedEviction:         DelayedEvictionDisabled,
+		DisableIMAWorkAround:    true,
+		DisableMemoryAccounting: true,
+		ExpectHugepages:         true,
+		AdviseNoHugepage:        true,
+		MaxHomes:                4,
+		ReserveMappings:         true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mf.Destroy()
+	owner := NewHomeOwner()
+	home, err := mf.ReserveHome(owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A page in each of 256 2 MiB of the home, written through the file's
+	// mapping, which takes a page table for each.
+	const regions = 256
+	var pages []memmap.FileRange
+	for i := uint64(0); i < regions; i++ {
+		fr, err := mf.AllocateAt(slotRange(home, i*pagesPerHugePage+1, 1), AllocOpts{Kind: usage.Anonymous})
+		if err != nil {
+			t.Fatal(err)
+		}
+		fillPages(t, mf, fr, 1)
+		pages = append(pages, fr)
+	}
+	before := vmPTE(t)
+	for _, fr := range pages {
+		mf.DecRef(fr)
+	}
+	mf.DisownHome(owner, home)
+	waitForRelease(t, mf)
+	if after := vmPTE(t); after+regions*hostarch.PageSize/1024*3/4 > before {
+		t.Errorf("page tables went from %d KiB to %d KiB once the home was spared, want about %d KiB fewer", before, after, regions*hostarch.PageSize/1024)
+	}
+
+	again, err := mf.ReserveHome(NewHomeOwner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fr, err := mf.AllocateAt(slotRange(again, 1, 1), AllocOpts{Kind: usage.Anonymous})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fillPages(t, mf, fr, 7)
+	if !pagesHold(t, mf, fr, 7) {
+		t.Error("a page of a home mapped afresh lost what was written to it")
+	}
+	mf.DecRef(fr)
 }

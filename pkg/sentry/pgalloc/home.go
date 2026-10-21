@@ -9,6 +9,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
@@ -262,6 +263,28 @@ func (f *MemoryFile) spareHomeIfEmptyLocked(i uint64) {
 		hc.hasUnit = false
 	}
 	f.freeHomes = append(f.freeHomes, i)
+	f.remapSparedHomeLocked(i)
+}
+
+// remapSparedHomeLocked maps the home chunk i, which has neither an owner nor
+// pages, afresh where f reserved addresses for its chunks. The host keeps the
+// page tables of the Sentry's mapping of pages once they are gone, and an
+// address space's pages spread over its home by their addresses, so that a
+// home that address spaces held one after another, as a build's processes
+// do, keeps up to 2 MiB of them, however few pages each held.
+//
+// Preconditions: f.mu must be locked.
+func (f *MemoryFile) remapSparedHomeLocked(i uint64) {
+	off := i * chunkSize
+	if f.file == nil || f.backing != nil || f.reservation.length == 0 || off+chunkSize > uint64(f.reservation.length) {
+		return
+	}
+	addr, err := f.mapChunksLocked(off, chunkSize)
+	if err != nil {
+		log.Warningf("MemoryFile: mapping spared home chunk %d again: %v", i, err)
+		return
+	}
+	f.madviseChunkMapping(addr, chunkSize, false)
 }
 
 // unitSlots returns the window of the residency unit of length bytes whose
