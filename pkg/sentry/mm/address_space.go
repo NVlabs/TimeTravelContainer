@@ -55,8 +55,23 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 	return mm.mapASWindowLocked(ctx, pseg, ar, platformEffect, hostarch.AddrRange{})
 }
 
+// mapASExactLocked is mapASLocked, but an address space with homes maps only
+// ar. Its callers have just made ar usable (a small mmap they populate, or
+// memory the Sentry copies into), and the pmas of ar may have merged with
+// neighbors that are mapped already (see mapASWindowLocked).
+//
+// Preconditions: as for mapASLocked.
+func (mm *MemoryManager) mapASExactLocked(ctx context.Context, pseg pmaIterator, ar hostarch.AddrRange, platformEffect memmap.MMapPlatformEffect) error {
+	var window hostarch.AddrRange
+	if mm.homeOwner != 0 {
+		window = ar
+	}
+	return mm.mapASWindowLocked(ctx, pseg, ar, platformEffect, window)
+}
+
 // mapASWindowLocked is mapASLocked, but maps nothing outside window, unless
-// window is empty.
+// window is empty; an address space with homes maps nothing outside the 2 MiB
+// around ar then.
 //
 // A fault that inserted pmas maps only what it inserted and the pages it
 // faulted (see HandleUserFault): a pma it inserted may merge with pmas mapped
@@ -64,7 +79,8 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 // (see allocatePrivateLocked), and a platform that maps whole pmas (MapUnit 0)
 // would map those again, which drops their host page tables and makes the
 // application fault on each of their pages once more. The host merges the
-// new mapping with theirs.
+// new mapping with theirs. An address space with homes has the same problem
+// with every other mapping it makes, such as populating a small mmap.
 //
 // Preconditions: as for mapASLocked; window, if not empty, contains ar.
 func (mm *MemoryManager) mapASWindowLocked(ctx context.Context, pseg pmaIterator, ar hostarch.AddrRange, platformEffect memmap.MMapPlatformEffect, window hostarch.AddrRange) error {
@@ -105,6 +121,14 @@ func (mm *MemoryManager) mapASWindowLocked(ctx context.Context, pseg pmaIterator
 		} else {
 			setMapUnit(32 << 20)
 		}
+	}
+	if window.Length() == 0 && mm.homeOwner != 0 {
+		// An address space's private pages at adjacent slots of its homes
+		// make one pma, however many allocations made them: a whole pma
+		// may be all of a process's memory, mapped already, and mapping it
+		// again for a page would drop the host page tables of all of it.
+		// Map as much as an allocation makes (see getPMAsInternalLocked).
+		window = hugepageAligned(ar)
 	}
 	if window.Length() != 0 {
 		mapAR = mapAR.Intersect(window)

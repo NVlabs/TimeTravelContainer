@@ -204,7 +204,9 @@ func (as *recordingAddressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr m
 
 // A fault that inserts pmas maps what it inserted, not the rest of the pma
 // they merge with, which is mapped already: mapping it again would drop its
-// host page tables. A fault on a pma that exists maps all of it.
+// host page tables. A fault on a pma that exists maps the 2 MiB around it, as
+// much as a fault that allocates does, and a small mmap that is populated
+// maps itself alone.
 func TestFaultMapsOnlyAroundWhatItInserted(t *testing.T) {
 	ctx, memMgr := homeTestMemoryManager(t, false)
 	defer memMgr.DecUsers(ctx)
@@ -228,6 +230,33 @@ func TestFaultMapsOnlyAroundWhatItInserted(t *testing.T) {
 		t.Fatalf("a fault that allocated mapped %d bytes, more than the 2 MiB it allocated", as.longest)
 	}
 
+	// A small mmap in a hole of the pma, whose slots it takes again, merges
+	// with it, and maps only itself when it is populated.
+	const small = 64 << 10
+	hole := addr + length/2
+	if err := memMgr.MUnmap(ctx, hole, small); err != nil {
+		t.Fatal(err)
+	}
+	as.longest = 0
+	memMgr.as = as
+	if _, err := memMgr.MMap(ctx, memmap.MMapOpts{
+		Length:   small,
+		Addr:     hole,
+		Fixed:    true,
+		Private:  true,
+		Perms:    hostarch.ReadWrite,
+		MaxPerms: hostarch.AnyAccess,
+	}); err != nil {
+		t.Fatalf("MMap: %v", err)
+	}
+	memMgr.as = as.AddressSpace
+	if n := countPMAs(memMgr, hostarch.AddrRange{Start: addr, End: addr + length}); n != 1 {
+		t.Fatalf("%d pmas map the range once the hole is mapped again, want 1", n)
+	}
+	if as.longest != small {
+		t.Fatalf("populating a %d-byte mmap mapped %d bytes, want it alone", small, as.longest)
+	}
+
 	child, err := cloneMemoryManagerMetadata(ctx, memMgr)
 	if err != nil {
 		t.Fatal(err)
@@ -238,8 +267,8 @@ func TestFaultMapsOnlyAroundWhatItInserted(t *testing.T) {
 	if err := child.HandleUserFault(ctx, addr, hostarch.Read, 0); err != nil {
 		t.Fatal(err)
 	}
-	if childAS.longest != length {
-		t.Fatalf("a read fault on an existing pma mapped %d bytes, want all %d", childAS.longest, length)
+	if childAS.longest != hostarch.HugePageSize {
+		t.Fatalf("a read fault on an existing pma mapped %d bytes, want the %d around it", childAS.longest, hostarch.HugePageSize)
 	}
 	// The child's copies, at their slots, merge with each other; each write
 	// fault maps the page it copied.

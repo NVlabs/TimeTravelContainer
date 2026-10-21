@@ -241,7 +241,7 @@ func (mm *MemoryManager) populateVMA(ctx context.Context, vseg vmaIterator, ar h
 	// Downgrade to a read-lock on activeMu since we don't need to mutate pmas
 	// anymore.
 	mm.activeMu.DowngradeLock()
-	err = mm.mapASLocked(ctx, pseg, ar, platformEffect)
+	err = mm.mapASExactLocked(ctx, pseg, ar, platformEffect)
 	mm.activeMu.RUnlock()
 	return err
 }
@@ -290,7 +290,7 @@ func (mm *MemoryManager) populateVMAAndUnlock(ctx context.Context, vseg vmaItera
 
 	// As above, errors are silently ignored.
 	mm.activeMu.DowngradeLock()
-	mm.mapASLocked(ctx, pseg, ar, platformEffect)
+	mm.mapASExactLocked(ctx, pseg, ar, platformEffect)
 	mm.activeMu.RUnlock()
 }
 
