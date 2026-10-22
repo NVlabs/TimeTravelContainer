@@ -1244,6 +1244,23 @@ func TestInvalidClears(t *testing.T) {
 	f.submit(t, s)
 }
 
+// A vertex buffer bound at an offset past its end, of which Zink would
+// bind the bytes of an underflowed size, is no buffer: the draw reads none
+// of it.
+func TestVertexBufferPastItsEnd(t *testing.T) {
+	f := newFixture(t)
+	var s stream
+	f.setup(&s)
+	s.cmd(cmdSetVertexBuffers, 0, 16, 1<<20, f.vb.ID())
+	clearRed(&s)
+	drawTriangle(&s)
+	f.submit(t, s)
+	f.finish(t)
+	if p := f.pixel(4, height/2); p != red {
+		t.Errorf("where the triangle would be: %v, want %v", p, red)
+	}
+}
+
 func TestInvalidCommands(t *testing.T) {
 	f := newFixture(t)
 	for _, tc := range []struct {

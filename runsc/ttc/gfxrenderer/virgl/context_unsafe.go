@@ -1711,9 +1711,17 @@ func (c *Context) bindVertexState() error {
 	old := make([]*Resource, sub.numVBs)
 	for i := 0; i < sub.numVBs; i++ {
 		vb := sub.vbs[i]
-		res[i] = pipeOf(vb.res)
+		r := vb.res
+		// Zink binds a buffer from an offset, which Vulkan requires within
+		// it, and, of buffers' addresses, of the size from the offset to
+		// the end, which an offset past it underflows, of which the GPU
+		// reads past the buffer: a slot of one has none, of zeros.
+		if r != nil && vb.offset >= uint32(C.ttc_virgl_resource_width(r.pipe, 0)) {
+			r = nil
+		}
+		res[i] = pipeOf(r)
 		offsets[i] = C.uint32_t(vb.offset)
-		old[i] = sub.hold(slot{slotVertexBuffer, 0, uint32(i)}, vb.res)
+		old[i] = sub.hold(slot{slotVertexBuffer, 0, uint32(i)}, r)
 	}
 	C.ttc_virgl_set_vertex_buffers(sub.pipe, C.uint32_t(sub.numVBs), &res[0], &offsets[0])
 	release(old...)
