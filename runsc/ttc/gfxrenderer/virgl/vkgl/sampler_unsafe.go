@@ -45,6 +45,60 @@ func (d *Device) NewSampler(desc SamplerDesc) (*Sampler, error) {
 	return &Sampler{sampler: *h}, nil
 }
 
+// NewSamplerOf returns a sampler of a Gallium sampler state's.
+func (d *Device) NewSamplerOf(st *SamplerState) (*Sampler, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	a := d.a
+	defer a.reset()
+	limits := &d.props.Limits
+	info := get[vn.VkSamplerCreateInfo](a)
+	info.SType = vn.VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO
+	// Gallium's filters, PIPE_TEX_FILTER_*, are Vulkan's, VkFilter.
+	info.MagFilter, info.MinFilter = st.MagFilter, st.MinFilter
+	info.AddressModeU, info.AddressModeV, info.AddressModeW = VkAddressMode(st.WrapS), VkAddressMode(st.WrapT), VkAddressMode(st.WrapR)
+	info.MipLodBias = max(min(st.LodBias, limits.MaxSamplerLodBias), -limits.MaxSamplerLodBias)
+	info.MinLod, info.MaxLod = st.MinLod, st.MaxLod
+	switch st.MipFilter {
+	case MipFilterLinear:
+		info.MipmapMode = 1 // VK_SAMPLER_MIPMAP_MODE_LINEAR
+	case MipFilterNone:
+		// Of the base level only, as Zink samples it.
+		info.MinLod, info.MaxLod = 0, 0.25
+	}
+	if st.MaxAnisotropy > 1 && d.features10.SamplerAnisotropy != 0 {
+		info.AnisotropyEnable = 1
+		info.MaxAnisotropy = min(float32(st.MaxAnisotropy), limits.MaxSamplerAnisotropy)
+	}
+	if st.CompareMode {
+		// Gallium's functions, PIPE_FUNC_*, are Vulkan's, VkCompareOp.
+		info.CompareEnable, info.CompareOp = 1, st.CompareFunc&7
+	}
+	info.BorderColor = vkBorderColor(st.BorderColor)
+	h := get[vn.Handle](a)
+	cs := get[vn.Args_vkCreateSampler](a)
+	cs.Device, cs.PCreateInfo, cs.PSampler = d.dev, unsafe.Pointer(info), unsafe.Pointer(h)
+	vk.Call(vn.VK_COMMAND_TYPE_vkCreateSampler_EXT, d.table, unsafe.Pointer(cs))
+	if err := check("vkCreateSampler", cs.Ret); err != nil {
+		return nil, err
+	}
+	return &Sampler{sampler: *h}, nil
+}
+
+// vkBorderColor returns Vulkan's border color, VkBorderColor, that is
+// nearest a Gallium border color's bits, as floats: transparent black,
+// opaque black, or opaque white.
+func vkBorderColor(c [4]uint32) uint32 {
+	const one = 0x3f800000
+	switch {
+	case c[0] == one && c[1] == one && c[2] == one && c[3] == one:
+		return 4 // VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE
+	case c[3] == one:
+		return 2 // VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK
+	}
+	return 0 // VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK
+}
+
 // DestroySampler destroys s, which the GPU no longer uses.
 func (d *Device) DestroySampler(s *Sampler) {
 	d.mu.Lock()

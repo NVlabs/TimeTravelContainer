@@ -26,7 +26,6 @@ const (
 	bindQueryBuffer         = 1 << 15
 	target2D                = 2
 	clearColor0             = 1 << 2
-	queryOcclusionCounter   = 0
 )
 
 // stream encodes virgl's commands, as Mesa's virgl driver does.
@@ -115,7 +114,7 @@ type fixture struct {
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
 	if err := Init(); err != nil {
-		t.Skipf("Zink is unavailable: %v", err)
+		t.Skipf("the backend is unavailable: %v", err)
 	}
 	f := &fixture{nextID: 100}
 	f.rtMem = make([]byte, width*height*4)
@@ -649,9 +648,15 @@ func TestTransformFeedbackLayout(t *testing.T) {
 	}
 }
 
+// onVkgl reports whether the tests render on the vkgl backend, where
+// TTC_VIRGL_BACKEND is "vkgl", or on Zink.
+func onVkgl() bool {
+	return os.Getenv("TTC_VIRGL_BACKEND") == "vkgl"
+}
+
 func TestCapsets(t *testing.T) {
 	if err := Init(); err != nil {
-		t.Skipf("Zink is unavailable: %v", err)
+		t.Skipf("the backend is unavailable: %v", err)
 	}
 	capsets, err := Capsets()
 	if err != nil {
@@ -661,13 +666,17 @@ func TestCapsets(t *testing.T) {
 		t.Fatalf("capsets %+v", capsets)
 	}
 	// struct virgl_caps_v1 begins with max_version, and v2's renderer
-	// string names Zink's device.
+	// string names the backend's device.
 	v2 := capsets[1].Data
 	if binary.LittleEndian.Uint32(v2) != 2 {
 		t.Errorf("v2's max_version %d", binary.LittleEndian.Uint32(v2))
 	}
-	if !strings.Contains(string(v2), "zink") {
-		t.Errorf("v2 names no renderer of Zink's")
+	backend := "zink"
+	if onVkgl() {
+		backend = "vkgl"
+	}
+	if !strings.Contains(string(v2), backend) {
+		t.Errorf("v2 names no renderer of %s's", backend)
 	}
 }
 
@@ -1391,7 +1400,9 @@ func TestUntranslatableTGSI(t *testing.T) {
 			var s stream
 			s.shader(f.id(), tc.stage, tc.text, 1<<16)
 			err := f.c.Submit(s.bytes())
-			if err == nil {
+			// Of Zink's translator: vkgl's, tospirv, translates of its own
+			// limits, which its tests check, and of these, refuses some.
+			if err == nil && !onVkgl() {
 				t.Errorf("no error")
 			}
 			t.Logf("%v", err)

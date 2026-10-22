@@ -1,7 +1,8 @@
 # A Go backend for TTC's virgl renderer
 
 Status: in progress (2026-10-23). Stage 1, the shader translator, is done;
-stage 2 is under way, and stage 3 is planned.
+stage 2 is under way: the decoder renders on the Go backend where
+`TTC_VIRGL_BACKEND` is `vkgl`, and on Zink otherwise. Stage 3 is planned.
 
 ## Goal
 
@@ -145,5 +146,11 @@ Stage 2 implements the decoder's backend (`virgl.h`'s operations) in Go:
     shader, translate, print as they parse, and validate.)
 2.  The state tracker, behind the decoder's backend interface, with Zink as
     the other backend: the virgl tests, `e2e_gfx.sh`'s OpenGL ES, and
-    redroid, compared with Zink's pixels.
+    redroid, compared with Zink's pixels. (Under way, 2026-10-23: the
+    decoder executes on a backend interface, and `vkgl` renders draws,
+    clears, copies, blits, queries, transform feedback and clones; the
+    virgl tests pass on both backends, of no errors of Vulkan's validation
+    layer of vkgl's, and the corpus's shaders create on both. Not yet:
+    shader buffers and images, compute, geometry and tessellation,
+    indirect draws, texture buffers.)
 3.  Mesa removed: no `tools/mesa.BUILD`, no glibc shims for it.

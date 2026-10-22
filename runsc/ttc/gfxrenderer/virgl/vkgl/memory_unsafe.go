@@ -149,6 +149,11 @@ func (d *Device) NewBuffer(size uint64, usage uint32, hostVisible bool) (*Buffer
 	return b, nil
 }
 
+// Size returns the buffer's size in bytes.
+func (b *Buffer) Size() uint64 {
+	return b.size
+}
+
 // Bytes returns a mapped buffer's memory.
 func (b *Buffer) Bytes() []byte {
 	if b.mem.data == nil {

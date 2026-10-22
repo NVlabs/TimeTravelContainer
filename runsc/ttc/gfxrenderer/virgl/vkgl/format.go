@@ -54,3 +54,22 @@ func (f Format) IsStencil() bool {
 func (f Format) IsInteger() (integer, signed bool) {
 	return f.kind == kindSint || f.kind == kindUint, f.kind == kindSint
 }
+
+// vkColor returns a color of the format's channels, of a clear or a write,
+// as the Vulkan format's: each of the channel that the swizzle reads it
+// as, or 0.
+func (f Format) vkColor(color [4]uint32) [4]uint32 {
+	if f.Swizzle == "XYZW" {
+		return color
+	}
+	var c [4]uint32
+	for k := range c {
+		for j := range f.Swizzle {
+			if f.Swizzle[j] == "XYZW"[k] {
+				c[k] = color[j]
+				break
+			}
+		}
+	}
+	return c
+}

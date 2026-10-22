@@ -169,6 +169,10 @@ func (d *Device) NewSamplerView(t *Texture, desc ViewDesc) (*SamplerView, error)
 	defer d.mu.Unlock()
 	a := d.a
 	defer a.reset()
+	// Of formats that the device samples, of images of their usage.
+	if t.usage&ImageSampled == 0 || d.formatFeatures(f.VK)&featureSampledImage == 0 {
+		return nil, fmt.Errorf("a view of %s, which %s samples not, of %+v", f.Name, d.Name, t.Desc)
+	}
 	aspects := t.aspects
 	switch {
 	case f.IsDepth():

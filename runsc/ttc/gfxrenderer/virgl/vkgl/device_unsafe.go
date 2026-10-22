@@ -104,12 +104,20 @@ type Device struct {
 	table     vk.Table
 	queue     vn.Handle
 	family    uint32
+	// timestampBits are the bits of the queue's timestamps, or 0 if it
+	// has none.
+	timestampBits uint32
 
 	props    vn.VkPhysicalDeviceProperties
 	memProps vn.VkPhysicalDeviceMemoryProperties
 	// The device's features, which it enables, of Vulkan 1.0 and 1.3.
 	features10 vn.VkPhysicalDeviceFeatures
 	features13 vn.VkPhysicalDeviceVulkan13Features
+	// The features of extensions that the device enables where it has
+	// them, of Gallium's that Vulkan 1.3 lacks: indexes of a byte, flat
+	// varyings of primitives' last vertices, of which pipelines may
+	// differ in a rendering instance, and instances' divisors.
+	indexUint8, provokingLast, divisors bool
 	// mapMemory is the device's vkMapMemory.
 	mapMemory unsafe.Pointer
 	// features are the formats' properties.
@@ -292,18 +300,72 @@ func (d *Device) chooseQueueFamily() (uint32, error) {
 	vk.Call(vn.VK_COMMAND_TYPE_vkGetPhysicalDeviceQueueFamilyProperties_EXT, d.pdTable, unsafe.Pointer(qf))
 	for i, f := range families[:*count] {
 		if f.QueueFlags&(queueGraphics|queueCompute) == queueGraphics|queueCompute {
+			d.timestampBits = f.TimestampValidBits
 			return uint32(i), nil
 		}
 	}
 	return 0, fmt.Errorf("%s has no queue of graphics and compute", d.Name)
 }
 
+// extensions returns the names of the physical device's extensions.
+func (d *Device) extensions() map[string]bool {
+	a := d.a
+	has := make(map[string]bool)
+	count := get[uint32](a)
+	ee := get[vn.Args_vkEnumerateDeviceExtensionProperties](a)
+	ee.PhysicalDevice, ee.PPropertyCount = d.pd, unsafe.Pointer(count)
+	vk.Call(vn.VK_COMMAND_TYPE_vkEnumerateDeviceExtensionProperties_EXT, d.pdTable, unsafe.Pointer(ee))
+	if ee.Ret != vn.VK_SUCCESS || *count == 0 {
+		return has
+	}
+	props := array[vn.VkExtensionProperties](a, int(*count))
+	ee.PProperties = unsafe.Pointer(&props[0])
+	vk.Call(vn.VK_COMMAND_TYPE_vkEnumerateDeviceExtensionProperties_EXT, d.pdTable, unsafe.Pointer(ee))
+	if ee.Ret < 0 {
+		return has
+	}
+	for _, p := range props[:min(int(*count), len(props))] {
+		has[cString(p.ExtensionName[:])] = true
+	}
+	return has
+}
+
 // createDevice creates the device, of its physical device's every feature
-// of Vulkan 1.0 to 1.3, and gets its queue.
+// of Vulkan 1.0 to 1.3, and of the extensions of Device's features, and
+// gets its queue.
 func (d *Device) createDevice() error {
 	a := d.a
+	has := d.extensions()
+	ext := func(names ...string) string {
+		for _, n := range names {
+			if has[n] {
+				return n
+			}
+		}
+		return ""
+	}
 	f13 := get[vn.VkPhysicalDeviceVulkan13Features](a)
 	f13.SType = vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES
+	// The features of the extensions that the device has, after Vulkan
+	// 1.3's.
+	tail := &f13.PNext
+	link := func(name string, feature unsafe.Pointer, next *unsafe.Pointer) {
+		if name != "" {
+			*tail, tail = feature, next
+		}
+	}
+	idx8 := get[vn.VkPhysicalDeviceIndexTypeUint8Features](a)
+	idx8.SType = vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES
+	idx8Ext := ext("VK_KHR_index_type_uint8", "VK_EXT_index_type_uint8")
+	link(idx8Ext, unsafe.Pointer(idx8), &idx8.PNext)
+	pv := get[vn.VkPhysicalDeviceProvokingVertexFeaturesEXT](a)
+	pv.SType = vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT
+	pvExt := ext("VK_EXT_provoking_vertex")
+	link(pvExt, unsafe.Pointer(pv), &pv.PNext)
+	div := get[vn.VkPhysicalDeviceVertexAttributeDivisorFeatures](a)
+	div.SType = vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES
+	divExt := ext("VK_KHR_vertex_attribute_divisor", "VK_EXT_vertex_attribute_divisor")
+	link(divExt, unsafe.Pointer(div), &div.PNext)
 	f12 := get[vn.VkPhysicalDeviceVulkan12Features](a)
 	f12.SType = vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES
 	f12.PNext = unsafe.Pointer(f13)
@@ -322,6 +384,31 @@ func (d *Device) createDevice() error {
 	d.features10 = features.Features
 	d.features13 = *f13
 	d.features13.PNext = nil
+	var exts []string
+	if runtime.GOOS == "darwin" {
+		exts = append(exts, "VK_KHR_portability_subset")
+	}
+	if idx8Ext != "" {
+		exts = append(exts, idx8Ext)
+		d.indexUint8 = idx8.IndexTypeUint8 != 0
+	}
+	if pvExt != "" {
+		exts = append(exts, pvExt)
+		// Of no transform feedback, which the device does not enable.
+		pv.TransformFeedbackPreservesProvokingVertex = 0
+		pvProps := get[vn.VkPhysicalDeviceProvokingVertexPropertiesEXT](a)
+		pvProps.SType = vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_PROPERTIES_EXT
+		props := get[vn.VkPhysicalDeviceProperties2](a)
+		props.SType, props.PNext = vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, unsafe.Pointer(pvProps)
+		gp := get[vn.Args_vkGetPhysicalDeviceProperties2](a)
+		gp.PhysicalDevice, gp.PProperties = d.pd, unsafe.Pointer(props)
+		vk.Call(vn.VK_COMMAND_TYPE_vkGetPhysicalDeviceProperties2_EXT, d.pdTable, unsafe.Pointer(gp))
+		d.provokingLast = pv.ProvokingVertexLast != 0 && pvProps.ProvokingVertexModePerPipeline != 0
+	}
+	if divExt != "" {
+		exts = append(exts, divExt)
+		d.divisors = div.VertexAttributeInstanceRateDivisor != 0
+	}
 
 	priority := get[float32](a)
 	*priority = 1
@@ -336,10 +423,6 @@ func (d *Device) createDevice() error {
 	info.PNext = unsafe.Pointer(features)
 	info.QueueCreateInfoCount = 1
 	info.PQueueCreateInfos = unsafe.Pointer(queue)
-	var exts []string
-	if runtime.GOOS == "darwin" {
-		exts = append(exts, "VK_KHR_portability_subset")
-	}
 	info.EnabledExtensionCount = uint32(len(exts))
 	info.PpEnabledExtensionNames = cstrings(a, exts)
 	dev := get[vn.Handle](a)

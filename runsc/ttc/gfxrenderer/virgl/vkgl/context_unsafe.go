@@ -29,6 +29,17 @@ type Context struct {
 	// the batches that it submitted that the GPU may not have finished.
 	batch    *batch
 	inflight []*batch
+	// fb is the framebuffer that draws render to.
+	fb Framebuffer
+	// occlusion and timestamps are the context's Vulkan queries, of its
+	// Query's; segment is the batch's occlusion query that counts for the
+	// active occlusion queries, active, or nil.
+	occlusion, timestamps queryPools
+	segment               *vkQuery
+	active                []*Query
+	// blitPipelines and blitSamplers are the blitter's.
+	blitPipelines map[string]*Pipeline
+	blitSamplers  [2]*Sampler
 }
 
 // batch is a command buffer of the context's, and what its commands use,
@@ -38,16 +49,26 @@ type batch struct {
 	fence vn.Handle
 	// staging are buffers of transfers, which the batch frees.
 	staging []*Buffer
-	// descPool is the pool of the batch's descriptor sets, or 0.
-	descPool vn.Handle
+	// descPools are the pools of the batch's descriptor sets.
+	descPools []vn.Handle
 	// rendering is whether the batch's commands are of a rendering
 	// instance, which commands that render not end.
 	rendering bool
+	// kept are what the batch's commands use, by keys of Keep's, and the
+	// functions that release them once the GPU is done.
+	kept map[any]func()
+	// queries are the batch's Vulkan queries, whose results the context
+	// adds up once the GPU is done with it.
+	queries []*vkQuery
+	// dropped is whether a flush dropped the batch, of a lost device.
+	dropped bool
 }
 
 // NewContext returns a new context.
 func (d *Device) NewContext() (*Context, error) {
 	c := &Context{d: d, a: newArena()}
+	c.occlusion.typ = 0  // VK_QUERY_TYPE_OCCLUSION
+	c.timestamps.typ = 2 // VK_QUERY_TYPE_TIMESTAMP
 	a := c.a
 	defer a.reset()
 	info := get[vn.VkCommandPoolCreateInfo](a)
@@ -75,6 +96,9 @@ func (c *Context) Destroy() {
 	}
 	a := c.a
 	defer a.reset()
+	c.destroyQueryPools(&c.occlusion)
+	c.destroyQueryPools(&c.timestamps)
+	c.destroyBlitter()
 	dp := get[vn.Args_vkDestroyCommandPool](a)
 	dp.Device, dp.CommandPool = c.d.dev, c.pool
 	vk.Call(vn.VK_COMMAND_TYPE_vkDestroyCommandPool_EXT, c.d.table, unsafe.Pointer(dp))
@@ -117,6 +141,8 @@ func (c *Context) begin() error {
 		return err
 	}
 	c.batch = b
+	// The active occlusion queries count on.
+	c.openSegment(&Commands{d: d, a: a, cb: b.cb})
 	return nil
 }
 
@@ -141,6 +167,8 @@ func (c *Context) Flush() *Fence {
 		cmds.EndRendering()
 		b.rendering = false
 	}
+	// Of the active occlusion queries, of the next batch's from then on.
+	c.closeSegment(cmds, b)
 	ec := get[vn.Args_vkEndCommandBuffer](a)
 	ec.CommandBuffer = b.cb
 	vk.Call(vn.VK_COMMAND_TYPE_vkEndCommandBuffer_EXT, d.table, unsafe.Pointer(ec))
@@ -153,6 +181,7 @@ func (c *Context) Flush() *Fence {
 	if ec.Ret != vn.VK_SUCCESS || cf.Ret != vn.VK_SUCCESS {
 		// The device is lost, or out of memory: the batch's commands are
 		// dropped, as a lost device's are.
+		b.dropped = true
 		c.freeBatch(b)
 		return nil
 	}
@@ -168,6 +197,7 @@ func (c *Context) Flush() *Fence {
 	vk.Call(vn.VK_COMMAND_TYPE_vkQueueSubmit_EXT, d.table, unsafe.Pointer(qs))
 	d.qmu.Unlock()
 	if qs.Ret != vn.VK_SUCCESS {
+		b.dropped = true
 		c.freeBatch(b)
 		return nil
 	}
@@ -224,15 +254,21 @@ func (c *Context) retire() {
 // submitted.
 func (c *Context) freeBatch(b *batch) {
 	d, a := c.d, c.a
+	c.settle(b)
+	for _, release := range b.kept {
+		release()
+	}
+	b.kept = nil
 	for _, s := range b.staging {
 		d.DestroyBuffer(s)
 	}
 	b.staging = nil
-	if b.descPool != 0 {
+	for _, pool := range b.descPools {
 		dp := get[vn.Args_vkDestroyDescriptorPool](a)
-		dp.Device, dp.DescriptorPool = d.dev, b.descPool
+		dp.Device, dp.DescriptorPool = d.dev, pool
 		vk.Call(vn.VK_COMMAND_TYPE_vkDestroyDescriptorPool_EXT, d.table, unsafe.Pointer(dp))
 	}
+	b.descPools = nil
 	if b.fence != 0 {
 		df := get[vn.Args_vkDestroyFence](a)
 		df.Device, df.Fence = d.dev, b.fence
@@ -243,6 +279,24 @@ func (c *Context) freeBatch(b *batch) {
 	fc := get[vn.Args_vkFreeCommandBuffers](a)
 	fc.Device, fc.CommandPool, fc.CommandBufferCount, fc.PCommandBuffers = d.dev, c.pool, 1, unsafe.Pointer(cbs)
 	vk.Call(vn.VK_COMMAND_TYPE_vkFreeCommandBuffers_EXT, d.table, unsafe.Pointer(fc))
+}
+
+// Keep has the context's batch keep what key names until the GPU is done
+// with the batch: once a batch, it calls hold, and then what hold returns
+// once the GPU is done.
+func (c *Context) Keep(key any, hold func() func()) error {
+	if _, err := c.commands(); err != nil {
+		return err
+	}
+	b := c.batch
+	if _, ok := b.kept[key]; ok {
+		return nil
+	}
+	if b.kept == nil {
+		b.kept = make(map[any]func())
+	}
+	b.kept[key] = hold()
+	return nil
 }
 
 // outsideRendering returns the batch's commands, of no rendering
@@ -377,16 +431,12 @@ type TextureRegion struct {
 func (t *Texture) copyRegion(r TextureRegion, offset uint64) vn.VkBufferImageCopy {
 	b := r.Box
 	c := vn.VkBufferImageCopy{
-		BufferOffset:     offset,
-		ImageSubresource: vn.VkImageSubresourceLayers{AspectMask: t.aspects, MipLevel: r.Level, LayerCount: 1},
-		ImageOffset:      vn.VkOffset3D{X: int32(b.X), Y: int32(b.Y)},
-		ImageExtent:      vn.VkExtent3D{Width: uint32(b.Width), Height: uint32(b.Height), Depth: 1},
+		BufferOffset: offset,
+		ImageExtent:  vn.VkExtent3D{Width: uint32(b.Width), Height: uint32(b.Height), Depth: 1},
 	}
-	switch t.Desc.Target {
-	case Target1DArray, Target2DArray, TargetCube, TargetCubeArray:
-		c.ImageSubresource.BaseArrayLayer, c.ImageSubresource.LayerCount = uint32(b.Z), uint32(b.Depth)
-	case Target3D:
-		c.ImageOffset.Z, c.ImageExtent.Depth = int32(b.Z), uint32(b.Depth)
+	c.ImageSubresource, c.ImageOffset = t.subresource(r.Level, b.X, b.Y, b.Z, b.Depth)
+	if t.Desc.Target == Target3D {
+		c.ImageExtent.Depth = uint32(b.Depth)
 	}
 	return c
 }
@@ -416,7 +466,24 @@ func (t *Texture) memLayout(r TextureRegion) (stride, layerStride, row, rows, sp
 // from offset, as the decoder's pipe.c checks transfers.
 func (t *Texture) checkRegion(r TextureRegion, data []byte, offset uint64) error {
 	b := r.Box
-	if b.Width <= 0 || b.Height <= 0 || b.Depth <= 0 || !t.Desc.boxOK(r.Level, b) {
+	if b.Width <= 0 || b.Height <= 0 || b.Depth <= 0 {
+		return fmt.Errorf("a box %+v of level %d of %+v", b, r.Level, t.Desc)
+	}
+	if err := t.checkBox(r); err != nil {
+		return err
+	}
+	stride, _, row, _, span := t.memLayout(r)
+	if row > stride || offset > uint64(len(data)) || span > uint64(len(data))-offset {
+		return fmt.Errorf("a box %+v of level %d of %+v, of %d bytes at %d of %d", b, r.Level, t.Desc, span, offset, len(data))
+	}
+	return nil
+}
+
+// checkBox returns an error unless r's box is of a level of t, of whose
+// texels Vulkan copies buffers' bytes.
+func (t *Texture) checkBox(r TextureRegion) error {
+	b := r.Box
+	if !t.Desc.boxOK(r.Level, b) {
 		return fmt.Errorf("a box %+v of level %d of %+v", b, r.Level, t.Desc)
 	}
 	if t.Format.IsDepth() && t.Format.IsStencil() {
@@ -429,10 +496,6 @@ func (t *Texture) checkRegion(r TextureRegion, data []byte, offset uint64) error
 	}
 	if !t.blocksOK(r.Level, b) {
 		return fmt.Errorf("a box %+v of parts of blocks of %s", b, t.Format.Name)
-	}
-	stride, _, row, _, span := t.memLayout(r)
-	if row > stride || offset > uint64(len(data)) || span > uint64(len(data))-offset {
-		return fmt.Errorf("a box %+v of level %d of %+v, of %d bytes at %d of %d", b, r.Level, t.Desc, span, offset, len(data))
 	}
 	return nil
 }
@@ -474,17 +537,22 @@ func (t *Texture) tightSize(r TextureRegion) uint64 {
 // general transitions t to the general layout, in which the context keeps
 // textures, if it is not.
 func (c *Context) general(cmds *Commands, t *Texture) {
+	cmds.general(t)
+}
+
+// general transitions t to the general layout if it is not.
+func (cmds *Commands) general(t *Texture) {
 	if t.layout == ImageLayoutGeneral {
 		return
 	}
-	b := get[vn.VkImageMemoryBarrier](c.a)
+	b := get[vn.VkImageMemoryBarrier](cmds.a)
 	b.SType = vn.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
 	b.SrcAccessMask, b.DstAccessMask = AccessMemoryWrite, AccessMemoryRead|AccessMemoryWrite
 	b.OldLayout, b.NewLayout = t.layout, ImageLayoutGeneral
 	b.SrcQueueFamilyIndex, b.DstQueueFamilyIndex = ^uint32(0), ^uint32(0)
 	b.Image = t.img
 	b.SubresourceRange = vn.VkImageSubresourceRange{AspectMask: t.aspects, LevelCount: ^uint32(0), LayerCount: ^uint32(0)}
-	pb := get[vn.Args_vkCmdPipelineBarrier](c.a)
+	pb := get[vn.Args_vkCmdPipelineBarrier](cmds.a)
 	pb.SrcStageMask, pb.DstStageMask = StageAllCommands, StageAllCommands
 	pb.ImageMemoryBarrierCount, pb.PImageMemoryBarriers = 1, unsafe.Pointer(b)
 	cmds.call(vn.VK_COMMAND_TYPE_vkCmdPipelineBarrier_EXT, unsafe.Pointer(pb))

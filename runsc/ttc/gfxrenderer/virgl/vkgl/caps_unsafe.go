@@ -56,11 +56,15 @@ func (d *Device) Caps(set uint32, ubos, ssbos uint32) []byte {
 	}
 	bools := uint32(capIndepBlendFunc | capStartInstance | capPrimitiveRestart | capBlendEqSep | capInstanceID |
 		capSeamlessCubeMap | capStreamoutPauseResume | capTextureMultisample | capFragmentCoordConventions |
-		capUBO | capTextureQueryLod | capHasIndirectDraw | capDerivativeControl)
+		capUBO | capTextureQueryLod | capHasIndirectDraw | capDerivativeControl | capOcclusionQuery)
 	flag := func(feature uint32, bit uint32) {
 		if feature != 0 {
 			bools |= bit
 		}
+	}
+	flag(d.timestampBits, capTimerQuery)
+	if d.divisors {
+		bools |= capVertexElementInstanceDivisor
 	}
 	flag(f.IndependentBlend, capIndepBlendEnable)
 	flag(f.ImageCubeArray, capCubeMapArray)

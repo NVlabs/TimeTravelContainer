@@ -38,7 +38,17 @@ func (d *Device) formatFeatures(format uint32) uint32 {
 	return d.formatProperties(format).OptimalTilingFeatures
 }
 
-// formatProperties returns a format's properties, which the device keeps.
+// lockedFormatFeatures is formatFeatures, of a caller that does not hold
+// d.mu.
+func (d *Device) lockedFormatFeatures(format uint32) uint32 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	defer d.a.reset()
+	return d.formatFeatures(format)
+}
+
+// formatProperties returns a format's properties, which the device keeps,
+// of a caller that holds d.mu.
 func (d *Device) formatProperties(format uint32) vn.VkFormatProperties {
 	if f, ok := d.features[format]; ok {
 		return f
@@ -68,11 +78,29 @@ type Texture struct {
 	// layout is the layout of the image's subresources, all of which the
 	// renderer keeps in one.
 	layout uint32
+	// usage is the image's, of VkImageUsageFlagBits.
+	usage uint32
 }
 
 // NewTexture returns a texture of desc, a texture's, of a format that
-// Vulkan has or emulates.
+// Vulkan has or emulates, in the general layout, in which contexts keep
+// textures: none changes a layout in a rendering instance.
 func (d *Device) NewTexture(desc ResourceDesc) (*Texture, error) {
+	t, err := d.newTexture(desc)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.Record(func(c *Commands) error {
+		c.general(t)
+		return nil
+	}); err != nil {
+		d.DestroyTexture(t)
+		return nil, err
+	}
+	return t, nil
+}
+
+func (d *Device) newTexture(desc ResourceDesc) (*Texture, error) {
 	desc = desc.normalize()
 	if desc.Target == TargetBuffer {
 		return nil, fmt.Errorf("a texture of a buffer's %+v", desc)
@@ -141,7 +169,7 @@ func (d *Device) NewTexture(desc ResourceDesc) (*Texture, error) {
 	if err := check("vkCreateImage", ci.Ret); err != nil {
 		return nil, fmt.Errorf("a texture of %+v, %s: %w", desc, f.Name, err)
 	}
-	t := &Texture{Desc: desc, Format: f, img: *h, layout: ImageLayoutUndefined, aspects: aspectColor}
+	t := &Texture{Desc: desc, Format: f, img: *h, layout: ImageLayoutUndefined, aspects: aspectColor, usage: usage}
 	switch {
 	case f.IsDepth() && f.IsStencil():
 		t.aspects = aspectDepth | aspectStencil

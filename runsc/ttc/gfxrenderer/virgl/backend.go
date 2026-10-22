@@ -6,7 +6,9 @@
 package virgl
 
 // The decoder executes virgl's commands on a backend: Zink, Mesa's Gallium
-// driver on Vulkan (zink_unsafe.go). The backend's operations are
+// driver on Vulkan (zink_unsafe.go), or, where TTC_VIRGL_BACKEND is
+// "vkgl", package vkgl's Gallium on Vulkan in Go (vkgl_unsafe.go), which
+// renders a part of what Zink does so far. The backend's operations are
 // Gallium's, of the commands' payloads, whose lengths and handles the
 // decoder validated, as virgl.h has them; operations that return errors
 // refuse what they cannot execute, with their state unchanged.

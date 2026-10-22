@@ -170,3 +170,27 @@ func TestCapsLayout(t *testing.T) {
 		}
 	}
 }
+
+// TestVkColor gives clears' colors of emulated formats as their Vulkan
+// formats' channels.
+func TestVkColor(t *testing.T) {
+	color := [4]uint32{1, 2, 3, 4}
+	for _, tc := range []struct {
+		format uint32
+		want   [4]uint32
+	}{
+		{67, [4]uint32{1, 2, 3, 4}}, // R8G8B8A8_UNORM
+		{10, [4]uint32{4, 0, 0, 0}}, // A8_UNORM, as R8's red
+		{9, [4]uint32{1, 0, 0, 0}},  // L8_UNORM, as R8's red
+		{12, [4]uint32{1, 4, 0, 0}}, // L8A8_UNORM, as R8G8's
+		{2, [4]uint32{1, 2, 3, 0}},  // B8G8R8X8_UNORM, of no alpha
+	} {
+		f, ok := LookupFormat(tc.format)
+		if !ok {
+			t.Fatalf("no format %d", tc.format)
+		}
+		if got := f.vkColor(color); got != tc.want {
+			t.Errorf("%s: %v, want %v", f.Name, got, tc.want)
+		}
+	}
+}

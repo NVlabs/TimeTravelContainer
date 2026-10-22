@@ -126,10 +126,17 @@ const (
 	primTrianglesAdjacency     = 12
 	primTriangleStripAdjacency = 13
 	primPatches                = 14
+	queryOcclusionCounter      = 0
+	queryOcclusionPredicate    = 1
+	queryTimestamp             = 2
+	queryTimestampDisjoint     = 3
+	queryTimeElapsed           = 4
 	queryPrimitivesGenerated   = 5
 	queryPrimitivesEmitted     = 6
 	querySOStatistics          = 7
 	querySOOverflowPredicate   = 8
+	queryGPUFinished           = 9
+	queryOcclusionConservative = 11
 	querySOOverflowAny         = 12
 	queryTypeI32               = 0
 	queryTypeU32               = 1

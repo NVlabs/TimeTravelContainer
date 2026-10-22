@@ -26,6 +26,7 @@ go_library(
         "virgl_int.h",
         "virgl_other.go",
         "virgl_unsafe.go",
+        "vkgl_unsafe.go",
         "zink_unsafe.go",
     ],
     # The renderer links Zink (see tools/mesa/README.md): on macOS, on the
@@ -46,6 +47,11 @@ go_library(
     bazel_cgo = True,
     stateify = False,
     visibility = ["//runsc/ttc/gfxrenderer:__subpackages__"],
+    deps = [
+        "//runsc/ttc/gfxrenderer/virgl/tgsi",
+        "//runsc/ttc/gfxrenderer/virgl/tospirv",
+        "//runsc/ttc/gfxrenderer/virgl/vkgl",
+    ],
 )
 
 go_test(

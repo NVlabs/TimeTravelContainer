@@ -17,6 +17,7 @@ import "C"
 import (
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 )
@@ -47,10 +48,16 @@ var (
 )
 
 // Init creates the process's backend, if it has not: Zink's screen, on the
-// Vulkan that the renderer links.
+// Vulkan that the renderer links, or, where TTC_VIRGL_BACKEND is "vkgl",
+// the Go backend's device (vkgl_unsafe.go).
 func Init() error {
 	initOnce.Do(func() {
-		if be, initErr = initZink(); initErr != nil {
+		if os.Getenv("TTC_VIRGL_BACKEND") == "vkgl" {
+			be, initErr = initVkgl()
+		} else {
+			be, initErr = initZink()
+		}
+		if initErr != nil {
 			return
 		}
 		xfbEmulated, xfbSSBO = be.xfb()

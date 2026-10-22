@@ -142,7 +142,16 @@ func (d *Device) descriptorPool() (vn.Handle, error) {
 	if d.descPool != 0 {
 		return d.descPool, nil
 	}
-	a := d.a
+	h, err := d.newDescriptorPool(d.a)
+	if err != nil {
+		return 0, err
+	}
+	d.descPool = h
+	return h, nil
+}
+
+// newDescriptorPool returns a new descriptor pool, of a's structs.
+func (d *Device) newDescriptorPool(a *arena) (vn.Handle, error) {
 	types := []uint32{descriptorCombinedImageSampler, descriptorStorageImage, descriptorUniformTexelBuffer,
 		descriptorStorageTexelBuffer, descriptorUniformBuffer, descriptorStorageBuffer}
 	sizes := array[vn.VkDescriptorPoolSize](a, len(types))
@@ -160,8 +169,7 @@ func (d *Device) descriptorPool() (vn.Handle, error) {
 	if err := check("vkCreateDescriptorPool", cp.Ret); err != nil {
 		return 0, err
 	}
-	d.descPool = *h
-	return d.descPool, nil
+	return *h, nil
 }
 
 // BufferBinding is a buffer bound to a stage's slot of a kind: a uniform
@@ -175,44 +183,81 @@ type BufferBinding struct {
 	Range  uint64
 }
 
-// TextureBinding is an image, in the shader read layout, and a sampler,
-// bound to a stage's sampler slot.
+// TextureBinding is a sampler view, in the general layout, or an image, in
+// the shader read layout, and a sampler, bound to a stage's sampler slot.
 type TextureBinding struct {
 	Stage   tgsi.Processor
 	Slot    int
+	View    *SamplerView
 	Image   *Image
 	Sampler *Sampler
 }
 
 // Bind binds buffers and textures to a pipeline's resources, in descriptor
-// sets of their kinds' that it allocates.
+// sets of their kinds' that it allocates of the device's pool, which a
+// Device.Record's submission frees.
 func (c *Commands) Bind(p *Pipeline, buffers []BufferBinding, textures []TextureBinding) error {
+	return c.bind(p, buffers, textures, func(bool) (vn.Handle, error) { return c.d.descriptorPool() })
+}
+
+// BindResources binds buffers and textures to a pipeline's resources, as
+// Bind does, in descriptor sets of the batch's pools, which the batch
+// frees.
+func (c *Context) BindResources(cmds *Commands, p *Pipeline, buffers []BufferBinding, textures []TextureBinding) error {
+	b := c.batch
+	return cmds.bind(p, buffers, textures, func(full bool) (vn.Handle, error) {
+		if len(b.descPools) == 0 || full {
+			h, err := c.d.newDescriptorPool(c.a)
+			if err != nil {
+				return 0, err
+			}
+			b.descPools = append(b.descPools, h)
+		}
+		return b.descPools[len(b.descPools)-1], nil
+	})
+}
+
+// bind binds buffers and textures to a pipeline's resources, in descriptor
+// sets of pool's, which returns another pool if full, as the last's are
+// out.
+func (c *Commands) bind(p *Pipeline, buffers []BufferBinding, textures []TextureBinding, pool func(full bool) (vn.Handle, error)) error {
 	d, a := c.d, c.a
-	pool, err := d.descriptorPool()
-	if err != nil {
-		return err
-	}
 	var sets [numSets]vn.Handle
 	for s := range sets {
-		layout := get[vn.Handle](a)
-		*layout = p.setLayouts[s]
-		ai := get[vn.VkDescriptorSetAllocateInfo](a)
-		ai.SType = vn.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
-		ai.DescriptorPool, ai.DescriptorSetCount, ai.PSetLayouts = pool, 1, unsafe.Pointer(layout)
-		h := get[vn.Handle](a)
-		as := get[vn.Args_vkAllocateDescriptorSets](a)
-		as.Device, as.PAllocateInfo, as.PDescriptorSets = d.dev, unsafe.Pointer(ai), unsafe.Pointer(h)
-		vk.Call(vn.VK_COMMAND_TYPE_vkAllocateDescriptorSets_EXT, d.table, unsafe.Pointer(as))
-		if err := check("vkAllocateDescriptorSets", as.Ret); err != nil {
-			return err
+		for full := false; ; full = true {
+			h, err := pool(full)
+			if err != nil {
+				return err
+			}
+			layout := get[vn.Handle](a)
+			*layout = p.setLayouts[s]
+			ai := get[vn.VkDescriptorSetAllocateInfo](a)
+			ai.SType = vn.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+			ai.DescriptorPool, ai.DescriptorSetCount, ai.PSetLayouts = h, 1, unsafe.Pointer(layout)
+			set := get[vn.Handle](a)
+			as := get[vn.Args_vkAllocateDescriptorSets](a)
+			as.Device, as.PAllocateInfo, as.PDescriptorSets = d.dev, unsafe.Pointer(ai), unsafe.Pointer(set)
+			vk.Call(vn.VK_COMMAND_TYPE_vkAllocateDescriptorSets_EXT, d.table, unsafe.Pointer(as))
+			// VK_ERROR_OUT_OF_POOL_MEMORY and VK_ERROR_FRAGMENTED_POOL.
+			if !full && (as.Ret == -1000069000 || as.Ret == -12) {
+				continue
+			}
+			if err := check("vkAllocateDescriptorSets", as.Ret); err != nil {
+				return err
+			}
+			sets[s] = *set
+			break
 		}
-		sets[s] = *h
 	}
 	if n := len(buffers) + len(textures); n != 0 {
 		writes := array[vn.VkWriteDescriptorSet](a, n)
 		for i, tex := range textures {
 			info := get[vn.VkDescriptorImageInfo](a)
-			*info = vn.VkDescriptorImageInfo{Sampler: tex.Sampler.sampler, ImageView: tex.Image.view, ImageLayout: tex.Image.layout}
+			if tex.View != nil {
+				*info = vn.VkDescriptorImageInfo{Sampler: tex.Sampler.sampler, ImageView: tex.View.view, ImageLayout: ImageLayoutGeneral}
+			} else {
+				*info = vn.VkDescriptorImageInfo{Sampler: tex.Sampler.sampler, ImageView: tex.Image.view, ImageLayout: tex.Image.layout}
+			}
 			w := &writes[len(buffers)+i]
 			w.SType = vn.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
 			w.DstSet = sets[tospirv.SetSamplers]
