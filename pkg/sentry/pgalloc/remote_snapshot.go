@@ -583,6 +583,10 @@ func exportMemoryFileMetadataForRemote(ctx context.Context, source *MemoryFile, 
 		source.unholdReleaserLocked()
 		source.mu.Unlock()
 	}()
+	// The saved state holds the pages of home chunks in the sets, as those of
+	// other chunks, and has no set of its own for home waste.
+	importHomePages := source.exportHomePagesLocked()
+	unmergeHomeWaste := source.mergeHomeWasteLocked()
 	collectUsed := func(set *unfreeSet) {
 		for seg := set.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
 			if seg.ValuePtr().refs != 0 {
@@ -592,10 +596,7 @@ func exportMemoryFileMetadataForRemote(ctx context.Context, source *MemoryFile, 
 	}
 	collectUsed(&source.unfreeSmall)
 	collectUsed(&source.unfreeHuge)
-	// The saved state has no set of its own for home waste.
-	unmergeHomeWaste := source.mergeHomeWasteLocked()
-	defer unmergeHomeWaste()
-	if _, err := state.Save(ctx, &metadata, &memoryFileSaved{
+	_, err := state.Save(ctx, &metadata, &memoryFileSaved{
 		unwasteSmall:     &source.unwasteSmall,
 		unwasteHuge:      &source.unwasteHuge,
 		unfreeSmall:      &source.unfreeSmall,
@@ -607,7 +608,10 @@ func exportMemoryFileMetadataForRemote(ctx context.Context, source *MemoryFile, 
 		subreleased:      source.subreleased,
 		memAcct:          &source.memAcct,
 		chunks:           source.chunksLoad(),
-	}); err != nil {
+	})
+	unmergeHomeWaste()
+	importHomePages()
+	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("saving remote MemoryFile metadata: %w", err)
 	}
 	sort.Slice(used, func(i, j int) bool { return used[i].Start < used[j].Start })
@@ -799,7 +803,6 @@ func ImportMemoryFileMetadataForRemote(ctx context.Context, target *MemoryFile, 
 		target.haveWaste = true
 		target.releaseCond.Signal()
 	}
-	target.mu.Unlock()
 	if !target.opts.DisableMemoryAccounting {
 		for seg := target.memAcct.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
 			if seg.ValuePtr().knownCommitted {
@@ -807,7 +810,9 @@ func ImportMemoryFileMetadataForRemote(ctx context.Context, target *MemoryFile, 
 			}
 		}
 	}
-
+	// Home chunks hold their pages' state in their tables from now on.
+	target.importHomePagesLocked()
+	target.mu.Unlock()
 	return nil
 }
 

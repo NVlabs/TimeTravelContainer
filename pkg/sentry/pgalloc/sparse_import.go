@@ -710,8 +710,7 @@ func (f *MemoryFile) InstallSparseChunks(installs []SparseChunkInstall) (*Sparse
 			}
 			if install.Huge && hostarch.IsHugePageAligned(fr.Start) {
 				// Its identities are a 2 MiB page's, as its allocation's were.
-				f.logicalPages.RemoveFullRange(fr)
-				f.logicalPages.InsertRange(fr, logicalPageInfo{
+				f.setLogicalPagesLocked(fr, logicalPageInfo{
 					Allocator: runs[0].Page.Allocator, FirstSequence: runs[0].Page.Sequence,
 					VersionAllocator: runs[0].Version.Allocator, FirstVersionSequence: runs[0].Version.Sequence,
 					Huge: true,
@@ -745,8 +744,7 @@ func (f *MemoryFile) InstallSparseChunks(installs []SparseChunkInstall) (*Sparse
 func (f *MemoryFile) setSparseIdentitiesLocked(base uint64, run SparseChunkRun, start, end uint16) {
 	delta := uint64(start - uint16(run.Position))
 	fr := memmap.FileRange{Start: base + uint64(start)*hostarch.PageSize, End: base + uint64(end)*hostarch.PageSize}
-	f.logicalPages.RemoveFullRange(fr)
-	f.logicalPages.InsertRange(fr, logicalPageInfo{
+	f.setLogicalPagesLocked(fr, logicalPageInfo{
 		Allocator: run.Page.Allocator, FirstSequence: run.Page.Sequence + delta,
 		VersionAllocator: run.Version.Allocator, FirstVersionSequence: run.Version.Sequence + delta,
 	})
@@ -861,22 +859,7 @@ func (f *MemoryFile) ReclaimUnusedSparseChunks() int {
 		}
 		// A page being loaded or awaited has a reference of its loader or
 		// its waiter besides the cache's.
-		unique := true
-		f.forEachChunk(resident.Range, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
-			unfree := &f.unfreeSmall
-			if chunk.huge {
-				unfree = &f.unfreeHuge
-			}
-			unfree.VisitFullRange(chunkFR, func(ufseg unfreeIterator) bool {
-				if ufseg.ValuePtr().refs != 1 {
-					unique = false
-					return false
-				}
-				return true
-			})
-			return unique
-		})
-		if unique {
+		if f.hasUniqueRefLocked(resident.Range) {
 			f.deleteSparseChunkLocked(object)
 			if f.reclaimedSparseChunks == nil {
 				f.reclaimedSparseChunks = make(map[SparseChunkObjectID]struct{})

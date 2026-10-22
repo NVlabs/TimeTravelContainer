@@ -3,8 +3,9 @@
 Status: implemented (2026-10-18): homes and placement, the Sentry's mappings of
 the memory file, folding, collapse, and restored memory at its slots. Where the
 implementation departs from the design below, the section says so. Measured
-against the code before it, and fixed where it cost more (2026-10-21); see
-"Performance".
+against the code before it, and fixed where it cost more (2026-10-21); the
+huge view and the homes' page tables, which the measurements proposed, are
+built (2026-10-22); see "Performance".
 
 ## Problem
 
@@ -98,7 +99,8 @@ A home chunk is a small chunk that `Allocate` never allocates from. Its free
 slots stay void (zero-reference segments) in `unfreeSmall`, as the pages of
 chunks of the other size are, so the gap search never finds them; its waste is
 tracked in a set of its own (`unwasteHome`), so that only `AllocateAt` recycles
-it, into its own slots. The releaser releases home waste as any other, back
+it, into its own slots. (Since 2026-10-22 all of a home's pages stay void
+there, and the home's table holds their state; see "Pages' state".) The releaser releases home waste as any other, back
 into free slots rather than free pages. Every place that picks a set by
 `chunkInfo.huge` stays right, since a home is small. The saved state has no set
 for home waste: an export folds it into `unwasteSmall`, and a load takes the
@@ -119,6 +121,49 @@ New operations:
 
 When a home has no pages and no owner, it goes back to the pool. The file never
 shrinks, as today; the releaser punches holes in freed pages wherever they are.
+
+### Pages' state
+
+Added 2026-10-22. pgalloc keeps what it knows of each page in segment sets
+keyed by file offset: references (`unfreeSmall`), identity and version
+(`logicalPages`), and accounting (`memAcct`). Neighbouring segments merge where
+their values continue one another, which kept the sets small while `Allocate`
+handed out offsets in allocation order. A home's pages are allocated, copied
+and written in the order their address space writes them, so copies on write at
+random left a segment per page in each set, and each operation on a page
+searched sets of millions of segments: 18% of the Sentry's CPU in a fork's
+random writes, and 24% in the rewrite of restored memory.
+
+A home keeps its pages' state in a table of its own instead
+(`pgalloc/home_pages.go`), by slot, in blocks of 2 MiB:
+
+- A block holds the runs of its pages whose states follow from one, in order:
+  a page's state is its references, a context, and its identity and version,
+  which are consecutive along a run. Adjacent runs that continue each other
+  merge, so that a block allocated whole is one run, a fork's copy of one of its
+  pages splits it into three, and the fork's end makes it one again.
+- A context indexes a table of what pages share besides their references and
+  sequences: memory kind, memory cgroup, and the allocators of identity and
+  version.
+- A block records whether it is one 2 MiB page, and the commit sequence that a
+  usage scan checks: per block rather than per page, so that a page decommitted
+  during a scan holds back the block's other pages until the next scan.
+
+An operation on a page searches the runs of its block alone, at most 512, and
+an operation over a block of one run, as a fork's references over a GiB
+written whole are, is one update per block. A first version kept a state per
+page, 24 bytes, for a block whose pages differed: random copies cost 10% less
+there than in runs, but every fork that copied a page of a block written whole
+gave it 12 KiB of states, which its exit walked page by page and the next fork
+merged again, so that 200 forks of a GiB, each copying 16 pages, took 35% longer
+than with the sets.
+
+The sets hold a home as void in `unfreeSmall`, and nothing of it in
+`logicalPages` or `memAcct`; waste stays in `unwasteHome` for the releaser.
+The saved state keeps its format: a save, and an export for a remote fork, move
+the tables' contents into the sets and back after (`exportHomePagesLocked`),
+and a load or an import moves them from the sets into the tables
+(`importHomePagesLocked`).
 
 ### Host huge pages inside a home
 
@@ -656,7 +701,28 @@ this host, whose tmpfs gives the memory file no huge pages, a first write takes
 4% less, a fork's write 4% less and a rehydration 4% less; the Sentry's page
 tables grow by 2 MiB per GiB of 2 MiB pages, which the view maps with base
 pages there, until their home is spared. Where the host gives huge pages, the
-view maps each with one entry. The second is proposed, not built.
+view maps each with one entry: on the farm (Linux 6.1.62, a huge tmpfs, three
+rounds), a first write takes 5% less, a fork's write 2% less, and no time nor
+the Sentry's page tables differ otherwise by more than the spread between
+rounds. The 2 MiB-page costs above were measured in another session: within
+one, the temporary mappings cost less than they seemed.
+
+The second is built too (2026-10-22): tables of runs of pages in place of the
+sets for homes (see "Pages' state"). Three rounds of the memory workload
+locally, against the commit before it, with base pages: a fork's random
+writes take 18% less, its source's 27% less, the rewrite of restored memory
+23% less, removing a branch 47% less, and the Sentry's CPU over the live forks
+20% less; the Sentry's private memory is 153 MB after the live forks where it
+was 299 MB, and 65 MB once rehydrated where it was 165 MB. 200 forks that each
+write 16 pages, and 300 forks that exec, take as long as before. With 2 MiB
+pages, locally and on the farm (five rounds), no time differs by more than
+the spread between rounds. The build of Lua and SQLite, measured on the tables'
+version before the one-run update below, took 2% less time and 5% less CPU.
+The tables' first version, a state per page, made 200 such forks 35% slower;
+runs fixed that. A fork's references over a GiB, and its exec's release of
+them, update 512 blocks of one run each, which an update that covers such a
+block whole does in place: through the general path, 300 forks that exec took
+12% longer on the farm.
 
 ## Phases
 

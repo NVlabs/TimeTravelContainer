@@ -12,7 +12,6 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
-	"gvisor.dev/gvisor/pkg/sentry/usage"
 )
 
 // Home chunks.
@@ -27,12 +26,13 @@ import (
 // then in address order whatever order they were allocated in. See
 // g3doc/proposals/ttc_address_ordered_memory.md.
 //
-// A home chunk is a small chunk that Allocate never allocates from. Its free
-// slots stay void in unfreeSmall, as the pages of chunks of the other size
-// are, and its waste is tracked in unwasteHome rather than unwasteSmall, so
-// that only AllocateAt recycles it, into its own slots. The releaser releases
-// it as any other waste, back into free slots. Home chunks are marked in
-// chunkInfo.node, so that the saved state keeps its fields.
+// A home chunk is a small chunk that Allocate never allocates from. Its pages
+// stay void in unfreeSmall, as the pages of chunks of the other size are: the
+// home's table holds their state (see home_pages.go). Its waste is tracked in
+// unwasteHome rather than unwasteSmall, so that only AllocateAt recycles it,
+// into its own slots. The releaser releases it as any other waste, back into
+// free slots. Home chunks are marked in chunkInfo.node, so that the saved
+// state keeps its fields.
 
 // homeChunkNode marks chunkInfo.node of a home chunk. Node numbers are small,
 // so it never marks one of theirs; and a chunk marked so is bound to no node,
@@ -84,6 +84,10 @@ type homeChunk struct {
 	// hugeViewLocked.
 	hugeView   uintptr
 	noHugeView bool
+
+	// rows holds the state of the chunk's pages, by row of blocks of 2 MiB; a
+	// nil row's pages are free slots. See home_pages.go.
+	rows [rowsPerHome]*[blocksPerRow]*homeBlock
 }
 
 // Identities from slots.
@@ -121,15 +125,14 @@ type unitWindow struct {
 	window    uint64
 }
 
-// homeIdentitiesLocked gives fr, pages of home chunk i allocated afresh, the
-// identities of their slots, in 2 MiB pages if huge, and new versions: those of
-// the first of the home's windows in which no page took them afresh before, or
-// identities of no slot, as pages out of homes take, if there is none.
+// homeIdentitiesLocked returns the first of the identities of the slots of fr,
+// pages of home chunk i allocated afresh, in the first of the home's windows in
+// which no page took them afresh before; and false if there is none, for fr to
+// take identities of no slot, as pages out of homes take.
 //
 // Preconditions: f.mu must be locked.
-func (f *MemoryFile) homeIdentitiesLocked(i uint64, fr memmap.FileRange, huge bool) {
+func (f *MemoryFile) homeIdentitiesLocked(i uint64, fr memmap.FileRange) (uint64, bool) {
 	hc := f.homes[i]
-	var w *slotWindow
 	for k := 0; k < maxSlotWindows; k++ {
 		if k == hc.windowCount {
 			if pagesPerChunk > hugeSequenceBit-f.nextLogicalPage {
@@ -140,33 +143,12 @@ func (f *MemoryFile) homeIdentitiesLocked(i uint64, fr memmap.FileRange, huge bo
 			hc.windows[k].start = start
 			hc.windowCount++
 		}
-		if hc.windows[k].fresh.IsEmptyRange(fr) {
-			w = &hc.windows[k]
-			break
+		if w := &hc.windows[k]; w.fresh.IsEmptyRange(fr) {
+			w.fresh.InsertRange(fr, unwasteInfo{})
+			return w.start + (fr.Start-i*chunkSize)/hostarch.PageSize, true
 		}
 	}
-	if w == nil {
-		f.assignLogicalPagesLocked(fr, huge)
-		return
-	}
-	w.fresh.InsertRange(fr, unwasteInfo{})
-	huge = huge && hostarch.IsHugePageAligned(fr.Start) && hostarch.IsHugePageAligned(fr.End)
-	pages := fr.Length() / hostarch.PageSize
-	if huge {
-		f.nextPageVersion = alignSequence(f.nextPageVersion)
-	}
-	if pages > hugeSequenceBit-f.nextPageVersion {
-		panic(fmt.Sprintf("page version sequence exhausted for %v", fr))
-	}
-	f.logicalPages.RemoveRange(fr)
-	f.logicalPages.InsertRange(fr, logicalPageInfo{
-		Allocator:            f.logicalAllocator,
-		FirstSequence:        w.start + (fr.Start-i*chunkSize)/hostarch.PageSize,
-		VersionAllocator:     f.logicalAllocator,
-		FirstVersionSequence: f.nextPageVersion,
-		Huge:                 huge,
-	})
-	f.nextPageVersion += pages
+	return 0, false
 }
 
 // ErrSlotsInUse is returned by AllocateAt when a page of the range it is
@@ -466,63 +448,34 @@ func (f *MemoryFile) markHomeUsedLocked(fr memmap.FileRange, opts AllocOpts, hug
 	for f.releasingHome.Overlaps(fr) {
 		f.releaserIdle.Wait()
 	}
-	// Every page must be a free slot or waste: void in unfreeSmall.
-	covered := fr.Start
-	for seg := f.unfreeSmall.LowerBoundSegment(fr.Start); seg.Ok() && seg.Start() < fr.End; seg = seg.NextSegment() {
-		if seg.Start() > covered || seg.ValuePtr().refs != 0 {
-			return nil, nil, ErrSlotsInUse
-		}
-		covered = seg.End()
-	}
-	if covered < fr.End {
+	// Every page must be a free slot or waste.
+	inUse := false
+	f.visitHomePagesLocked(fr, func(_, _ uint64, ps pageState) bool {
+		inUse = ps.inUse()
+		return !inUse
+	})
+	if inUse {
 		return nil, nil, ErrSlotsInUse
 	}
-	for gap := f.unwasteHome.LowerBoundGap(fr.Start); gap.Ok() && gap.Start() < fr.End; gap = gap.NextGap() {
-		if wasteFR := gap.Range().Intersect(fr); wasteFR.Length() != 0 {
-			waste = append(waste, wasteFR)
-		}
-	}
-	f.unfreeSmall.MutateFullRange(fr, func(ufseg unfreeIterator) bool {
-		ufseg.ValuePtr().refs = 1
-		return true
-	})
-	freePages := fr.Length() / hostarch.PageSize
+	waste = f.homeWasteLocked(fr)
 	for _, wasteFR := range waste {
 		f.unwasteHome.Insert(f.unwasteHome.FindGap(wasteFR.Start), wasteFR, unwasteInfo{})
-		freePages -= wasteFR.Length() / hostarch.PageSize
 	}
-	hc.pages += freePages
-	// Waste pages are accounted already, as System, and recycled as
-	// findAllocatableAndMarkUsed recycles them; free slots are not.
-	for _, wasteFR := range waste {
-		f.memAcct.MutateFullRange(wasteFR, func(maseg memAcctIterator) bool {
-			ma := maseg.ValuePtr()
-			if ma.knownCommitted {
-				malen := maseg.Range().Length()
-				ma.knownCommitted = false
-				f.knownCommittedBytes -= malen
-				if !f.opts.DisableMemoryAccounting {
-					usage.MemoryAccounting.Dec(malen, usage.System, ma.memCgID)
-				}
-			}
-			ma.kind = opts.Kind
-			ma.memCgID = opts.MemCgID
-			ma.wasteOrReleasing = false
-			ma.commitSeq = f.commitSeq
-			return true
-		})
-	}
-	for _, freeFR := range subtractRanges(fr, waste) {
-		f.memAcct.InsertRange(freeFR, memAcctInfo{
-			kind: opts.Kind, memCgID: opts.MemCgID, commitSeq: f.commitSeq,
-		})
-		f.accountLocked(int64(freeFR.Length()))
-	}
+	// fr is one 2 MiB page per 2 MiB, with the identities and versions of
+	// one, if it is allocated as such; see logicalPageInfo.Huge.
+	hugePages := huge && opts.LogicalHugePages && hostarch.IsHugePageAligned(fr.Start) && hostarch.IsHugePageAligned(fr.End)
+	first := LogicalPageID{Allocator: f.logicalAllocator}
+	ver := PageVersionID{Allocator: f.logicalAllocator}
+	slotted := false
 	if opts.ReaderFunc == nil && !opts.callerIdentities {
-		f.homeIdentitiesLocked(i, fr, huge && opts.LogicalHugePages)
-	} else {
-		f.assignLogicalPagesLocked(fr, huge && opts.LogicalHugePages)
+		first.Sequence, slotted = f.homeIdentitiesLocked(i, fr)
 	}
+	if slotted {
+		ver.Sequence = f.newVersionsLocked(fr, hugePages)
+	} else {
+		first.Sequence, ver.Sequence = f.newIdentitiesLocked(fr, hugePages)
+	}
+	hc.pages += f.markHomePagesUsedLocked(fr, opts.Kind, opts.MemCgID, first, ver, hugePages) / hostarch.PageSize
 	if node != 0 {
 		if hc.nodes == nil {
 			hc.nodes = make([]int32, chunkSize/hostarch.HugePageSize)
@@ -614,23 +567,6 @@ func (f *MemoryFile) populateHome(fr memmap.FileRange, opts AllocOpts, huge bool
 		panic(fmt.Sprintf("unknown AllocOpts.Mode %d", opts.Mode))
 	}
 	return 0, false, nil
-}
-
-// subtractRanges returns the parts of fr outside holes, which are sorted, do
-// not overlap, and lie in fr.
-func subtractRanges(fr memmap.FileRange, holes []memmap.FileRange) []memmap.FileRange {
-	var parts []memmap.FileRange
-	at := fr.Start
-	for _, hole := range holes {
-		if hole.Start > at {
-			parts = append(parts, memmap.FileRange{Start: at, End: hole.Start})
-		}
-		at = hole.End
-	}
-	if at < fr.End {
-		parts = append(parts, memmap.FileRange{Start: at, End: fr.End})
-	}
-	return parts
 }
 
 // mergeHomeWasteLocked moves the waste of home chunks into unwasteSmall, for

@@ -20,7 +20,7 @@ import (
 
 // newHomeTestMemoryFile returns a MemoryFile, backed by a file, that may have
 // maxHomes home chunks, and whose huge allocations may be 2 MiB pages.
-func newHomeTestMemoryFile(t *testing.T, maxHomes int) *MemoryFile {
+func newHomeTestMemoryFile(t testing.TB, maxHomes int) *MemoryFile {
 	t.Helper()
 	file, err := os.CreateTemp("", "ttc-home-")
 	if err != nil {

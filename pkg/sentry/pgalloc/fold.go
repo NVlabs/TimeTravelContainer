@@ -68,8 +68,8 @@ func (f *MemoryFile) MovePages(src, dst memmap.FileRange) error {
 	f.splitPartlyCoveredHugePagesLocked(src)
 	huge := hostarch.HugePageOffset(src.Start) == hostarch.HugePageOffset(dst.Start) && f.isHugeLocked(src)
 	opts := AllocOpts{Huge: huge, LogicalHugePages: huge, callerIdentities: true}
-	if seg := f.memAcct.FindSegment(src.Start); seg.Ok() {
-		opts.Kind, opts.MemCgID = seg.ValuePtr().kind, seg.ValuePtr().memCgID
+	if kind, memCgID, ok := f.accountingAtLocked(src.Start); ok {
+		opts.Kind, opts.MemCgID = kind, memCgID
 	}
 	// 2 MiB pages read through their home's huge view, with one page table
 	// entry each.
@@ -112,9 +112,7 @@ func (f *MemoryFile) moveIdentitiesLocked(src, dst memmap.FileRange) {
 	aligned := hostarch.HugePageOffset(src.Start) == hostarch.HugePageOffset(dst.Start)
 	for _, run := range f.logicalPageRangesLocked(src) {
 		start := dst.Start + (run.Range.Start - src.Start)
-		to := memmap.FileRange{Start: start, End: start + run.Range.Length()}
-		f.logicalPages.RemoveRange(to)
-		f.logicalPages.InsertRange(to, logicalPageInfo{
+		f.setLogicalPagesLocked(memmap.FileRange{Start: start, End: start + run.Range.Length()}, logicalPageInfo{
 			Allocator:            run.First.Allocator,
 			FirstSequence:        run.First.Sequence,
 			VersionAllocator:     run.FirstVersion.Allocator,
@@ -149,19 +147,12 @@ func (f *MemoryFile) FreeSlots(fr memmap.FileRange) []memmap.FileRange {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var free []memmap.FileRange
-	at := fr.Start
-	for seg := f.unfreeSmall.LowerBoundSegment(fr.Start); seg.Ok() && seg.Start() < fr.End; seg = seg.NextSegment() {
-		if seg.ValuePtr().refs == 0 {
-			continue
+	f.homeRefsLocked(fr, func(run memmap.FileRange, refs uint64) bool {
+		if refs == 0 {
+			free = append(free, run)
 		}
-		if seg.Start() > at {
-			free = append(free, memmap.FileRange{Start: at, End: seg.Start()})
-		}
-		at = seg.End()
-	}
-	if at < fr.End {
-		free = append(free, memmap.FileRange{Start: at, End: fr.End})
-	}
+		return true
+	})
 	return free
 }
 

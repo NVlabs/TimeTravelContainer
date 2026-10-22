@@ -122,16 +122,13 @@ func (f *MemoryFile) collapseIdentitiesLocked(fr memmap.FileRange) {
 		first = LogicalPageID{Allocator: f.logicalAllocator, Sequence: f.nextLogicalPage}
 		f.nextLogicalPage += pagesPerHugePage
 	}
-	f.nextPageVersion = alignSequence(f.nextPageVersion)
-	f.logicalPages.RemoveRange(fr)
-	f.logicalPages.InsertRange(fr, logicalPageInfo{
+	f.setLogicalPagesLocked(fr, logicalPageInfo{
 		Allocator:            first.Allocator,
 		FirstSequence:        first.Sequence,
 		VersionAllocator:     f.logicalAllocator,
-		FirstVersionSequence: f.nextPageVersion,
+		FirstVersionSequence: f.newVersionsLocked(fr, true),
 		Huge:                 true,
 	})
-	f.nextPageVersion += pagesPerHugePage
 }
 
 // Resident returns true if every page of fr is in memory: none was discarded,
@@ -166,12 +163,10 @@ func (f *MemoryFile) Resident(fr memmap.FileRange) bool {
 func (f *MemoryFile) SlotsFull(fr memmap.FileRange) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	at := fr.Start
-	for seg := f.unfreeSmall.LowerBoundSegment(fr.Start); seg.Ok() && seg.Start() < fr.End; seg = seg.NextSegment() {
-		if seg.Start() > at || seg.ValuePtr().refs == 0 {
-			return false
-		}
-		at = seg.End()
-	}
-	return at >= fr.End
+	full := true
+	f.homeRefsLocked(fr, func(_ memmap.FileRange, refs uint64) bool {
+		full = refs != 0
+		return full
+	})
+	return full
 }

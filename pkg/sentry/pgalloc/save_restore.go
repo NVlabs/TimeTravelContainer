@@ -131,6 +131,9 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		runtime.Gosched()
 		f.mu.Lock()
 	}
+	// The saved state holds the pages of home chunks in the sets, as those of
+	// other chunks.
+	defer f.exportHomePagesLocked()()
 
 	// Ensure that there are no pending evictions.
 	if len(f.evictable) != 0 {
@@ -1272,6 +1275,10 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 		log.Infof("MemoryFile(%p): loaded pages in %s (%d bytes, %.3f MB/s)", f, durPages, f.knownCommittedBytes, float64(f.knownCommittedBytes)*1e-6/durPages.Seconds())
 	}
 
+	// Home chunks hold their pages' state in their tables from now on.
+	f.mu.Lock()
+	f.importHomePagesLocked()
+	f.mu.Unlock()
 	return nil
 }
 

@@ -153,10 +153,11 @@ type MemoryFile struct {
 
 	// unfreeSmall and unfreeHuge track information for non-free ranges backed
 	// by small/huge pages respectively. Each unfreeSet also contains segments
-	// representing chunks that are backed by a different page size. Gaps in
-	// the sets therefore represent free ranges backed by small/huge pages,
-	// allowing use of segment.Set gap-tracking to efficiently find free ranges
-	// for allocation.
+	// representing chunks that are backed by a different page size, and home
+	// chunks, whose tables hold their pages' references (see home_pages.go).
+	// Gaps in the sets therefore represent free ranges backed by small/huge
+	// pages, allowing use of segment.Set gap-tracking to efficiently find free
+	// ranges for allocation.
 	//
 	// unfreeSmall and unfreeHuge are protected by mu.
 	unfreeSmall unfreeSet
@@ -165,7 +166,8 @@ type MemoryFile struct {
 	// logicalPages maps used backing-file offsets to stable logical page IDs.
 	// Unlike backing-file offsets, IDs are never reused. Contiguous IDs are
 	// stored as runs, so ordinary multi-page allocations add one segment rather
-	// than one metadata object per page.
+	// than one metadata object per page. Home chunks keep their pages' IDs in
+	// their tables instead.
 	//
 	// logicalAllocator, nextLogicalPage, nextPageVersion, and logicalPages are
 	// protected by mu.
@@ -211,6 +213,13 @@ type MemoryFile struct {
 	freeHomes []uint64
 	unitHomes map[unitWindow][]uint64
 
+	// pageContexts holds, from index 1, the contexts of the pages of home
+	// chunks, which their tables hold in place of unfreeSmall, logicalPages
+	// and memAcct (see home_pages.go); pageContextIndex maps each to its
+	// index. They are protected by mu.
+	pageContexts     []pageContext
+	pageContextIndex map[pageContext]uint32
+
 	// releasingHome is the range of a home chunk that the releaser is
 	// releasing, with mu unlocked, if any. It is protected by mu.
 	releasingHome memmap.FileRange
@@ -229,12 +238,13 @@ type MemoryFile struct {
 	// which pages are committed.
 	//
 	// memAcct tracks memory accounting state, including commitment status, for
-	// each page. Non-empty gaps in memAcct represent pages known to be
-	// uncommitted (void, free, and sub-released pages).
+	// each page but those of home chunks, whose tables track theirs. Non-empty
+	// gaps in memAcct represent pages known to be uncommitted (void, free, and
+	// sub-released pages, and those of home chunks).
 	//
 	// knownCommittedBytes is the number of bytes in the file known to be
 	// committed, i.e. the span of all segments in memAcct for which
-	// knownCommitted is true.
+	// knownCommitted is true, and of the pages of home chunks marked so.
 	//
 	// commitSeq is a sequence counter used to detect races between scans for
 	// committed pages and concurrent decommitment.
@@ -256,8 +266,9 @@ type MemoryFile struct {
 	ongoingCommitScan   atomic.Bool
 	isSaving            bool
 
-	// accountedBytes is the span of memAcct, the bytes of pages that may be
-	// committed: those in use, and those freed but not yet released.
+	// accountedBytes is the span of memAcct, with the pages of home chunks
+	// that are not free slots, the bytes of pages that may be committed:
+	// those in use, and those freed but not yet released.
 	// commitLimit, if not 0, is the most of them a family may have without
 	// overCommitLimit being true; see SetCommitLimit. accountedBytes and
 	// commitLimit are protected by mu.
@@ -418,23 +429,68 @@ func (f *MemoryFile) chunksLoad() []chunkInfo {
 // Preconditions: f.mu must be locked and fr must contain newly allocated pages.
 func (f *MemoryFile) assignLogicalPagesLocked(fr memmap.FileRange, huge bool) {
 	huge = huge && hostarch.IsHugePageAligned(fr.Start) && hostarch.IsHugePageAligned(fr.End)
+	seq, ver := f.newIdentitiesLocked(fr, huge)
+	f.setLogicalPagesLocked(fr, logicalPageInfo{
+		Allocator:            f.logicalAllocator,
+		FirstSequence:        seq,
+		VersionAllocator:     f.logicalAllocator,
+		FirstVersionSequence: ver,
+		Huge:                 huge,
+	})
+}
+
+// newIdentitiesLocked returns the first of fresh, never-reused identities and
+// versions for the pages of fr, those of 2 MiB pages if huge.
+//
+// Preconditions: f.mu must be locked.
+func (f *MemoryFile) newIdentitiesLocked(fr memmap.FileRange, huge bool) (seq, ver uint64) {
 	if huge {
 		f.nextLogicalPage = alignSequence(f.nextLogicalPage)
+	}
+	pages := fr.Length() / hostarch.PageSize
+	if pages == 0 || pages > hugeSequenceBit-f.nextLogicalPage {
+		panic(fmt.Sprintf("logical page sequence exhausted for allocation %v", fr))
+	}
+	seq = f.nextLogicalPage
+	f.nextLogicalPage += pages
+	return seq, f.newVersionsLocked(fr, huge)
+}
+
+// newVersionsLocked returns the first of fresh, never-reused versions for the
+// pages of fr, those of 2 MiB pages if huge.
+//
+// Preconditions: f.mu must be locked.
+func (f *MemoryFile) newVersionsLocked(fr memmap.FileRange, huge bool) uint64 {
+	if huge {
 		f.nextPageVersion = alignSequence(f.nextPageVersion)
 	}
 	pages := fr.Length() / hostarch.PageSize
-	if pages == 0 || pages > hugeSequenceBit-f.nextLogicalPage || pages > hugeSequenceBit-f.nextPageVersion {
-		panic(fmt.Sprintf("logical page sequence exhausted for allocation %v", fr))
+	if pages == 0 || pages > hugeSequenceBit-f.nextPageVersion {
+		panic(fmt.Sprintf("page version sequence exhausted for %v", fr))
 	}
-	f.logicalPages.InsertRange(fr, logicalPageInfo{
-		Allocator:            f.logicalAllocator,
-		FirstSequence:        f.nextLogicalPage,
-		VersionAllocator:     f.logicalAllocator,
-		FirstVersionSequence: f.nextPageVersion,
-		Huge:                 huge,
-	})
-	f.nextLogicalPage += pages
+	ver := f.nextPageVersion
 	f.nextPageVersion += pages
+	return ver
+}
+
+// setLogicalPagesLocked gives the pages of fr the identities and versions
+// that info gives them, as one run, in place of those they have.
+//
+// Preconditions: f.mu must be locked; the pages of fr in home chunks are in
+// use.
+func (f *MemoryFile) setLogicalPagesLocked(fr memmap.FileRange, info logicalPageInfo) {
+	f.splitHomes(fr, func(part memmap.FileRange, home bool) {
+		at := info
+		delta := (part.Start - fr.Start) / hostarch.PageSize
+		at.FirstSequence += delta
+		at.FirstVersionSequence += delta
+		if home {
+			f.setHomeIdentitiesLocked(part, at)
+			return
+		}
+		f.logicalPages.RemoveRange(part)
+		f.logicalPages.InsertRange(part, at)
+	})
 }
 
 // alignSequence returns the first sequence, from seq on, that a 2 MiB page can
@@ -449,12 +505,12 @@ func alignSequence(seq uint64) uint64 {
 // HugePageAt returns the 2 MiB page that the page at off is part of, if it is
 // one of a 2 MiB page; see logicalPageInfo.Huge.
 func (f *MemoryFile) HugePageAt(off uint64) (memmap.FileRange, bool) {
+	start := hostarch.HugePageRoundDown(off)
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if seg := f.logicalPages.FindSegment(off); !seg.Ok() || !seg.ValuePtr().Huge {
+	if !f.isHugeLocked(memmap.FileRange{Start: off, End: off + hostarch.PageSize}) {
 		return memmap.FileRange{}, false
 	}
-	start := hostarch.HugePageRoundDown(off)
 	return memmap.FileRange{Start: start, End: start + hostarch.HugePageSize}, true
 }
 
@@ -488,14 +544,21 @@ func (f *MemoryFile) SplitPartlyCoveredHugePages(fr memmap.FileRange) {
 // Preconditions: f.mu must be locked.
 func (f *MemoryFile) splitHugePagesLocked(fr memmap.FileRange) {
 	whole := memmap.FileRange{Start: hostarch.HugePageRoundDown(fr.Start), End: hostarch.MustHugePageRoundUp(fr.End)}
-	for seg := f.logicalPages.LowerBoundSegment(whole.Start); seg.Ok() && seg.Start() < whole.End; seg = seg.NextSegment() {
-		if !seg.ValuePtr().Huge {
-			continue
+	f.splitHomes(whole, func(part memmap.FileRange, home bool) {
+		if home {
+			f.splitHugeHomeLocked(part)
+			return
 		}
-		// whole is aligned to 2 MiB pages, so the pages around it stay whole.
-		seg = f.logicalPages.Isolate(seg, whole)
-		seg.ValuePtr().Huge = false
-	}
+		for seg := f.logicalPages.LowerBoundSegment(part.Start); seg.Ok() && seg.Start() < part.End; seg = seg.NextSegment() {
+			if !seg.ValuePtr().Huge {
+				continue
+			}
+			// part is aligned to 2 MiB pages, so the pages around it stay
+			// whole.
+			seg = f.logicalPages.Isolate(seg, part)
+			seg.ValuePtr().Huge = false
+		}
+	})
 }
 
 // splitPartlyCoveredHugePagesLocked splits the 2 MiB pages that fr covers in
@@ -514,7 +577,8 @@ func (f *MemoryFile) splitPartlyCoveredHugePagesLocked(fr memmap.FileRange) {
 // written before logical-page metadata existed. New checkpoints always take
 // the fast path because logicalPages is already populated.
 //
-// Preconditions: f is not concurrently accessible, or f.mu is locked.
+// Preconditions: f is not concurrently accessible, or f.mu is locked; the sets
+// hold the state of all of f's pages, as a load leaves them.
 func (f *MemoryFile) ensureLogicalPagesLocked() {
 	if f.logicalPages.FirstSegment().Ok() {
 		return
@@ -522,7 +586,13 @@ func (f *MemoryFile) ensureLogicalPagesLocked() {
 	assignUsed := func(set *unfreeSet) {
 		for seg := set.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
 			if seg.ValuePtr().refs != 0 {
-				f.assignLogicalPagesLocked(seg.Range(), false)
+				seq, ver := f.newIdentitiesLocked(seg.Range(), false)
+				f.logicalPages.InsertRange(seg.Range(), logicalPageInfo{
+					Allocator:            f.logicalAllocator,
+					FirstSequence:        seq,
+					VersionAllocator:     f.logicalAllocator,
+					FirstVersionSequence: ver,
+				})
 			}
 		}
 	}
@@ -545,19 +615,11 @@ func (f *MemoryFile) LogicalPageVersionAt(offset uint64) (LogicalPageID, PageVer
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	seg := f.logicalPages.FindSegment(offset)
-	if !seg.Ok() {
+	runs := f.logicalPageRangesLocked(memmap.FileRange{Start: offset, End: offset + hostarch.PageSize})
+	if len(runs) == 0 {
 		return LogicalPageID{}, PageVersionID{}, false
 	}
-	info := seg.ValuePtr()
-	pageDelta := (offset - seg.Start()) / hostarch.PageSize
-	return LogicalPageID{
-			Allocator: info.Allocator,
-			Sequence:  info.FirstSequence + pageDelta,
-		}, PageVersionID{
-			Allocator: info.VersionAllocator,
-			Sequence:  info.FirstVersionSequence + pageDelta,
-		}, true
+	return runs[0].First, runs[0].FirstVersion, true
 }
 
 // LogicalPageRanges returns the stable identity runs intersecting fr. The
@@ -646,20 +708,16 @@ func (f *MemoryFile) AdoptCOWIdentities(source *MemoryFile, sourceFR, targetFR m
 			pieces = append(pieces, piece)
 		}
 	}
-	f.logicalPages.RemoveFullRange(targetFR)
 	for _, piece := range pieces {
-		if piece.Huge {
-			f.nextPageVersion = alignSequence(f.nextPageVersion)
-		}
 		destStart := targetFR.Start + (piece.Range.Start - sourceFR.Start)
-		f.logicalPages.InsertRange(memmap.FileRange{Start: destStart, End: destStart + piece.Range.Length()}, logicalPageInfo{
+		dest := memmap.FileRange{Start: destStart, End: destStart + piece.Range.Length()}
+		f.setLogicalPagesLocked(dest, logicalPageInfo{
 			Allocator:            piece.First.Allocator,
 			FirstSequence:        piece.First.Sequence,
 			VersionAllocator:     f.logicalAllocator,
-			FirstVersionSequence: f.nextPageVersion,
+			FirstVersionSequence: f.newVersionsLocked(dest, piece.Huge),
 			Huge:                 piece.Huge,
 		})
-		f.nextPageVersion += piece.Range.Length() / hostarch.PageSize
 	}
 	return nil
 }
@@ -669,13 +727,23 @@ func (f *MemoryFile) AdoptCOWIdentities(source *MemoryFile, sourceFR, targetFR m
 // Preconditions: f.mu must be locked.
 func (f *MemoryFile) isHugeLocked(fr memmap.FileRange) bool {
 	huge := true
-	cursor := fr.Start
-	f.logicalPages.VisitRange(fr, func(seg logicalPageIterator) bool {
-		huge = seg.Start() <= cursor && seg.ValuePtr().Huge
-		cursor = seg.End()
-		return huge
+	f.splitHomes(fr, func(part memmap.FileRange, home bool) {
+		if !huge {
+			return
+		}
+		if home {
+			huge = f.isHugeHomeLocked(part)
+			return
+		}
+		cursor := part.Start
+		f.logicalPages.VisitRange(part, func(seg logicalPageIterator) bool {
+			huge = seg.Start() <= cursor && seg.ValuePtr().Huge
+			cursor = seg.End()
+			return huge
+		})
+		huge = huge && cursor >= part.End
 	})
-	return huge && cursor >= fr.End
+	return huge
 }
 
 // logicalPageRangesLocked is LogicalPageRanges without locking.
@@ -683,23 +751,29 @@ func (f *MemoryFile) isHugeLocked(fr memmap.FileRange) bool {
 // Preconditions: f.mu must be locked.
 func (f *MemoryFile) logicalPageRangesLocked(fr memmap.FileRange) []LogicalPageRange {
 	var ranges []LogicalPageRange
-	f.logicalPages.VisitRange(fr, func(seg logicalPageIterator) bool {
-		intersection := seg.Range().Intersect(fr)
-		info := seg.ValuePtr()
-		pageDelta := (intersection.Start - seg.Start()) / hostarch.PageSize
-		ranges = append(ranges, LogicalPageRange{
-			Range: intersection,
-			First: LogicalPageID{
-				Allocator: info.Allocator,
-				Sequence:  info.FirstSequence + pageDelta,
-			},
-			FirstVersion: PageVersionID{
-				Allocator: info.VersionAllocator,
-				Sequence:  info.FirstVersionSequence + pageDelta,
-			},
-			Huge: info.Huge,
+	f.splitHomes(fr, func(part memmap.FileRange, home bool) {
+		if home {
+			ranges = f.homeLogicalPageRangesLocked(part, ranges)
+			return
+		}
+		f.logicalPages.VisitRange(part, func(seg logicalPageIterator) bool {
+			intersection := seg.Range().Intersect(part)
+			info := seg.ValuePtr()
+			pageDelta := (intersection.Start - seg.Start()) / hostarch.PageSize
+			ranges = append(ranges, LogicalPageRange{
+				Range: intersection,
+				First: LogicalPageID{
+					Allocator: info.Allocator,
+					Sequence:  info.FirstSequence + pageDelta,
+				},
+				FirstVersion: PageVersionID{
+					Allocator: info.VersionAllocator,
+					Sequence:  info.FirstVersionSequence + pageDelta,
+				},
+				Huge: info.Huge,
+			})
+			return true
 		})
-		return true
 	})
 	return ranges
 }
@@ -1785,20 +1859,26 @@ func (f *MemoryFile) Decommit(fr memmap.FileRange) {
 	// A 2 MiB page that is decommitted in part splits into base pages, as
 	// Linux splits a huge page that MADV_DONTNEED frees in part.
 	f.splitPartlyCoveredHugePagesLocked(fr)
-	f.memAcct.MutateFullRange(fr, func(maseg memAcctIterator) bool {
-		ma := maseg.ValuePtr()
-		if ma.knownCommitted {
-			ma.knownCommitted = false
-			malen := maseg.Range().Length()
-			f.knownCommittedBytes -= malen
-			if !f.opts.DisableMemoryAccounting {
-				usage.MemoryAccounting.Dec(malen, ma.kind, ma.memCgID)
-			}
+	f.splitHomes(fr, func(part memmap.FileRange, home bool) {
+		if home {
+			f.decommitHomeLocked(part)
+			return
 		}
-		// Update commitSeq to invalidate any observations made by
-		// concurrent calls to f.updateUsageLocked().
-		ma.commitSeq = f.commitSeq
-		return true
+		f.memAcct.MutateFullRange(part, func(maseg memAcctIterator) bool {
+			ma := maseg.ValuePtr()
+			if ma.knownCommitted {
+				ma.knownCommitted = false
+				malen := maseg.Range().Length()
+				f.knownCommittedBytes -= malen
+				if !f.opts.DisableMemoryAccounting {
+					usage.MemoryAccounting.Dec(malen, ma.kind, ma.memCgID)
+				}
+			}
+			// Update commitSeq to invalidate any observations made by
+			// concurrent calls to f.updateUsageLocked().
+			ma.commitSeq = f.commitSeq
+			return true
+		})
 	})
 }
 
@@ -1884,24 +1964,18 @@ func (f *MemoryFile) renewPageVersionsLocked(fr memmap.FileRange) {
 		panic(fmt.Sprintf("page version sequence exhausted for %v", fr))
 	}
 	f.splitPartlyCoveredHugePagesLocked(fr)
-	runs := f.logicalPageRangesLocked(fr)
-	f.logicalPages.RemoveRange(fr)
 	cursor := fr.Start
-	for _, run := range runs {
+	for _, run := range f.logicalPageRangesLocked(fr) {
 		if run.Range.Start != cursor {
 			f.assignLogicalPagesLocked(memmap.FileRange{Start: cursor, End: run.Range.Start}, false)
 		}
-		if run.Huge {
-			f.nextPageVersion = alignSequence(f.nextPageVersion)
-		}
-		f.logicalPages.InsertRange(run.Range, logicalPageInfo{
+		f.setLogicalPagesLocked(run.Range, logicalPageInfo{
 			Allocator:            run.First.Allocator,
 			FirstSequence:        run.First.Sequence,
 			VersionAllocator:     f.logicalAllocator,
-			FirstVersionSequence: f.nextPageVersion,
+			FirstVersionSequence: f.newVersionsLocked(run.Range, run.Huge),
 			Huge:                 run.Huge,
 		})
-		f.nextPageVersion += run.Range.Length() / hostarch.PageSize
 		cursor = run.Range.End
 	}
 	if cursor != fr.End {
@@ -1912,18 +1986,8 @@ func (f *MemoryFile) renewPageVersionsLocked(fr memmap.FileRange) {
 // Preconditions: f.mu must be locked.
 func (f *MemoryFile) hasUniqueRefLocked(fr memmap.FileRange) bool {
 	hasUniqueRef := true
-	f.forEachChunk(fr, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
-		unfree := &f.unfreeSmall
-		if chunk.huge {
-			unfree = &f.unfreeHuge
-		}
-		unfree.VisitFullRange(fr, func(ufseg unfreeIterator) bool {
-			if ufseg.ValuePtr().refs != 1 {
-				hasUniqueRef = false
-				return false
-			}
-			return true
-		})
+	f.visitRefsLocked(fr, func(_ memmap.FileRange, refs uint64) bool {
+		hasUniqueRef = refs == 1
 		return hasUniqueRef
 	})
 	return hasUniqueRef
@@ -1943,6 +2007,10 @@ func (f *MemoryFile) IncRef(fr memmap.FileRange, memCgID uint32) {
 // Preconditions: f.mu must be locked.
 func (f *MemoryFile) incRefLocked(fr memmap.FileRange) {
 	f.forEachChunk(fr, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
+		if chunk.isHome() {
+			f.incRefHomeLocked(chunkFR)
+			return true
+		}
 		unfree := &f.unfreeSmall
 		if chunk.huge {
 			unfree = &f.unfreeHuge
@@ -1970,14 +2038,18 @@ func (f *MemoryFile) DecRef(fr memmap.FileRange) {
 
 	haveWaste := false
 	f.forEachChunk(fr, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
+		if chunk.isHome() {
+			// Home waste is recycled only into its slots.
+			if f.decRefHomeLocked(chunkFR) {
+				haveWaste = true
+			}
+			return true
+		}
 		unwaste := &f.unwasteSmall
 		unfree := &f.unfreeSmall
 		if chunk.huge {
 			unwaste = &f.unwasteHuge
 			unfree = &f.unfreeHuge
-		} else if chunk.isHome() {
-			// Home waste is recycled only into its slots.
-			unwaste = &f.unwasteHome
 		}
 		unfree.MutateFullRange(chunkFR, func(ufseg unfreeIterator) bool {
 			uf := ufseg.ValuePtr()
@@ -2006,15 +2078,7 @@ func (f *MemoryFile) DecRef(fr memmap.FileRange) {
 					ma.wasteOrReleasing = true
 					return true
 				})
-				// Cancel any pending async load on waste pages.
-				if apl := f.asyncPageLoad.Load(); apl != nil {
-					apl.cancelWasteLoad(wasteFR)
-				}
-				if apls := f.sparseAsyncLoads.Load(); apls != nil {
-					for _, apl := range *apls {
-						apl.cancelWasteLoad(wasteFR)
-					}
-				}
+				f.cancelWasteLoadsLocked(wasteFR)
 			}
 			return true
 		})
@@ -2026,6 +2090,21 @@ func (f *MemoryFile) DecRef(fr memmap.FileRange) {
 	if haveWaste && !f.haveWaste {
 		f.haveWaste = true
 		f.releaseCond.Signal()
+	}
+}
+
+// cancelWasteLoadsLocked cancels any pending async load of fr, pages that have
+// just become waste.
+//
+// Preconditions: f.mu must be locked.
+func (f *MemoryFile) cancelWasteLoadsLocked(fr memmap.FileRange) {
+	if apl := f.asyncPageLoad.Load(); apl != nil {
+		apl.cancelWasteLoad(fr)
+	}
+	if apls := f.sparseAsyncLoads.Load(); apls != nil {
+		for _, apl := range *apls {
+			apl.cancelWasteLoad(fr)
+		}
 	}
 }
 
@@ -2151,6 +2230,10 @@ func (f *MemoryFile) unholdReleaserLocked() {
 // Preconditions: f.mu must be locked; it may be unlocked and reacquired.
 func (f *MemoryFile) releaseLocked(fr memmap.FileRange, kind releaseKind) {
 	defer func() {
+		if kind == releaseHome {
+			// A home's table accounts its pages; see below.
+			return
+		}
 		maseg := f.memAcct.LowerBoundSegmentSplitBefore(fr.Start)
 		for maseg.Ok() && maseg.Start() < fr.End {
 			maseg = f.memAcct.SplitAfter(maseg, fr.End)
@@ -2188,6 +2271,7 @@ func (f *MemoryFile) releaseLocked(fr memmap.FileRange, kind releaseKind) {
 		f.decommitOrManuallyZero(fr)
 		f.mu.Lock()
 		f.releasingHome = memmap.FileRange{}
+		f.releaseHomeLocked(fr)
 		// The range may span adjacent homes.
 		for i := fr.Start / chunkSize; i*chunkSize < fr.End; i++ {
 			f.homes[i].pages -= fr.Intersect(chunkRange(i)).Length() / hostarch.PageSize
@@ -2903,6 +2987,21 @@ func (f *MemoryFile) updateUsageLocked(memCgIDs map[uint32]struct{}) error {
 		}
 	}
 
+	// Home chunks account their pages in their tables, which f.mu, unlocked
+	// for each, does not keep from changing.
+	homes := make([]uint64, 0, len(f.homes))
+	for i := range f.homes {
+		homes = append(homes, i)
+	}
+	for _, i := range homes {
+		ok, err := f.updateHomeUsageLocked(i, memCgIDs, &buf)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return updateUsageDuringSaveErr{}
+		}
+	}
 	return nil
 }
 
@@ -3008,23 +3107,15 @@ func (f *MemoryFile) syncAndDropCache(candidates []cacheDropCandidate) error {
 	var unique []memmap.FileRange
 	f.mu.Lock()
 	for _, candidate := range candidates {
-		f.forEachChunk(candidate.range_, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
-			unfree := &f.unfreeSmall
-			if chunk.huge {
-				unfree = &f.unfreeHuge
-			}
-			unfree.VisitFullRange(chunkFR, func(seg unfreeIterator) bool {
-				if seg.ValuePtr().refs != candidate.expectedRefs {
-					return true
-				}
-				fr := seg.Range().Intersect(chunkFR)
-				if n := len(unique); n != 0 && unique[n-1].End == fr.Start {
-					unique[n-1].End = fr.End
-				} else {
-					unique = append(unique, fr)
-				}
+		f.visitRefsLocked(candidate.range_, func(fr memmap.FileRange, refs uint64) bool {
+			if refs != candidate.expectedRefs {
 				return true
-			})
+			}
+			if n := len(unique); n != 0 && unique[n-1].End == fr.Start {
+				unique[n-1].End = fr.End
+			} else {
+				unique = append(unique, fr)
+			}
 			return true
 		})
 	}
@@ -3091,6 +3182,9 @@ func (f *MemoryFile) stringLocked() string {
 		}
 	}
 	fmt.Fprintf(&b, "memAcct:\n%s", &f.memAcct)
+	if len(f.homes) != 0 {
+		b.WriteString(f.homePagesString())
+	}
 	return b.String()
 }
 
