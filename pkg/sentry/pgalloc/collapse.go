@@ -23,7 +23,8 @@ import (
 // memory in base pages; collapse returns what is whole again to huge pages.
 // See g3doc/proposals/ttc_address_ordered_memory.md.
 
-// collapseHost has the host back fr of the file fd with a huge page; tests
+// collapseHost has the host back fr of the file fd with a huge page, through
+// view, fr's address in the huge view of its home, if that is not 0; tests
 // replace it on hosts whose files have none.
 var collapseHost = collapseFileRange
 
@@ -39,7 +40,7 @@ var noCollapse atomicbitops.Bool
 // is called.
 func SetCollapseHostForTest(fn func(fd uintptr, fr memmap.FileRange) error) func() {
 	old := collapseHost
-	collapseHost = fn
+	collapseHost = func(fd uintptr, fr memmap.FileRange, _ uintptr) error { return fn(fd, fr) }
 	return func() {
 		collapseHost = old
 		noCollapse.Store(false)
@@ -72,11 +73,17 @@ func (f *MemoryFile) CollapseHuge(fr memmap.FileRange) (collapsed, retry bool) {
 	}
 	f.mu.Lock()
 	ok := f.homes[fr.Start/chunkSize] != nil && !f.isHugeLocked(fr)
+	var view uintptr
+	if ok {
+		if view = f.hugeViewLocked(fr.Start / chunkSize); view != 0 {
+			view += uintptr(fr.Start % chunkSize)
+		}
+	}
 	f.mu.Unlock()
 	if !ok {
 		return false, false
 	}
-	if err := collapseHost(f.file.Fd(), fr); err != nil {
+	if err := collapseHost(f.file.Fd(), fr, view); err != nil {
 		if errors.Is(err, errNoHostCollapse) && noCollapse.CompareAndSwap(false, true) {
 			log.Infof("MemoryFile: %v; collapse is off", err)
 		}

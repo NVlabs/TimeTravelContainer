@@ -1466,10 +1466,8 @@ func createMemoryFileFromFileWithOptions(appHugePages bool, hostTHP HostTHP, mem
 	}
 	if !diskBacked && backingProvider == nil {
 		mfopts.NUMANodes = applicationNUMANodes
+		// A home chunk for each block of addresses that applications use.
 		mfopts.MaxHomes = applicationMaxHomes
-		// A home chunk for each block of addresses that applications use:
-		// mapped in one reserved range, they cost the Sentry no mappings.
-		mfopts.ReserveMappings = applicationMaxHomes != 0
 	}
 	if appHugePages {
 		switch hostTHP.ShmemEnabled {

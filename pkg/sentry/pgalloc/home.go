@@ -78,6 +78,12 @@ type homeChunk struct {
 	// holds at their slots; see unitSlots.
 	unit    unitWindow
 	hasUnit bool
+
+	// hugeView is the address of the chunk's huge view, or 0 if it has none
+	// yet; noHugeView is true if the host had no room for one. See
+	// hugeViewLocked.
+	hugeView   uintptr
+	noHugeView bool
 }
 
 // Identities from slots.
@@ -267,24 +273,30 @@ func (f *MemoryFile) spareHomeIfEmptyLocked(i uint64) {
 }
 
 // remapSparedHomeLocked maps the home chunk i, which has neither an owner nor
-// pages, afresh where f reserved addresses for its chunks. The host keeps the
-// page tables of the Sentry's mapping of pages once they are gone, and an
-// address space's pages spread over its home by their addresses, so that a
-// home that address spaces held one after another, as a build's processes
-// do, keeps up to 2 MiB of them, however few pages each held.
+// pages, afresh where it is mapped, and its huge view if it has one. The host
+// keeps the page tables of the Sentry's mapping of pages once they are gone,
+// and an address space's pages spread over its home by their addresses, so
+// that a home that address spaces held one after another, as a build's
+// processes do, keeps up to 2 MiB of them, however few pages each held.
 //
 // Preconditions: f.mu must be locked.
 func (f *MemoryFile) remapSparedHomeLocked(i uint64) {
-	off := i * chunkSize
-	if f.file == nil || f.backing != nil || f.reservation.length == 0 || off+chunkSize > uint64(f.reservation.length) {
+	chunks := f.chunksLoad()
+	if f.file == nil || f.backing != nil || i >= uint64(len(chunks)) || chunks[i].mapping == 0 {
 		return
 	}
-	addr, err := f.mapChunksLocked(off, chunkSize)
-	if err != nil {
+	if err := f.remapChunkLocked(chunks[i].mapping, i*chunkSize, chunkSize); err != nil {
 		log.Warningf("MemoryFile: mapping spared home chunk %d again: %v", i, err)
 		return
 	}
-	f.madviseChunkMapping(addr, chunkSize, false)
+	f.madviseChunkMapping(chunks[i].mapping, chunkSize, false)
+	if view := f.homes[i].hugeView; view != 0 {
+		if err := f.remapChunkLocked(view, i*chunkSize, chunkSize); err != nil {
+			log.Warningf("MemoryFile: mapping the huge view of spared home chunk %d again: %v", i, err)
+			return
+		}
+		adviseHugeView(view, chunkSize, f.opts.AdviseHugepage)
+	}
 }
 
 // unitSlots returns the window of the residency unit of length bytes whose
@@ -399,6 +411,10 @@ func (f *MemoryFile) AllocateAt(fr memmap.FileRange, opts AllocOpts) (memmap.Fil
 	node := f.placementNode(&opts)
 	f.mu.Lock()
 	waste, bind, err := f.markHomeUsedLocked(fr, opts, huge, node)
+	var view uintptr
+	if err == nil && huge && len(waste) == 0 {
+		view = f.hugeViewLocked(fr.Start / chunkSize)
+	}
 	f.mu.Unlock()
 	if err != nil {
 		return memmap.FileRange{}, err
@@ -406,7 +422,7 @@ func (f *MemoryFile) AllocateAt(fr memmap.FileRange, opts AllocOpts) (memmap.Fil
 	for _, hugeFR := range bind {
 		bindFileRange(f.file.Fd(), hugeFR, int(node-1))
 	}
-	n, filled, err := f.populateHome(fr, opts, huge, waste)
+	n, filled, err := f.populateHome(fr, opts, huge, waste, view)
 	if err != nil && !filled {
 		f.DecRef(fr)
 		return memmap.FileRange{}, err
@@ -522,17 +538,23 @@ func (f *MemoryFile) markHomeUsedLocked(fr memmap.FileRange, opts AllocOpts, hug
 }
 
 // populateHome commits what AllocateAt commits of fr, which it has just
-// marked used, and zeroes its waste parts. If it commits a 2 MiB page through
-// a mapping of its own and opts has a ReaderFunc, it fills the page through
-// that mapping too: filled is true then, n is how many bytes the ReaderFunc
-// filled, and err is its error.
-func (f *MemoryFile) populateHome(fr memmap.FileRange, opts AllocOpts, huge bool, waste []memmap.FileRange) (n uint64, filled bool, err error) {
+// marked used, and zeroes its waste parts. 2 MiB pages whose slots were all
+// free it commits through view, the address of the huge view of fr's home, or
+// a mapping of their own if that is 0; and if opts has a ReaderFunc, it fills
+// them through it too: filled is true then, n is how many bytes the
+// ReaderFunc filled, and err is its error.
+func (f *MemoryFile) populateHome(fr memmap.FileRange, opts AllocOpts, huge bool, waste []memmap.FileRange, view uintptr) (n uint64, filled bool, err error) {
 	if f.file == nil {
 		return 0, false, nil
 	}
 	if huge && len(waste) == 0 {
 		// A 2 MiB page whose slots were all free: commit a huge page.
-		n, committed, err := populateHugeFileRange(f.file.Fd(), fr, f.opts.AdviseHugepage, opts.ReaderFunc)
+		var committed bool
+		if view != 0 {
+			n, committed, err = populateHugeView(mappingSlice(view+uintptr(fr.Start%chunkSize), uintptr(fr.Length())), opts.ReaderFunc)
+		} else {
+			n, committed, err = populateHugeFileRange(f.file.Fd(), fr, f.opts.AdviseHugepage, opts.ReaderFunc)
+		}
 		if !committed || opts.ReaderFunc != nil {
 			return n, committed, err
 		}

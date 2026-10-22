@@ -71,10 +71,19 @@ func (f *MemoryFile) MovePages(src, dst memmap.FileRange) error {
 	if seg := f.memAcct.FindSegment(src.Start); seg.Ok() {
 		opts.Kind, opts.MemCgID = seg.ValuePtr().kind, seg.ValuePtr().memCgID
 	}
+	// 2 MiB pages read through their home's huge view, with one page table
+	// entry each.
+	srcs, viewed := safemem.BlockSeq{}, false
+	if huge {
+		srcs, viewed = f.hugeMappingLocked(src)
+	}
 	f.mu.Unlock()
-	srcs, lease, err := f.MapInternalWithLease(src, hostarch.Read)
-	if err != nil {
-		return err
+	var lease memmap.InternalMappingLease
+	if !viewed {
+		var err error
+		if srcs, lease, err = f.MapInternalWithLease(src, hostarch.Read); err != nil {
+			return err
+		}
 	}
 	reader := safemem.BlockSeqReader{Blocks: srcs}
 	opts.ReaderFunc = reader.ReadToBlocks

@@ -903,7 +903,14 @@ func (mm *MemoryManager) breakHugePageCOWLocked(ctx context.Context, block hosta
 			return pmaIterator{}, false
 		}
 	}
-	reader := safemem.BlockSeqReader{Blocks: mm.internalMappingsLocked(first, block)}
+	// The original is read through its home's huge view where it has one,
+	// with one page table entry, rather than 512 through the Sentry's own
+	// mapping of the home.
+	original, viewed := source.HugePageMapping(page)
+	if !viewed {
+		original = mm.internalMappingsLocked(first, block)
+	}
+	reader := safemem.BlockSeqReader{Blocks: original}
 	huge := mm.mf.HugepagesEnabled()
 	fr, err := mm.allocatePrivateLocked(block, pgalloc.AllocOpts{
 		Kind:             usage.Anonymous,

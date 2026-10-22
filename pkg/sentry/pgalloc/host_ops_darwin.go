@@ -26,15 +26,14 @@ func commitHostFile(int, memmap.FileRange) error { return nil }
 // Returning EOPNOTSUPP selects MemoryFile's mandatory manual-zero fallback.
 func decommitHostFile(int, memmap.FileRange) error { return unix.EOPNOTSUPP }
 
-// reserveAddressRange reserves nothing: a platform backing maps its chunks
-// itself.
-func reserveAddressRange() (base, length uintptr) { return 0, 0 }
+// mapHugeView maps nothing: a platform backing has no home chunks.
+func mapHugeView(uintptr, uint64, uint64, bool) (uintptr, error) { return 0, unix.ENOSYS }
 
-// releaseAddressRange does nothing, as reserveAddressRange reserves nothing.
-func releaseAddressRange(base, length uintptr) {}
+// adviseHugeView does nothing, as there are no huge views.
+func adviseHugeView(uintptr, uint64, bool) {}
 
 // collapseFileRange collapses nothing: a platform backing has no home chunks.
-func collapseFileRange(uintptr, memmap.FileRange) error { return errNoHostCollapse }
+func collapseFileRange(uintptr, memmap.FileRange, uintptr) error { return errNoHostCollapse }
 
 // populateHugeFileRange does nothing: a platform backing has no home chunks.
 func populateHugeFileRange(uintptr, memmap.FileRange, bool, safemem.ReaderFunc) (uint64, bool, error) {

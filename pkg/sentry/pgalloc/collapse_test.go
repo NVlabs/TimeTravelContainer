@@ -145,7 +145,8 @@ func pmdMappedKB(t *testing.T, addr uintptr) uint64 {
 // with its base pages' contents, which a mapping at an aligned address maps
 // as one: whatever address the host would pick for a mapping of the file, and
 // though the host maps the huge page in the mapping it collapses through only
-// if that has a page table (Linux 6.1).
+// if that has a page table (Linux 6.1). It collapses one 2 MiB range through a
+// huge view, and the other through a mapping of its own.
 func TestCollapseFileRange(t *testing.T) {
 	fd, err := unix.MemfdCreate("ttc-collapse", 0)
 	if err != nil {
@@ -164,32 +165,33 @@ func TestCollapseFileRange(t *testing.T) {
 	for i := 0; i < length; i += hostarch.PageSize {
 		m[i] = byte(i / hostarch.PageSize)
 	}
-	fr := memmap.FileRange{Start: hostarch.HugePageSize, End: length}
-	switch err := collapseFileRange(uintptr(fd), fr); {
-	case errors.Is(err, errNoHostCollapse):
-		t.Skip("the host does not collapse base pages into huge pages")
-	case errors.Is(err, unix.ENOMEM), errors.Is(err, unix.EAGAIN), errors.Is(err, unix.EBUSY):
-		t.Skipf("the host has no huge page now: %v", err)
-	case err != nil:
-		t.Fatalf("collapseFileRange(%v): %v", fr, err)
+	view, err := mapHugeView(uintptr(fd), 0, length, false)
+	if err != nil {
+		t.Fatalf("mapHugeView: %v", err)
 	}
-
-	room, _, errno := unix.Syscall6(unix.SYS_MMAP, 0, 2*hostarch.HugePageSize, unix.PROT_NONE, unix.MAP_PRIVATE|unix.MAP_ANONYMOUS|unix.MAP_NORESERVE, ^uintptr(0) /* fd */, 0)
-	if errno != 0 {
-		t.Fatal(errno)
-	}
-	defer unix.Syscall(unix.SYS_MUNMAP, room, 2*hostarch.HugePageSize, 0)
-	addr := uintptr(hostarch.Addr(room).MustHugeRoundUp())
-	if _, _, errno := unix.Syscall6(unix.SYS_MMAP, addr, hostarch.HugePageSize, unix.PROT_READ, unix.MAP_SHARED|unix.MAP_FIXED, uintptr(fd), uintptr(fr.Start)); errno != 0 {
-		t.Fatal(errno)
-	}
-	mapped := mappingSlice(addr, hostarch.HugePageSize)
-	for i := 0; i < len(mapped); i += hostarch.PageSize {
-		if want := byte((hostarch.HugePageSize + i) / hostarch.PageSize); mapped[i] != want {
-			t.Fatalf("byte %#x of the collapsed range is %d, want %d", i, mapped[i], want)
+	defer unix.Syscall(unix.SYS_MUNMAP, view, length, 0)
+	viewed := memmap.FileRange{Start: 0, End: hostarch.HugePageSize}
+	alone := memmap.FileRange{Start: hostarch.HugePageSize, End: length}
+	for _, c := range []struct {
+		fr   memmap.FileRange
+		view uintptr
+	}{{viewed, view}, {alone, 0}} {
+		switch err := collapseFileRange(uintptr(fd), c.fr, c.view); {
+		case errors.Is(err, errNoHostCollapse):
+			t.Skip("the host does not collapse base pages into huge pages")
+		case errors.Is(err, unix.ENOMEM), errors.Is(err, unix.EAGAIN), errors.Is(err, unix.EBUSY):
+			t.Skipf("the host has no huge page now: %v", err)
+		case err != nil:
+			t.Fatalf("collapseFileRange(%v, view %#x): %v", c.fr, c.view, err)
 		}
 	}
-	if kb := pmdMappedKB(t, addr); kb != hostarch.HugePageSize/1024 {
-		t.Errorf("the collapsed range maps as %d kB of huge pages, want %d", kb, hostarch.HugePageSize/1024)
+	mapped := mappingSlice(view, length)
+	for i := 0; i < len(mapped); i += hostarch.PageSize {
+		if want := byte(i / hostarch.PageSize); mapped[i] != want {
+			t.Fatalf("byte %#x of the collapsed ranges is %d, want %d", i, mapped[i], want)
+		}
+	}
+	if kb := pmdMappedKB(t, view); kb != length/1024 {
+		t.Errorf("the collapsed ranges map in the view as %d kB of huge pages, want %d", kb, length/1024)
 	}
 }

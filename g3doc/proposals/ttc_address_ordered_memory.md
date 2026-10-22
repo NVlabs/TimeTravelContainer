@@ -1,7 +1,7 @@
 # Address-ordered private memory under systrap
 
-Status: implemented (2026-10-18): homes and placement, the Sentry's address
-reservation, folding, collapse, and restored memory at its slots. Where the
+Status: implemented (2026-10-18): homes and placement, the Sentry's mappings of
+the memory file, folding, collapse, and restored memory at its slots. Where the
 implementation departs from the design below, the section says so. Measured
 against the code before it, and fixed where it cost more (2026-10-21); see
 "Performance".
@@ -133,10 +133,20 @@ Sentry must decide which the host backs with transparent huge pages without
 - A 2 MiB page is populated through a temporary mapping of its 2 MiB range with
   the advice that allows a huge page, then unmapped, as `bindFileRange` already
   does for NUMA binding (`numa_linux_unsafe.go:40`). That costs three system
-  calls per 2 MiB page, against zeroing 2 MiB. A copy into a 2 MiB page
-  (copy-on-write, a fold) is written through that mapping too, which has the
-  page's table entries: the Sentry's own mapping has none, and a copy through
-  it faulted on each base page, which doubled the copy's cost.
+  calls per 2 MiB page, against zeroing 2 MiB.
+
+  Implemented so first, with a copy into a 2 MiB page (copy-on-write, a fold, a
+  restored unit) written through that mapping too, as the Sentry's own mapping
+  has no table entries for the page and a copy through it faulted on each base
+  page. Replaced (2026-10-22) by a second mapping of a home that holds 2 MiB
+  pages, its huge view (`pgalloc/chunk_mapping.go`): the home's chunk mapped
+  at an address aligned to huge pages, with the advice that allows them, once,
+  when the home gets its first 2 MiB page. A 2 MiB page is committed, filled
+  and read through it, with one page table entry: a copy on write reads its
+  original there, and a fold reads and writes 2 MiB pages there. Nothing
+  touches a home's 4 KiB pages through the view, which would have the host put
+  a huge page over their range. Where the host has no room for a view, the
+  temporary mapping remains.
 - The stub's mappings carry no advice, so on the huge-page tmpfs the stub's
   first touch of an empty 2 MiB range would get a huge page. That is right for a
   2 MiB page and wrong for a range of 4 KiB pages. So the first 4 KiB page placed
@@ -174,19 +184,27 @@ as guest physical memory within the CPU's physical address bits
 (`pkg/sentry/platform/kvm/physical_map.go:57`), and a large reservation needs
 checking there. KVM does not need homes at all (goal 2 holds there already).
 
-Implemented as `MemoryFileOpts.ReserveMappings`, on wherever homes are: the
-file reserves the largest of 64 TiB down to 64 GiB that the host has room for,
-at its first growth, and maps growths, a checkpoint's load and a remote fork's
-import there (`pgalloc/mapping_reservation.go`); chunks past it are mapped
-apart, as before. A family whose Sentry held 19 to 32 mappings of its memory
-file in the local suite (`vmacheck`) holds one.
+Implemented first as `MemoryFileOpts.ReserveMappings`, on wherever homes were:
+the file reserved the largest of 64 TiB down to 64 GiB that the host had room
+for, and mapped growths, a checkpoint's load and a remote fork's import there,
+so that a family whose Sentry held 19 to 32 mappings of its memory file in the
+local suite (`vmacheck`) held one. Replaced (2026-10-22) by a mapping per
+growth, where the host places it, as before homes, which bounds the Sentry's
+mappings by the file's size, as goal 1 asks, without claiming half of the
+process's address space: a home is a growth of its own, so that each home has an
+address range of its own, and a second one for its huge view once it holds a 2
+MiB page (see "Host huge pages inside a home"). The Sentry holds at most two
+mappings per GiB of the file: in `vmacheck`, one per GiB with base pages (12 to
+30, for files of 12 to 30 GiB), and 13 to 41 for files of 12 to 35 GiB with 2
+MiB pages, whose homes have views.
 
 The host keeps the page tables of the Sentry's mapping of pages once the pages
 are gone, and an address space spreads its pages over its home by their
 addresses: a home that processes held one after another kept up to 2 MiB of
 them, and a build left the Sentry 21 MB of page tables where it left 2 MB
 without homes. A home that is spared, with neither owner nor pages, is mapped
-afresh, which drops them (`remapSparedHomeLocked`): the build leaves 0.7 MB.
+afresh where it is mapped, as is its huge view, which drops them
+(`remapSparedHomeLocked`): the build leaves 0.7 MB.
 
 ### Limits
 
@@ -388,27 +406,27 @@ default also refills discarded pages with zeroes, which would undo the
 application's frees.
 
 Implemented (`pgalloc.MemoryFile.CollapseHuge`, `mm/collapse.go`) with
-`MADV_COLLAPSE` alone, through a temporary mapping of the range at a
-2 MiB-aligned address, touched first: the host collapses only what it may map as
-a huge page there, and Linux 6.1 maps the huge page into the mapping only where
-that has a page table already, failing the call (EINVAL) otherwise though it
-collapsed the range. A host without `MADV_COLLAPSE` (before 6.1: the advice
-fails even for no range) turns collapse off; a range the host refuses is
-dropped, and one without a free huge page (ENOMEM, EAGAIN, EBUSY) is asked again
-on later passes, eight times at most. A range keeps its pages' identities if
-they are a 2 MiB page's already (consecutive from a multiple of 512, as pages
-allocated afresh at their slots are; see "Restored memory"), and takes one new
-version. The fold steps collapse candidates: the 2 MiB of a page placed in a
-home that fills its slots, of a write that takes pages over in place, of a
-fold's block, and of a 2 MiB page freed in part in place (`MADV_DONTNEED`), once
-each has waited 10 s, as khugepaged scans every 10 s, so that a short-lived
-process's memory is not copied into huge pages just before it goes. A range is
-collapsed only if every page is in memory (`mincore`), so that no page the
-application discarded is filled; a range that waits for one to be written again,
-which the Sentry does not see, is looked at again every 10 s, as khugepaged
-scans, 4096 ranges at most per address space. Linux 7.0 and 6.1 (the farm's
-hosts) collapse both a huge tmpfs's pages and a memfd's, whatever
-`shmem_enabled` says.
+`MADV_COLLAPSE` alone, through the home's huge view (or, where it has none, a
+temporary mapping of the range at a 2 MiB-aligned address), touched first: the
+host collapses only what it may map as a huge page there, and Linux 6.1 maps the
+huge page into the mapping only where that has a page table already, failing the
+call (EINVAL) otherwise though it collapsed the range. A host without
+`MADV_COLLAPSE` (before 6.1: the advice fails even for no range) turns collapse
+off; a range the host refuses is dropped, and one without a free huge page
+(ENOMEM, EAGAIN, EBUSY) is asked again on later passes, eight times at most. A
+range keeps its pages' identities if they are a 2 MiB page's already
+(consecutive from a multiple of 512, as pages allocated afresh at their slots
+are; see "Restored memory"), and takes one new version. The fold steps collapse
+candidates: the 2 MiB of a page placed in a home that fills its slots, of a
+write that takes pages over in place, of a fold's block, and of a 2 MiB page
+freed in part in place (`MADV_DONTNEED`), once each has waited 10 s, as
+khugepaged scans every 10 s, so that a short-lived process's memory is not
+copied into huge pages just before it goes. A range is collapsed only if every
+page is in memory (`mincore`), so that no page the application discarded is
+filled; a range that waits for one to be written again, which the Sentry does
+not see, is looked at again every 10 s, as khugepaged scans, 4096 ranges at most
+per address space. Linux 7.0 and 6.1 (the farm's hosts) collapse both a huge
+tmpfs's pages and a memfd's, whatever `shmem_enabled` says.
 
 ## Lifecycles
 
@@ -509,7 +527,8 @@ alternates between their homes, unit by unit or finer.
   a memfd, through an aligned mapping that has a page table (see "Collapse").
 - Kernel memory for shared NUMA policies: one range per 2 MiB of homes, only with
   `--cpu-topology host`.
-- The Sentry's address reservation alongside the Go runtime's.
+- The Sentry's mappings of its memory file: at most two per GiB of the file,
+  within its `vm.max_map_count`, of which `maxHomes` is at most a quarter.
 - Folding cost: a page moves at most once per fork that shared it, within the
   budget, and memory briefly holds both copies of a page in flight.
 
@@ -531,20 +550,21 @@ alternates between their homes, unit by unit or finer.
   - a fork-and-exec-heavy build.
 - **Overhead**: fault latency, fold CPU and memory bandwidth, and file size.
 
-The stress suite `vmacheck` counts real host mappings: a process writes a
-buffer at random, and the stub's mappings over it are counted, after it reads
-every page, against what goal 2 promises, through a fork that writes all,
-writes while a fork shares, the fork's removal, a parent's removal with
-adoption, a guest fork, a dehydration and rehydration, and (with 2 MiB pages)
-frees in part and collapse; and the Sentry's mappings of its memory file,
-against goal 1. Locally (Linux 7.0) and on the farm (Linux 6.1.62, hardened,
-with a huge tmpfs, 1 GiB and 2 GiB buffers), every count where the pages are
-written alike is one per block and the Sentry's is one; before folding, the
-same steps left 65,467 to 86,067 stub mappings and 19 to 32 Sentry ones. On
-the farm, a page freed in each 2 MiB splits every huge page of the buffer, and
-once the pages are written again, collapse maps all of it with huge pages
-again (1,048,576 and 2,097,152 kB). Its cluster counterpart, `c29`, counts a
-remote fork's: a 256 MiB buffer written at random takes one stub mapping on
+The stress suite `vmacheck` counts real host mappings: a process writes a buffer
+at random, and the stub's mappings over it are counted, after it reads every
+page, against what goal 2 promises, through a fork that writes all, writes while
+a fork shares, the fork's removal, a parent's removal with adoption, a guest
+fork, a dehydration and rehydration, and (with 2 MiB pages) frees in part and
+collapse; and the Sentry's mappings of its memory file, against goal 1. Locally
+(Linux 7.0) and on the farm (Linux 6.1.62, hardened, with a huge tmpfs, 1 GiB
+and 2 GiB buffers), every count where the pages are written alike is one per
+block, and the Sentry's mappings of its memory file were one while it reserved
+an address range for them, and are at most two per GiB of the file since; before
+folding, the same steps left 65,467 to 86,067 stub mappings and 19 to 32 Sentry
+ones. On the farm, a page freed in each 2 MiB splits every huge page of the
+buffer, and once the pages are written again, collapse maps all of it with huge
+pages again (1,048,576 and 2,097,152 kB). Its cluster counterpart, `c29`, counts
+a remote fork's: a 256 MiB buffer written at random takes one stub mapping on
 the target node, where it took 128 before phase 4, one per residency unit.
 
 ## Performance
@@ -621,11 +641,22 @@ Every everyday command's median is within 10% of before. What still costs:
 - A live fork's writes while its source forks take 4% longer: the cost of copies
   above, and a pass over what the fork shares every 10 s.
 
-Two changes would remove most of these, and are proposed, not built: a second
-view of home chunks in the Sentry's reserved range, without the advice against
-huge pages, through which the Sentry reads and writes 2 MiB pages; and tables of
-each home's pages in place of segment sets, whose cost would not depend on the
-order of writes.
+Two changes were proposed to remove most of these: a second view of home chunks,
+without the advice against huge pages, through which the Sentry reads and
+writes 2 MiB pages; and tables of each home's pages in place of segment sets,
+whose cost would not depend on the order of writes.
+
+The first is built (2026-10-22): the huge view (see "Host huge pages inside a
+home"), with a mapping per growth of the file in place of the reserved range
+(see "The Sentry's mapping"). Three rounds of the memory workload locally,
+against the commit before it: with base pages, no time differs by more than the
+spread between rounds of one build, nor does removing a rehydrated family in
+five more rounds of that alone (0.20 to 0.23 s in both). With 2 MiB pages, on
+this host, whose tmpfs gives the memory file no huge pages, a first write takes
+4% less, a fork's write 4% less and a rehydration 4% less; the Sentry's page
+tables grow by 2 MiB per GiB of 2 MiB pages, which the view maps with base
+pages there, until their home is spared. Where the host gives huge pages, the
+view maps each with one entry. The second is proposed, not built.
 
 ## Phases
 
