@@ -30,11 +30,10 @@
 #include "virgl_int.h"
 
 enum {
-   // ureg's temporaries, UREG_MAX_TEMP.
-   MAX_TEMPS = 4096,
    // tgsi_sanity_check, which checks that the registers that instructions
    // name are declared, keys a register by its indexes, of 14 bits.
    MAX_INDEX = 1 << 14,
+   MAX_TEMPS = MAX_INDEX,
    // tgsi_scan_shader masks samplers, images and buffers in 32 bits.
    MAX_RESOURCES = 32,
    // tgsi_to_nir's vertex shaders' inputs are VERT_ATTRIB_GENERIC0..15.
@@ -169,6 +168,12 @@ static bool check_property(struct check *k, struct tgsi_token *tokens, unsigned 
    case TGSI_PROPERTY_FS_COORD_PIXEL_CENTER:
    case TGSI_PROPERTY_LEGACY_MATH_RULES:
       if (value > 1)
+         return fail(k, "property %u of %u", name, value);
+      return true;
+   case TGSI_PROPERTY_FS_EARLY_DEPTH_STENCIL:
+      // Which tgsi_to_nir has not, but ttc_virgl_create_shader gives a
+      // fragment shader's NIR.
+      if (value > 1 || (value && k->stage != MESA_SHADER_FRAGMENT))
          return fail(k, "property %u of %u", name, value);
       return true;
    case TGSI_PROPERTY_FS_COLOR0_WRITES_ALL_CBUFS:
@@ -498,8 +503,10 @@ static uint32_t tex_targets(unsigned opcode) {
              T(SHADOW2D_ARRAY) | T(SHADOWCUBE) | T(SHADOWRECT);
    case TGSI_OPCODE_TXQ:
       // tgsi_to_nir queries a level's size and the levels of each target,
-      // of which rectangles, buffers and multisampled textures have none.
-      return T_LOD | T(SHADOW2D_ARRAY) | T(SHADOWCUBE) | T(CUBE_ARRAY) | T(SHADOWCUBE_ARRAY);
+      // of which buffers and multisampled textures have none; Zink makes
+      // rectangles 2D textures.
+      return T_LOD | T(RECT) | T(SHADOWRECT) | T(SHADOW2D_ARRAY) | T(SHADOWCUBE) |
+             T(CUBE_ARRAY) | T(SHADOWCUBE_ARRAY);
    default:
       return 0;
    }
@@ -758,6 +765,26 @@ static bool check_end(struct check *k) {
          return fail(k, "a block of %ux%ux%u", b[0], b[1], b[2]);
    }
    return true;
+}
+
+uint32_t ttc_virgl_tgsi_property(struct tgsi_token *tokens, unsigned name, bool clear) {
+   struct tgsi_parse_context p;
+   if (tgsi_parse_init(&p, tokens) != TGSI_PARSE_OK)
+      return 0;
+   uint32_t value = 0;
+   while (!tgsi_parse_end_of_tokens(&p)) {
+      unsigned pos = p.Position;
+      tgsi_parse_token(&p);
+      const struct tgsi_full_property *prop = &p.FullToken.FullProperty;
+      if (p.FullToken.Token.Type != TGSI_TOKEN_TYPE_PROPERTY || prop->Property.PropertyName != name ||
+          prop->Property.NrTokens < 2)
+         continue;
+      value = prop->u[0].Data;
+      if (clear)
+         ((struct tgsi_property_data *)&tokens[pos + 1])->Data = 0;
+   }
+   tgsi_parse_free(&p);
+   return value;
 }
 
 bool ttc_virgl_check_tgsi(struct tgsi_token *tokens, char *err, uint32_t errlen) {

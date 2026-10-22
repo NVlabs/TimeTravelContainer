@@ -35,6 +35,10 @@ extern uint32_t ttc_virgl_xfb_ubo, ttc_virgl_xfb_ssbo;
 // has.
 bool ttc_virgl_check_tgsi(struct tgsi_token *tokens, char *err, uint32_t errlen);
 
+// ttc_virgl_tgsi_property returns the value of tokens' property name, the
+// last of its, and clears it if clear (tgsi_check.c).
+uint32_t ttc_virgl_tgsi_property(struct tgsi_token *tokens, unsigned name, bool clear);
+
 // ttc_virgl_pipe_format returns the Gallium format of a virgl format.
 enum pipe_format ttc_virgl_pipe_format(uint32_t format);
 

@@ -805,6 +805,26 @@ void *ttc_virgl_create_shader(struct pipe_context *pipe, uint32_t stage, const v
       ss.type = PIPE_SHADER_IR_NIR;
       ss.ir.nir = nir;
    }
+   if (s == MESA_SHADER_FRAGMENT &&
+       ttc_virgl_tgsi_property((struct tgsi_token *)tokens, TGSI_PROPERTY_FS_EARLY_DEPTH_STENCIL, false)) {
+      // tgsi_to_nir has no early fragment tests: the NIR of the shader's
+      // tokens without their property has them.
+      struct tgsi_token *t = tgsi_dup_tokens(tokens);
+      if (!t) {
+         snprintf(err, errlen, "no memory for the shader's tokens");
+         return NULL;
+      }
+      ttc_virgl_tgsi_property(t, TGSI_PROPERTY_FS_EARLY_DEPTH_STENCIL, true);
+      nir_shader *nir = tgsi_to_nir(t, pipe->screen, false);
+      FREE(t);
+      if (!nir) {
+         snprintf(err, errlen, "tgsi_to_nir failed");
+         return NULL;
+      }
+      nir->info.fs.early_fragment_tests = true;
+      ss.type = PIPE_SHADER_IR_NIR;
+      ss.ir.nir = nir;
+   }
    switch (s) {
    case MESA_SHADER_VERTEX:
       shader = pipe->create_vs_state(pipe, &ss);

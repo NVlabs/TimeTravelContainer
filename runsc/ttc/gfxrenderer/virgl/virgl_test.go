@@ -1075,7 +1075,7 @@ func TestUntranslatableTGSI(t *testing.T) {
 		stage uint32
 		text  string
 	}{
-		{"an unknown property", stageFragment, "FRAG\nPROPERTY FS_EARLY_DEPTH_STENCIL 1\nDCL OUT[0], COLOR\n" +
+		{"an unknown property", stageFragment, "FRAG\nPROPERTY FS_POST_DEPTH_COVERAGE 1\nDCL OUT[0], COLOR\n" +
 			greenImm + "  0: MOV OUT[0], IMM[0]\n  1: END\n"},
 		{"a geometry shader", stageGeometry, "GEOM\nPROPERTY GS_INPUT_PRIMITIVE TRIANGLES\n" +
 			"PROPERTY GS_OUTPUT_PRIMITIVE TRIANGLE_STRIP\nPROPERTY GS_MAX_OUTPUT_VERTICES 3\n" +
@@ -1132,18 +1132,21 @@ func TestUntranslatableTGSI(t *testing.T) {
 		})
 	}
 	// A property that the shader's code has, which tgsi_to_nir took for
-	// a meaning that it has not, is the shader's.
-	var s stream
-	f.setup(&s)
-	fs := f.id()
-	s.shader(fs, stageFragment, "FRAG\nPROPERTY FS_BLEND_EQUATION_ADVANCED 65534\nDCL OUT[0], COLOR\n"+greenImm+
-		"  0: MOV OUT[0], IMM[0]\n  1: END\n", 1<<16)
-	s.cmd(cmdBindShader, 0, fs, stageFragment)
-	clearRed(&s)
-	drawTriangle(&s)
-	f.submit(t, s)
-	f.finish(t)
-	f.checkTriangle(t)
+	// a meaning that it has not, is the shader's; early fragment tests,
+	// which it has not, are the NIR's.
+	for _, property := range []string{"FS_BLEND_EQUATION_ADVANCED 65534", "FS_EARLY_DEPTH_STENCIL 1"} {
+		var s stream
+		f.setup(&s)
+		fs := f.id()
+		s.shader(fs, stageFragment, "FRAG\nPROPERTY "+property+"\nDCL OUT[0], COLOR\n"+greenImm+
+			"  0: MOV OUT[0], IMM[0]\n  1: END\n", 1<<16)
+		s.cmd(cmdBindShader, 0, fs, stageFragment)
+		clearRed(&s)
+		drawTriangle(&s)
+		f.submit(t, s)
+		f.finish(t)
+		f.checkTriangle(t)
+	}
 }
 
 // TestTGSICorpus creates a shader of each of $VIRGL_TGSI_CORPUS, a
