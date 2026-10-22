@@ -1050,9 +1050,12 @@ ttc stats --json web@test-b
 ```
 
 Resident memory counts mapped application pages in the Sentry; it deliberately
-does not estimate the Sentry's Go heap or unmapped cache. Filesystem sharing is
-reported at TTC's immutable file-object boundary, while durable memory backing
-is reported from still-present sparse chunk objects.
+does not estimate the Sentry's Go heap or unmapped cache. It is counted from the
+ranges of the Sentry's memory file that address spaces and in-memory files hold,
+not page by page, so that it takes milliseconds however much memory the family
+holds. Filesystem sharing is reported at TTC's immutable file-object boundary,
+while durable memory backing is reported from still-present sparse chunk
+objects.
 
 JSON inspection reports storage separately from lifecycle. `storage_state` is
 `local`, `resident`, `publishing`, `shared`, `materializing`, or `error`;

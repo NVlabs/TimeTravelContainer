@@ -2544,10 +2544,12 @@ func (s *Sandbox) BranchRootfsSize(branchID, cid string) (control.RootfsSize, er
 	return size, nil
 }
 
-// FamilyResidentMemory accounts mapped resident guest pages in this Sentry.
-func (s *Sandbox) FamilyResidentMemory() (boot.FamilyResidentMemory, error) {
+// FamilyResidentMemory accounts mapped resident guest pages in this Sentry,
+// and their versions' bitmaps if versions is true (see
+// boot.FamilyResidentMemoryArgs).
+func (s *Sandbox) FamilyResidentMemory(versions bool) (boot.FamilyResidentMemory, error) {
 	var memory boot.FamilyResidentMemory
-	if err := s.call(boot.ContMgrFamilyResidentMemory, nil, &memory); err != nil {
+	if err := s.call(boot.ContMgrFamilyResidentMemory, &boot.FamilyResidentMemoryArgs{Versions: versions}, &memory); err != nil {
 		return boot.FamilyResidentMemory{}, fmt.Errorf("accounting family resident memory: %w", err)
 	}
 	return memory, nil

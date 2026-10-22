@@ -56,6 +56,7 @@ type TimeTravel struct {
 	execID                        string
 	signal                        int
 	all                           bool
+	versions                      bool
 	consoleID                     string
 	consoleStream                 string
 	consoleMaxBytes               int
@@ -151,6 +152,7 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&t.execID, "exec-id", "", "stable branch-local exec session ID")
 	f.IntVar(&t.signal, "signal", int(linux.SIGTERM), "signal number for the signal action")
 	f.BoolVar(&t.all, "all", false, "signal every process in the container")
+	f.BoolVar(&t.versions, "versions", false, "with stats, also the bitmaps of resident page versions that the cluster's placement planner matches across nodes")
 	f.StringVar(&t.consoleID, "console", "init", "internal console session ID")
 	f.StringVar(&t.consoleStream, "stream", "stdout", "console output stream: stdout or stderr")
 	f.IntVar(&t.consoleMaxBytes, "max-bytes", 65536, "maximum bytes returned by console-read")
@@ -681,7 +683,7 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 	case "size":
 		output, err = cont.Sandbox.BranchRootfsSize(f.Arg(2), cont.ID)
 	case "stats":
-		output, err = cont.Sandbox.FamilyResidentMemory()
+		output, err = cont.Sandbox.FamilyResidentMemory(t.versions)
 	case "signal":
 		mode := boot.DeliverToProcess
 		if t.all {

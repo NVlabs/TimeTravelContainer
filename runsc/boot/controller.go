@@ -1584,8 +1584,8 @@ func (cm *containerManager) BranchRootfsSize(args *BranchRootfsSizeArgs, out *co
 }
 
 // FamilyResidentMemory accounts mapped resident guest pages across branches.
-func (cm *containerManager) FamilyResidentMemory(_ *struct{}, out *FamilyResidentMemory) error {
-	return cm.l.family.ResidentMemory(out)
+func (cm *containerManager) FamilyResidentMemory(args *FamilyResidentMemoryArgs, out *FamilyResidentMemory) error {
+	return cm.l.family.ResidentMemory(args, out)
 }
 
 // BranchSignal sends a signal within one branch.

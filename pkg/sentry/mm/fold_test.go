@@ -369,3 +369,81 @@ func TestFoldGroups(t *testing.T) {
 		t.Errorf("the released restored address space and its fork asked groups %v to fold, want 0, any, each", asked)
 	}
 }
+
+// residentVersions returns the versions of the pages that ranges hold, as
+// ttc stats once counted them, page by page.
+func residentVersions(ranges []pgalloc.CapturedMemoryRange) map[pgalloc.PageVersionID]struct{} {
+	versions := make(map[pgalloc.PageVersionID]struct{})
+	for _, r := range ranges {
+		for _, run := range r.MemoryFile.LogicalPageRanges(r.Range) {
+			for page := uint64(0); page < run.Range.Length()/hostarch.PageSize; page++ {
+				versions[pgalloc.PageVersionID{Allocator: run.FirstVersion.Allocator, Sequence: run.FirstVersion.Sequence + page}] = struct{}{}
+			}
+		}
+	}
+	return versions
+}
+
+// residentPages returns the pages that ranges of one MemoryFile hold, by
+// offset.
+func residentPages(ranges []pgalloc.CapturedMemoryRange) map[uint64]struct{} {
+	pages := make(map[uint64]struct{})
+	for _, r := range ranges {
+		for off := r.Range.Start; off < r.Range.End; off += hostarch.PageSize {
+			pages[off] = struct{}{}
+		}
+	}
+	return pages
+}
+
+// Two address spaces share a page exactly where their mappings' ranges of the
+// MemoryFile overlap, as they share a version: a copy on write gives the copy
+// a version of its own, and a fold moves a page with its version. So that ttc
+// stats can count shared pages by ranges rather than versions.
+func TestResidentRangesShareAsVersions(t *testing.T) {
+	ctx, parent := homeTestMemoryManager(t, false)
+	defer parent.DecUsers(ctx)
+	const pages = 64
+	addr := mapPrivate(ctx, t, parent, pages*hostarch.PageSize)
+	writePagesInRandomOrder(ctx, t, parent, addr, pages, 1)
+	child, err := cloneMemoryManagerMetadata(ctx, parent)
+	if err != nil {
+		t.Fatalf("cloneMemoryManagerMetadata: %v", err)
+	}
+	check := func(when string) {
+		t.Helper()
+		parentRanges, childRanges := parent.AppendResidentFileRanges(nil), child.AppendResidentFileRanges(nil)
+		parentVersions, childVersions := residentVersions(parentRanges), residentVersions(childRanges)
+		parentPages, childPages := residentPages(parentRanges), residentPages(childRanges)
+		if len(parentVersions) != len(parentPages) || len(childVersions) != len(childPages) {
+			t.Fatalf("%s: %d and %d versions in %d and %d pages, want one each", when, len(parentVersions), len(childVersions), len(parentPages), len(childPages))
+		}
+		sharedVersions, sharedPages := 0, 0
+		for version := range parentVersions {
+			if _, ok := childVersions[version]; ok {
+				sharedVersions++
+			}
+		}
+		for page := range parentPages {
+			if _, ok := childPages[page]; ok {
+				sharedPages++
+			}
+		}
+		if sharedVersions != sharedPages {
+			t.Errorf("%s: %d shared versions, but %d shared pages", when, sharedVersions, sharedPages)
+		}
+	}
+	check("cloned")
+	// The parent's copies of the even pages go to a layer; the child's of
+	// some odd ones to its home.
+	writePages(ctx, t, parent, addr, 0, pages, 2)
+	writePages(ctx, t, child, addr, 1, pages/2, 3)
+	check("after copies on write")
+	child.DecUsers(ctx)
+	writePages(ctx, t, parent, addr, 1, pages, 4)
+	foldAll(t, parent)
+	ranges := parent.AppendResidentFileRanges(nil)
+	if versions, pages := residentVersions(ranges), residentPages(ranges); len(versions) != len(pages) {
+		t.Errorf("after a fold, %d versions in %d pages, want one each", len(versions), len(pages))
+	}
+}

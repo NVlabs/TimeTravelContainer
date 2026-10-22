@@ -6269,7 +6269,7 @@ func (b *runtimeBackend) localPlannerSnapshot() (cluster.PlannerSnapshot, error)
 		if firstPhysicalBranch == "" {
 			firstPhysicalBranch = local[0].BranchID
 		}
-		output, err := b.command("timetravel", physical, "stats", firstPhysicalBranch)
+		output, err := b.command("timetravel", "--versions", physical, "stats", firstPhysicalBranch)
 		if err != nil {
 			return snapshot, fmt.Errorf("accounting resident memory for physical runtime %q: %w", physical, err)
 		}

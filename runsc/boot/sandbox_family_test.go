@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -20,7 +21,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/testutil"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	"gvisor.dev/gvisor/pkg/sentry/mm"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	sentryplatform "gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
@@ -33,56 +34,98 @@ import (
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
-func TestResidentMemorySharingEdgesExactAndBounded(t *testing.T) {
-	page := func(sequence uint64) mm.ResidentPageVersion {
-		return mm.ResidentPageVersion{Version: pgalloc.PageVersionID{Sequence: sequence}}
+// pageRanges returns one MemoryFile's pages as the ranges a branch holds them
+// in, one range per page.
+func pageRanges(mf *pgalloc.MemoryFile, pages ...uint64) []pgalloc.CapturedMemoryRange {
+	ranges := make([]pgalloc.CapturedMemoryRange, 0, len(pages))
+	for _, page := range pages {
+		start := page * hostarch.PageSize
+		ranges = append(ranges, pgalloc.CapturedMemoryRange{MemoryFile: mf, Range: memmap.FileRange{Start: start, End: start + hostarch.PageSize}})
 	}
-	set := func(sequences ...uint64) map[mm.ResidentPageVersion]struct{} {
-		pages := make(map[mm.ResidentPageVersion]struct{}, len(sequences))
-		for _, sequence := range sequences {
-			pages[page(sequence)] = struct{}{}
+	return ranges
+}
+
+// Ranges that overlap or touch, of one MemoryFile, merge; another file's do
+// not, at the same offsets.
+func TestMergeResidentRanges(t *testing.T) {
+	file1, file2 := &pgalloc.MemoryFile{}, &pgalloc.MemoryFile{}
+	files := residentFiles{index: make(map[*pgalloc.MemoryFile]int)}
+	ranges := append(pageRanges(file1, 4, 1, 2, 9), pageRanges(file2, 1)...)
+	ranges = append(ranges, pgalloc.CapturedMemoryRange{MemoryFile: file1, Range: memmap.FileRange{Start: hostarch.PageSize, End: 3 * hostarch.PageSize}})
+	got := mergeResidentRanges(ranges, &files)
+	page := func(n uint64) uint64 { return n * hostarch.PageSize }
+	want := []residentRange{{0, page(1), page(3)}, {0, page(4), page(5)}, {0, page(9), page(10)}, {1, page(1), page(2)}}
+	if !slices.Equal(got, want) {
+		t.Errorf("merged ranges %+v, want %+v", got, want)
+	}
+	if len(files.files) != 2 || files.files[0] != file1 || files.files[1] != file2 {
+		t.Errorf("files %v, want file1 and file2 in order", files.files)
+	}
+}
+
+// Branches share a page where their ranges of one MemoryFile overlap: each
+// branch's private and shared bytes, the family's unique bytes, and the
+// hyperedges of shared pages are exact, and the edges bounded.
+func TestResidentMemoryAccountsExactAndBounded(t *testing.T) {
+	file1, file2 := &pgalloc.MemoryFile{}, &pgalloc.MemoryFile{}
+	accounts := func(ids []string, branchRanges [][]pgalloc.CapturedMemoryRange, limit int) ([]uint64, []uint64, uint64, []ResidentMemorySharingEdge, bool, uint64) {
+		files := residentFiles{index: make(map[*pgalloc.MemoryFile]int)}
+		merged := make([][]residentRange, len(branchRanges))
+		for index, ranges := range branchRanges {
+			merged[index] = mergeResidentRanges(ranges, &files)
 		}
-		return pages
+		return residentMemoryAccounts(ids, merged, limit)
 	}
-	edges, truncated, omitted, counts := residentMemorySharingEdges(
-		[]string{"a", "b", "c"},
-		[]map[mm.ResidentPageVersion]struct{}{set(1, 2, 3), set(2, 3, 4), set(3, 5)},
-		maxResidentMemorySharingEdges,
-	)
+	const page = uint64(hostarch.PageSize)
+	ids := []string{"a", "b", "c"}
+	// file2's page 3 is another page than file1's page 3.
+	branches := [][]pgalloc.CapturedMemoryRange{
+		pageRanges(file1, 1, 2, 3),
+		pageRanges(file1, 2, 3, 4),
+		append(pageRanges(file1, 3, 5), pageRanges(file2, 3)...),
+	}
+	private, shared, unique, edges, truncated, omitted := accounts(ids, branches, maxResidentMemorySharingEdges)
+	if want := []uint64{page, page, 2 * page}; !slices.Equal(private, want) {
+		t.Errorf("private bytes %v, want %v", private, want)
+	}
+	if want := []uint64{2 * page, 2 * page, page}; !slices.Equal(shared, want) {
+		t.Errorf("shared bytes %v, want %v", shared, want)
+	}
+	if unique != 6*page {
+		t.Errorf("unique bytes %d, want %d", unique, 6*page)
+	}
 	if truncated || omitted != 0 || len(edges) != 2 {
 		t.Fatalf("edges=%+v truncated=%t omitted=%d", edges, truncated, omitted)
 	}
-	if got := counts[page(1)]; got != 1 {
-		t.Errorf("private page references=%d, want 1", got)
-	}
-	if got := counts[page(3)]; got != 3 {
-		t.Errorf("three-way page references=%d, want 3", got)
-	}
-	if got := edges[0]; got.Bytes != uint64(hostarch.PageSize) || strings.Join(got.Branches, ",") != "a,b" {
+	if got := edges[0]; got.Bytes != page || strings.Join(got.Branches, ",") != "a,b" {
 		t.Errorf("first edge=%+v, want one a,b page", got)
 	}
-	if got := edges[1]; got.Bytes != uint64(hostarch.PageSize) || strings.Join(got.Branches, ",") != "a,b,c" {
+	if got := edges[1]; got.Bytes != page || strings.Join(got.Branches, ",") != "a,b,c" {
 		t.Errorf("second edge=%+v, want one a,b,c page", got)
 	}
-	bounded, truncated, omitted, _ := residentMemorySharingEdges(
-		[]string{"a", "b", "c"},
-		[]map[mm.ResidentPageVersion]struct{}{set(1, 2, 3), set(2, 3, 4), set(3, 5)},
-		1,
-	)
-	if !truncated || len(bounded) != 1 || omitted != uint64(hostarch.PageSize) {
+	bounded, truncated, omitted := func() ([]ResidentMemorySharingEdge, bool, uint64) {
+		_, _, _, edges, truncated, omitted := accounts(ids, branches, 1)
+		return edges, truncated, omitted
+	}()
+	if !truncated || len(bounded) != 1 || omitted != page {
 		t.Fatalf("bounded edges=%+v truncated=%t omitted=%d", bounded, truncated, omitted)
 	}
-	ids := make([]string, 65)
-	pages := make([]map[mm.ResidentPageVersion]struct{}, len(ids))
+
+	// More branches than a word of bits.
+	ids = make([]string, 65)
+	branches = make([][]pgalloc.CapturedMemoryRange, len(ids))
 	for index := range ids {
 		ids[index] = fmt.Sprintf("b%02d", index)
-		pages[index] = set(uint64(1000 + index))
+		branches[index] = pageRanges(file1, uint64(1000+index))
 	}
-	pages[0][page(2000)] = struct{}{}
-	pages[64][page(2000)] = struct{}{}
-	largeEdges, truncated, omitted, _ := residentMemorySharingEdges(ids, pages, maxResidentMemorySharingEdges)
-	if truncated || omitted != 0 || len(largeEdges) != 1 || strings.Join(largeEdges[0].Branches, ",") != "b00,b64" {
-		t.Fatalf("large-family edges=%+v truncated=%t omitted=%d", largeEdges, truncated, omitted)
+	branches[0] = append(branches[0], pageRanges(file1, 2000)...)
+	branches[64] = append(branches[64], pageRanges(file1, 2000)...)
+	_, shared, unique, edges, truncated, omitted = accounts(ids, branches, maxResidentMemorySharingEdges)
+	if truncated || omitted != 0 || len(edges) != 1 || strings.Join(edges[0].Branches, ",") != "b00,b64" || edges[0].Bytes != page {
+		t.Fatalf("large-family edges=%+v truncated=%t omitted=%d", edges, truncated, omitted)
+	}
+	if shared[0] != page || shared[64] != page || shared[1] != 0 || unique != 66*page {
+		t.Errorf("large-family shared %d %d %d unique %d", shared[0], shared[64], shared[1], unique)
 	}
 }
 
@@ -129,38 +172,28 @@ func TestWaitExecSessionConsumesAlreadyExitedTransientSession(t *testing.T) {
 	}
 }
 
-func TestResidentMemoryVersionRunsCompressAndDeduplicate(t *testing.T) {
-	allocator := pgalloc.LogicalAllocatorID{1, 2, 3}
-	file1 := &pgalloc.MemoryFile{}
-	file2 := &pgalloc.MemoryFile{}
-	pages := map[mm.ResidentPageVersion]struct{}{
-		{File: file1, Version: pgalloc.PageVersionID{Allocator: allocator, Sequence: 7}}:  {},
-		{File: file2, Version: pgalloc.PageVersionID{Allocator: allocator, Sequence: 7}}:  {},
-		{File: file1, Version: pgalloc.PageVersionID{Allocator: allocator, Sequence: 8}}:  {},
-		{File: file1, Version: pgalloc.PageVersionID{Allocator: allocator, Sequence: 10}}: {},
-	}
-	runs := residentMemoryVersionRuns([]string{"main"}, []map[mm.ResidentPageVersion]struct{}{pages})
-	if len(runs) != 2 || runs[0].Branch != "main" || runs[0].FirstSequence != 7 || runs[0].Pages != 2 || runs[1].FirstSequence != 10 || runs[1].Pages != 1 {
-		t.Fatalf("runs=%+v", runs)
-	}
-}
-
+// Versions become bitmaps of 256, from runs of them, whatever MemoryFile holds
+// them: a version held twice is one bit.
 func TestResidentMemoryVersionChunksBoundFragmentation(t *testing.T) {
 	allocator := pgalloc.LogicalAllocatorID{1, 2, 3}
-	file1 := &pgalloc.MemoryFile{}
-	file2 := &pgalloc.MemoryFile{}
-	pages := make(map[mm.ResidentPageVersion]struct{})
+	var runs []residentVersionRun
 	for sequence := uint64(0); sequence < 256; sequence += 2 {
-		pages[mm.ResidentPageVersion{File: file1, Version: pgalloc.PageVersionID{Allocator: allocator, Sequence: sequence}}] = struct{}{}
+		runs = append(runs, residentVersionRun{allocator: allocator, first: sequence, pages: 1})
 	}
 	// A physical alias of the same stable version must not create another bit.
-	pages[mm.ResidentPageVersion{File: file2, Version: pgalloc.PageVersionID{Allocator: allocator, Sequence: 10}}] = struct{}{}
-	chunks := residentMemoryVersionChunks([]string{"main"}, []map[mm.ResidentPageVersion]struct{}{pages})
+	runs = append(runs, residentVersionRun{allocator: allocator, first: 10, pages: 1})
+	chunks := residentMemoryVersionChunks([]string{"main"}, [][]residentVersionRun{runs})
 	if len(chunks) != 1 {
 		t.Fatalf("chunks=%+v, want one bounded record", chunks)
 	}
 	if got := chunks[0]; got.Branch != "main" || got.Chunk != 0 || got.Bitmap != strings.Repeat("55", 32) {
 		t.Fatalf("chunk=%+v, want even-slot bitmap", got)
+	}
+	// A run that crosses chunks sets bits in each.
+	chunks = residentMemoryVersionChunks([]string{"main"}, [][]residentVersionRun{{{allocator: allocator, first: 250, pages: 12}}})
+	if len(chunks) != 2 || chunks[0].Chunk != 0 || chunks[1].Chunk != 1 ||
+		chunks[0].Bitmap != strings.Repeat("00", 31)+"fc" || chunks[1].Bitmap != "3f"+strings.Repeat("00", 31) {
+		t.Fatalf("chunks=%+v, want versions 250-255 and 256-261", chunks)
 	}
 }
 

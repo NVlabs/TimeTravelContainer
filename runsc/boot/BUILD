@@ -115,7 +115,7 @@ go_library(
         "//pkg/sentry/inet",
         "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",
-        "//pkg/sentry/mm",
+        "//pkg/sentry/memmap",
         "//pkg/sentry/ktime",
         "//pkg/sentry/limits",
         "//pkg/sentry/loader",

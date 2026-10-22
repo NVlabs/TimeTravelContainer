@@ -1543,40 +1543,20 @@ func (mm *MemoryManager) ResidentSetSize() uint64 {
 	return mm.curRSS
 }
 
-// ResidentPageVersion identifies one resident page backing a mapping in mm.
-// File identity is significant: equal logical versions installed in distinct
-// MemoryFiles occupy distinct host memory and are not resident CoW sharing.
-type ResidentPageVersion struct {
-	File    *pgalloc.MemoryFile
-	Version pgalloc.PageVersionID
-}
-
-// ResidentPageVersions returns a deduplicated snapshot of resident pages
-// backing mappings in mm. Aliases of the same page within one address space
-// are returned once.
-func (mm *MemoryManager) ResidentPageVersions() map[ResidentPageVersion]struct{} {
+// AppendResidentFileRanges appends to ranges the MemoryFile ranges whose pages
+// back mm's mappings, one for each of its pmas that maps a MemoryFile, and
+// returns the result. It holds mm's activeMu for a copy of its pmas' ranges:
+// with homes, few, however much memory mm maps. A page that mm maps at several
+// addresses is in each range that maps it.
+func (mm *MemoryManager) AppendResidentFileRanges(ranges []pgalloc.CapturedMemoryRange) []pgalloc.CapturedMemoryRange {
 	mm.activeMu.RLock()
 	defer mm.activeMu.RUnlock()
-	pages := make(map[ResidentPageVersion]struct{}, mm.curRSS/hostarch.PageSize)
 	for pseg := mm.pmas.FirstSegment(); pseg.Ok(); pseg = pseg.NextSegment() {
-		mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile)
-		if !ok {
-			continue
-		}
-		for _, run := range mf.LogicalPageRanges(pseg.fileRange()) {
-			count := run.Range.Length() / hostarch.PageSize
-			for index := uint64(0); index < count; index++ {
-				pages[ResidentPageVersion{
-					File: mf,
-					Version: pgalloc.PageVersionID{
-						Allocator: run.FirstVersion.Allocator,
-						Sequence:  run.FirstVersion.Sequence + index,
-					},
-				}] = struct{}{}
-			}
+		if mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile); ok {
+			ranges = append(ranges, pgalloc.CapturedMemoryRange{MemoryFile: mf, Range: pseg.fileRange()})
 		}
 	}
-	return pages
+	return ranges
 }
 
 // MaxResidentSetSize returns the value advertised as mm's max RSS in bytes.

@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/bits"
 	"net"
 	"os"
 	"reflect"
@@ -42,7 +43,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	"gvisor.dev/gvisor/pkg/sentry/mm"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
@@ -3203,97 +3204,157 @@ func (f *SandboxFamily) RootfsSize(id, cid string, out *control.RootfsSize) erro
 	return control.RootfsUpperLayerSize(b.k, cid, out)
 }
 
-func residentMemorySharingEdges(branchIDs []string, branchPages []map[mm.ResidentPageVersion]struct{}, limit int) ([]ResidentMemorySharingEdge, bool, uint64, map[mm.ResidentPageVersion]uint32) {
-	if len(branchIDs) != len(branchPages) {
-		panic("resident memory branch identity/page count mismatch")
+// residentRange is a range of resident pages of one MemoryFile, which it names
+// by its index in a residentFiles.
+type residentRange struct {
+	file       int
+	start, end uint64
+}
+
+// residentFiles numbers the MemoryFiles whose pages an accounting counts.
+type residentFiles struct {
+	files []*pgalloc.MemoryFile
+	index map[*pgalloc.MemoryFile]int
+}
+
+// mergeResidentRanges returns ranges sorted by file and offset, with those that
+// overlap or touch merged: the pages that one branch holds, each once. It
+// numbers the ranges' files in files.
+func mergeResidentRanges(ranges []pgalloc.CapturedMemoryRange, files *residentFiles) []residentRange {
+	result := make([]residentRange, 0, len(ranges))
+	for _, r := range ranges {
+		if r.Range.Length() == 0 {
+			continue
+		}
+		index, ok := files.index[r.MemoryFile]
+		if !ok {
+			index = len(files.files)
+			files.files = append(files.files, r.MemoryFile)
+			files.index[r.MemoryFile] = index
+		}
+		result = append(result, residentRange{file: index, start: r.Range.Start, end: r.Range.End})
 	}
-	counts := make(map[mm.ResidentPageVersion]uint32)
-	for _, pages := range branchPages {
-		for page := range pages {
-			counts[page]++
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].file != result[j].file {
+			return result[i].file < result[j].file
+		}
+		return result[i].start < result[j].start
+	})
+	merged := result[:0]
+	for _, r := range result {
+		if last := len(merged) - 1; last >= 0 && merged[last].file == r.file && r.start <= merged[last].end {
+			merged[last].end = max(merged[last].end, r.end)
+			continue
+		}
+		merged = append(merged, r)
+	}
+	return merged
+}
+
+// residentMemoryAccounts accounts the resident pages of the branches named by
+// branchIDs, whose merged ranges (see mergeResidentRanges) branchRanges holds
+// in the same order. It returns, for each branch, the bytes of the pages that
+// it alone holds and of those it shares with another branch; the bytes of the
+// distinct pages of all of them; and the shared pages' weighted hyperedges, one
+// per set of branches that share pages, at most limit of them, and whether
+// others were left out, and their bytes. Within one MemoryFile a page is at one
+// offset, so that branches share a page exactly where their ranges overlap: the
+// cost follows the number of ranges, not of pages.
+func residentMemoryAccounts(branchIDs []string, branchRanges [][]residentRange, limit int) (private, shared []uint64, unique uint64, edges []ResidentMemorySharingEdge, truncated bool, omitted uint64) {
+	if len(branchIDs) != len(branchRanges) {
+		panic("resident memory branch identity/range count mismatch")
+	}
+	type event struct {
+		file   int
+		offset uint64
+		branch int
+		start  bool
+	}
+	var events []event
+	for branch, ranges := range branchRanges {
+		for _, r := range ranges {
+			events = append(events,
+				event{file: r.file, offset: r.start, branch: branch, start: true},
+				event{file: r.file, offset: r.end, branch: branch})
 		}
 	}
+	sort.Slice(events, func(i, j int) bool {
+		if events[i].file != events[j].file {
+			return events[i].file < events[j].file
+		}
+		return events[i].offset < events[j].offset
+	})
+	private = make([]uint64, len(branchIDs))
+	shared = make([]uint64, len(branchIDs))
+	// covering is the set of branches that hold the pages from the current
+	// offset on, one bit each.
+	covering := make([]uint64, (len(branchIDs)+63)/64)
+	count := 0
+	weights := make(map[string]uint64)
+	for i := 0; i < len(events); {
+		at := events[i]
+		for ; i < len(events) && events[i].file == at.file && events[i].offset == at.offset; i++ {
+			word, bit := events[i].branch/64, uint64(1)<<(events[i].branch%64)
+			if events[i].start {
+				covering[word] |= bit
+				count++
+			} else {
+				covering[word] &^= bit
+				count--
+			}
+		}
+		if count == 0 || i == len(events) || events[i].file != at.file {
+			continue
+		}
+		length := events[i].offset - at.offset
+		unique += length
+		for word, set := range covering {
+			for ; set != 0; set &= set - 1 {
+				branch := word*64 + bits.TrailingZeros64(set)
+				if count == 1 {
+					private[branch] += length
+				} else {
+					shared[branch] += length
+				}
+			}
+		}
+		if count > 1 {
+			key := make([]byte, 0, 8*len(covering))
+			for _, set := range covering {
+				key = binary.LittleEndian.AppendUint64(key, set)
+			}
+			weights[string(key)] += length
+		}
+	}
+
 	type weightedMembership struct {
 		sortKey  string
 		branches []string
 		bytes    uint64
 	}
-	var memberships []weightedMembership
-	// Most families have at most 64 simultaneously resident branches. A word
-	// signature avoids allocating one membership slice and string per shared
-	// page; allocations scale with distinct hyperedges instead.
-	if len(branchIDs) <= 64 {
-		signatures := make(map[mm.ResidentPageVersion]uint64)
-		for index, pages := range branchPages {
-			bit := uint64(1) << uint(index)
-			for page := range pages {
-				if counts[page] > 1 {
-					signatures[page] |= bit
-				}
-			}
-		}
-		weights := make(map[uint64]uint64)
-		for _, signature := range signatures {
-			weights[signature] += uint64(hostarch.PageSize)
-		}
-		for signature, bytes := range weights {
-			var builder strings.Builder
-			var edgeBranches []string
-			for index, id := range branchIDs {
-				if signature&(uint64(1)<<uint(index)) == 0 {
-					continue
-				}
+	memberships := make([]weightedMembership, 0, len(weights))
+	for key, bytes := range weights {
+		var builder strings.Builder
+		var members []string
+		for word := 0; word < len(key)/8; word++ {
+			for set := binary.LittleEndian.Uint64([]byte(key[8*word:])); set != 0; set &= set - 1 {
+				id := branchIDs[word*64+bits.TrailingZeros64(set)]
 				builder.WriteByte(0)
 				builder.WriteString(id)
-				edgeBranches = append(edgeBranches, id)
-			}
-			memberships = append(memberships, weightedMembership{
-				sortKey: builder.String(), branches: edgeBranches, bytes: bytes,
-			})
-		}
-	} else {
-		weights := make(map[string]uint64)
-		members := make(map[string][]string)
-		pageMembers := make(map[mm.ResidentPageVersion][]uint32)
-		for index, pages := range branchPages {
-			for page := range pages {
-				if counts[page] > 1 {
-					pageMembers[page] = append(pageMembers[page], uint32(index))
-				}
+				members = append(members, id)
 			}
 		}
-		for _, indexes := range pageMembers {
-			var builder strings.Builder
-			edgeBranches := make([]string, 0, len(indexes))
-			for _, index := range indexes {
-				id := branchIDs[index]
-				builder.WriteByte(0)
-				builder.WriteString(id)
-				edgeBranches = append(edgeBranches, id)
-			}
-			key := builder.String()
-			weights[key] += uint64(hostarch.PageSize)
-			members[key] = edgeBranches
-		}
-		for key, bytes := range weights {
-			memberships = append(memberships, weightedMembership{
-				sortKey: key, branches: members[key], bytes: bytes,
-			})
-		}
-	}
-	if limit < 0 {
-		limit = 0
+		memberships = append(memberships, weightedMembership{sortKey: builder.String(), branches: members, bytes: bytes})
 	}
 	sort.Slice(memberships, func(i, j int) bool { return memberships[i].sortKey < memberships[j].sortKey })
-	truncated := len(memberships) > limit
-	var omitted uint64
-	if truncated {
+	limit = max(limit, 0)
+	if truncated = len(memberships) > limit; truncated {
 		for _, membership := range memberships[limit:] {
 			omitted += membership.bytes
 		}
 		memberships = memberships[:limit]
 	}
-	edges := make([]ResidentMemorySharingEdge, 0, len(memberships))
+	edges = make([]ResidentMemorySharingEdge, 0, len(memberships))
 	for index, membership := range memberships {
 		edges = append(edges, ResidentMemorySharingEdge{
 			ID:       fmt.Sprintf("resident-share-%04d", index),
@@ -3301,68 +3362,63 @@ func residentMemorySharingEdges(branchIDs []string, branchPages []map[mm.Residen
 			Branches: membership.branches,
 		})
 	}
-	return edges, truncated, omitted, counts
+	return private, shared, unique, edges, truncated, omitted
 }
 
-func residentMemoryVersionRuns(branchIDs []string, branchPages []map[mm.ResidentPageVersion]struct{}) []ResidentMemoryVersionRun {
-	if len(branchIDs) != len(branchPages) {
-		panic("resident memory branch identity/page count mismatch")
-	}
-	type version struct {
-		allocator pgalloc.LogicalAllocatorID
-		sequence  uint64
-	}
-	var result []ResidentMemoryVersionRun
-	for index, pages := range branchPages {
-		// File identity distinguishes physical sharing inside one Sentry, while
-		// stable version identity describes reusable content across nodes. An
-		// alias of the same stable version is exported only once per branch.
-		versions := make(map[version]struct{}, len(pages))
-		for page := range pages {
-			versions[version{allocator: page.Version.Allocator, sequence: page.Version.Sequence}] = struct{}{}
-		}
-		ordered := make([]version, 0, len(versions))
-		for page := range versions {
-			ordered = append(ordered, page)
-		}
-		sort.Slice(ordered, func(i, j int) bool {
-			if ordered[i].allocator != ordered[j].allocator {
-				return string(ordered[i].allocator[:]) < string(ordered[j].allocator[:])
+// residentVersionRun is a run of consecutive versions of one allocator.
+type residentVersionRun struct {
+	allocator pgalloc.LogicalAllocatorID
+	first     uint64
+	pages     uint64
+}
+
+// residentMemoryVersionRuns returns the versions of the pages in branchRanges,
+// as runs, branch by branch.
+func residentMemoryVersionRuns(files []*pgalloc.MemoryFile, branchRanges [][]residentRange) [][]residentVersionRun {
+	result := make([][]residentVersionRun, len(branchRanges))
+	for branch, ranges := range branchRanges {
+		for _, r := range ranges {
+			for _, run := range files[r.file].LogicalPageRanges(memmap.FileRange{Start: r.start, End: r.end}) {
+				result[branch] = append(result[branch], residentVersionRun{
+					allocator: run.FirstVersion.Allocator,
+					first:     run.FirstVersion.Sequence,
+					pages:     run.Range.Length() / hostarch.PageSize,
+				})
 			}
-			return ordered[i].sequence < ordered[j].sequence
-		})
-		for cursor := 0; cursor < len(ordered); {
-			end := cursor + 1
-			for end < len(ordered) && ordered[end].allocator == ordered[cursor].allocator && ordered[end].sequence == ordered[end-1].sequence+1 {
-				end++
-			}
-			result = append(result, ResidentMemoryVersionRun{
-				Branch: branchIDs[index], Allocator: hex.EncodeToString(ordered[cursor].allocator[:]),
-				FirstSequence: ordered[cursor].sequence, Pages: uint64(end - cursor),
-			})
-			cursor = end
 		}
 	}
 	return result
 }
 
-func residentMemoryVersionChunks(branchIDs []string, branchPages []map[mm.ResidentPageVersion]struct{}) []ResidentMemoryVersionChunk {
-	if len(branchIDs) != len(branchPages) {
-		panic("resident memory branch identity/page count mismatch")
+// residentMemoryVersionChunks returns the versions in branchRuns as bitmaps of
+// 256 versions each, by branch, allocator and chunk: a fixed cost per 256
+// versions however concurrent copies interleave their sequences, which keeps
+// the planner's response bounded. A version that a branch holds twice, as two
+// MemoryFiles may, is one bit.
+func residentMemoryVersionChunks(branchIDs []string, branchRuns [][]residentVersionRun) []ResidentMemoryVersionChunk {
+	if len(branchIDs) != len(branchRuns) {
+		panic("resident memory branch identity/run count mismatch")
 	}
 	type chunkKey struct {
 		allocator pgalloc.LogicalAllocatorID
 		sequence  uint64
 	}
 	var result []ResidentMemoryVersionChunk
-	for index, pages := range branchPages {
-		chunks := make(map[chunkKey][32]byte)
-		for page := range pages {
-			key := chunkKey{allocator: page.Version.Allocator, sequence: page.Version.Sequence / 256}
-			bitmap := chunks[key]
-			slot := page.Version.Sequence % 256
-			bitmap[slot/8] |= byte(1 << (slot % 8))
-			chunks[key] = bitmap
+	for index, runs := range branchRuns {
+		chunks := make(map[chunkKey]*[32]byte)
+		for _, run := range runs {
+			for sequence, end := run.first, run.first+run.pages; sequence < end; {
+				key := chunkKey{allocator: run.allocator, sequence: sequence / 256}
+				bitmap := chunks[key]
+				if bitmap == nil {
+					bitmap = new([32]byte)
+					chunks[key] = bitmap
+				}
+				for chunkEnd := min(end, (key.sequence+1)*256); sequence < chunkEnd; sequence++ {
+					slot := sequence % 256
+					bitmap[slot/8] |= byte(1 << (slot % 8))
+				}
+			}
 		}
 		keys := make([]chunkKey, 0, len(chunks))
 		for key := range chunks {
@@ -3375,28 +3431,34 @@ func residentMemoryVersionChunks(branchIDs []string, branchPages []map[mm.Reside
 			return keys[i].sequence < keys[j].sequence
 		})
 		for _, key := range keys {
-			bitmap := chunks[key]
 			result = append(result, ResidentMemoryVersionChunk{
 				Branch: branchIDs[index], Allocator: hex.EncodeToString(key.allocator[:]),
-				Chunk: key.sequence, Bitmap: hex.EncodeToString(bitmap[:]),
+				Chunk: key.sequence, Bitmap: hex.EncodeToString(chunks[key][:]),
 			})
 		}
 	}
 	return result
 }
 
+// FamilyResidentMemoryArgs selects what ResidentMemory accounts.
+type FamilyResidentMemoryArgs struct {
+	// Versions asks for VersionChunks, which the cluster's placement planner
+	// matches across Sentries. They cost a walk of the version of every
+	// resident page, which the rest of the accounting does not.
+	Versions bool
+}
+
 // ResidentMemory accounts resident guest pages across live branches. This
 // includes task mappings and tmpfs/shmem file contents, including unmapped
 // contents retained by /dev/shm files. It deliberately excludes the Sentry Go
-// heap and host-backed filesystem page-cache objects.
-func (f *SandboxFamily) ResidentMemory(out *FamilyResidentMemory) error {
+// heap and host-backed filesystem page-cache objects. It works on the ranges of
+// the MemoryFiles that hold the pages, as their address spaces and files hold
+// them, rather than page by page: a branch with 70 GB resident in homes has a
+// few hundred.
+func (f *SandboxFamily) ResidentMemory(args *FamilyResidentMemoryArgs, out *FamilyResidentMemory) error {
 	f.dehydrationMu.Lock()
 	defer f.dehydrationMu.Unlock()
 
-	type heldBranch struct {
-		branch *sandboxBranch
-		pages  map[mm.ResidentPageVersion]struct{}
-	}
 	f.mu.Lock()
 	ids := make([]string, 0, len(f.branches))
 	for id := range f.branches {
@@ -3408,72 +3470,54 @@ func (f *SandboxFamily) ResidentMemory(out *FamilyResidentMemory) error {
 		branches = append(branches, f.branches[id])
 	}
 	f.mu.Unlock()
-	held := make([]heldBranch, 0, len(ids))
+	held := make([]*sandboxBranch, 0, len(ids))
 	for _, branch := range branches {
 		branch.opMu.Lock()
 		f.mu.Lock()
 		if branch.k != nil && branch.state != BranchCreating && branch.state != BranchDestroying && branch.state != BranchFailed {
 			branch.controlOps.Add(1)
 			branch.compactionOps.Add(1)
-			held = append(held, heldBranch{branch: branch})
+			held = append(held, branch)
 		}
 		f.mu.Unlock()
 		branch.opMu.Unlock()
 	}
 	defer func() {
 		for _, branch := range held {
-			branch.branch.compactionOps.Done()
-			branch.branch.controlOps.Done()
+			branch.compactionOps.Done()
+			branch.controlOps.Done()
 		}
 	}()
 
-	for index := range held {
-		pages, err := held[index].branch.k.ResidentPageVersions()
-		if err != nil {
-			return fmt.Errorf("accounting resident memory for branch %q: %w", held[index].branch.id, err)
-		}
-		held[index].pages = pages
-	}
+	files := residentFiles{index: make(map[*pgalloc.MemoryFile]int)}
 	heldIDs := make([]string, 0, len(held))
-	heldPages := make([]map[mm.ResidentPageVersion]struct{}, 0, len(held))
+	heldRanges := make([][]residentRange, 0, len(held))
 	for _, branch := range held {
-		heldIDs = append(heldIDs, branch.branch.id)
-		heldPages = append(heldPages, branch.pages)
-	}
-	var counts map[mm.ResidentPageVersion]uint32
-	out.SharingEdges, out.SharingEdgesTruncated, out.SharingEdgesOmittedBytes, counts = residentMemorySharingEdges(heldIDs, heldPages, maxResidentMemorySharingEdges)
-	// Bitmaps have a fixed cost per 256-version window even when concurrent
-	// sibling writes interleave every allocated sequence. This avoids
-	// page-count-sized planner RPCs under the exact workload that creates
-	// placement pressure.
-	out.VersionChunks = residentMemoryVersionChunks(heldIDs, heldPages)
-	out.Branches = make([]BranchResidentMemory, 0, len(ids))
-	const pageBytes = uint64(hostarch.PageSize)
-	for _, id := range ids {
-		var branch *heldBranch
-		for index := range held {
-			if held[index].branch.id == id {
-				branch = &held[index]
-				break
-			}
+		ranges, err := branch.k.ResidentFileRanges()
+		if err != nil {
+			return fmt.Errorf("accounting resident memory for branch %q: %w", branch.id, err)
 		}
+		heldIDs = append(heldIDs, branch.id)
+		heldRanges = append(heldRanges, mergeResidentRanges(ranges, &files))
+	}
+	private, shared, unique, edges, truncated, omitted := residentMemoryAccounts(heldIDs, heldRanges, maxResidentMemorySharingEdges)
+	out.SharingEdges, out.SharingEdgesTruncated, out.SharingEdgesOmittedBytes = edges, truncated, omitted
+	if args != nil && args.Versions {
+		out.VersionChunks = residentMemoryVersionChunks(heldIDs, residentMemoryVersionRuns(files.files, heldRanges))
+	}
+	out.Branches = make([]BranchResidentMemory, 0, len(ids))
+	for _, id := range ids {
 		f.mu.Lock()
 		state := f.branches[id].state
 		f.mu.Unlock()
 		account := BranchResidentMemory{ID: id, State: string(state)}
-		if branch != nil {
-			for page := range branch.pages {
-				if counts[page] > 1 {
-					account.SharedBytes += pageBytes
-				} else {
-					account.PrivateBytes += pageBytes
-				}
-			}
+		if index := slices.Index(heldIDs, id); index >= 0 {
+			account.PrivateBytes, account.SharedBytes = private[index], shared[index]
 			account.TotalBytes = account.PrivateBytes + account.SharedBytes
 		}
 		out.Branches = append(out.Branches, account)
 	}
-	out.UniqueBytes = uint64(len(counts)) * pageBytes
+	out.UniqueBytes = unique
 	return nil
 }
 

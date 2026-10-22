@@ -6,17 +6,17 @@ package kernel
 import (
 	"fmt"
 
-	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 )
 
-// ResidentPageVersions returns the physical-and-logical identities of all
-// resident guest pages reachable from k. This includes pages mapped by tasks
-// and tmpfs/shmem regular-file contents, even when the latter are not mapped.
-// Multiple graph paths to the same resident page contribute one identity.
-func (k *Kernel) ResidentPageVersions() (map[mm.ResidentPageVersion]struct{}, error) {
+// ResidentFileRanges returns the MemoryFile ranges of all resident guest pages
+// reachable from k: those that its tasks' address spaces map, and the contents
+// of tmpfs and shmem regular files, even where no task maps them. Ranges may
+// overlap, where processes share pages or a task maps a file's pages; a page
+// that several paths reach is resident once.
+func (k *Kernel) ResidentFileRanges() ([]pgalloc.CapturedMemoryRange, error) {
 	managers := make(map[*mm.MemoryManager]struct{})
 	ts := k.TaskSet()
 	ts.mu.RLock()
@@ -36,11 +36,9 @@ func (k *Kernel) ResidentPageVersions() (map[mm.ResidentPageVersion]struct{}, er
 			memoryManager.DecUsers(k.SupervisorContext())
 		}
 	}()
-	pages := make(map[mm.ResidentPageVersion]struct{})
+	var ranges []pgalloc.CapturedMemoryRange
 	for memoryManager := range managers {
-		for page := range memoryManager.ResidentPageVersions() {
-			pages[page] = struct{}{}
-		}
+		ranges = memoryManager.AppendResidentFileRanges(ranges)
 	}
 
 	// A tmpfs file can retain resident memory without being mapped by a task.
@@ -62,19 +60,5 @@ func (k *Kernel) ResidentPageVersions() (map[mm.ResidentPageVersion]struct{}, er
 		}
 		fs.DecRef(ctx)
 	}
-	for _, captured := range capture.Ranges() {
-		for _, run := range captured.MemoryFile.LogicalPageRanges(captured.Range) {
-			count := run.Range.Length() / hostarch.PageSize
-			for index := uint64(0); index < count; index++ {
-				pages[mm.ResidentPageVersion{
-					File: captured.MemoryFile,
-					Version: pgalloc.PageVersionID{
-						Allocator: run.FirstVersion.Allocator,
-						Sequence:  run.FirstVersion.Sequence + index,
-					},
-				}] = struct{}{}
-			}
-		}
-	}
-	return pages, nil
+	return append(ranges, capture.Ranges()...), nil
 }

@@ -89,7 +89,22 @@ func newRemoteKernelMemoryFile(t *testing.T) *pgalloc.MemoryFile {
 
 var errInjectedLiveForkFailure = errors.New("injected live-fork failure")
 
-func TestResidentPageVersionsIncludesUnmappedTmpfs(t *testing.T) {
+// residentBytes returns the bytes of the ranges ResidentFileRanges returns,
+// which here do not overlap.
+func residentBytes(t *testing.T, k *kernel.Kernel) uint64 {
+	t.Helper()
+	ranges, err := k.ResidentFileRanges()
+	if err != nil {
+		t.Fatalf("ResidentFileRanges: %v", err)
+	}
+	var bytes uint64
+	for _, r := range ranges {
+		bytes += r.Range.Length()
+	}
+	return bytes
+}
+
+func TestResidentFileRangesIncludesUnmappedTmpfs(t *testing.T) {
 	k, err := testutil.Boot()
 	if err != nil {
 		t.Fatalf("Boot: %v", err)
@@ -109,10 +124,7 @@ func TestResidentPageVersionsIncludesUnmappedTmpfs(t *testing.T) {
 	root := mntns.Root(ctx)
 	defer root.DecRef(ctx)
 
-	before, err := k.ResidentPageVersions()
-	if err != nil {
-		t.Fatalf("ResidentPageVersions before write: %v", err)
-	}
+	before := residentBytes(t, k)
 	fd, err := k.VFS().OpenAt(ctx, creds, &vfs.PathOperation{
 		Root: root, Start: root, Path: fspath.Parse("resident"),
 	}, &vfs.OpenOptions{Flags: linux.O_CREAT | linux.O_RDWR, Mode: 0600})
@@ -129,12 +141,8 @@ func TestResidentPageVersionsIncludesUnmappedTmpfs(t *testing.T) {
 	}
 	fd.DecRef(ctx) // The file remains linked, but has no FD or VMA reference.
 
-	after, err := k.ResidentPageVersions()
-	if err != nil {
-		t.Fatalf("ResidentPageVersions after write: %v", err)
-	}
-	if got, want := len(after)-len(before), 3; got != want {
-		t.Fatalf("resident page increase after unmapped tmpfs write: got %d pages, want %d", got, want)
+	if got, want := residentBytes(t, k)-before, uint64(3*hostarch.PageSize); got != want {
+		t.Fatalf("resident increase after unmapped tmpfs write: got %d bytes, want %d", got, want)
 	}
 }
 
