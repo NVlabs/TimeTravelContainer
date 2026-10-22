@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//go:build darwin && cgo
+//go:build (darwin || linux) && cgo
 
 package virgl
 
@@ -832,15 +832,39 @@ func TestCloneSubContexts(t *testing.T) {
 	}
 }
 
+// sampled reports whether the capabilities offer sampling textures of format.
+func sampled(t *testing.T, format uint32) bool {
+	t.Helper()
+	caps, err := Capsets()
+	if err != nil {
+		t.Fatalf("Capsets: %v", err)
+	}
+	// virgl_caps_v1: its version, and then the mask of sampled formats.
+	return binary.LittleEndian.Uint32(caps[0].Data[4+4*(format/32):])&(1<<(format%32)) != 0
+}
+
 // A copy between a compressed format and a plain one of its blocks' size
 // copies blocks as texels, as glCopyImageSubData does, which the
 // capabilities offer.
 func TestCopyCompressedAndPlain(t *testing.T) {
 	const (
+		formatDXT1RGB    = 105
 		formatETC2RGB8   = 269
 		formatR32G32Uint = 194
 	)
 	f := newFixture(t)
+	// A format of 4x4 blocks of 8 bytes that the GPU samples: ETC2's, as
+	// Apple's GPUs, or S3TC's, as desktop GPUs and lavapipe.
+	var compressed uint32
+	for _, format := range []uint32{formatETC2RGB8, formatDXT1RGB} {
+		if sampled(t, format) {
+			compressed = format
+			break
+		}
+	}
+	if compressed == 0 {
+		t.Skip("the GPU samples no compressed format of 8-byte blocks")
+	}
 	// A 16x16 texture of 4x4 blocks of 8 bytes, and textures of their size.
 	blocks := make([]byte, 128)
 	for i := range blocks {
@@ -856,10 +880,10 @@ func TestCopyCompressedAndPlain(t *testing.T) {
 		f.c.Attach(r)
 		return r
 	}
-	etc := texture(5, formatETC2RGB8, 16, 16, blocks)
+	etc := texture(5, compressed, 16, 16, blocks)
 	plainMem, etc2Mem := make([]byte, 128), make([]byte, 128)
 	plain := texture(6, formatR32G32Uint, 4, 4, plainMem)
-	etc2 := texture(7, formatETC2RGB8, 16, 16, etc2Mem)
+	etc2 := texture(7, compressed, 16, 16, etc2Mem)
 	if err := f.c.Transfer(etc, TransferArgs{ToHost: true, W: 16, H: 16, D: 1}); err != nil {
 		t.Fatalf("Transfer: %v", err)
 	}

@@ -12,9 +12,9 @@ toolchain, which must be the official release that go.mod names, as Bazel's
 is. It fetches from GitHub the license files of the Vulkan headers that the
 GPU renderer compiles, and of MoltenVK, which ttcd links on macOS, and of the
 components that MoltenVK's library holds, at the revisions of the release
-that MODULE.bazel names. Of Mesa, whose Zink ttcd links on macOS, it reads
-the tree that Bazel fetched, and the copyright notices of the files that
-tools/mesa.BUILD compiles.
+that MODULE.bazel names. Of Mesa, whose Zink the GPU renderer links, it
+reads the tree that Bazel fetched, and the copyright notices of the files
+that tools/mesa.BUILD compiles.
 
 Run it from the repository root whenever go.mod, the renderer's Vulkan headers
 or venus-protocol, MoltenVK, or Mesa change: python3 tools/third_party_notices.py
@@ -266,9 +266,9 @@ def moltenvk_components():
     return components
 
 
-# The components of others that the part of Mesa that ttcd links holds, by
-# the files of theirs that tools/mesa.BUILD compiles, which Mesa's own
-# copyright notices leave out.
+# The components of others that the part of Mesa that the renderer links
+# holds, by the files of theirs that tools/mesa.BUILD compiles, which Mesa's
+# own copyright notices leave out.
 MESA_FOREIGN = ("src/util/blake3/", "src/util/xxhash.h", "src/util/softfloat.", "src/c11/")
 
 
@@ -329,7 +329,7 @@ def mesa_components():
     mit = mit[mit.index("Permission is hereby granted"):]
     components = [component_of_files("Mesa", version, [("copyright notices of the files linked, and licenses/MIT",
                                                         "\n".join(sorted(holders)) + "\n\n" + mit)],
-                                     tree, "linked into ttcd on macOS (Zink, Gallium, NIR, and utilities)")]
+                                     tree, "linked into ttcd's GPU renderer (Zink, Gallium, NIR, and utilities)")]
     with open(os.path.join(tree, "src/util/blake3/README")) as f:
         blake3 = re.search(r"version (\d+(?:\.\d+)+)", f.read()).group(1)
     components.append(component_of_files("BLAKE3", blake3, [("licenses/Apache-2.0", mesa_license_text(tree, "Apache-2.0"))],
@@ -412,9 +412,9 @@ def main():
                          [f"| {name} | [{patch}]({patch}) |" for name, patch in bazel_patches()]) + "\n")
     out.append("### C and C++ components\n")
     out.append("`ttcd`'s GPU renderer compiles Vulkan's headers and the code that venus-protocol "
-               "generates, which this repository holds; on macOS, `ttcd` also links MoltenVK's "
-               "static library, of its release, with what that holds, and Zink and what it needs "
-               "of Mesa, which Bazel builds from Mesa's release, with what that holds.\n")
+               "generates, which this repository holds, and links Zink and what it needs of Mesa, "
+               "which Bazel builds from Mesa's release, with what that holds; on macOS, `ttcd` "
+               "also links MoltenVK's static library, of its release, with what that holds.\n")
     out.append(table(["Component", "Version", "License", "Use"], native))
     out.append("### Go modules\n")
     out.append("Every module `go.mod` requires. `ttc` and `ttcd` link those their packages "

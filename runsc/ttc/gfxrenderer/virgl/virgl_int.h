@@ -16,8 +16,13 @@ struct pipe_screen;
 
 extern struct pipe_screen *ttc_virgl_screen;
 
+// ttc_virgl_vulkan gives Zink the platform's Vulkan, before the renderer
+// creates its screen (screen_darwin.c, screen_linux.c): it returns 0, or -1
+// if the platform has none.
+int ttc_virgl_vulkan(void);
+
 // The slots of the vertex shader's state that the renderer keeps for
-// transform feedback, which it emulates if Zink has none (pipe_darwin.c):
+// transform feedback, which it emulates if Zink has none (pipe.c):
 // a uniform buffer of a draw's parameters, and four shader buffers, the
 // targets'.
 extern bool ttc_virgl_xfb_emulated;

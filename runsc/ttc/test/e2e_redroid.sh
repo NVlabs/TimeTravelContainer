@@ -5,15 +5,24 @@
 
 # Manual end-to-end coverage for Android in TTC: redroid (an Android image
 # for containers) boots, as its container's init, with the virtual GPU
-# (--gfx); SurfaceFlinger composes with ANGLE on the renderer's Vulkan driver;
-# Android's network comes up and validates; apps render on the GPU; the
-# screen records to video, as screen mirroring such as scrcpy's needs; given
-# one, an APK installs and runs; and a live fork of Android, whose GPU state
-# the child restores, runs on in both branches.
+# (--gfx); SurfaceFlinger composes on the GPU; Android's network comes up and
+# validates; apps render on the GPU; the screen records to video, as screen
+# mirroring such as scrcpy's needs; given one, an APK installs and runs; and
+# a live fork of Android, whose GPU state the child restores, runs on in both
+# branches.
 #
-# It needs what runsc/ttc/test/e2e_gfx.sh needs (TTC, TTCD,
-# TTC_GFX_GUEST_DRIVER, and optionally TTC_GFX_RENDERER), and:
-#   ANDROID_GFX_DRIVER, Mesa's Venus Vulkan driver for Android
+# REDROID_GPU_MODE says how Android drives the GPU:
+#   host (the default), redroid's own host mode, by flags alone: its Mesa's
+#     virgl OpenGL driver, which the renderer serves with Zink, and its GBM
+#     gralloc;
+#   venus, TTC's Venus Vulkan driver for Android, which the container gets
+#     with TTC's graphics configuration for redroid, and ANGLE, OpenGL ES on
+#     Vulkan, for SurfaceFlinger and apps.
+#
+# It needs TTC and TTCD, the binaries, and optionally TTC_GFX_RENDERER, as
+# runsc/ttc/test/e2e_gfx.sh does, and:
+#   with REDROID_GPU_MODE=venus, TTC_GFX_GUEST_DRIVER, as e2e_gfx.sh does,
+#     and ANDROID_GFX_DRIVER, Mesa's Venus Vulkan driver for Android
 #     (runsc/ttc/gfxrenderer/guest/build_mesa_venus_android.sh);
 #   REDROID_IMAGE, a redroid image of the host's architecture (default
 #     redroid/redroid:14.0.0_64only-latest), which the daemon pulls;
@@ -30,6 +39,7 @@ TTCD=${TTCD:-}
 TTC_GFX_RENDERER=${TTC_GFX_RENDERER:-}
 TTC_GFX_GUEST_DRIVER=${TTC_GFX_GUEST_DRIVER:-}
 ANDROID_GFX_DRIVER=${ANDROID_GFX_DRIVER:-}
+REDROID_GPU_MODE=${REDROID_GPU_MODE:-host}
 REDROID_IMAGE=${REDROID_IMAGE:-redroid/redroid:14.0.0_64only-latest}
 APK=${APK:-}
 REDROID_DNS=${REDROID_DNS:-}
@@ -51,10 +61,24 @@ fail() {
 GUEST_DRIVER=libvulkan_virtio.so
 ANDROID_DRIVER=vulkan.virtio.so
 DEVICE="Virtio-GPU Venus"
-[ -f "$TTC_GFX_GUEST_DRIVER/$GUEST_DRIVER" ] ||
-  fail "set TTC_GFX_GUEST_DRIVER to a directory with Mesa's $GUEST_DRIVER"
-[ -f "$ANDROID_GFX_DRIVER" ] ||
-  fail "set ANDROID_GFX_DRIVER to Mesa's Venus driver for Android"
+case "$REDROID_GPU_MODE" in
+  host)
+    # SurfaceFlinger's renderer, and what apps render with: Mesa's OpenGL ES
+    # and its Gallium drivers, whose virtio_gpu_dri.so, virgl, is a link to
+    # them.
+    WANT_GLES="virgl"
+    WANT_LIBS="libGLESv2_mesa.so libgallium_dri.so"
+    ;;
+  venus)
+    [ -f "$TTC_GFX_GUEST_DRIVER/$GUEST_DRIVER" ] ||
+      fail "set TTC_GFX_GUEST_DRIVER to a directory with Mesa's $GUEST_DRIVER"
+    [ -f "$ANDROID_GFX_DRIVER" ] ||
+      fail "set ANDROID_GFX_DRIVER to Mesa's Venus driver for Android"
+    WANT_GLES="ANGLE*$DEVICE"
+    WANT_LIBS="libGLESv2_angle.so $ANDROID_DRIVER"
+    ;;
+  *) fail "REDROID_GPU_MODE is host or venus, not $REDROID_GPU_MODE" ;;
+esac
 [ -z "$APK" ] || [ -f "$APK" ] || fail "APK $APK does not exist"
 owned_root=false
 if [ -z "$TTC_E2E_ROOT" ]; then
@@ -86,7 +110,11 @@ if [ "$(uname -s)" = Darwin ]; then
   /usr/bin/codesign --force --sign - \
     --entitlements "$TEST_DIR/../../hvf.entitlements" "$BIN_DIR/ttcd" >/dev/null
 fi
-install -m 0644 "$TTC_GFX_GUEST_DRIVER/$GUEST_DRIVER" "$DRIVER_DIR/"
+if [ "$REDROID_GPU_MODE" = venus ]; then
+  install -m 0644 "$TTC_GFX_GUEST_DRIVER/$GUEST_DRIVER" "$DRIVER_DIR/"
+fi
+# In host mode, the daemon finds no guest Vulkan driver, which Android has no
+# use for, and gives the container none.
 export TTC_GFX_GUEST_DRIVER="$DRIVER_DIR"
 
 ttc() {
@@ -130,16 +158,23 @@ adb_in() {
   ttc exec "$NAME@$branch" "$@"
 }
 
-# Android's init is the container's. Before it starts, the container gets
-# the Android driver, and redroid's graphics configuration for the GPU.
+# Android's init is the container's. In host mode, its flags have redroid
+# drive the GPU's render node, which it otherwise finds by debugfs, which TTC
+# has none of. In Venus mode, before it starts, the container gets the
+# Android driver, and TTC's graphics configuration for redroid.
 set -- qemu=1 androidboot.hardware=redroid androidboot.use_memfd=true
+if [ "$REDROID_GPU_MODE" = host ]; then
+  set -- "$@" androidboot.redroid_gpu_mode=host androidboot.redroid_gpu_node=/dev/dri/renderD128
+fi
 if [ -n "$REDROID_DNS" ]; then
   set -- "$@" androidboot.redroid_net_ndns=1 "androidboot.redroid_net_dns1=$REDROID_DNS"
 fi
 ttc create --name "$NAME" --gfx --gfx-fork snapshot --cap-add ALL --network ttc --nat \
   --entrypoint /init "$REDROID_IMAGE" "$@" >/dev/null
-ttc cp "$ANDROID_GFX_DRIVER" "$NAME@main:/vendor/lib64/hw/$ANDROID_DRIVER" >/dev/null
-ttc cp "$GPU_CONFIG" "$NAME@main:/vendor/bin/gpu_config.sh" >/dev/null
+if [ "$REDROID_GPU_MODE" = venus ]; then
+  ttc cp "$ANDROID_GFX_DRIVER" "$NAME@main:/vendor/lib64/hw/$ANDROID_DRIVER" >/dev/null
+  ttc cp "$GPU_CONFIG" "$NAME@main:/vendor/bin/gpu_config.sh" >/dev/null
+fi
 ttc start "$NAME" >/dev/null
 
 deadline=$(($(date +%s) + BOOT_TIMEOUT))
@@ -149,11 +184,12 @@ until [ "$(adb /system/bin/getprop sys.boot_completed 2>/dev/null)" = 1 ]; do
 done
 echo "ttc redroid e2e: booted"
 
-# SurfaceFlinger composes with ANGLE, on the virtual GPU.
+# SurfaceFlinger composes on the virtual GPU: with virgl in host mode, with
+# ANGLE on the Venus driver in Venus mode.
 gles=$(adb /system/bin/dumpsys SurfaceFlinger 2>&1 | grep '^GLES:') ||
   fail "SurfaceFlinger reports no GLES renderer"
 case "$gles" in
-  *ANGLE*"$DEVICE"*) ;;
+  *$WANT_GLES*) ;;
   *) fail "SurfaceFlinger composes without the virtual GPU: $gles" ;;
 esac
 echo "ttc redroid e2e: $gles"
@@ -168,7 +204,7 @@ done
 echo "ttc redroid e2e: the network is validated"
 
 # launch PACKAGE [BRANCH] starts the package's launcher activity, and checks
-# that it renders with ANGLE on the backend's driver.
+# that it renders on the GPU, with the mode's libraries.
 launch() {
   branch=${2:-main}
   component=$(adb_in "$branch" /system/bin/cmd package resolve-activity --brief \
@@ -181,14 +217,12 @@ launch() {
   sleep 5
   pid=$(adb_in "$branch" /system/bin/pidof -s "$1") || fail "$1 is not running"
   maps=$(adb_in "$branch" /system/bin/cat "/proc/$pid/maps")
-  case "$maps" in
-    *libGLESv2_angle.so*) ;;
-    *) fail "$1 does not render with ANGLE" ;;
-  esac
-  case "$maps" in
-    *"$ANDROID_DRIVER"*) ;;
-    *) fail "$1 does not use the backend's Vulkan driver" ;;
-  esac
+  for lib in $WANT_LIBS; do
+    case "$maps" in
+      *"$lib"*) ;;
+      *) fail "$1 does not render with $lib" ;;
+    esac
+  done
   adb_in "$branch" /system/bin/screencap -p "/data/local/tmp/$1.png" || fail "screencap"
   ttc cp "$NAME@$branch:/data/local/tmp/$1.png" "$OUT_DIR/$branch-$1.png" >/dev/null
   # A blank screen compresses to a few kilobytes.
@@ -235,8 +269,10 @@ done
 for branch in main child; do
   [ "$(adb_in "$branch" /system/bin/pidof system_server)" = "$system_server" ] ||
     fail "Android's framework restarted in $branch after the fork"
-  adb_in "$branch" /system/bin/dumpsys SurfaceFlinger 2>&1 | grep -q '^GLES:.*ANGLE' ||
-    fail "SurfaceFlinger composes without the GPU in $branch after the fork"
+  case "$(adb_in "$branch" /system/bin/dumpsys SurfaceFlinger 2>&1 | grep '^GLES:')" in
+    *$WANT_GLES*) ;;
+    *) fail "SurfaceFlinger composes without the GPU in $branch after the fork" ;;
+  esac
 done
 launch com.android.settings child
 echo "ttc redroid e2e: Android runs on in both branches of a live fork"

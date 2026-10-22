@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+//go:build (darwin || linux) && cgo
+
 // virgl's formats, which are Gallium's of 2015 with fixed values, as
 // Gallium's of today: those of the same names, which some of today's name
 // by another. The others, which Gallium no longer has, are

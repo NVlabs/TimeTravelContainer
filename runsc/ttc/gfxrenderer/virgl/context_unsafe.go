@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//go:build darwin && cgo
+//go:build (darwin || linux) && cgo
 
 package virgl
 
@@ -1458,7 +1458,18 @@ type capture struct {
 func (c *Context) prepareCapture(mode, first, count, instances uint32, indexed, indirect bool) *capture {
 	sub := c.sub
 	vs := sub.shaders[stageVertex]
-	if sub.soCount == 0 || len(vs.so) == 0 || vs.so[0] == 0 || !xfbEmulated {
+	if sub.soCount == 0 || !xfbEmulated {
+		return nil
+	}
+	if len(vs.so) == 0 || vs.so[0] == 0 {
+		// The guest gives the stream output to the last stage that
+		// processes vertices: the renderer captures a vertex shader's only.
+		for _, stage := range []uint32{stageGeometry, stageTessEval} {
+			if s := sub.shaders[stage]; s != nil && len(s.so) > 0 && s.so[0] > 0 && !c.loggedCapture {
+				c.loggedCapture = true
+				log.Printf("virgl: context %d: transform feedback of shader stage %d captures nothing", c.id, stage)
+			}
+		}
 		return nil
 	}
 	vertices := listVertices(mode)

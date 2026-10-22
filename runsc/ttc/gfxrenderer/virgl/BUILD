@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-load("//tools:defs.bzl", "go_library", "go_test", "select_system")
+load("//tools:defs.bzl", "go_library", "go_test")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -13,23 +13,30 @@ go_library(
     srcs = [
         "clone_unsafe.go",
         "context_unsafe.go",
-        "formats_darwin.c",
-        "pipe_darwin.c",
+        "formats.c",
+        "pipe.c",
         "protocol.go",
+        "screen.c",
         "screen_darwin.c",
+        "screen_linux.c",
         "virgl.go",
         "virgl.h",
         "virgl_int.h",
         "virgl_other.go",
         "virgl_unsafe.go",
     ],
-    # On macOS the renderer links Zink (see tools/mesa/README.md), on the
-    # MoltenVK that the Venus renderer links.
+    # The renderer links Zink (see tools/mesa/README.md): on macOS, on the
+    # MoltenVK that the Venus renderer links; on Linux, on the host's Vulkan
+    # loader, which it loads.
     bazel_cdeps = select({
         "@platforms//os:macos": [
             "@mesa//:gallium_api",
             "@mesa//:zink",
             "@moltenvk",
+        ],
+        "@platforms//os:linux": [
+            "@mesa//:gallium_api",
+            "@mesa//:zink",
         ],
         "//conditions:default": [],
     }),
@@ -41,11 +48,9 @@ go_library(
 go_test(
     name = "virgl_test",
     size = "small",
-    srcs = ["virgl_darwin_test.go"],
+    srcs = ["virgl_test.go"],
     library = ":virgl",
-    # The tests render with Zink, through cgo, as the renderer does.
-    pure = select_system(
-        darwin = "off",
-        linux = "auto",
-    ),
+    # The tests render with Zink, through cgo, as the renderer does, and skip
+    # where Zink finds no Vulkan device.
+    pure = "off",
 )

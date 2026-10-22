@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//go:build darwin && cgo
+//go:build (darwin || linux) && cgo
 
 package virgl
 
 /*
+#cgo linux LDFLAGS: -ldl
 #include <stdlib.h>
 #include "virgl.h"
 #include "virgl_hw.h"

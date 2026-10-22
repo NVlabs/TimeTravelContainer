@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+//go:build (darwin || linux) && cgo
+
 // virgl's commands as Gallium's calls. The Go decoder checked each command's
 // length and resolved its handles; these unpack its fields, as
 // virglrenderer's vrend_decode.c does, into Gallium's state. d is a

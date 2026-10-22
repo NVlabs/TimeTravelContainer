@@ -96,6 +96,8 @@ const (
 	// tessellation control and evaluation, and compute.
 	stageVertex              = 0
 	stageFragment            = 1
+	stageGeometry            = 2
+	stageTessEval            = 4
 	stageCompute             = 5
 	shaderOffsetContinuation = 1 << 31
 	shaderOffsetMask         = 0x7fffffff

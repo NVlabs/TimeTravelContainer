@@ -5,8 +5,8 @@
 
 # Manual end-to-end coverage for the virtual GPU, --gfx: vulkaninfo, an
 # offscreen render's checksum (test/gfx/vkoffscreen.c), OpenGL ES by Zink
-# (test/gfx/gloffscreen.c), on macOS by Debian's virgl driver too, and forks
-# with --gfx-fork=device-lost and --gfx-fork=snapshot, in containers whose
+# (test/gfx/gloffscreen.c) and by Debian's virgl driver, and forks with
+# --gfx-fork=device-lost and --gfx-fork=snapshot, in containers whose
 # renderer is ttc-gfx-renderer on the host's GPU, and whose Vulkan driver is
 # the daemon's.
 #
@@ -174,15 +174,16 @@ case "$result" in
   *"renderer zink"*"$DEVICE"*"gloffscreen: ok checksum=$WANT_GL_CHECKSUM"*) ;;
   *) fail "gloffscreen: $result" ;;
 esac
-# On macOS, Debian's Mesa drives the GPU with its virgl driver by default,
-# which the renderer serves with Zink on the host: the same render.
-if [ "$(uname -s)" = Darwin ]; then
-  result=$(ttc exec "$NAME@main" /work/gloffscreen 2>&1) || fail "gloffscreen by virgl: $result"
-  case "$result" in
-    *"renderer virgl (zink"*"gloffscreen: ok checksum=$WANT_GL_CHECKSUM"*) ;;
-    *) fail "gloffscreen by virgl: $result" ;;
-  esac
-fi
+# Debian's Mesa drives the GPU with its virgl driver, which the renderer
+# serves with Zink on the host: the same render. It does by default on
+# macOS, and elsewhere where applications ask for it, rather than for the
+# daemon's configuration's Zink in the guest.
+VIRGL=MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu
+result=$(ttc exec -e "$VIRGL" "$NAME@main" /work/gloffscreen 2>&1) || fail "gloffscreen by virgl: $result"
+case "$result" in
+  *"renderer virgl (zink"*"gloffscreen: ok checksum=$WANT_GL_CHECKSUM"*) ;;
+  *) fail "gloffscreen by virgl: $result" ;;
+esac
 
 # Repeat the render: each run creates a context of the branch's renderer.
 for i in 1 2 3; do
@@ -317,9 +318,8 @@ ttc rm -f "$NAME" >/dev/null
 # A family with --gfx-fork=snapshot: a fork's child resumes the GPU's state,
 # which the family's renderer clones, recorded command buffers too, so the
 # Vulkan render loop records them once; Zink records its own for each draw.
-# On macOS a third loop renders by virgl, whose contexts the renderer clones
-# too. The family forks thrice: a child, two children at once, and a child's
-# child.
+# A third loop renders by virgl, whose contexts the renderer clones too. The
+# family forks thrice: a child, two children at once, and a child's child.
 SNAP="$NAME-snap"
 SNAP_BRANCHES="kid one two grandkid"
 ttc run -d --name "$SNAP" --gfx --gfx-fork=snapshot --network ttc --nat \
@@ -337,13 +337,10 @@ ttc exec -d "$SNAP@main" sh -c \
 ttc exec -d -e "$ZINK" "$SNAP@main" sh -c \
   'cd /work && ./gloffscreen 300 20 >/tmp/gl.log 2>&1
    echo "exit=$?" >>/tmp/gl.log' >/dev/null
-GL_LOGS=/tmp/gl.log
-if [ "$(uname -s)" = Darwin ]; then
-  ttc exec -d "$SNAP@main" sh -c \
-    'cd /work && ./gloffscreen 300 20 >/tmp/virgl.log 2>&1
-     echo "exit=$?" >>/tmp/virgl.log' >/dev/null
-  GL_LOGS="$GL_LOGS /tmp/virgl.log"
-fi
+ttc exec -d -e "$VIRGL" "$SNAP@main" sh -c \
+  'cd /work && ./gloffscreen 300 20 >/tmp/virgl.log 2>&1
+   echo "exit=$?" >>/tmp/virgl.log' >/dev/null
+GL_LOGS="/tmp/gl.log /tmp/virgl.log"
 wait_log "$SNAP@main" "iteration 3 ok" 60
 for gl in $GL_LOGS; do
   wait_log "$SNAP@main" "iteration 3 ok" 60 "$gl"

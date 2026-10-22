@@ -47,7 +47,7 @@ const (
 	gfxGuestDriverDir = "/usr/lib/ttc-gfx"
 	// gfxGuestDriconfPath is where Mesa's OpenGL in containers finds the
 	// configuration that has it drive the virtual GPU by Zink, over the
-	// Vulkan driver: the GPU has no OpenGL driver.
+	// Vulkan driver, rather than by its OpenGL driver, virgl.
 	gfxGuestDriconfPath = "/usr/share/drirc.d/50-ttc-gfx.conf"
 )
 
@@ -56,15 +56,18 @@ const (
 // software, as it would without the configuration.
 //
 // Containers get it where Zink offers OpenGL 3 and more on the host's GPU,
-// which takes transform feedback and geometry shaders. MoltenVK, macOS's
-// Vulkan, has neither, and Zink on it offers only OpenGL 2.1 and OpenGL ES
-// 2.0: applications that need more, Chromium's default ANGLE on OpenGL
-// among them, would fail instead of rendering in software. There,
-// applications opt in with MESA_LOADER_DRIVER_OVERRIDE=zink.
+// which takes transform feedback and geometry shaders, of every vertex
+// stream: virgl's transform feedback, which the renderer emulates, captures
+// the vertex shader's first stream alone. MoltenVK, macOS's Vulkan, has
+// neither, and Zink on it offers only OpenGL 2.1 and OpenGL ES 2.0:
+// applications that need more, Chromium's default ANGLE on OpenGL among
+// them, would fail instead of rendering in software. There, Mesa drives
+// the GPU by virgl, and applications opt in to Zink with
+// MESA_LOADER_DRIVER_OVERRIDE=zink.
 var gfxGuestZinkByDefault = runtime.GOOS != "darwin"
 
 const gfxGuestDriconf = `<?xml version="1.0" standalone="yes"?>
-<!-- TTC's virtual GPU has no OpenGL driver: drive it by Zink. -->
+<!-- Drive TTC's virtual GPU by Zink, over its Vulkan driver. -->
 <driconf>
     <device driver="loader" kernel_driver="virtio_gpu">
         <application name="Default">

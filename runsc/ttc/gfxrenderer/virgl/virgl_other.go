@@ -1,14 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//go:build !darwin || !cgo
+//go:build !(darwin || linux) || !cgo
 
 package virgl
 
 import "errors"
 
-// The renderer links Zink only on macOS, for now.
-var errUnavailable = errors.New("the renderer renders for virgl's guests only on macOS")
+// The renderer links Zink on macOS and Linux, with cgo.
+var errUnavailable = errors.New("the renderer renders for virgl's guests only on macOS and Linux")
 
 // Init fails: see Available.
 func Init() error {
