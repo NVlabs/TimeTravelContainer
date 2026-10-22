@@ -11587,19 +11587,27 @@ func (b *runtimeBackend) removeFamily(name string, force, volumes bool, known *t
 	if err != nil {
 		return fmt.Errorf("checking runtime state before removing %q: %w", name, err)
 	}
-	for _, family := range families {
-		if family.ID != runtimeID {
-			continue
+	// The host frees the family's memory as its Sentry exits, which takes
+	// time in proportion to it: other commands go on meanwhile, as they do
+	// while the graph lets the memory go.
+	if err := b.withoutLifecycleLock(info, longOperation{state: "removing", shown: true}, func() error {
+		for _, family := range families {
+			if family.ID != runtimeID {
+				continue
+			}
+			args := []string{"delete"}
+			if force || persistentFamilyProcessFree(info) {
+				args = append(args, "--force")
+			}
+			args = append(args, runtimeID)
+			if _, err := b.command(args...); err != nil {
+				return fmt.Errorf("deleting runtime container %q: %w", name, err)
+			}
+			break
 		}
-		args := []string{"delete"}
-		if force || persistentFamilyProcessFree(info) {
-			args = append(args, "--force")
-		}
-		args = append(args, runtimeID)
-		if _, err := b.command(args...); err != nil {
-			return fmt.Errorf("deleting runtime container %q: %w", name, err)
-		}
-		break
+		return nil
+	}); err != nil {
+		return err
 	}
 	graphRoots := make([]string, 0)
 	seenGraphRoots := make(map[string]struct{})
