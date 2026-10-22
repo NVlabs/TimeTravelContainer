@@ -1353,6 +1353,15 @@ int ttc_virgl_clear_texture(struct pipe_context *pipe, struct pipe_resource *res
    if (res->target == PIPE_BUFFER || box.width < 0 || box.height < 0 || box.depth < 0 ||
        !box_ok(res, d[1], &box))
       return EINVAL;
+   // Zink clears a texture as a framebuffer's attachment, of its format,
+   // which it must render, of an area of texels.
+   unsigned bind = util_format_is_depth_or_stencil(res->format) ? PIPE_BIND_DEPTH_STENCIL
+                                                                 : PIPE_BIND_RENDER_TARGET;
+   if (!pipe->screen->is_format_supported(pipe->screen, res->format, res->target, res->nr_samples,
+                                          res->nr_samples, bind))
+      return EINVAL;
+   if (!box.width || !box.height || !box.depth)
+      return 0;
    pipe->clear_texture(pipe, res, d[1], &box, &d[8]);
    return 0;
 }
@@ -1368,11 +1377,19 @@ int ttc_virgl_clear_surface(struct pipe_context *pipe, const struct ttc_virgl_su
       return EINVAL;
    bool rc = d[0] & 1;
    unsigned buffers = (d[0] >> 1) & 7;
-   if (buffers & PIPE_CLEAR_COLOR0) {
-      union pipe_color_union color;
+   // Zink clears a surface as a framebuffer's attachment, which it must
+   // be, of an area of texels.
+   bool color = buffers & PIPE_CLEAR_COLOR0;
+   if ((color || buffers & PIPE_CLEAR_DEPTHSTENCIL) &&
+       !attachment_ok(pipe, s, color ? PIPE_BIND_RENDER_TARGET : PIPE_BIND_DEPTH_STENCIL))
+      return EINVAL;
+   if (!d[8] || !d[9])
+      return 0;
+   if (color) {
+      union pipe_color_union value;
       for (unsigned i = 0; i < 4; i++)
-         color.ui[i] = d[2 + i];
-      pipe->clear_render_target(pipe, &surf, &color, d[6], d[7], d[8], d[9], rc);
+         value.ui[i] = d[2 + i];
+      pipe->clear_render_target(pipe, &surf, &value, d[6], d[7], d[8], d[9], rc);
       return 0;
    }
    if (!(buffers & PIPE_CLEAR_DEPTHSTENCIL))

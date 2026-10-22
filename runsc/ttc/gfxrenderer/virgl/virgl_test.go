@@ -1176,6 +1176,74 @@ func TestCopyLayersToSlices(t *testing.T) {
 	}
 }
 
+// Clears that Zink would render as attachments that they cannot be are
+// refused: of colors of a depth surface, of depth of a color surface, and
+// of a compressed texture; and clears of no texels do nothing.
+func TestInvalidClears(t *testing.T) {
+	const (
+		formatZ24S8      = 19
+		formatDXT1RGB    = 105
+		formatETC2RGB8   = 269
+		bindDepthStencil = 1 << 0
+		clearDepth       = 1 << 0
+		clearStencil     = 1 << 1
+	)
+	f := newFixture(t)
+	depth, err := NewResource(5, ResourceArgs{Target: target2D, Format: formatZ24S8, Bind: bindDepthStencil,
+		Width: width, Height: height, Depth: 1, ArraySize: 1}, make([]byte, width*height*4), nil)
+	if err != nil {
+		t.Fatalf("NewResource: %v", err)
+	}
+	defer depth.DecRef()
+	f.c.Attach(depth)
+	colorSurf, depthSurf := f.id(), f.id()
+	var s stream
+	s.cmd(cmdCreateObject, objectSurface, colorSurf, f.rt.ID(), formatR8G8B8A8Unorm, 0, 0)
+	s.cmd(cmdCreateObject, objectSurface, depthSurf, depth.ID(), formatZ24S8, 0, 0)
+	f.submit(t, s)
+	clearSurface := func(s *stream, buffers, surf, w, h uint32) {
+		s.cmd(cmdClearSurface, 0, buffers<<1, surf, 0, 0, 0, 0, 0, 0, w, h)
+	}
+	cases := []struct {
+		name string
+		s    func(*stream)
+	}{
+		{"a color clear of a depth surface", func(s *stream) { clearSurface(s, clearColor0, depthSurf, width, height) }},
+		{"a depth clear of a color surface", func(s *stream) { clearSurface(s, clearDepth, colorSurf, width, height) }},
+	}
+	for _, format := range []uint32{formatETC2RGB8, formatDXT1RGB} {
+		if !sampled(t, format) {
+			continue
+		}
+		r, err := NewResource(6, ResourceArgs{Target: target2D, Format: format, Bind: bindSamplerView,
+			Width: 16, Height: 16, Depth: 1, ArraySize: 1}, make([]byte, 128), nil)
+		if err != nil {
+			t.Fatalf("NewResource: %v", err)
+		}
+		defer r.DecRef()
+		f.c.Attach(r)
+		cases = append(cases, struct {
+			name string
+			s    func(*stream)
+		}{"a clear of a compressed texture", func(s *stream) { s.cmd(cmdClearTexture, 0, r.ID(), 0, 0, 0, 0, 16, 16, 1, 0, 0, 0, 0) }})
+		break
+	}
+	for _, tc := range cases {
+		s = nil
+		tc.s(&s)
+		if err := f.c.Submit(s.bytes()); err == nil {
+			t.Errorf("%s: no error", tc.name)
+		}
+	}
+	// The surfaces' own clears, and clears of no texels.
+	s = nil
+	clearSurface(&s, clearColor0, colorSurf, width, height)
+	clearSurface(&s, clearDepth|clearStencil, depthSurf, width, height)
+	clearSurface(&s, clearColor0, colorSurf, 0, height)
+	s.cmd(cmdClearTexture, 0, f.rt.ID(), 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0)
+	f.submit(t, s)
+}
+
 func TestInvalidCommands(t *testing.T) {
 	f := newFixture(t)
 	for _, tc := range []struct {
