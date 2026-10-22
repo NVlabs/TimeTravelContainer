@@ -5,16 +5,10 @@
 
 package virgl
 
-/*
-#include "virgl.h"
-*/
-import "C"
-
 import (
 	"errors"
 	"fmt"
 	"sort"
-	"unsafe"
 )
 
 // A live fork of a branch whose GPU is in use clones the branch's virgl
@@ -22,7 +16,7 @@ import (
 // children, as it clones Venus's (see the venus package's clone_unsafe.go):
 // nothing is serialized.
 //
-// A clone's sub-contexts are Gallium contexts of their own, of the parent's
+// A clone's sub-contexts are backend contexts of their own, of the parent's
 // IDs, in which the clone creates the parent's objects again, of what the
 // commands that created them carried, and binds and sets what the parent's
 // state holds, of what the decoder keeps of it. Its shaders are compiled
@@ -64,8 +58,8 @@ func (c *Context) Clone(resource func(*Resource) (*Resource, error)) (*Context, 
 // Preconditions: c.mu is locked.
 func (c *Context) waitIdleLocked() {
 	for _, sub := range c.subs {
-		if h := C.ttc_virgl_flush(sub.pipe); h != nil {
-			C.ttc_virgl_fence_wait(h)
+		if f := sub.pipe.flush(); f != nil {
+			f.wait()
 		}
 	}
 	c.checkQueriesLocked()
@@ -188,30 +182,29 @@ func (cl *cloner) object(nc *Context, sub *subContext, o *object) (*object, erro
 	d := o.args
 	switch o.typ {
 	case objectBlend:
-		co.ptr = C.ttc_virgl_create_blend(pipe, ptr(d))
+		co.obj = pipe.createBlend(d)
 	case objectRasterizer:
-		co.ptr = C.ttc_virgl_create_rasterizer(pipe, ptr(d))
+		co.obj = pipe.createRasterizer(d)
 	case objectDSA:
-		co.ptr = C.ttc_virgl_create_dsa(pipe, ptr(d))
+		co.obj = pipe.createDSA(d)
 	case objectSamplerState:
-		co.ptr = C.ttc_virgl_create_sampler_state(pipe, ptr(d))
+		co.obj = pipe.createSamplerState(d)
 	case objectVertexElements:
-		// Draws create Gallium's vertex elements of the strides bound.
+		// Draws create the backend's vertex elements of the strides bound.
 		co.elements, co.sintMask, co.uintMask = o.elements, o.sintMask, o.uintMask
-		co.csos = make(map[string]unsafe.Pointer)
+		co.csos = make(map[string]any)
 	case objectSurface, objectMSAASurface:
 		co.surf = o.surf
-		co.surf.res = co.res.pipe
+		co.surf.res = co.res.res
 	case objectSamplerView:
-		co.ptr = unsafe.Pointer(C.ttc_virgl_create_sampler_view(pipe, co.res.pipe, C.uint32_t(d[2]&0xffffff),
-			C.uint32_t(d[2]>>24), C.uint32_t(d[3]), C.uint32_t(d[4]), C.uint32_t(d[5])))
+		co.obj = pipe.createSamplerView(co.res.res, d[2]&0xffffff, d[2]>>24, d[3], d[4], d[5])
 	case objectQuery:
 		co.qtype, co.counted, co.sub = o.qtype, o.counted, sub
 		co.generated, co.emitted, co.needed = o.generated, o.emitted, o.needed
 		if !o.counted {
-			co.ptr = unsafe.Pointer(C.ttc_virgl_create_query(pipe, C.uint32_t(o.qtype), C.uint32_t(d[1]>>16)))
-			if co.ptr != nil && o.active {
-				C.ttc_virgl_begin_query(pipe, (*C.struct_pipe_query)(co.ptr))
+			co.obj = pipe.createQuery(o.qtype, d[1]>>16)
+			if co.obj != nil && o.active {
+				pipe.beginQuery(co.obj)
 				co.active = true
 			}
 		}
@@ -225,25 +218,22 @@ func (cl *cloner) object(nc *Context, sub *subContext, o *object) (*object, erro
 			co.filled = o.filled
 			break
 		}
-		if o.tokens == nil {
+		if o.code == nil {
 			nc.freeObjectLocked(sub, co)
 			return nil, errors.New("a shader without its TGSI")
 		}
-		co.tokens = C.ttc_virgl_dup_tokens(o.tokens)
-		var errBuf [256]C.char
-		co.ptr = C.ttc_virgl_create_shader(pipe, C.uint32_t(o.stage), co.tokens, ptr(o.so), C.uint32_t(len(o.so)),
-			C.uint32_t(o.shared), 0, 0, false, &errBuf[0], C.uint32_t(len(errBuf)))
-		if co.ptr == nil {
+		co.code = o.code.dup()
+		if co.obj, err = pipe.createShader(o.stage, co.code, o.so, o.shared, 0, 0, false); err != nil {
 			nc.freeObjectLocked(sub, co)
-			return nil, fmt.Errorf("compiling a shader again: %s", C.GoString(&errBuf[0]))
+			return nil, fmt.Errorf("compiling a shader again: %w", err)
 		}
 		if o.stage == stageVertex {
-			co.variants = map[variantKey]unsafe.Pointer{{}: co.ptr}
+			co.variants = map[variantKey]any{{}: co.obj}
 		}
 	}
-	if co.ptr == nil && co.text == nil && co.typ != objectSurface && co.typ != objectMSAASurface && !co.renderers() {
+	if co.obj == nil && co.text == nil && co.typ != objectSurface && co.typ != objectMSAASurface && !co.renderers() {
 		nc.freeObjectLocked(sub, co)
-		return nil, errors.New("Zink refused it")
+		return nil, errors.New("the backend refused it")
 	}
 	return co, nil
 }
@@ -254,7 +244,7 @@ func (cl *cloner) state(nc *Context, nsub, sub *subContext, objs map[*object]*ob
 	pipe := nsub.pipe
 	for _, typ := range []uint32{objectBlend, objectRasterizer, objectDSA} {
 		if o := objs[sub.cso[typ]]; o != nil {
-			C.ttc_virgl_bind_object(pipe, C.uint32_t(typ), o.ptr)
+			pipe.bindObject(typ, o.obj)
 			nc.rebind(nsub, &nsub.cso[typ], o)
 		}
 	}
@@ -265,7 +255,7 @@ func (cl *cloner) state(nc *Context, nsub, sub *subContext, objs map[*object]*ob
 		}
 		// Draws bind the vertex shader's variant.
 		if stage != stageVertex {
-			C.ttc_virgl_bind_shader(pipe, C.uint32_t(stage), o.ptr)
+			pipe.bindShader(uint32(stage), o.obj)
 		}
 		nc.rebind(nsub, &nsub.shaders[stage], o)
 	}
@@ -274,8 +264,7 @@ func (cl *cloner) state(nc *Context, nsub, sub *subContext, objs map[*object]*ob
 			if o = objs[o]; o == nil {
 				continue
 			}
-			states := [1]unsafe.Pointer{o.ptr}
-			C.ttc_virgl_bind_samplers(pipe, C.uint32_t(stage), C.uint32_t(i), 1, &states[0])
+			pipe.bindSamplers(uint32(stage), uint32(i), []any{o.obj})
 			nc.rebind(nsub, &nsub.samplers[stage][i], o)
 		}
 	}
@@ -284,15 +273,14 @@ func (cl *cloner) state(nc *Context, nsub, sub *subContext, objs map[*object]*ob
 			if o = objs[o]; o == nil {
 				continue
 			}
-			views := [1]*C.struct_pipe_sampler_view{(*C.struct_pipe_sampler_view)(o.ptr)}
-			C.ttc_virgl_set_sampler_views(pipe, C.uint32_t(stage), C.uint32_t(i), 1, &views[0])
+			pipe.setSamplerViews(uint32(stage), uint32(i), []any{o.obj})
 			nc.rebind(nsub, &nsub.views[stage][i], o)
 		}
 	}
 	nsub.velems = objs[sub.velems]
 
-	var cbufs [maxColorBufs]C.struct_ttc_virgl_surface
-	var zsbuf C.struct_ttc_virgl_surface
+	cbufs := make([]surface, sub.fbCbufs)
+	var zsbuf surface
 	for i, o := range sub.fb {
 		o = objs[o]
 		nc.rebind(nsub, &nsub.fb[i], o)
@@ -300,11 +288,11 @@ func (cl *cloner) state(nc *Context, nsub, sub *subContext, objs map[*object]*ob
 		case o == nil:
 		case i == 0:
 			zsbuf = o.surf
-		default:
+		case i-1 < len(cbufs):
 			cbufs[i-1] = o.surf
 		}
 	}
-	if err := errnoErr(C.ttc_virgl_set_framebuffer(pipe, C.uint32_t(sub.fbCbufs), &cbufs[0], &zsbuf)); err != nil {
+	if err := pipe.setFramebuffer(cbufs, zsbuf); err != nil {
 		return fmt.Errorf("setting the framebuffer: %w", err)
 	}
 	nsub.fbCbufs, nsub.fbAttached = sub.fbCbufs, sub.fbAttached
@@ -367,8 +355,7 @@ func (cl *cloner) state(nc *Context, nsub, sub *subContext, objs map[*object]*ob
 		nsub.countedQueries[objs[o]] = struct{}{}
 	}
 	if o := objs[sub.cond]; o != nil {
-		C.ttc_virgl_render_condition(pipe, (*C.struct_pipe_query)(o.ptr), C.bool(sub.condition[0]&1 != 0),
-			C.uint32_t(sub.condition[1]))
+		pipe.renderCondition(o.obj, sub.condition[0]&1 != 0, sub.condition[1])
 		nc.rebind(nsub, &nsub.cond, o)
 		nsub.condition = sub.condition
 	}
@@ -395,26 +382,19 @@ func (cl *cloner) bindRange(sub *subContext, s slot, r *Resource, d []uint32) er
 	release(sub.hold(s, cr))
 	cr.DecRef()
 	sub.ranges[s] = append([]uint32(nil), d...)
-	res := [1]*C.struct_pipe_resource{cr.pipe}
-	var errno C.int
+	res := []backendResource{cr.res}
 	switch s.kind {
 	case slotConstantBuffer:
-		errno = C.ttc_virgl_set_uniform_buffer(sub.pipe, C.uint32_t(s.stage), C.uint32_t(s.index), cr.pipe,
-			C.uint32_t(d[0]), C.uint32_t(d[1]))
-	case slotShaderBuffer, slotAtomicBuffer:
-		offsets, sizes := [1]C.uint32_t{C.uint32_t(d[0])}, [1]C.uint32_t{C.uint32_t(d[1])}
-		if s.kind == slotShaderBuffer {
-			errno = C.ttc_virgl_set_shader_buffers(sub.pipe, C.uint32_t(s.stage), C.uint32_t(s.index), 1, &res[0],
-				&offsets[0], &sizes[0])
-		} else {
-			errno = C.ttc_virgl_set_atomic_buffers(sub.pipe, C.uint32_t(s.index), 1, &res[0], &offsets[0], &sizes[0])
-		}
+		err = sub.pipe.setUniformBuffer(s.stage, s.index, cr.res, d[0], d[1])
+	case slotShaderBuffer:
+		err = sub.pipe.setShaderBuffers(s.stage, s.index, res, d[:1], d[1:2])
+	case slotAtomicBuffer:
+		err = sub.pipe.setAtomicBuffers(s.index, res, d[:1], d[1:2])
 	case slotShaderImage:
 		image := [5]uint32{d[0], d[1], d[2], d[3]}
-		errno = C.ttc_virgl_set_shader_images(sub.pipe, C.uint32_t(s.stage), C.uint32_t(s.index), 1, &res[0],
-			ptr(image[:]))
+		err = sub.pipe.setShaderImages(s.stage, s.index, res, image[:])
 	}
-	if err := errnoErr(errno); err != nil {
+	if err != nil {
 		return fmt.Errorf("binding resource %d to slot %+v: %w", r.id, s, err)
 	}
 	return nil

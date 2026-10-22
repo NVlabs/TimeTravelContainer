@@ -5,12 +5,6 @@
 
 package virgl
 
-/*
-#include <stdlib.h>
-#include "virgl.h"
-*/
-import "C"
-
 import (
 	"encoding/binary"
 	"errors"
@@ -23,7 +17,7 @@ import (
 
 // Context is a virgl context: what one guest process does with the GPU by
 // virgl. Its sub-contexts, one for each of the process's OpenGL contexts,
-// are Gallium contexts of Zink's.
+// are Gallium contexts of the backend's.
 type Context struct {
 	id uint32
 
@@ -49,12 +43,13 @@ type Context struct {
 // it, and what of its state the decoder keeps.
 //
 // Gallium's drivers keep no references to much of their state: to the
-// buffers bound to slots, which Zink holds until a call replaces them in
-// their slots, and to the state objects bound, which they free when they
-// are deleted. A sub-context keeps the resources that Zink holds, and an
-// object that the guest destroys while bound lives on until it is unbound.
+// buffers bound to slots, which the backend holds until a call replaces
+// them in their slots, and to the state objects bound, which they free when
+// they are deleted. A sub-context keeps the resources that the backend
+// holds, and an object that the guest destroys while bound lives on until
+// it is unbound.
 type subContext struct {
-	pipe    *C.struct_pipe_context
+	pipe    backendContext
 	objects map[uint32]*object
 	// zombies are objects that the guest destroyed while they were bound.
 	zombies map[*object]struct{}
@@ -68,13 +63,13 @@ type subContext struct {
 	shaders     [maxShaderStages]*object
 	samplers    [maxShaderStages][maxSamplers]*object
 	velemsBound *object
-	velemsCSO   unsafe.Pointer
+	velemsCSO   any
 	cond        *object
 	// vsBound is the vertex shader whose variant, vsCSO, is bound: draws
 	// bind the variant of the guest's vertex shader, shaders[stageVertex],
 	// for the vertex elements' types.
 	vsBound *object
-	vsCSO   unsafe.Pointer
+	vsCSO   any
 
 	// fbAttached is whether the framebuffer has attachments, whose size
 	// SET_FRAMEBUFFER_STATE_NO_ATTACH, which guests send after each
@@ -96,7 +91,7 @@ type subContext struct {
 	numVBs   int
 	vbsDirty bool
 
-	// held are the resources that Zink holds, by slot.
+	// held are the resources that the backend holds, by slot.
 	held map[slot]*Resource
 
 	ib       *Resource
@@ -150,7 +145,8 @@ const (
 type object struct {
 	typ   uint32
 	stage uint32
-	ptr   unsafe.Pointer
+	// obj is the backend's object, or nil.
+	obj any
 	// binds counts the slots of the sub-context's state that hold the
 	// object, and deleted is whether the guest destroyed it.
 	binds   int
@@ -158,7 +154,7 @@ type object struct {
 	// res is the resource that a surface, sampler view, query or stream
 	// output target is of.
 	res  *Resource
-	surf C.struct_ttc_virgl_surface
+	surf surface
 	// args are what the command that created a state object, a sampler
 	// view or a query carried, of which a clone creates it again.
 	args []uint32
@@ -166,7 +162,7 @@ type object struct {
 	// Gallium state of them for each set of strides. sintMask and uintMask
 	// are the elements of signed and unsigned integers.
 	elements []uint32
-	csos     map[string]unsafe.Pointer
+	csos     map[string]any
 	sintMask uint32
 	uintMask uint32
 	// A shader whose text comes in parts.
@@ -177,8 +173,8 @@ type object struct {
 	shared    uint32
 	// A shader's TGSI, which a clone compiles again, and a vertex shader's
 	// variants (see bindVertexShader).
-	tokens   unsafe.Pointer
-	variants map[variantKey]unsafe.Pointer
+	code     shaderCode
+	variants map[variantKey]any
 	// A stream output target's range of its buffer, and the bytes and the
 	// vertices captured to it.
 	soOffset uint32
@@ -198,7 +194,7 @@ type object struct {
 }
 
 var (
-	errNoContext = errors.New("Zink refused a context")
+	errNoContext = errors.New("the backend refused a context")
 	errDestroyed = errors.New("the context is destroyed")
 )
 
@@ -222,9 +218,9 @@ func NewContext(id uint32) (*Context, error) {
 }
 
 func (c *Context) newSubContext() (*subContext, error) {
-	pipe := C.ttc_virgl_context_create()
-	if pipe == nil {
-		return nil, errNoContext
+	pipe, err := be.newContext()
+	if err != nil {
+		return nil, err
 	}
 	sub := &subContext{
 		pipe:    pipe,
@@ -236,9 +232,9 @@ func (c *Context) newSubContext() (*subContext, error) {
 		ranges:         make(map[slot][]uint32),
 		scalars:        make(map[uint32][]uint32),
 	}
-	// Zink draws with the blend, rasterizer and depth-stencil-alpha states
-	// bound, which a guest that binds none would leave unbound: OpenGL's
-	// defaults, as near as matters.
+	// The backend draws with the blend, rasterizer and depth-stencil-alpha
+	// states bound, which a guest that binds none would leave unbound:
+	// OpenGL's defaults, as near as matters.
 	var blend [11]uint32
 	for i := 3; i < len(blend); i++ {
 		blend[i] = 0xf << 27 // colormask
@@ -249,16 +245,16 @@ func (c *Context) newSubContext() (*subContext, error) {
 		5: 0x3f800000,           // line_width 1.0
 	}
 	var dsa [5]uint32
-	sub.defaults[objectBlend] = &object{typ: objectBlend, ptr: C.ttc_virgl_create_blend(pipe, ptr(blend[:]))}
-	sub.defaults[objectRasterizer] = &object{typ: objectRasterizer, ptr: C.ttc_virgl_create_rasterizer(pipe, ptr(rast[:]))}
-	sub.defaults[objectDSA] = &object{typ: objectDSA, ptr: C.ttc_virgl_create_dsa(pipe, ptr(dsa[:]))}
+	sub.defaults[objectBlend] = &object{typ: objectBlend, obj: pipe.createBlend(blend[:])}
+	sub.defaults[objectRasterizer] = &object{typ: objectRasterizer, obj: pipe.createRasterizer(rast[:])}
+	sub.defaults[objectDSA] = &object{typ: objectDSA, obj: pipe.createDSA(dsa[:])}
 	for _, typ := range []uint32{objectBlend, objectRasterizer, objectDSA} {
 		o := sub.defaults[typ]
-		if o.ptr == nil {
+		if o.obj == nil {
 			c.destroySubLocked(sub)
-			return nil, fmt.Errorf("Zink refused a default state of type %d", typ)
+			return nil, fmt.Errorf("the backend refused a default state of type %d", typ)
 		}
-		C.ttc_virgl_bind_object(pipe, C.uint32_t(typ), o.ptr)
+		pipe.bindObject(typ, o.obj)
 		c.rebind(sub, &sub.cso[typ], o)
 	}
 	return sub, nil
@@ -299,7 +295,7 @@ func (c *Context) Transfer(r *Resource, a TransferArgs) error {
 // Fence is a fence of what a context executed before Flush returned it.
 type Fence struct {
 	c       *Context
-	handles []*C.struct_pipe_fence_handle
+	handles []backendFence
 }
 
 // Flush has the GPU execute what the context executed, and returns a fence
@@ -312,7 +308,7 @@ func (c *Context) Flush() *Fence {
 	}
 	f := &Fence{c: c}
 	for _, sub := range c.subs {
-		if h := C.ttc_virgl_flush(sub.pipe); h != nil {
+		if h := sub.pipe.flush(); h != nil {
 			f.handles = append(f.handles, h)
 		}
 	}
@@ -325,7 +321,7 @@ func (c *Context) Flush() *Fence {
 // so that a guest that waits for the fence finds them.
 func (f *Fence) Wait() {
 	for _, h := range f.handles {
-		C.ttc_virgl_fence_wait(h)
+		h.wait()
 	}
 	f.handles = nil
 	c := f.c
@@ -372,7 +368,7 @@ func (c *Context) destroySubsLocked() {
 // destroySubLocked unbinds sub's state, as Gallium's frontends do before
 // they destroy a context, frees its objects, and destroys it.
 func (c *Context) destroySubLocked(sub *subContext) {
-	C.ttc_virgl_context_unbind(sub.pipe)
+	sub.pipe.unbind()
 	for _, o := range sub.objects {
 		c.freeObjectLocked(sub, o)
 	}
@@ -384,7 +380,7 @@ func (c *Context) destroySubLocked(sub *subContext) {
 			c.freeObjectLocked(sub, o)
 		}
 	}
-	C.ttc_virgl_context_destroy(sub.pipe)
+	sub.pipe.destroy()
 	sub.pipe = nil
 	sub.objects = nil
 	sub.zombies = nil
@@ -417,15 +413,15 @@ func (c *Context) rebind(sub *subContext, s **object, o *object) {
 
 // unhold undoes holds of slots of kind and stage from start, whose
 // previous holdings were old, where the call that would have replaced them
-// failed, and left Zink's state as it was.
+// failed, and left the backend's state as it was.
 func (sub *subContext) unhold(kind, stage, start uint32, old []*Resource) {
 	for i, r := range old {
 		release(sub.hold(slot{kind, stage, start + uint32(i)}, r), r)
 	}
 }
 
-// hold records that Zink holds r in slot s, and returns what s held, which
-// the caller releases once the call that replaced it returned.
+// hold records that the backend holds r in slot s, and returns what s held,
+// which the caller releases once the call that replaced it returned.
 func (sub *subContext) hold(s slot, r *Resource) *Resource {
 	old := sub.held[s]
 	if r != nil {
@@ -480,23 +476,23 @@ func (c *Context) freeObjectLocked(sub *subContext, o *object) {
 	delete(sub.zombies, o)
 	delete(sub.countedQueries, o)
 	if o.variants != nil {
-		// o.ptr is one of them.
+		// o.obj is one of them.
 		for _, v := range o.variants {
-			C.ttc_virgl_delete_object(sub.pipe, objectShader, stageVertex, v)
+			sub.pipe.deleteObject(objectShader, stageVertex, v)
 		}
 		o.variants = nil
-		o.ptr = nil
+		o.obj = nil
 	}
-	if o.tokens != nil {
-		C.ttc_virgl_free_tokens(o.tokens)
-		o.tokens = nil
+	if o.code != nil {
+		o.code.free()
+		o.code = nil
 	}
-	if o.ptr != nil {
-		C.ttc_virgl_delete_object(sub.pipe, C.uint32_t(o.typ), C.uint32_t(o.stage), o.ptr)
-		o.ptr = nil
+	if o.obj != nil {
+		sub.pipe.deleteObject(o.typ, o.stage, o.obj)
+		o.obj = nil
 	}
 	for _, cso := range o.csos {
-		C.ttc_virgl_delete_object(sub.pipe, objectVertexElements, 0, cso)
+		sub.pipe.deleteObject(objectVertexElements, 0, cso)
 	}
 	o.csos = nil
 	if o.res != nil {
@@ -540,22 +536,8 @@ func (c *Context) Submit(buf []byte) error {
 	return nil
 }
 
-func ptr(d []uint32) *C.uint32_t {
-	if len(d) == 0 {
-		return nil
-	}
-	return (*C.uint32_t)(unsafe.Pointer(&d[0]))
-}
-
 func errLen(n int) error {
 	return fmt.Errorf("%d dwords", n)
-}
-
-func errnoErr(errno C.int) error {
-	if errno != 0 {
-		return fmt.Errorf("errno %d", int(errno))
-	}
-	return nil
 }
 
 func (c *Context) resource(h uint32) (*Resource, error) {
@@ -573,7 +555,7 @@ func (c *Context) resource(h uint32) (*Resource, error) {
 // binds a texture of no VkBuffer as no buffer.
 func (c *Context) buffer(h uint32) (*Resource, error) {
 	r, err := c.resource(h)
-	if err == nil && r != nil && C.ttc_virgl_resource_target(r.pipe) != targetBuffer {
+	if err == nil && r != nil && r.res.target() != targetBuffer {
 		err = fmt.Errorf("resource %d is no buffer", h)
 	}
 	return r, err
@@ -588,19 +570,21 @@ func (c *Context) mustResource(h uint32) (*Resource, error) {
 	return r, err
 }
 
-func pipeOf(r *Resource) *C.struct_pipe_resource {
+// resOf returns r's backend resource, or nil.
+func resOf(r *Resource) backendResource {
 	if r == nil {
 		return nil
 	}
-	return r.pipe
+	return r.res
 }
 
-func pipes(rs []*Resource) **C.struct_pipe_resource {
-	ps := make([]*C.struct_pipe_resource, len(rs)+1)
+// resOfs returns rs's backend resources.
+func resOfs(rs []*Resource) []backendResource {
+	res := make([]backendResource, len(rs))
 	for i, r := range rs {
-		ps[i] = pipeOf(r)
+		res[i] = resOf(r)
 	}
-	return &ps[0]
+	return res
 }
 
 // lookup returns the sub-context's object h of type typ, or nil if h is 0.
@@ -609,7 +593,7 @@ func (c *Context) lookup(h, typ uint32) (*object, error) {
 		return nil, nil
 	}
 	o := c.sub.objects[h]
-	if o == nil || o.typ != typ || o.ptr == nil && !o.renderers() {
+	if o == nil || o.typ != typ || o.obj == nil && !o.renderers() {
 		return nil, fmt.Errorf("no object %d of type %d", h, typ)
 	}
 	return o, nil
@@ -632,11 +616,12 @@ func (c *Context) mustLookup(h, typ uint32) (*object, error) {
 	return o, err
 }
 
-func objPtr(o *object) unsafe.Pointer {
+// objOf returns o's backend object, or nil.
+func objOf(o *object) any {
 	if o == nil {
 		return nil
 	}
-	return o.ptr
+	return o.obj
 }
 
 func (c *Context) surface(h uint32) (*object, error) {
@@ -679,7 +664,7 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 			if o == nil {
 				o = sub.defaults[obj]
 			}
-			C.ttc_virgl_bind_object(pipe, C.uint32_t(obj), o.ptr)
+			pipe.bindObject(obj, o.obj)
 			c.rebind(sub, &sub.cso[obj], o)
 		case objectVertexElements:
 			o, err := c.lookup(d[0], obj)
@@ -707,7 +692,7 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		if count > maxViewports || d[0] > maxViewports-count {
 			return fmt.Errorf("viewports %d+%d", d[0], count)
 		}
-		C.ttc_virgl_set_viewports(pipe, C.uint32_t(d[0]), C.uint32_t(count), ptr(d[1:]))
+		pipe.setViewports(d[0], d[1:])
 		for i := uint32(0); i < count; i++ {
 			v := &sub.viewports[d[0]+i]
 			*v = append((*v)[:0], d[1+6*i:7+6*i]...)
@@ -722,7 +707,7 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		if count > maxViewports || d[0] > maxViewports-count {
 			return fmt.Errorf("scissors %d+%d", d[0], count)
 		}
-		C.ttc_virgl_set_scissors(pipe, C.uint32_t(d[0]), C.uint32_t(count), ptr(d[1:]))
+		pipe.setScissors(d[0], d[1:])
 		for i := uint32(0); i < count; i++ {
 			v := &sub.scissors[d[0]+i]
 			*v = append((*v)[:0], d[1+2*i:3+2*i]...)
@@ -733,7 +718,7 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		if n < 2 || d[0] > maxColorBufs || n != 2+int(d[0]) {
 			return errLen(n)
 		}
-		var cbufs [maxColorBufs]C.struct_ttc_virgl_surface
+		cbufs := make([]surface, d[0])
 		var surfs [1 + maxColorBufs]*object
 		for i := 0; i < int(d[0]); i++ {
 			o, err := c.surfaceOrNil(d[2+i])
@@ -750,7 +735,7 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 			return err
 		}
 		surfs[0] = zs
-		var zsbuf C.struct_ttc_virgl_surface
+		var zsbuf surface
 		attached := zs != nil
 		if zs != nil {
 			zsbuf = zs.surf
@@ -758,8 +743,8 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		for _, cb := range cbufs {
 			attached = attached || cb.res != nil
 		}
-		// Zink keeps references to the framebuffer's resources.
-		if err := errnoErr(C.ttc_virgl_set_framebuffer(pipe, C.uint32_t(d[0]), &cbufs[0], &zsbuf)); err != nil {
+		// The backend keeps references to the framebuffer's resources.
+		if err := pipe.setFramebuffer(cbufs, zsbuf); err != nil {
 			return err
 		}
 		sub.fbAttached = attached
@@ -779,8 +764,7 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		if sub.fbAttached {
 			return nil
 		}
-		if err := errnoErr(C.ttc_virgl_set_framebuffer_no_attach(pipe, C.uint32_t(d[0]&0xffff), C.uint32_t(d[0]>>16),
-			C.uint32_t(d[1]&0xffff), C.uint32_t((d[1]>>16)&0xff))); err != nil {
+		if err := pipe.setFramebufferNoAttach(d[0]&0xffff, d[0]>>16, d[1]&0xffff, (d[1]>>16)&0xff); err != nil {
 			return err
 		}
 		sub.fbNoAttach = []uint32{d[0], d[1]}
@@ -837,7 +821,7 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		}
 		// The constants take the slot of uniform buffer 0.
 		old := sub.hold(slot{slotConstantBuffer, d[0], 0}, nil)
-		C.ttc_virgl_set_constants(pipe, C.uint32_t(d[0]), ptr(d[2:]), C.uint32_t(n-2))
+		pipe.setConstants(d[0], d[2:])
 		release(old)
 		delete(sub.ranges, slot{slotConstantBuffer, d[0], 0})
 		sub.constants[d[0]] = append(sub.constants[d[0]][:0], d[2:]...)
@@ -852,8 +836,7 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 			return err
 		}
 		old := sub.hold(slot{slotConstantBuffer, d[0], d[1]}, r)
-		if err := errnoErr(C.ttc_virgl_set_uniform_buffer(pipe, C.uint32_t(d[0]), C.uint32_t(d[1]), pipeOf(r),
-			C.uint32_t(d[2]), C.uint32_t(d[3]))); err != nil {
+		if err := pipe.setUniformBuffer(d[0], d[1], resOf(r), d[2], d[3]); err != nil {
 			sub.unhold(slotConstantBuffer, d[0], d[1], []*Resource{old})
 			return err
 		}
@@ -872,8 +855,8 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		if count > maxSamplerViews || d[1] > maxSamplerViews-count {
 			return fmt.Errorf("sampler views %d+%d", d[1], count)
 		}
-		// Zink keeps references to the views that it binds.
-		views := make([]*C.struct_pipe_sampler_view, count+1)
+		// The backend keeps references to the views that it binds.
+		views := make([]any, count)
 		objs := make([]*object, count)
 		for i := uint32(0); i < count; i++ {
 			o, err := c.lookup(d[2+i], objectSamplerView)
@@ -881,9 +864,9 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 				return err
 			}
 			objs[i] = o
-			views[i] = (*C.struct_pipe_sampler_view)(objPtr(o))
+			views[i] = objOf(o)
 		}
-		C.ttc_virgl_set_sampler_views(pipe, C.uint32_t(d[0]), C.uint32_t(d[1]), C.uint32_t(count), &views[0])
+		pipe.setSamplerViews(d[0], d[1], views)
 		for i, o := range objs {
 			c.rebind(sub, &sub.views[d[0]][d[1]+uint32(i)], o)
 		}
@@ -898,16 +881,16 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 			return fmt.Errorf("samplers %d+%d", d[1], count)
 		}
 		objs := make([]*object, count)
-		states := make([]unsafe.Pointer, count+1)
+		states := make([]any, count)
 		for i := uint32(0); i < count; i++ {
 			o, err := c.lookup(d[2+i], objectSamplerState)
 			if err != nil {
 				return err
 			}
 			objs[i] = o
-			states[i] = objPtr(o)
+			states[i] = objOf(o)
 		}
-		C.ttc_virgl_bind_samplers(pipe, C.uint32_t(d[0]), C.uint32_t(d[1]), C.uint32_t(count), &states[0])
+		pipe.bindSamplers(d[0], d[1], states)
 		for i, o := range objs {
 			c.rebind(sub, &sub.samplers[d[0]][d[1]+uint32(i)], o)
 		}
@@ -917,7 +900,7 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		if n != 1 {
 			return errLen(n)
 		}
-		C.ttc_virgl_set_stencil_ref(pipe, C.uint32_t(d[0]))
+		pipe.setStencilRef(d[0])
 		sub.scalars[cmd] = append(sub.scalars[cmd][:0], d...)
 		return nil
 
@@ -925,7 +908,7 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		if n != 4 {
 			return errLen(n)
 		}
-		C.ttc_virgl_set_blend_color(pipe, ptr(d))
+		pipe.setBlendColor(d)
 		sub.scalars[cmd] = append(sub.scalars[cmd][:0], d...)
 		return nil
 
@@ -933,7 +916,7 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		if n != 32 {
 			return errLen(n)
 		}
-		C.ttc_virgl_set_polygon_stipple(pipe, ptr(d))
+		pipe.setPolygonStipple(d)
 		sub.scalars[cmd] = append(sub.scalars[cmd][:0], d...)
 		return nil
 
@@ -941,7 +924,7 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		if n != 32 {
 			return errLen(n)
 		}
-		C.ttc_virgl_set_clip_state(pipe, ptr(d))
+		pipe.setClipState(d)
 		sub.scalars[cmd] = append(sub.scalars[cmd][:0], d...)
 		return nil
 
@@ -949,7 +932,7 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		if n != 1 {
 			return errLen(n)
 		}
-		C.ttc_virgl_set_sample_mask(pipe, C.uint32_t(d[0]))
+		pipe.setSampleMask(d[0])
 		sub.scalars[cmd] = append(sub.scalars[cmd][:0], d...)
 		return nil
 
@@ -957,7 +940,7 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		if n != 1 {
 			return errLen(n)
 		}
-		C.ttc_virgl_set_min_samples(pipe, C.uint32_t(d[0]))
+		pipe.setMinSamples(d[0])
 		sub.scalars[cmd] = append(sub.scalars[cmd][:0], d...)
 		return nil
 
@@ -965,7 +948,7 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		if n != 6 {
 			return errLen(n)
 		}
-		C.ttc_virgl_set_tess_state(pipe, ptr(d))
+		pipe.setTessState(d)
 		sub.scalars[cmd] = append(sub.scalars[cmd][:0], d...)
 		return nil
 
@@ -985,14 +968,13 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 			return err
 		}
 		old := c.holdRange(slotShaderBuffer, d[0], d[1], res)
-		if err := errnoErr(C.ttc_virgl_set_shader_buffers(pipe, C.uint32_t(d[0]), C.uint32_t(d[1]), C.uint32_t(count),
-			pipes(res), &offsets[0], &sizes[0])); err != nil {
+		if err := pipe.setShaderBuffers(d[0], d[1], resOfs(res), offsets, sizes); err != nil {
 			sub.unhold(slotShaderBuffer, d[0], d[1], old)
 			return err
 		}
 		release(old...)
 		for i, r := range res {
-			sub.setRange(slot{slotShaderBuffer, d[0], d[1] + uint32(i)}, r, uint32(offsets[i]), uint32(sizes[i]))
+			sub.setRange(slot{slotShaderBuffer, d[0], d[1] + uint32(i)}, r, offsets[i], sizes[i])
 		}
 		return nil
 
@@ -1012,13 +994,13 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 			return err
 		}
 		old := c.holdRange(slotAtomicBuffer, 0, d[0], res)
-		if err := errnoErr(C.ttc_virgl_set_atomic_buffers(pipe, C.uint32_t(d[0]), C.uint32_t(count), pipes(res), &offsets[0], &sizes[0])); err != nil {
+		if err := pipe.setAtomicBuffers(d[0], resOfs(res), offsets, sizes); err != nil {
 			sub.unhold(slotAtomicBuffer, 0, d[0], old)
 			return err
 		}
 		release(old...)
 		for i, r := range res {
-			sub.setRange(slot{slotAtomicBuffer, 0, d[0] + uint32(i)}, r, uint32(offsets[i]), uint32(sizes[i]))
+			sub.setRange(slot{slotAtomicBuffer, 0, d[0] + uint32(i)}, r, offsets[i], sizes[i])
 		}
 		return nil
 
@@ -1042,7 +1024,7 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 			res[i] = r
 		}
 		old := c.holdRange(slotShaderImage, d[0], d[1], res)
-		if err := errnoErr(C.ttc_virgl_set_shader_images(pipe, C.uint32_t(d[0]), C.uint32_t(d[1]), C.uint32_t(count), pipes(res), ptr(d[2:]))); err != nil {
+		if err := pipe.setShaderImages(d[0], d[1], resOfs(res), d[2:]); err != nil {
 			sub.unhold(slotShaderImage, d[0], d[1], old)
 			return err
 		}
@@ -1087,7 +1069,7 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 			// OpenGL conditions rendering on occlusion queries.
 			return fmt.Errorf("a render condition of mode %d", d[2])
 		}
-		C.ttc_virgl_render_condition(pipe, (*C.struct_pipe_query)(objPtr(o)), C.bool(d[1]&1 != 0), C.uint32_t(d[2]))
+		pipe.renderCondition(objOf(o), d[1]&1 != 0, d[2])
 		c.rebind(sub, &sub.cond, o)
 		sub.condition = [2]uint32{d[1], d[2]}
 		return nil
@@ -1096,7 +1078,7 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		if n != 8 {
 			return errLen(n)
 		}
-		C.ttc_virgl_clear(pipe, ptr(d))
+		pipe.clear(d)
 		return nil
 
 	case cmdClearTexture:
@@ -1107,7 +1089,7 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		if err != nil {
 			return err
 		}
-		return errnoErr(C.ttc_virgl_clear_texture(pipe, r.pipe, ptr(d)))
+		return pipe.clearTexture(r.res, d)
 
 	case cmdClearSurface:
 		if n != 10 {
@@ -1117,7 +1099,7 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		if err != nil {
 			return err
 		}
-		return errnoErr(C.ttc_virgl_clear_surface(pipe, &o.surf, ptr(d)))
+		return pipe.clearSurface(o.surf, d)
 
 	case cmdDrawVBO:
 		return c.draw(d)
@@ -1134,7 +1116,7 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		if err != nil {
 			return err
 		}
-		return errnoErr(C.ttc_virgl_blit(pipe, dst.pipe, src.pipe, ptr(d)))
+		return pipe.blit(dst.res, src.res, d)
 
 	case cmdResourceCopyRegion:
 		if n != 13 {
@@ -1148,7 +1130,7 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		if err != nil {
 			return err
 		}
-		return errnoErr(C.ttc_virgl_copy_region(pipe, dst.pipe, src.pipe, ptr(d)))
+		return pipe.copyRegion(dst.res, src.res, d)
 
 	case cmdResourceInlineWrite:
 		if n < 12 {
@@ -1159,7 +1141,7 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 			return err
 		}
 		data := d[11:]
-		return errnoErr(C.ttc_virgl_inline_write(pipe, r.pipe, ptr(d), (*C.uint8_t)(unsafe.Pointer(&data[0])), C.uint32_t(4*len(data))))
+		return pipe.inlineWrite(r.res, d, unsafe.Slice((*byte)(unsafe.Pointer(&data[0])), 4*len(data)))
 
 	case cmdTransfer3D:
 		if n < 13 {
@@ -1194,10 +1176,10 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		case o.counted:
 			delete(sub.countedQueries, o)
 		case cmd == cmdBeginQuery:
-			C.ttc_virgl_begin_query(pipe, (*C.struct_pipe_query)(o.ptr))
+			pipe.beginQuery(o.obj)
 			o.active = true
 		default:
-			C.ttc_virgl_end_query(pipe, (*C.struct_pipe_query)(o.ptr))
+			pipe.endQuery(o.obj)
 			o.active = false
 		}
 		return nil
@@ -1242,8 +1224,7 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		if o.counted {
 			return c.countedResultQBO(o, qbo, d[3], d[4], int32(d[5]))
 		}
-		return errnoErr(C.ttc_virgl_query_result_qbo(pipe, (*C.struct_pipe_query)(o.ptr), qbo.pipe, C.bool(d[2] != 0),
-			C.uint32_t(d[3]), C.uint32_t(d[4]), C.int32_t(d[5])))
+		return pipe.queryResultQBO(o.obj, qbo.res, d[2] != 0, d[3], d[4], int32(d[5]))
 
 	case cmdSetSubCtx, cmdCreateSubCtx, cmdDestroySubCtx:
 		if n != 1 {
@@ -1263,7 +1244,7 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 			return fmt.Errorf("binding a shader of stage %d to stage %d", o.stage, d[1])
 		}
 		if d[1] != stageVertex {
-			C.ttc_virgl_bind_shader(pipe, C.uint32_t(d[1]), objPtr(o))
+			pipe.bindShader(d[1], objOf(o))
 		}
 		c.rebind(sub, &sub.shaders[d[1]], o)
 		return nil
@@ -1272,14 +1253,14 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 		if n != 1 {
 			return errLen(n)
 		}
-		C.ttc_virgl_memory_barrier(pipe, C.uint32_t(d[0]))
+		pipe.memoryBarrier(d[0])
 		return nil
 
 	case cmdTextureBarrier:
 		if n != 1 {
 			return errLen(n)
 		}
-		C.ttc_virgl_texture_barrier(pipe, C.uint32_t(d[0]))
+		pipe.textureBarrier(d[0])
 		return nil
 
 	case cmdLaunchGrid:
@@ -1294,7 +1275,7 @@ func (c *Context) execute(cmd, obj uint32, d []uint32) error {
 			// Like virglrenderer, drop work without a shader.
 			return nil
 		}
-		return errnoErr(C.ttc_virgl_launch_grid(pipe, ptr(d), pipeOf(r)))
+		return pipe.launchGrid(d, resOf(r))
 	}
 	return fmt.Errorf("unsupported command %d", cmd)
 }
@@ -1309,18 +1290,18 @@ func (c *Context) holdRange(kind, stage, start uint32, res []*Resource) []*Resou
 	return old
 }
 
-func (c *Context) buffers(d []uint32, count uint32) ([]*Resource, []C.uint32_t, []C.uint32_t, error) {
+func (c *Context) buffers(d []uint32, count uint32) ([]*Resource, []uint32, []uint32, error) {
 	res := make([]*Resource, count)
-	offsets := make([]C.uint32_t, count)
-	sizes := make([]C.uint32_t, count)
+	offsets := make([]uint32, count)
+	sizes := make([]uint32, count)
 	for i := uint32(0); i < count; i++ {
 		r, err := c.resource(d[3*i+2])
 		if err != nil {
 			return nil, nil, nil, err
 		}
 		res[i] = r
-		offsets[i] = C.uint32_t(d[3*i])
-		sizes[i] = C.uint32_t(d[3*i+1])
+		offsets[i] = d[3*i]
+		sizes[i] = d[3*i+1]
 	}
 	return res, offsets, sizes, nil
 }
@@ -1363,7 +1344,7 @@ func (c *Context) draw(d []uint32) error {
 	sub := c.sub
 	if sub.velems == nil || sub.shaders[0] == nil || sub.shaders[1] == nil {
 		// Like virglrenderer, drop draws without vertex elements or vertex
-		// and fragment shaders, which Zink cannot draw without.
+		// and fragment shaders, which the backend cannot draw without.
 		return nil
 	}
 	for i := 0; i < len(sub.velems.elements)/4; i++ {
@@ -1383,7 +1364,7 @@ func (c *Context) draw(d []uint32) error {
 		d = append([]uint32(nil), d...)
 		d[0], d[1], d[11] = 0, o.soVerts, 0
 	}
-	var draw C.struct_ttc_virgl_draw
+	var args drawArgs
 	if d[3] != 0 {
 		ib := sub.ib
 		if ib == nil {
@@ -1394,9 +1375,7 @@ func (c *Context) draw(d []uint32) error {
 		default:
 			return fmt.Errorf("index size %d", sub.ibSize)
 		}
-		draw.index = ib.pipe
-		draw.index_size = C.uint32_t(sub.ibSize)
-		draw.index_offset = C.uint32_t(sub.ibOffset)
+		args.index, args.indexSize, args.indexOffset = ib.res, sub.ibSize, sub.ibOffset
 	}
 	if n == 20 && d[14] != 0 {
 		r, err := c.mustResource(d[14])
@@ -1407,10 +1386,9 @@ func (c *Context) draw(d []uint32) error {
 		if err != nil {
 			return err
 		}
-		draw.indirect = r.pipe
-		draw.indirect_count = pipeOf(count)
+		args.indirect, args.indirectCount = r.res, resOf(count)
 	}
-	indirect := draw.indirect != nil
+	indirect := args.indirect != nil
 	cp := c.prepareCapture(d[2], d[0], d[1], d[4], d[3] != 0, indirect)
 	if err := c.bindVertexState(); err != nil {
 		return err
@@ -1419,20 +1397,20 @@ func (c *Context) draw(d []uint32) error {
 		return err
 	}
 	if cp != nil {
-		var res [maxStreamoutTargets]*C.struct_pipe_resource
+		targets := make([]backendResource, maxStreamoutTargets)
 		old := make([]*Resource, maxStreamoutTargets)
-		for b := range res {
+		for b := range targets {
 			var r *Resource
 			if cp.strides[b] != 0 {
 				r = sub.soTargets[b].res
 			}
-			res[b] = pipeOf(r)
+			targets[b] = resOf(r)
 			old[b] = sub.hold(slot{slotShaderBuffer, stageVertex, xfbSSBO + uint32(b)}, r)
 		}
-		C.ttc_virgl_set_xfb(sub.pipe, ptr(cp.params[:]), &res[0])
+		sub.pipe.setXfb(cp.params[:], targets)
 		release(old...)
 	}
-	if err := errnoErr(C.ttc_virgl_draw(sub.pipe, ptr(d), C.uint32_t(n), &draw)); err != nil {
+	if err := sub.pipe.draw(d, args); err != nil {
 		return err
 	}
 	c.countDraw(d[2], d[1], d[4], indirect, d, cp)
@@ -1663,11 +1641,11 @@ func (c *Context) countedResultQBO(o *object, qbo *Resource, resultType, offset 
 	default:
 		return fmt.Errorf("query result type %d", resultType)
 	}
-	width := uint32(C.ttc_virgl_resource_width(qbo.pipe, 0))
-	if C.ttc_virgl_resource_target(qbo.pipe) != targetBuffer || offset > width || size > width-offset {
+	width := qbo.res.width(0)
+	if qbo.res.target() != targetBuffer || offset > width || size > width-offset {
 		return fmt.Errorf("a query result at %d of resource %d", offset, qbo.id)
 	}
-	C.ttc_virgl_buffer_write(c.sub.pipe, qbo.pipe, C.uint32_t(offset), unsafe.Pointer(&b[0]), C.uint32_t(size))
+	c.sub.pipe.bufferWrite(qbo.res, offset, b[:size])
 	return nil
 }
 
@@ -1678,25 +1656,25 @@ func (c *Context) bindVertexState() error {
 	sub := c.sub
 	o := sub.velems
 	var key strings.Builder
-	var strides [maxVertexBuffers]C.uint32_t
+	var strides [maxVertexBuffers]uint32
 	for i := 0; i < len(o.elements)/4; i++ {
 		vb := o.elements[4*i+2]
 		if vb >= maxVertexBuffers {
 			return fmt.Errorf("vertex buffer %d", vb)
 		}
-		strides[vb] = C.uint32_t(sub.vbs[vb].stride)
+		strides[vb] = uint32(sub.vbs[vb].stride)
 		fmt.Fprintf(&key, "%d:%d,", vb, sub.vbs[vb].stride)
 	}
 	cso := o.csos[key.String()]
 	if cso == nil {
-		cso = C.ttc_virgl_create_vertex_elements(sub.pipe, ptr(o.elements), C.uint32_t(len(o.elements)/4), &strides[0])
+		cso = sub.pipe.createVertexElements(o.elements, strides[:])
 		if cso == nil {
-			return errors.New("Zink refused vertex elements")
+			return errors.New("the backend refused vertex elements")
 		}
 		o.csos[key.String()] = cso
 	}
 	if cso != sub.velemsCSO {
-		C.ttc_virgl_bind_object(sub.pipe, objectVertexElements, cso)
+		sub.pipe.bindObject(objectVertexElements, cso)
 		sub.velemsCSO = cso
 		c.rebind(sub, &sub.velemsBound, o)
 		sub.vbsDirty = true
@@ -1706,8 +1684,8 @@ func (c *Context) bindVertexState() error {
 	}
 	// Zink replaces the buffers of the slots below the count, and holds
 	// the others' until a later call replaces them.
-	var res [maxVertexBuffers]*C.struct_pipe_resource
-	var offsets [maxVertexBuffers]C.uint32_t
+	res := make([]backendResource, sub.numVBs)
+	offsets := make([]uint32, sub.numVBs)
 	old := make([]*Resource, sub.numVBs)
 	for i := 0; i < sub.numVBs; i++ {
 		vb := sub.vbs[i]
@@ -1716,14 +1694,14 @@ func (c *Context) bindVertexState() error {
 		// it, and, of buffers' addresses, of the size from the offset to
 		// the end, which an offset past it underflows, of which the GPU
 		// reads past the buffer: a slot of one has none, of zeros.
-		if r != nil && vb.offset >= uint32(C.ttc_virgl_resource_width(r.pipe, 0)) {
+		if r != nil && vb.offset >= r.res.width(0) {
 			r = nil
 		}
-		res[i] = pipeOf(r)
-		offsets[i] = C.uint32_t(vb.offset)
+		res[i] = resOf(r)
+		offsets[i] = vb.offset
 		old[i] = sub.hold(slot{slotVertexBuffer, 0, uint32(i)}, r)
 	}
-	C.ttc_virgl_set_vertex_buffers(sub.pipe, C.uint32_t(sub.numVBs), &res[0], &offsets[0])
+	sub.pipe.setVertexBuffers(res, offsets)
 	release(old...)
 	sub.vbsDirty = false
 	return nil
@@ -1746,30 +1724,30 @@ func (c *Context) createObject(typ uint32, d []uint32) error {
 		if n != 11 {
 			return errLen(n)
 		}
-		o.ptr = C.ttc_virgl_create_blend(pipe, ptr(d))
+		o.obj = pipe.createBlend(d)
 	case objectRasterizer:
 		if n != 9 {
 			return errLen(n)
 		}
-		o.ptr = C.ttc_virgl_create_rasterizer(pipe, ptr(d))
+		o.obj = pipe.createRasterizer(d)
 	case objectDSA:
 		if n != 5 {
 			return errLen(n)
 		}
-		o.ptr = C.ttc_virgl_create_dsa(pipe, ptr(d))
+		o.obj = pipe.createDSA(d)
 	case objectSamplerState:
 		if n != 9 {
 			return errLen(n)
 		}
-		o.ptr = C.ttc_virgl_create_sampler_state(pipe, ptr(d))
+		o.obj = pipe.createSamplerState(d)
 	case objectVertexElements:
 		if (n-1)%4 != 0 || (n-1)/4 > maxVertexElements {
 			return errLen(n)
 		}
 		o.elements = append([]uint32(nil), d[1:]...)
-		o.csos = make(map[string]unsafe.Pointer)
+		o.csos = make(map[string]any)
 		for i := 0; i < len(o.elements)/4; i++ {
-			switch C.ttc_virgl_format_int_class(C.uint32_t(o.elements[4*i+3])) {
+			switch be.formatIntClass(o.elements[4*i+3]) {
 			case 1:
 				o.sintMask |= 1 << i
 			case 2:
@@ -1784,18 +1762,18 @@ func (c *Context) createObject(typ uint32, d []uint32) error {
 		if err != nil {
 			return err
 		}
-		if C.ttc_virgl_check_surface(r.pipe, C.uint32_t(d[2]), C.uint32_t(d[3]), C.uint32_t(d[4])) != 0 {
+		if err := r.res.checkSurface(d[2], d[3], d[4]); err != nil {
 			return fmt.Errorf("a surface of resource %d: format %d, %#x, %#x", d[1], d[2], d[3], d[4])
 		}
 		r.incRef()
 		o.res = r
-		o.surf = C.struct_ttc_virgl_surface{res: r.pipe, format: C.uint32_t(d[2]), val0: C.uint32_t(d[3]), val1: C.uint32_t(d[4])}
+		o.surf = surface{res: r.res, format: d[2], val0: d[3], val1: d[4]}
 		if typ == objectMSAASurface {
 			if d[5] > 32 || d[5]&(d[5]-1) != 0 {
 				r.DecRef()
 				return fmt.Errorf("a surface of %d samples", d[5])
 			}
-			o.surf.nr_samples = C.uint32_t(d[5])
+			o.surf.nrSamples = d[5]
 		}
 	case objectSamplerView:
 		if n != 6 {
@@ -1805,9 +1783,8 @@ func (c *Context) createObject(typ uint32, d []uint32) error {
 		if err != nil {
 			return err
 		}
-		o.ptr = unsafe.Pointer(C.ttc_virgl_create_sampler_view(pipe, r.pipe, C.uint32_t(d[2]&0xffffff),
-			C.uint32_t(d[2]>>24), C.uint32_t(d[3]), C.uint32_t(d[4]), C.uint32_t(d[5])))
-		if o.ptr != nil {
+		o.obj = pipe.createSamplerView(r.res, d[2]&0xffffff, d[2]>>24, d[3], d[4], d[5])
+		if o.obj != nil {
 			r.incRef()
 			o.res = r
 		}
@@ -1824,13 +1801,13 @@ func (c *Context) createObject(typ uint32, d []uint32) error {
 		}
 		o.qtype = d[1] & 0xffff
 		if xfbEmulated && countedQuery(o.qtype) {
-			// Queries that Zink, which has no transform feedback here,
+			// Queries that the backend, which has no transform feedback,
 			// cannot answer: the renderer counts their primitives itself.
 			o.counted = true
 		} else {
-			o.ptr = unsafe.Pointer(C.ttc_virgl_create_query(pipe, C.uint32_t(o.qtype), C.uint32_t(d[1]>>16)))
+			o.obj = pipe.createQuery(o.qtype, d[1]>>16)
 		}
-		if o.ptr != nil || o.counted {
+		if o.obj != nil || o.counted {
 			r.incRef()
 			o.res = r
 			o.sub = sub
@@ -1846,8 +1823,8 @@ func (c *Context) createObject(typ uint32, d []uint32) error {
 		if !xfbEmulated {
 			return errors.New("no transform feedback")
 		}
-		width := uint32(C.ttc_virgl_resource_width(r.pipe, 0))
-		if C.ttc_virgl_resource_target(r.pipe) != targetBuffer || d[2] > width || d[3] > width-d[2] || d[2]%4 != 0 {
+		width := r.res.width(0)
+		if r.res.target() != targetBuffer || d[2] > width || d[3] > width-d[2] || d[2]%4 != 0 {
 			return fmt.Errorf("a stream output target at %d, of %d bytes, of resource %d", d[2], d[3], d[1])
 		}
 		r.incRef()
@@ -1856,8 +1833,8 @@ func (c *Context) createObject(typ uint32, d []uint32) error {
 	default:
 		return fmt.Errorf("creating object type %d", typ)
 	}
-	if o.ptr == nil && typ != objectSurface && typ != objectMSAASurface && !o.renderers() {
-		return fmt.Errorf("Zink refused object %d of type %d", h, typ)
+	if o.obj == nil && typ != objectSurface && typ != objectMSAASurface && !o.renderers() {
+		return fmt.Errorf("the backend refused object %d of type %d", h, typ)
 	}
 	switch typ {
 	case objectBlend, objectRasterizer, objectDSA, objectSamplerState, objectSamplerView, objectQuery:
@@ -1900,7 +1877,7 @@ func (c *Context) createShader(d []uint32) error {
 	if offlen&shaderOffsetContinuation != 0 {
 		o = sub.objects[h]
 		off := offlen & shaderOffsetMask
-		if o == nil || o.typ != objectShader || o.ptr != nil || o.text == nil || off != o.filled {
+		if o == nil || o.typ != objectShader || o.obj != nil || o.text == nil || off != o.filled {
 			return fmt.Errorf("shader %d continues at %d", h, off)
 		}
 	} else {
@@ -1921,24 +1898,21 @@ func (c *Context) createShader(d []uint32) error {
 		text = text[:i]
 	}
 	o.text = nil
-	ctext := C.CString(text)
-	defer C.free(unsafe.Pointer(ctext))
-	var errBuf [256]C.char
-	tgsi := C.ttc_virgl_translate_tgsi(ctext, C.uint32_t(o.numTokens), &errBuf[0], C.uint32_t(len(errBuf)))
-	if tgsi != nil {
-		o.ptr = C.ttc_virgl_create_shader(sub.pipe, C.uint32_t(o.stage), tgsi, ptr(o.so), C.uint32_t(len(o.so)),
-			C.uint32_t(o.shared), 0, 0, false, &errBuf[0], C.uint32_t(len(errBuf)))
+	code, err := be.parseShader(text, o.numTokens)
+	if err == nil {
+		if o.obj, err = sub.pipe.createShader(o.stage, code, o.so, o.shared, 0, 0, false); err != nil {
+			code.free()
+		}
 	}
-	if o.ptr == nil {
-		C.ttc_virgl_free_tokens(tgsi)
+	if err != nil {
 		delete(sub.objects, h)
-		return fmt.Errorf("shader %d: %s", h, C.GoString(&errBuf[0]))
+		return fmt.Errorf("shader %d: %w", h, err)
 	}
-	o.tokens = tgsi
+	o.code = code
 	if o.stage == stageVertex {
 		// Draws bind the vertex shader's variant of the vertex elements'
 		// types.
-		o.variants = map[variantKey]unsafe.Pointer{{}: o.ptr}
+		o.variants = map[variantKey]any{{}: o.obj}
 	}
 	return nil
 }
@@ -1960,16 +1934,14 @@ func (c *Context) bindVertexShader(xfb bool) error {
 	key := variantKey{ve.sintMask, ve.uintMask, xfb}
 	v := vs.variants[key]
 	if v == nil {
-		var errBuf [256]C.char
-		v = C.ttc_virgl_create_shader(sub.pipe, stageVertex, vs.tokens, ptr(vs.so), C.uint32_t(len(vs.so)), 0,
-			C.uint32_t(ve.sintMask), C.uint32_t(ve.uintMask), C.bool(xfb), &errBuf[0], C.uint32_t(len(errBuf)))
-		if v == nil {
-			return fmt.Errorf("a vertex shader of integer inputs %#x and %#x: %s", ve.sintMask, ve.uintMask, C.GoString(&errBuf[0]))
+		var err error
+		if v, err = sub.pipe.createShader(stageVertex, vs.code, vs.so, 0, ve.sintMask, ve.uintMask, xfb); err != nil {
+			return fmt.Errorf("a vertex shader of integer inputs %#x and %#x: %w", ve.sintMask, ve.uintMask, err)
 		}
 		vs.variants[key] = v
 	}
 	if v != sub.vsCSO {
-		C.ttc_virgl_bind_shader(sub.pipe, stageVertex, v)
+		sub.pipe.bindShader(stageVertex, v)
 		sub.vsCSO = v
 		c.rebind(sub, &sub.vsBound, vs)
 	}
@@ -1980,7 +1952,7 @@ func (c *Context) bindVertexShader(xfb bool) error {
 // resource if it is ready, and reports whether it did.
 func (c *Context) queryResultLocked(o *object) bool {
 	var state [queryStateSize]byte
-	if !C.ttc_virgl_query_result(o.sub.pipe, (*C.struct_pipe_query)(o.ptr), C.uint32_t(o.qtype), false, unsafe.Pointer(&state[0])) {
+	if !o.sub.pipe.queryResult(o.obj, o.qtype, false, state[:]) {
 		return false
 	}
 	copy(o.res.backing, state[:])

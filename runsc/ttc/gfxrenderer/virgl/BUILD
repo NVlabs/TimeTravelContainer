@@ -11,6 +11,7 @@ package(
 go_library(
     name = "virgl",
     srcs = [
+        "backend.go",
         "clone_unsafe.go",
         "context_unsafe.go",
         "formats.c",
@@ -25,6 +26,7 @@ go_library(
         "virgl_int.h",
         "virgl_other.go",
         "virgl_unsafe.go",
+        "zink_unsafe.go",
     ],
     # The renderer links Zink (see tools/mesa/README.md): on macOS, on the
     # MoltenVK that the Venus renderer links; on Linux, on the host's Vulkan

@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
-	"unsafe"
 )
 
 // The protocol's numbers in protocol.go are virgl_protocol.h's: an index
@@ -37,6 +36,8 @@ var (
 var (
 	initOnce sync.Once
 	initErr  error
+	// be is the backend that the renderer renders with.
+	be backend
 
 	// xfbEmulated is whether the renderer emulates transform feedback,
 	// which Zink has none of here, and xfbSSBO the vertex shader's first
@@ -45,17 +46,14 @@ var (
 	xfbSSBO     uint32
 )
 
-// Init creates the process's Zink screen, on the Vulkan that the renderer
-// links, if it has not.
+// Init creates the process's backend, if it has not: Zink's screen, on the
+// Vulkan that the renderer links.
 func Init() error {
 	initOnce.Do(func() {
-		if C.ttc_virgl_init() != 0 {
-			initErr = errors.New("Zink found no usable Vulkan device")
+		if be, initErr = initZink(); initErr != nil {
 			return
 		}
-		var ssbo C.uint32_t
-		xfbEmulated = bool(C.ttc_virgl_xfb(&ssbo))
-		xfbSSBO = uint32(ssbo)
+		xfbEmulated, xfbSSBO = be.xfb()
 	})
 	return initErr
 }
@@ -65,27 +63,27 @@ func Available() bool {
 	return true
 }
 
-// Capsets returns virgl's capability sets, of what Zink offers.
+// Capsets returns virgl's capability sets, of what the backend offers.
 func Capsets() ([]Capset, error) {
 	if err := Init(); err != nil {
 		return nil, err
 	}
 	v1 := make([]byte, C.sizeof_struct_virgl_caps_v1)
-	C.ttc_virgl_fill_caps(CapsetVirgl, unsafe.Pointer(&v1[0]), C.uint32_t(len(v1)))
+	be.fillCaps(CapsetVirgl, v1)
 	v2 := make([]byte, C.sizeof_struct_virgl_caps_v2)
-	C.ttc_virgl_fill_caps(CapsetVirgl2, unsafe.Pointer(&v2[0]), C.uint32_t(len(v2)))
+	be.fillCaps(CapsetVirgl2, v2)
 	return []Capset{
 		{ID: CapsetVirgl, MaxVersion: 1, Data: v1},
 		{ID: CapsetVirgl2, MaxVersion: 2, Data: v2},
 	}, nil
 }
 
-// Resource is a guest's classic resource: a Gallium resource of Zink's, and
-// the guest's memory of it, which transfers copy to and from.
+// Resource is a guest's classic resource: the backend's resource, and the
+// guest's memory of it, which transfers copy to and from.
 type Resource struct {
 	id      uint32
 	args    ResourceArgs
-	pipe    *C.struct_pipe_resource
+	res     backendResource
 	backing []byte
 	release func()
 	refs    atomic.Int32
@@ -97,13 +95,11 @@ func NewResource(id uint32, a ResourceArgs, backing []byte, release func()) (*Re
 	if err := Init(); err != nil {
 		return nil, err
 	}
-	p := C.ttc_virgl_resource_create(C.uint32_t(a.Target), C.uint32_t(a.Format), C.uint32_t(a.Bind),
-		C.uint32_t(a.Width), C.uint32_t(a.Height), C.uint32_t(a.Depth), C.uint32_t(a.ArraySize),
-		C.uint32_t(a.LastLevel), C.uint32_t(a.NrSamples), C.uint32_t(a.Flags))
-	if p == nil {
-		return nil, fmt.Errorf("Zink refused resource %d %+v", id, a)
+	res, err := be.newResource(a)
+	if err != nil {
+		return nil, fmt.Errorf("resource %d %+v: %w", id, a, err)
 	}
-	r := &Resource{id: id, args: a, pipe: p, backing: backing, release: release}
+	r := &Resource{id: id, args: a, res: res, backing: backing, release: release}
 	r.refs.Store(1)
 	return r, nil
 }
@@ -126,7 +122,7 @@ func (r *Resource) Clone(backing []byte, release func()) (*Resource, error) {
 		c.DecRef()
 		return nil, err
 	}
-	C.ttc_virgl_resource_copy(t.pipe, c.pipe, r.pipe)
+	t.pipe.copyResource(c.res, r.res)
 	return c, nil
 }
 
@@ -155,35 +151,31 @@ func (r *Resource) DecRef() {
 	if r.refs.Add(-1) != 0 {
 		return
 	}
-	C.ttc_virgl_resource_unref(r.pipe)
-	r.pipe = nil
+	r.res.unref()
+	r.res = nil
 	if r.release != nil {
 		r.release()
 	}
 }
 
-func transfer(pipe *C.struct_pipe_context, r *Resource, a TransferArgs) error {
+func transfer(pipe backendContext, r *Resource, a TransferArgs) error {
 	if len(r.backing) == 0 {
 		return errors.New("no memory")
 	}
-	errno := C.ttc_virgl_transfer(pipe, r.pipe, C.bool(a.ToHost), C.uint32_t(a.Level),
-		C.int32_t(a.X), C.int32_t(a.Y), C.int32_t(a.Z), C.int32_t(a.W), C.int32_t(a.H), C.int32_t(a.D),
-		(*C.uint8_t)(unsafe.Pointer(&r.backing[0])), C.uint64_t(len(r.backing)), C.uint64_t(a.Offset),
-		C.uint32_t(a.Stride), C.uint32_t(a.LayerStride))
-	if errno != 0 {
-		return fmt.Errorf("transferring resource %d %+v: errno %d", r.id, a, int(errno))
+	if err := pipe.transfer(r.res, a, r.backing); err != nil {
+		return fmt.Errorf("transferring resource %d %+v: %w", r.id, a, err)
 	}
 	return nil
 }
 
-// transferContext is the renderer's own Gallium context, for the transfers
+// transferContext is the renderer's own backend context, for the transfers
 // of no virgl context's, and the copies of clones.
 var transferContext ownContext
 
-// ownContext is a Gallium context of the renderer's own.
+// ownContext is a backend context of the renderer's own.
 type ownContext struct {
 	mu   sync.Mutex
-	pipe *C.struct_pipe_context
+	pipe backendContext
 }
 
 // createLocked creates the context if it has none.
@@ -191,9 +183,11 @@ type ownContext struct {
 // Preconditions: t.mu is locked.
 func (t *ownContext) createLocked() error {
 	if t.pipe == nil {
-		if t.pipe = C.ttc_virgl_context_create(); t.pipe == nil {
-			return errNoContext
+		pipe, err := be.newContext()
+		if err != nil {
+			return err
 		}
+		t.pipe = pipe
 	}
 	return nil
 }
@@ -209,7 +203,7 @@ func Transfer(r *Resource, a TransferArgs) error {
 	}
 	err := transfer(t.pipe, r, a)
 	// Contexts' later work follows the transfer on the GPU's queue.
-	C.ttc_virgl_flush_async(t.pipe)
+	t.pipe.flushAsync()
 	return err
 }
 
@@ -222,7 +216,7 @@ func Sync() {
 	if t.pipe == nil {
 		return
 	}
-	if h := C.ttc_virgl_flush(t.pipe); h != nil {
-		C.ttc_virgl_fence_wait(h)
+	if f := t.pipe.flush(); f != nil {
+		f.wait()
 	}
 }
