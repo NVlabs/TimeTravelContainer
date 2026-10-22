@@ -118,6 +118,14 @@ static bool box_ok(const struct pipe_resource *res, unsigned level, const struct
           span_ok(box->z, box->depth, d);
 }
 
+// blocks_ok reports whether box is of whole blocks of format, but at the
+// edges of a level of w by h, as Vulkan copies them.
+static bool blocks_ok(enum pipe_format format, const struct pipe_box *box, int64_t w, int64_t h) {
+   unsigned bw = util_format_get_blockwidth(format), bh = util_format_get_blockheight(format);
+   return box->x % bw == 0 && box->y % bh == 0 && (box->width % bw == 0 || box->x + box->width == w) &&
+          (box->height % bh == 0 || box->y + box->height == h);
+}
+
 static bool samples_ok(uint32_t n) {
    return n <= 32 && (n & (n - 1)) == 0;
 }
@@ -259,7 +267,10 @@ void ttc_virgl_resource_copy(struct pipe_context *pipe, struct pipe_resource *ds
 static int transfer(struct pipe_context *pipe, struct pipe_resource *res, bool to_host,
                     uint32_t level, const struct pipe_box *box, uint8_t *data, uint64_t size,
                     uint64_t offset, uint32_t stride, uint32_t layer_stride) {
-   if (box->width <= 0 || box->height <= 0 || box->depth <= 0 || !box_ok(res, level, box))
+   // Of no samples of multisampled textures, which Vulkan copies none of,
+   // and guests' Mesa resolves before it transfers them.
+   if (box->width <= 0 || box->height <= 0 || box->depth <= 0 || !box_ok(res, level, box) ||
+       res->nr_samples > 1)
       return EINVAL;
    if (res->target == PIPE_BUFFER) {
       if (offset > size || box->width > size - offset)
@@ -279,6 +290,8 @@ static int transfer(struct pipe_context *pipe, struct pipe_resource *res, bool t
    enum pipe_format format = res->format;
    int64_t lw, lh, ld;
    level_extent(res, level, &lw, &lh, &ld);
+   if (!blocks_ok(format, box, lw, lh))
+      return EINVAL;
    // Like virglrenderer, rows and layers of the level's size unless the
    // guest says otherwise.
    if (!stride)
@@ -1502,6 +1515,39 @@ int ttc_virgl_copy_region(struct pipe_context *pipe, struct pipe_resource *dst,
        util_format_get_num_planes(dst->format) != 1 || util_format_get_num_planes(src->format) != 1 ||
        dst->nr_samples != src->nr_samples)
       return EINVAL;
+   // What Vulkan copies: whole blocks, but at levels' edges, depth and
+   // stencil of one format, and images of one type, or 2D ones and 3D
+   // ones.
+   int64_t src_w, src_h, src_d, dst_w, dst_h, dst_d;
+   level_extent(src, d[6], &src_w, &src_h, &src_d);
+   level_extent(dst, d[1], &dst_w, &dst_h, &dst_d);
+   bool src_zs = util_format_is_depth_or_stencil(src->format);
+   bool src_1d = src->target == PIPE_TEXTURE_1D || src->target == PIPE_TEXTURE_1D_ARRAY;
+   bool dst_1d = dst->target == PIPE_TEXTURE_1D || dst->target == PIPE_TEXTURE_1D_ARRAY;
+   if (!blocks_ok(src->format, &box, src_w, src_h) || !blocks_ok(dst->format, &to, dst_w, dst_h) ||
+       src_zs != util_format_is_depth_or_stencil(dst->format) || (src_zs && src->format != dst->format) ||
+       src_1d != dst_1d)
+      return EINVAL;
+   if (!box.width || !box.height || !box.depth)
+      return 0;
+   if (src == dst && d[1] == d[6]) {
+      // Of a level to itself: Vulkan copies no regions that overlap, and
+      // a box to itself copies nothing.
+      if (to.x == box.x && to.y == box.y && to.z == box.z)
+         return 0;
+      if (to.x < box.x + box.width && box.x < to.x + to.width && to.y < box.y + box.height &&
+          box.y < to.y + to.height && to.z < box.z + box.depth && box.z < to.z + to.depth)
+         return EINVAL;
+   }
+   if (dst->target == PIPE_TEXTURE_3D && src->target != PIPE_TEXTURE_3D) {
+      // Zink copies layers to a 3D texture's slices as of one slice's
+      // depth, of which Vulkan copies a layer: a layer at a time.
+      struct pipe_box layer = box;
+      layer.depth = 1;
+      for (int i = 0; i < box.depth; i++, layer.z++)
+         pipe->resource_copy_region(pipe, dst, d[1], to.x, to.y, to.z + i, src, d[6], &layer);
+      return 0;
+   }
    // Of the destination's offsets, those checked: its box's z is 16 bits.
    pipe->resource_copy_region(pipe, dst, d[1], to.x, to.y, to.z, src, d[6], &box);
    return 0;

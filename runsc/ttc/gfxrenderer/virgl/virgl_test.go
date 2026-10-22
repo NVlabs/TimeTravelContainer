@@ -1050,6 +1050,132 @@ func TestTexture1DArrayLayers(t *testing.T) {
 	}
 }
 
+// Transfers and copies that Vulkan does not do are refused: of samples of
+// multisampled textures, which guests' Mesa resolves before it transfers
+// them, of parts of compressed blocks, between depth and colors, between
+// 1D and 2D textures, and between boxes that overlap; and copies of no
+// texels do nothing.
+func TestTransfersAndCopiesOfVulkan(t *testing.T) {
+	const (
+		target1D         = 1
+		formatR32Float   = 28
+		formatZ32Float   = 18
+		formatDXT1RGB    = 105
+		formatETC2RGB8   = 269
+		bindDepthStencil = 1 << 0
+	)
+	f := newFixture(t)
+	texture := func(id uint32, a ResourceArgs) *Resource {
+		t.Helper()
+		a.Depth, a.ArraySize = max(a.Depth, 1), max(a.ArraySize, 1)
+		r, err := NewResource(id, a, make([]byte, 4*a.Width*max(a.Height, 1)), nil)
+		if err != nil {
+			return nil
+		}
+		t.Cleanup(r.DecRef)
+		f.c.Attach(r)
+		return r
+	}
+	copyRegion := func(dst, src *Resource, x, w, h uint32) error {
+		var s stream
+		s.cmd(cmdResourceCopyRegion, 0, dst.ID(), 0, 0, 0, 0, src.ID(), 0, x, 0, 0, w, h, 1)
+		return f.c.Submit(s.bytes())
+	}
+	if ms := texture(5, ResourceArgs{Target: target2D, Format: formatR8G8B8A8Unorm, Bind: bindRenderTarget,
+		Width: 4, Height: 4, NrSamples: 4}); ms == nil {
+		t.Logf("no textures of 4 samples")
+	} else {
+		for _, toHost := range []bool{true, false} {
+			if err := f.c.Transfer(ms, TransferArgs{ToHost: toHost, W: 4, H: 4, D: 1}); err == nil {
+				t.Errorf("a transfer of a multisampled texture, to the host %v: no error", toHost)
+			}
+		}
+		var s stream
+		s.cmd(cmdResourceInlineWrite, 0, ms.ID(), 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0)
+		if err := f.c.Submit(s.bytes()); err == nil {
+			t.Errorf("an inline write of a multisampled texture: no error")
+		}
+	}
+	for _, format := range []uint32{formatETC2RGB8, formatDXT1RGB} {
+		if !sampled(t, format) {
+			continue
+		}
+		bc := texture(6, ResourceArgs{Target: target2D, Format: format, Bind: bindSamplerView, Width: 16, Height: 16})
+		bc2 := texture(7, ResourceArgs{Target: target2D, Format: format, Bind: bindSamplerView, Width: 16, Height: 16})
+		if err := f.c.Transfer(bc, TransferArgs{ToHost: true, X: 2, W: 4, H: 4, D: 1}); err == nil {
+			t.Errorf("a transfer of parts of blocks: no error")
+		}
+		if err := f.c.Transfer(bc, TransferArgs{ToHost: true, X: 12, W: 4, H: 4, D: 1}); err != nil {
+			t.Errorf("a transfer of a block: %v", err)
+		}
+		if err := copyRegion(bc2, bc, 2, 4, 4); err == nil {
+			t.Errorf("a copy of parts of blocks: no error")
+		}
+		break
+	}
+	depth := texture(8, ResourceArgs{Target: target2D, Format: formatZ32Float, Bind: bindDepthStencil, Width: 4, Height: 4})
+	r32 := texture(9, ResourceArgs{Target: target2D, Format: formatR32Float, Bind: bindSamplerView, Width: 4, Height: 4})
+	if depth != nil && r32 != nil {
+		if err := copyRegion(r32, depth, 0, 4, 4); err == nil {
+			t.Errorf("a copy of depth to colors: no error")
+		}
+	}
+	tex1D := texture(10, ResourceArgs{Target: target1D, Format: formatR8G8B8A8Unorm, Bind: bindSamplerView, Width: 4})
+	if err := copyRegion(f.rt, tex1D, 0, 4, 1); err == nil {
+		t.Errorf("a copy of a 1D texture to a 2D one: no error")
+	}
+	if err := copyRegion(f.rt, f.rt, 0, 0, 4); err != nil {
+		t.Errorf("a copy of no texels: %v", err)
+	}
+	if err := copyRegion(f.rt, f.rt, 1, 4, 4); err == nil {
+		t.Errorf("a copy of a box to a box that it overlaps: no error")
+	}
+	if err := copyRegion(f.rt, f.rt, 8, 4, 4); err != nil {
+		t.Errorf("a copy of a box to one of its texture's level: %v", err)
+	}
+}
+
+// A copy of an array's layers to a 3D texture's slices copies each layer
+// to its slice.
+func TestCopyLayersToSlices(t *testing.T) {
+	const target3D, target2DArray, layers = 3, 7, 3
+	f := newFixture(t)
+	texels := make([]byte, 4*4*4*layers)
+	for i := range texels {
+		texels[i] = byte(5*i + 1)
+	}
+	slicesMem := make([]byte, len(texels))
+	var res [2]*Resource
+	for i, a := range []ResourceArgs{
+		{Target: target2DArray, Format: formatR8G8B8A8Unorm, Bind: bindSamplerView, Width: 4, Height: 4, Depth: 1, ArraySize: layers},
+		{Target: target3D, Format: formatR8G8B8A8Unorm, Bind: bindSamplerView, Width: 4, Height: 4, Depth: layers, ArraySize: 1},
+	} {
+		mem := texels
+		if i == 1 {
+			mem = slicesMem
+		}
+		r, err := NewResource(uint32(5+i), a, mem, nil)
+		if err != nil {
+			t.Fatalf("NewResource: %v", err)
+		}
+		defer r.DecRef()
+		f.c.Attach(r)
+		res[i] = r
+	}
+	if err := f.c.Transfer(res[0], TransferArgs{ToHost: true, W: 4, H: 4, D: layers}); err != nil {
+		t.Fatalf("Transfer: %v", err)
+	}
+	var s stream
+	s.cmd(cmdResourceCopyRegion, 0, res[1].ID(), 0, 0, 0, 0, res[0].ID(), 0, 0, 0, 0, 4, 4, layers)
+	f.submit(t, s)
+	if err := f.c.Transfer(res[1], TransferArgs{W: 4, H: 4, D: layers}); err != nil {
+		t.Fatalf("Transfer: %v", err)
+	}
+	if !bytes.Equal(slicesMem, texels) {
+		t.Errorf("the slices: % x, want % x", slicesMem, texels)
+	}
+}
+
 func TestInvalidCommands(t *testing.T) {
 	f := newFixture(t)
 	for _, tc := range []struct {

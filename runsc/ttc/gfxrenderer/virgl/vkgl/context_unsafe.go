@@ -422,11 +422,28 @@ func (t *Texture) checkRegion(r TextureRegion, data []byte, offset uint64) error
 	if t.Format.IsDepth() && t.Format.IsStencil() {
 		return fmt.Errorf("transfers of %s", t.Format.Name)
 	}
+	if t.Desc.Samples > 1 {
+		// Which Vulkan copies none of, and guests' Mesa resolves before
+		// it transfers them.
+		return fmt.Errorf("transfers of a texture of %d samples", t.Desc.Samples)
+	}
+	if !t.blocksOK(r.Level, b) {
+		return fmt.Errorf("a box %+v of parts of blocks of %s", b, t.Format.Name)
+	}
 	stride, _, row, _, span := t.memLayout(r)
 	if row > stride || offset > uint64(len(data)) || span > uint64(len(data))-offset {
 		return fmt.Errorf("a box %+v of level %d of %+v, of %d bytes at %d of %d", b, r.Level, t.Desc, span, offset, len(data))
 	}
 	return nil
+}
+
+// blocksOK reports whether b, a box of level of t, is of whole blocks of
+// t's format, but at the level's edges, as Vulkan copies them.
+func (t *Texture) blocksOK(level uint32, b Box) bool {
+	f := t.Format
+	w, h, _ := t.Desc.levelExtent(level)
+	bw, bh := int64(f.BlockWidth), int64(f.BlockHeight)
+	return b.X%bw == 0 && b.Y%bh == 0 && (b.Width%bw == 0 || b.X+b.Width == w) && (b.Height%bh == 0 || b.Y+b.Height == h)
 }
 
 // packRegion copies a texture region of data from offset to dst, tightly,

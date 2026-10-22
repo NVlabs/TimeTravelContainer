@@ -306,6 +306,16 @@ func TestContextTextures(t *testing.T) {
 		}
 		d.DestroyTexture(tex)
 	}
+	// Of no samples of multisampled textures, which Vulkan copies none of.
+	ms, err := d.NewTexture(ResourceDesc{Target: Target2D, Format: 67, Width: 4, Height: 4, Samples: 4})
+	if err != nil {
+		t.Logf("no textures of 4 samples: %v", err)
+		return
+	}
+	defer d.DestroyTexture(ms)
+	if err := c.WriteTexture(ms, TextureRegion{Box: Box{Width: 4, Height: 4, Depth: 1}}, make([]byte, 64), 0); err == nil {
+		t.Errorf("a transfer of a multisampled texture: no error")
+	}
 }
 
 // TestCaps fills the device's capability sets.
