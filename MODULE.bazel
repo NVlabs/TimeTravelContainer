@@ -87,6 +87,8 @@ http_archive(
         "//tools/mesa:0002-tgsi-count-sanity-errors-whether-they-are-printed-or-not.patch",
         "//tools/mesa:0003-zink-let-an-embedder-render-on-a-CPU-s-Vulkan-device.patch",
         "//tools/mesa:0004-tgsi-read-floats-printed-as-hex-as-their-bits.patch",
+        "//tools/mesa:0005-tgsi_to_nir-read-an-input-FACE-as-TGSI-s-float.patch",
+        "//tools/mesa:0006-tgsi-bound-the-vertices-that-the-sanity-check-declares.patch",
     ],
     sha256 = "bce5f7fbebb934373b86c999a064d52fb5065878dc57f287f95346648ec832e9",
     strip_prefix = "mesa-26.2.4",

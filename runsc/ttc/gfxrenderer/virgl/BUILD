@@ -19,6 +19,7 @@ go_library(
         "screen.c",
         "screen_darwin.c",
         "screen_linux.c",
+        "tgsi_check.c",
         "virgl.go",
         "virgl.h",
         "virgl_int.h",

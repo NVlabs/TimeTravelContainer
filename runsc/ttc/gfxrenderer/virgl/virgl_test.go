@@ -9,6 +9,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -62,6 +64,12 @@ func textDwords(text []byte) []uint32 {
 
 // shader creates a shader of text, in parts of at most part bytes.
 func (s *stream) shader(handle, stage uint32, text string, part int) {
+	s.shaderTokens(handle, stage, text, part, 300)
+}
+
+// shaderTokens creates a shader of text, of tokens tokens as the guest
+// counts them, in parts of at most part bytes.
+func (s *stream) shaderTokens(handle, stage uint32, text string, part int, tokens uint32) {
 	b := append([]byte(text), 0)
 	for off := 0; off < len(b); off += part {
 		end := min(off+part, len(b))
@@ -69,7 +77,7 @@ func (s *stream) shader(handle, stage uint32, text string, part int) {
 		if off > 0 {
 			offlen = shaderOffsetContinuation | uint32(off)
 		}
-		payload := append([]uint32{handle, stage, offlen, 300, 0}, textDwords(b[off:end])...)
+		payload := append([]uint32{handle, stage, offlen, tokens, 0}, textDwords(b[off:end])...)
 		s.cmd(cmdCreateObject, objectShader, payload...)
 	}
 }
@@ -261,6 +269,55 @@ IMM[0] FLT32 {0x3f000000, 0x3f800000, 0x00000000, 0x3f800000}
 	// 0.5 of 255, which GPUs round either way.
 	if p := f.pixel(4, height/2); p[0] < 127 || p[0] > 128 || p[1] != 255 || p[2] != 0 || p[3] != 255 {
 		t.Errorf("inside the triangle: %v, want {127 or 128, 255, 0, 255}", p)
+	}
+}
+
+// TestFrontFace draws the triangle in green where a fragment shader's FACE
+// input, which TGSI has positive for front faces, is, as Mesa's virgl
+// driver reads it, and red where it is not. The rasterizer culls back
+// faces, of either winding in turn: the triangle is front facing of the
+// winding that draws it. tgsi_to_nir gave Zink, whose face is an integer
+// system value, an input FACE of the system value's bits: ~0, a NaN, of
+// front faces.
+func TestFrontFace(t *testing.T) {
+	f := newFixture(t)
+	drawn := 0
+	for _, ccw := range []uint32{0, 1} {
+		var s stream
+		f.setup(&s)
+		rast := f.id()
+		// Clip depth, cull back faces, and center pixels.
+		s.cmd(cmdCreateObject, objectRasterizer, rast, 1<<1|2<<8|ccw<<15|1<<29, f32(1), 0, 0, f32(1), 0, 0, 0)
+		s.cmd(cmdBindObject, objectRasterizer, rast)
+		fs := f.id()
+		s.shader(fs, stageFragment, `FRAG
+PROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1
+DCL IN[0], FACE, CONSTANT
+DCL OUT[0], COLOR
+DCL TEMP[0]
+IMM[0] FLT32 {0x00000000, 0x3f800000, 0x00000000, 0x00000000}
+  0: SGE TEMP[0].x, IN[0].xxxx, IMM[0].xxxx
+  1: ADD OUT[0].x, IMM[0].yyyy, -TEMP[0].xxxx
+  2: MOV OUT[0].y, TEMP[0].xxxx
+  3: MOV OUT[0].zw, IMM[0].xxxy
+  4: END
+`, 1<<16)
+		s.cmd(cmdBindShader, 0, fs, stageFragment)
+		s.cmd(cmdClear, 0, clearColor0, 0, 0, f32(1), f32(1), 0, 0, 0)
+		drawTriangle(&s)
+		f.submit(t, s)
+		f.finish(t)
+		switch p := f.pixel(4, height/2); p {
+		case [4]byte{0, 0, 255, 255}:
+		case green:
+			drawn++
+		default:
+			t.Errorf("front faces counterclockwise %d: %v, want %v", ccw, p, green)
+			drawn++
+		}
+	}
+	if drawn != 1 {
+		t.Errorf("the triangle drew of %d windings, want 1", drawn)
 	}
 }
 
@@ -1003,6 +1060,134 @@ func TestInvalidCommands(t *testing.T) {
 	f.submit(t, s)
 	f.finish(t)
 	f.checkTriangle(t)
+}
+
+// TestUntranslatableTGSI creates shaders that tgsi_to_nir, and
+// tgsi_scan_shader, which Zink translates TGSI with, aborted on, read or
+// wrote past their arrays of, or that tgsi_sanity_check allocated without
+// end of: the renderer refuses them, and renders on.
+func TestUntranslatableTGSI(t *testing.T) {
+	f := newFixture(t)
+	const stageTessCtrl = 3
+	const greenImm = "IMM[0] FLT32 {0x00000000, 0x3f800000, 0x00000000, 0x3f800000}\n"
+	for _, tc := range []struct {
+		name  string
+		stage uint32
+		text  string
+	}{
+		{"an unknown property", stageFragment, "FRAG\nPROPERTY FS_EARLY_DEPTH_STENCIL 1\nDCL OUT[0], COLOR\n" +
+			greenImm + "  0: MOV OUT[0], IMM[0]\n  1: END\n"},
+		{"a geometry shader", stageGeometry, "GEOM\nPROPERTY GS_INPUT_PRIMITIVE TRIANGLES\n" +
+			"PROPERTY GS_OUTPUT_PRIMITIVE TRIANGLE_STRIP\nPROPERTY GS_MAX_OUTPUT_VERTICES 3\n" +
+			"DCL IN[][0], POSITION\nDCL OUT[0], POSITION\nIMM[0] INT32 {0, 0, 0, 0}\n" +
+			"  0: MOV OUT[0], IN[0][0]\n  1: EMIT IMM[0].xxxx\n  2: END\n"},
+		{"a tessellation control shader of 2^31 vertices", stageTessCtrl,
+			"TESS_CTRL\nPROPERTY TCS_VERTICES_OUT 2147483647\nDCL OUT[][0], GENERIC[0]\n  0: END\n"},
+		{"a color beyond the targets", stageFragment, "FRAG\nDCL OUT[0], COLOR[9]\n" + greenImm +
+			"  0: MOV OUT[0], IMM[0]\n  1: END\n"},
+		{"a uniform buffer beyond tgsi_scan_shader's", stageVertex,
+			"VERT\nDCL IN[0]\nDCL OUT[0], POSITION\nDCL CONST[40][0]\n  0: MOV OUT[0], CONST[40][0]\n  1: END\n"},
+		{"a sampler beyond tgsi_to_nir's", stageFragment, "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\n" +
+			"DCL OUT[0], COLOR\nDCL SAMP[40]\nDCL SVIEW[40], 2D, FLOAT\n  0: TEX OUT[0], IN[0], SAMP[40], 2D\n  1: END\n"},
+		{"an input beyond tgsi_scan_shader's", stageFragment, "FRAG\nDCL IN[100], GENERIC[0], PERSPECTIVE\n" +
+			"DCL OUT[0], COLOR\n  0: MOV OUT[0], IN[100]\n  1: END\n"},
+		{"a vertex input beyond tgsi_to_nir's", stageVertex,
+			"VERT\nDCL IN[20]\nDCL OUT[0], POSITION\n  0: MOV OUT[0], IN[20]\n  1: END\n"},
+		// TGSI's indexes are of 16 bits, signed: 40000 is -25536.
+		{"a register of a negative index", stageFragment, "FRAG\nDCL OUT[0], COLOR\n" +
+			"DCL TEMP[0..3], ARRAY(1)\nDCL ADDR[0]\nIMM[0] INT32 {1, 0, 0, 0}\n" +
+			"  0: UARL ADDR[0].x, IMM[0].xxxx\n  1: MOV OUT[0], TEMP[ADDR[0].x+40000]\n  2: END\n"},
+		{"an unknown system value", stageFragment, "FRAG\nDCL SV[0], SAMPLEPOS\nDCL OUT[0], COLOR\n" +
+			"  0: MOV OUT[0], SV[0]\n  1: END\n"},
+		{"shared memory", stageCompute, "COMP\nPROPERTY CS_FIXED_BLOCK_WIDTH 1\n" +
+			"PROPERTY CS_FIXED_BLOCK_HEIGHT 1\nPROPERTY CS_FIXED_BLOCK_DEPTH 1\nDCL MEMORY[0], SHARED\n" +
+			"DCL TEMP[0]\nIMM[0] UINT32 {0, 0, 0, 0}\n  0: LOAD TEMP[0].x, MEMORY[0], IMM[0].xxxx\n  1: END\n"},
+		{"ENDIF of no IF", stageFragment, "FRAG\nDCL OUT[0], COLOR\n" + greenImm +
+			"  0: MOV OUT[0], IMM[0]\n  1: ENDIF\n  2: END\n"},
+		{"TEX of a shadow cube array", stageFragment, "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\n" +
+			"DCL OUT[0], COLOR\nDCL SAMP[0]\nDCL SVIEW[0], SHADOWCUBEARRAY, FLOAT\n" +
+			"  0: TEX OUT[0], IN[0], SAMP[0], SHADOWCUBEARRAY\n  1: END\n"},
+		{"TG4 of a component of a register", stageFragment, "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\n" +
+			"DCL OUT[0], COLOR\nDCL SAMP[0]\nDCL SVIEW[0], 2D, FLOAT\nDCL TEMP[0]\n" +
+			"  0: MOV TEMP[0], IN[0]\n  1: TG4 OUT[0], IN[0], TEMP[0].xxxx, SAMP[0], 2D\n  2: END\n"},
+		{"an indirect temporary of no array", stageFragment, "FRAG\nDCL OUT[0], COLOR\nDCL TEMP[0..3]\n" +
+			"DCL ADDR[0]\nIMM[0] INT32 {1, 0, 0, 0}\n  0: UARL ADDR[0].x, IMM[0].xxxx\n" +
+			"  1: MOV OUT[0], TEMP[ADDR[0].x]\n  2: END\n"},
+		// Which tgsi_sanity_check does not check.
+		{"an offset of an immediate beyond the shader's", stageFragment,
+			"FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL SAMP[0]\n" +
+				"DCL SVIEW[0], 2D, FLOAT\nIMM[0] INT32 {1, 1, 0, 0}\n" +
+				"  0: TEX OUT[0], IN[0], SAMP[0], 2D, IMM[3].xyz\n  1: END\n"},
+		{"BRK out of loops", stageFragment, "FRAG\nDCL OUT[0], COLOR\n" + greenImm +
+			"  0: MOV OUT[0], IMM[0]\n  1: BRK\n  2: END\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var s stream
+			s.shader(f.id(), tc.stage, tc.text, 1<<16)
+			err := f.c.Submit(s.bytes())
+			if err == nil {
+				t.Errorf("no error")
+			}
+			t.Logf("%v", err)
+		})
+	}
+	// A property that the shader's code has, which tgsi_to_nir took for
+	// a meaning that it has not, is the shader's.
+	var s stream
+	f.setup(&s)
+	fs := f.id()
+	s.shader(fs, stageFragment, "FRAG\nPROPERTY FS_BLEND_EQUATION_ADVANCED 65534\nDCL OUT[0], COLOR\n"+greenImm+
+		"  0: MOV OUT[0], IMM[0]\n  1: END\n", 1<<16)
+	s.cmd(cmdBindShader, 0, fs, stageFragment)
+	clearRed(&s)
+	drawTriangle(&s)
+	f.submit(t, s)
+	f.finish(t)
+	f.checkTriangle(t)
+}
+
+// TestTGSICorpus creates a shader of each of $VIRGL_TGSI_CORPUS, a
+// directory of the TGSI texts, *.tgsi, that a renderer's guests sent, and
+// reports those that the renderer refuses, by their errors.
+func TestTGSICorpus(t *testing.T) {
+	dir := os.Getenv("VIRGL_TGSI_CORPUS")
+	if dir == "" {
+		t.Skip("VIRGL_TGSI_CORPUS names no corpus")
+	}
+	f := newFixture(t)
+	files, err := filepath.Glob(filepath.Join(dir, "*.tgsi"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stages := map[string]uint32{"VERT": stageVertex, "FRAG": stageFragment, "GEOM": stageGeometry,
+		"TESS_CTRL": 3, "TESS_EVAL": stageTessEval, "COMP": stageCompute}
+	refused := make(map[string][]string)
+	n := 0
+	for _, path := range files {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(b)
+		header, _, _ := strings.Cut(text, "\n")
+		var s stream
+		// The corpus has not the guests' counts of their tokens, of which
+		// each takes a few bytes of text at least.
+		s.shaderTokens(f.id(), stages[header], text, 1<<16, uint32(len(text)))
+		if err := f.c.Submit(s.bytes()); err != nil {
+			msg := err.Error()
+			if i := strings.Index(msg, ": shader "); i >= 0 {
+				_, msg, _ = strings.Cut(msg[i+len(": shader "):], ": ")
+			}
+			msg = header + ": " + msg
+			refused[msg] = append(refused[msg], filepath.Base(path))
+			n++
+		}
+	}
+	for msg, names := range refused {
+		t.Errorf("%d refused, %s: %v", len(names), msg, names[:min(len(names), 4)])
+	}
+	t.Logf("%d shaders, %d refused", len(files), n)
 }
 
 func TestDestroyWithFenceInFlight(t *testing.T) {

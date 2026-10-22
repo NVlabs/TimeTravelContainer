@@ -13,6 +13,7 @@
 #include "util/format/u_formats.h"
 
 struct pipe_screen;
+struct tgsi_token;
 
 extern struct pipe_screen *ttc_virgl_screen;
 
@@ -27,6 +28,12 @@ int ttc_virgl_vulkan(void);
 // targets'.
 extern bool ttc_virgl_xfb_emulated;
 extern uint32_t ttc_virgl_xfb_ubo, ttc_virgl_xfb_ssbo;
+
+// ttc_virgl_check_tgsi reports whether Zink translates a guest's TGSI, its
+// tokens, as TGSI means it, and why not in err (tgsi_check.c). It clears
+// the properties that Zink would take for meanings that the shader's code
+// has.
+bool ttc_virgl_check_tgsi(struct tgsi_token *tokens, char *err, uint32_t errlen);
 
 // ttc_virgl_pipe_format returns the Gallium format of a virgl format.
 enum pipe_format ttc_virgl_pipe_format(uint32_t format);

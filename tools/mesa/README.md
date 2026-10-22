@@ -40,6 +40,15 @@ shares.
 * `0004-tgsi-read-floats-printed-as-hex-as-their-bits.patch`: virgl's
   guests print their immediates' floats as their bits, in hex, which
   `tgsi_text_translate` read with `strtof`, as hexadecimal floats.
+* `0005-tgsi_to_nir-read-an-input-FACE-as-TGSI-s-float.patch`: TGSI's
+  `FACE` is a float where shaders read it from an input, as virgl's guests
+  do, and an integer where they read it from a system value; `tgsi_to_nir`
+  gave Zink, whose face is an integer system value, the integer of either,
+  of which guests took front faces for back faces.
+* `0006-tgsi-bound-the-vertices-that-the-sanity-check-declares.patch`:
+  `tgsi_sanity_check`, which `tgsi_text_translate` runs, declared each of
+  as many vertices of a tessellation control shader's outputs as a guest's
+  shader said, 2^31 of them.
 
 On Linux, the renderer runs on every glibc since 2.17
 (`runsc/ttc/glibccompat`): the Linux builds drop the defines of functions

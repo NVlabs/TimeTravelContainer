@@ -161,7 +161,8 @@ void ttc_virgl_fill_caps(uint32_t set, void *out, uint32_t size) {
    v2->max_geom_output_vertices = c->max_geometry_output_vertices;
    v2->max_geom_total_output_components = c->max_geometry_total_output_components;
    v2->max_vertex_outputs = vs->max_outputs;
-   v2->max_vertex_attribs = vs->max_inputs;
+   // tgsi_to_nir's vertex shaders' inputs are VERT_ATTRIB_GENERIC0..15.
+   v2->max_vertex_attribs = MIN2(vs->max_inputs, 16);
    v2->max_shader_patch_varyings = c->max_shader_patch_varyings;
    v2->min_texel_offset = c->min_texel_offset;
    v2->max_texel_offset = c->max_texel_offset;
@@ -171,6 +172,9 @@ void ttc_virgl_fill_caps(uint32_t set, void *out, uint32_t size) {
    v2->uniform_buffer_offset_alignment = c->constant_buffer_offset_alignment;
    v2->shader_buffer_offset_alignment = c->shader_buffer_offset_alignment;
 
+   // Of what Zink has, the renderer offers none of the features of whose
+   // shaders tgsi_to_nir translates none, and that no version of OpenGL
+   // requires (tgsi_check.c): no shader clock.
    uint32_t bits = VIRGL_CAP_TGSI_INVARIANT | VIRGL_CAP_SET_MIN_SAMPLES | VIRGL_CAP_TGSI_PRECISE |
                    VIRGL_CAP_MEMORY_BARRIER | VIRGL_CAP_CLEAR_TEXTURE | VIRGL_CAP_BIND_COMMAND_ARGS;
    if (c->texture_query_samples)
@@ -206,8 +210,6 @@ void ttc_virgl_fill_caps(uint32_t set, void *out, uint32_t size) {
       bits |= VIRGL_CAP_TRANSFORM_FEEDBACK3;
    if (c->fbfetch)
       bits |= VIRGL_CAP_TGSI_FBFETCH;
-   if (c->shader_clock)
-      bits |= VIRGL_CAP_SHADER_CLOCK;
    v2->capability_bits = bits;
 
    v2->max_vertex_attrib_stride = c->max_vertex_attrib_stride;
@@ -246,15 +248,16 @@ void ttc_virgl_fill_caps(uint32_t set, void *out, uint32_t size) {
    // version up to it, which this host has.
    v2->host_feature_check_version = 23;
 
+   // As above, no vertex shaders' viewport indexes, nor advanced blend
+   // equations, which the blend states that the renderer decodes have not,
+   // and which guests blend in their shaders with framebuffer fetch.
    uint32_t bits2 = 0;
-   if (c->blend_equation_advanced)
-      bits2 |= VIRGL_CAP_V2_BLEND_EQUATION;
    if (c->surface_sample_count)
       bits2 |= VIRGL_CAP_V2_IMPLICIT_MSAA;
    if (c->texture_shadow_lod)
       bits2 |= VIRGL_CAP_V2_TEXTURE_SHADOW_LOD;
    if (c->vs_layer_viewport)
-      bits2 |= VIRGL_CAP_V2_VS_VERTEX_LAYER | VIRGL_CAP_V2_VS_VIEWPORT_INDEX;
+      bits2 |= VIRGL_CAP_V2_VS_VERTEX_LAYER;
    if (c->query_pipeline_statistics)
       bits2 |= VIRGL_CAP_V2_PIPELINE_STATISTICS_QUERY;
    if (c->draw_parameters)

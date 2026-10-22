@@ -581,6 +581,10 @@ void *ttc_virgl_translate_tgsi(const char *text, uint32_t num_tokens, char *err,
       FREE(tokens);
       return NULL;
    }
+   if (!ttc_virgl_check_tgsi(tokens, err, errlen)) {
+      FREE(tokens);
+      return NULL;
+   }
    return tokens;
 }
 
