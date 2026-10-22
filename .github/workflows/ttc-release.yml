@@ -80,7 +80,7 @@ jobs:
       - name: Install git
         run: apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates git >/dev/null
       - uses: actions/checkout@v5
-      - uses: actions/cache/restore@v4
+      - uses: actions/cache/restore@v6
         with:
           path: .ci-cache
           key: ttc-bazel-linux-${{ matrix.arch }}-v1-${{ github.sha }}
@@ -108,7 +108,7 @@ jobs:
       RELEASE_TAG: ${{ needs.plan.outputs.tag }}
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/cache/restore@v4
+      - uses: actions/cache/restore@v6
         with:
           path: .ci-cache
           key: ttc-bazel-darwin-arm64-v1-${{ github.sha }}

@@ -56,7 +56,7 @@ jobs:
         # The checkout's history, which the build's version stamp reads.
         run: apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates git >/dev/null
       - uses: actions/checkout@v5
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: .ci-cache
           key: ttc-bazel-linux-${{ matrix.arch }}-v1-${{ github.sha }}
@@ -86,7 +86,7 @@ jobs:
       CI_BAZEL_DISK_CACHE_SIZE: 3G
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: .ci-cache
           key: ttc-bazel-darwin-arm64-v1-${{ github.sha }}
