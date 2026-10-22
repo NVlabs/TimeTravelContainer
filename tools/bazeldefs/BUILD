@@ -45,6 +45,15 @@ config_setting(
     ],
 )
 
+# rules_go's platforms without cgo, such as those that nogo analyzes each
+# architecture's packages of.
+config_setting(
+    name = "cgo_off",
+    constraint_values = [
+        "@io_bazel_rules_go//go/toolchain:cgo_off",
+    ],
+)
+
 genrule(
     name = "version",
     outs = ["version.txt"],

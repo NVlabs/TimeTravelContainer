@@ -138,6 +138,13 @@ def go_test(name, static = False, pure = False, library = None, **kwargs):
         library: the library to embed.
         **kwargs: rest of the arguments to pass to _go_test.
     """
+    if pure == "off":
+        # Where the platform has no cgo, as nogo's of each architecture have
+        # not, a test that needs it is analyzed without it.
+        pure = select({
+            "//tools/bazeldefs:cgo_off": "on",
+            "//conditions:default": "off",
+        })
     _set_pure(kwargs, pure)
     if static:
         kwargs["static"] = "on"
