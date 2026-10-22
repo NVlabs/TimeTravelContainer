@@ -766,16 +766,28 @@ func (c *vkglContext) setMinSamples(n uint32) {
 
 func (c *vkglContext) setTessState(d []uint32) {}
 
+// unbinding returns errVkgl unless res are of no resources, of which
+// guests' Mesa unbinds slots of shader buffers and images that the
+// backend renders none of yet: of them, nothing.
+func unbinding(what string, res []backendResource) error {
+	for _, r := range res {
+		if r != nil {
+			return fmt.Errorf("%s: %w", what, errVkgl)
+		}
+	}
+	return nil
+}
+
 func (c *vkglContext) setShaderBuffers(stage, start uint32, res []backendResource, offsets, sizes []uint32) error {
-	return errVkgl
+	return unbinding("shader buffers", res)
 }
 
 func (c *vkglContext) setAtomicBuffers(start uint32, res []backendResource, offsets, sizes []uint32) error {
-	return errVkgl
+	return unbinding("atomic buffers", res)
 }
 
 func (c *vkglContext) setShaderImages(stage, start uint32, res []backendResource, d []uint32) error {
-	return errVkgl
+	return unbinding("shader images", res)
 }
 
 func (c *vkglContext) renderCondition(q any, condition bool, mode uint32) {}
@@ -1131,6 +1143,7 @@ func (c *vkglContext) draw(d []uint32, a drawArgs) error {
 	}
 	vsOpts.ClipDisable = uint8(^c.rast.ClipPlaneEnable)
 	vsOpts.StreamOutput = vs.so
+	vsOpts.GLClipZ = !c.rast.ClipHalfZ
 	fsOpts.ColorBuffers = len(colors)
 	fsOpts.ColorTypes = colorTypes
 	fsOpts.FlatShade, fsOpts.TwoSided = c.rast.FlatShade, c.rast.LightTwoSide

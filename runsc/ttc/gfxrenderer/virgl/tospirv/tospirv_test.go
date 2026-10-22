@@ -548,6 +548,9 @@ DCL OUT[2], TEXCOORD[3]
 `
 	translate(t, "vs-user-clip-planes", ucp, Options{UserClipPlanes: [][4]float32{{1, 0, 0, 0}, {0, 1, 0, 0.5}}})
 	translate(t, "vs-clip-disable", shaders["vs-clip-cull"], Options{ClipDisable: 0x21})
+	// Of OpenGL's clip space's z, which Vulkan's is not, once the clip
+	// planes used it.
+	translate(t, "vs-gl-clip-z", ucp, Options{UserClipPlanes: [][4]float32{{1, 0, 0, 0}}, GLClipZ: true})
 	sprite := `FRAG
 DCL IN[0], TEXCOORD[3], PERSPECTIVE
 DCL IN[1], TEXCOORD[4], PERSPECTIVE

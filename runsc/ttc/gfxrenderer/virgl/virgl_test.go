@@ -8,6 +8,7 @@ package virgl
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -1268,6 +1269,115 @@ func TestVertexBufferPastItsEnd(t *testing.T) {
 	if p := f.pixel(4, height/2); p != red {
 		t.Errorf("where the triangle would be: %v, want %v", p, red)
 	}
+}
+
+// Shaders read their constants, which the guest sets, and uniform buffers,
+// of resources, as Mesa's state tracker binds them: the vertex shader's
+// offsets the triangle, and the fragment shader's color it.
+func TestConstantsAndUniformBuffers(t *testing.T) {
+	const (
+		constVS = `VERT
+DCL IN[0]
+DCL OUT[0], POSITION
+DCL CONST[0][0]
+  0: ADD OUT[0], IN[0], CONST[0][0]
+  1: END
+`
+		constFS = `FRAG
+DCL OUT[0], COLOR
+DCL CONST[%d][0..1]
+  0: MOV OUT[0], CONST[%d][1]
+  1: END
+`
+	)
+	floats := func(fs ...float32) []uint32 {
+		var d []uint32
+		for _, f := range fs {
+			d = append(d, f32(f))
+		}
+		return d
+	}
+	f := newFixture(t)
+	// A uniform buffer of an offset of 0, and green.
+	uboMem := make([]byte, 32)
+	for i, w := range floats(0, 0, 0, 0, 0, 1, 0, 1) {
+		binary.LittleEndian.PutUint32(uboMem[4*i:], w)
+	}
+	ubo, err := NewResource(5, ResourceArgs{Target: targetBuffer, Format: formatR8Unorm, Bind: 1 << 6,
+		Width: 32, Height: 1, Depth: 1, ArraySize: 1}, uboMem, nil)
+	if err != nil {
+		t.Fatalf("NewResource: %v", err)
+	}
+	defer ubo.DecRef()
+	f.c.Attach(ubo)
+	if err := f.c.Transfer(ubo, TransferArgs{ToHost: true, W: 32, H: 1, D: 1}); err != nil {
+		t.Fatalf("Transfer: %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		set  func(s *stream, fs uint32)
+	}{
+		{"constants", func(s *stream, fs uint32) {
+			s.shader(fs, stageFragment, fmt.Sprintf(constFS, 0, 0), 1<<16)
+			s.cmd(cmdSetConstantBuffer, 0, append([]uint32{stageFragment, 0}, floats(0, 0, 0, 0, 0, 1, 0, 1)...)...)
+		}},
+		{"a uniform buffer", func(s *stream, fs uint32) {
+			s.shader(fs, stageFragment, fmt.Sprintf(constFS, 1, 1), 1<<16)
+			s.cmd(cmdSetUniformBuffer, 0, stageFragment, 1, 0, 32, ubo.ID())
+		}},
+		{"a uniform buffer of the constants' slot", func(s *stream, fs uint32) {
+			s.shader(fs, stageFragment, fmt.Sprintf(constFS, 0, 0), 1<<16)
+			s.cmd(cmdSetUniformBuffer, 0, stageFragment, 0, 0, 32, ubo.ID())
+		}},
+	} {
+		var s stream
+		f.setup(&s)
+		vs, fs := f.id(), f.id()
+		s.shader(vs, stageVertex, constVS, 1<<16)
+		s.cmd(cmdSetConstantBuffer, 0, append([]uint32{stageVertex, 0}, floats(0, 0, 0, 0)...)...)
+		tc.set(&s, fs)
+		s.cmd(cmdBindShader, 0, vs, stageVertex)
+		s.cmd(cmdBindShader, 0, fs, stageFragment)
+		clearRed(&s)
+		drawTriangle(&s)
+		f.submit(t, s)
+		f.finish(t)
+		if p := f.pixel(4, height/2); p != green {
+			t.Errorf("%s: inside the triangle: %v, want %v", tc.name, p, green)
+		}
+		if p := f.pixel(width-4, height/2); p != red {
+			t.Errorf("%s: outside the triangle: %v, want %v", tc.name, p, red)
+		}
+	}
+}
+
+// A triangle of OpenGL's clip space's z between -w and 0, which Vulkan's
+// clips, as SurfaceFlinger's orthographic projections place layers at -1,
+// is drawn.
+func TestGLClipSpaceZ(t *testing.T) {
+	f := newFixture(t)
+	vbMem := make([]byte, 48)
+	for i, v := range []float32{-1, -1, -0.9, 1, 0, -1, -0.9, 1, -1, 1, -0.9, 1} {
+		binary.LittleEndian.PutUint32(vbMem[4*i:], math.Float32bits(v))
+	}
+	vb, err := NewResource(5, ResourceArgs{Target: targetBuffer, Format: formatR8Unorm,
+		Bind: bindVertexBuffer, Width: 48, Height: 1, Depth: 1, ArraySize: 1}, vbMem, nil)
+	if err != nil {
+		t.Fatalf("NewResource: %v", err)
+	}
+	defer vb.DecRef()
+	f.c.Attach(vb)
+	if err := f.c.Transfer(vb, TransferArgs{ToHost: true, W: 48, H: 1, D: 1}); err != nil {
+		t.Fatalf("Transfer: %v", err)
+	}
+	var s stream
+	f.setup(&s)
+	s.cmd(cmdSetVertexBuffers, 0, 16, 0, vb.ID())
+	clearRed(&s)
+	drawTriangle(&s)
+	f.submit(t, s)
+	f.finish(t)
+	f.checkTriangle(t)
 }
 
 func TestInvalidCommands(t *testing.T) {

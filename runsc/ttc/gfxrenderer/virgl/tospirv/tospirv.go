@@ -80,6 +80,11 @@ type Options struct {
 	// the rasterizer state does not enable, by their indexes' bits.
 	UserClipPlanes [][4]float32
 	ClipDisable    uint8
+	// GLClipZ is whether the last stage before rasterization's positions
+	// are of OpenGL's clip space, whose z is of [-w, w], which it makes
+	// Vulkan's, of [0, w], as the rasterizer state's clip_halfz says they
+	// are not.
+	GLClipZ bool
 	// PointSize, if not 0, is the size of the points that the last stage
 	// before rasterization writes, rather than its PSIZE, as the
 	// rasterizer state's point size is GL's unless shaders' sizes are

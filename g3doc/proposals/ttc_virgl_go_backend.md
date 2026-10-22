@@ -150,7 +150,10 @@ Stage 2 implements the decoder's backend (`virgl.h`'s operations) in Go:
     decoder executes on a backend interface, and `vkgl` renders draws,
     clears, copies, blits, queries, transform feedback and clones; the
     virgl tests pass on both backends, of no errors of Vulkan's validation
-    layer of vkgl's, and the corpus's shaders create on both. Not yet:
-    shader buffers and images, compute, geometry and tessellation,
-    indirect draws, texture buffers.)
+    layer of vkgl's, and the corpus's shaders create on both. On lavapipe,
+    `e2e_gfx.sh`'s OpenGL ES and redroid pass on `vkgl`: SurfaceFlinger
+    and Settings render, record and fork, and the Settings screen is
+    Zink's to the pixel. Not yet, nor offered to guests: shader buffers
+    and images, compute, geometry and tessellation, indirect draws,
+    texture buffers.)
 3.  Mesa removed: no `tools/mesa.BUILD`, no glibc shims for it.

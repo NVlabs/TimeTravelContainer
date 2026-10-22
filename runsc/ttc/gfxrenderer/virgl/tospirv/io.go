@@ -883,6 +883,30 @@ func (t *translator) epilogue() {
 			t.store(f.v, t.float32Const(t.opts.PointSize))
 		}
 	}
+	if t.opts.GLClipZ {
+		t.vulkanClipZ()
+	}
+}
+
+// vulkanClipZ makes the position, of OpenGL's clip space, Vulkan's: its z,
+// of [-w, w], (z + w) / 2, of [0, w], once the clip planes and the stream
+// output used OpenGL's.
+func (t *translator) vulkanClipZ() {
+	switch t.s.Processor {
+	case tgsi.ProcessorVertex, tgsi.ProcessorTessEval, tgsi.ProcessorGeometry:
+	default:
+		return
+	}
+	f := t.builtins[builtinKey{spirv.StorageClassOutput, spirv.BuiltInPosition}]
+	if f == nil {
+		return
+	}
+	pos := t.load(t.tVec4F, f.v)
+	z := t.f.Op(spirv.OpCompositeExtract, t.tF32, uint32(pos), 2)
+	w := t.f.Op(spirv.OpCompositeExtract, t.tF32, uint32(pos), 3)
+	zw := t.f.Op(spirv.OpFAdd, t.tF32, uint32(z), uint32(w))
+	half := t.f.Op(spirv.OpFMul, t.tF32, uint32(zw), uint32(t.float32Const(0.5)))
+	t.store(f.v, t.f.Op(spirv.OpCompositeInsert, t.tVec4F, uint32(half), uint32(pos), 2))
 }
 
 // The mesa_prim primitives of the properties of geometry and tessellation
