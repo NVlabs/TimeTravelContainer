@@ -137,13 +137,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - if: needs.plan.outputs.release == '1'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: ttc-*
           path: ci-out/release
           merge-multiple: true
       - if: needs.plan.outputs.release == '1'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: release-notes
       - name: Publish, and expire old releases
