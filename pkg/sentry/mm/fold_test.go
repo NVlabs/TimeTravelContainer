@@ -5,6 +5,7 @@ package mm
 
 import (
 	"bytes"
+	"slices"
 	"testing"
 	"time"
 
@@ -445,5 +446,59 @@ func TestResidentRangesShareAsVersions(t *testing.T) {
 	ranges := parent.AppendResidentFileRanges(nil)
 	if versions, pages := residentVersions(ranges), residentPages(ranges); len(versions) != len(pages) {
 		t.Errorf("after a fold, %d versions in %d pages, want one each", len(versions), len(pages))
+	}
+}
+
+// An address space whose fork took over pages in place, at slots of the
+// address space's home, cannot fold its own copies of them there while a
+// later fork holds them. Once that fork's fold moves them to a home of its
+// own, it asks their group to fold again, and the address space's next fold
+// puts its pages in one home: whichever of the two folds first.
+func TestFoldAfterAForkLeavesItsSlots(t *testing.T) {
+	ctx, main := homeTestMemoryManager(t, false)
+	defer main.DecUsers(ctx)
+	const pages = 64
+	addr := mapPrivate(ctx, t, main, pages*hostarch.PageSize)
+	writePagesInRandomOrder(ctx, t, main, addr, pages, 1)
+	home := checkAddressOrdered(t, main, addr, pages)
+	x, err := cloneMemoryManagerMetadata(ctx, main)
+	if err != nil {
+		t.Fatalf("cloneMemoryManagerMetadata: %v", err)
+	}
+	// main's copies of the even pages go to a layer: x shares the
+	// originals. x then holds those alone, and takes them over in place,
+	// at main's slots; it copies the odd ones, which main shares.
+	writePages(ctx, t, main, addr, 0, pages, 2)
+	writePagesInRandomOrder(ctx, t, x, addr, pages, 3)
+	y, err := cloneMemoryManagerMetadata(ctx, x)
+	if err != nil {
+		t.Fatalf("cloneMemoryManagerMetadata: %v", err)
+	}
+	defer y.DecUsers(ctx)
+	x.DecUsers(ctx)
+	// main folds first: y holds the pages at the slots of its copies.
+	foldAll(t, main)
+	if off := fileOffsetAt(t, main, addr); off == home {
+		t.Fatalf("main's copy of page 0 is at its slot %#x though y holds the page there", off)
+	}
+	var asked []uint64
+	defer func(hook func(*pgalloc.MemoryFile, uint64)) { FoldRequestHook = hook }(FoldRequestHook)
+	FoldRequestHook = func(_ *pgalloc.MemoryFile, group uint64) { asked = append(asked, group) }
+	// y folds its pages into x's home, which it adopts, from main's slots.
+	foldAll(t, y)
+	if !slices.Contains(asked, main.FoldGroup()) {
+		t.Fatalf("y's fold out of main's home asked groups %v to fold, want main's, %d", asked, main.FoldGroup())
+	}
+	// main writes the odd pages, its own now, in place, as the address
+	// space that TestFoldAfterForkReleased folds does.
+	writePages(ctx, t, main, addr, 1, pages, 4)
+	foldAll(t, main)
+	if got := checkAddressOrdered(t, main, addr, pages); got != home {
+		t.Errorf("main's pages were folded into %#x, want its home %#x", got, home)
+	}
+	for page, v := range foldedPages(ctx, t, main, addr, pages) {
+		if want := byte(2 + 2*(page%2)); v.b != want {
+			t.Errorf("main's page %d holds %d, want %d", page, v.b, want)
+		}
 	}
 }

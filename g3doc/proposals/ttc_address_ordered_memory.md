@@ -342,9 +342,13 @@ and a guest process's exit. A save keeps no fork groups: an address space
 restored from one, and those forked or live-forked from it, are of no known
 group, so that their releases ask for folds of all, as every release did at
 first, and they fold when all are asked. A candidate for collapse asks for a
-pass once it has waited (`FoldRetryHook`). Pages that `mremap` moved fold when
-their group is next asked: they keep their offsets, contiguous, and folding them
-at once copied a compiler's growing buffers just before it exited. A capture or
+pass once it has waited (`FoldRetryHook`). A fold that moves pages out of a home
+that another address space owns, as pages that a fork took over in place stay at
+its source's slots, asks their group to fold again: the owner could not fold its
+own copies into those slots while the fork held them, and the two may fold in
+either order, each in its own Kernel. Pages that `mremap` moved fold when their
+group is next asked: they keep their offsets, contiguous, and folding them at
+once copied a compiler's growing buffers just before it exited. A capture or
 remote snapshot that closes asks through the file (`SetFoldNotify`). A residency
 unit's release asks nothing: what holds a unit's pages besides the cache is what
 restored them. The pma-count trigger is not implemented; the ENOMEM one asks for

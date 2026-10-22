@@ -114,6 +114,11 @@ type foldState struct {
 	idleAt   time.Time
 	deferred bool
 
+	// freedSlots is true if the current pass moved pages out of a home that
+	// another address space owns, which may then fold its own pages into
+	// their slots: see movePrivateLocked.
+	freedSlots bool
+
 	// cursor is where the next step starts.
 	cursor hostarch.Addr
 
@@ -212,6 +217,10 @@ func (mm *MemoryManager) FoldStep(limit uint64) (uint64, bool) {
 				}
 				fs.residue = false
 				fs.collapsing = false
+				if fs.freedSlots {
+					fs.freedSlots = false
+					requestFolds(mm.mf, mm.foldGroup)
+				}
 				return moved, true
 			}
 			mm.planFoldLocked(block)
@@ -426,6 +435,13 @@ func (mm *MemoryManager) movePrivateLocked(ar hostarch.AddrRange, src, dst memma
 	p.internalMappings = safemem.BlockSeq{}
 	p.huge = mm.mf.IsHugePages(dst)
 	mm.mf.DecRef(src)
+	// The pages were at slots of another's home, as pages a fork took over in
+	// place stay: its owner, which a fold could not bring its own copies of
+	// them to, may fold now. It is of mm's fork group, as only a fork leaves
+	// pages in another's home.
+	if _, owner, ok := mm.mf.HomeOf(src.Start); ok && owner != 0 && owner != mm.homeOwner {
+		mm.fold.freedSlots = true
+	}
 	return true
 }
 
