@@ -64,8 +64,9 @@ static unsigned pipe_bind(uint32_t bind) {
    return b;
 }
 
-// level_extent returns the extent of level of res in a box's terms: a 1D
-// array's layers are its y, and a 2D array's or cube's its z.
+// level_extent returns the extent of level of res in a box's terms: an
+// array's or a cube's layers are its z, as Gallium's boxes, guests' and
+// Zink's, address them.
 static void level_extent(const struct pipe_resource *res, unsigned level, int64_t *w, int64_t *h,
                          int64_t *d) {
    *w = u_minify(res->width0, level);
@@ -78,7 +79,7 @@ static void level_extent(const struct pipe_resource *res, unsigned level, int64_
    case PIPE_TEXTURE_1D:
       break;
    case PIPE_TEXTURE_1D_ARRAY:
-      *h = res->array_size;
+      *d = res->array_size;
       break;
    case PIPE_TEXTURE_3D:
       *h = u_minify(res->height0, level);
@@ -248,11 +249,6 @@ void ttc_virgl_resource_copy(struct pipe_context *pipe, struct pipe_resource *ds
    for (unsigned level = 0; level <= src->last_level; level++) {
       int64_t w, h, d;
       level_extent(src, level, &w, &h, &d);
-      if (src->target == PIPE_TEXTURE_1D_ARRAY) {
-         // Zink's copies take a 1D array's layers as a 2D array's.
-         d = h;
-         h = 1;
-      }
       struct pipe_box box = {.x = 0, .y = 0, .z = 0, .width = w, .height = h, .depth = d};
       pipe->resource_copy_region(pipe, dst, level, 0, 0, 0, src, level, &box);
    }
@@ -1044,8 +1040,7 @@ int ttc_virgl_check_surface(struct pipe_resource *res, uint32_t format, uint32_t
    unsigned first = val1 & 0xffff, last = (val1 >> 16) & 0xffff;
    int64_t w, h, d;
    level_extent(res, val0, &w, &h, &d);
-   int64_t layers = res->target == PIPE_TEXTURE_1D_ARRAY ? h : d;
-   if (val0 > res->last_level || last < first || last >= layers)
+   if (val0 > res->last_level || last < first || last >= d)
       return EINVAL;
    return 0;
 }

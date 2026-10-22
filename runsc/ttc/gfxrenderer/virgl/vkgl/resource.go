@@ -121,15 +121,15 @@ func (d ResourceDesc) check(l Limits) error {
 }
 
 // levelExtent returns the extent of a level of d, of its texels, rows, and
-// layers or slices, as transfers' boxes address them: a 1D array's layers
-// are its rows.
+// layers or slices, as boxes address them: an array's or a cube's layers
+// are its z, as Gallium's boxes, and guests', address them.
 func (d ResourceDesc) levelExtent(level uint32) (w, h, depth int64) {
 	w, h, depth = int64(minify(d.Width, level)), 1, 1
 	switch d.Target {
 	case TargetBuffer:
 		w = int64(d.Width)
 	case Target1DArray:
-		h = int64(d.ArraySize)
+		depth = int64(d.ArraySize)
 	case Target3D:
 		h, depth = int64(minify(d.Height, level)), int64(minify(d.Depth, level))
 	case Target2DArray, TargetCube, TargetCubeArray:

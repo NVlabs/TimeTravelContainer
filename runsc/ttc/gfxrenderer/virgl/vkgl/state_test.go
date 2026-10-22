@@ -140,10 +140,12 @@ func TestResourceChecks(t *testing.T) {
 		}
 	}
 	d := ResourceDesc{Target: Target1DArray, Width: 64, ArraySize: 4, LastLevel: 2}.normalize()
-	if w, h, depth := d.levelExtent(2); w != 16 || h != 4 || depth != 1 {
+	if w, h, depth := d.levelExtent(2); w != 16 || h != 1 || depth != 4 {
 		t.Errorf("a 1D array's level 2: %d %d %d", w, h, depth)
 	}
-	if !d.boxOK(1, Box{X: 0, Y: 1, Z: 0, Width: 32, Height: 3, Depth: 1}) || d.boxOK(1, Box{Width: 33, Height: 1, Depth: 1}) ||
+	// Whose layers are boxes' z, as guests address them.
+	if !d.boxOK(1, Box{X: 0, Y: 0, Z: 1, Width: 32, Height: 1, Depth: 3}) || d.boxOK(1, Box{Y: 1, Width: 32, Height: 1, Depth: 1}) ||
+		d.boxOK(1, Box{Width: 33, Height: 1, Depth: 1}) ||
 		d.boxOK(3, Box{Width: 1, Height: 1, Depth: 1}) || !d.boxOK(0, Box{X: 64, Width: -64, Height: 1, Depth: 1}) {
 		t.Errorf("boxes of %+v", d)
 	}

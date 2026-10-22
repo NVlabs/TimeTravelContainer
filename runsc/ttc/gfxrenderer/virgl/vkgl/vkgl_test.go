@@ -269,8 +269,9 @@ func TestContextTextures(t *testing.T) {
 			TextureRegion{Level: 1, Box: Box{X: 0, Y: 0, Width: 8, Height: 4, Depth: 1}}},
 		{ResourceDesc{Target: Target2DArray, Format: 31, Width: 4, Height: 4, ArraySize: 3},
 			TextureRegion{Box: Box{X: 1, Y: 1, Z: 1, Width: 2, Height: 2, Depth: 2}, Stride: 40, LayerStride: 100}},
+		// Whose layers are the box's z, as guests address them.
 		{ResourceDesc{Target: Target1DArray, Format: 67, Width: 8, ArraySize: 4},
-			TextureRegion{Box: Box{X: 2, Y: 1, Width: 4, Height: 3, Depth: 1}}},
+			TextureRegion{Box: Box{X: 2, Z: 1, Width: 4, Height: 1, Depth: 3}}},
 		{ResourceDesc{Target: Target3D, Format: 64, Width: 4, Height: 4, Depth: 4}, // R8_UNORM
 			TextureRegion{Box: Box{Y: 1, Z: 2, Width: 4, Height: 3, Depth: 2}}},
 		{ResourceDesc{Target: TargetCube, Format: 67, Width: 4, Height: 4, ArraySize: 6},

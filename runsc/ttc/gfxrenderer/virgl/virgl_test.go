@@ -995,6 +995,61 @@ func TestCopyCompressedAndPlain(t *testing.T) {
 	}
 }
 
+// A 1D array's layers are its boxes' z, as guests' Mesa addresses them, of
+// transfers, copies and clones: a box of rows past the first, which Zink
+// would copy outside the image, is refused.
+func TestTexture1DArrayLayers(t *testing.T) {
+	const target1DArray, layers = 6, 3
+	f := newFixture(t)
+	array := func(id uint32, mem []byte) *Resource {
+		r, err := NewResource(id, ResourceArgs{Target: target1DArray, Format: formatR8G8B8A8Unorm, Bind: bindSamplerView,
+			Width: 4, Height: 1, Depth: 1, ArraySize: layers}, mem, nil)
+		if err != nil {
+			t.Fatalf("NewResource: %v", err)
+		}
+		t.Cleanup(r.DecRef)
+		f.c.Attach(r)
+		return r
+	}
+	texels := make([]byte, 16*layers)
+	for i := range texels {
+		texels[i] = byte(i + 1)
+	}
+	mem, copyMem := append([]byte(nil), texels...), make([]byte, 16*layers)
+	src, dst := array(5, mem), array(6, copyMem)
+	// Layer by layer, from the layer's place in the guest's memory.
+	for z := uint32(0); z < layers; z++ {
+		if err := f.c.Transfer(src, TransferArgs{ToHost: true, Z: z, W: 4, H: 1, D: 1, Offset: 16 * uint64(z)}); err != nil {
+			t.Fatalf("Transfer of layer %d: %v", z, err)
+		}
+	}
+	if err := f.c.Transfer(src, TransferArgs{ToHost: true, Y: 1, W: 4, H: 1, D: 1, Offset: 16}); err == nil {
+		t.Errorf("a transfer of a 1D array's second row: no error")
+	}
+	// Its layers 1 and 2 to the other's 0 and 1.
+	var s stream
+	s.cmd(cmdResourceCopyRegion, 0, dst.ID(), 0, 0, 0, 0, src.ID(), 0, 0, 0, 1, 4, 1, 2)
+	f.submit(t, s)
+	clear(mem)
+	cf := f.clone(t)
+	for _, c := range []struct {
+		name string
+		f    *fixture
+		mems map[uint32][]byte
+	}{{"context", f, map[uint32][]byte{src.ID(): mem, dst.ID(): copyMem}}, {"clone", cf, cf.mems}} {
+		s = nil
+		s.cmd(cmdTransfer3D, 0, src.ID(), 0, 0, 0, 0, 0, 0, 0, 4, 1, layers, 0, transferFromHost)
+		s.cmd(cmdTransfer3D, 0, dst.ID(), 0, 0, 0, 0, 0, 0, 0, 4, 1, 2, 0, transferFromHost)
+		c.f.submit(t, s)
+		if got := c.mems[src.ID()]; !bytes.Equal(got, texels) {
+			t.Errorf("%s: the array: % x, want % x", c.name, got, texels)
+		}
+		if got := c.mems[dst.ID()][:32]; !bytes.Equal(got, texels[16:]) {
+			t.Errorf("%s: the copy: % x, want % x", c.name, got, texels[16:])
+		}
+	}
+}
+
 func TestInvalidCommands(t *testing.T) {
 	f := newFixture(t)
 	for _, tc := range []struct {

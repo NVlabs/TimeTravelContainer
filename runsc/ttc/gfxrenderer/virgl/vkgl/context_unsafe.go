@@ -383,11 +383,7 @@ func (t *Texture) copyRegion(r TextureRegion, offset uint64) vn.VkBufferImageCop
 		ImageExtent:      vn.VkExtent3D{Width: uint32(b.Width), Height: uint32(b.Height), Depth: 1},
 	}
 	switch t.Desc.Target {
-	case Target1DArray:
-		// Whose layers are the box's rows.
-		c.ImageOffset.Y, c.ImageExtent.Height = 0, 1
-		c.ImageSubresource.BaseArrayLayer, c.ImageSubresource.LayerCount = uint32(b.Y), uint32(b.Height)
-	case Target2DArray, TargetCube, TargetCubeArray:
+	case Target1DArray, Target2DArray, TargetCube, TargetCubeArray:
 		c.ImageSubresource.BaseArrayLayer, c.ImageSubresource.LayerCount = uint32(b.Z), uint32(b.Depth)
 	case Target3D:
 		c.ImageOffset.Z, c.ImageExtent.Depth = int32(b.Z), uint32(b.Depth)
@@ -397,8 +393,7 @@ func (t *Texture) copyRegion(r TextureRegion, offset uint64) vn.VkBufferImageCop
 
 // memLayout returns the texture region's layout of the guest's memory: its
 // rows' and layers' strides, of the level's size if the region says none,
-// the bytes of a row of the box, its rows, and the bytes that it spans. A
-// 1D array's layers are rows, as the decoder's pipe.c lays them out.
+// the bytes of a row of the box, its rows, and the bytes that it spans.
 func (t *Texture) memLayout(r TextureRegion) (stride, layerStride, row, rows, span uint64) {
 	f := t.Format
 	w, h, _ := t.Desc.levelExtent(r.Level)
