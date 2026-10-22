@@ -3,8 +3,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# The steps of TTC's CI pipeline (.gitlab-ci.yml), which also run by hand
-# from the repository's root:
+# The steps of TTC's CI pipelines, on GitLab (.gitlab-ci.yml) and GitHub
+# (.github/workflows/ttc-*.yml), which also run by hand from the repository's
+# root:
 #
 #   tools/ci/ci.sh setup          installs what a Linux build needs, and Bazel,
 #                                 on Ubuntu, as root
@@ -19,7 +20,9 @@
 # once. On Linux, Bazel keeps it, its downloads and its outputs in
 # CI_CACHE_DIR (default .ci-cache), which the pipeline caches between jobs. On
 # macOS the runner's Bazel output base persists between jobs instead, and
-# Bazel's release is kept in CI_TOOLS_DIR (default ~/.cache/ttc-ci).
+# Bazel's release is kept in CI_TOOLS_DIR (default ~/.cache/ttc-ci); where
+# CI_CACHE_DIR is set, as on GitHub's runners, which keep nothing, Bazel keeps
+# its downloads and outputs there too.
 set -eu
 
 cd "$(dirname "$0")/../.."
@@ -78,7 +81,7 @@ bazel_startup() {
 
 bazel_flags() {
 	echo "--color=no --curses=no --show_progress_rate_limit=30"
-	if [ "$os" = Linux ]; then
+	if [ "$os" = Linux ] || [ -n "${CI_CACHE_DIR:-}" ]; then
 		# The caches are in the checkout, where the pipeline's cache
 		# takes them from, and Bazel refuses its repository contents
 		# cache there.
@@ -228,7 +231,7 @@ verify_binaries() {
 # documentation, and RELEASE_TAG, the new release's tag; and release-notes.md,
 # the release's description.
 release_plan() {
-	[ -n "${CI_API_V4_URL:-}" ] || fail "release-plan runs in a pipeline"
+	[ -n "${CI_API_V4_URL:-}${GITHUB_API_URL:-}" ] || fail "release-plan runs in a pipeline"
 	last=$(python3 tools/ci/release.py last)
 	tag="daily-$(date -u +%Y%m%d)-$(git rev-parse --short=10 HEAD)"
 	release=1

@@ -1,0 +1,157 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# TTC's daily release on GitHub's hosted runners, as .gitlab-ci.yml's release
+# jobs on GitLab: daily, or when run by hand, if the default branch changed
+# since the last release other than in its documentation, it builds and tests
+# each platform's binaries and publishes them as the release
+# daily-YYYYMMDD-COMMIT. Daily releases expire after TTC_RELEASE_KEEP_DAYS
+# days (a repository variable; 30 if it is unset), the newest excepted. See
+# tools/ci/README.md.
+
+name: TTC daily release
+
+"on":
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ttc-release
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    # Releases are of the default branch, which a schedule runs.
+    if: github.event_name == 'schedule' || github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-24.04
+    outputs:
+      release: ${{ steps.plan.outputs.RELEASE }}
+      tag: ${{ steps.plan.outputs.RELEASE_TAG }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The last release's commit, which the plan compares the branch
+          # with.
+          fetch-depth: 0
+      - id: plan
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          tools/ci/ci.sh release-plan
+          cat release.env >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: release-notes.md
+          retention-days: 7
+
+  linux:
+    name: build (linux-${{ matrix.arch }})
+    needs: plan
+    if: needs.plan.outputs.release == '1'
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    # As ttc-check.yml's Linux jobs.
+    container:
+      image: ubuntu:22.04
+      volumes:
+        - /usr/share/dotnet:/runner-free/dotnet
+        - /usr/local/lib/android:/runner-free/android
+        - /opt/ghc:/runner-free/ghc
+        - /opt/hostedtoolcache:/runner-free/toolcache
+    env:
+      CI_BAZEL_DISK_CACHE_SIZE: 3G
+      RELEASE: "1"
+      RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+    steps:
+      - name: Free disk space
+        run: rm -rf /runner-free/*/* || true
+      - name: Install git
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates git >/dev/null
+      - uses: actions/checkout@v5
+      - uses: actions/cache/restore@v4
+        with:
+          path: .ci-cache
+          key: ttc-bazel-linux-${{ matrix.arch }}-v1-${{ github.sha }}
+          restore-keys: ttc-bazel-linux-${{ matrix.arch }}-v1-
+      - run: tools/ci/ci.sh setup
+      - run: tools/ci/ci.sh release-build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ttc-linux-${{ matrix.arch }}
+          path: ci-out/release/
+          retention-days: 7
+          if-no-files-found: error
+
+  macos:
+    name: build (darwin-arm64)
+    needs: plan
+    if: needs.plan.outputs.release == '1'
+    runs-on: macos-15
+    timeout-minutes: 300
+    env:
+      CI_CACHE_DIR: ${{ github.workspace }}/.ci-cache
+      CI_TOOLS_DIR: ${{ github.workspace }}/.ci-cache/bin
+      CI_BAZEL_DISK_CACHE_SIZE: 3G
+      RELEASE: "1"
+      RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache/restore@v4
+        with:
+          path: .ci-cache
+          key: ttc-bazel-darwin-arm64-v1-${{ github.sha }}
+          restore-keys: ttc-bazel-darwin-arm64-v1-
+      - run: tools/ci/ci.sh release-build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ttc-darwin-arm64
+          path: ci-out/release/
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    needs: [plan, linux, macos]
+    # Old releases expire daily, whether or not there is a new one.
+    if: >-
+      always() && needs.plan.result == 'success' &&
+      (needs.plan.outputs.release != '1' ||
+      (needs.linux.result == 'success' && needs.macos.result == 'success'))
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      TTC_RELEASE_KEEP_DAYS: ${{ vars.TTC_RELEASE_KEEP_DAYS }}
+    steps:
+      - uses: actions/checkout@v5
+      - if: needs.plan.outputs.release == '1'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ttc-*
+          path: ci-out/release
+          merge-multiple: true
+      - if: needs.plan.outputs.release == '1'
+        uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+      - name: Publish, and expire old releases
+        if: needs.plan.outputs.release == '1'
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_NOTES: release-notes.md
+        run: python3 tools/ci/release.py publish ci-out/release
+      - name: Expire old releases
+        if: needs.plan.outputs.release != '1'
+        run: python3 tools/ci/release.py prune

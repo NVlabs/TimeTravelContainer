@@ -1,0 +1,102 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# TTC's checks on GitHub's hosted runners, as .gitlab-ci.yml's check jobs on
+# GitLab: each push to the default branch, and each pull request to it, builds
+# ttc and ttcd and runs TTC's unit tests on Linux x86-64 and arm64 and on macOS
+# arm64. tools/ci/ci.sh holds the steps; see tools/ci/README.md.
+
+name: TTC checks
+
+"on":
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push supersedes the checks of an older one.
+concurrency:
+  group: ttc-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: check (linux-${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    # The GitLab jobs' image, as root, as they run.
+    container:
+      image: ubuntu:22.04
+      volumes:
+        # Toolchains that the runner comes with, which the job deletes for
+        # the disk space that Bazel's outputs take.
+        - /usr/share/dotnet:/runner-free/dotnet
+        - /usr/local/lib/android:/runner-free/android
+        - /opt/ghc:/runner-free/ghc
+        - /opt/hostedtoolcache:/runner-free/toolcache
+    env:
+      # Bazel's caches, within what GitHub keeps for a repository.
+      CI_BAZEL_DISK_CACHE_SIZE: 3G
+    steps:
+      - name: Free disk space
+        run: rm -rf /runner-free/*/* || true
+      - name: Install git
+        # The checkout's history, which the build's version stamp reads.
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates git >/dev/null
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v4
+        with:
+          path: .ci-cache
+          key: ttc-bazel-linux-${{ matrix.arch }}-v1-${{ github.sha }}
+          restore-keys: ttc-bazel-linux-${{ matrix.arch }}-v1-
+      - run: tools/ci/ci.sh setup
+      - run: tools/ci/ci.sh check
+      - name: Keep the failed tests' logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: check-linux-${{ matrix.arch }}
+          path: ci-out/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  macos:
+    name: check (darwin-arm64)
+    # The release's minimum macOS; Hypervisor.framework is not available to
+    # its virtual machines, whose HVF platform tests skip.
+    runs-on: macos-15
+    timeout-minutes: 300
+    env:
+      # The runner keeps nothing between jobs: Bazel's caches, and Bazel, are
+      # in the checkout, which the job's cache restores.
+      CI_CACHE_DIR: ${{ github.workspace }}/.ci-cache
+      CI_TOOLS_DIR: ${{ github.workspace }}/.ci-cache/bin
+      CI_BAZEL_DISK_CACHE_SIZE: 3G
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v4
+        with:
+          path: .ci-cache
+          key: ttc-bazel-darwin-arm64-v1-${{ github.sha }}
+          restore-keys: ttc-bazel-darwin-arm64-v1-
+      - run: tools/ci/ci.sh check
+      - name: Keep the failed tests' logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: check-darwin-arm64
+          path: ci-out/
+          retention-days: 7
+          if-no-files-found: ignore

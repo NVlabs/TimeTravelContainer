@@ -3,7 +3,8 @@
 
 # TTC's CI: light checks of every push, on Linux x86-64 and arm64 and on
 # macOS arm64, and a daily release when the default branch has changed since
-# the last one. tools/ci/ci.sh holds the steps, which also run by hand.
+# the last one. tools/ci/ci.sh holds the steps, which also run by hand, and
+# .github/workflows/ttc-*.yml runs them on GitHub.
 #
 # Checks build ttc and ttcd and run TTC's unit tests (and, on macOS, the HVF
 # platform's), in a job per platform.
@@ -18,6 +19,8 @@
 # entitlements that ttcd is signed with. The zips
 # are in the package registry, as package ttc, and are direct assets: the
 # latest release's are at <project>/-/releases/permalink/latest/downloads/<file>.
+# Daily releases expire after TTC_RELEASE_KEEP_DAYS days (a CI/CD variable; 30
+# if it is unset), the newest excepted, with their packages.
 
 workflow:
   rules:
@@ -163,5 +166,6 @@ release:publish:
   before_script:
     - apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates python3 >/dev/null
   script:
-    - if [ "$RELEASE" != 1 ]; then echo "No release"; exit 0; fi
+    # Old releases expire daily, whether or not there is a new one.
+    - if [ "$RELEASE" != 1 ]; then echo "No release"; python3 tools/ci/release.py prune; exit 0; fi
     - RELEASE_NOTES=release-notes.md python3 tools/ci/release.py publish ci-out/release
