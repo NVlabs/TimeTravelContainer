@@ -249,7 +249,21 @@ def renderer_components():
     text = "\n".join(sorted(holders)) + "\n\n" + mit[mit.index("Permission is hereby granted"):]
     venus = component_of_files("venus-protocol", versions.pop(), [("vn_protocol_renderer_*.h", text)],
                                VENUS, "generated code of ttcd's GPU renderer")
-    return [headers, venus]
+    # The virgl translator's SPIR-V constants are generated of Khronos's
+    # grammar of SPIR-V and GLSL.std.450.h, as Mesa holds them, whose
+    # copyright and license, MIT, the generated file's header names.
+    gen = "runsc/ttc/gfxrenderer/virgl/spirv/spirv_gen.go"
+    with open(gen) as f:
+        generated = f.read()
+    holder = re.search(r"^// SPDX-FileCopyrightText: (\d[^\n]* The Khronos Group Inc\.)$", generated, re.MULTILINE)
+    grammar = re.search(r"from the grammar of SPIR-V (\d+\.\d+), revision (\d+)", generated)
+    if not holder or not grammar or "// SPDX-License-Identifier: MIT" not in generated:
+        sys.exit(f"{gen}: no Khronos copyright, license, or grammar version")
+    text = "Copyright " + holder.group(1) + "\n\n" + mit[mit.index("Permission is hereby granted"):]
+    grammar = component_of_files("SPIR-V grammar (SPIRV-Headers)", f"{grammar.group(1)} rev. {grammar.group(2)}",
+                                 [("spirv.core.grammar.json, GLSL.std.450.h", text)], gen,
+                                 "generated code of ttcd's GPU renderer")
+    return [headers, venus, grammar]
 
 
 def moltenvk_components():
@@ -411,8 +425,9 @@ def main():
     out.append("\n".join(["| Component | Patch |", "|---|---|"] +
                          [f"| {name} | [{patch}]({patch}) |" for name, patch in bazel_patches()]) + "\n")
     out.append("### C and C++ components\n")
-    out.append("`ttcd`'s GPU renderer compiles Vulkan's headers and the code that venus-protocol "
-               "generates, which this repository holds, and links Zink and what it needs of Mesa, "
+    out.append("`ttcd`'s GPU renderer compiles Vulkan's headers, the code that venus-protocol "
+               "generates, and constants generated of Khronos's SPIR-V grammar, which this "
+               "repository holds, and links Zink and what it needs of Mesa, "
                "which Bazel builds from Mesa's release, with what that holds; on macOS, `ttcd` "
                "also links MoltenVK's static library, of its release, with what that holds.\n")
     out.append(table(["Component", "Version", "License", "Use"], native))

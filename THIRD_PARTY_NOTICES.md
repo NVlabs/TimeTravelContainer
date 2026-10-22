@@ -83,12 +83,13 @@ Bazel builds apply these patches to the components they name.
 
 ### C and C++ components
 
-`ttcd`'s GPU renderer compiles Vulkan's headers and the code that venus-protocol generates, which this repository holds, and links Zink and what it needs of Mesa, which Bazel builds from Mesa's release, with what that holds; on macOS, `ttcd` also links MoltenVK's static library, of its release, with what that holds.
+`ttcd`'s GPU renderer compiles Vulkan's headers, the code that venus-protocol generates, and constants generated of Khronos's SPIR-V grammar, which this repository holds, and links Zink and what it needs of Mesa, which Bazel builds from Mesa's release, with what that holds; on macOS, `ttcd` also links MoltenVK's static library, of its release, with what that holds.
 
 | Component | Version | License | Use |
 |---|---|---|---|
 | Vulkan-Headers | 1.4.357 | Apache-2.0 OR MIT | compiled into ttcd's GPU renderer |
 | venus-protocol | 1.1.3 | MIT | generated code of ttcd's GPU renderer |
+| SPIR-V grammar (SPIRV-Headers) | 1.6 rev. 7 | MIT | generated code of ttcd's GPU renderer |
 | MoltenVK | 1.4.2 | Apache-2.0 | linked into ttcd on macOS |
 | SPIRV-Cross | 6c09849fe88c | Apache-2.0 | in MoltenVK |
 | SPIRV-Tools | 0d6fd73ca738 | Apache-2.0 | in MoltenVK |
@@ -560,6 +561,20 @@ Of venus-protocol 1.1.3 (vn_protocol_renderer_*.h).
 Copyright 2020 Google LLC
 Copyright 2022 Collabora Ltd.
 Copyright 2022 Google LLC
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+````
+
+### MIT
+
+Of SPIR-V grammar (SPIRV-Headers) 1.6 rev. 7 (spirv.core.grammar.json, GLSL.std.450.h).
+
+````text
+Copyright 2014-2024 The Khronos Group Inc.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
 
