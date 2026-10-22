@@ -33,6 +33,12 @@ func (a *arena) reset() {
 	a.dec.ResetTempPool()
 }
 
+// release frees the arena's memory, of an arena no longer used.
+func (a *arena) release() {
+	a.reset()
+	a.pool.Release()
+}
+
 // get returns a new, zeroed T of a.
 func get[T any](a *arena) *T {
 	p := a.dec.AllocTemp(unsafe.Sizeof(*new(T)))
@@ -94,6 +100,10 @@ type Device struct {
 	mu  sync.Mutex
 	qmu sync.Mutex
 	a   *arena
+	// waitArenas are arenas of fences' waits, of any goroutine, which
+	// waitMu guards.
+	waitMu     sync.Mutex
+	waitArenas []*arena
 
 	lib       *vk.Library
 	inst      vn.Handle
@@ -450,7 +460,13 @@ func (d *Device) createDevice() error {
 // Destroy destroys the device, whose objects must be destroyed.
 func (d *Device) Destroy() {
 	a := d.a
-	defer a.reset()
+	defer func() {
+		a.release()
+		for _, w := range d.waitArenas {
+			w.release()
+		}
+		d.waitArenas = nil
+	}()
 	if d.dev != 0 {
 		w := get[vn.Args_vkDeviceWaitIdle](a)
 		w.Device = d.dev
@@ -479,6 +495,27 @@ func (d *Device) Destroy() {
 		d.pdTable.Free()
 		d.inst = 0
 	}
+}
+
+// waitArena returns an arena of a fence's wait, of any goroutine, which
+// putWaitArena takes back.
+func (d *Device) waitArena() *arena {
+	d.waitMu.Lock()
+	defer d.waitMu.Unlock()
+	if n := len(d.waitArenas); n != 0 {
+		a := d.waitArenas[n-1]
+		d.waitArenas = d.waitArenas[:n-1]
+		return a
+	}
+	return newArena()
+}
+
+// putWaitArena takes back an arena of waitArena's.
+func (d *Device) putWaitArena(a *arena) {
+	a.reset()
+	d.waitMu.Lock()
+	defer d.waitMu.Unlock()
+	d.waitArenas = append(d.waitArenas, a)
 }
 
 // memoryType returns the index of the first memory type of bits that has

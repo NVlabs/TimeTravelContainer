@@ -7,6 +7,7 @@ package vkgl
 
 import (
 	"fmt"
+	"sync"
 	"unsafe"
 
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/venus/vk"
@@ -62,6 +63,11 @@ type batch struct {
 	queries []*vkQuery
 	// dropped is whether a flush dropped the batch, of a lost device.
 	dropped bool
+	// mu guards fence, which a Fence's Wait, of any goroutine, waits for,
+	// and which the context destroys as it frees the batch, of no waiter;
+	// done is whether the GPU finished the batch, as a wait found.
+	mu   sync.Mutex
+	done bool
 }
 
 // NewContext returns a new context.
@@ -95,7 +101,7 @@ func (c *Context) Destroy() {
 		c.waitOldest()
 	}
 	a := c.a
-	defer a.reset()
+	defer a.release()
 	c.destroyQueryPools(&c.occlusion)
 	c.destroyQueryPools(&c.timestamps)
 	c.destroyBlitter()
@@ -146,7 +152,8 @@ func (c *Context) begin() error {
 	return nil
 }
 
-// Fence is a batch that a flush submitted, which Wait waits for.
+// Fence is a batch that a flush submitted, which Wait waits for, of any
+// goroutine, as the context's goes on.
 type Fence struct {
 	c *Context
 	b *batch
@@ -205,44 +212,62 @@ func (c *Context) Flush() *Fence {
 	return &Fence{c: c, b: b}
 }
 
-// Wait waits until the GPU finished the fence's batch.
+// Wait waits until the GPU finished the fence's batch. It touches nothing
+// of the context's but the batch's fence: the context's goroutine frees the
+// batch once the GPU is done with it.
 func (f *Fence) Wait() {
-	if f == nil || f.b.fence == 0 {
+	if f == nil {
 		return
 	}
-	c := f.c
-	for len(c.inflight) != 0 {
-		done := c.inflight[0] == f.b
-		c.waitOldest()
-		if done {
-			return
-		}
+	d := f.c.d
+	a := d.waitArena()
+	defer d.putWaitArena(a)
+	f.b.wait(d, a)
+}
+
+// wait waits until the GPU finished b, of a, an arena of the caller's.
+func (b *batch) wait(d *Device, a *arena) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.done || b.fence == 0 {
+		return
 	}
+	fence := get[vn.Handle](a)
+	*fence = b.fence
+	wf := get[vn.Args_vkWaitForFences](a)
+	wf.Device, wf.FenceCount, wf.PFences, wf.WaitAll, wf.Timeout = d.dev, 1, unsafe.Pointer(fence), 1, ^uint64(0)
+	vk.Call(vn.VK_COMMAND_TYPE_vkWaitForFences_EXT, d.table, unsafe.Pointer(wf))
+	// Or the device is lost, whose batches never finish.
+	b.done = true
 }
 
 // waitOldest waits for the oldest batch in flight, and frees it.
 func (c *Context) waitOldest() {
 	b := c.inflight[0]
 	c.inflight = c.inflight[1:]
-	a := c.a
-	defer a.reset()
-	fence := get[vn.Handle](a)
-	*fence = b.fence
-	wf := get[vn.Args_vkWaitForFences](a)
-	wf.Device, wf.FenceCount, wf.PFences, wf.WaitAll, wf.Timeout = c.d.dev, 1, unsafe.Pointer(fence), 1, ^uint64(0)
-	vk.Call(vn.VK_COMMAND_TYPE_vkWaitForFences_EXT, c.d.table, unsafe.Pointer(wf))
+	b.wait(c.d, c.a)
+	c.a.reset()
 	c.freeBatch(b)
 }
 
-// retire frees the batches that the GPU finished.
+// retire frees the batches that the GPU finished, in order, until one that
+// it has not, or that another goroutine waits for.
 func (c *Context) retire() {
 	a := c.a
 	for len(c.inflight) != 0 {
 		b := c.inflight[0]
-		gs := get[vn.Args_vkGetFenceStatus](a)
-		gs.Device, gs.Fence = c.d.dev, b.fence
-		vk.Call(vn.VK_COMMAND_TYPE_vkGetFenceStatus_EXT, c.d.table, unsafe.Pointer(gs))
-		if gs.Ret != vn.VK_SUCCESS {
+		if !b.mu.TryLock() {
+			return
+		}
+		if !b.done {
+			gs := get[vn.Args_vkGetFenceStatus](a)
+			gs.Device, gs.Fence = c.d.dev, b.fence
+			vk.Call(vn.VK_COMMAND_TYPE_vkGetFenceStatus_EXT, c.d.table, unsafe.Pointer(gs))
+			b.done = gs.Ret == vn.VK_SUCCESS
+		}
+		done := b.done
+		b.mu.Unlock()
+		if !done {
 			return
 		}
 		c.inflight = c.inflight[1:]
@@ -269,11 +294,16 @@ func (c *Context) freeBatch(b *batch) {
 		vk.Call(vn.VK_COMMAND_TYPE_vkDestroyDescriptorPool_EXT, d.table, unsafe.Pointer(dp))
 	}
 	b.descPools = nil
+	// Of no waiter, which finds it gone.
+	b.mu.Lock()
 	if b.fence != 0 {
 		df := get[vn.Args_vkDestroyFence](a)
 		df.Device, df.Fence = d.dev, b.fence
 		vk.Call(vn.VK_COMMAND_TYPE_vkDestroyFence_EXT, d.table, unsafe.Pointer(df))
+		b.fence = 0
 	}
+	b.done = true
+	b.mu.Unlock()
 	cbs := get[vn.Handle](a)
 	*cbs = b.cb
 	fc := get[vn.Args_vkFreeCommandBuffers](a)

@@ -8,6 +8,7 @@ package vkgl
 import (
 	"encoding/binary"
 	"math"
+	"sync"
 	"testing"
 
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/virgl/tospirv"
@@ -176,5 +177,42 @@ func TestContextQueries(t *testing.T) {
 	}
 	if got := result(finished); got != 1 {
 		t.Errorf("finished: %d", got)
+	}
+}
+
+// TestFenceWaitConcurrent waits for fences of other goroutines as the
+// context's goes on submitting and retiring batches, as the decoder's
+// fences are waited for.
+func TestFenceWaitConcurrent(t *testing.T) {
+	d := newTestDevice(t)
+	c, err := d.NewContext()
+	if err != nil {
+		t.Fatalf("NewContext: %v", err)
+	}
+	defer c.Destroy()
+	buf, err := d.NewBuffer(4096, BufferTransferSrc|BufferTransferDst, false)
+	if err != nil {
+		t.Fatalf("NewBuffer: %v", err)
+	}
+	defer d.DestroyBuffer(buf)
+	var wg sync.WaitGroup
+	data := make([]byte, 4096)
+	for i := range 200 {
+		data[0] = byte(i)
+		if err := c.WriteBuffer(buf, 0, data); err != nil {
+			t.Fatalf("WriteBuffer: %v", err)
+		}
+		f := c.Flush()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			f.Wait()
+			f.Wait()
+		}()
+	}
+	wg.Wait()
+	got := make([]byte, 1)
+	if err := c.ReadBuffer(buf, 0, got); err != nil || got[0] != 199 {
+		t.Errorf("ReadBuffer: %v %v, want 199", got, err)
 	}
 }
