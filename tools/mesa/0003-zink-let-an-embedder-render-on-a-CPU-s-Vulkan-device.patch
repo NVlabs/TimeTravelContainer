@@ -1,0 +1,58 @@
+From: Zizheng Guo <gzz_2000@126.com>
+Subject: [PATCH] zink: let an embedder render on a CPU's Vulkan device
+
+Zink renders on a CPU's Vulkan device, such as lavapipe, only where
+LIBGL_ALWAYS_SOFTWARE asks it to. TTC's GPU renderer renders on the host's
+CPU device where the host has no GPU, as its Venus renderer does: it now
+sets zink_vk_cpu_device before it creates a screen, rather than change the
+process's environment, which other threads read.
+
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: MIT
+---
+
+diff --git a/src/gallium/drivers/zink/zink_public.h b/src/gallium/drivers/zink/zink_public.h
+--- a/src/gallium/drivers/zink/zink_public.h
++++ b/src/gallium/drivers/zink/zink_public.h
+@@ -24,6 +24,8 @@
+ #ifndef ZINK_PUBLIC_H
+ #define ZINK_PUBLIC_H
+ 
++#include <stdbool.h>
++
+ struct pipe_screen;
+ struct renderonly;
+ struct sw_winsys;
+@@ -35,6 +37,11 @@
+ extern void *zink_vk_get_instance_proc_addr;
+ extern void *zink_vk_get_device_proc_addr;
+ 
++/* An embedder sets this before it creates a screen to have Zink render on
++ * a CPU's Vulkan device, such as lavapipe, as LIBGL_ALWAYS_SOFTWARE has it,
++ * without changing the process's environment, which other threads read. */
++extern bool zink_vk_cpu_device;
++
+ struct pipe_screen *
+ zink_create_screen(struct sw_winsys *winsys, const struct pipe_screen_config *config);
+ 
+diff --git a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zink_screen.c
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -65,6 +65,7 @@
+ /* See zink_public.h. */
+ void *zink_vk_get_instance_proc_addr;
+ void *zink_vk_get_device_proc_addr;
++bool zink_vk_cpu_device;
+ 
+ static int num_screens = 0;
+ bool zink_tracing = false;
+@@ -1770,7 +1771,8 @@
+ static void
+ choose_pdev(struct zink_screen *screen, int64_t dev_major, int64_t dev_minor, uint64_t adapter_luid)
+ {
+-   bool cpu = debug_get_bool_option("LIBGL_ALWAYS_SOFTWARE", false) ||
++   bool cpu = zink_vk_cpu_device ||
++              debug_get_bool_option("LIBGL_ALWAYS_SOFTWARE", false) ||
+               debug_get_bool_option("D3D_ALWAYS_SOFTWARE", false);
+ 
+    if (cpu || zink_picks_device(dev_major, adapter_luid)) {
