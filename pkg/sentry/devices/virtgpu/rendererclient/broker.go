@@ -66,6 +66,12 @@ func (b *Broker) start() (int, error) {
 		m.CloseFDs()
 		return -1, fmt.Errorf("the broker answered with %d descriptors", len(m.FDs))
 	}
+	// The broker keeps its end of the connection open until it hears that
+	// the Sentry received it: see gfxproto.RendererReceived.
+	if err := b.conn.Send(gfxproto.MsgRendererReceived, 0, &gfxproto.RendererReceived{}, nil); err != nil {
+		m.CloseFDs()
+		return -1, fmt.Errorf("telling the broker that the renderer's connection arrived: %w", err)
+	}
 	return m.FDs[0], nil
 }
 

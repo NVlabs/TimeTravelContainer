@@ -39,3 +39,11 @@ cc_library(
     target_compatible_with = ["@platforms//os:macos"],
     deps = [":static_library"],
 )
+
+# MoltenVK's own headers, without its copy of Vulkan's, for Zink (@mesa).
+cc_library(
+    name = "mvk_headers",
+    hdrs = glob(["MoltenVK/include/MoltenVK/*.h"]),
+    strip_include_prefix = "MoltenVK/include",
+    target_compatible_with = ["@platforms//os:macos"],
+)

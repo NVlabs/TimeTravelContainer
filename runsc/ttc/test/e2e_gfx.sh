@@ -5,9 +5,10 @@
 
 # Manual end-to-end coverage for the virtual GPU, --gfx: vulkaninfo, an
 # offscreen render's checksum (test/gfx/vkoffscreen.c), OpenGL ES by Zink
-# (test/gfx/gloffscreen.c), and forks with --gfx-fork=device-lost and
-# --gfx-fork=snapshot, in containers whose renderer is ttc-gfx-renderer on
-# the host's GPU, and whose Vulkan driver is the daemon's.
+# (test/gfx/gloffscreen.c), on macOS by Debian's virgl driver too, and forks
+# with --gfx-fork=device-lost and --gfx-fork=snapshot, in containers whose
+# renderer is ttc-gfx-renderer on the host's GPU, and whose Vulkan driver is
+# the daemon's.
 #
 # It needs:
 #   TTC and TTCD, the binaries;
@@ -173,6 +174,15 @@ case "$result" in
   *"renderer zink"*"$DEVICE"*"gloffscreen: ok checksum=$WANT_GL_CHECKSUM"*) ;;
   *) fail "gloffscreen: $result" ;;
 esac
+# On macOS, Debian's Mesa drives the GPU with its virgl driver by default,
+# which the renderer serves with Zink on the host: the same render.
+if [ "$(uname -s)" = Darwin ]; then
+  result=$(ttc exec "$NAME@main" /work/gloffscreen 2>&1) || fail "gloffscreen by virgl: $result"
+  case "$result" in
+    *"renderer virgl (zink"*"gloffscreen: ok checksum=$WANT_GL_CHECKSUM"*) ;;
+    *) fail "gloffscreen by virgl: $result" ;;
+  esac
+fi
 
 # Repeat the render: each run creates a context of the branch's renderer.
 for i in 1 2 3; do
@@ -307,7 +317,8 @@ ttc rm -f "$NAME" >/dev/null
 # A family with --gfx-fork=snapshot: a fork's child resumes the GPU's state,
 # which the family's renderer clones, recorded command buffers too, so the
 # Vulkan render loop records them once; Zink records its own for each draw.
-# The family forks thrice: a child, two children at once, and a child's
+# On macOS a third loop renders by virgl, whose contexts the renderer clones
+# too. The family forks thrice: a child, two children at once, and a child's
 # child.
 SNAP="$NAME-snap"
 SNAP_BRANCHES="kid one two grandkid"
@@ -326,8 +337,17 @@ ttc exec -d "$SNAP@main" sh -c \
 ttc exec -d -e "$ZINK" "$SNAP@main" sh -c \
   'cd /work && ./gloffscreen 300 20 >/tmp/gl.log 2>&1
    echo "exit=$?" >>/tmp/gl.log' >/dev/null
+GL_LOGS=/tmp/gl.log
+if [ "$(uname -s)" = Darwin ]; then
+  ttc exec -d "$SNAP@main" sh -c \
+    'cd /work && ./gloffscreen 300 20 >/tmp/virgl.log 2>&1
+     echo "exit=$?" >>/tmp/virgl.log' >/dev/null
+  GL_LOGS="$GL_LOGS /tmp/virgl.log"
+fi
 wait_log "$SNAP@main" "iteration 3 ok" 60
-wait_log "$SNAP@main" "iteration 3 ok" 60 /tmp/gl.log
+for gl in $GL_LOGS; do
+  wait_log "$SNAP@main" "iteration 3 ok" 60 "$gl"
+done
 ttc fork "$SNAP@main" kid >/dev/null
 sleep 1
 ttc fork "$SNAP@main" one two >/dev/null
@@ -340,12 +360,14 @@ for target in "$SNAP@main" $(for b in $SNAP_BRANCHES; do echo "$SNAP@$b"; done);
     *"iteration 300 ok"*"vkoffscreen: ok checksum=$WANT_CHECKSUM"*exit=0) ;;
     *) fail "$target's render loop, across a snapshot fork: $loop_log" ;;
   esac
-  wait_log "$target" "^exit=" 180 /tmp/gl.log
-  gl_log=$(ttc exec "$target" cat /tmp/gl.log)
-  case "$gl_log" in
-    *"iteration 300 ok"*"gloffscreen: ok checksum=$WANT_GL_CHECKSUM"*exit=0) ;;
-    *) fail "$target's OpenGL loop, across a snapshot fork: $gl_log" ;;
-  esac
+  for gl in $GL_LOGS; do
+    wait_log "$target" "^exit=" 180 "$gl"
+    gl_log=$(ttc exec "$target" cat "$gl")
+    case "$gl_log" in
+      *"iteration 300 ok"*"gloffscreen: ok checksum=$WANT_GL_CHECKSUM"*exit=0) ;;
+      *) fail "$target's OpenGL loop ($gl), across a snapshot fork: $gl_log" ;;
+    esac
+  done
 done
 ttc rm -f "$SNAP" >/dev/null
 echo "ttc gfx e2e: ok"

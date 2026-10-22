@@ -353,8 +353,13 @@ func (fd *renderFD) getparam(t *kernel.Task, cmd uint32, addr hostarch.Addr) err
 		linux.VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME:
 		value = 1
 	case linux.VIRTGPU_PARAM_CROSS_DEVICE:
-		// The device cannot share resources with other virtio devices.
-		value = 0
+		// Linux offers cross-device resources where the device gives
+		// resources UUIDs, by which other virtio devices import them. The
+		// Sentry has no other virtio devices: a cross-device resource is
+		// one that the guest shares by dma-buf, as any resource. Mesa's
+		// Venus driver before 24.2 requires the parameter, which Android
+		// images such as redroid's ship.
+		value = 1
 	case linux.VIRTGPU_PARAM_SUPPORTED_CAPSET_IDS:
 		value = int32(fd.dev.capsetMask)
 	default:
@@ -718,10 +723,12 @@ func (fd *renderFD) resourceCreateBlob(t *kernel.Task, cmd uint32, addr hostarch
 	// VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME, which the device offers, for
 	// ChromeOS's VIRTGPU_PARAM_CREATE_GUEST_HANDLE, and ask for blobs of
 	// their memory with host handles, which the renderer's memory, that the
-	// guest maps as its own, is.
+	// guest maps as its own, is. Cross-device blobs are shareable ones (see
+	// getparam), as Mesa's Venus driver makes the memory that it exports
+	// as dma-bufs.
 	const knownFlags = linux.VIRTGPU_BLOB_FLAG_USE_MAPPABLE | linux.VIRTGPU_BLOB_FLAG_USE_SHAREABLE |
 		linux.VIRTGPU_BLOB_FLAG_USE_CROSS_DEVICE | linux.VIRTGPU_BLOB_FLAG_CREATE_GUEST_HANDLE
-	if rc.BlobFlags&^knownFlags != 0 || rc.BlobFlags&linux.VIRTGPU_BLOB_FLAG_USE_CROSS_DEVICE != 0 {
+	if rc.BlobFlags&^knownFlags != 0 {
 		return linuxerr.EINVAL
 	}
 	switch rc.BlobMem {

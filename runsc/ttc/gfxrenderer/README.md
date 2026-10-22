@@ -3,15 +3,21 @@
 `ttc-gfx-renderer` (`runsc/ttcgfx`) renders what the virtual GPUs
 (`pkg/sentry/devices/virtgpu`) of a family's branches submit, with TTC's
 Venus renderer (`venus/`), for guests whose Vulkan driver is Mesa's Venus
-driver. The design is in `g3doc/proposals/ttc_venus_renderer.md`, and the
-virtual GPU's in `g3doc/proposals/ttc_gpu_gfx_nvproxy.md`.
+driver, and, on macOS, with its virgl renderer (`virgl/`), for guests whose
+OpenGL driver is Mesa's virgl driver. The design is in
+`g3doc/proposals/ttc_venus_renderer.md`, and the virtual GPU's in
+`g3doc/proposals/ttc_gpu_gfx_nvproxy.md`.
 
 *   `serve-family` renders for the branches of a family, a connection to each,
     speaking `pkg/gfxproto`. The daemon's broker (`ServeBroker`), which each
     Sentry asks for a branch's renderer, gives it the connections, on the
     control connection that is its fd 3, and starts it when the family has
     none. It exits once it serves no branch and keeps nothing for a fork's
-    children.
+    children. The broker keeps its copies of a connection's ends until the
+    renderer and the Sentry say that they received them: macOS may flush a
+    Unix socket whose every reference is in a message in flight, and the
+    renderer then read the end of a connection whose Sentry was there, as
+    one boot of redroid in about sixteen did.
 *   `probe` prints the renderer's capability sets as JSON. The Sentry needs
     them before any renderer runs.
 *   `launch` starts renderers for the ttcd connected to its fd 3
@@ -102,10 +108,12 @@ container sets it: the Venus driver that distributions package (Debian's
 Applications need no change: Vulkan ones find the GPU, and OpenGL ones that
 use Mesa's EGL on its surfaceless platform render on it by Zink. On macOS,
 Zink on MoltenVK has only OpenGL 2.1 and OpenGL ES 2.0, as MoltenVK has
-neither transform feedback nor geometry shaders, and applications that need
-more would fail rather than render in software (Mesa's llvmpipe has OpenGL
-4.6): there, OpenGL renders in software unless an application sets
-`MESA_LOADER_DRIVER_OVERRIDE=zink`. Chromium renders on the GPU with ANGLE
+neither transform feedback nor geometry shaders: there, Mesa's OpenGL drives
+the GPU with its virgl driver, which the renderer serves with Zink on the
+host (see [virgl](#virgl)), with OpenGL 3.1 and OpenGL ES 3.1, unless an
+application sets `MESA_LOADER_DRIVER_OVERRIDE=zink`, for Zink in the guest,
+or `LIBGL_ALWAYS_SOFTWARE=1`, for Mesa's llvmpipe, which has OpenGL 4.6 in
+software. Chromium renders on the GPU with ANGLE
 on Vulkan (`--use-angle=vulkan`), which offers OpenGL ES 3, and llama.cpp's
 Vulkan backend computes on it. The driver has no window systems
 (`-Dplatforms=`), which would link libxcb and libwayland: X11 and Wayland
@@ -179,5 +187,98 @@ within a second after.
 `runsc/ttc/test/e2e_redroid.sh` boots it so, checks that SurfaceFlinger and
 apps render with ANGLE on the GPU, that the screen records to video, and
 that both branches of a live fork run on, and installs and runs an APK.
+
+redroid 14's own Venus driver, redroid's build of Mesa 24.0.8, does not do:
+the device and the renderer serve it, as they serve Venus drivers before
+Mesa 24.2 (`CROSS_DEVICE`, and sync files that `venus/syncfd_unsafe.go`
+emulates), and SurfaceFlinger starts on it, but the build offers no
+`VK_ANDROID_external_memory_android_hardware_buffer`, without which ANGLE
+has no `EGL_ANDROID_image_native_buffer` and SurfaceFlinger composes no
+app's buffers. Android 14's Vulkan loader also offers ANGLE
+`VK_EXT_swapchain_maintenance1` on it, whose feature the driver refuses at
+`vkCreateDevice` unless ANGLE leaves it off
+(`debug.angle.feature_overrides_disabled=supportsSwapchainMaintenance1`).
+
+## virgl
+
+On macOS the renderer also serves Mesa's virgl driver, the OpenGL driver for
+virtio-gpu that distributions' Mesa and Android images ship: it offers
+virgl's capability sets, 1 and 2, and executes the contexts of those, or of
+none, which guests create without asking for one, with Zink, Mesa's Gallium
+driver on Vulkan, which ttcd links on the MoltenVK that the Venus renderer
+links (`tools/mesa/README.md`). virgl's commands are Gallium's calls, of
+Gallium's state objects and TGSI shaders, which Zink takes as they are:
+`virgl/context_unsafe.go` checks each command and resolves its handles, and
+`virgl/pipe_darwin.c` checks what Zink trusts of its fields and makes the
+call, as virglrenderer's vrend does on the host's OpenGL. A command that a
+guest's driver would not send, on which Zink could trap, ends its stream.
+
+A virgl context's classic resources are Gallium resources, and the
+renderer's shared memory, which the guest maps, is the guest's memory of
+them: transfers copy between the two. Fences of the global timeline, which
+virgl's submissions use, signal once Zink's work before them is done, and
+queries' results are in the guest's memory by then.
+
+Guests need no configuration: Debian's Mesa reports `virgl (zink Vulkan
+1.4(Apple M5 Pro (MOLTENVK)))`, with OpenGL 3.1 and OpenGL ES 3.1, more than
+Zink in the guest has, and redroid's image runs in its own host mode, with
+no file of TTC's: its Mesa's virgl driver renders SurfaceFlinger and apps,
+and its GBM allocates their buffers. With `--gfx-fork=snapshot`, it forks
+live, as its Venus driver's Android does.
+
+```sh
+ttc create --name android --gfx --gfx-fork snapshot --cap-add ALL \
+  --network ttc --nat --entrypoint /init redroid/redroid:14.0.0_64only-latest \
+  qemu=1 androidboot.hardware=redroid androidboot.use_memfd=true \
+  androidboot.redroid_gpu_mode=host androidboot.redroid_gpu_node=/dev/dri/renderD128
+```
+
+The node names the render node, which redroid otherwise finds through
+debugfs, which TTC has none of; without debugfs, redroid offers apps no
+Vulkan. Applications that need more OpenGL than virgl has here fail rather
+than render in software: they can ask for Mesa's llvmpipe with
+`LIBGL_ALWAYS_SOFTWARE=1`.
+
+OpenGL 3.0 and OpenGL ES 3.0, which Android 14's HWUI requires, require
+transform feedback, which MoltenVK, and so Zink, has none of: the renderer
+emulates it, as ANGLE does on Vulkan without it. A vertex shader with a
+stream output captures it itself: at its end it stores its outputs to the
+targets' buffers, which the renderer binds as shader buffers, at its
+vertex's index among the draw's, which a uniform buffer of the draw's
+parameters gives. The renderer keeps those slots of the vertex shader's
+state from the guest, and counts the queries of transform feedback and of
+primitives generated on the CPU, which knows each draw's size. It captures
+what OpenGL ES 3.0 allows to: lists of points, lines and triangles, of no
+indexed draw; of OpenGL's indexed and strip draws, it captures nothing, and
+logs so.
+
+TGSI's shaders differ from what Zink's own frontends give it, in ways that
+MoltenVK refuses:
+
+*   TGSI's vertex inputs have no types, and Metal requires that shaders read
+    integer vertex formats as integers: draws bind a variant of the vertex
+    shader whose inputs have the types of the vertex elements bound, as
+    virglrenderer's vrend makes for OpenGL.
+*   Zink names SPIR-V's variables by TGSI's, which MoltenVK names Metal's
+    by, and Metal fails to compile a texture named `sampler`: the
+    renderer's Vulkan, for Zink, drops the names, which are for debuggers
+    only.
+
+Where MoltenVK still fails to create a pipeline, Zink binds none, and the
+renderer drops the draws that would use it, as virglrenderer drops draws
+that it cannot draw. The renderer's Vulkan for Zink logs only MoltenVK's
+errors, not the warning that MoltenVK logs of each of Zink's pipelines.
+
+A live fork with `--gfx-fork=snapshot` clones a branch's virgl contexts, as
+it clones Venus's (`virgl/clone_unsafe.go`): a clone's sub-contexts are
+Gallium contexts of their own, in which it creates the parent's objects
+again, of what the commands that created them carried, compiles their
+shaders again, which Zink's cache of live shaders finds compiled, and binds
+and sets what the parent's state holds, of what the decoder keeps of it.
+Its resources are copies of the parent's memory and contents. A query that
+is active when the branch forks is begun again, and counts what the child
+does from the fork on. The child of a `--gfx-fork=device-lost` fork loses
+virgl's contexts, as it loses Venus's. On Linux the renderer offers no virgl
+capability sets yet.
 
 [scrcpy]: https://github.com/Genymobile/scrcpy

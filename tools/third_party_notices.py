@@ -12,13 +12,16 @@ toolchain, which must be the official release that go.mod names, as Bazel's
 is. It fetches from GitHub the license files of the Vulkan headers that the
 GPU renderer compiles, and of MoltenVK, which ttcd links on macOS, and of the
 components that MoltenVK's library holds, at the revisions of the release
-that MODULE.bazel names.
+that MODULE.bazel names. Of Mesa, whose Zink ttcd links on macOS, it reads
+the tree that Bazel fetched, and the copyright notices of the files that
+tools/mesa.BUILD compiles.
 
 Run it from the repository root whenever go.mod, the renderer's Vulkan headers
-or venus-protocol, or MoltenVK change: python3 tools/third_party_notices.py
+or venus-protocol, MoltenVK, or Mesa change: python3 tools/third_party_notices.py
 """
 
 import collections
+import glob
 import json
 import os
 import re
@@ -36,6 +39,7 @@ LICENSE_MARKERS = [
     ("Apache-2.0", [r"Apache License", r"Version 2\.0"]),
     ("MPL-2.0", [r"Mozilla Public License,? [Vv]ersion 2\.0"]),
     ("ISC", [r"Permission to use, copy, modify, and(/or)? distribute this software for any"]),
+    ("BSL-1.0", [r"Boost Software License - Version 1\.0"]),
     ("MIT", [r"Permission is hereby granted, free of charge"]),
     ("BSD-3-Clause", [r"Redistribution and use in source and binary forms", r"(Neither the name|The names? of .{0,80} may not be used)"]),
     ("BSD-2-Clause", [r"Redistribution and use in source and binary forms"]),
@@ -54,6 +58,9 @@ def classify(text):
     for spdx, patterns in LICENSE_MARKERS:
         if all(re.search(p, text) for p in patterns):
             if spdx == "BSD-2-Clause" and "BSD-3-Clause" in found:
+                continue
+            # The Boost license grants permission in the MIT license's words.
+            if spdx == "MIT" and "BSL-1.0" in found:
                 continue
             found.append(spdx)
     return found
@@ -147,19 +154,28 @@ def go_toolchain_component():
     return component("Go standard library and runtime", version, root, "linked into ttc and ttcd")
 
 
+# The components of http_archive repositories that ttc and ttcd link, by the
+# repositories' names.
+ARCHIVE_COMPONENTS = {"mesa": "Mesa"}
+
+
 def bazel_patches():
     """Returns (component, patch) for each patch MODULE.bazel applies to the Go
-    SDK or to a Go module."""
+    SDK, to a Go module, or to a component of ARCHIVE_COMPONENTS."""
     with open("MODULE.bazel") as f:
         module = f.read()
     patches = []
-    for call in re.finditer(r"(go_sdk\.from_file|go_deps\.module_override)\((.*?)\n\)", module, re.DOTALL):
+    for call in re.finditer(r"(go_sdk\.from_file|go_deps\.module_override|http_archive)\((.*?)\n\)", module, re.DOTALL):
         body = call.group(2)
         listed = re.search(r"patches\s*=\s*\[(.*?)\]", body, re.DOTALL)
         if not listed:
             continue
         if call.group(1) == "go_sdk.from_file":
             name = "Go standard library, runtime and toolchain"
+        elif call.group(1) == "http_archive":
+            name = ARCHIVE_COMPONENTS.get(re.search(r'name\s*=\s*"([^"]+)"', body).group(1))
+            if name is None:
+                continue
         else:
             name = re.search(r'path\s*=\s*"([^"]+)"', body).group(1)
         for label in re.findall(r'"//([^:"]*):([^"]+)"', listed.group(1)):
@@ -250,6 +266,101 @@ def moltenvk_components():
     return components
 
 
+# The components of others that the part of Mesa that ttcd links holds, by
+# the files of theirs that tools/mesa.BUILD compiles, which Mesa's own
+# copyright notices leave out.
+MESA_FOREIGN = ("src/util/blake3/", "src/util/xxhash.h", "src/util/softfloat.", "src/c11/")
+
+
+def mesa_tree():
+    """Returns the directory of Mesa's tree that Bazel fetched."""
+    run(["bazel", "fetch", "@mesa//:all"])
+    base = run(["bazel", "info", "output_base"]).strip()
+    trees = glob.glob(os.path.join(base, "external", "*mesa"))
+    if len(trees) != 1:
+        sys.exit(f"Mesa's tree: {trees}")
+    return trees[0]
+
+
+def mesa_license_text(tree, name):
+    """Returns the text of Mesa's licenses/name, after its SPDX preamble."""
+    with open(os.path.join(tree, "licenses", name)) as f:
+        text = f.read()
+    return text[text.index("License-Text:") + len("License-Text:"):].strip("\n") + "\n"
+
+
+def comment_block(path, first, last):
+    """Returns the lines of the comment at the top of path from the one
+    with first through the one with last, without the comment's markers."""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        lines = f.read().split("\n")
+    start = next(i for i, l in enumerate(lines) if first in l)
+    end = next(i for i in range(start, len(lines)) if last in lines[i])
+    return "\n".join(re.sub(r"^\s*(/\*+|\*+/?|\*\*|//)? ?", "", l).rstrip() for l in lines[start:end + 1]) + "\n"
+
+
+def mesa_components():
+    with open("MODULE.bazel") as f:
+        module = f.read()
+    version = re.search(r'name = "mesa",.*?/mesa-(\d+\.\d+\.\d+)\.tar', module, re.DOTALL).group(1)
+    tree = mesa_tree()
+    with open("tools/mesa.BUILD") as f:
+        build = f.read()
+    # The files that it compiles, and the headers beside them, which they
+    # include.
+    compiled = sorted(set(p for p in re.findall(r'"((?:src|include)/[^"*]+\.(?:c|cpp|h|hpp))"', build)
+                          if os.path.exists(os.path.join(tree, p))))
+    headers = set()
+    for d in set(os.path.dirname(p) for p in compiled):
+        headers.update(os.path.relpath(h, tree) for h in glob.glob(os.path.join(tree, d, "*.h")))
+    holders = set()
+    for path in sorted(set(compiled) | headers):
+        if path.startswith(MESA_FOREIGN):
+            continue
+        with open(os.path.join(tree, path), encoding="utf-8", errors="replace") as f:
+            head = f.read(6000)
+        for line in head.split("\n"):
+            m = re.match(r"^\W*(Copyright\b[ :(©cC)]*\d.*?)\s*(\*/)?$", line.strip())
+            if m:
+                holders.add(" ".join(m.group(1).split()))
+    if not holders:
+        sys.exit(f"Mesa {version}: no copyright notices in {tree}")
+    mit = mesa_license_text(tree, "MIT")
+    mit = mit[mit.index("Permission is hereby granted"):]
+    components = [component_of_files("Mesa", version, [("copyright notices of the files linked, and licenses/MIT",
+                                                        "\n".join(sorted(holders)) + "\n\n" + mit)],
+                                     tree, "linked into ttcd on macOS (Zink, Gallium, NIR, and utilities)")]
+    with open(os.path.join(tree, "src/util/blake3/README")) as f:
+        blake3 = re.search(r"version (\d+(?:\.\d+)+)", f.read()).group(1)
+    components.append(component_of_files("BLAKE3", blake3, [("licenses/Apache-2.0", mesa_license_text(tree, "Apache-2.0"))],
+                                         tree, "in Mesa", "CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception"))
+    with open(os.path.join(tree, "src/util/xxhash.h")) as f:
+        xxhash = ".".join(re.findall(r"#define XXH_VERSION_(?:MAJOR|MINOR|RELEASE)\s+(\d+)", f.read()))
+    components.append(component_of_files("xxHash", xxhash, [("src/util/xxhash.h", comment_block(
+        os.path.join(tree, "src/util/xxhash.h"), "xxHash - Extremely Fast Hash algorithm", "POSSIBILITY OF SUCH DAMAGE"))],
+        tree, "in Mesa"))
+    softfloat = comment_block(os.path.join(tree, "src/util/softfloat.c"), "License for Berkeley SoftFloat",
+                              "POSSIBILITY OF SUCH DAMAGE")
+    components.append(component_of_files("Berkeley SoftFloat", re.search(r"Release (\w+)", softfloat).group(1),
+                                          [("src/util/softfloat.c", softfloat)], tree, "in Mesa"))
+    with open(os.path.join(tree, "src/c11/impl/threads_posix.c")) as f:
+        c11 = re.search(r"Copyright .+?\.", f.read()).group(0)
+    components.append(component_of_files("C11 threads emulation (yohhoy)", version,
+                                          [("src/c11/impl/threads_posix.c, licenses/BSL-1.0",
+                                            c11 + "\n\n" + mesa_license_text(tree, "BSL-1.0"))],
+                                          tree, "in Mesa"))
+    # Vulkan's headers, which Zink compiles, carry no license file of their
+    # own in Mesa's tree.
+    with open(os.path.join(tree, "include/vulkan/vulkan_core.h")) as f:
+        core = f.read()
+    major, minor = re.search(r"VK_HEADER_VERSION_COMPLETE VK_MAKE_API_VERSION\(0, (\d+), (\d+), VK_HEADER_VERSION\)", core).groups()
+    tag = f"v{major}.{minor}." + re.search(r"#define VK_HEADER_VERSION (\d+)", core).group(1)
+    components.append(component_of_files("Vulkan-Headers", tag.lstrip("v"),
+                                         github_license_files("KhronosGroup/Vulkan-Headers", tag),
+                                         "KhronosGroup/Vulkan-Headers", "in Mesa", "Apache-2.0 OR MIT"))
+    return components
+
+
 def gvisor_texts():
     """Returns the MIT and BSD texts that LICENSE notes some of gVisor's files carry."""
     with open("LICENSE") as f:
@@ -273,7 +384,7 @@ def main():
         sys.exit("run from the repository root")
     go = go_components()
     toolchain = go_toolchain_component()
-    native = renderer_components() + moltenvk_components()
+    native = renderer_components() + moltenvk_components() + mesa_components()
     out = []
     out.append("# Third-party notices\n")
     out.append(
@@ -302,7 +413,8 @@ def main():
     out.append("### C and C++ components\n")
     out.append("`ttcd`'s GPU renderer compiles Vulkan's headers and the code that venus-protocol "
                "generates, which this repository holds; on macOS, `ttcd` also links MoltenVK's "
-               "static library, of its release, with what that holds.\n")
+               "static library, of its release, with what that holds, and Zink and what it needs "
+               "of Mesa, which Bazel builds from Mesa's release, with what that holds.\n")
     out.append(table(["Component", "Version", "License", "Use"], native))
     out.append("### Go modules\n")
     out.append("Every module `go.mod` requires. `ttc` and `ttcd` link those their packages "

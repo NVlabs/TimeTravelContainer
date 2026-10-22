@@ -90,12 +90,33 @@ func ServeBroker(fd int, opts BrokerOptions) error {
 			}
 			continue
 		}
+		// The broker closes its end of the connection once the Sentry says
+		// that it received it: see gfxproto.RendererReceived.
 		err = conn.Send(gfxproto.MsgReply, m.Seq, &gfxproto.Reply{}, nil, sentryFD)
+		if err == nil {
+			err = recvReceived(conn)
+		}
 		unix.Close(sentryFD)
+		if errors.Is(err, gfxproto.ErrClosed) {
+			return nil
+		}
 		if err != nil {
 			return err
 		}
 	}
+}
+
+// recvReceived receives the Sentry's RendererReceived.
+func recvReceived(conn *gfxproto.Conn) error {
+	m, err := conn.Recv()
+	if err != nil {
+		return err
+	}
+	m.CloseFDs()
+	if m.Type != gfxproto.MsgRendererReceived {
+		return fmt.Errorf("unexpected %v", m.Type)
+	}
+	return nil
 }
 
 // connectFamilyRenderer returns the Sentry's end of a new connection to the
@@ -114,11 +135,13 @@ func connectFamilyRenderer(opts *BrokerOptions, family *gfxproto.Conn) (int, *gf
 		if err != nil {
 			return -1, family, err
 		}
+		// The broker closes the renderer's end once the renderer replies,
+		// which it does once it received it: see gfxproto.RendererReceived.
 		err = family.Send(gfxproto.MsgServeConnection, 0, &gfxproto.ServeConnection{}, nil, fds[1])
-		unix.Close(fds[1])
 		if err == nil {
 			err = recvServing(family)
 		}
+		unix.Close(fds[1])
 		if err == nil {
 			return fds[0], family, nil
 		}

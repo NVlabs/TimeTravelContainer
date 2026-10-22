@@ -8,6 +8,7 @@ package eventfd
 import (
 	"fmt"
 	"io"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
@@ -24,11 +25,18 @@ import (
 // returns and resets their sum; the pipe can never fill.
 func Create() (Eventfd, error) {
 	var fds [2]int
-	if err := unix.Pipe(fds[:]); err != nil {
+	// Darwin has no pipe2: hold off concurrent forks until the descriptors
+	// are close-on-exec, as os.Pipe does, so that no child inherits them.
+	syscall.ForkLock.RLock()
+	err := unix.Pipe(fds[:])
+	if err == nil {
+		unix.CloseOnExec(fds[0])
+		unix.CloseOnExec(fds[1])
+	}
+	syscall.ForkLock.RUnlock()
+	if err != nil {
 		return Eventfd{}, fmt.Errorf("creating event pipe: %w", err)
 	}
-	unix.CloseOnExec(fds[0])
-	unix.CloseOnExec(fds[1])
 	if err := unix.SetNonblock(fds[1], true); err != nil {
 		_ = unix.Close(fds[0])
 		_ = unix.Close(fds[1])

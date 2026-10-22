@@ -80,6 +80,9 @@ type physicalDevice struct {
 	// emulateModifiers is whether the renderer offers DRM format modifiers
 	// and foreign queue families: see modifier_unsafe.go.
 	emulateModifiers bool
+	// emulateSemaphoreFD and emulateFenceFD are whether the renderer offers
+	// sync files of semaphores and fences: see syncfd_unsafe.go.
+	emulateSemaphoreFD, emulateFenceFD bool
 	// hostVisibleTypes are the host-visible memory types.
 	hostVisibleTypes uint32
 	// familyCount is the number of queue families that guests see.

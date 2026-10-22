@@ -4,6 +4,8 @@
 package rendererclient
 
 import (
+	"encoding/binary"
+	"math"
 	"os"
 	"testing"
 	"time"
@@ -215,6 +217,136 @@ func TestRealSnapshot(t *testing.T) {
 	copyMemory(t, childMem, offset, got, false)
 	if string(got) != string(message) {
 		t.Errorf("the restored blob holds %q, want %q", got, message)
+	}
+}
+
+// virglCommand returns a virgl command, cmd of object type obj, of payload.
+func virglCommand(cmd, obj uint32, payload ...uint32) []byte {
+	b := binary.LittleEndian.AppendUint32(nil, cmd|obj<<8|uint32(len(payload))<<16)
+	for _, d := range payload {
+		b = binary.LittleEndian.AppendUint32(b, d)
+	}
+	return b
+}
+
+// virglClear returns a virgl command that clears the framebuffer's color
+// buffer to rgba.
+func virglClear(rgba [4]float32) []byte {
+	const clearColor0 = 1 << 2
+	return virglCommand(7, 0, clearColor0, math.Float32bits(rgba[0]), math.Float32bits(rgba[1]),
+		math.Float32bits(rgba[2]), math.Float32bits(rgba[3]), 0, 0, 0)
+}
+
+// TestRealVirglSnapshot forks a branch whose virgl context cleared a render
+// target: the child's target holds what the parent's did then, and the
+// child's context has the parent's framebuffer, which the child clears.
+func TestRealVirglSnapshot(t *testing.T) {
+	broker, closeBroker := startBroker(t)
+	defer func() {
+		if err := closeBroker(); err != nil {
+			t.Errorf("ServeBroker: %v", err)
+		}
+	}()
+	sourceEvents := &events{lost: make(chan error, 1)}
+	source, err := broker.NewRenderer(sourceEvents)
+	if err != nil {
+		t.Fatalf("NewRenderer: %v", err)
+	}
+	defer source.Close()
+	if err := source.CreateContext(1, linux.VIRTGPU_DRM_CAPSET_VIRGL2, "virgl-snapshot-test"); err != nil {
+		t.Skipf("the renderer has no virgl here: %v", err)
+	}
+	// A 4x4 render target of R8G8B8A8_UNORM, the framebuffer's color
+	// buffer.
+	const size = 4 * 4 * 4
+	if err := source.CreateResource(1, 1, virtgpu.ResourceArgs{
+		Target: 2, Format: 67, Bind: 1 << 1, Width: 4, Height: 4, Depth: 1, ArraySize: 1, Size: size,
+	}); err != nil {
+		t.Fatalf("CreateResource: %v", err)
+	}
+	source.AttachResource(1, 1)
+	const surface = 10
+	cmds := virglCommand(1, 8, surface, 1, 67, 0, 0)
+	cmds = append(cmds, virglCommand(5, 0, 1, 0, surface)...)
+	red, green, blue := [4]float32{1, 0, 0, 1}, [4]float32{0, 1, 0, 1}, [4]float32{0, 0, 1, 1}
+	cmds = append(cmds, virglClear(red)...)
+	if err := source.SubmitCommand(1, cmds); err != nil {
+		t.Fatalf("SubmitCommand: %v", err)
+	}
+	sourceMem, err := source.MapResource(1)
+	if err != nil {
+		t.Fatalf("MapResource: %v", err)
+	}
+	defer sourceMem.Release()
+	// pixel reads a pixel of the target of r, whose memory is mem, once the
+	// transfer that reads it, which r executes in turn, is done, as a fence
+	// of r's context after it reports.
+	fence := uint64(0)
+	pixel := func(r virtgpu.Renderer, ev *events, mem virtgpu.ResourceMemory) [4]byte {
+		t.Helper()
+		if err := r.Transfer(1, 1, virtgpu.TransferArgs{W: 4, H: 4, D: 1}); err != nil {
+			t.Fatalf("Transfer: %v", err)
+		}
+		fence++
+		if err := r.CreateFence(virtgpu.Fence{ID: fence, CtxID: 1, HasRing: true}); err != nil {
+			t.Fatalf("CreateFence: %v", err)
+		}
+		for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+			ev.mu.Lock()
+			signaled := len(ev.fences) != 0 && ev.fences[len(ev.fences)-1].ID == fence
+			ev.mu.Unlock()
+			if signaled {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("fence %d did not signal", fence)
+			}
+		}
+		var p [4]byte
+		copyMemory(t, mem, 0, p[:], false)
+		return p
+	}
+	if p := pixel(source, sourceEvents, sourceMem); p != [4]byte{255, 0, 0, 255} {
+		t.Fatalf("the target before the snapshot: %v, want red", p)
+	}
+
+	snapshot, err := source.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	// The source renders on, alone.
+	if err := source.SubmitCommand(1, virglClear(blue)); err != nil {
+		t.Fatalf("SubmitCommand after the snapshot: %v", err)
+	}
+	if p := pixel(source, sourceEvents, sourceMem); p != [4]byte{0, 0, 255, 255} {
+		t.Errorf("the source's target after the snapshot: %v, want blue", p)
+	}
+
+	childEvents := &events{lost: make(chan error, 1)}
+	child, err := broker.NewRenderer(childEvents)
+	if err != nil {
+		t.Fatalf("NewRenderer: %v", err)
+	}
+	defer child.Close()
+	if err := child.Restore(snapshot.Data, map[uint32]uint64{1: size}, true); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	childMem, err := child.MapResource(1)
+	if err != nil {
+		t.Fatalf("MapResource after Restore: %v", err)
+	}
+	defer childMem.Release()
+	if p := pixel(child, childEvents, childMem); p != [4]byte{255, 0, 0, 255} {
+		t.Errorf("the child's target: %v, want the red of the snapshot", p)
+	}
+	if err := child.SubmitCommand(1, virglClear(green)); err != nil {
+		t.Fatalf("the child's SubmitCommand: %v", err)
+	}
+	if p := pixel(child, childEvents, childMem); p != [4]byte{0, 255, 0, 255} {
+		t.Errorf("the child's target after its clear: %v, want green", p)
+	}
+	if p := pixel(source, sourceEvents, sourceMem); p != [4]byte{0, 0, 255, 255} {
+		t.Errorf("the source's target after the child's clear: %v, want blue", p)
 	}
 }
 

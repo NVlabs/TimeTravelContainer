@@ -227,17 +227,3 @@ func (q *queue) releaseFences(s *stream) {
 	}
 	q.pool.Release()
 }
-
-func registerQueue() {
-	// The guest's driver resolves sync_fd payloads itself: the renderer has
-	// no external fences or semaphores to export.
-	handle(vn.VK_COMMAND_TYPE_vkResetFenceResourceMESA_EXT, func(s *stream, cmd *vn.Command, args unsafe.Pointer) {
-		s.fail("vkResetFenceResourceMESA: the renderer has no sync_fd fences")
-	})
-	handle(vn.VK_COMMAND_TYPE_vkWaitSemaphoreResourceMESA_EXT, func(s *stream, cmd *vn.Command, args unsafe.Pointer) {
-		s.fail("vkWaitSemaphoreResourceMESA: the renderer has no sync_fd semaphores")
-	})
-	handle(vn.VK_COMMAND_TYPE_vkImportSemaphoreResourceMESA_EXT, func(s *stream, cmd *vn.Command, args unsafe.Pointer) {
-		s.fail("vkImportSemaphoreResourceMESA: the renderer has no sync_fd semaphores")
-	})
-}

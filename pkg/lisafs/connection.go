@@ -170,8 +170,11 @@ func (c *Connection) Run() {
 
 // service starts servicing the passed channel until the channel is shutdown.
 // This is a blocking method and hence must be called in a separate goroutine.
-func (c *Connection) service(ch *channel) error {
+// It closes clientFDSock, the server's copy of the client's end of the FD
+// channel, once the client has its own: see ChannelHandler.
+func (c *Connection) service(ch *channel, clientFDSock int) error {
 	rcvDataLen, err := ch.data.RecvFirst()
+	unix.Close(clientFDSock)
 	if err != nil {
 		return err
 	}

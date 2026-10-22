@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+
+	"golang.org/x/sys/unix"
 )
 
 // connFD is the descriptor of a renderer's connection to the broker or ttcd.
@@ -62,11 +64,15 @@ func Main(args []string) int {
 			return fatal(err)
 		}
 	case "probe":
+		out, err := reserveStdout()
+		if err != nil {
+			return fatal(err)
+		}
 		capsets, err := Probe()
 		if err != nil {
 			return fatal(err)
 		}
-		if err := json.NewEncoder(os.Stdout).Encode(capsets); err != nil {
+		if err := json.NewEncoder(out).Encode(capsets); err != nil {
 			return fatal(err)
 		}
 	case "launch":
@@ -81,6 +87,23 @@ func Main(args []string) int {
 		}
 	}
 	return 0
+}
+
+// reserveStdout returns a file of the standard output, whose descriptor
+// then refers to the standard error: the probe's output is its capability
+// sets, which libraries that print to the standard output, as Zink does,
+// would corrupt.
+func reserveStdout() (*os.File, error) {
+	fd, err := unix.Dup(1)
+	if err != nil {
+		return nil, err
+	}
+	unix.CloseOnExec(fd)
+	if err := unix.Dup2(2, 1); err != nil {
+		unix.Close(fd)
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), "stdout"), nil
 }
 
 func fatal(err error) int {

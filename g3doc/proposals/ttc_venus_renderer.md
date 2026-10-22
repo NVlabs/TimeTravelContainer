@@ -126,6 +126,15 @@ and another process samples, without copies. minigbm built against
 ChromeOS's headers creates its blobs with ChromeOS's
 `VIRTGPU_BLOB_FLAG_CREATE_GUEST_HANDLE`, which the Sentry accepts.
 
+Venus drivers before Mesa 24.2, such as redroid 14's own, offer Android's
+window system only where the renderer's semaphores import sync files and
+its fences export them, which neither the renderer nor MoltenVK has: the
+renderer offers `VK_KHR_external_semaphore_fd` and `VK_KHR_external_fence_fd`
+where the host lacks them, and does what those drivers ask of the sync
+files (`venus/syncfd_unsafe.go`): it signals and waits on semaphores by
+empty submissions, and replaces a fence whose signal is pending when the
+driver resets it.
+
 ## Kernel metadata
 
 A live fork's child was the source's kernel serialized and decoded.
