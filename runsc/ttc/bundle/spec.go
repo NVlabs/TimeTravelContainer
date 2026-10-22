@@ -45,6 +45,9 @@ const (
 	// CopiedHostMountsAnnotation maps detached TTC-volume mount destinations to
 	// the host paths from which they were imported.
 	CopiedHostMountsAnnotation = "dev.timetravelcontainer.config.copied-host-mounts"
+	// DirectHostMountsAnnotation records the destinations of host binds that
+	// are writable binds of the host paths themselves.
+	DirectHostMountsAnnotation = specutils.AnnotationTTCDirectHostMounts
 
 	// DefaultStopSignal matches Docker's default graceful-termination signal.
 	DefaultStopSignal = "SIGTERM"
@@ -143,7 +146,9 @@ type ManagedVolume struct {
 }
 
 // HostMount describes a host path exposed through a read-only gofer bind, a
-// persistent CoW overlay, or a detached copy in a private ttcvol repository.
+// persistent CoW overlay, a detached copy in a private ttcvol repository, or,
+// if Direct, a writable gofer bind of the path itself, as Docker binds one,
+// which only a family that waives live forks may have.
 type HostMount struct {
 	Source          string
 	Destination     string
@@ -152,6 +157,7 @@ type HostMount struct {
 	ImmutableSource bool
 	ManagedCoW      bool
 	Copy            bool
+	Direct          bool
 	RepositoryID    string
 	RepositoryPath  string
 	CopyMode        string
@@ -867,9 +873,13 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		})
 	}
 	copiedHostMounts := make(map[string]string)
+	directHostMounts := make([]string, 0)
 	for _, mount := range opts.HostMounts {
-		if !mount.Readonly && !mount.ManagedCoW && !mount.Copy {
+		if !mount.Readonly && !mount.ManagedCoW && !mount.Copy && !mount.Direct {
 			return nil, fmt.Errorf("host mount %q at %q is writable without TTC isolation", mount.Source, mount.Destination)
+		}
+		if mount.Direct && (mount.Readonly || mount.ManagedCoW || mount.Copy || mount.Internal) {
+			return nil, fmt.Errorf("direct host mount %q at %q cannot be read-only, internal, or have a TTC layer", mount.Source, mount.Destination)
 		}
 		if mount.Readonly && (mount.ManagedCoW || mount.Copy) {
 			return nil, fmt.Errorf("read-only host mount %q at %q cannot have a writable TTC layer", mount.Source, mount.Destination)
@@ -895,6 +905,18 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 			return nil, fmt.Errorf("duplicate mount destination %q", destination)
 		}
 		seenDestinations[destination] = struct{}{}
+		if mount.Direct {
+			// Writes reach the host path, through the gofer, with no
+			// overlay above it (see runsc's gofer mount configurations).
+			mounts = append(mounts, specs.Mount{
+				Destination: destination,
+				Type:        "bind",
+				Source:      filepath.Clean(mount.Source),
+				Options:     []string{"rbind", "rw"},
+			})
+			directHostMounts = append(directHostMounts, destination)
+			continue
+		}
 		if !mount.Readonly {
 			if mount.RepositoryID == "" || mount.RepositoryPath == "" || mount.CopyMode == "" {
 				return nil, fmt.Errorf("writable host mount %q at %q is missing resolved repository metadata", mount.Source, mount.Destination)
@@ -944,6 +966,13 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 			return nil, fmt.Errorf("encoding copied host mounts: %w", err)
 		}
 		annotations[CopiedHostMountsAnnotation] = string(encoded)
+	}
+	if len(directHostMounts) != 0 {
+		encoded, err := json.Marshal(directHostMounts)
+		if err != nil {
+			return nil, fmt.Errorf("encoding direct host mount destinations: %w", err)
+		}
+		annotations[DirectHostMountsAnnotation] = string(encoded)
 	}
 	internalMounts := make([]string, 0)
 	immutableHostMounts := make([]string, 0)

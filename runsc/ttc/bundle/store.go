@@ -2777,7 +2777,7 @@ func (s Store) resolveWritableHostMounts(containerDir string, opts *PrepareOptio
 	hostMountRootCreated := false
 	for index := range opts.HostMounts {
 		mount := &opts.HostMounts[index]
-		if mount.Readonly || mount.Internal {
+		if mount.Readonly || mount.Internal || mount.Direct {
 			continue
 		}
 		if !mount.ManagedCoW && !mount.Copy {

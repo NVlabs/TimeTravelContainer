@@ -90,14 +90,6 @@ func fchown(hostFD int, uid lisafs.UID, gid lisafs.GID) error {
 	return unix.Fchownat(hostFD, "", u, g, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
 }
 
-func mapHostOwnerToGuest(_ *Config, uid, gid uint32) (uint32, uint32) {
-	return uid, gid
-}
-
-func mapGuestOwnerToHost(_ *Config, uid lisafs.UID, gid lisafs.GID) (lisafs.UID, lisafs.GID) {
-	return uid, gid
-}
-
 func fstatTo(hostFD int) (lisafs.Statx, error) {
 	var stat unix.Statx_t
 	if err := unix.Statx(hostFD, "", unix.AT_EMPTY_PATH, linux.STATX_BASIC_STATS|linux.STATX_BTIME, &stat); err != nil {

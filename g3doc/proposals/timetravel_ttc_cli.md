@@ -35,11 +35,13 @@ devpts instance with `/dev/ptmx`. Docker-compatible `--shm-size` configures the
 mode, size, and access options; TTC extensions
 `--mount type=proc|procfs|sysfs` add alternate Sentry virtual-filesystem
 views. Existing host paths can be attached read-only with Docker-style `-v`
-or `--mount` syntax. An ordinary writable host mount places a persistent,
-branch-local `ttcvol` upper over the live read-only host lower; guest writes
-never reach the host. The `:copy` extension imports the source into a detached
-private repository during creation, using reflinks opportunistically and
-falling back to streamed copies.
+or `--mount` syntax. A writable host mount without a mode, as Docker binds one,
+writes the host path itself, and needs `--waive-live-fork` (since 2026-10-22;
+it was a `:lazy_copy` mount before). The `:lazy_copy` extension places a
+persistent, branch-local `ttcvol` upper over the live read-only host lower;
+guest writes never reach the host. The `:copy` extension imports the source
+into a detached private repository during creation, using reflinks
+opportunistically and falling back to streamed copies.
 Named and anonymous disk-backed managed volumes can be attached through
 Docker-compatible syntax, initialized from image contents, and fork their
 immutable metadata root plus regular-file backing objects CoW with each live

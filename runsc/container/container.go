@@ -1119,6 +1119,10 @@ func (c *Container) initGoferConfs(ovlConf config.Overlay2, mountHints *boot.Pod
 	c.GoferMountConfs = append(c.GoferMountConfs, goferConf)
 
 	// Handle sub mounts.
+	direct, err := specutils.TTCDirectHostMounts(c.Spec)
+	if err != nil {
+		return err
+	}
 	for i := range c.Spec.Mounts {
 		if !specutils.HasMountConfig(c.Spec.Mounts[i]) {
 			continue
@@ -1131,7 +1135,7 @@ func (c *Container) initGoferConfs(ovlConf config.Overlay2, mountHints *boot.Pod
 
 		overlayMedium := ovlConf.SubMountOverlayMedium()
 		overlaySize := ovlConf.SubMountOverlaySize()
-		if specutils.IsReadonlyMount(c.Spec.Mounts[i].Options) {
+		if specutils.IsReadonlyMount(c.Spec.Mounts[i].Options) || direct[path.Clean(c.Spec.Mounts[i].Destination)] {
 			overlayMedium = config.NoOverlay
 		}
 		if hint := mountHints.FindMount(c.Spec.Mounts[i].Source); hint != nil && hint.IsSandboxLocal() {

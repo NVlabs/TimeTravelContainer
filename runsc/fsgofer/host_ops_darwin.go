@@ -179,32 +179,6 @@ func fchown(hostFD int, uid lisafs.UID, gid lisafs.GID) error {
 	return unix.Fchown(hostFD, u, g)
 }
 
-func mapHostOwnerToGuest(config *Config, uid, gid uint32) (uint32, uint32) {
-	if config == nil || !config.TrustedRootOwnership {
-		return uid, gid
-	}
-	if int(uid) == config.RUID || int(uid) == config.EUID {
-		uid = 0
-	}
-	if int(gid) == config.RGID || int(gid) == config.EGID {
-		gid = 0
-	}
-	return uid, gid
-}
-
-func mapGuestOwnerToHost(config *Config, uid lisafs.UID, gid lisafs.GID) (lisafs.UID, lisafs.GID) {
-	if config == nil || !config.TrustedRootOwnership {
-		return uid, gid
-	}
-	if uid.Ok() && uid == 0 {
-		uid = lisafs.UID(config.RUID)
-	}
-	if gid.Ok() && gid == 0 {
-		gid = lisafs.GID(config.RGID)
-	}
-	return uid, gid
-}
-
 func fstatTo(hostFD int) (lisafs.Statx, error) {
 	var stat unix.Stat_t
 	if err := unix.Fstat(hostFD, &stat); err != nil {

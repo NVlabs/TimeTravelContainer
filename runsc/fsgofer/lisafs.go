@@ -83,9 +83,10 @@ type Config struct {
 
 	// TrustedRootOwnership makes the invoking host user and group appear as
 	// Linux root, and translates guest root ownership requests back to those
-	// host IDs. This is used by Darwin's explicitly unsafe, non-chrooted gofer
-	// to provide the ownership view that a Linux user namespace normally gives
-	// to a rootless container. Linux host adapters leave ownership unchanged.
+	// host IDs. The explicitly unsafe gofer, which no user namespace maps,
+	// uses it on Darwin and Linux to give the ownership view that a Linux user
+	// namespace gives a rootless container: so that guest root may write a
+	// writable bind of a host path that the invoking user owns.
 	TrustedRootOwnership bool
 
 	// LazyFiles supplies immutable whole-file data for a skeleton rootfs.
@@ -162,6 +163,36 @@ func (i *connectionImpl) stat(hostFD int, virtualPath string) (lisafs.Statx, err
 		stat.Mode = stat.Mode&unix.S_IFMT | uint16(mode)
 	}
 	return stat, nil
+}
+
+// mapHostOwnerToGuest returns the owner that the guest sees of a host file that
+// uid and gid own: see Config.TrustedRootOwnership.
+func mapHostOwnerToGuest(config *Config, uid, gid uint32) (uint32, uint32) {
+	if config == nil || !config.TrustedRootOwnership {
+		return uid, gid
+	}
+	if int(uid) == config.RUID || int(uid) == config.EUID {
+		uid = 0
+	}
+	if int(gid) == config.RGID || int(gid) == config.EGID {
+		gid = 0
+	}
+	return uid, gid
+}
+
+// mapGuestOwnerToHost returns the host owner of a file that the guest asks
+// uid and gid to own: see Config.TrustedRootOwnership.
+func mapGuestOwnerToHost(config *Config, uid lisafs.UID, gid lisafs.GID) (lisafs.UID, lisafs.GID) {
+	if config == nil || !config.TrustedRootOwnership {
+		return uid, gid
+	}
+	if uid.Ok() && uid == 0 {
+		uid = lisafs.UID(config.RUID)
+	}
+	if gid.Ok() && gid == 0 {
+		gid = lisafs.GID(config.RGID)
+	}
+	return uid, gid
 }
 
 func (i *connectionImpl) fchown(hostFD int, uid lisafs.UID, gid lisafs.GID) error {

@@ -3889,6 +3889,44 @@ func TestBuildSpecManagedCoWHostMount(t *testing.T) {
 	}
 }
 
+// A direct host mount binds the host path itself, writable, with no TTC
+// repository, and the annotation that keeps runsc from overlaying it.
+func TestBuildSpecDirectHostMount(t *testing.T) {
+	host := t.TempDir()
+	image := ocispec.Image{Config: ocispec.ImageConfig{Cmd: []string{"true"}}}
+	spec, err := BuildSpec(image, SpecOptions{
+		RootFS:     t.TempDir(),
+		HostMounts: []HostMount{{Source: host, Destination: "/data", Direct: true}},
+	})
+	if err != nil {
+		t.Fatalf("BuildSpec: %v", err)
+	}
+	mount := spec.Mounts[len(spec.Mounts)-1]
+	if mount.Type != "bind" || mount.Source != host || mount.Destination != "/data" || !reflect.DeepEqual(mount.Options, []string{"rbind", "rw"}) {
+		t.Errorf("direct mount=%+v", mount)
+	}
+	direct, err := specutils.TTCDirectHostMounts(spec)
+	if err != nil || len(direct) != 1 || !direct["/data"] {
+		t.Errorf("direct host mounts=%v, %v", direct, err)
+	}
+	if repositories, err := specutils.TTCVolumeRepositories(spec); err != nil || len(repositories) != 0 {
+		t.Errorf("direct mount's repositories=%+v, %v", repositories, err)
+	}
+	for _, invalid := range []HostMount{
+		{Source: host, Destination: "/data"},
+		{Source: host, Destination: "/data", Direct: true, Readonly: true},
+		{
+			Source: host, Destination: "/data", Direct: true, ManagedCoW: true,
+			RepositoryID:   "0123456789abcdef0123456789abcdef",
+			RepositoryPath: "/repository", CopyMode: "reflink",
+		},
+	} {
+		if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), HostMounts: []HostMount{invalid}}); err == nil {
+			t.Errorf("BuildSpec accepted invalid host mount %+v", invalid)
+		}
+	}
+}
+
 func TestBuildSpecCopiedHostMount(t *testing.T) {
 	host := t.TempDir()
 	spec, err := BuildSpec(ocispec.Image{Config: ocispec.ImageConfig{Cmd: []string{"true"}}}, SpecOptions{

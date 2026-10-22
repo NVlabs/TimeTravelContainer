@@ -2568,20 +2568,67 @@ func TestParseImmutableHostMountAssertion(t *testing.T) {
 	}
 }
 
-func TestWritableHostMountsDefaultToManagedCoW(t *testing.T) {
+// A host bind with no mode, or rw, binds the host path itself, writable, as
+// Docker does; ro, copy and lazy_copy are explicit.
+func TestWritableHostMountsDefaultToDirect(t *testing.T) {
 	for _, input := range []struct {
 		volumes []string
 		mounts  []string
 	}{
 		{volumes: []string{"/host:/data"}},
+		{volumes: []string{"/host:/data:rw"}},
 		{mounts: []string{"type=bind,source=/host,target=/data"}},
 	} {
 		mounts, err := parseHostMounts(input.volumes, input.mounts)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(mounts) != 1 || !mounts[0].ManagedCoW || mounts[0].Readonly || mounts[0].Copy {
-			t.Errorf("writable host mounts=%+v", mounts)
+		if len(mounts) != 1 || !mounts[0].Direct || mounts[0].ManagedCoW || mounts[0].Readonly || mounts[0].Copy {
+			t.Errorf("writable host mounts of %+v=%+v", input, mounts)
+		}
+	}
+	for _, value := range []string{"/host:/data:ro,rw", "/host:/data:immutable-source", "/host:/data:rw,immutable-source"} {
+		if mounts, err := parseHostMounts([]string{value}, nil); err == nil {
+			t.Errorf("parseHostMounts(%q)=%+v, want an error", value, mounts)
+		}
+	}
+}
+
+// Only a family that waives live forks binds a host path writable.
+func TestRunAndCreateRequireForkWaiverForWritableHostBind(t *testing.T) {
+	for _, command := range []string{"run", "create"} {
+		for _, bind := range [][]string{{"-v", "/host:/data"}, {"-v", "/host:/data:rw"}, {"--mount", "type=bind,source=/host,target=/data"}} {
+			b := &fakeBackend{}
+			var stdout, stderr bytes.Buffer
+			args := append(append([]string{command}, bind...), "busybox")
+			if status := runCommand(args, &stdout, &stderr, b); status != 1 {
+				t.Errorf("%q without waiver status=%d, want 1", args, status)
+			}
+			if !strings.Contains(stderr.String(), "--waive-live-fork") || !strings.Contains(stderr.String(), ":lazy_copy") {
+				t.Errorf("%q error=%q, want waiver and lazy_copy guidance", args, stderr.String())
+			}
+			stderr.Reset()
+			args = append(append([]string{command, "--waive-live-fork"}, bind...), "busybox")
+			if status := runCommand(args, &stdout, &stderr, b); status != 0 {
+				t.Fatalf("%q status=%d: %s", args, status, stderr.String())
+			}
+			if mounts := b.runRequest.hostMounts; len(mounts) != 1 || !mounts[0].Direct {
+				t.Errorf("%q host mounts=%+v, want one direct bind", args, mounts)
+			}
+			if b.runRequest.liveForkEligible || b.runRequest.liveForkWaiver != "explicit waiver for a writable host bind" {
+				t.Errorf("%q eligibility=(%t, %q), want the writable bind's waiver", args, b.runRequest.liveForkEligible, b.runRequest.liveForkWaiver)
+			}
+		}
+		// The explicit modes keep live forks.
+		for _, mode := range []string{"ro", "copy", "lazy_copy"} {
+			b := &fakeBackend{}
+			var stdout, stderr bytes.Buffer
+			if status := runCommand([]string{command, "-v", "/host:/data:" + mode, "busybox"}, &stdout, &stderr, b); status != 0 {
+				t.Fatalf("%s :%s status=%d: %s", command, mode, status, stderr.String())
+			}
+			if !b.runRequest.liveForkEligible {
+				t.Errorf("%s :%s waived live forks", command, mode)
+			}
 		}
 	}
 }
@@ -7503,16 +7550,24 @@ func TestDynamicCompletionUsesTTCObjects(t *testing.T) {
 
 func TestParseManagedCoWHostMount(t *testing.T) {
 	mounts, err := parseHostMounts(
-		[]string{"/host/a:/data:cow,immutable-source"},
-		[]string{"type=bind,source=/host/b,target=/config,managed-cow=true,immutable-source"},
+		[]string{"/host/a:/data:cow,immutable-source", "/host/c:/lazy:lazy_copy", "/host/d:/lazy2:rw,lazy-copy"},
+		[]string{"type=bind,source=/host/b,target=/config,managed-cow=true,immutable-source", "type=bind,source=/host/e,target=/lazy3,lazy_copy"},
 	)
 	if err != nil {
 		t.Fatalf("parseHostMounts: %v", err)
 	}
-	if len(mounts) != 2 || !mounts[0].ManagedCoW || !mounts[1].ManagedCoW || mounts[0].Readonly || mounts[1].Readonly || !mounts[0].ImmutableSource || !mounts[1].ImmutableSource {
-		t.Errorf("managed CoW host mounts=%+v", mounts)
+	if len(mounts) != 5 {
+		t.Fatalf("managed CoW host mounts=%+v", mounts)
 	}
-	for _, value := range []string{"/host:/data:ro,cow,immutable-source", "/host:/data:cow,copy"} {
+	for _, mount := range mounts {
+		if !mount.ManagedCoW || mount.Readonly || mount.Direct || mount.Copy {
+			t.Errorf("managed CoW host mount=%+v", mount)
+		}
+	}
+	if !mounts[0].ImmutableSource || !mounts[3].ImmutableSource {
+		t.Errorf("managed CoW host mounts=%+v, want immutable sources", mounts)
+	}
+	for _, value := range []string{"/host:/data:ro,cow,immutable-source", "/host:/data:cow,copy", "/host:/data:ro,lazy_copy"} {
 		if _, err := parseHostMounts([]string{value}, nil); err == nil {
 			t.Errorf("parseHostMounts accepted invalid managed CoW mount %q", value)
 		}
@@ -7542,14 +7597,34 @@ func TestInspectManagedCoWHostMount(t *testing.T) {
 		},
 	}
 	info := buildInspectInfo(ttcbundle.ContainerInfo{Name: "demo"}, spec, nil, "")
-	if len(info.Mounts) != 1 || !info.Mounts[0].RW || info.Mounts[0].Mode != "rw,cow" {
+	if len(info.Mounts) != 1 || !info.Mounts[0].RW || info.Mounts[0].Mode != "rw,lazy_copy" {
 		t.Errorf("managed CoW inspect mounts=%+v", info.Mounts)
 	}
-	if got, want := info.HostConfig.Binds, []string{"/host/lower:/data:rw,cow"}; !reflect.DeepEqual(got, want) {
+	if got, want := info.HostConfig.Binds, []string{"/host/lower:/data:rw,lazy_copy"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("managed CoW binds=%q, want %q", got, want)
 	}
 	if got := info.TTC.ExternalViews; len(got) != 1 || !got[0].ManagedCoW || !got[0].ImmutableSourceAsserted || got[0].Readonly || got[0].Semantics != "branch-local-persistent-cow-over-user-asserted-immutable-host-lower" {
 		t.Errorf("managed CoW external view=%+v", got)
+	}
+}
+
+func TestInspectDirectHostMount(t *testing.T) {
+	spec := &specs.Spec{
+		Process: &specs.Process{},
+		Mounts:  []specs.Mount{{Type: "bind", Source: "/host/data", Destination: "/data", Options: []string{"rbind", "rw"}}},
+		Annotations: map[string]string{
+			ttcbundle.DirectHostMountsAnnotation: `["/data"]`,
+		},
+	}
+	info := buildInspectInfo(ttcbundle.ContainerInfo{Name: "demo"}, spec, nil, "")
+	if len(info.Mounts) != 1 || !info.Mounts[0].RW || info.Mounts[0].Mode != "rw" {
+		t.Errorf("direct inspect mounts=%+v", info.Mounts)
+	}
+	if got, want := info.HostConfig.Binds, []string{"/host/data:/data:rw"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("direct binds=%q, want %q", got, want)
+	}
+	if got := info.TTC.ExternalViews; len(got) != 1 || got[0].ManagedCoW || got[0].Readonly || got[0].Semantics != "shared-external-writable-view" {
+		t.Errorf("direct external view=%+v", got)
 	}
 }
 

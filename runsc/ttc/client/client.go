@@ -697,7 +697,9 @@ choose a compute node. Important options:
   --ip IPv4                   Virtual NIC address (default: 10.0.2.15)
   --mac-address MAC           Virtual NIC address (default: 02:42:0a:00:02:0f)
   -p, --publish SPEC          [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]; repeatable
-  -v, --volume SPEC           VOLUME:PATH[:ro] or HOST:PATH[:ro|rw|copy]; repeatable
+  -v, --volume SPEC           VOLUME:PATH[:ro] or HOST:PATH[:ro|rw|copy|lazy_copy];
+                              repeatable. HOST:PATH alone, or :rw, binds the host
+                              path writable, which needs --waive-live-fork
   --tmpfs PATH[:OPTIONS]      Add an explicitly memory-backed mount; repeatable
   -e, --env NAME[=VALUE]      Set/import an environment variable; repeatable
   -u, --user USER[:GROUP]     Guest user (default: image user)

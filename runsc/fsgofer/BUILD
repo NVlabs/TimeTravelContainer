@@ -68,7 +68,7 @@ go_test(
 go_test(
     name = "trusted_ownership_test",
     size = "small",
-    srcs = ["trusted_ownership_darwin_test.go"],
+    srcs = ["trusted_ownership_test.go"],
     library = ":fsgofer",
     deps = ["//pkg/lisafs"],
 )

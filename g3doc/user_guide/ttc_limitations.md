@@ -67,9 +67,11 @@ non-forkable for its entire lifetime.
 
 ## Storage and networking
 
-- Read-only host mounts remain live shared views. A normal writable host mount
-  uses the host path as a live read-only lower layer with a branch-private
-  upper; use `:copy` for a view detached from later host changes.
+- Read-only host mounts remain live shared views. A writable host mount, as
+  Docker makes one, writes the host path itself, so its family must waive live
+  forks; `:lazy_copy` uses the host path as a live read-only lower layer with a
+  branch-private upper instead, and `:copy` gives a view detached from later
+  host changes.
 - A managed volume cannot be attached writable to unrelated container
   families at the same time.
 - Efficient persistent file CoW requires filesystem reflinks. Without them,

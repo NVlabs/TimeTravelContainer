@@ -1141,6 +1141,30 @@ it; `ttc volume ls` lists the volumes of every node, with a `NODE` column.
 Keep data that branches on several nodes must share on shared storage, and
 bind it read-only.
 
+A host path binds as Docker binds it: `-v HOST:PATH` alone, or with `:rw`, and
+`--mount type=bind,...` without a mode, bind the host path itself, writable.
+Its other modes are explicit: `:ro` (`readonly` in `--mount`), `:lazy_copy`
+(`lazy_copy`), and `:copy` (`copy`).
+
+A writable bind of the host path itself shares it with the host: the
+container's writes reach the host path at once, and the host's changes show in
+the container. Live forks could not give each branch a view of its own, so the
+family must waive them:
+
+```shell
+ttc run -d --name build --waive-live-fork \
+  -v "$PWD":/src \
+  alpine:3.20 sleep 600
+```
+
+Without `--waive-live-fork`, `ttc run` and `ttc create` refuse such a bind,
+and name the forkable modes. Such a family stops, starts, dehydrates and
+rehydrates with its bind; as any family that waives live forks, it cannot be
+forked or checkpointed. In rootless mode the invoking host user is the guest's
+root, as a user namespace maps it; with `--unsafe-no-host-isolation` the gofer
+shows that user's files as root's too, and creates the guest root's files as
+that user, so that guest root writes such a bind in either.
+
 Use `:ro` for a live read-only view of a host path:
 
 ```shell
@@ -1155,12 +1179,13 @@ become visible in every branch. Its source may be under an autofs map, as
 sandbox, so that the map mounts it, which a sandbox, in a mount namespace of
 its own, cannot have done.
 
-An ordinary writable bind creates a persistent, branch-local writable layer
-over the live host path:
+Use `:lazy_copy` (`cow` and `managed-cow` are its other names) for a writable
+view that live forks keep: a persistent, branch-local writable layer over the
+live host path.
 
 ```shell
 ttc run -d --name edit \
-  -v /host/base:/work \
+  -v /host/base:/work:lazy_copy \
   alpine:3.20 sleep 600
 ```
 

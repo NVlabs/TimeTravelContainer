@@ -1351,9 +1351,10 @@ func parseHostMounts(volumeSpecs, mountSpecs []string) ([]ttcbundle.HostMount, e
 	for _, value := range volumeSpecs {
 		parts := strings.Split(value, ":")
 		if len(parts) < 2 || len(parts) > 3 || parts[0] == "" || parts[1] == "" {
-			return nil, fmt.Errorf("invalid volume specification %q; want HOST:CONTAINER[:ro|rw|copy]", value)
+			return nil, fmt.Errorf("invalid volume specification %q; want HOST:CONTAINER[:ro|rw|copy|lazy_copy]", value)
 		}
 		readonly := false
+		writable := false
 		immutableSource := false
 		managedCoW := false
 		copySource := false
@@ -1363,10 +1364,10 @@ func parseHostMounts(volumeSpecs, mountSpecs []string) ([]ttcbundle.HostMount, e
 				case "ro", "readonly":
 					readonly = true
 				case "rw":
-					readonly = false
+					writable = true
 				case "immutable-source":
 					immutableSource = true
-				case "cow", "managed-cow":
+				case "lazy_copy", "lazy-copy", "cow", "managed-cow":
 					managedCoW = true
 				case "copy":
 					copySource = true
@@ -1375,6 +1376,9 @@ func parseHostMounts(volumeSpecs, mountSpecs []string) ([]ttcbundle.HostMount, e
 					return nil, fmt.Errorf("unsupported volume option %q in %q", option, value)
 				}
 			}
+		}
+		if readonly && writable {
+			return nil, fmt.Errorf("volume %q is both ro and rw", value)
 		}
 		mount, err := normalizeHostMount(parts[0], parts[1], readonly, immutableSource, managedCoW, copySource)
 		if err != nil {
@@ -1402,7 +1406,7 @@ func parseHostMounts(volumeSpecs, mountSpecs []string) ([]ttcbundle.HostMount, e
 				case "immutable-source":
 					immutableSource = true
 					continue
-				case "cow", "managed-cow":
+				case "lazy_copy", "lazy-copy", "cow", "managed-cow":
 					managedCoW = true
 					continue
 				case "copy":
@@ -1445,10 +1449,10 @@ func parseHostMounts(volumeSpecs, mountSpecs []string) ([]ttcbundle.HostMount, e
 					return nil, fmt.Errorf("invalid immutable-source value %q in %q", raw, value)
 				}
 				immutableSource = parsed
-			case "cow", "managed-cow":
+			case "lazy_copy", "lazy-copy", "cow", "managed-cow":
 				parsed, err := strconv.ParseBool(raw)
 				if err != nil {
-					return nil, fmt.Errorf("invalid managed-cow value %q in %q", raw, value)
+					return nil, fmt.Errorf("invalid %s value %q in %q", key, raw, value)
 				}
 				managedCoW = parsed
 			case "copy":
@@ -1476,6 +1480,11 @@ func parseHostMounts(volumeSpecs, mountSpecs []string) ([]ttcbundle.HostMount, e
 	return mounts, nil
 }
 
+// normalizeHostMount returns the host bind of source at destination: read-only
+// if readonly; a branch-local layer over source, which copies a file on its
+// first write, if managedCoW (lazy_copy); a copy of source if copySource; and
+// otherwise, as Docker binds a host path, source itself, writable, which only a
+// family that waives live forks may bind (see validateHostMountForkPolicy).
 func normalizeHostMount(source, destination string, readonly, immutableSource, managedCoW, copySource bool) (ttcbundle.HostMount, error) {
 	if source == "" || destination == "" {
 		return ttcbundle.HostMount{}, errors.New("host bind mount requires both source and destination")
@@ -1494,18 +1503,34 @@ func normalizeHostMount(source, destination string, readonly, immutableSource, m
 		return ttcbundle.HostMount{}, fmt.Errorf("host mount destination %q must be an absolute non-root path", destination)
 	}
 	if readonly && (managedCoW || copySource) {
-		return ttcbundle.HostMount{}, fmt.Errorf("host bind %q:%q cannot combine read-only with cow or copy", source, destination)
+		return ttcbundle.HostMount{}, fmt.Errorf("host bind %q:%q cannot combine read-only with lazy_copy or copy", source, destination)
 	}
 	if managedCoW && copySource {
-		return ttcbundle.HostMount{}, fmt.Errorf("host bind %q:%q cannot combine cow and copy", source, destination)
+		return ttcbundle.HostMount{}, fmt.Errorf("host bind %q:%q cannot combine lazy_copy and copy", source, destination)
 	}
-	if !readonly && !copySource {
-		managedCoW = true
+	direct := !readonly && !managedCoW && !copySource
+	if direct && immutableSource {
+		return ttcbundle.HostMount{}, fmt.Errorf("host bind %q:%q is writable, so its source is not immutable; bind it :ro, :copy or :lazy_copy", source, destination)
 	}
 	return ttcbundle.HostMount{
 		Source: filepath.Clean(source), Destination: filepath.Clean(destination),
-		Readonly: readonly, ImmutableSource: immutableSource, ManagedCoW: managedCoW, Copy: copySource,
+		Readonly: readonly, ImmutableSource: immutableSource, ManagedCoW: managedCoW, Copy: copySource, Direct: direct,
 	}, nil
+}
+
+// validateHostMountForkPolicy returns an error if a family that may live fork
+// binds a host path writable, as Docker binds one: its branches would share the
+// host path, where each must have a view of its own.
+func validateHostMountForkPolicy(mounts []ttcbundle.HostMount, waived bool) error {
+	if waived {
+		return nil
+	}
+	for _, mount := range mounts {
+		if mount.Direct {
+			return fmt.Errorf("host bind %s:%s writes the host path, of which live forks cannot give each branch its own view; pass --waive-live-fork to bind it so, or bind it :ro, :copy or :lazy_copy", mount.Source, mount.Destination)
+		}
+	}
+	return nil
 }
 
 func parseNetworkMode(value string) (string, error) {
@@ -1517,7 +1542,7 @@ func parseNetworkMode(value string) (string, error) {
 	}
 }
 
-func liveForkWaiverReason(waived bool, networkMode string, gpu ttcbundle.GPUOptions) string {
+func liveForkWaiverReason(waived bool, networkMode string, gpu ttcbundle.GPUOptions, hostMounts []ttcbundle.HostMount) string {
 	if !waived {
 		return ""
 	}
@@ -1529,6 +1554,11 @@ func liveForkWaiverReason(waived bool, networkMode string, gpu ttcbundle.GPUOpti
 	}
 	if gpu.NVProxy && gpu.NVProxyFork == "" {
 		return "explicit waiver for NVIDIA GPUs"
+	}
+	for _, mount := range hostMounts {
+		if mount.Direct {
+			return "explicit waiver for a writable host bind"
+		}
 	}
 	return "explicitly waived during container creation"
 }
@@ -1989,8 +2019,8 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	fs.Var(&labels, "l", "set container metadata KEY[=VALUE]")
 	fs.Var(&labelFiles, "label-file", "read container labels from a file")
 	var volumes, mounts, tmpfsMounts stringSlice
-	fs.Var(&volumes, "volume", "attach VOLUME:CONTAINER[:ro] or HOST:CONTAINER[:ro|rw|copy]")
-	fs.Var(&volumes, "v", "attach VOLUME:CONTAINER[:ro] or HOST:CONTAINER[:ro|rw|copy]")
+	fs.Var(&volumes, "volume", "attach VOLUME:CONTAINER[:ro] or HOST:CONTAINER[:ro|rw|copy|lazy_copy]")
+	fs.Var(&volumes, "v", "attach VOLUME:CONTAINER[:ro] or HOST:CONTAINER[:ro|rw|copy|lazy_copy]")
 	fs.Var(&mounts, "mount", "attach type=bind|tmpfs|proc|sysfs,target=CONTAINER[,OPTIONS]")
 	fs.Var(&tmpfsMounts, "tmpfs", "mount tmpfs at CONTAINER[:OPTIONS]")
 	var logOptions, ulimitValues, groupAddValues, capAddValues, capDropValues stringSlice
@@ -2078,6 +2108,9 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		return err
 	}
 	if err := memberHostMountRefusal(requester, len(parsedMounts.host)); err != nil {
+		return err
+	}
+	if err := validateHostMountForkPolicy(parsedMounts.host, *waiveLiveFork); err != nil {
 		return err
 	}
 	logDriver, err := parseLogDriver(*logDriverValue, logOptions)
@@ -2171,7 +2204,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		hostname:           *hostname,
 		networkMode:        networkMode,
 		liveForkEligible:   !*waiveLiveFork,
-		liveForkWaiver:     liveForkWaiverReason(*waiveLiveFork, networkMode, gpuOptions),
+		liveForkWaiver:     liveForkWaiverReason(*waiveLiveFork, networkMode, gpuOptions, parsedMounts.host),
 		gpu:                gpuOptions,
 		networkNAT:         *networkNAT,
 		networkIP:          *networkIP,
@@ -2279,8 +2312,8 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs.Var(&labels, "l", "set container metadata KEY[=VALUE]")
 	fs.Var(&labelFiles, "label-file", "read container labels from a file")
 	var volumes, mounts, tmpfsMounts stringSlice
-	fs.Var(&volumes, "volume", "attach VOLUME:CONTAINER[:ro] or HOST:CONTAINER[:ro|rw|copy]")
-	fs.Var(&volumes, "v", "attach VOLUME:CONTAINER[:ro] or HOST:CONTAINER[:ro|rw|copy]")
+	fs.Var(&volumes, "volume", "attach VOLUME:CONTAINER[:ro] or HOST:CONTAINER[:ro|rw|copy|lazy_copy]")
+	fs.Var(&volumes, "v", "attach VOLUME:CONTAINER[:ro] or HOST:CONTAINER[:ro|rw|copy|lazy_copy]")
 	fs.Var(&mounts, "mount", "attach type=bind|tmpfs|proc|sysfs,target=CONTAINER[,OPTIONS]")
 	fs.Var(&tmpfsMounts, "tmpfs", "mount tmpfs at CONTAINER[:OPTIONS]")
 	var logOptions, ulimitValues, groupAddValues, capAddValues, capDropValues stringSlice
@@ -2368,6 +2401,9 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		return err
 	}
 	if err := memberHostMountRefusal(requester, len(parsedMounts.host)); err != nil {
+		return err
+	}
+	if err := validateHostMountForkPolicy(parsedMounts.host, *waiveLiveFork); err != nil {
 		return err
 	}
 	logDriver, err := parseLogDriver(*logDriverValue, logOptions)
@@ -2461,7 +2497,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		hostname:           *hostname,
 		networkMode:        networkMode,
 		liveForkEligible:   !*waiveLiveFork,
-		liveForkWaiver:     liveForkWaiverReason(*waiveLiveFork, networkMode, gpuOptions),
+		liveForkWaiver:     liveForkWaiverReason(*waiveLiveFork, networkMode, gpuOptions, parsedMounts.host),
 		gpu:                gpuOptions,
 		networkNAT:         *networkNAT,
 		networkIP:          *networkIP,
@@ -10941,7 +10977,7 @@ func inspectMounts(spec *specs.Spec) ([]InspectMount, []string, map[string]struc
 		switch {
 		case mount.Type == "bind":
 			if _, managedCoW := managedCoWHostMounts[filepath.Clean(mount.Destination)]; managedCoW {
-				mode += ",cow"
+				mode += ",lazy_copy"
 			}
 			binds = append(binds, mount.Source+":"+mount.Destination+":"+mode)
 			mounts = append(mounts, InspectMount{
@@ -11059,6 +11095,10 @@ func buildInspectInfo(container ttcbundle.ContainerInfo, spec *specs.Spec, famil
 			_, immutableSource := immutableHostMounts[filepath.Clean(mount.Destination)]
 			_, managedCoW := managedCoWHostMounts[filepath.Clean(mount.Destination)]
 			semantics := "shared-external-view"
+			if mount.RW {
+				// A writable bind of the host path itself.
+				semantics = "shared-external-writable-view"
+			}
 			if immutableSource {
 				semantics = "user-asserted-immutable-external-view"
 			}

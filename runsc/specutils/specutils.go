@@ -90,6 +90,11 @@ const (
 	// the annotation must never be applied to user-provided host mounts.
 	AnnotationTTCInternalMounts = "dev.timetravelcontainer.config.internal-mounts"
 
+	// AnnotationTTCDirectHostMounts lists, as JSON, the destinations of bind
+	// mounts that are writable binds of their host paths, whose writes reach
+	// the host: they have no overlay, whatever --overlay2 says.
+	AnnotationTTCDirectHostMounts = "dev.timetravelcontainer.config.direct-host-mounts"
+
 	// AnnotationTTCMemoryFile identifies obsolete pathname-backed application
 	// memory created by older TTC versions. It is retained only so upgraded
 	// bundles can discard it safely; runtimes must never open the path.
@@ -1017,6 +1022,24 @@ type TTCVolumeRepository struct {
 	// RestoreID is the repository identity serialized in a TTC checkpoint.
 	// Empty during ordinary creation and live fork.
 	RestoreID string `json:"restore_id,omitempty"`
+}
+
+// TTCDirectHostMounts returns the destinations of the spec's bind mounts that
+// AnnotationTTCDirectHostMounts lists.
+func TTCDirectHostMounts(spec *specs.Spec) (map[string]bool, error) {
+	encoded := spec.Annotations[AnnotationTTCDirectHostMounts]
+	if encoded == "" {
+		return nil, nil
+	}
+	var destinations []string
+	if err := json.Unmarshal([]byte(encoded), &destinations); err != nil {
+		return nil, fmt.Errorf("decoding %s: %w", AnnotationTTCDirectHostMounts, err)
+	}
+	direct := make(map[string]bool, len(destinations))
+	for _, destination := range destinations {
+		direct[filepath.Clean(destination)] = true
+	}
+	return direct, nil
 }
 
 // TTCVolumeRepositories parses and validates persistent-volume donations in
