@@ -1,0 +1,45 @@
+From: Zizheng Guo <gzz_2000@126.com>
+Subject: [PATCH] tgsi: read floats printed as hex as their bits
+
+tgsi_dump prints an immediate's floats as their bits, in hex, with
+TGSI_DUMP_FLOAT_AS_HEX, as Mesa's virgl driver sends its shaders to the
+host, but tgsi_text_translate read them with strtof, which takes them for
+hexadecimal floats: 0x3f000000, 0.5, was 1056964608. It now reads them as
+their bits, as virglrenderer's copy of it does.
+
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: MIT
+---
+
+diff --git a/src/gallium/auxiliary/tgsi/tgsi_text.c b/src/gallium/auxiliary/tgsi/tgsi_text.c
+--- a/src/gallium/auxiliary/tgsi/tgsi_text.c
++++ b/src/gallium/auxiliary/tgsi/tgsi_text.c
+@@ -25,7 +25,10 @@
+  * 
+  **************************************************************************/
+ 
++#include <stdlib.h>
++
+ #include "util/u_debug.h"
++#include "util/u_math.h"
+ #include "util/u_memory.h"
+ #include "pipe/p_defines.h"
+ #include "util/u_inlines.h"
+@@ -231,6 +234,17 @@
+ static bool parse_float( const char **pcur, float *val )
+ {
+    const char *cur = *pcur;
++   /* tgsi_dump prints floats as their bits, in hex, with
++    * TGSI_DUMP_FLOAT_AS_HEX, as virgl's guests send their shaders. */
++   if (cur[0] == '0' && (cur[1] == 'x' || cur[1] == 'X')) {
++      char *end;
++      unsigned long bits = strtoul(cur + 2, &end, 16);
++      if (end == cur + 2 || bits > UINT32_MAX)
++         return false;
++      *val = uif((uint32_t)bits);
++      *pcur = end;
++      return true;
++   }
+    *val = _mesa_strtof(cur, (char**)pcur);
+    if (*pcur == cur)
+       return false;

@@ -37,6 +37,9 @@ shares.
   `LIBGL_ALWAYS_SOFTWARE` asks it to; on Linux, the renderer renders on one
   where the host has no GPU, as the Venus renderer does, and says so without
   changing its environment, which its other threads read.
+* `0004-tgsi-read-floats-printed-as-hex-as-their-bits.patch`: virgl's
+  guests print their immediates' floats as their bits, in hex, which
+  `tgsi_text_translate` read with `strtof`, as hexadecimal floats.
 
 On Linux, the renderer runs on every glibc since 2.17
 (`runsc/ttc/glibccompat`): the Linux builds drop the defines of functions

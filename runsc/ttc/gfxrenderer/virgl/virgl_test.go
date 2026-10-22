@@ -238,6 +238,32 @@ func TestTriangle(t *testing.T) {
 	f.checkTriangle(t)
 }
 
+// TestHexFloatImmediate draws with an immediate of floats that Mesa's virgl
+// driver prints as their bits in hex, which strtof took for hexadecimal
+// floats: 0x3f000000, 0.5, was 1056964608.
+func TestHexFloatImmediate(t *testing.T) {
+	f := newFixture(t)
+	var s stream
+	f.setup(&s)
+	fs := f.id()
+	s.shader(fs, stageFragment, `FRAG
+PROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1
+DCL OUT[0], COLOR
+IMM[0] FLT32 {0x3f000000, 0x3f800000, 0x00000000, 0x3f800000}
+  0: MOV OUT[0], IMM[0]
+  1: END
+`, 1<<16)
+	s.cmd(cmdBindShader, 0, fs, stageFragment)
+	clearRed(&s)
+	drawTriangle(&s)
+	f.submit(t, s)
+	f.finish(t)
+	// 0.5 of 255, which GPUs round either way.
+	if p := f.pixel(4, height/2); p[0] < 127 || p[0] > 128 || p[1] != 255 || p[2] != 0 || p[3] != 255 {
+		t.Errorf("inside the triangle: %v, want {127 or 128, 255, 0, 255}", p)
+	}
+}
+
 // TestTexture samples a texture, whose sampler TGSI's NIR names
 // "sampler", which Metal has for a type: MoltenVK failed to compile the
 // shader, and Zink crashed binding no pipeline.

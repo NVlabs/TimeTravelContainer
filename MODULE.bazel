@@ -86,6 +86,7 @@ http_archive(
         "//tools/mesa:0001-zink-take-Vulkan-s-entry-points-from-an-embedder.patch",
         "//tools/mesa:0002-tgsi-count-sanity-errors-whether-they-are-printed-or-not.patch",
         "//tools/mesa:0003-zink-let-an-embedder-render-on-a-CPU-s-Vulkan-device.patch",
+        "//tools/mesa:0004-tgsi-read-floats-printed-as-hex-as-their-bits.patch",
     ],
     sha256 = "bce5f7fbebb934373b86c999a064d52fb5065878dc57f287f95346648ec832e9",
     strip_prefix = "mesa-26.2.4",
