@@ -32,7 +32,7 @@ jobs:
       release: ${{ steps.plan.outputs.RELEASE }}
       tag: ${{ steps.plan.outputs.RELEASE_TAG }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           # The last release's commit, which the plan compares the branch
           # with.
@@ -79,7 +79,7 @@ jobs:
         run: rm -rf /runner-free/*/* || true
       - name: Install git
         run: apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates git >/dev/null
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/cache/restore@v4
         with:
           path: .ci-cache
@@ -107,7 +107,7 @@ jobs:
       RELEASE: "1"
       RELEASE_TAG: ${{ needs.plan.outputs.tag }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/cache/restore@v4
         with:
           path: .ci-cache
@@ -135,7 +135,7 @@ jobs:
       GITHUB_TOKEN: ${{ github.token }}
       TTC_RELEASE_KEEP_DAYS: ${{ vars.TTC_RELEASE_KEEP_DAYS }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - if: needs.plan.outputs.release == '1'
         uses: actions/download-artifact@v4
         with:

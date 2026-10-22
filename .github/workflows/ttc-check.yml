@@ -55,7 +55,7 @@ jobs:
       - name: Install git
         # The checkout's history, which the build's version stamp reads.
         run: apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates git >/dev/null
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/cache@v4
         with:
           path: .ci-cache
@@ -85,7 +85,7 @@ jobs:
       CI_TOOLS_DIR: ${{ github.workspace }}/.ci-cache/bin
       CI_BAZEL_DISK_CACHE_SIZE: 3G
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/cache@v4
         with:
           path: .ci-cache
