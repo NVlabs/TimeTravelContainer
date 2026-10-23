@@ -1319,7 +1319,12 @@ func (c *Context) subContextCmd(cmd, id uint32) error {
 		c.subs[id] = sub
 	case cmdSetSubCtx:
 		// Like virglrenderer, stay in the sub-context if there is no other.
-		if sub := c.subs[id]; sub != nil {
+		if sub := c.subs[id]; sub != nil && sub != c.sub {
+			// The sub-context's work goes to the GPU before the next's,
+			// which may use what it wrote: a backend may hold a context's
+			// work until it flushes, and the GPU executes contexts' work
+			// in the order that they flush it.
+			c.sub.pipe.flushAsync()
 			c.sub = sub
 		}
 	case cmdDestroySubCtx:
