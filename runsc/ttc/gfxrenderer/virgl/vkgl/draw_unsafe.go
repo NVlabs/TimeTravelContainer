@@ -70,16 +70,28 @@ var vkTopologies = map[uint32]uint32{
 	14: 10, // PATCHES: PATCH_LIST
 }
 
+// primTriangleFan is MESA_PRIM_TRIANGLE_FAN.
+const primTriangleFan = 6
+
 // VkTopology returns the VkPrimitiveTopology of Gallium's primitive mode,
-// and whether Vulkan has it.
-func VkTopology(mode uint32) (uint32, bool) {
+// and whether the device draws it: of triangle fans, which a device of the
+// portability subset may lack, of which the caps then have guests' drivers
+// draw triangles.
+func (d *Device) VkTopology(mode uint32) (uint32, bool) {
+	if mode == primTriangleFan && !d.triangleFans {
+		return 0, false
+	}
 	t, ok := vkTopologies[mode]
 	return t, ok
 }
 
 // Gallium's polygon modes, PIPE_POLYGON_MODE_*, of which Vulkan's,
 // VkPolygonMode, are the first three in its order.
-const pipePolygonFill = 0
+const (
+	pipePolygonFill = iota
+	pipePolygonLine
+	pipePolygonPoint
+)
 
 // NewPipeline returns a pipeline of desc.
 func (d *Device) NewPipeline(desc PipelineDesc) (*Pipeline, error) {
@@ -193,6 +205,11 @@ func (d *Device) NewPipeline(desc PipelineDesc) (*Pipeline, error) {
 	if fill > 2 {
 		fill = pipePolygonFill
 	}
+	if fill == pipePolygonPoint && !d.pointPolygons {
+		// Of the device's that draw no polygons as points, the
+		// nearest: their edges, through their vertices.
+		fill = pipePolygonLine
+	}
 	rs.PolygonMode = fill
 	rs.CullMode = r.CullFace & 3
 	rs.FrontFace = 1 // VK_FRONT_FACE_CLOCKWISE
@@ -215,7 +232,9 @@ func (d *Device) NewPipeline(desc PipelineDesc) (*Pipeline, error) {
 	}
 	if !r.FlatShadeFirst && d.provokingLast {
 		// Of flat varyings of primitives' last vertices, as OpenGL's are
-		// by default, and Vulkan's not.
+		// by default, and Vulkan's not. A device of no
+		// VK_EXT_provoking_vertex, as MoltenVK, gives the first's, as
+		// Metal does.
 		pv := get[vn.VkPipelineRasterizationProvokingVertexStateCreateInfoEXT](a)
 		pv.SType = vn.VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT
 		pv.ProvokingVertexMode = 1 // VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT
@@ -416,8 +435,12 @@ func (c *Commands) SetBlendConstants(rgba [4]float32) {
 	c.call(vn.VK_COMMAND_TYPE_vkCmdSetBlendConstants_EXT, unsafe.Pointer(bc))
 }
 
-// SetStencilReference sets the stencil reference of front and back faces.
+// SetStencilReference sets the stencil reference of front and back faces:
+// of a device of the portability subset that has one of both, the front's.
 func (c *Commands) SetStencilReference(front, back uint32) {
+	if !c.d.separateStencilRef {
+		back = front
+	}
 	for _, f := range []struct{ mask, ref uint32 }{{1, front}, {2, back}} {
 		sr := get[vn.Args_vkCmdSetStencilReference](c.a)
 		sr.FaceMask, sr.Reference = f.mask, f.ref

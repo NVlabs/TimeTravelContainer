@@ -48,7 +48,7 @@ func (d *Device) NewSurface(t *Texture, format, level, first, last uint32) (*Sur
 	if err := t.CheckSurface(format, level, first, last); err != nil {
 		return nil, err
 	}
-	f, _ := LookupFormat(format)
+	f, _ := d.LookupFormat(format)
 	want, feature := uint32(ImageColorAttachment), uint32(featureColorAttachment)
 	if t.aspects != aspectColor {
 		want, feature = ImageDepthAttachment, featureDepthStencil

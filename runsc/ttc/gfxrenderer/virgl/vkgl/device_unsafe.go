@@ -93,6 +93,29 @@ const (
 	instanceCreateEnumeratePortability = 0x1
 )
 
+// portabilitySubsetFeatures is vulkan_beta.h's
+// VkPhysicalDevicePortabilitySubsetFeaturesKHR, which venus-protocol has
+// not: what a device of VK_KHR_portability_subset has of Vulkan's.
+type portabilitySubsetFeatures struct {
+	SType                                  uint32
+	PNext                                  unsafe.Pointer
+	ConstantAlphaColorBlendFactors         uint32
+	Events                                 uint32
+	ImageViewFormatReinterpretation        uint32
+	ImageViewFormatSwizzle                 uint32
+	ImageView2DOn3DImage                   uint32
+	MultisampleArrayImage                  uint32
+	MutableComparisonSamplers              uint32
+	PointPolygons                          uint32
+	SamplerMipLodBias                      uint32
+	SeparateStencilMaskRef                 uint32
+	ShaderSampleRateInterpolationFunctions uint32
+	TessellationIsolines                   uint32
+	TessellationPointMode                  uint32
+	TriangleFans                           uint32
+	VertexAttributeAccessBeyondStride      uint32
+}
+
 // Device is a Vulkan device of the renderer's, on which contexts render:
 // a GPU's, or, of a host that has none, a software rasterizer's.
 type Device struct {
@@ -128,6 +151,18 @@ type Device struct {
 	// varyings of primitives' last vertices, of which pipelines may
 	// differ in a rendering instance, and instances' divisors.
 	indexUint8, provokingLast, divisors bool
+	// The features of Vulkan that a device of VK_KHR_portability_subset,
+	// as MoltenVK, macOS's Vulkan, may lack, which the package works
+	// around, and every other device has: triangle fans, polygons drawn
+	// as points, samplers' LOD bias, stencil references of each face,
+	// and multisampled arrays. MoltenVK on Macs has the subset's others
+	// that the package uses: constant alpha blend factors, updates of
+	// comparison samplers' descriptors, and attributes past their
+	// bindings' strides.
+	triangleFans, pointPolygons, samplerMipLodBias, separateStencilRef, multisampleArrays bool
+	// substitutes are the Vulkan formats that the device renders depths
+	// to in place of those that it lacks, by the formats lacked.
+	substitutes map[uint32]uint32
 	// mapMemory is the device's vkMapMemory.
 	mapMemory unsafe.Pointer
 	// features are the formats' properties.
@@ -376,6 +411,10 @@ func (d *Device) createDevice() error {
 	div.SType = vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES
 	divExt := ext("VK_KHR_vertex_attribute_divisor", "VK_EXT_vertex_attribute_divisor")
 	link(divExt, unsafe.Pointer(div), &div.PNext)
+	ps := get[portabilitySubsetFeatures](a)
+	ps.SType = vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR
+	psExt := ext("VK_KHR_portability_subset")
+	link(psExt, unsafe.Pointer(ps), &ps.PNext)
 	f12 := get[vn.VkPhysicalDeviceVulkan12Features](a)
 	f12.SType = vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES
 	f12.PNext = unsafe.Pointer(f13)
@@ -395,9 +434,22 @@ func (d *Device) createDevice() error {
 	d.features13 = *f13
 	d.features13.PNext = nil
 	var exts []string
-	if runtime.GOOS == "darwin" {
-		exts = append(exts, "VK_KHR_portability_subset")
+	d.triangleFans, d.pointPolygons, d.samplerMipLodBias, d.separateStencilRef, d.multisampleArrays = true, true, true, true, true
+	if psExt != "" {
+		// Which a device that has it requires enabled.
+		exts = append(exts, psExt)
+		// Views' swizzles are textures' swizzles, which OpenGL ES 3.0
+		// has, and those of the formats that the package emulates.
+		if ps.ImageViewFormatSwizzle == 0 {
+			return fmt.Errorf("%s swizzles no image views", d.Name)
+		}
+		d.triangleFans = ps.TriangleFans != 0
+		d.pointPolygons = ps.PointPolygons != 0
+		d.samplerMipLodBias = ps.SamplerMipLodBias != 0
+		d.separateStencilRef = ps.SeparateStencilMaskRef != 0
+		d.multisampleArrays = ps.MultisampleArrayImage != 0
 	}
+	d.initSubstitutes()
 	if idx8Ext != "" {
 		exts = append(exts, idx8Ext)
 		d.indexUint8 = idx8.IndexTypeUint8 != 0
@@ -455,6 +507,42 @@ func (d *Device) createDevice() error {
 	vk.Call(vn.VK_COMMAND_TYPE_vkGetDeviceQueue_EXT, d.table, unsafe.Pointer(gq))
 	d.queue = *q
 	return nil
+}
+
+// The Vulkan formats of depth that Apple's GPUs lack, their substitutes,
+// and virgl's format of 24-bit depths alone.
+const (
+	vkX8D24    = 125 // VK_FORMAT_X8_D24_UNORM_PACK32
+	vkD32      = 126 // VK_FORMAT_D32_SFLOAT
+	vkD24S8    = 129 // VK_FORMAT_D24_UNORM_S8_UINT
+	vkD32S8    = 130 // VK_FORMAT_D32_SFLOAT_S8_UINT
+	virglZ24X8 = 21  // PIPE_FORMAT_Z24X8_UNORM
+)
+
+// initSubstitutes settles the formats of depth that the device renders
+// depths to in place of those that it lacks, as Zink does: of 24-bit
+// depths, which Apple's GPUs lack, 32-bit floats. Guests' OpenGL has no
+// other format of GL_DEPTH24_STENCIL8, which Android's EGL configurations
+// are of, and takes 16-bit depths for GL_DEPTH_COMPONENT24. A polygon
+// offset's units are then of floats' precision, which is that of 24-bit
+// depths at depths of 0.5 and more, and finer nearer.
+func (d *Device) initSubstitutes() {
+	d.substitutes = make(map[uint32]uint32)
+	for _, s := range []struct{ lacked, sub uint32 }{{vkD24S8, vkD32S8}, {vkX8D24, vkD32}} {
+		if d.formatFeatures(s.lacked)&featureDepthStencil == 0 && d.formatFeatures(s.sub)&featureDepthStencil != 0 {
+			d.substitutes[s.lacked] = s.sub
+		}
+	}
+}
+
+// LookupFormat returns virgl's format f as the device has or emulates it:
+// as the package's LookupFormat, of the device's substitutes.
+func (d *Device) LookupFormat(f uint32) (Format, bool) {
+	ft, ok := LookupFormat(f)
+	if sub, ok := d.substitutes[ft.VK]; ok {
+		ft.VK = sub
+	}
+	return ft, ok
 }
 
 // Destroy destroys the device, whose objects must be destroyed.

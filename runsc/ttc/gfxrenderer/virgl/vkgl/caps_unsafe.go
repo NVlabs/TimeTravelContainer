@@ -26,7 +26,8 @@ func (d *Device) Caps(set uint32, ubos, ssbos uint32) []byte {
 	if set == 1 {
 		v1.MaxVersion = 1
 	}
-	for vf, ft := range formats {
+	for vf := range formats {
+		ft, _ := d.LookupFormat(vf)
 		props := d.formatProperties(ft.VK)
 		opt := props.OptimalTilingFeatures
 		if opt&featureSampledImage != 0 {
@@ -76,7 +77,10 @@ func (d *Device) Caps(set uint32, ubos, ssbos uint32) []byte {
 	v1.BoolSet1 = bools
 	v1.GLSLLevel = 450
 	v1.MaxTextureArrayLayers = l.MaxImageArrayLayers
-	v1.MaxStreamoutBuffers = MaxStreamOutputBuffers
+	if f.VertexPipelineStoresAndAtomics != 0 {
+		// Of which vertex shaders capture their stream outputs.
+		v1.MaxStreamoutBuffers = MaxStreamOutputBuffers
+	}
 	if f.DualSrcBlend != 0 {
 		v1.MaxDualSourceRenderTargets = l.MaxFragmentDualSrcAttachments
 	}
@@ -89,6 +93,9 @@ func (d *Device) Caps(set uint32, ubos, ssbos uint32) []byte {
 		}
 	}
 	v1.PrimMask = vkPrimMask
+	if !d.triangleFans {
+		v1.PrimMask &^= 1 << primTriangleFan
+	}
 	if f.TessellationShader == 0 {
 		v1.PrimMask &^= 1 << 14 // MESA_PRIM_PATCHES
 	}

@@ -80,6 +80,10 @@ type Texture struct {
 	layout uint32
 	// usage is the image's, of VkImageUsageFlagBits.
 	usage uint32
+	// floatDepth24 is whether the image's depths are 32-bit floats, the
+	// substitute of the format's 24-bit depths, of which the guest's
+	// memory has its texels.
+	floatDepth24 bool
 }
 
 // NewTexture returns a texture of desc, a texture's, of a format that
@@ -108,9 +112,12 @@ func (d *Device) newTexture(desc ResourceDesc) (*Texture, error) {
 	if err := desc.check(d.limits()); err != nil {
 		return nil, err
 	}
-	f, ok := LookupFormat(desc.Format)
+	f, ok := d.LookupFormat(desc.Format)
 	if !ok {
 		return nil, fmt.Errorf("a texture of format %d, which Vulkan lacks", desc.Format)
+	}
+	if desc.Samples > 1 && desc.Target == Target2DArray && !d.multisampleArrays {
+		return nil, fmt.Errorf("a multisampled array %+v, which %s has none of", desc, d.Name)
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -169,7 +176,8 @@ func (d *Device) newTexture(desc ResourceDesc) (*Texture, error) {
 	if err := check("vkCreateImage", ci.Ret); err != nil {
 		return nil, fmt.Errorf("a texture of %+v, %s: %w", desc, f.Name, err)
 	}
-	t := &Texture{Desc: desc, Format: f, img: *h, layout: ImageLayoutUndefined, aspects: aspectColor, usage: usage}
+	t := &Texture{Desc: desc, Format: f, img: *h, layout: ImageLayoutUndefined, aspects: aspectColor, usage: usage,
+		floatDepth24: desc.Format == virglZ24X8 && f.VK == vkD32}
 	switch {
 	case f.IsDepth() && f.IsStencil():
 		t.aspects = aspectDepth | aspectStencil

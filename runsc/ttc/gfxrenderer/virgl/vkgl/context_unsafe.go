@@ -605,6 +605,9 @@ func (c *Context) WriteTexture(t *Texture, r TextureRegion, data []byte, offset 
 		return err
 	}
 	t.packRegion(r, data, offset, s.Bytes(), false)
+	if t.floatDepth24 {
+		depth24ToFloat(s.Bytes()[:t.tightSize(r)])
+	}
 	c.general(cmds, t)
 	cmds.barrier()
 	region := get[vn.VkBufferImageCopy](c.a)
@@ -648,6 +651,9 @@ func (c *Context) ReadTexture(t *Texture, r TextureRegion, data []byte, offset u
 		return fmt.Errorf("reading a texture: the device is lost")
 	}
 	f.Wait()
+	if t.floatDepth24 {
+		floatToDepth24(s.Bytes()[:t.tightSize(r)])
+	}
 	t.packRegion(r, data, offset, s.Bytes(), true)
 	return nil
 }

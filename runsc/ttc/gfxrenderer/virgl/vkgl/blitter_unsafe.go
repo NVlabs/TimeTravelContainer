@@ -119,8 +119,8 @@ func blitOutput(f Format, mask uint32) (string, uint32) {
 // of blending.
 func (c *Context) shaderBlit(b Blit, scissor *Scissor) error {
 	d := c.d
-	df, _ := LookupFormat(b.DstFormat)
-	sf, _ := LookupFormat(b.SrcFormat)
+	df, _ := d.LookupFormat(b.DstFormat)
+	sf, _ := d.LookupFormat(b.SrcFormat)
 	depth := b.Mask&MaskZ != 0
 	if max(b.Src.Desc.Samples, 1) > 1 || b.Mask&MaskS != 0 || b.Dst.Desc.Target == Target3D {
 		return ErrNotNative

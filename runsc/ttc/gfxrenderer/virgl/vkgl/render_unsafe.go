@@ -254,6 +254,9 @@ func (c *Context) ClearTexture(t *Texture, level uint32, box Box, texel []byte) 
 	for i := 0; i < len(data); i += int(f.BlockBytes) {
 		copy(data[i:], texel[:f.BlockBytes])
 	}
+	if t.floatDepth24 {
+		depth24ToFloat(data)
+	}
 	bh := int64(f.BlockHeight)
 	var regions []vn.VkBufferImageCopy
 	for z := int64(0); z < box.Depth; z++ {
@@ -300,4 +303,26 @@ func (c *Context) Upload(data []byte) (*Buffer, error) {
 	copy(b.Bytes(), data)
 	c.batch.staging = append(c.batch.staging, b)
 	return b, nil
+}
+
+// WidenIndexes returns a buffer, as Upload's, of count indexes of 16 bits
+// of the indexes of a byte of b from offset, of a device that draws none
+// of a byte, as MoltenVK may not, as Zink widens them: restart, the
+// draw's restart index, if restart is enabled, widens to Vulkan's, of all
+// ones. It reads b back, once the GPU executed the context's commands
+// before.
+func (c *Context) WidenIndexes(b *Buffer, offset uint64, count uint32, restart bool, restartIndex uint32) (*Buffer, error) {
+	narrow := make([]byte, count)
+	if err := c.ReadBuffer(b, offset, narrow); err != nil {
+		return nil, err
+	}
+	wide := make([]byte, 2*len(narrow))
+	for i, x := range narrow {
+		w := uint16(x)
+		if restart && uint32(x) == restartIndex {
+			w = 0xffff
+		}
+		wide[2*i], wide[2*i+1] = byte(w), byte(w>>8)
+	}
+	return c.Upload(wide)
 }

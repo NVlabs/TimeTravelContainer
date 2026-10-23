@@ -164,7 +164,7 @@ func (d *Device) NewSamplerView(t *Texture, desc ViewDesc) (*SamplerView, error)
 	if err := desc.check(t); err != nil {
 		return nil, err
 	}
-	f, _ := LookupFormat(desc.Format)
+	f, _ := d.LookupFormat(desc.Format)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	a := d.a

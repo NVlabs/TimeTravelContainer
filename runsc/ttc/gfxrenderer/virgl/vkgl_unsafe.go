@@ -1113,7 +1113,7 @@ func (c *vkglContext) draw(d []uint32, a drawArgs) error {
 	if a.indirect != nil {
 		return fmt.Errorf("an indirect draw: %w", errVkgl)
 	}
-	topology, ok := vkgl.VkTopology(d[drawMode])
+	topology, ok := c.b.d.VkTopology(d[drawMode])
 	if !ok {
 		return fmt.Errorf("a draw of primitives %d", d[drawMode])
 	}
@@ -1121,6 +1121,42 @@ func (c *vkglContext) draw(d []uint32, a drawArgs) error {
 	if vs == nil || fs == nil || ve == nil || c.blend == nil || c.rast == nil || c.dsa == nil {
 		// Like virglrenderer, the decoder drops such draws.
 		return nil
+	}
+	// The indexes first: widening them reads them back, which submits the
+	// context's batch, of which the draw's uploads and resources must not
+	// be.
+	var indexes *vkgl.Buffer
+	indexSize := a.indexSize
+	var firstIndex uint32
+	if d[drawIndexed] != 0 {
+		index := resOfVkgl(a.index)
+		if index == nil || index.buf == nil {
+			return errors.New("an indexed draw of no index buffer")
+		}
+		widen := indexSize == 1 && !c.b.d.IndexSizeOK(1)
+		if !widen && !c.b.d.IndexSizeOK(indexSize) {
+			return fmt.Errorf("indexes of %d bytes: %w", indexSize, errVkgl)
+		}
+		// Of indexes of the buffer, as pipe.c checks them, and draws them:
+		// from the offset's index, which Vulkan binds them at a multiple
+		// of their size of.
+		size := index.buf.Size()
+		start := uint64(a.indexOffset) + uint64(d[drawStart])*uint64(indexSize)
+		if n := uint64(d[drawCount]) * uint64(indexSize); start > size || n > size-start {
+			return fmt.Errorf("%d indexes from %d of a buffer of %d bytes", d[drawCount], start, size)
+		}
+		firstIndex = uint32(a.indexOffset/indexSize) + d[drawStart]
+		if err := c.use(&index.vkglRef); err != nil {
+			return err
+		}
+		indexes = index.buf
+		if widen {
+			var err error
+			if indexes, err = c.ctx.WidenIndexes(index.buf, start, d[drawCount], d[drawPrimitiveRestart] != 0, d[drawRestartIndex]); err != nil {
+				return err
+			}
+			indexSize, firstIndex = 2, 0
+		}
 	}
 	colors, depthFormat, hasDepth, hasStencil, colorTypes := c.formats()
 
@@ -1222,28 +1258,6 @@ func (c *vkglContext) draw(d []uint32, a drawArgs) error {
 		}
 		vbufs[i], voffs[i] = vb.res.buf, uint64(vb.offset)
 	}
-	var index *vkglResource
-	var firstIndex uint32
-	if d[drawIndexed] != 0 {
-		if index = resOfVkgl(a.index); index == nil || index.buf == nil {
-			return errors.New("an indexed draw of no index buffer")
-		}
-		if !c.b.d.IndexSizeOK(a.indexSize) {
-			return fmt.Errorf("indexes of %d bytes: %w", a.indexSize, errVkgl)
-		}
-		// Of indexes of the buffer, as pipe.c checks them, and draws them:
-		// from the offset's index, which Vulkan binds them at a multiple
-		// of their size of.
-		size := index.buf.Size()
-		start := uint64(a.indexOffset) + uint64(d[drawStart])*uint64(a.indexSize)
-		if n := uint64(d[drawCount]) * uint64(a.indexSize); start > size || n > size-start {
-			return fmt.Errorf("%d indexes from %d of a buffer of %d bytes", d[drawCount], start, size)
-		}
-		firstIndex = uint32(a.indexOffset/a.indexSize) + d[drawStart]
-		if err := c.use(&index.vkglRef); err != nil {
-			return err
-		}
-	}
 	width, height, _ := c.area()
 	if width == 0 || height == 0 {
 		// Of a framebuffer of no area: nothing.
@@ -1270,8 +1284,8 @@ func (c *vkglContext) draw(d []uint32, a drawArgs) error {
 		binary.LittleEndian.PutUint32(push[tospirv.PushBaseInstance:], d[drawStartInstance])
 		cmds.PushConstants(p, 0, push[:])
 		cmds.BindVertexBuffers(0, vbufs, voffs)
-		if index != nil {
-			cmds.BindIndexBuffer(index.buf, 0, a.indexSize)
+		if indexes != nil {
+			cmds.BindIndexBuffer(indexes, 0, indexSize)
 			cmds.DrawIndexed(d[drawCount], max(d[drawInstances], 1), firstIndex, int32(d[drawIndexBias]), d[drawStartInstance])
 		} else {
 			cmds.DrawVertices(d[drawCount], max(d[drawInstances], 1), d[drawStart], d[drawStartInstance])

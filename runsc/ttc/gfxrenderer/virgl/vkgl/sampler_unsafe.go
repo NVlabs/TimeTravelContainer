@@ -57,7 +57,12 @@ func (d *Device) NewSamplerOf(st *SamplerState) (*Sampler, error) {
 	// Gallium's filters, PIPE_TEX_FILTER_*, are Vulkan's, VkFilter.
 	info.MagFilter, info.MinFilter = st.MagFilter, st.MinFilter
 	info.AddressModeU, info.AddressModeV, info.AddressModeW = VkAddressMode(st.WrapS), VkAddressMode(st.WrapT), VkAddressMode(st.WrapR)
-	info.MipLodBias = max(min(st.LodBias, limits.MaxSamplerLodBias), -limits.MaxSamplerLodBias)
+	// Of none where the device's samplers have none, as a device of the
+	// portability subset's may not: OpenGL ES has no samplers' bias, but
+	// shaders' (TXB).
+	if d.samplerMipLodBias {
+		info.MipLodBias = max(min(st.LodBias, limits.MaxSamplerLodBias), -limits.MaxSamplerLodBias)
+	}
 	info.MinLod, info.MaxLod = st.MinLod, st.MaxLod
 	switch st.MipFilter {
 	case MipFilterLinear:

@@ -113,8 +113,8 @@ func (c *Context) nativeBlit(b Blit) error {
 		return ErrNotNative
 	}
 	d := c.d
-	df, _ := LookupFormat(b.DstFormat)
-	sf, _ := LookupFormat(b.SrcFormat)
+	df, _ := d.LookupFormat(b.DstFormat)
+	sf, _ := d.LookupFormat(b.SrcFormat)
 	aspects, ok := b.aspects()
 	// Of the textures' formats, but of channels that the destination
 	// ignores, and of the channels that the formats have.
