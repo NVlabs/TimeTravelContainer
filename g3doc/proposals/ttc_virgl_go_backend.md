@@ -1,8 +1,12 @@
 # A Go backend for TTC's virgl renderer
 
-Status: in progress (2026-10-23). Stage 1, the shader translator, is done;
-stage 2 is under way: the decoder renders on the Go backend where
-`TTC_VIRGL_BACKEND` is `vkgl`, and on Zink otherwise. Stage 3 is planned.
+Status: in progress (2026-10-23). Stages 1 and 2, the shader translator and
+the state tracker, are done on Linux, where the renderer renders on the Go
+backend, vkgl, and links no Mesa. macOS's renders on Zink unless
+`TTC_VIRGL_BACKEND` is `vkgl`, until vkgl passes [the Mac's
+tests](#the-macs-tests); stage 3, Mesa's removal, follows them. vkgl offers
+guests OpenGL ES 3.0, where Zink offered 3.1: [OpenGL ES
+3.1](#opengl-es-31) is to do.
 
 ## Goal
 
@@ -159,5 +163,94 @@ Stage 2 implements the decoder's backend (`virgl.h`'s operations) in Go:
     and Settings render, record and fork, and the Settings screen is
     Zink's to the pixel. Not yet, nor offered to guests: shader buffers
     and images, compute, geometry and tessellation, indirect draws,
-    texture buffers.)
-3.  Mesa removed: no `tools/mesa.BUILD`, no glibc shims for it.
+    texture buffers. On an NVIDIA GB300, of driver 610 on arm64, the
+    virgl tests pass on vkgl, 27 of 27, where Zink failed 5 (textures,
+    uniform buffers and transform feedback rendered nothing), and so do
+    vkgl's, and the corpus's 3,995 vertex and fragment shaders, all but
+    the 63 of FBFETCH, compile into pipelines, of no errors of Vulkan's
+    validation layer 1.4.341; `MOD` of negative operands was the one
+    difference. The node runs no containers, of no root: redroid
+    ran on lavapipe. Done on Linux since: vkgl is its backend, and its
+    build has no Mesa, of which ttcd is 3.3 MB smaller and the renderer
+    7.0 MB of 24.8, of glibc's functions of 2.4.)
+3.  Mesa removed: no `tools/mesa.BUILD`, no glibc shims for it. (Linux's
+    build has neither since 2026-10-23; macOS's awaits the Mac's tests.)
+
+## The Mac's tests
+
+vkgl renders on MoltenVK as on any Vulkan 1.3 device of dynamic rendering,
+but for what MoltenVK lacks, which it works around
+(`vkgl/device_unsafe.go`):
+
+*   `VK_KHR_portability_subset`'s triangle fans, which its capability sets
+    then leave guests' Mesa to draw as triangles (`u_primconvert`); polygons
+    drawn as points, which it draws as lines; samplers' LOD bias, which
+    OpenGL ES has none of; stencil references of each face, of which it
+    sets the front's; and multisampled arrays, which it refuses. A device
+    of no swizzles of image views, which textures' swizzles and its
+    emulated formats are, it refuses.
+*   Apple's GPUs' 24-bit depths, of which it renders to 32-bit floats, as
+    Zink does: Mesa has no other format of `GL_DEPTH24_STENCIL8`, which
+    Android's EGL configurations are of. Transfers and clears of
+    `Z24X8` convert the guest's depths.
+*   Indexes of a byte, which Metal has none of, where the device has no
+    `VK_KHR_index_type_uint8`: a draw's are read back and widened to 16
+    bits, as Zink widens them.
+*   `VK_EXT_provoking_vertex`, which MoltenVK lacks: flat varyings are
+    the first vertex's, Metal's, rather than OpenGL's last.
+*   robustness2's `nullDescriptor`: vkgl binds a texture or buffer of its
+    own to every slot that a shader reads and a guest binds none to.
+
+`vkgl`'s `TestPortabilitySubset` forces the workarounds on the device it
+runs on. On a Mac, before Mesa leaves:
+
+1.  The unit tests on vkgl:
+    `bazel test --test_env=TTC_VIRGL_BACKEND=vkgl //runsc/ttc/gfxrenderer/virgl:virgl_test //runsc/ttc/gfxrenderer/virgl/vkgl:vkgl_test`,
+    and, of a corpus of guests' TGSI (see [Validation](#validation)),
+    `VIRGL_TGSI_CORPUS=DIR` and `VKGL_TGSI_CORPUS=DIR`, whose
+    `TestCorpusPipelines` compiles a pipeline of each vertex and fragment
+    shader.
+2.  `runsc/ttc/test/e2e_gfx.sh` and `runsc/ttc/test/e2e_redroid.sh`, with
+    `TTC_VIRGL_BACKEND=vkgl`, which the daemon and so the renderer
+    inherit, and without, on Zink: both check that guests render on the
+    backend asked for, and redroid's screenshots, in its `out/`, compare.
+3.  Then vkgl is every platform's backend (`virgl/backend_linux.go`'s
+    `initBackend`), and Mesa leaves: `tools/mesa.BUILD`, `tools/mesa/`,
+    `@mesa` and the Python modules of its code generators in
+    `MODULE.bazel`, the decoder's C (`pipe.c`, `formats.c`, `screen.c`,
+    `screen_darwin.c`, `tgsi_check.c`, `virgl.h`, `virgl_int.h`) and
+    `zink_unsafe.go`, and Mesa's components in `THIRD_PARTY_NOTICES.md`
+    (`tools/third_party_notices.py`).
+
+## OpenGL ES 3.1
+
+TODO. vkgl's capability sets offer guests what it renders, of which
+Mesa's virgl driver gives them OpenGL ES 3.0 (`vkgl/caps_unsafe.go`).
+Zink gave them 3.1, which some of Android's apps require. Mesa's OpenGL ES
+3.1 (`src/mesa/main/version.c`) needs, beyond 3.0, what vkgl refuses
+today (`virgl/vkgl_unsafe.go`'s `errVkgl`):
+
+*   compute shaders: compute pipelines of `tospirv`'s compute shaders,
+    which it translates, `LAUNCH_GRID`, and its indirect form;
+*   shader buffers (`SET_SHADER_BUFFERS`) and atomic counters
+    (`SET_ATOMIC_BUFFERS`, `HWATOMIC`), as storage buffers, in fragment
+    and compute shaders at least;
+*   shader images (`SET_SHADER_IMAGES`), as storage images, of the
+    formats that the device stores to;
+*   indirect draws, of `DRAW_VBO`'s indirect buffer, and their counts;
+*   memory barriers (`MEMORY_BARRIER`), as Vulkan's, which vkgl ignores
+    while shaders store nothing;
+*   checks of what 3.1 adds to 3.0's state: multisampled textures and
+    their sample masks, and stencil sampled of depth-stencil textures.
+
+Then the capability sets offer them, which `caps_unsafe.go` now clears.
+
+Two gaps of what guests get already: rendering to 3D textures' slices,
+which OpenGL ES 3.0 allows, and vkgl's surfaces refuse, as Vulkan views a
+3D image's slices only of images created to be viewed so; and conditional
+rendering, which desktop OpenGL 3.0 requires, and which the capability
+sets do not offer, of which desktop OpenGL guests get 2.1 (Linux's use Zink
+in the guest by default). OpenGL ES 3.2 and OpenGL 3.2 and later need,
+besides, geometry and tessellation shaders, which `tospirv` translates,
+texture buffers, and framebuffer fetch (`FBFETCH`, of advanced blending),
+whose input attachments pipelines' layouts refuse.

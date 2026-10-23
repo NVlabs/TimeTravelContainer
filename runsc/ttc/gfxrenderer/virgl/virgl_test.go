@@ -12,6 +12,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -649,10 +650,10 @@ func TestTransformFeedbackLayout(t *testing.T) {
 	}
 }
 
-// onVkgl reports whether the tests render on the vkgl backend, where
-// TTC_VIRGL_BACKEND is "vkgl", or on Zink.
+// onVkgl reports whether the tests render on the vkgl backend, as on
+// Linux, or on Zink, as on macOS unless TTC_VIRGL_BACKEND is "vkgl".
 func onVkgl() bool {
-	return os.Getenv("TTC_VIRGL_BACKEND") == "vkgl"
+	return runtime.GOOS != "darwin" || os.Getenv("TTC_VIRGL_BACKEND") == "vkgl"
 }
 
 func TestCapsets(t *testing.T) {

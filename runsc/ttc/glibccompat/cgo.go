@@ -5,7 +5,6 @@
 
 package glibccompat
 
-// The package's C files, start_dl.c, pthread.c and stat_math.c, are empty but
-// on Linux.
+// The package's C files, start_dl.c and pthread.c, are empty but on Linux.
 
 import "C"

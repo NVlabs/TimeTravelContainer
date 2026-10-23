@@ -12,6 +12,7 @@ go_library(
     name = "virgl",
     srcs = [
         "backend.go",
+        "backend_linux.go",
         "clone_unsafe.go",
         "context_unsafe.go",
         "formats.c",
@@ -19,7 +20,6 @@ go_library(
         "protocol.go",
         "screen.c",
         "screen_darwin.c",
-        "screen_linux.c",
         "tgsi_check.c",
         "virgl.go",
         "virgl.h",
@@ -29,18 +29,15 @@ go_library(
         "vkgl_unsafe.go",
         "zink_unsafe.go",
     ],
-    # The renderer links Zink (see tools/mesa/README.md): on macOS, on the
-    # MoltenVK that the Venus renderer links; on Linux, on the host's Vulkan
-    # loader, which it loads.
+    # The renderer renders with vkgl, of no Mesa, and on macOS links Zink
+    # too (see tools/mesa/README.md), on the MoltenVK that the Venus
+    # renderer links, until vkgl is verified on MoltenVK. Zink's C files,
+    # and zink_unsafe.go, are of macOS's builds only.
     bazel_cdeps = select({
         "@platforms//os:macos": [
             "@mesa//:gallium_api",
             "@mesa//:zink",
             "@moltenvk",
-        ],
-        "@platforms//os:linux": [
-            "@mesa//:gallium_api",
-            "@mesa//:zink",
         ],
         "//conditions:default": [],
     }),
@@ -59,7 +56,7 @@ go_test(
     size = "small",
     srcs = ["virgl_test.go"],
     library = ":virgl",
-    # The tests render with Zink, through cgo, as the renderer does, and skip
-    # where Zink finds no Vulkan device.
+    # The tests render with the renderer's backend, through cgo, and skip
+    # where it finds no Vulkan device.
     pure = "off",
 )

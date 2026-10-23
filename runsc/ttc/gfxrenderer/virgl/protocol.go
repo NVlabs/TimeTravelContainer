@@ -109,6 +109,11 @@ const (
 	queryStateSize = 16
 	queryStateDone = 1
 
+	// capsV1Size and capsV2Size are the sizes of virgl_hw.h's struct
+	// virgl_caps_v1 and struct virgl_caps_v2, the capability sets.
+	capsV1Size = 308
+	capsV2Size = 1408
+
 	// Gallium's primitives, and queries, as virgl numbers them: as
 	// Gallium did.
 	primPoints                 = 0

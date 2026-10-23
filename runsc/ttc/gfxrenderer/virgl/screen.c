@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//go:build (darwin || linux) && cgo
+//go:build darwin && cgo
 
-// The process's Zink screen, on the platform's Vulkan (screen_darwin.c,
-// screen_linux.c), and the capability sets that virgl guests read of it.
+// The process's Zink screen, on the MoltenVK that the renderer links
+// (screen_darwin.c), and the capability sets that virgl guests read of it.
 
 #include <stdio.h>
 #include <string.h>

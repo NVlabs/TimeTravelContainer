@@ -112,7 +112,10 @@ func (d *Device) Caps(set uint32, ubos, ssbos uint32) []byte {
 	}
 	v1.MaxTextureGatherComponents = 4
 	// What the backend renders none of yet, which guests are offered not:
-	// indirect draws, tessellation, and texture buffers.
+	// indirect draws, tessellation, and texture buffers. TODO: indirect
+	// draws, with compute, shader buffers and images below, which OpenGL
+	// ES 3.1 needs (g3doc/proposals/ttc_virgl_go_backend.md, "OpenGL ES
+	// 3.1").
 	v1.BoolSet1 &^= capHasIndirectDraw | capHasTessellationShaders
 	v1.PrimMask &^= 1 << 14 // MESA_PRIM_PATCHES
 	v1.MaxTBOSize = 0
@@ -183,7 +186,8 @@ func (d *Device) Caps(set uint32, ubos, ssbos uint32) []byte {
 		c.MaxTESOutputs = min(l.MaxTessellationEvaluationOutputComponents/4, 32)
 	}
 	// Nor geometry and tessellation shaders, compute, shader buffers and
-	// images, and multiple indirect draws.
+	// images, and multiple indirect draws. TODO: compute, shader buffers
+	// and images, and atomic counters, of OpenGL ES 3.1, as above.
 	c.CapabilityBits &^= capComputeShader | capMultiDrawIndirect
 	c.MaxGeomOutputVertices, c.MaxGeomTotalOutputComponents, c.MaxShaderPatchVaryings = 0, 0, 0
 	c.MaxTCSOutputs, c.MaxTESOutputs = 0, 0

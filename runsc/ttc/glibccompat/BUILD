@@ -32,8 +32,8 @@ cc_library(
     alwayslink = True,
 )
 
-# For Go binaries with cgo, as the GPU renderer: the start, dl, pthread, file
-# status and math functions.
+# For Go binaries with cgo, as the GPU renderer: the start, dl and pthread
+# functions.
 go_library(
     name = "glibccompat",
     srcs = [
@@ -42,7 +42,6 @@ go_library(
         "glibccompat.h",
         "pthread.c",
         "start_dl.c",
-        "stat_math.c",
     ],
     bazel_cgo = True,
     bazel_clinkopts = select_system(

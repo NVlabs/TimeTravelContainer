@@ -72,7 +72,6 @@ Bazel builds apply these patches to the components they name.
 |---|---|
 | Mesa | [tools/mesa/0001-zink-take-Vulkan-s-entry-points-from-an-embedder.patch](tools/mesa/0001-zink-take-Vulkan-s-entry-points-from-an-embedder.patch) |
 | Mesa | [tools/mesa/0002-tgsi-count-sanity-errors-whether-they-are-printed-or-not.patch](tools/mesa/0002-tgsi-count-sanity-errors-whether-they-are-printed-or-not.patch) |
-| Mesa | [tools/mesa/0003-zink-let-an-embedder-render-on-a-CPU-s-Vulkan-device.patch](tools/mesa/0003-zink-let-an-embedder-render-on-a-CPU-s-Vulkan-device.patch) |
 | Mesa | [tools/mesa/0004-tgsi-read-floats-printed-as-hex-as-their-bits.patch](tools/mesa/0004-tgsi-read-floats-printed-as-hex-as-their-bits.patch) |
 | Mesa | [tools/mesa/0005-tgsi_to_nir-read-an-input-FACE-as-TGSI-s-float.patch](tools/mesa/0005-tgsi_to_nir-read-an-input-FACE-as-TGSI-s-float.patch) |
 | Mesa | [tools/mesa/0006-tgsi-bound-the-vertices-that-the-sanity-check-declares.patch](tools/mesa/0006-tgsi-bound-the-vertices-that-the-sanity-check-declares.patch) |
@@ -83,7 +82,7 @@ Bazel builds apply these patches to the components they name.
 
 ### C and C++ components
 
-`ttcd`'s GPU renderer compiles Vulkan's headers, the code that venus-protocol generates, and constants generated of Khronos's SPIR-V grammar, which this repository holds, and links Zink and what it needs of Mesa, which Bazel builds from Mesa's release, with what that holds; on macOS, `ttcd` also links MoltenVK's static library, of its release, with what that holds.
+`ttcd`'s GPU renderer compiles Vulkan's headers, the code that venus-protocol generates, and constants generated of Khronos's SPIR-V grammar, which this repository holds; on macOS, `ttcd` also links MoltenVK's static library, of its release, with what that holds, and Zink and what it needs of Mesa, which Bazel builds from Mesa's release, with what that holds.
 
 | Component | Version | License | Use |
 |---|---|---|---|
@@ -96,7 +95,7 @@ Bazel builds apply these patches to the components they name.
 | SPIRV-Headers | 29981f652416 | MIT | in MoltenVK |
 | Vulkan-Headers | e3b1eec08173 | Apache-2.0 OR MIT | in MoltenVK |
 | cereal | a56bad8bbb77 | BSD-3-Clause | in MoltenVK |
-| Mesa | 26.2.4 | MIT | linked into ttcd's GPU renderer (Zink, Gallium, NIR, and utilities) |
+| Mesa | 26.2.4 | MIT | linked into ttcd on macOS (Zink, Gallium, NIR, and utilities) |
 | BLAKE3 | 1.8.2 | CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception | in Mesa |
 | xxHash | 0.8.3 | BSD-2-Clause | in Mesa |
 | Berkeley SoftFloat | 3e | BSD-3-Clause | in Mesa |

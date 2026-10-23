@@ -76,8 +76,7 @@ http_archive(
 
 ### Mesa
 # Zink, Mesa's Gallium driver on Vulkan, which the GPU renderer links on macOS
-# and Linux to render for guests' virgl drivers (tools/mesa.BUILD,
-# tools/mesa/README.md).
+# to render for guests' virgl drivers (tools/mesa.BUILD, tools/mesa/README.md).
 http_archive(
     name = "mesa",
     build_file = "//tools:mesa.BUILD",
@@ -85,7 +84,6 @@ http_archive(
     patches = [
         "//tools/mesa:0001-zink-take-Vulkan-s-entry-points-from-an-embedder.patch",
         "//tools/mesa:0002-tgsi-count-sanity-errors-whether-they-are-printed-or-not.patch",
-        "//tools/mesa:0003-zink-let-an-embedder-render-on-a-CPU-s-Vulkan-device.patch",
         "//tools/mesa:0004-tgsi-read-floats-printed-as-hex-as-their-bits.patch",
         "//tools/mesa:0005-tgsi_to_nir-read-an-input-FACE-as-TGSI-s-float.patch",
         "//tools/mesa:0006-tgsi-bound-the-vertices-that-the-sanity-check-declares.patch",

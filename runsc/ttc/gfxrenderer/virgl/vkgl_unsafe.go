@@ -37,7 +37,9 @@ const (
 	vkglXfbSSBO = 12
 )
 
-// errVkgl is the error of what the vkgl backend does not render yet.
+// errVkgl is the error of what the vkgl backend does not render yet, which
+// its capability sets offer guests none of. TODO: what OpenGL ES 3.1 needs
+// (g3doc/proposals/ttc_virgl_go_backend.md, "OpenGL ES 3.1").
 var errVkgl = errors.New("the vkgl backend renders none of it yet")
 
 type vkglBackend struct {

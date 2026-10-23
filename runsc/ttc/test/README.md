@@ -143,7 +143,10 @@ TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
     `gfx/vkoffscreen.c` checks;
 *   OpenGL ES on EGL's surfaceless platform, which must render by Zink on the
     GPU, every pixel checked (`gfx/gloffscreen.c`). On macOS, where Zink has
-    only OpenGL ES 2.0, the test opts in with `MESA_LOADER_DRIVER_OVERRIDE`;
+    only OpenGL ES 2.0, the test opts in with `MESA_LOADER_DRIVER_OVERRIDE`.
+    It must render the same by Mesa's virgl driver, which the renderer
+    serves with vkgl, or on macOS with Zink unless the daemon's environment
+    has `TTC_VIRGL_BACKEND=vkgl`;
 *   a live fork with `--gfx-fork=device-lost` while the guest renders. In the
     child, the process that was rendering must die of `SIGBUS`, not hang, and
     a new one must render. The source must render on;
@@ -174,23 +177,30 @@ TTC_GFX_GUEST_DRIVER=/path/to/dir/of/libvulkan_virtio.so \
 ```
 
 `e2e_redroid.sh` boots Android with the virtual GPU: redroid's image, of the
-host's architecture, whose init is the container's, with Mesa's Venus Vulkan
-driver for Android and `runsc/ttc/gfxrenderer/guest/redroid/gpu_config.sh`, in a
-family with `--gfx-fork=snapshot`. It checks that SurfaceFlinger composes with
-ANGLE on the GPU, that Android's network comes up on `eth0` and validates on the
-internet, that Settings, and the app of `APK` once it installs, render on the
-GPU, and that the screen records to video, as scrcpy needs. Then it forks
+host's architecture, whose init is the container's, in a family with
+`--gfx-fork=snapshot`. By default it boots redroid's own host mode, by flags
+alone: Android's Mesa renders with its virgl driver, which the renderer serves
+with vkgl, or on macOS with Zink unless `TTC_VIRGL_BACKEND=vkgl`. With
+`REDROID_GPU_MODE=venus`, Android renders with ANGLE on Mesa's Venus Vulkan
+driver for Android, with `runsc/ttc/gfxrenderer/guest/redroid/gpu_config.sh`. It
+checks that SurfaceFlinger composes on the GPU, by the mode's driver and the
+renderer's backend, that Android's network comes up on `eth0` and validates on
+the internet, that Settings, and the app of `APK` once it installs, render on
+the GPU, and that the screen records to video, as scrcpy needs. Then it forks
 Android live, and checks that both branches run on, with the same framework, and
 that Settings renders in the child. The screens and the recording are left in
-`out/` of `TTC_E2E_ROOT`, when that is set. Besides what `e2e_gfx.sh` needs, it
-needs the driver that `runsc/ttc/gfxrenderer/guest/build_mesa_venus_android.sh`
-builds (with `ARCH=x86_64` for x86-64 hosts). Where the host's network blocks
-Android's DNS server, 8.8.8.8, `REDROID_DNS` names another.
+`out/` of `TTC_E2E_ROOT`, when that is set. Venus mode needs, besides what
+`e2e_gfx.sh` needs, the driver that
+`runsc/ttc/gfxrenderer/guest/build_mesa_venus_android.sh` builds (with
+`ARCH=x86_64` for x86-64 hosts). Where the host's network blocks Android's DNS
+server, 8.8.8.8, `REDROID_DNS` names another.
 
 ```shell
-TTC=... TTCD=... TTC_GFX_GUEST_DRIVER=... \
+TTC=... TTCD=... APK=/path/to/app.apk \
+  "$PWD/runsc/ttc/test/e2e_redroid.sh"
+
+REDROID_GPU_MODE=venus TTC=... TTCD=... TTC_GFX_GUEST_DRIVER=... \
 ANDROID_GFX_DRIVER=/path/to/vulkan.virtio.so \
-APK=/path/to/app.apk \
   "$PWD/runsc/ttc/test/e2e_redroid.sh"
 ```
 

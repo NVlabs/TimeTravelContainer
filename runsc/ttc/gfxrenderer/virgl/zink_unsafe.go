@@ -1,21 +1,49 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//go:build (darwin || linux) && cgo
+//go:build darwin && cgo
 
 package virgl
 
 /*
 #include <stdlib.h>
 #include "virgl.h"
+#include "virgl_hw.h"
+#include "virgl_protocol.h"
 */
 import "C"
 
 import (
 	"errors"
 	"fmt"
+	"os"
 	"unsafe"
 )
+
+// The protocol's numbers in protocol.go are virgl_protocol.h's, and the
+// sizes of its structs virgl_hw.h's: an index other than 0 fails to
+// compile.
+var (
+	_ = [1]struct{}{}[cmdSetTessState-C.VIRGL_CCMD_SET_TESS_STATE]
+	_ = [1]struct{}{}[cmdTransfer3D-C.VIRGL_CCMD_TRANSFER3D]
+	_ = [1]struct{}{}[cmdLinkShader-C.VIRGL_CCMD_LINK_SHADER]
+	_ = [1]struct{}{}[cmdClearSurface-C.VIRGL_CCMD_CLEAR_SURFACE]
+	_ = [1]struct{}{}[objectMSAASurface-C.VIRGL_OBJECT_MSAA_SURFACE]
+	_ = [1]struct{}{}[transferFromHost-C.VIRGL_TRANSFER_FROM_HOST]
+	_ = [1]struct{}{}[queryStateSize-C.sizeof_struct_virgl_host_query_state]
+	_ = [1]struct{}{}[capsV1Size-C.sizeof_struct_virgl_caps_v1]
+	_ = [1]struct{}{}[capsV2Size-C.sizeof_struct_virgl_caps_v2]
+)
+
+// initBackend creates the process's backend: on macOS, Zink, on MoltenVK,
+// unless TTC_VIRGL_BACKEND is "vkgl", until vkgl is verified on MoltenVK
+// (g3doc/proposals/ttc_virgl_go_backend.md), when Mesa goes.
+func initBackend() (backend, error) {
+	if os.Getenv("TTC_VIRGL_BACKEND") == "vkgl" {
+		return initVkgl()
+	}
+	return initZink()
+}
 
 // zink is the backend of Zink, Mesa's Gallium driver on Vulkan, which
 // pipe.c and screen.c call.

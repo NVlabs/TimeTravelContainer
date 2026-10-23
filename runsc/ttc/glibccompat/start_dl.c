@@ -22,7 +22,6 @@ TTC_GLIBC_OLDEST(dlopen);
 TTC_GLIBC_OLDEST(dlsym);
 TTC_GLIBC_OLDEST(dlerror);
 TTC_GLIBC_OLDEST(dlclose);
-TTC_GLIBC_OLDEST(dladdr);
 
 extern int ttc_oldest___libc_start_main(int (*main)(int, char **, char **), int argc, char **argv,
                                         void (*init)(int, char **, char **), void (*fini)(void),
@@ -31,9 +30,6 @@ extern void *ttc_oldest_dlopen(const char *file, int mode);
 extern void *ttc_oldest_dlsym(void *handle, const char *name);
 extern char *ttc_oldest_dlerror(void);
 extern int ttc_oldest_dlclose(void *handle);
-// info is a Dl_info, which dlfcn.h, whose declarations these definitions
-// would conflict with, declares.
-extern int ttc_oldest_dladdr(const void *addr, void *info);
 
 // The executable's constructors. glibc before 2.34 runs those that the
 // startup code gives it, and so does 2.34's oldest __libc_start_main: the
@@ -67,8 +63,6 @@ TTC_LOCAL void *dlsym(void *handle, const char *name) { return ttc_oldest_dlsym(
 TTC_LOCAL char *dlerror(void) { return ttc_oldest_dlerror(); }
 
 TTC_LOCAL int dlclose(void *handle) { return ttc_oldest_dlclose(handle); }
-
-TTC_LOCAL int dladdr(const void *addr, void *info) { return ttc_oldest_dladdr(addr, info); }
 
 #endif // __GLIBC__
 #endif // __linux__

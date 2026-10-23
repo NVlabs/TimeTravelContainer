@@ -20,16 +20,6 @@
 #define TTC_GLIBC_OLDEST(name) \
     __asm__(".symver ttc_oldest_" #name ", " #name "@" TTC_GLIBC_OLDEST_VERSION)
 
-// TTC_GLIBC_SINCE(name, version) has ttc_oldest_name stand for name's oldest
-// version, version on x86-64, which glibc added name in after its port:
-// arm64's port has every function since its first version.
-#if defined(__x86_64__)
-#define TTC_GLIBC_SINCE(name, version) \
-    __asm__(".symver ttc_oldest_" #name ", " #name "@GLIBC_" version)
-#else
-#define TTC_GLIBC_SINCE(name, version) TTC_GLIBC_OLDEST(name)
-#endif
-
 // TTC_LOCAL defines a function of the C library anew in the binary, for all
 // of the binary's calls, its startup code's among them, which the linker binds
 // to it rather than to the library's; the binary does not export it, and the

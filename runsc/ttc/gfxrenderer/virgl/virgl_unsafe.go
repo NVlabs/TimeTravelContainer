@@ -5,33 +5,11 @@
 
 package virgl
 
-/*
-#cgo linux LDFLAGS: -ldl
-#include <stdlib.h>
-#include "virgl.h"
-#include "virgl_hw.h"
-#include "virgl_protocol.h"
-*/
-import "C"
-
 import (
 	"errors"
 	"fmt"
-	"os"
 	"sync"
 	"sync/atomic"
-)
-
-// The protocol's numbers in protocol.go are virgl_protocol.h's: an index
-// other than 0 fails to compile.
-var (
-	_ = [1]struct{}{}[cmdSetTessState-C.VIRGL_CCMD_SET_TESS_STATE]
-	_ = [1]struct{}{}[cmdTransfer3D-C.VIRGL_CCMD_TRANSFER3D]
-	_ = [1]struct{}{}[cmdLinkShader-C.VIRGL_CCMD_LINK_SHADER]
-	_ = [1]struct{}{}[cmdClearSurface-C.VIRGL_CCMD_CLEAR_SURFACE]
-	_ = [1]struct{}{}[objectMSAASurface-C.VIRGL_OBJECT_MSAA_SURFACE]
-	_ = [1]struct{}{}[transferFromHost-C.VIRGL_TRANSFER_FROM_HOST]
-	_ = [1]struct{}{}[queryStateSize-C.sizeof_struct_virgl_host_query_state]
 )
 
 var (
@@ -41,23 +19,18 @@ var (
 	be backend
 
 	// xfbEmulated is whether the renderer emulates transform feedback,
-	// which Zink has none of here, and xfbSSBO the vertex shader's first
+	// which the backend has none of, and xfbSSBO the vertex shader's first
 	// shader buffer slot that it keeps for its targets.
 	xfbEmulated bool
 	xfbSSBO     uint32
 )
 
-// Init creates the process's backend, if it has not: Zink's screen, on the
-// Vulkan that the renderer links, or, where TTC_VIRGL_BACKEND is "vkgl",
-// the Go backend's device (vkgl_unsafe.go).
+// Init creates the process's backend, if it has not: the Go backend's
+// device (vkgl_unsafe.go), or, on macOS, unless TTC_VIRGL_BACKEND is
+// "vkgl", Zink's screen (zink_unsafe.go).
 func Init() error {
 	initOnce.Do(func() {
-		if os.Getenv("TTC_VIRGL_BACKEND") == "vkgl" {
-			be, initErr = initVkgl()
-		} else {
-			be, initErr = initZink()
-		}
-		if initErr != nil {
+		if be, initErr = initBackend(); initErr != nil {
 			return
 		}
 		xfbEmulated, xfbSSBO = be.xfb()
@@ -75,9 +48,9 @@ func Capsets() ([]Capset, error) {
 	if err := Init(); err != nil {
 		return nil, err
 	}
-	v1 := make([]byte, C.sizeof_struct_virgl_caps_v1)
+	v1 := make([]byte, capsV1Size)
 	be.fillCaps(CapsetVirgl, v1)
-	v2 := make([]byte, C.sizeof_struct_virgl_caps_v2)
+	v2 := make([]byte, capsV2Size)
 	be.fillCaps(CapsetVirgl2, v2)
 	return []Capset{
 		{ID: CapsetVirgl, MaxVersion: 1, Data: v1},

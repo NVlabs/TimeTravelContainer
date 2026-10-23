@@ -13,8 +13,8 @@
 #
 # REDROID_GPU_MODE says how Android drives the GPU:
 #   host (the default), redroid's own host mode, by flags alone: its Mesa's
-#     virgl OpenGL driver, which the renderer serves with Zink, and its GBM
-#     gralloc;
+#     virgl OpenGL driver, which the renderer serves with vkgl, or on macOS
+#     with Zink, and its GBM gralloc;
 #   venus, TTC's Venus Vulkan driver for Android, which the container gets
 #     with TTC's graphics configuration for redroid, and ANGLE, OpenGL ES on
 #     Vulkan, for SurfaceFlinger and apps.
@@ -65,8 +65,11 @@ case "$REDROID_GPU_MODE" in
   host)
     # SurfaceFlinger's renderer, and what apps render with: Mesa's OpenGL ES
     # and its Gallium drivers, whose virtio_gpu_dri.so, virgl, is a link to
-    # them.
-    WANT_GLES="virgl"
+    # them; virgl of the renderer's backend, vkgl, or, on macOS, Zink unless
+    # TTC_VIRGL_BACKEND=vkgl.
+    VIRGL_BACKEND=vkgl
+    if [ "$(uname -s)" = Darwin ] && [ "${TTC_VIRGL_BACKEND:-}" != vkgl ]; then VIRGL_BACKEND=zink; fi
+    WANT_GLES="virgl ($VIRGL_BACKEND"
     WANT_LIBS="libGLESv2_mesa.so libgallium_dri.so"
     ;;
   venus)
