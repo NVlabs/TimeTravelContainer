@@ -238,6 +238,9 @@ Debian's and redroid's Mesa report `virgl (vkgl (DEVICE))`, with OpenGL ES
 buffers), shader images, indirect draws, stencil texturing and
 multisampled textures, besides 3.0's (see
 [OpenGL ES 3.1](../../../g3doc/proposals/ttc_virgl_go_backend.md#opengl-es-31)).
+On MoltenVK, dEQP-GLES31's failures are of geometry shaders, which Mesa's
+virgl driver offers of OpenGL ES 3.1 and Metal has not, but for three
+([dEQP-GLES31](../../../g3doc/proposals/ttc_virgl_go_backend.md#deqp-gles31)).
 On Linux, ttcd's configuration of Mesa has applications use
 Zink in the guest instead, whose transform feedback is the host GPU's (see
 [The guest's driver](#the-guests-driver)); an application asks for virgl

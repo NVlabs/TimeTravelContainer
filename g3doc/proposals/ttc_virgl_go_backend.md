@@ -265,21 +265,67 @@ MoltenVK, `tospirv` gives `MEMBAR`'s fences the workgroup's scope
 checks: vkgl's tests of compute, indirect draws, stencil texturing and
 multisampled textures; the decoder's of `LAUNCH_GRID`, shader images,
 indirect draws and fragment shaders' atomics; `test/gfx/gles31.c` of
-Debian's Mesa in `e2e_gfx.sh`; and redroid's SurfaceFlinger, of OpenGL ES
-3.1.
+Debian's Mesa in `e2e_gfx.sh`; redroid's SurfaceFlinger, of OpenGL ES 3.1;
+and dEQP-GLES31, below.
 
 Gaps of 3.1: indirect draws' first instances, which OpenGL ES has of zero
 (`reservedMustBeZero`), and which instance IDs of desktop OpenGL's would
-miss; and images of a 3D texture's slice as a 2D image, which Vulkan views
-only of images created to be viewed so, and which guests get images of
-zeros of.
+miss.
 
-Two gaps of what guests get already: rendering to 3D textures' slices,
-which OpenGL ES 3.0 allows, and vkgl's surfaces refuse, as Vulkan views a
-3D image's slices only of images created to be viewed so; and conditional
-rendering, which desktop OpenGL 3.0 requires, and which the capability
-sets do not offer, of which desktop OpenGL guests get 2.1 (Linux's use Zink
-in the guest by default). OpenGL ES 3.2 and OpenGL 3.2 and later need,
-besides, geometry and tessellation shaders, which `tospirv` translates,
-texture buffers, and framebuffer fetch (`FBFETCH`, of advanced blending),
-whose input attachments pipelines' layouts refuse.
+A gap of what guests get already: conditional rendering, which desktop
+OpenGL 3.0 requires, and which the capability sets do not offer, of which
+desktop OpenGL guests get 2.1 (Linux's use Zink in the guest by default).
+OpenGL ES 3.2 and OpenGL 3.2 and later need, besides, geometry and
+tessellation shaders, which `tospirv` translates, texture buffers, and
+framebuffer fetch (`FBFETCH`, of advanced blending), whose input
+attachments pipelines' layouts refuse.
+
+### dEQP-GLES31
+
+VK-GL-CTS's dEQP-GLES31, all 37,899 cases that it runs, surfaceless, of a
+Debian guest's Mesa 26.2 virgl driver, on vkgl on MoltenVK (Apple M5 Pro,
+macOS 26.7), passes 18,197, fails 804, and finds the others not supported
+(2026-10-23). Its runs found what vkgl now does:
+
+*   one-sided stencil tests' back faces, of the front's reference: Mesa's
+    state tracker draws scissored stencil clears of quads that face back,
+    of a back reference of 0;
+*   compute shaders' barriers of buffers and images, besides shared
+    memory: Metal orders a workgroup's texture writes before its atomics
+    of them of a fence of textures alone;
+*   atomic exchanges of float images, of their bits, of devices of no
+    float image atomics, as MoltenVK is;
+*   3D textures' slices as surfaces and as 2D images
+    (`2D_ARRAY_COMPATIBLE`, `VK_EXT_image_2d_view_of_3d`);
+*   multisampled formats of every count up to the most, of depth formats,
+    and of framebuffers of no attachments;
+*   transfers of packed depth and stencil textures, of planes of each
+    aspect;
+*   every plain vertex format, which Mesa's virgl driver offers whatever
+    the caps say: of formats that Vulkan or the device has not, fetched as
+    integers that the vertex shader converts, and of addresses or strides
+    of no multiple of 4, which Metal fetches not, of a realigned copy;
+*   shader buffers numbered from the least binding of their blocks, as
+    Mesa's driver numbers them (`nir_to_tgsi`'s `lower_ssbo_bindings`) and
+    virglrenderer reads them;
+*   border colors that Vulkan's are not (`EXT_texture_border_clamp`, which
+    Mesa offers of every context), blended of two samples, of transparent
+    black and opaque white borders, whose difference is the border's
+    weight: MoltenVK has no `VK_EXT_custom_border_color`;
+*   sample shading's inputs at the samples' locations, which Metal
+    interpolates at the pixels' centers but of inputs of the `Sample`
+    decoration; and single-sampled framebuffers' sample masks, which
+    OpenGL ignores, and Vulkan does not;
+*   `isnan` of a float's bits, as Metal's fast math folds `x != x`;
+*   blits to boxes past their destinations' edges, which Mesa's state
+    tracker clips of scissors.
+
+What fails yet: geometry shaders (801 cases), which Mesa's virgl driver
+offers of every OpenGL ES 3.1 context (`OES_geometry_shader`: virgl's caps
+have no bit to refuse them), and Metal has not: vkgl refuses them, and the
+caps' maximum of their output vertices, 0, fails guests' compiles of them;
+shadow samplers' gathers of float depths of a border depth past [0, 1] (2),
+whose blend is exact of depths within it; and a negative test of Mesa's own
+order of errors (1). Not supported: tessellation shaders, texture buffers,
+`EXT_copy_image`, advanced blending, framebuffer fetch, GLSL ES 3.2, and
+more than 8 samples.
