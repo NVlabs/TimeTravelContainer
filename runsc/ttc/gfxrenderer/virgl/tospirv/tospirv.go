@@ -99,6 +99,10 @@ type Options struct {
 	StreamOutput *StreamOutput
 	// SharedMemory is a compute shader's shared memory, in bytes.
 	SharedMemory int
+	// WorkgroupFences is whether MEMBAR's fences of the device's scope
+	// are of the workgroup's: Apple's GPU compiler crashes of a fence of
+	// the device's scope before an atomic's read-modify-write.
+	WorkgroupFences bool
 	// Multisampled is whether a fragment shader's color buffers, which
 	// FBFETCH reads, are multisampled: it reads its sample's.
 	Multisampled bool

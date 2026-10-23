@@ -124,6 +124,16 @@ func (t *translator) wordIndex(inst *tgsi.Instruction, n int, c uint32) spirv.ID
 	return i
 }
 
+// TGSI's MEMBAR's flags, TGSI_MEMBAR_*: of the memory that it orders, and
+// of the workgroup's scope.
+const (
+	membarShaderBuffer = 1 << iota
+	membarAtomicBuffer
+	membarShaderImage
+	membarShared
+	membarThreadGroup
+)
+
 // The atomics, by their opcodes: SPIR-V's, and their operands' type.
 var atomics = map[tgsi.Opcode]struct {
 	op spirv.Op
@@ -214,10 +224,27 @@ func (t *translator) memoryInstruction(inst *tgsi.Instruction) bool {
 			t.fail("BARRIER of %v", t.s.Processor)
 		}
 	case tgsi.OpMEMBAR:
-		dev := t.m.ConstantUint(uint32(spirv.ScopeDevice))
-		sem := t.m.ConstantUint(uint32(spirv.MemorySemanticsAcquireRelease | spirv.MemorySemanticsUniformMemory |
-			spirv.MemorySemanticsWorkgroupMemory | spirv.MemorySemanticsImageMemory))
-		t.f.Do(spirv.OpMemoryBarrier, uint32(dev), uint32(sem))
+		// Of the memory of its flags, of the workgroup's scope if they
+		// say or the options do, or of the device's.
+		flags := t.immediateChannel(&inst.Src[0])
+		sem := spirv.MemorySemanticsAcquireRelease
+		if flags&(membarShaderBuffer|membarAtomicBuffer) != 0 {
+			sem |= spirv.MemorySemanticsUniformMemory
+		}
+		if flags&membarShaderImage != 0 {
+			sem |= spirv.MemorySemanticsImageMemory
+		}
+		if flags&membarShared != 0 {
+			sem |= spirv.MemorySemanticsWorkgroupMemory
+		}
+		if sem == spirv.MemorySemanticsAcquireRelease {
+			break
+		}
+		scope := spirv.ScopeDevice
+		if flags&membarThreadGroup != 0 || t.opts.WorkgroupFences {
+			scope = spirv.ScopeWorkgroup
+		}
+		t.f.Do(spirv.OpMemoryBarrier, uint32(t.m.ConstantUint(uint32(scope))), uint32(t.m.ConstantUint(uint32(sem))))
 	default:
 		a, ok := atomics[op]
 		if !ok {
