@@ -1321,6 +1321,50 @@ func TestDestroyReleasesBindings(t *testing.T) {
 	}
 }
 
+// TestUniformBufferRanges binds uniform buffers' ranges that Vulkan binds
+// none of as they are: of no bytes, which shaders read zeros of, and past
+// their buffers, which the renderer refuses.
+func TestUniformBufferRanges(t *testing.T) {
+	f := newFixture(t)
+	uboMem := make([]byte, 32)
+	for i := range uboMem {
+		uboMem[i] = 0xff
+	}
+	ubo, err := NewResource(f.id(), ResourceArgs{Target: targetBuffer, Format: formatR8Unorm, Bind: 1 << 6,
+		Width: 32, Height: 1, Depth: 1, ArraySize: 1}, uboMem, nil)
+	if err != nil {
+		t.Fatalf("NewResource: %v", err)
+	}
+	defer ubo.DecRef()
+	f.c.Attach(ubo)
+	if err := f.c.Transfer(ubo, TransferArgs{ToHost: true, W: 32, H: 1, D: 1}); err != nil {
+		t.Fatalf("Transfer: %v", err)
+	}
+	var s stream
+	f.setup(&s)
+	fs := f.id()
+	s.shader(fs, stageFragment, `FRAG
+DCL OUT[0], COLOR
+DCL CONST[1][0]
+  0: MOV OUT[0], CONST[1][0]
+  1: END
+`, 1<<16)
+	s.cmd(cmdBindShader, 0, fs, stageFragment)
+	s.cmd(cmdSetUniformBuffer, 0, stageFragment, 1, 32, 0, ubo.ID())
+	clearRed(&s)
+	drawTriangle(&s)
+	f.submit(t, s)
+	f.finish(t)
+	if p := f.pixel(4, height/2); p != [4]byte{} {
+		t.Errorf("of a uniform buffer of no bytes: %v, want zeros", p)
+	}
+	var bad stream
+	bad.cmd(cmdSetUniformBuffer, 0, stageFragment, 1, 0, 64, ubo.ID())
+	if err := f.c.Submit(bad.bytes()); err == nil {
+		t.Errorf("a uniform buffer of 64 bytes of a buffer of 32 was bound")
+	}
+}
+
 // Shaders read their constants, which the guest sets, and uniform buffers,
 // of resources, as Mesa's state tracker binds them: the vertex shader's
 // offsets the triangle, and the fragment shader's color it.

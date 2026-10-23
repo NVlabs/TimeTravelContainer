@@ -702,6 +702,14 @@ func (c *vkglContext) setUniformBuffer(stage, index uint32, br backendResource, 
 	if r != nil && r.buf == nil {
 		return errors.New("a uniform buffer of a texture")
 	}
+	// Of a range of the buffer, of an offset of Vulkan's alignment, as the
+	// caps have guests align them.
+	if r != nil {
+		align := uint64(c.b.d.UniformBufferAlignment())
+		if n := r.buf.Size(); uint64(offset)%align != 0 || uint64(offset) > n || uint64(size) > n-uint64(offset) {
+			return fmt.Errorf("a uniform buffer of %d bytes at %d of a buffer of %d", size, offset, n)
+		}
+	}
 	if old := c.ubos[stage][index].res; old != nil {
 		old.decRef()
 	}
@@ -1430,11 +1438,16 @@ func (c *vkglContext) uniformBinding(stage tgsi.Processor, virgl uint32, slot in
 		return bb, nil
 	}
 	if slot < maxConstantBuffers {
-		if rg := c.ubos[virgl][slot]; rg.res != nil {
+		// Of a range of no bytes, as Mesa's state tracker binds of an
+		// offset at a buffer's end, none; of a range past the device's
+		// most, which Mesa binds of a buffer bound whole, of shaders
+		// that read less, the most.
+		if rg := c.ubos[virgl][slot]; rg.res != nil && rg.size != 0 {
 			if err := c.use(&rg.res.vkglRef); err != nil {
 				return bb, err
 			}
-			bb.Buffer, bb.Offset, bb.Range = rg.res.buf, uint64(rg.offset), uint64(rg.size)
+			bb.Buffer, bb.Offset = rg.res.buf, uint64(rg.offset)
+			bb.Range = uint64(min(rg.size, c.b.d.MaxUniformBufferRange()))
 			return bb, nil
 		}
 	}

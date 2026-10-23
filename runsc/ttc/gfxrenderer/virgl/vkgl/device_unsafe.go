@@ -643,3 +643,15 @@ func (d *Device) memoryType(bits, want uint32) (uint32, bool) {
 	}
 	return 0, false
 }
+
+// UniformBufferAlignment returns the alignment of the offsets of uniform
+// buffers' bindings.
+func (d *Device) UniformBufferAlignment() uint32 {
+	return uint32(d.props.Limits.MinUniformBufferOffsetAlignment)
+}
+
+// MaxUniformBufferRange returns the most bytes of a uniform buffer's
+// binding.
+func (d *Device) MaxUniformBufferRange() uint32 {
+	return d.props.Limits.MaxUniformBufferRange
+}
