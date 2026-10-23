@@ -130,7 +130,7 @@ func render(t *testing.T, d *Device, vs, fs string, vertices [][8]float32, size 
 		if ubo != nil {
 			buffers = append(buffers, BufferBinding{tgsi.ProcessorFragment, tospirv.UniformBuffer, 0, ubo, 0, ubo.size})
 		}
-		if err := c.Bind(p, buffers, textures); err != nil {
+		if err := c.Bind(p, buffers, textures, nil); err != nil {
 			return err
 		}
 		c.PushConstants(p, 0, make([]byte, tospirv.PushConstantsSize))

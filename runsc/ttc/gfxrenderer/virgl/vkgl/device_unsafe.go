@@ -159,6 +159,12 @@ type Device struct {
 	// comparison samplers' descriptors, and attributes past their
 	// bindings' strides.
 	triangleFans, pointPolygons, samplerMipLodBias, separateStencilRef, multisampleArrays bool
+	// workgroupFences is whether shaders' fences of the device's scope are
+	// of the workgroup's, of MoltenVK: Apple's GPU compiler crashes of a
+	// fence of the device's scope before an atomic's read-modify-write of
+	// device memory (macOS 26.7, M5), which MoltenVK's MSL before 3.2
+	// fenced of the threadgroup's scope too.
+	workgroupFences bool
 	// substitutes are the Vulkan formats that the device renders depths
 	// to in place of those that it lacks, by the formats lacked.
 	substitutes map[uint32]uint32
@@ -475,6 +481,7 @@ func (d *Device) createDevice() error {
 		d.samplerMipLodBias = ps.SamplerMipLodBias != 0
 		d.separateStencilRef = ps.SeparateStencilMaskRef != 0
 		d.multisampleArrays = ps.MultisampleArrayImage != 0
+		d.workgroupFences = true
 	}
 	d.initSubstitutes()
 	if idx8Ext != "" {

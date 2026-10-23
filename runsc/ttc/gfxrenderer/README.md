@@ -111,7 +111,7 @@ use Mesa's EGL on its surfaceless platform render on it by Zink. On macOS,
 Zink on MoltenVK has only OpenGL 2.1 and OpenGL ES 2.0, as MoltenVK has
 neither transform feedback nor geometry shaders: there, Mesa's OpenGL drives
 the GPU with its virgl driver, which the renderer serves with vkgl on the
-host (see [virgl](#virgl)), with OpenGL ES 3.0, unless an application sets
+host (see [virgl](#virgl)), with OpenGL ES 3.1, unless an application sets
 `MESA_LOADER_DRIVER_OVERRIDE=zink`, for Zink in the guest,
 or `LIBGL_ALWAYS_SOFTWARE=1`, for Mesa's llvmpipe, which has OpenGL 4.6 in
 software. Chromium renders on the GPU with ANGLE
@@ -234,9 +234,9 @@ done, and queries' results are in the guest's memory by then.
 
 Guests need no configuration, and get what the backend renders. On vkgl,
 Debian's and redroid's Mesa report `virgl (vkgl (DEVICE))`, with OpenGL ES
-3.0. OpenGL ES 3.1 needs compute shaders, shader buffers and images,
-atomic counters and indirect draws, which vkgl renders none of yet, and
-its capability sets offer none of (TODO:
+3.1: compute shaders, shader buffers, atomic counters (of shader
+buffers), shader images, indirect draws, stencil texturing and
+multisampled textures, besides 3.0's (see
 [OpenGL ES 3.1](../../../g3doc/proposals/ttc_virgl_go_backend.md#opengl-es-31)).
 On Linux, ttcd's configuration of Mesa has applications use
 Zink in the guest instead, whose transform feedback is the host GPU's (see

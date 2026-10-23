@@ -6,6 +6,7 @@ package vkgl
 import (
 	"encoding/binary"
 	"math"
+	"strings"
 )
 
 // Format is a virgl format, as Vulkan has or emulates it: its Vulkan
@@ -36,11 +37,42 @@ const (
 	kindDepthStencil
 )
 
+// viewFormats are virgl's formats of views alone, which Vulkan has as
+// textures' own: of the stencil of depth and stencil textures, which
+// shaders sample, as GL's stencil texturing does, of Vulkan's formats of the
+// textures, which views of its stencil aspect sample.
+var viewFormats = map[uint32]Format{
+	136: {Name: "X24S8_UINT", VK: 129, Swizzle: "XYZW", BlockBytes: 4, BlockWidth: 1, BlockHeight: 1, kind: kindStencil},     // VK_FORMAT_D24_UNORM_S8_UINT
+	138: {Name: "X32_S8X24_UINT", VK: 130, Swizzle: "XYZW", BlockBytes: 8, BlockWidth: 1, BlockHeight: 1, kind: kindStencil}, // VK_FORMAT_D32_SFLOAT_S8_UINT
+}
+
 // LookupFormat returns virgl's format f, as Vulkan has or emulates it, or
 // false if it has neither.
 func LookupFormat(f uint32) (Format, bool) {
-	ft, ok := formats[f]
+	if ft, ok := formats[f]; ok {
+		return ft, true
+	}
+	ft, ok := viewFormats[f]
 	return ft, ok
+}
+
+// FormatByName returns virgl's format of name, as Mesa names Gallium's
+// formats, PIPE_FORMAT_ and on, of textures that Vulkan has or emulates.
+func FormatByName(name string) (uint32, bool) {
+	name = strings.TrimPrefix(name, "PIPE_FORMAT_")
+	for vf, f := range formats {
+		if f.Name == name {
+			return vf, true
+		}
+	}
+	return 0, false
+}
+
+// IsViewFormat reports whether virgl's format f is of views alone, of no
+// textures.
+func IsViewFormat(f uint32) bool {
+	_, ok := viewFormats[f]
+	return ok
 }
 
 // IsDepth reports whether the format has depth, and IsStencil whether it

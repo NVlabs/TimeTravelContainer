@@ -232,7 +232,7 @@ func (c *Context) shaderBlit(b Blit, scissor *Scissor) error {
 			}
 			cmds.SetBlendConstants([4]float32{})
 			cmds.SetStencilReference(0, 0)
-			if err := c.BindResources(cmds, p, nil, []TextureBinding{{Stage: tgsi.ProcessorFragment, View: view, Sampler: sampler}}); err != nil {
+			if err := c.BindResources(cmds, p, nil, []TextureBinding{{Stage: tgsi.ProcessorFragment, View: view, Sampler: sampler}}, nil); err != nil {
 				return err
 			}
 			var push [tospirv.PushConstantsSize]byte

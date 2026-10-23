@@ -5,7 +5,11 @@
 
 package vkgl
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+
+	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/virgl/tospirv"
+)
 
 // Format features of buffers, of VkFormatFeatureFlagBits.
 const featureVertexBuffer = 0x40
@@ -47,6 +51,13 @@ func (d *Device) Caps(set uint32, ubos, ssbos uint32) []byte {
 		}
 		if props.BufferFeatures&featureVertexBuffer != 0 && ft.Swizzle == "XYZW" {
 			v1.VertexBuffer.set(vf)
+		}
+	}
+	for vf := range viewFormats {
+		// Of views alone, which shaders sample.
+		ft, _ := d.LookupFormat(vf)
+		if d.formatProperties(ft.VK).OptimalTilingFeatures&featureSampledImage != 0 {
+			v1.Sampler.set(vf)
 		}
 	}
 	for _, s := range []uint32{1, 2, 67, 134, 7, 8} {
@@ -112,11 +123,8 @@ func (d *Device) Caps(set uint32, ubos, ssbos uint32) []byte {
 	}
 	v1.MaxTextureGatherComponents = 4
 	// What the backend renders none of yet, which guests are offered not:
-	// indirect draws, tessellation, and texture buffers. TODO: indirect
-	// draws, with compute, shader buffers and images below, which OpenGL
-	// ES 3.1 needs (g3doc/proposals/ttc_virgl_go_backend.md, "OpenGL ES
-	// 3.1").
-	v1.BoolSet1 &^= capHasIndirectDraw | capHasTessellationShaders
+	// tessellation, and texture buffers. TODO: of OpenGL ES 3.2.
+	v1.BoolSet1 &^= capHasTessellationShaders
 	v1.PrimMask &^= 1 << 14 // MESA_PRIM_PATCHES
 	v1.MaxTBOSize = 0
 	if set == 1 {
@@ -149,31 +157,38 @@ func (d *Device) Caps(set uint32, ubos, ssbos uint32) []byte {
 		c.CapabilityBits |= capMultiDrawIndirect
 	}
 	c.MaxVertexAttribStride = min(l.MaxVertexInputBindingStride, 2048)
+	// Shader buffers and images, of the stages that store to memory, the
+	// vertex shader's less the renderer's, and of compute, of no
+	// geometry and tessellation shaders. Guests have atomic counters of
+	// shader buffers, of none of the hardware's.
 	stageBuffers := min(l.MaxPerStageDescriptorStorageBuffers, 16)
-	c.MaxShaderBufferFragCompute = stageBuffers
-	if f.VertexPipelineStoresAndAtomics != 0 {
-		c.MaxShaderBufferOtherStages = stageBuffers - ssbos
-	}
 	stageImages := min(l.MaxPerStageDescriptorStorageImages, 8)
-	if f.FragmentStoresAndAtomics != 0 {
-		c.MaxShaderImageFragCompute = stageImages
-	}
+	var vertexBuffers, fragmentBuffers, vertexImages, fragmentImages uint32
 	if f.VertexPipelineStoresAndAtomics != 0 {
-		c.MaxShaderImageOtherStages = stageImages
+		vertexBuffers, vertexImages = max(stageBuffers, ssbos)-ssbos, stageImages
 	}
+	if f.FragmentStoresAndAtomics != 0 {
+		fragmentBuffers, fragmentImages = stageBuffers, stageImages
+	}
+	c.MaxShaderStorageBlocks = [6]uint32{stageVertex: vertexBuffers, stageFragment: fragmentBuffers, stageCompute: stageBuffers}
+	c.MaxShaderBufferFragCompute, c.MaxShaderBufferOtherStages = fragmentBuffers, vertexBuffers
+	c.MaxShaderImageFragCompute, c.MaxShaderImageOtherStages = fragmentImages, vertexImages
+	c.MaxCombinedShaderBuffers = min(l.MaxDescriptorSetStorageBuffers, vertexBuffers+fragmentBuffers+stageBuffers)
+	// Of compute's shared memory, the most that the renderer's shaders
+	// have.
 	c.MaxComputeWorkGroupInvocations = l.MaxComputeWorkGroupInvocations
-	c.MaxComputeSharedMemorySize = l.MaxComputeSharedMemorySize
+	c.MaxComputeSharedMemorySize = min(l.MaxComputeSharedMemorySize, tospirv.MaxSharedMemory)
 	c.MaxComputeGridSize = l.MaxComputeWorkGroupCount
 	c.MaxComputeBlockSize = l.MaxComputeWorkGroupSize
 	c.MaxTexture2DSize = l.MaxImageDimension2D
 	c.MaxTexture3DSize = l.MaxImageDimension3D
 	c.MaxTextureCubeSize = l.MaxImageDimensionCube
-	c.MaxCombinedShaderBuffers = min(l.MaxDescriptorSetStorageBuffers, 6*stageBuffers)
 	for i := range c.MaxConstBufferSize {
 		c.MaxConstBufferSize[i] = min(l.MaxUniformBufferRange, 64<<10)
-		c.MaxShaderStorageBlocks[i] = stageBuffers
 	}
-	c.MaxShaderStorageBlocks[0] -= ssbos
+	if l.StandardSampleLocations != 0 {
+		c.SampleLocations = standardSampleLocations()
+	}
 	// virglrenderer's: the guest relies on the host's behaviors of every
 	// version up to it, which this host has.
 	c.HostFeatureCheckVersion = 23
@@ -185,16 +200,35 @@ func (d *Device) Caps(set uint32, ubos, ssbos uint32) []byte {
 		c.MaxTCSOutputs = min(l.MaxTessellationControlPerVertexOutputComponents/4, 32)
 		c.MaxTESOutputs = min(l.MaxTessellationEvaluationOutputComponents/4, 32)
 	}
-	// Nor geometry and tessellation shaders, compute, shader buffers and
-	// images, and multiple indirect draws. TODO: compute, shader buffers
-	// and images, and atomic counters, of OpenGL ES 3.1, as above.
-	c.CapabilityBits &^= capComputeShader | capMultiDrawIndirect
+	// Nor geometry and tessellation shaders, as above.
 	c.MaxGeomOutputVertices, c.MaxGeomTotalOutputComponents, c.MaxShaderPatchVaryings = 0, 0, 0
 	c.MaxTCSOutputs, c.MaxTESOutputs = 0, 0
-	c.MaxShaderBufferFragCompute, c.MaxShaderBufferOtherStages = 0, 0
-	c.MaxShaderImageFragCompute, c.MaxShaderImageOtherStages = 0, 0
-	c.MaxCombinedShaderBuffers, c.MaxShaderStorageBlocks = 0, [6]uint32{}
-	c.MaxComputeWorkGroupInvocations, c.MaxComputeSharedMemorySize = 0, 0
-	c.MaxComputeGridSize, c.MaxComputeBlockSize = [3]uint32{}, [3]uint32{}
 	return encodeCaps(&c)
+}
+
+// virgl's shader stages, of the caps' arrays of each.
+const (
+	stageVertex   = 0
+	stageFragment = 1
+	stageCompute  = 5
+)
+
+// standardSampleLocations returns Vulkan's standard locations of samples,
+// in sixteenths of a pixel, of 2, 4, 8 and 16 samples, as virgl's caps
+// have them: of each sample a byte of x and y, from words 0, 1, 2 and 4.
+func standardSampleLocations() [8]uint32 {
+	var words [8]uint32
+	for k, locations := range [][][2]uint32{
+		{{12, 12}, {4, 4}},
+		{{6, 2}, {14, 6}, {2, 10}, {10, 14}},
+		{{9, 5}, {7, 11}, {13, 9}, {5, 3}, {3, 13}, {1, 7}, {11, 15}, {15, 1}},
+		{{9, 9}, {7, 5}, {5, 10}, {12, 7}, {3, 6}, {10, 13}, {13, 11}, {11, 3}, {6, 14}, {8, 1}, {4, 2}, {2, 12},
+			{0, 8}, {15, 4}, {14, 15}, {1, 0}},
+	} {
+		first := []int{0, 1, 2, 4}[k]
+		for i, p := range locations {
+			words[first+i/4] |= (p[0]<<4 | p[1]) << (8 * (i % 4))
+		}
+	}
+	return words
 }

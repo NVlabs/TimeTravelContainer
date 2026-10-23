@@ -11,7 +11,6 @@ import (
 
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/venus/vk"
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/venus/vn"
-	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/virgl/tospirv"
 )
 
 // VertexBinding is a binding of a pipeline's vertex buffers: its vertices'
@@ -115,28 +114,10 @@ func (d *Device) NewPipeline(desc PipelineDesc) (*Pipeline, error) {
 	defer d.mu.Unlock()
 	a := d.a
 	defer a.reset()
-	p := &Pipeline{}
-	var err error
-	if p.setLayouts, err = d.setLayouts(desc.Resources); err != nil {
+	p, err := d.newGraphicsPipeline(desc.Resources)
+	if err != nil {
 		return nil, err
 	}
-	sl := array[vn.Handle](a, numSets)
-	copy(sl, p.setLayouts[:])
-	pcr := get[vn.VkPushConstantRange](a)
-	*pcr = vn.VkPushConstantRange{StageFlags: shaderStageAllGraphics, Size: tospirv.PushConstantsSize}
-	li := get[vn.VkPipelineLayoutCreateInfo](a)
-	li.SType = vn.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
-	li.SetLayoutCount, li.PSetLayouts = numSets, unsafe.Pointer(&sl[0])
-	li.PushConstantRangeCount, li.PPushConstantRanges = 1, unsafe.Pointer(pcr)
-	layout := get[vn.Handle](a)
-	cl := get[vn.Args_vkCreatePipelineLayout](a)
-	cl.Device, cl.PCreateInfo, cl.PPipelineLayout = d.dev, unsafe.Pointer(li), unsafe.Pointer(layout)
-	vk.Call(vn.VK_COMMAND_TYPE_vkCreatePipelineLayout_EXT, d.table, unsafe.Pointer(cl))
-	if err := check("vkCreatePipelineLayout", cl.Ret); err != nil {
-		d.destroyPipeline(p)
-		return nil, err
-	}
-	p.layout = *layout
 
 	vs, err := d.shaderModule(desc.VS)
 	if err != nil {
@@ -389,6 +370,18 @@ func (c *Commands) BindVertexBuffers(first uint32, bufs []*Buffer, offsets []uin
 	c.call(vn.VK_COMMAND_TYPE_vkCmdBindVertexBuffers_EXT, unsafe.Pointer(bv))
 }
 
+// StorageBufferAlignment returns the alignment of the offsets of storage
+// buffers' bindings.
+func (d *Device) StorageBufferAlignment() uint32 {
+	return uint32(d.props.Limits.MinStorageBufferOffsetAlignment)
+}
+
+// MaxStorageBufferRange returns the most bytes of a storage buffer's
+// binding.
+func (d *Device) MaxStorageBufferRange() uint32 {
+	return d.props.Limits.MaxStorageBufferRange
+}
+
 // IndexSizeOK reports whether the device draws indexes of size bytes.
 func (d *Device) IndexSizeOK(size uint32) bool {
 	return size == 2 || size == 4 || size == 1 && d.indexUint8
@@ -421,6 +414,47 @@ func (c *Commands) DrawIndexed(indexes, instances, first uint32, bias int32, fir
 	dr := get[vn.Args_vkCmdDrawIndexed](c.a)
 	dr.IndexCount, dr.InstanceCount, dr.FirstIndex, dr.VertexOffset, dr.FirstInstance = indexes, instances, first, bias, firstInstance
 	c.call(vn.VK_COMMAND_TYPE_vkCmdDrawIndexed_EXT, unsafe.Pointer(dr))
+}
+
+// DrawIndirect draws count draws of the commands of b from offset, of
+// stride bytes each: VkDrawIndirectCommands, or VkDrawIndexedIndirectCommands
+// of the bound indexes if indexed. Gallium's commands of indirect draws are
+// Vulkan's.
+func (c *Commands) DrawIndirect(b *Buffer, offset uint64, count, stride uint32, indexed bool) {
+	if indexed {
+		dr := get[vn.Args_vkCmdDrawIndexedIndirect](c.a)
+		dr.Buffer, dr.Offset, dr.DrawCount, dr.Stride = b.buf, offset, count, stride
+		c.call(vn.VK_COMMAND_TYPE_vkCmdDrawIndexedIndirect_EXT, unsafe.Pointer(dr))
+		return
+	}
+	dr := get[vn.Args_vkCmdDrawIndirect](c.a)
+	dr.Buffer, dr.Offset, dr.DrawCount, dr.Stride = b.buf, offset, count, stride
+	c.call(vn.VK_COMMAND_TYPE_vkCmdDrawIndirect_EXT, unsafe.Pointer(dr))
+}
+
+// CheckIndirect returns an error unless count commands of size bytes, of
+// stride bytes each, from offset, are of b, as Vulkan reads them: from an
+// offset of a multiple of 4, of a stride of one, at least size, if more
+// than one, of a device of multiple draws.
+func (d *Device) CheckIndirect(b *Buffer, offset uint64, count, stride, size uint32) error {
+	bad := func() error {
+		return fmt.Errorf("%d indirect commands of %d bytes, of a stride of %d, at %d of a buffer of %d bytes",
+			count, size, stride, offset, b.size)
+	}
+	if offset%4 != 0 || count == 0 {
+		return bad()
+	}
+	span := uint64(size)
+	if count > 1 {
+		if d.features10.MultiDrawIndirect == 0 || stride%4 != 0 || stride < size {
+			return bad()
+		}
+		span += uint64(count-1) * uint64(stride)
+	}
+	if offset > b.size || span > b.size-offset {
+		return bad()
+	}
+	return nil
 }
 
 // SetViewport sets the viewport, of Vulkan's parameters.
@@ -459,4 +493,10 @@ func (c *Commands) SetStencilReference(front, back uint32) {
 		sr.FaceMask, sr.Reference = f.mask, f.ref
 		c.call(vn.VK_COMMAND_TYPE_vkCmdSetStencilReference_EXT, unsafe.Pointer(sr))
 	}
+}
+
+// WorkgroupFences reports whether shaders' fences of the device's scope
+// are to be of the workgroup's, as tospirv's Options.WorkgroupFences.
+func (d *Device) WorkgroupFences() bool {
+	return d.workgroupFences
 }

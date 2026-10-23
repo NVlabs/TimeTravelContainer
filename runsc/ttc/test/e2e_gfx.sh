@@ -5,7 +5,8 @@
 
 # Manual end-to-end coverage for the virtual GPU, --gfx: vulkaninfo, an
 # offscreen render's checksum (test/gfx/vkoffscreen.c), OpenGL ES by Zink
-# (test/gfx/gloffscreen.c) and by Debian's virgl driver, and forks with
+# (test/gfx/gloffscreen.c) and by Debian's virgl driver, of OpenGL ES 3.1's
+# compute shaders and the rest that it adds (test/gfx/gles31.c), and forks with
 # --gfx-fork=device-lost and --gfx-fork=snapshot, in containers whose
 # renderer is ttc-gfx-renderer on the host's GPU, and whose Vulkan driver is
 # the daemon's.
@@ -152,6 +153,7 @@ ttc exec "$NAME@main" sh -c '
   glslangValidator -V /src/red.frag -o red.spv >/dev/null
   gcc -O2 -Wall -o vkoffscreen /src/vkoffscreen.c -lvulkan
   gcc -O2 -Wall -o gloffscreen /src/gloffscreen.c -lEGL -lGLESv2
+  gcc -O2 -Wall -o gles31 /src/gles31.c -lEGL -lGLESv2
 ' || fail "preparing the container"
 ttc cp "$NAME@main:/work" "$WORK_DIR" >/dev/null || fail "copying the test programs out"
 
@@ -183,6 +185,14 @@ result=$(ttc exec -e "$VIRGL" "$NAME@main" /work/gloffscreen 2>&1) || fail "glof
 case "$result" in
   *"renderer virgl (vkgl"*"gloffscreen: ok checksum=$WANT_GL_CHECKSUM"*) ;;
   *) fail "gloffscreen by virgl: $result" ;;
+esac
+# virgl has OpenGL ES 3.1 of vkgl: compute shaders, of shader buffers,
+# shared memory, atomic counters and images, indirect draws, and the rest
+# that 3.1 adds.
+result=$(ttc exec -e "$VIRGL" "$NAME@main" /work/gles31 2>&1) || fail "gles31 by virgl: $result"
+case "$result" in
+  *"renderer virgl (vkgl"*"OpenGL ES 3."[12]*"gles31: ok"*) ;;
+  *) fail "gles31 by virgl: $result" ;;
 esac
 
 # Repeat the render: each run creates a context of the branch's renderer.

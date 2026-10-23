@@ -37,7 +37,8 @@ const (
 )
 
 // errVkgl is the error of what the vkgl backend does not render yet, which
-// its capability sets offer guests none of. TODO: what OpenGL ES 3.1 needs
+// its capability sets offer guests none of. TODO: what OpenGL ES 3.2 needs:
+// geometry and tessellation shaders, and texture buffers
 // (g3doc/proposals/ttc_virgl_go_backend.md, "OpenGL ES 3.1").
 var errVkgl = errors.New("the vkgl backend renders none of it yet")
 
@@ -239,12 +240,14 @@ func (b *vkglBackend) parseShader(text string, numTokens uint32) (shaderCode, er
 
 // vkglShader is a shader of a stage, and of a vertex shader its variant's:
 // the inputs that are signed and unsigned integers, and whether it
-// captures its stream output.
+// captures its stream output; of a compute shader, its shared memory, in
+// bytes.
 type vkglShader struct {
 	s          *vkgl.Shader
 	stage      uint32
 	sint, uint uint32
 	so         *tospirv.StreamOutput
+	sharedMem  uint32
 }
 
 // vkglView is a sampler view, and the resource that it holds a reference
@@ -282,6 +285,65 @@ type vkglRange struct {
 	offset, size uint32
 }
 
+// vkglImage is a shader image's binding: a level, and layers, of a
+// texture, as a format, of which it makes views of the targets that
+// shaders declare.
+type vkglImage struct {
+	vkglRef
+	d                  *vkgl.Device
+	res                *vkglResource
+	format             uint32
+	level, first, last uint32
+	views              map[uint32]*vkgl.ImageView
+	// refused are the targets of views that the device refused, which
+	// the context logged.
+	refused map[uint32]bool
+}
+
+// free destroys the binding's views, of no references.
+func (img *vkglImage) free() {
+	for _, v := range img.views {
+		img.d.DestroyImageView(v)
+	}
+	img.views = nil
+	img.res.decRef()
+}
+
+// view returns the binding's view of target, a view type's.
+func (img *vkglImage) view(target uint32) (*vkgl.ImageView, error) {
+	if v := img.views[target]; v != nil {
+		return v, nil
+	}
+	desc := vkgl.ViewDesc{Format: img.format, Target: target, FirstLevel: img.level, LastLevel: img.level,
+		FirstLayer: img.first, LastLayer: img.last}
+	switch target {
+	case vkgl.Target1D, vkgl.Target2D:
+		// Of one layer, the first, of a binding of one or of all.
+		desc.LastLayer = desc.FirstLayer
+	case vkgl.TargetCube:
+		desc.LastLayer = desc.FirstLayer + 5
+	case vkgl.Target3D:
+		// Of the level's slices, all.
+		desc.FirstLayer, desc.LastLayer = 0, 0
+	}
+	v, err := img.d.NewImageView(img.res.tex, desc)
+	if err != nil {
+		return nil, err
+	}
+	if img.views == nil {
+		img.views = make(map[uint32]*vkgl.ImageView)
+	}
+	img.views[target] = v
+	return v, nil
+}
+
+// vkglDummyImage is an image of a texel of zeros, which shaders access of
+// slots of no image.
+type vkglDummyImage struct {
+	tex  *vkgl.Texture
+	view *vkgl.ImageView
+}
+
 // vkglContext is a context of the backend's: a vkgl context, and the
 // Gallium state bound to it.
 type vkglContext struct {
@@ -297,7 +359,12 @@ type vkglContext struct {
 	samplers  [maxShaderStages][maxSamplers]*vkglSampler
 	constants [maxShaderStages][]uint32
 	ubos      [maxShaderStages][maxConstantBuffers]vkglRange
-	vbs       []vkglRange
+	ssbos     [maxShaderStages][maxShaderBuffers]vkglRange
+	images    [maxShaderStages][maxShaderImages]*vkglImage
+	// dummies are the images of slots of no image, of their targets and
+	// formats.
+	dummies map[[2]uint32]vkglDummyImage
+	vbs     []vkglRange
 	// fb is the framebuffer, of fbRes's surfaces.
 	fb         vkgl.Framebuffer
 	fbRes      []*vkglResource
@@ -385,6 +452,9 @@ func (c *vkglContext) unbind() {
 		for i := range c.ubos[stage] {
 			c.setUniformBuffer(uint32(stage), uint32(i), nil, 0, 0)
 		}
+		c.setShaderBuffers(uint32(stage), 0, make([]backendResource, maxShaderBuffers), make([]uint32, maxShaderBuffers),
+			make([]uint32, maxShaderBuffers))
+		c.setShaderImages(uint32(stage), 0, make([]backendResource, maxShaderImages), make([]uint32, 5*maxShaderImages))
 	}
 	c.setVertexBuffers(nil, nil)
 }
@@ -395,6 +465,11 @@ func (c *vkglContext) destroy() {
 		c.b.d.DestroyPipeline(p)
 	}
 	c.pipelines = nil
+	for _, img := range c.dummies {
+		c.b.d.DestroyImageView(img.view)
+		c.b.d.DestroyTexture(img.tex)
+	}
+	c.dummies = nil
 }
 
 func (c *vkglContext) flush() backendFence {
@@ -458,6 +533,8 @@ func (c *vkglContext) createShader(stage uint32, code shaderCode, so []uint32, s
 		p = tgsi.ProcessorVertex
 	case stageFragment:
 		p = tgsi.ProcessorFragment
+	case stageCompute:
+		p = tgsi.ProcessorCompute
 	default:
 		return nil, fmt.Errorf("a shader of stage %d: %w", stage, errVkgl)
 	}
@@ -465,7 +542,7 @@ func (c *vkglContext) createShader(stage uint32, code shaderCode, so []uint32, s
 	if vs.TGSI.Processor != p {
 		return nil, fmt.Errorf("TGSI of %v, of a shader of stage %d", vs.TGSI.Processor, stage)
 	}
-	s := &vkglShader{s: vs, stage: stage, sint: sintMask, uint: uintMask}
+	s := &vkglShader{s: vs, stage: stage, sint: sintMask, uint: uintMask, sharedMem: sharedMem}
 	if xfb {
 		var err error
 		if s.so, err = decodeStreamOutput(so); err != nil {
@@ -779,28 +856,97 @@ func (c *vkglContext) setMinSamples(n uint32) {
 
 func (c *vkglContext) setTessState(d []uint32) {}
 
-// unbinding returns errVkgl unless res are of no resources, of which
-// guests' Mesa unbinds slots of shader buffers and images that the
-// backend renders none of yet: of them, nothing.
-func unbinding(what string, res []backendResource) error {
-	for _, r := range res {
-		if r != nil {
-			return fmt.Errorf("%s: %w", what, errVkgl)
+func (c *vkglContext) setShaderBuffers(stage, start uint32, res []backendResource, offsets, sizes []uint32) error {
+	if stage >= maxShaderStages || start > maxShaderBuffers || uint32(len(res)) > maxShaderBuffers-start {
+		return fmt.Errorf("shader buffers %d+%d of stage %d", start, len(res), stage)
+	}
+	// Of buffers' ranges, which Vulkan binds of offsets of its alignment,
+	// as the caps have guests align them, and within the buffers. A range
+	// of no bytes, as Mesa's state tracker binds of an offset at a
+	// buffer's end, is a slot of none.
+	align := uint64(c.b.d.StorageBufferAlignment())
+	for i, br := range res {
+		r := resOfVkgl(br)
+		if r == nil {
+			continue
+		}
+		if r.buf == nil {
+			return errors.New("a shader buffer of a texture")
+		}
+		if size := r.buf.Size(); uint64(offsets[i])%align != 0 || uint64(offsets[i]) > size || uint64(sizes[i]) > size-uint64(offsets[i]) {
+			return fmt.Errorf("a shader buffer of %d bytes at %d of a buffer of %d", sizes[i], offsets[i], size)
+		}
+	}
+	for i, br := range res {
+		slot := &c.ssbos[stage][start+uint32(i)]
+		if slot.res != nil {
+			slot.res.decRef()
+		}
+		*slot = vkglRange{}
+		if r := resOfVkgl(br); r != nil && sizes[i] != 0 {
+			r.incRef()
+			*slot = vkglRange{res: r, offset: offsets[i], size: sizes[i]}
 		}
 	}
 	return nil
 }
 
-func (c *vkglContext) setShaderBuffers(stage, start uint32, res []backendResource, offsets, sizes []uint32) error {
-	return unbinding("shader buffers", res)
-}
-
 func (c *vkglContext) setAtomicBuffers(start uint32, res []backendResource, offsets, sizes []uint32) error {
-	return unbinding("atomic buffers", res)
+	// Of no atomic counters of the hardware's, as the caps say: guests'
+	// counters are of shader buffers, and their atomic buffers unbound.
+	for _, r := range res {
+		if r != nil {
+			return fmt.Errorf("atomic buffers: %w", errVkgl)
+		}
+	}
+	return nil
 }
 
 func (c *vkglContext) setShaderImages(stage, start uint32, res []backendResource, d []uint32) error {
-	return unbinding("shader images", res)
+	if stage >= maxShaderStages || start > maxShaderImages || uint32(len(res)) > maxShaderImages-start ||
+		len(d) < 5*len(res) {
+		return fmt.Errorf("shader images %d+%d of stage %d", start, len(res), stage)
+	}
+	images := make([]*vkglImage, len(res))
+	for i, br := range res {
+		r := resOfVkgl(br)
+		if r == nil {
+			continue
+		}
+		if r.tex == nil {
+			return fmt.Errorf("an image of a buffer: %w", errVkgl)
+		}
+		// Of each: its format, its access, the first and the last of its
+		// layers, of 16 bits each, and its level, of the low 8 bits of
+		// the last dword, whose others are Mesa's flags of views that
+		// the targets that shaders declare say.
+		format, layers, level := d[5*i], d[5*i+2], d[5*i+3]&0xff
+		img := &vkglImage{d: c.b.d, res: r, format: format, level: level, first: layers & 0xffff, last: layers >> 16}
+		desc := r.tex.Desc
+		// Of a 3D texture, its slices are its layers.
+		layerCount := max(desc.ArraySize, 1)
+		if desc.Target == vkgl.Target3D {
+			layerCount = max(desc.Depth>>level, 1)
+		}
+		if _, ok := vkgl.LookupFormat(format); !ok || vkgl.IsViewFormat(format) || level > desc.LastLevel ||
+			img.first > img.last || img.last >= layerCount {
+			return fmt.Errorf("an image of format %d, of level %d, of layers %d to %d, of %+v", format, level, img.first,
+				img.last, desc)
+		}
+		images[i] = img
+	}
+	for i, img := range images {
+		slot := &c.images[stage][start+uint32(i)]
+		if *slot != nil {
+			(*slot).decRef()
+		}
+		*slot = img
+		if img != nil {
+			img.res.incRef()
+			img.init(img.free)
+		}
+	}
+	return nil
 }
 
 func (c *vkglContext) renderCondition(q any, condition bool, mode uint32) {}
@@ -971,13 +1117,112 @@ func (c *vkglContext) inlineWrite(br backendResource, d []uint32, data []byte) e
 	return c.ctx.WriteBuffer(r.buf, x, data[:w])
 }
 
+// The decoder's launch_grid's payload: virgl's.
+const (
+	gridBlock          = 0
+	gridSize           = 3
+	gridIndirectOffset = 7
+)
+
 func (c *vkglContext) launchGrid(d []uint32, indirect backendResource) error {
-	return errVkgl
+	cs := c.shaders[stageCompute]
+	if cs == nil {
+		return nil
+	}
+	// Of a shader of a fixed block, as OpenGL's are, which Gallium's
+	// block of the launch is of.
+	res, err := cs.s.Translate(tospirv.Options{SharedMemory: int(cs.sharedMem), WorkgroupFences: c.b.d.WorkgroupFences()})
+	if err != nil {
+		return fmt.Errorf("the compute shader: %w", err)
+	}
+	if block := fixedBlock(cs.s.TGSI); block != [3]uint32(d[gridBlock:gridBlock+3]) {
+		return fmt.Errorf("a grid of blocks of %v of a shader of %v: %w", d[gridBlock:gridBlock+3], block, errVkgl)
+	}
+	var commands *vkglResource
+	if indirect != nil {
+		commands = resOfVkgl(indirect)
+		if commands.buf == nil {
+			return errors.New("a grid of a texture's commands")
+		}
+		// VkDispatchIndirectCommand, Gallium's grid's.
+		if err := c.b.d.CheckIndirect(commands.buf, uint64(d[gridIndirectOffset]), 1, 0, 12); err != nil {
+			return err
+		}
+		if err := c.use(&commands.vkglRef); err != nil {
+			return err
+		}
+	} else if err := c.b.d.CheckDispatch(d[gridSize], d[gridSize+1], d[gridSize+2]); err != nil {
+		return err
+	}
+	var resources []vkgl.StageResource
+	for _, r := range res.Resources {
+		resources = append(resources, vkgl.StageResource{Stage: tgsi.ProcessorCompute, Resource: r})
+	}
+	key := computeKey(res.Words)
+	p := c.pipelines[key]
+	if p == nil {
+		if p, err = c.b.d.NewComputePipeline(vkgl.ComputeDesc{CS: res.Words, Resources: resources}); err != nil {
+			return err
+		}
+		c.pipelines[key] = p
+	}
+	var b vkglBindings
+	if err := c.stageBindings(tgsi.ProcessorCompute, stageCompute, res, &b); err != nil {
+		return err
+	}
+	return c.ctx.Compute(func(cmds *vkgl.Commands) error {
+		cmds.BindPipeline(p)
+		if err := c.ctx.BindResources(cmds, p, b.buffers, b.textures, b.images); err != nil {
+			return err
+		}
+		if commands != nil {
+			cmds.DispatchIndirect(commands.buf, uint64(d[gridIndirectOffset]))
+		} else {
+			cmds.Dispatch(d[gridSize], d[gridSize+1], d[gridSize+2])
+		}
+		return nil
+	})
 }
 
-func (c *vkglContext) memoryBarrier(flags uint32) {}
+// fixedBlock returns a compute shader's block, as its properties fix it:
+// of 1 of each dimension that they do not.
+func fixedBlock(s *tgsi.Shader) [3]uint32 {
+	block := [3]uint32{1, 1, 1}
+	for _, p := range s.Properties {
+		switch p.Name {
+		case tgsi.PropertyCSFixedBlockWidth:
+			block[0] = max(p.Value, 1)
+		case tgsi.PropertyCSFixedBlockHeight:
+			block[1] = max(p.Value, 1)
+		case tgsi.PropertyCSFixedBlockDepth:
+			block[2] = max(p.Value, 1)
+		}
+	}
+	return block
+}
 
-func (c *vkglContext) textureBarrier(flags uint32) {}
+// computeKey returns a key of a compute pipeline of a shader's SPIR-V, of
+// which pipelines are the same, apart from graphics pipelines' keys.
+func computeKey(words []uint32) string {
+	var b strings.Builder
+	b.WriteString("compute|")
+	for _, w := range words {
+		fmt.Fprintf(&b, "%x,", w)
+	}
+	return b.String()
+}
+
+func (c *vkglContext) memoryBarrier(flags uint32) {
+	if err := c.ctx.Barrier(); err != nil {
+		log.Printf("virgl: a memory barrier: %v", err)
+	}
+}
+
+func (c *vkglContext) textureBarrier(flags uint32) {
+	if err := c.ctx.Barrier(); err != nil {
+		log.Printf("virgl: a texture barrier: %v", err)
+	}
+}
 
 func (c *vkglContext) beginQuery(q any) bool {
 	vq, ok := q.(*vkglQuery)
@@ -1120,12 +1365,18 @@ const (
 	drawStartInstance
 	drawPrimitiveRestart
 	drawRestartIndex
+	drawMinIndex
+	drawMaxIndex
+	drawCountFromSO
+	drawVerticesPerPatch
+	drawID
+	drawIndirectHandle
+	drawIndirectOffset
+	drawIndirectStride
+	drawIndirectDrawCount
 )
 
 func (c *vkglContext) draw(d []uint32, a drawArgs) error {
-	if a.indirect != nil {
-		return fmt.Errorf("an indirect draw: %w", errVkgl)
-	}
 	topology, ok := c.b.d.VkTopology(d[drawMode])
 	if !ok {
 		return fmt.Errorf("a draw of primitives %d", d[drawMode])
@@ -1135,12 +1386,36 @@ func (c *vkglContext) draw(d []uint32, a drawArgs) error {
 		// Like virglrenderer, the decoder drops such draws.
 		return nil
 	}
+	// Of an indirect draw, its commands, of Gallium's, which are Vulkan's,
+	// of a buffer: of a count of the payload's, and of none of a buffer's,
+	// which the caps offer guests not.
+	var commands *vkglResource
+	var commandCount uint32
+	if a.indirect != nil {
+		if a.indirectCount != nil {
+			return fmt.Errorf("an indirect draw of a count of a buffer: %w", errVkgl)
+		}
+		if commands = resOfVkgl(a.indirect); commands.buf == nil {
+			return errors.New("an indirect draw of a texture's commands")
+		}
+		if commandCount = d[drawIndirectDrawCount]; commandCount == 0 {
+			return nil
+		}
+		size := uint32(16) // VkDrawIndirectCommand
+		if d[drawIndexed] != 0 {
+			size = 20 // VkDrawIndexedIndirectCommand
+		}
+		if err := c.b.d.CheckIndirect(commands.buf, uint64(d[drawIndirectOffset]), commandCount, d[drawIndirectStride], size); err != nil {
+			return err
+		}
+	}
 	// The indexes first: widening them reads them back, which submits the
 	// context's batch, of which the draw's uploads and resources must not
 	// be.
 	var indexes *vkgl.Buffer
 	indexSize := a.indexSize
 	var firstIndex uint32
+	var indexOffset uint64
 	if d[drawIndexed] != 0 {
 		index := resOfVkgl(a.index)
 		if index == nil || index.buf == nil {
@@ -1155,23 +1430,37 @@ func (c *vkglContext) draw(d []uint32, a drawArgs) error {
 		// of their size of. The offset is that of the draw's first index:
 		// Mesa's virgl driver sets the index buffer's offset of the
 		// draw's start, which it sends too, and which virglrenderer, as
-		// the renderer, ignores of indexed draws.
+		// the renderer, ignores of indexed draws. Of an indirect draw, of
+		// the indexes from the offset, which its commands' first indexes
+		// count from.
 		size := index.buf.Size()
 		start := uint64(a.indexOffset)
-		if n := uint64(d[drawCount]) * uint64(indexSize); start%uint64(indexSize) != 0 || start > size || n > size-start {
-			return fmt.Errorf("%d indexes of %d bytes from %d of a buffer of %d bytes", d[drawCount], indexSize, start, size)
+		count := uint64(d[drawCount])
+		if commands != nil && start <= size {
+			count = (size - start) / uint64(indexSize)
+		}
+		if n := count * uint64(indexSize); start%uint64(indexSize) != 0 || start > size || n > size-start {
+			return fmt.Errorf("%d indexes of %d bytes from %d of a buffer of %d bytes", count, indexSize, start, size)
 		}
 		firstIndex = a.indexOffset / indexSize
+		if commands != nil {
+			firstIndex, indexOffset = 0, start
+		}
 		if err := c.use(&index.vkglRef); err != nil {
 			return err
 		}
 		indexes = index.buf
 		if widen {
 			var err error
-			if indexes, err = c.ctx.WidenIndexes(index.buf, start, d[drawCount], d[drawPrimitiveRestart] != 0, d[drawRestartIndex]); err != nil {
+			if indexes, err = c.ctx.WidenIndexes(index.buf, start, uint32(count), d[drawPrimitiveRestart] != 0, d[drawRestartIndex]); err != nil {
 				return err
 			}
-			indexSize, firstIndex = 2, 0
+			indexSize, firstIndex, indexOffset = 2, 0, 0
+		}
+	}
+	if commands != nil {
+		if err := c.use(&commands.vkglRef); err != nil {
+			return err
 		}
 	}
 	colors, depthFormat, hasDepth, hasStencil, colorTypes := c.formats()
@@ -1196,6 +1485,8 @@ func (c *vkglContext) draw(d []uint32, a drawArgs) error {
 	vsOpts.ClipDisable = uint8(^c.rast.ClipPlaneEnable)
 	vsOpts.StreamOutput = vs.so
 	vsOpts.GLClipZ = !c.rast.ClipHalfZ
+	vsOpts.WorkgroupFences = c.b.d.WorkgroupFences()
+	fsOpts.WorkgroupFences = vsOpts.WorkgroupFences
 	fsOpts.ColorBuffers = len(colors)
 	fsOpts.ColorTypes = colorTypes
 	fsOpts.FlatShade, fsOpts.TwoSided = c.rast.FlatShade, c.rast.LightTwoSide
@@ -1258,8 +1549,11 @@ func (c *vkglContext) draw(d []uint32, a drawArgs) error {
 		c.pipelines[key] = p
 	}
 
-	buffers, textures, err := c.bindings(vsRes, fsRes, d)
-	if err != nil {
+	var b vkglBindings
+	if err := c.stageBindings(tgsi.ProcessorVertex, stageVertex, vsRes, &b); err != nil {
+		return err
+	}
+	if err := c.stageBindings(tgsi.ProcessorFragment, stageFragment, fsRes, &b); err != nil {
 		return err
 	}
 	vbufs := make([]*vkgl.Buffer, len(ve.elements))
@@ -1299,7 +1593,7 @@ func (c *vkglContext) draw(d []uint32, a drawArgs) error {
 			back = c.stencilRef[0]
 		}
 		cmds.SetStencilReference(c.stencilRef[0], back)
-		if err := c.ctx.BindResources(cmds, p, buffers, textures); err != nil {
+		if err := c.ctx.BindResources(cmds, p, b.buffers, b.textures, b.images); err != nil {
 			return err
 		}
 		var push [tospirv.PushConstantsSize]byte
@@ -1308,9 +1602,14 @@ func (c *vkglContext) draw(d []uint32, a drawArgs) error {
 		cmds.PushConstants(p, 0, push[:])
 		cmds.BindVertexBuffers(0, vbufs, voffs)
 		if indexes != nil {
-			cmds.BindIndexBuffer(indexes, 0, indexSize)
+			cmds.BindIndexBuffer(indexes, indexOffset, indexSize)
+		}
+		switch {
+		case commands != nil:
+			cmds.DrawIndirect(commands.buf, uint64(d[drawIndirectOffset]), commandCount, d[drawIndirectStride], indexes != nil)
+		case indexes != nil:
 			cmds.DrawIndexed(d[drawCount], max(d[drawInstances], 1), firstIndex, int32(d[drawIndexBias]), d[drawStartInstance])
-		} else {
+		default:
 			cmds.DrawVertices(d[drawCount], max(d[drawInstances], 1), d[drawStart], d[drawStartInstance])
 		}
 		return nil
@@ -1362,57 +1661,63 @@ func pipelineKey(desc *vkgl.PipelineDesc) string {
 	return b.String()
 }
 
-// bindings returns the buffers and textures that shaders of vsRes and
-// fsRes read, of the draw d: of the bound state, and of the backend's
-// dummies where it binds none.
-func (c *vkglContext) bindings(vsRes, fsRes *tospirv.Result, d []uint32) ([]vkgl.BufferBinding, []vkgl.TextureBinding, error) {
-	var buffers []vkgl.BufferBinding
-	var textures []vkgl.TextureBinding
-	for _, sr := range []struct {
-		stage    tgsi.Processor
-		virgl    uint32
-		resource *tospirv.Result
-	}{{tgsi.ProcessorVertex, stageVertex, vsRes}, {tgsi.ProcessorFragment, stageFragment, fsRes}} {
-		for _, r := range sr.resource.Resources {
-			for slot := r.Slot; slot < r.Slot+max(r.Count, 1); slot++ {
-				switch r.Kind {
-				case tospirv.UniformBuffer:
-					bb, err := c.uniformBinding(sr.stage, sr.virgl, slot)
-					if err != nil {
-						return nil, nil, err
-					}
-					buffers = append(buffers, bb)
-				case tospirv.SampledTexture:
-					if r.Target == tgsi.TextureBuffer {
-						return nil, nil, fmt.Errorf("a texture buffer: %w", errVkgl)
-					}
-					tb := vkgl.TextureBinding{Stage: sr.stage, Slot: slot, View: c.b.dummyView, Sampler: c.b.dummySampler}
-					if v := c.views[sr.virgl][slot]; v != nil {
-						if err := c.use(&v.vkglRef); err != nil {
-							return nil, nil, err
-						}
-						tb.View = v.view
-					}
-					if s := c.samplers[sr.virgl][slot]; s != nil {
-						if err := c.use(&s.vkglRef); err != nil {
-							return nil, nil, err
-						}
-						tb.Sampler = s.sampler
-					}
-					textures = append(textures, tb)
-				case tospirv.StorageBuffer:
-					bb, err := c.storageBinding(sr.stage, sr.virgl, slot)
-					if err != nil {
-						return nil, nil, err
-					}
-					buffers = append(buffers, bb)
-				default:
-					return nil, nil, fmt.Errorf("a resource of kind %d: %w", r.Kind, errVkgl)
+// vkglBindings are what the resources of a draw's or a dispatch's shaders
+// bind.
+type vkglBindings struct {
+	buffers  []vkgl.BufferBinding
+	textures []vkgl.TextureBinding
+	images   []vkgl.ImageBinding
+}
+
+// stageBindings appends to b the bindings of the resources, res's, that a
+// stage's shader uses: of the bound state, and of the backend's dummies
+// where it binds none.
+func (c *vkglContext) stageBindings(stage tgsi.Processor, virgl uint32, res *tospirv.Result, b *vkglBindings) error {
+	for _, r := range res.Resources {
+		for slot := r.Slot; slot < r.Slot+max(r.Count, 1); slot++ {
+			switch r.Kind {
+			case tospirv.UniformBuffer:
+				bb, err := c.uniformBinding(stage, virgl, slot)
+				if err != nil {
+					return err
 				}
+				b.buffers = append(b.buffers, bb)
+			case tospirv.SampledTexture:
+				if r.Target == tgsi.TextureBuffer {
+					return fmt.Errorf("a texture buffer: %w", errVkgl)
+				}
+				tb := vkgl.TextureBinding{Stage: stage, Slot: slot, View: c.b.dummyView, Sampler: c.b.dummySampler}
+				if v := c.views[virgl][slot]; v != nil {
+					if err := c.use(&v.vkglRef); err != nil {
+						return err
+					}
+					tb.View = v.view
+				}
+				if s := c.samplers[virgl][slot]; s != nil {
+					if err := c.use(&s.vkglRef); err != nil {
+						return err
+					}
+					tb.Sampler = s.sampler
+				}
+				b.textures = append(b.textures, tb)
+			case tospirv.StorageBuffer:
+				bb, err := c.storageBinding(stage, virgl, slot)
+				if err != nil {
+					return err
+				}
+				b.buffers = append(b.buffers, bb)
+			case tospirv.StorageImage:
+				ib, err := c.imageBinding(stage, virgl, r, slot)
+				if err != nil {
+					return err
+				}
+				b.images = append(b.images, ib)
+			default:
+				return fmt.Errorf("a resource of kind %d: %w", r.Kind, errVkgl)
 			}
 		}
 	}
-	return buffers, textures, nil
+	return nil
 }
 
 // uniformBinding returns the binding of a stage's uniform buffer slot: the
@@ -1469,20 +1774,26 @@ func (c *vkglContext) uniformBinding(stage tgsi.Processor, virgl uint32, slot in
 
 // storageBinding returns the binding of a stage's shader buffer slot: of
 // the vertex shader's capture of its stream output, the buffer of a target,
-// whole, as the decoder's draws give the shader its offsets, or zeros of
-// none.
+// whole, as the decoder's draws give the shader its offsets; of the
+// guest's, the range bound, of the device's most bytes; or zeros of none.
 func (c *vkglContext) storageBinding(stage tgsi.Processor, virgl uint32, slot int) (vkgl.BufferBinding, error) {
 	bb := vkgl.BufferBinding{Stage: stage, Kind: tospirv.StorageBuffer, Slot: slot}
-	i := slot - vkglXfbSSBO
-	if virgl != stageVertex || i < 0 || i >= maxStreamoutTargets {
-		return bb, fmt.Errorf("shader buffer %d of stage %d: %w", slot, virgl, errVkgl)
-	}
-	if i < len(c.xfbTargets) {
-		if r := resOfVkgl(c.xfbTargets[i]); r != nil && r.buf != nil {
-			if err := c.use(&r.vkglRef); err != nil {
+	if i := slot - vkglXfbSSBO; virgl == stageVertex && i >= 0 && i < maxStreamoutTargets {
+		if i < len(c.xfbTargets) {
+			if r := resOfVkgl(c.xfbTargets[i]); r != nil && r.buf != nil {
+				if err := c.use(&r.vkglRef); err != nil {
+					return bb, err
+				}
+				bb.Buffer, bb.Range = r.buf, r.buf.Size()
+				return bb, nil
+			}
+		}
+	} else if slot < maxShaderBuffers {
+		if rg := c.ssbos[virgl][slot]; rg.res != nil {
+			if err := c.use(&rg.res.vkglRef); err != nil {
 				return bb, err
 			}
-			bb.Buffer, bb.Range = r.buf, r.buf.Size()
+			bb.Buffer, bb.Offset, bb.Range = rg.res.buf, uint64(rg.offset), uint64(min(rg.size, c.b.d.MaxStorageBufferRange()))
 			return bb, nil
 		}
 	}
@@ -1492,4 +1803,97 @@ func (c *vkglContext) storageBinding(stage tgsi.Processor, virgl uint32, slot in
 	}
 	bb.Buffer, bb.Range = buf, 16
 	return bb, nil
+}
+
+// imageTargets are the targets of the views of the images that shaders
+// declare, of their TGSI's.
+var imageTargets = map[tgsi.TextureTarget]uint32{
+	tgsi.Texture1D:        vkgl.Target1D,
+	tgsi.Texture2D:        vkgl.Target2D,
+	tgsi.Texture3D:        vkgl.Target3D,
+	tgsi.TextureCube:      vkgl.TargetCube,
+	tgsi.Texture1DArray:   vkgl.Target1DArray,
+	tgsi.Texture2DArray:   vkgl.Target2DArray,
+	tgsi.TextureCubeArray: vkgl.TargetCubeArray,
+}
+
+// imageBinding returns the binding of a stage's image slot, of r, the
+// image that its shader declares: a view of the bound image of r's target,
+// or, of none, the context's image of zeros of it, as of an image that
+// Vulkan views not of it, as of a 3D texture's slice of a 2D image: GL's
+// loads of an incompatible image are of zeros, and its stores dropped.
+func (c *vkglContext) imageBinding(stage tgsi.Processor, virgl uint32, r tospirv.Resource, slot int) (vkgl.ImageBinding, error) {
+	ib := vkgl.ImageBinding{Stage: stage, Slot: slot}
+	target, ok := imageTargets[r.Target]
+	if !ok {
+		return ib, fmt.Errorf("an image of %v: %w", r.Target, errVkgl)
+	}
+	if slot < maxShaderImages {
+		if img := c.images[virgl][slot]; img != nil {
+			v, err := img.view(target)
+			if err == nil {
+				if err := c.use(&img.vkglRef); err != nil {
+					return ib, err
+				}
+				ib.View = v
+				return ib, nil
+			}
+			if !img.refused[target] {
+				log.Printf("virgl: an image of zeros in place of %v: %v", r.Target, err)
+				if img.refused == nil {
+					img.refused = make(map[uint32]bool)
+				}
+				img.refused[target] = true
+			}
+		}
+	}
+	v, err := c.dummyImage(target, r)
+	if err != nil {
+		return ib, err
+	}
+	ib.View = v
+	return ib, nil
+}
+
+// dummyImage returns the context's image of zeros of target, of the
+// format of r, an image that a shader declares, or of its channels' type of
+// a declaration of none.
+func (c *vkglContext) dummyImage(target uint32, r tospirv.Resource) (*vkgl.ImageView, error) {
+	format, ok := vkgl.FormatByName(r.Format)
+	if !ok {
+		name := map[tospirv.BaseType]string{tospirv.Float: "R32G32B32A32_FLOAT", tospirv.Int: "R32G32B32A32_SINT",
+			tospirv.Uint: "R32G32B32A32_UINT"}[r.Type]
+		format, _ = vkgl.FormatByName(name)
+	}
+	key := [2]uint32{target, format}
+	if img, ok := c.dummies[key]; ok {
+		return img.view, nil
+	}
+	d := c.b.d
+	desc := vkgl.ResourceDesc{Target: target, Format: format, Width: 1, Height: 1, Depth: 1, ArraySize: 1}
+	if target == vkgl.TargetCube || target == vkgl.TargetCubeArray {
+		desc.ArraySize = 6
+	}
+	tex, err := d.NewTexture(desc)
+	if err != nil {
+		return nil, err
+	}
+	view, err := d.NewImageView(tex, vkgl.ViewDesc{Format: format, Target: target, LastLayer: desc.ArraySize - 1})
+	if err != nil {
+		d.DestroyTexture(tex)
+		return nil, err
+	}
+	// Of zeros, which Vulkan's new images are not of.
+	zeros := make([]byte, tex.Format.BlockBytes*desc.ArraySize)
+	region := vkgl.TextureRegion{Box: vkgl.Box{Width: 1, Height: 1, Depth: int64(desc.ArraySize)}}
+	if err := c.ctx.WriteTexture(tex, region, zeros, 0); err != nil {
+		d.DestroyImageView(view)
+		d.DestroyTexture(tex)
+		return nil, err
+	}
+	if c.dummies == nil {
+		c.dummies = make(map[[2]uint32]vkglDummyImage)
+	}
+	c.dummies[key] = vkglDummyImage{tex: tex, view: view}
+	return view, nil
 }

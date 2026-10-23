@@ -289,6 +289,39 @@ func (c *Context) Render(f func(cmds *Commands) error) error {
 	return f(cmds)
 }
 
+// Compute records f's commands, of compute pipelines' dispatches, outside
+// of the context's rendering instances: after a barrier of what the
+// commands before wrote, as each of the context's commands that reads
+// memory, after them, has.
+func (c *Context) Compute(f func(cmds *Commands) error) error {
+	defer c.a.reset()
+	cmds, err := c.outsideRendering()
+	if err != nil {
+		return err
+	}
+	cmds.barrier()
+	return f(cmds)
+}
+
+// Barrier orders the context's commands after of what those before wrote,
+// as Gallium's memory_barrier and texture_barrier do: shaders' stores, and
+// renderings' writes of what draws then sample. It ends the batch's
+// rendering instance, in which Vulkan has no barriers of shaders' memory;
+// the next begins after a barrier. Of no batch, the batches before are
+// ordered of the barriers that begin the next's commands.
+func (c *Context) Barrier() error {
+	if c.batch == nil {
+		return nil
+	}
+	defer c.a.reset()
+	cmds, err := c.outsideRendering()
+	if err != nil {
+		return err
+	}
+	cmds.barrier()
+	return nil
+}
+
 // Upload returns a buffer, visible to the host, of data, which shaders
 // read as a uniform or a shader buffer, and draws as vertices or indexes,
 // and which the batch frees once the GPU is done with it.

@@ -1445,6 +1445,249 @@ func TestDestroyReleasesBindings(t *testing.T) {
 	}
 }
 
+// buffer returns a buffer resource of mem, attached to f's context, and
+// transferred to the host.
+func (f *fixture) buffer(t *testing.T, mem []byte) *Resource {
+	t.Helper()
+	r, err := NewResource(f.id(), ResourceArgs{Target: targetBuffer, Format: formatR8Unorm, Bind: bindShaderBuffer,
+		Width: uint32(len(mem)), Height: 1, Depth: 1, ArraySize: 1}, mem, nil)
+	if err != nil {
+		t.Fatalf("NewResource: %v", err)
+	}
+	t.Cleanup(r.DecRef)
+	f.c.Attach(r)
+	if err := f.c.Transfer(r, TransferArgs{ToHost: true, W: uint32(len(mem)), H: 1, D: 1}); err != nil {
+		t.Fatalf("Transfer: %v", err)
+	}
+	return r
+}
+
+// readBuffer waits for what the context executed, and reads r back to
+// its memory.
+func (f *fixture) readBuffer(t *testing.T, r *Resource, size int) {
+	t.Helper()
+	f.c.Flush().Wait()
+	if err := f.c.Transfer(r, TransferArgs{W: uint32(size), H: 1, D: 1}); err != nil {
+		t.Fatalf("Transfer: %v", err)
+	}
+}
+
+const bindShaderBuffer = 1 << 14
+
+// TestLaunchGrid launches a compute shader's grid, of a block of 64
+// invocations, which store their thread's IDs, thrice, to a shader buffer:
+// of a grid of the payload's, and of an indirect grid of a buffer's. A
+// grid of blocks other than its shader's is refused.
+func TestLaunchGrid(t *testing.T) {
+	f := newFixture(t)
+	mem := make([]byte, 2*64*4)
+	buf := f.buffer(t, mem)
+	grid := f.buffer(t, []byte{0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0})
+	var s stream
+	cs := f.id()
+	s.shader(cs, stageCompute, `COMP
+PROPERTY CS_FIXED_BLOCK_WIDTH 64
+PROPERTY CS_FIXED_BLOCK_HEIGHT 1
+PROPERTY CS_FIXED_BLOCK_DEPTH 1
+DCL SV[0], THREAD_ID
+DCL BUFFER[0]
+DCL TEMP[0], LOCAL
+IMM[0] UINT32 {2, 3, 0, 0}
+  0: SHL TEMP[0].x, SV[0].xxxx, IMM[0].xxxx
+  1: UMUL TEMP[0].y, SV[0].xxxx, IMM[0].yyyy
+  2: STORE BUFFER[0].x, TEMP[0].xxxx, TEMP[0].yyyy
+  3: END
+`, 1<<16)
+	s.cmd(cmdBindShader, 0, cs, stageCompute)
+	// Of the buffer's first half, and of its second, of a grid of a
+	// buffer's, from its fourth byte.
+	s.cmd(cmdSetShaderBuffers, 0, stageCompute, 0, 0, 64*4, buf.ID())
+	s.cmd(cmdLaunchGrid, 0, 64, 1, 1, 1, 1, 1, 0, 0)
+	s.cmd(cmdMemoryBarrier, 0, 0xffffffff)
+	s.cmd(cmdSetShaderBuffers, 0, stageCompute, 0, 64*4, 64*4, buf.ID())
+	s.cmd(cmdLaunchGrid, 0, 64, 1, 1, 0, 0, 0, grid.ID(), 4)
+	s.cmd(cmdMemoryBarrier, 0, 0xffffffff)
+	f.submit(t, s)
+	f.readBuffer(t, buf, len(mem))
+	for i := 0; i < 2*64; i++ {
+		if got, want := binary.LittleEndian.Uint32(mem[4*i:]), uint32(i%64*3); got != want {
+			t.Fatalf("word %d: %d, want %d", i, got, want)
+		}
+	}
+	var bad stream
+	bad.cmd(cmdLaunchGrid, 0, 32, 1, 1, 1, 1, 1, 0, 0)
+	if err := f.c.Submit(bad.bytes()); err == nil {
+		t.Errorf("a grid of blocks of 32 of a shader of 64 was launched")
+	}
+}
+
+// TestShaderImages stores a color to each texel of a texture, of a
+// compute shader's image, and reads one back of another image.
+func TestShaderImages(t *testing.T) {
+	f := newFixture(t)
+	mem := make([]byte, 8*8*4)
+	tex, err := NewResource(f.id(), ResourceArgs{Target: target2D, Format: formatR8G8B8A8Unorm,
+		Bind: bindSamplerView, Width: 8, Height: 8, Depth: 1, ArraySize: 1}, mem, nil)
+	if err != nil {
+		t.Fatalf("NewResource: %v", err)
+	}
+	defer tex.DecRef()
+	f.c.Attach(tex)
+	var s stream
+	cs := f.id()
+	s.shader(cs, stageCompute, `COMP
+PROPERTY CS_FIXED_BLOCK_WIDTH 8
+PROPERTY CS_FIXED_BLOCK_HEIGHT 8
+PROPERTY CS_FIXED_BLOCK_DEPTH 1
+DCL SV[0], THREAD_ID
+DCL IMAGE[0], 2D, PIPE_FORMAT_R8G8B8A8_UNORM, WR
+DCL IMAGE[1], 2D, PIPE_FORMAT_R8G8B8A8_UNORM
+DCL TEMP[0], LOCAL
+IMM[0] FLT32 {    0.0000,     1.0000,     0.0000,     1.0000}
+  0: LOAD TEMP[0], IMAGE[1], SV[0].xyyy, 2D, PIPE_FORMAT_R8G8B8A8_UNORM
+  1: ADD TEMP[0], TEMP[0], IMM[0]
+  2: STORE IMAGE[0], SV[0].xyyy, TEMP[0], 2D, PIPE_FORMAT_R8G8B8A8_UNORM
+  3: END
+`, 1<<16)
+	s.cmd(cmdBindShader, 0, cs, stageCompute)
+	// Of the texture as image 0, its first layer and level, writable, and
+	// of none as image 1, which reads zeros.
+	s.cmd(cmdSetShaderImages, 0, stageCompute, 0, formatR8G8B8A8Unorm, 2, 0, 0, tex.ID(), 0, 0, 0, 0, 0)
+	s.cmd(cmdLaunchGrid, 0, 8, 8, 1, 1, 1, 1, 0, 0)
+	s.cmd(cmdMemoryBarrier, 0, 0xffffffff)
+	f.submit(t, s)
+	f.c.Flush().Wait()
+	if err := f.c.Transfer(tex, TransferArgs{W: 8, H: 8, D: 1}); err != nil {
+		t.Fatalf("Transfer: %v", err)
+	}
+	for i := 0; i < len(mem); i += 4 {
+		if p := [4]byte(mem[i : i+4]); p != green {
+			t.Fatalf("texel %d: %v, want %v", i/4, p, green)
+		}
+	}
+	// Of a layer past the texture's.
+	var bad stream
+	bad.cmd(cmdSetShaderImages, 0, stageCompute, 0, formatR8G8B8A8Unorm, 2, 1|1<<16, 0, tex.ID())
+	if err := f.c.Submit(bad.bytes()); err == nil {
+		t.Errorf("an image of a layer past its texture's was bound")
+	}
+}
+
+// TestDrawIndirect draws the triangle of a command of a buffer's.
+func TestDrawIndirect(t *testing.T) {
+	f := newFixture(t)
+	// VkDrawIndirectCommand: 3 vertices, of an instance, after 8 bytes.
+	commands := f.buffer(t, []byte{0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0})
+	var s stream
+	f.setup(&s)
+	clearRed(&s)
+	s.cmd(cmdDrawVBO, 0, 0, 0, primTriangles, 0, 0, 0, 0, 0, 0, 0, 0xffffffff, 0, 0, 0, commands.ID(), 8, 16, 1, 0, 0)
+	f.submit(t, s)
+	f.finish(t)
+	f.checkTriangle(t)
+	// Of a command past its buffer.
+	var bad stream
+	bad.cmd(cmdDrawVBO, 0, 0, 0, primTriangles, 0, 0, 0, 0, 0, 0, 0, 0xffffffff, 0, 0, 0, commands.ID(), 12, 16, 1, 0, 0)
+	if err := f.c.Submit(bad.bytes()); err == nil {
+		t.Errorf("a draw of a command past its buffer was accepted")
+	}
+}
+
+// TestFragmentShaderBuffer counts the triangle's fragments of an atomic of
+// a fragment shader's shader buffer, as Mesa's atomic counters of shader
+// buffers count.
+func TestFragmentShaderBuffer(t *testing.T) {
+	f := newFixture(t)
+	mem := make([]byte, 16)
+	counter := f.buffer(t, mem)
+	var s stream
+	f.setup(&s)
+	fs := f.id()
+	s.shader(fs, stageFragment, `FRAG
+PROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1
+DCL OUT[0], COLOR
+DCL BUFFER[0]
+DCL TEMP[0]
+IMM[0] UINT32 {0, 1, 0, 0}
+IMM[1] FLT32 {    0.0000,     1.0000,     0.0000,     1.0000}
+  0: ATOMUADD TEMP[0].x, BUFFER[0], IMM[0].xxxx, IMM[0].yyyy
+  1: MOV OUT[0], IMM[1]
+  2: END
+`, 1<<16)
+	s.cmd(cmdBindShader, 0, fs, stageFragment)
+	s.cmd(cmdSetShaderBuffers, 0, stageFragment, 0, 0, 16, counter.ID())
+	clearRed(&s)
+	drawTriangle(&s)
+	s.cmd(cmdMemoryBarrier, 0, 0xffffffff)
+	f.submit(t, s)
+	f.finish(t)
+	f.checkTriangle(t)
+	f.readBuffer(t, counter, len(mem))
+	// The triangle's pixels, half of 32 by 64, of the rule of their
+	// centers'.
+	if got := binary.LittleEndian.Uint32(mem); got < 32*64/2-64 || got > 32*64/2+64 {
+		t.Errorf("the triangle's fragments: %d, want about %d", got, 32*64/2)
+	}
+}
+
+// TestStencilTexturing clears a depth and stencil texture of a framebuffer
+// of it alone, and samples its stencil, as GL's stencil texturing does: of
+// a view of its format of the stencil alone, X24S8_UINT.
+func TestStencilTexturing(t *testing.T) {
+	f := newFixture(t)
+	const (
+		formatZ24S8      = 19
+		formatX24S8      = 136
+		bindDepthStencil = 1 << 0
+		clearDepth       = 1 << 0
+		clearStencil     = 1 << 1
+	)
+	zs, err := NewResource(f.id(), ResourceArgs{Target: target2D, Format: formatZ24S8, Bind: bindDepthStencil | bindSamplerView,
+		Width: width, Height: height, Depth: 1, ArraySize: 1}, make([]byte, width*height*4), nil)
+	if err != nil {
+		t.Fatalf("NewResource: %v", err)
+	}
+	defer zs.DecRef()
+	f.c.Attach(zs)
+	var s stream
+	surf := f.id()
+	s.cmd(cmdCreateObject, objectSurface, surf, zs.ID(), formatZ24S8, 0, 0)
+	s.cmd(cmdSetFramebufferState, 0, 0, surf)
+	s.cmd(cmdSetFramebufferNoAttach, 0, width|height<<16, 0)
+	depth := math.Float64bits(0.5)
+	s.cmd(cmdClear, 0, clearDepth|clearStencil, 0, 0, 0, 0, uint32(depth), uint32(depth>>32), 0x5a)
+	f.setup(&s)
+	clearRed(&s)
+	fs, view, samp := f.id(), f.id(), f.id()
+	s.shader(fs, stageFragment, `FRAG
+DCL IN[0], POSITION, LINEAR
+DCL OUT[0], COLOR
+DCL SAMP[0]
+DCL SVIEW[0], 2D, UINT
+DCL TEMP[0..1]
+IMM[0] UINT32 {0, 1132396544, 1065353216, 0}
+  0: F2I TEMP[0].xy, IN[0].xyyy
+  1: MOV TEMP[0].zw, IMM[0].xxxx
+  2: TXF TEMP[1], TEMP[0], SAMP[0], 2D
+  3: U2F TEMP[1].x, TEMP[1].xxxx
+  4: DIV OUT[0].x, TEMP[1].xxxx, IMM[0].yyyy
+  5: MOV OUT[0].yzw, IMM[0].xxxz
+  6: END
+`, 1<<16)
+	s.cmd(cmdBindShader, 0, fs, stageFragment)
+	const swizzleRGBA = 0 | 1<<3 | 2<<6 | 3<<9
+	s.cmd(cmdCreateObject, objectSamplerView, view, zs.ID(), formatX24S8|target2D<<24, 0, 0, swizzleRGBA)
+	s.cmd(cmdCreateObject, objectSamplerState, samp, 0, 0, 0, 0, 0, 0, 0, 0)
+	s.cmd(cmdSetSamplerViews, 0, stageFragment, 0, view)
+	s.cmd(cmdBindSamplerStates, 0, stageFragment, 0, samp)
+	drawTriangle(&s)
+	f.submit(t, s)
+	f.finish(t)
+	if p := f.pixel(4, height/2); p != [4]byte{0x5a, 0, 0, 255} {
+		t.Errorf("the stencil sampled: %v, want %v", p, [4]byte{0x5a, 0, 0, 255})
+	}
+}
+
 // TestUniformBufferRanges binds uniform buffers' ranges that Vulkan binds
 // none of as they are: of no bytes, which shaders read zeros of, and past
 // their buffers, which the renderer refuses.

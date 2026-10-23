@@ -6,6 +6,7 @@
 package vkgl
 
 import (
+	"fmt"
 	"unsafe"
 
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/venus/vk"
@@ -212,11 +213,37 @@ func (c *Commands) Viewport(x, y, width, height float32, w, h uint32) {
 	c.call(vn.VK_COMMAND_TYPE_vkCmdSetScissor_EXT, unsafe.Pointer(ss))
 }
 
-// BindPipeline binds a graphics pipeline.
+// BindPipeline binds a graphics or a compute pipeline.
 func (c *Commands) BindPipeline(p *Pipeline) {
 	bp := get[vn.Args_vkCmdBindPipeline](c.a)
-	bp.Pipeline = p.pipeline
+	bp.PipelineBindPoint, bp.Pipeline = p.bindPoint, p.pipeline
 	c.call(vn.VK_COMMAND_TYPE_vkCmdBindPipeline_EXT, unsafe.Pointer(bp))
+}
+
+// Dispatch dispatches workgroups of the bound compute pipeline, x by y by
+// z, of fewer than the device's most of each, which CheckDispatch checks.
+func (c *Commands) Dispatch(x, y, z uint32) {
+	dp := get[vn.Args_vkCmdDispatch](c.a)
+	dp.GroupCountX, dp.GroupCountY, dp.GroupCountZ = x, y, z
+	c.call(vn.VK_COMMAND_TYPE_vkCmdDispatch_EXT, unsafe.Pointer(dp))
+}
+
+// DispatchIndirect dispatches the workgroups of the VkDispatchIndirectCommand
+// of b at offset, which CheckIndirect checks.
+func (c *Commands) DispatchIndirect(b *Buffer, offset uint64) {
+	dp := get[vn.Args_vkCmdDispatchIndirect](c.a)
+	dp.Buffer, dp.Offset = b.buf, offset
+	c.call(vn.VK_COMMAND_TYPE_vkCmdDispatchIndirect_EXT, unsafe.Pointer(dp))
+}
+
+// CheckDispatch returns an error unless the device dispatches workgroups x
+// by y by z, of the bound compute pipeline's.
+func (d *Device) CheckDispatch(x, y, z uint32) error {
+	l := d.props.Limits.MaxComputeWorkGroupCount
+	if x > l[0] || y > l[1] || z > l[2] {
+		return fmt.Errorf("a dispatch of %dx%dx%d workgroups, of %v at most", x, y, z, l)
+	}
+	return nil
 }
 
 // BindVertexBuffer binds b at binding 0, of offset.
@@ -235,7 +262,7 @@ func (c *Commands) PushConstants(p *Pipeline, offset uint32, data []byte) {
 	values := array[byte](c.a, len(data))
 	copy(values, data)
 	pc := get[vn.Args_vkCmdPushConstants](c.a)
-	pc.Layout, pc.StageFlags, pc.Offset, pc.Size, pc.PValues = p.layout, shaderStageAllGraphics, offset, uint32(len(data)), unsafe.Pointer(&values[0])
+	pc.Layout, pc.StageFlags, pc.Offset, pc.Size, pc.PValues = p.layout, p.stages, offset, uint32(len(data)), unsafe.Pointer(&values[0])
 	c.call(vn.VK_COMMAND_TYPE_vkCmdPushConstants_EXT, unsafe.Pointer(pc))
 }
 

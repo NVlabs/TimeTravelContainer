@@ -181,16 +181,27 @@ func (d *Device) NewSamplerView(t *Texture, desc ViewDesc) (*SamplerView, error)
 	case f.IsStencil():
 		aspects = aspectStencil
 	}
-	usage := get[vn.VkImageViewUsageCreateInfo](a)
-	usage.SType = vn.VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO
-	usage.Usage = ImageSampled
+	h, err := d.newView(t, desc, f, aspects, ImageSampled, vkComponents(desc.Swizzle, f))
+	if err != nil {
+		return nil, err
+	}
+	return &SamplerView{Desc: desc, Format: f, tex: t, view: h}, nil
+}
+
+// newView returns a view of t of desc, of format f, of its aspects, for
+// usage, of components, of a caller that holds d.mu.
+func (d *Device) newView(t *Texture, desc ViewDesc, f Format, aspects, usage uint32, components vn.VkComponentMapping) (vn.Handle, error) {
+	a := d.a
+	u := get[vn.VkImageViewUsageCreateInfo](a)
+	u.SType = vn.VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO
+	u.Usage = usage
 	info := get[vn.VkImageViewCreateInfo](a)
 	info.SType = vn.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
-	info.PNext = unsafe.Pointer(usage)
+	info.PNext = unsafe.Pointer(u)
 	info.Image = t.img
 	info.ViewType = vkViewType(desc.Target)
 	info.Format = f.VK
-	info.Components = vkComponents(desc.Swizzle, f)
+	info.Components = components
 	info.SubresourceRange = vn.VkImageSubresourceRange{
 		AspectMask:     aspects,
 		BaseMipLevel:   desc.FirstLevel,
@@ -209,17 +220,61 @@ func (d *Device) NewSamplerView(t *Texture, desc ViewDesc) (*SamplerView, error)
 	cv.Device, cv.PCreateInfo, cv.PView = d.dev, unsafe.Pointer(info), unsafe.Pointer(h)
 	vk.Call(vn.VK_COMMAND_TYPE_vkCreateImageView_EXT, d.table, unsafe.Pointer(cv))
 	if err := check("vkCreateImageView", cv.Ret); err != nil {
-		return nil, fmt.Errorf("a view %+v of %+v: %w", desc, t.Desc, err)
+		return 0, fmt.Errorf("a view %+v of %+v: %w", desc, t.Desc, err)
 	}
-	return &SamplerView{Desc: desc, Format: f, tex: t, view: *h}, nil
+	return *h, nil
 }
 
 // DestroySamplerView destroys v, which the GPU no longer uses.
 func (d *Device) DestroySamplerView(v *SamplerView) {
+	d.destroyView(v.view)
+}
+
+func (d *Device) destroyView(h vn.Handle) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	defer d.a.reset()
 	dv := get[vn.Args_vkDestroyImageView](d.a)
-	dv.Device, dv.ImageView = d.dev, v.view
+	dv.Device, dv.ImageView = d.dev, h
 	vk.Call(vn.VK_COMMAND_TYPE_vkDestroyImageView_EXT, d.table, unsafe.Pointer(dv))
+}
+
+// ImageView is a view of a texture's level that shaders load and store,
+// as a shader image.
+type ImageView struct {
+	Desc   ViewDesc
+	Format Format
+	tex    *Texture
+	view   vn.Handle
+}
+
+// NewImageView returns a view of t of desc, of one level, which shaders
+// load and store texels of, of the format's channels, which it swizzles
+// none of: of a format that the device stores, of Vulkan's own, of an image
+// of storage.
+func (d *Device) NewImageView(t *Texture, desc ViewDesc) (*ImageView, error) {
+	desc.Swizzle = [4]uint32{SwizzleX, SwizzleY, SwizzleZ, SwizzleW}
+	if err := desc.check(t); err != nil {
+		return nil, err
+	}
+	f, _ := d.LookupFormat(desc.Format)
+	if desc.FirstLevel != desc.LastLevel || f.Swizzle != "XYZW" || f.IsDepth() || f.IsStencil() {
+		return nil, fmt.Errorf("an image view %+v of %s", desc, f.Name)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	defer d.a.reset()
+	if t.usage&ImageStorage == 0 || d.formatFeatures(f.VK)&featureStorageImage == 0 {
+		return nil, fmt.Errorf("an image view of %s, which %s stores not, of %+v", f.Name, d.Name, t.Desc)
+	}
+	h, err := d.newView(t, desc, f, aspectColor, ImageStorage, vn.VkComponentMapping{})
+	if err != nil {
+		return nil, err
+	}
+	return &ImageView{Desc: desc, Format: f, tex: t, view: h}, nil
+}
+
+// DestroyImageView destroys v, which the GPU no longer uses.
+func (d *Device) DestroyImageView(v *ImageView) {
+	d.destroyView(v.view)
 }

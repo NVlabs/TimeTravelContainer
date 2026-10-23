@@ -16,10 +16,6 @@ import (
 // it is of translate for their state, once of each.
 type Shader struct {
 	TGSI *tgsi.Shader
-	// StreamOutput is a vertex shader's stream output, or nil.
-	StreamOutput *tospirv.StreamOutput
-	// SharedMemory is a compute shader's shared memory, in bytes.
-	SharedMemory int
 	// id is the shader's, of pipelines' keys.
 	id uint64
 
@@ -47,10 +43,6 @@ func optionsKey(opts *tospirv.Options) string {
 // first time. The result's words are the caller's copy, which linking may
 // change.
 func (s *Shader) Translate(opts tospirv.Options) (*tospirv.Result, error) {
-	if s.StreamOutput != nil {
-		opts.StreamOutput = s.StreamOutput
-	}
-	opts.SharedMemory = s.SharedMemory
 	key := optionsKey(&opts)
 	s.mu.Lock()
 	defer s.mu.Unlock()

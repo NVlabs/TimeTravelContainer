@@ -193,19 +193,39 @@ type TextureBinding struct {
 	Sampler *Sampler
 }
 
-// Bind binds buffers and textures to a pipeline's resources, in descriptor
-// sets of their kinds' that it allocates of the device's pool, which a
-// Device.Record's submission frees.
-func (c *Commands) Bind(p *Pipeline, buffers []BufferBinding, textures []TextureBinding) error {
-	return c.bind(p, buffers, textures, func(bool) (vn.Handle, error) { return c.d.descriptorPool() })
+// ImageBinding is a view of a texture, in the general layout, bound to a
+// stage's image slot.
+type ImageBinding struct {
+	Stage tgsi.Processor
+	Slot  int
+	View  *ImageView
 }
 
-// BindResources binds buffers and textures to a pipeline's resources, as
-// Bind does, in descriptor sets of the batch's pools, which the batch
-// frees.
-func (c *Context) BindResources(cmds *Commands, p *Pipeline, buffers []BufferBinding, textures []TextureBinding) error {
+// binding returns the binding of a stage's resource of kind of slot in p's
+// layout, and its element, of an array's slots, or false if p has none.
+func (p *Pipeline) binding(stage tgsi.Processor, kind tospirv.ResourceKind, slot int) (binding, element uint32, ok bool) {
+	for _, r := range p.resources {
+		if r.Stage == stage && r.Kind == kind && slot >= r.Slot && slot < r.Slot+max(r.Count, 1) {
+			return tospirv.Binding(stage, r.Slot), uint32(slot - r.Slot), true
+		}
+	}
+	return 0, 0, false
+}
+
+// Bind binds buffers, textures and images to a pipeline's resources, in
+// descriptor sets of their kinds' that it allocates of the device's pool,
+// which a Device.Record's submission frees.
+func (c *Commands) Bind(p *Pipeline, buffers []BufferBinding, textures []TextureBinding, images []ImageBinding) error {
+	return c.bind(p, buffers, textures, images, func(bool) (vn.Handle, error) { return c.d.descriptorPool() })
+}
+
+// BindResources binds buffers, textures and images to a pipeline's
+// resources, as Bind does, in descriptor sets of the batch's pools, which
+// the batch frees.
+func (c *Context) BindResources(cmds *Commands, p *Pipeline, buffers []BufferBinding, textures []TextureBinding,
+	images []ImageBinding) error {
 	b := c.batch
-	return cmds.bind(p, buffers, textures, func(full bool) (vn.Handle, error) {
+	return cmds.bind(p, buffers, textures, images, func(full bool) (vn.Handle, error) {
 		if len(b.descPools) == 0 || full {
 			h, err := c.d.newDescriptorPool(c.a)
 			if err != nil {
@@ -217,10 +237,11 @@ func (c *Context) BindResources(cmds *Commands, p *Pipeline, buffers []BufferBin
 	})
 }
 
-// bind binds buffers and textures to a pipeline's resources, in descriptor
-// sets of pool's, which returns another pool if full, as the last's are
-// out.
-func (c *Commands) bind(p *Pipeline, buffers []BufferBinding, textures []TextureBinding, pool func(full bool) (vn.Handle, error)) error {
+// bind binds buffers, textures and images to a pipeline's resources, in
+// descriptor sets of pool's, which returns another pool if full, as the
+// last's are out.
+func (c *Commands) bind(p *Pipeline, buffers []BufferBinding, textures []TextureBinding, images []ImageBinding,
+	pool func(full bool) (vn.Handle, error)) error {
 	d, a := c.d, c.a
 	var sets [numSets]vn.Handle
 	for s := range sets {
@@ -249,40 +270,65 @@ func (c *Commands) bind(p *Pipeline, buffers []BufferBinding, textures []Texture
 			break
 		}
 	}
-	if n := len(buffers) + len(textures); n != 0 {
+	if n := len(buffers) + len(textures) + len(images); n != 0 {
 		writes := array[vn.VkWriteDescriptorSet](a, n)
-		for i, tex := range textures {
+		// write fills the next write, of a stage's resource of kind of
+		// slot, of a type of descriptor.
+		next := 0
+		write := func(stage tgsi.Processor, kind tospirv.ResourceKind, slot int, typ uint32) (*vn.VkWriteDescriptorSet, error) {
+			binding, element, ok := p.binding(stage, kind, slot)
+			if !ok {
+				return nil, fmt.Errorf("a binding of slot %d of resources of kind %d of %v, which the pipeline has none of",
+					slot, kind, stage)
+			}
+			w := &writes[next]
+			next++
+			w.SType = vn.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+			w.DstSet = sets[setOf(kind)]
+			w.DstBinding, w.DstArrayElement = binding, element
+			w.DescriptorCount = 1
+			w.DescriptorType = typ
+			return w, nil
+		}
+		for _, tex := range textures {
 			info := get[vn.VkDescriptorImageInfo](a)
 			if tex.View != nil {
 				*info = vn.VkDescriptorImageInfo{Sampler: tex.Sampler.sampler, ImageView: tex.View.view, ImageLayout: ImageLayoutGeneral}
 			} else {
 				*info = vn.VkDescriptorImageInfo{Sampler: tex.Sampler.sampler, ImageView: tex.Image.view, ImageLayout: tex.Image.layout}
 			}
-			w := &writes[len(buffers)+i]
-			w.SType = vn.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
-			w.DstSet = sets[tospirv.SetSamplers]
-			w.DstBinding = tospirv.Binding(tex.Stage, tex.Slot)
-			w.DescriptorCount = 1
-			w.DescriptorType = descriptorCombinedImageSampler
+			w, err := write(tex.Stage, tospirv.SampledTexture, tex.Slot, descriptorCombinedImageSampler)
+			if err != nil {
+				return err
+			}
 			w.PImageInfo = unsafe.Pointer(info)
 		}
-		for i, b := range buffers {
+		for _, b := range buffers {
 			info := get[vn.VkDescriptorBufferInfo](a)
 			*info = vn.VkDescriptorBufferInfo{Buffer: b.Buffer.buf, Offset: b.Offset, Range: b.Range}
-			w := &writes[i]
-			w.SType = vn.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
-			w.DstSet = sets[setOf(b.Kind)]
-			w.DstBinding = tospirv.Binding(b.Stage, b.Slot)
-			w.DescriptorCount = 1
+			var typ uint32
 			switch b.Kind {
 			case tospirv.UniformBuffer:
-				w.DescriptorType = descriptorUniformBuffer
+				typ = descriptorUniformBuffer
 			case tospirv.StorageBuffer:
-				w.DescriptorType = descriptorStorageBuffer
+				typ = descriptorStorageBuffer
 			default:
 				return fmt.Errorf("a buffer of resources of kind %d", b.Kind)
 			}
+			w, err := write(b.Stage, b.Kind, b.Slot, typ)
+			if err != nil {
+				return err
+			}
 			w.PBufferInfo = unsafe.Pointer(info)
+		}
+		for _, img := range images {
+			info := get[vn.VkDescriptorImageInfo](a)
+			*info = vn.VkDescriptorImageInfo{ImageView: img.View.view, ImageLayout: ImageLayoutGeneral}
+			w, err := write(img.Stage, tospirv.StorageImage, img.Slot, descriptorStorageImage)
+			if err != nil {
+				return err
+			}
+			w.PImageInfo = unsafe.Pointer(info)
 		}
 		ud := get[vn.Args_vkUpdateDescriptorSets](a)
 		ud.Device, ud.DescriptorWriteCount, ud.PDescriptorWrites = d.dev, uint32(n), unsafe.Pointer(&writes[0])
@@ -291,7 +337,7 @@ func (c *Commands) bind(p *Pipeline, buffers []BufferBinding, textures []Texture
 	hs := array[vn.Handle](a, numSets)
 	copy(hs, sets[:])
 	bd := get[vn.Args_vkCmdBindDescriptorSets](a)
-	bd.Layout, bd.DescriptorSetCount, bd.PDescriptorSets = p.layout, numSets, unsafe.Pointer(&hs[0])
+	bd.PipelineBindPoint, bd.Layout, bd.DescriptorSetCount, bd.PDescriptorSets = p.bindPoint, p.layout, numSets, unsafe.Pointer(&hs[0])
 	c.call(vn.VK_COMMAND_TYPE_vkCmdBindDescriptorSets_EXT, unsafe.Pointer(bd))
 	return nil
 }

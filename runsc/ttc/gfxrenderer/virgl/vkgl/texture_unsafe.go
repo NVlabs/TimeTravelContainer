@@ -113,7 +113,7 @@ func (d *Device) newTexture(desc ResourceDesc) (*Texture, error) {
 		return nil, err
 	}
 	f, ok := d.LookupFormat(desc.Format)
-	if !ok {
+	if !ok || IsViewFormat(desc.Format) {
 		return nil, fmt.Errorf("a texture of format %d, which Vulkan lacks", desc.Format)
 	}
 	if desc.Samples > 1 && desc.Target == Target2DArray && !d.multisampleArrays {

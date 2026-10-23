@@ -23,12 +23,13 @@ IMM[0] FLT32 {    1.0000,     0.0000,     0.0000,     1.0000}
   1: END
 `
 
-// TestCorpusPipelines compiles a pipeline of each vertex and fragment
-// shader of a corpus of guests' TGSI, the .tgsi files of the directory that
-// VKGL_TGSI_CORPUS names, with a fragment or vertex shader of the test's,
-// so that the device's compiler compiles every one, as draws would. It
-// leaves out those that read the framebuffer (FBFETCH), which vkgl's caps
-// do not offer guests.
+// TestCorpusPipelines compiles a pipeline of each vertex, fragment and
+// compute shader of a corpus of guests' TGSI, the .tgsi files of the
+// directory that VKGL_TGSI_CORPUS names, of a vertex or fragment shader's
+// with a fragment or vertex shader of the test's, so that the device's
+// compiler compiles every one, as draws and grids would. It leaves out
+// those that read the framebuffer (FBFETCH), which vkgl's caps do not
+// offer guests.
 func TestCorpusPipelines(t *testing.T) {
 	dir := os.Getenv("VKGL_TGSI_CORPUS")
 	if dir == "" {
@@ -43,7 +44,8 @@ func TestCorpusPipelines(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fopts := tospirv.Options{ColorBuffers: 1}
+	fences := d.WorkgroupFences()
+	fopts := tospirv.Options{ColorBuffers: 1, WorkgroupFences: fences}
 	compiled, fetches := 0, 0
 	for _, path := range files {
 		name := filepath.Base(path)
@@ -61,13 +63,20 @@ func TestCorpusPipelines(t *testing.T) {
 		switch s.Processor {
 		case tgsi.ProcessorVertex:
 			vsShader = s
-			if vs, err = tospirv.Translate(s, tospirv.Options{}); err == nil {
+			if vs, err = tospirv.Translate(s, tospirv.Options{WorkgroupFences: fences}); err == nil {
 				fs = translate(t, solidFS, fopts)
 			}
 		case tgsi.ProcessorFragment:
 			if fs, err = tospirv.Translate(s, fopts); err == nil {
 				vs = translate(t, passVS, tospirv.Options{})
 			}
+		case tgsi.ProcessorCompute:
+			if err := compileCompute(d, s); err != nil {
+				t.Errorf("%s: %v", name, err)
+				continue
+			}
+			compiled++
+			continue
 		default:
 			continue
 		}
@@ -80,7 +89,7 @@ func TestCorpusPipelines(t *testing.T) {
 			continue
 		}
 		if missing := Link(vs, fs); len(missing) != 0 {
-			if vs, err = tospirv.Translate(vsShader, tospirv.Options{ExtraOutputs: missing}); err != nil {
+			if vs, err = tospirv.Translate(vsShader, tospirv.Options{ExtraOutputs: missing, WorkgroupFences: fences}); err != nil {
 				t.Errorf("%s: of the outputs that it lacks: %v", name, err)
 				continue
 			}
@@ -116,4 +125,22 @@ func TestCorpusPipelines(t *testing.T) {
 		compiled++
 	}
 	t.Logf("%d shaders, %d pipelines compiled, %d of FBFETCH left out", len(files), compiled, fetches)
+}
+
+// compileCompute compiles a compute pipeline of s.
+func compileCompute(d *Device, s *tgsi.Shader) error {
+	cs, err := tospirv.Translate(s, tospirv.Options{WorkgroupFences: d.WorkgroupFences()})
+	if err != nil {
+		return err
+	}
+	var resources []StageResource
+	for _, r := range cs.Resources {
+		resources = append(resources, StageResource{tgsi.ProcessorCompute, r})
+	}
+	p, err := d.NewComputePipeline(ComputeDesc{CS: cs.Words, Resources: resources})
+	if err != nil {
+		return err
+	}
+	d.DestroyPipeline(p)
+	return nil
 }

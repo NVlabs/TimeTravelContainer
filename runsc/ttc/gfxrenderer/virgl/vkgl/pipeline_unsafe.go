@@ -13,19 +13,28 @@ import (
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/virgl/tospirv"
 )
 
-// Shader stages, VkShaderStageFlagBits.
+// Shader stages, VkShaderStageFlagBits, and pipelines' bind points,
+// VkPipelineBindPoint.
 const (
 	shaderStageVertex      = 0x1
 	shaderStageFragment    = 0x10
 	shaderStageAllGraphics = 0x1f
+	shaderStageCompute     = 0x20
+	bindPointGraphics      = 0
+	bindPointCompute       = 1
 )
 
-// Pipeline is a graphics pipeline, and its layout, of the layouts of the
-// sets of its shaders' resources.
+// Pipeline is a graphics or a compute pipeline, and its layout, of the
+// layouts of the sets of its shaders' resources.
 type Pipeline struct {
 	pipeline   vn.Handle
 	layout     vn.Handle
 	setLayouts [numSets]vn.Handle
+	// resources are the shaders' resources, of which bindings are.
+	resources []StageResource
+	// bindPoint is the pipeline's, and stages are those of its push
+	// constants.
+	bindPoint, stages uint32
 }
 
 // VertexAttribute is a vertex shader's input, of binding 0's vertices.
@@ -69,22 +78,18 @@ func (d *Device) destroyShaderModule(h vn.Handle) {
 	vk.Call(vn.VK_COMMAND_TYPE_vkDestroyShaderModule_EXT, d.table, unsafe.Pointer(ds))
 }
 
-// NewGraphicsPipeline returns a pipeline of desc.
-func (d *Device) NewGraphicsPipeline(desc GraphicsDesc) (*Pipeline, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+// newLayout makes p's layout, of its resources and its push constants, of
+// a caller that holds d.mu.
+func (d *Device) newLayout(p *Pipeline) error {
 	a := d.a
-	defer a.reset()
-	p := &Pipeline{}
-
 	var err error
-	if p.setLayouts, err = d.setLayouts(desc.Resources); err != nil {
-		return nil, err
+	if p.setLayouts, err = d.setLayouts(p.resources); err != nil {
+		return err
 	}
 	sl := array[vn.Handle](a, numSets)
 	copy(sl, p.setLayouts[:])
 	pcr := get[vn.VkPushConstantRange](a)
-	*pcr = vn.VkPushConstantRange{StageFlags: shaderStageAllGraphics, Size: tospirv.PushConstantsSize}
+	*pcr = vn.VkPushConstantRange{StageFlags: p.stages, Size: tospirv.PushConstantsSize}
 	li := get[vn.VkPipelineLayoutCreateInfo](a)
 	li.SType = vn.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
 	li.SetLayoutCount, li.PSetLayouts = numSets, unsafe.Pointer(&sl[0])
@@ -95,9 +100,33 @@ func (d *Device) NewGraphicsPipeline(desc GraphicsDesc) (*Pipeline, error) {
 	vk.Call(vn.VK_COMMAND_TYPE_vkCreatePipelineLayout_EXT, d.table, unsafe.Pointer(cl))
 	if err := check("vkCreatePipelineLayout", cl.Ret); err != nil {
 		d.destroyPipeline(p)
-		return nil, err
+		return err
 	}
 	p.layout = *layout
+	return nil
+}
+
+// newGraphicsPipeline returns a graphics pipeline of resources, whose
+// layout it makes, of a caller that holds d.mu.
+func (d *Device) newGraphicsPipeline(resources []StageResource) (*Pipeline, error) {
+	p := &Pipeline{resources: append([]StageResource(nil), resources...), bindPoint: bindPointGraphics,
+		stages: shaderStageAllGraphics}
+	if err := d.newLayout(p); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// NewGraphicsPipeline returns a pipeline of desc.
+func (d *Device) NewGraphicsPipeline(desc GraphicsDesc) (*Pipeline, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	a := d.a
+	defer a.reset()
+	p, err := d.newGraphicsPipeline(desc.Resources)
+	if err != nil {
+		return nil, err
+	}
 
 	vs, err := d.shaderModule(desc.VS)
 	if err != nil {
@@ -184,6 +213,49 @@ func (d *Device) NewGraphicsPipeline(desc GraphicsDesc) (*Pipeline, error) {
 	cg.Device, cg.CreateInfoCount, cg.PCreateInfos, cg.PPipelines = d.dev, 1, unsafe.Pointer(info), unsafe.Pointer(pl)
 	vk.Call(vn.VK_COMMAND_TYPE_vkCreateGraphicsPipelines_EXT, d.table, unsafe.Pointer(cg))
 	if err := check("vkCreateGraphicsPipelines", cg.Ret); err != nil {
+		d.destroyPipeline(p)
+		return nil, err
+	}
+	p.pipeline = *pl
+	return p, nil
+}
+
+// ComputeDesc describes a compute pipeline: its shader's SPIR-V, and its
+// resources.
+type ComputeDesc struct {
+	CS        []uint32
+	Resources []StageResource
+}
+
+// NewComputePipeline returns a pipeline of desc.
+func (d *Device) NewComputePipeline(desc ComputeDesc) (*Pipeline, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	a := d.a
+	defer a.reset()
+	p := &Pipeline{resources: append([]StageResource(nil), desc.Resources...), bindPoint: bindPointCompute,
+		stages: shaderStageCompute}
+	if err := d.newLayout(p); err != nil {
+		return nil, err
+	}
+	cs, err := d.shaderModule(desc.CS)
+	if err != nil {
+		d.destroyPipeline(p)
+		return nil, err
+	}
+	defer d.destroyShaderModule(cs)
+	main := cstrings(a, []string{"main"})
+	info := get[vn.VkComputePipelineCreateInfo](a)
+	info.SType = vn.VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO
+	info.Stage = vn.VkPipelineShaderStageCreateInfo{SType: vn.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+		Stage: shaderStageCompute, Module: cs, PName: *(*unsafe.Pointer)(main)}
+	info.Layout = p.layout
+	info.BasePipelineIndex = -1
+	pl := get[vn.Handle](a)
+	cc := get[vn.Args_vkCreateComputePipelines](a)
+	cc.Device, cc.CreateInfoCount, cc.PCreateInfos, cc.PPipelines = d.dev, 1, unsafe.Pointer(info), unsafe.Pointer(pl)
+	vk.Call(vn.VK_COMMAND_TYPE_vkCreateComputePipelines_EXT, d.table, unsafe.Pointer(cc))
+	if err := check("vkCreateComputePipelines", cc.Ret); err != nil {
 		d.destroyPipeline(p)
 		return nil, err
 	}

@@ -1,10 +1,10 @@
 # A Go backend for TTC's virgl renderer
 
-Status: done (2026-10-23), but for OpenGL ES 3.1. Stages 1 to 3, the shader
-translator, the state tracker, and Mesa's removal, are done: the renderer
-renders on the Go backend, vkgl, on Linux and on macOS, which passed [the
-Mac's tests](#the-macs-tests), and links no Mesa. vkgl offers guests OpenGL
-ES 3.0, where Zink offered 3.1: [OpenGL ES 3.1](#opengl-es-31) is to do.
+Status: done (2026-10-23). Stages 1 to 3, the shader translator, the state
+tracker, and Mesa's removal, are done: the renderer renders on the Go
+backend, vkgl, on Linux and on macOS, which passed [the Mac's
+tests](#the-macs-tests), and links no Mesa. vkgl offers guests [OpenGL ES
+3.1](#opengl-es-31), as Zink did.
 
 ## Goal
 
@@ -234,26 +234,45 @@ Mesa, as did the macOS check of CI.
 
 ## OpenGL ES 3.1
 
-TODO. vkgl's capability sets offer guests what it renders, of which
-Mesa's virgl driver gives them OpenGL ES 3.0 (`vkgl/caps_unsafe.go`).
-Zink gave them 3.1, which some of Android's apps require. Mesa's OpenGL ES
-3.1 (`src/mesa/main/version.c`) needs, beyond 3.0, what vkgl refuses
-today (`virgl/vkgl_unsafe.go`'s `errVkgl`):
+Done (2026-10-23). vkgl renders what Mesa's OpenGL ES 3.1
+(`src/mesa/main/version.c`) needs beyond 3.0, and its capability sets
+offer it (`vkgl/caps_unsafe.go`):
 
-*   compute shaders: compute pipelines of `tospirv`'s compute shaders,
-    which it translates, `LAUNCH_GRID`, and its indirect form;
-*   shader buffers (`SET_SHADER_BUFFERS`) and atomic counters
-    (`SET_ATOMIC_BUFFERS`, `HWATOMIC`), as storage buffers, in fragment
-    and compute shaders at least;
-*   shader images (`SET_SHADER_IMAGES`), as storage images, of the
-    formats that the device stores to;
-*   indirect draws, of `DRAW_VBO`'s indirect buffer, and their counts;
-*   memory barriers (`MEMORY_BARRIER`), as Vulkan's, which vkgl ignores
-    while shaders store nothing;
-*   checks of what 3.1 adds to 3.0's state: multisampled textures and
-    their sample masks, and stencil sampled of depth-stencil textures.
+*   compute shaders: compute pipelines of `tospirv`'s compute shaders, of
+    `LAUNCH_GRID`'s grids and of its indirect ones, of blocks of the
+    shaders' fixed sizes, each after a barrier of what the context's
+    commands before wrote;
+*   shader buffers (`SET_SHADER_BUFFERS`), as storage buffers, in vertex,
+    fragment and compute shaders, of which guests' atomic counters are:
+    the caps offer no counters of the hardware's, and Mesa's state
+    tracker lowers them to shader buffers;
+*   shader images (`SET_SHADER_IMAGES`), as storage images: views of the
+    level and layers bound of the targets that shaders declare, or images
+    of zeros of slots of none, and of views that Vulkan has not;
+*   indirect draws, of `DRAW_VBO`'s indirect buffer, of several draws
+    where the device has them, and of no count of a buffer's
+    (`ARB_indirect_parameters`, which the caps offer not);
+*   memory and texture barriers, which end the batch's rendering
+    instance, of which the next begins after a barrier;
+*   stencil texturing, of virgl's formats of views of the stencil alone
+    (`X24S8_UINT`, `X32_S8X24_UINT`), and multisampled textures, of
+    Vulkan's standard sample locations in the caps.
 
-Then the capability sets offer them, which `caps_unsafe.go` now clears.
+Apple's GPU compiler (macOS 26.7, M5) crashes compiling a fence of the
+device's scope before an atomic's read-modify-write of device memory: on
+MoltenVK, `tospirv` gives `MEMBAR`'s fences the workgroup's scope
+(`Options.WorkgroupFences`), as MoltenVK's MSL before 3.2 fenced. The
+checks: vkgl's tests of compute, indirect draws, stencil texturing and
+multisampled textures; the decoder's of `LAUNCH_GRID`, shader images,
+indirect draws and fragment shaders' atomics; `test/gfx/gles31.c` of
+Debian's Mesa in `e2e_gfx.sh`; and redroid's SurfaceFlinger, of OpenGL ES
+3.1.
+
+Gaps of 3.1: indirect draws' first instances, which OpenGL ES has of zero
+(`reservedMustBeZero`), and which instance IDs of desktop OpenGL's would
+miss; and images of a 3D texture's slice as a 2D image, which Vulkan views
+only of images created to be viewed so, and which guests get images of
+zeros of.
 
 Two gaps of what guests get already: rendering to 3D textures' slices,
 which OpenGL ES 3.0 allows, and vkgl's surfaces refuse, as Vulkan views a
