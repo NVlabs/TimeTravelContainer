@@ -1295,6 +1295,32 @@ func TestIndexedDrawFromStart(t *testing.T) {
 	f.checkTriangle(t)
 }
 
+// TestDestroyReleasesBindings checks that a destroyed context holds none
+// of the resources that its state bound: of vertex and uniform buffers,
+// which it held until the backend freed them, never.
+func TestDestroyReleasesBindings(t *testing.T) {
+	f := newFixture(t)
+	var s stream
+	f.setup(&s)
+	s.cmd(cmdSetUniformBuffer, 0, stageFragment, 1, 0, 16, f.vb.ID())
+	sampler := f.id()
+	s.cmd(cmdCreateObject, objectSamplerState, sampler, 0, 0, 0, 0, 0, 0, 0, 0)
+	s.cmd(cmdBindSamplerStates, 0, stageFragment, 0, sampler)
+	clearRed(&s)
+	drawTriangle(&s)
+	f.submit(t, s)
+	f.c.Flush().Wait()
+	vb, ok := f.vb.res.(*vkglResource)
+	if !ok {
+		t.Skipf("a resource of %T", f.vb.res)
+	}
+	f.c.Destroy()
+	// The guest's resource's reference, alone.
+	if n := vb.refs.Load(); n != 1 {
+		t.Errorf("the vertex buffer has %d references, want 1", n)
+	}
+}
+
 // Shaders read their constants, which the guest sets, and uniform buffers,
 // of resources, as Mesa's state tracker binds them: the vertex shader's
 // offsets the triangle, and the fragment shader's color it.

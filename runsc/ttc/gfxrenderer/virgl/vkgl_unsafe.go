@@ -380,9 +380,13 @@ func (c *vkglContext) copyResource(dst, src backendResource) {
 func (c *vkglContext) unbind() {
 	c.setFramebuffer(nil, surface{})
 	for stage := range c.views {
-		views := make([]any, maxSamplerViews)
-		c.setSamplerViews(uint32(stage), 0, views)
+		c.setSamplerViews(uint32(stage), 0, make([]any, maxSamplerViews))
+		c.bindSamplers(uint32(stage), 0, make([]any, maxSamplers))
+		for i := range c.ubos[stage] {
+			c.setUniformBuffer(uint32(stage), uint32(i), nil, 0, 0)
+		}
 	}
+	c.setVertexBuffers(nil, nil)
 }
 
 func (c *vkglContext) destroy() {
