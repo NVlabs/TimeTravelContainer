@@ -214,7 +214,13 @@ func (t *translator) memoryInstruction(inst *tgsi.Instruction) bool {
 		wg := t.m.ConstantUint(uint32(spirv.ScopeWorkgroup))
 		switch t.s.Processor {
 		case tgsi.ProcessorCompute:
-			sem := t.m.ConstantUint(uint32(spirv.MemorySemanticsAcquireRelease | spirv.MemorySemanticsWorkgroupMemory))
+			// GLSL's barrier() orders shared memory alone, but drivers
+			// order buffers and images too, which shaders count on:
+			// dEQP's image_atomic_op needs a workgroup's texture writes
+			// ordered before its atomics of them, which Metal orders of
+			// a fence of textures alone.
+			sem := t.m.ConstantUint(uint32(spirv.MemorySemanticsAcquireRelease | spirv.MemorySemanticsWorkgroupMemory |
+				spirv.MemorySemanticsUniformMemory | spirv.MemorySemanticsImageMemory))
 			t.f.Do(spirv.OpControlBarrier, uint32(wg), uint32(wg), uint32(sem))
 		case tgsi.ProcessorTessCtrl:
 			// Which orders the invocations' outputs' accesses too.

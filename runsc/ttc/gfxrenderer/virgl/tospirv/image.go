@@ -104,13 +104,20 @@ func (t *translator) storageImage(slot int) *storageImage {
 		t.fail("images of %v", d.ImageTarget)
 	}
 	img := &storageImage{info: ti, typ: Float, format: spirv.ImageFormatUnknown}
-	if f, ok := imageFormats[d.ImageFormat]; ok {
+	format := d.ImageFormat
+	if format == "PIPE_FORMAT_R32_FLOAT" && !t.opts.FloatImageAtomics && t.exchangesImage(slot) {
+		// OES_shader_image_atomic exchanges floats, which a device of no
+		// atomics of float images exchanges as their bits: the image is
+		// one of unsigned integers, as its Resource says, as its view is.
+		format = "PIPE_FORMAT_R32_UINT"
+	}
+	if f, ok := imageFormats[format]; ok {
 		img.typ, img.format = f.b, f.f
 		if f.extended {
 			t.m.Capability(spirv.CapabilityStorageImageExtendedFormats)
 		}
-	} else if d.ImageFormat != "PIPE_FORMAT_NONE" && d.ImageFormat != "" {
-		t.fail("images of %s", d.ImageFormat)
+	} else if format != "PIPE_FORMAT_NONE" && format != "" {
+		t.fail("images of %s", format)
 	}
 	switch {
 	case ti.dim == spirv.Dim1D:
@@ -136,7 +143,7 @@ func (t *translator) storageImage(slot int) *storageImage {
 	}
 	t.images[key] = img
 	t.resource(Resource{Kind: StorageImage, Slot: slot, Target: d.ImageTarget, Type: img.typ,
-		Format: d.ImageFormat}, img.array)
+		Format: format}, img.array)
 	return img
 }
 
@@ -230,7 +237,11 @@ func (t *translator) imageSize(inst *tgsi.Instruction) {
 // integers: ATOMCAS's of its sources 2 and 3, or the others' of source 2.
 func (t *translator) imageAtomic(inst *tgsi.Instruction, op spirv.Op, b BaseType) {
 	img, imgPtr := t.storageImageOf(&inst.Src[0].Register)
-	if img.format != spirv.ImageFormatR32ui && img.format != spirv.ImageFormatR32i {
+	switch {
+	case img.format == spirv.ImageFormatR32ui || img.format == spirv.ImageFormatR32i:
+	case img.format == spirv.ImageFormatR32f && op == spirv.OpAtomicExchange && t.opts.FloatImageAtomics:
+		// OES_shader_image_atomic's exchange of floats.
+	default:
 		t.fail("atomics of images of format %d", img.format)
 	}
 	scalar := t.scalarType(img.typ)
@@ -254,4 +265,17 @@ func (t *translator) imageAtomic(inst *tgsi.Instruction, op spirv.Op, b BaseType
 		old = t.f.Op(op, scalar, uint32(ptr), uint32(scope), uint32(sem), uint32(arg(2)))
 	}
 	t.dst(inst, 0, img.typ, t.splat(t.vecType(img.typ), old))
+}
+
+// exchangesImage reports whether the shader exchanges texels of image
+// slot, or of an image that it indexes indirectly, atomically.
+func (t *translator) exchangesImage(slot int) bool {
+	for i := range t.s.Instructions {
+		inst := &t.s.Instructions[i]
+		if inst.Opcode == tgsi.OpATOMXCHG && len(inst.Src) != 0 && inst.Src[0].File == tgsi.FileImage &&
+			(inst.Src[0].Index == slot || inst.Src[0].Indirect != nil) {
+			return true
+		}
+	}
+	return false
 }

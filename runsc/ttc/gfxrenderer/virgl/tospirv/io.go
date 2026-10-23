@@ -356,6 +356,13 @@ func (t *translator) declareInput(o *io, i int) {
 			t.fail("vertex input %d", i)
 		}
 		b := t.opts.InputTypes[i]
+		switch fetch := t.opts.VertexFetches[i]; {
+		case fetch.Kind == FetchNative:
+		case fetch.Signed && fetch.Kind != FetchPacked1010102:
+			b = Int
+		default:
+			b = Uint
+		}
 		f := t.newIface(spirv.StorageClassInput, t.vecType(b), t.scalarType(b), t.vecType(b), 0)
 		t.m.Decorate(f.v, spirv.DecorationLocation, uint32(i))
 		o.reg, o.chans = t.privateReg(), vecChannels(f)
@@ -696,7 +703,11 @@ func (t *translator) prologue() {
 				continue
 			}
 		}
-		t.store(o.reg, t.loadChannels(o, 0))
+		v := t.loadChannels(o, 0)
+		if t.s.Processor == tgsi.ProcessorVertex && i < MaxVertexInputs && t.opts.VertexFetches[i].Kind != FetchNative {
+			v = t.convertFetch(t.opts.VertexFetches[i], v)
+		}
+		t.store(o.reg, v)
 	}
 	for _, i := range sortedKeys(t.sysvals) {
 		sv := t.sysvals[i]
@@ -1141,4 +1152,68 @@ func (t *translator) clipPlanes() {
 		}
 		t.store(t.chanPtr(channel{f, i}, 0), d)
 	}
+}
+
+// convertFetch converts the bits of a vertex input of integers, as fetch
+// fetches them, to the bits of the floats of its format.
+func (t *translator) convertFetch(fetch VertexFetch, bits spirv.ID) spirv.ID {
+	var v spirv.ID
+	switch fetch.Kind {
+	case FetchScaled, FetchNormalized32:
+		if fetch.Signed {
+			v = t.f.Op(spirv.OpConvertSToF, t.tVec4F, uint32(t.bitcast(t.tVec4I, t.tVec4U, bits)))
+		} else {
+			v = t.f.Op(spirv.OpConvertUToF, t.tVec4F, uint32(bits))
+		}
+		if fetch.Kind == FetchNormalized32 {
+			scale := float32(1.0 / 4294967295.0)
+			if fetch.Signed {
+				scale = 1.0 / 2147483647.0
+			}
+			v = t.f.Op(spirv.OpVectorTimesScalar, t.tVec4F, uint32(v), uint32(t.float32Const(scale)))
+			if fetch.Signed {
+				v = t.glsl(t.tVec4F, spirv.GLSLstd450FMax, v, t.constVec4F(-1, -1, -1, -1))
+			}
+		}
+	case FetchPacked1010102:
+		word := t.f.Op(spirv.OpCompositeExtract, t.tU32, uint32(bits), 0)
+		var chans [4]uint32
+		for c, field := range [4][2]uint32{{0, 10}, {10, 10}, {20, 10}, {30, 2}} {
+			offset, count := t.m.ConstantUint(field[0]), t.m.ConstantUint(field[1])
+			var x spirv.ID
+			if fetch.Signed {
+				s := t.f.Op(spirv.OpBitFieldSExtract, t.tI32, uint32(t.bitcast(t.tI32, t.tU32, word)), uint32(offset), uint32(count))
+				x = t.f.Op(spirv.OpConvertSToF, t.tF32, uint32(s))
+			} else {
+				x = t.f.Op(spirv.OpConvertUToF, t.tF32, uint32(t.f.Op(spirv.OpBitFieldUExtract, t.tU32, uint32(word),
+					uint32(offset), uint32(count))))
+			}
+			if fetch.Normalized {
+				most := float32(uint32(1)<<field[1] - 1)
+				if fetch.Signed {
+					most = float32(uint32(1)<<(field[1]-1) - 1)
+				}
+				x = t.f.Op(spirv.OpFMul, t.tF32, uint32(x), uint32(t.float32Const(1/most)))
+				if fetch.Signed {
+					x = t.glsl(t.tF32, spirv.GLSLstd450FMax, x, t.float32Const(-1))
+				}
+			}
+			chans[c] = uint32(x)
+		}
+		if fetch.BGR {
+			chans[0], chans[2] = chans[2], chans[0]
+		}
+		v = t.f.Op(spirv.OpCompositeConstruct, t.tVec4F, chans[:]...)
+	default:
+		t.fail("a vertex input's fetch of kind %d", fetch.Kind)
+	}
+	// The channels past the format's: (0, 0, 1).
+	for c := uint32(fetch.Channels); c < 4; c++ {
+		def := t.float32Const(0)
+		if c == 3 {
+			def = t.float32Const(1)
+		}
+		v = t.f.Op(spirv.OpCompositeInsert, t.tVec4F, uint32(def), uint32(v), c)
+	}
+	return t.bitcast(t.tVec4U, t.tVec4F, v)
 }

@@ -42,6 +42,9 @@ type Options struct {
 	// elements bound give them: Vulkan, and Metal, read integer formats as
 	// integers.
 	InputTypes [MaxVertexInputs]BaseType
+	// VertexFetches are the conversions of a vertex shader's inputs of
+	// formats that the device fetches not, which it fetches as integers.
+	VertexFetches [MaxVertexInputs]VertexFetch
 	// ColorTypes are a fragment shader's color outputs' types, as the
 	// framebuffer's color buffers' formats give them: Vulkan writes
 	// integer formats of integers.
@@ -103,6 +106,11 @@ type Options struct {
 	// are of the workgroup's: Apple's GPU compiler crashes of a fence of
 	// the device's scope before an atomic's read-modify-write.
 	WorkgroupFences bool
+	// FloatImageAtomics is whether the device exchanges texels of float
+	// images atomically, as OES_shader_image_atomic does: without it, the
+	// translation declares those images as unsigned integers', as their
+	// Resources say.
+	FloatImageAtomics bool
 	// Multisampled is whether a fragment shader's color buffers, which
 	// FBFETCH reads, are multisampled: it reads its sample's.
 	Multisampled bool
@@ -682,3 +690,35 @@ func (t *translator) constVec4F(x, y, z, w float32) spirv.ID {
 }
 
 func float32bits(f float32) uint32 { return math.Float32bits(f) }
+
+// VertexFetch is the conversion of a vertex shader's input of a format that
+// the device fetches not, which it fetches as integers of the vertex
+// buffer's bits: the prologue converts them to the format's floats, of
+// Channels channels, and the others to 0, but w to 1.
+type VertexFetch struct {
+	Kind     FetchKind
+	Signed   bool
+	Channels uint8
+	// Normalized is whether a packed format's channels are normalized,
+	// and BGR whether its first is blue.
+	Normalized, BGR bool
+}
+
+// FetchKind is a kind of a vertex input's conversion.
+type FetchKind uint8
+
+// The kinds of conversions.
+const (
+	// FetchNative is a fetch of the input's format itself.
+	FetchNative FetchKind = iota
+	// FetchScaled converts integers to floats of their values, as
+	// Gallium's SCALED formats have them.
+	FetchScaled
+	// FetchNormalized32 converts integers of 32 bits to floats of [0, 1],
+	// or of [-1, 1] if Signed, as Gallium's 32-bit UNORM and SNORM formats
+	// have them.
+	FetchNormalized32
+	// FetchPacked1010102 unpacks an integer of 32 bits to channels of 10,
+	// 10, 10 and 2 bits, which it scales or normalizes.
+	FetchPacked1010102
+)
