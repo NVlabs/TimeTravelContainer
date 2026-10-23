@@ -231,6 +231,21 @@ launch() {
   echo "ttc redroid e2e: $1 renders on the GPU in $branch"
 }
 
+# Android's first boot provisions the device, and then starts the home
+# screen over the activities that started before it: launch on the home
+# screen, which is provisioning's until it ends.
+deadline=$(($(date +%s) + 120))
+until [ "$(adb /system/bin/settings get global device_provisioned 2>/dev/null)" = 1 ]; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "Android is not provisioned"
+  sleep 2
+done
+home=$(adb /system/bin/cmd package resolve-activity --brief -a android.intent.action.MAIN \
+  -c android.intent.category.HOME | tail -1)
+until adb /system/bin/dumpsys activity activities 2>/dev/null | grep -q "topResumedActivity=.* ${home%%/*}/"; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "the home screen, $home, does not start"
+  sleep 2
+done
+
 launch com.android.settings
 
 # The screen records to video: Codec2's software encoder, whose buffers come
