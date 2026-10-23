@@ -34,7 +34,7 @@ func setOf(kind tospirv.ResourceKind) int {
 	switch kind {
 	case tospirv.UniformBuffer:
 		return tospirv.SetUniformBuffers
-	case tospirv.SampledTexture:
+	case tospirv.SampledTexture, tospirv.BorderTexture:
 		return tospirv.SetSamplers
 	case tospirv.StorageBuffer:
 		return tospirv.SetStorageBuffers
@@ -47,7 +47,7 @@ func descriptorType(r tospirv.Resource) uint32 {
 	switch r.Kind {
 	case tospirv.UniformBuffer:
 		return descriptorUniformBuffer
-	case tospirv.SampledTexture:
+	case tospirv.SampledTexture, tospirv.BorderTexture:
 		if r.Target == tgsi.TextureBuffer {
 			return descriptorUniformTexelBuffer
 		}
@@ -98,7 +98,7 @@ func (d *Device) setLayouts(resources []StageResource) ([numSets]vn.Handle, erro
 		}
 		s := setOf(r.Kind)
 		bindings[s] = append(bindings[s], vn.VkDescriptorSetLayoutBinding{
-			Binding:         tospirv.Binding(r.Stage, r.Slot),
+			Binding:         tospirv.ResourceBinding(r.Stage, r.Kind, r.Slot),
 			DescriptorType:  descriptorType(r.Resource),
 			DescriptorCount: uint32(max(r.Count, 1)),
 			StageFlags:      shaderStageBit(r.Stage),
@@ -191,6 +191,8 @@ type TextureBinding struct {
 	View    *SamplerView
 	Image   *Image
 	Sampler *Sampler
+	// Border is whether the binding is the slot's BorderTexture's.
+	Border bool
 }
 
 // ImageBinding is a view of a texture, in the general layout, bound to a
@@ -206,7 +208,7 @@ type ImageBinding struct {
 func (p *Pipeline) binding(stage tgsi.Processor, kind tospirv.ResourceKind, slot int) (binding, element uint32, ok bool) {
 	for _, r := range p.resources {
 		if r.Stage == stage && r.Kind == kind && slot >= r.Slot && slot < r.Slot+max(r.Count, 1) {
-			return tospirv.Binding(stage, r.Slot), uint32(slot - r.Slot), true
+			return tospirv.ResourceBinding(stage, kind, r.Slot), uint32(slot - r.Slot), true
 		}
 	}
 	return 0, 0, false
@@ -297,7 +299,11 @@ func (c *Commands) bind(p *Pipeline, buffers []BufferBinding, textures []Texture
 			} else {
 				*info = vn.VkDescriptorImageInfo{Sampler: tex.Sampler.sampler, ImageView: tex.Image.view, ImageLayout: tex.Image.layout}
 			}
-			w, err := write(tex.Stage, tospirv.SampledTexture, tex.Slot, descriptorCombinedImageSampler)
+			kind := tospirv.SampledTexture
+			if tex.Border {
+				kind = tospirv.BorderTexture
+			}
+			w, err := write(tex.Stage, kind, tex.Slot, descriptorCombinedImageSampler)
 			if err != nil {
 				return err
 			}

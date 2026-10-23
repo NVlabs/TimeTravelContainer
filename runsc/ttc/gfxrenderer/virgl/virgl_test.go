@@ -445,6 +445,138 @@ func TestOneSidedStencilReference(t *testing.T) {
 	check("of stencils of 1", green)
 }
 
+// TestBorderColors samples textures' borders of colors that Vulkan's
+// samplers have not, and MoltenVK has none of, which the translation blends
+// of samples of borders of transparent black and of opaque white: of
+// colors, of gathers, of swizzled views, of integers, of comparisons of
+// depths, of filtering at the edge, and of the texture within it.
+func TestBorderColors(t *testing.T) {
+	const (
+		formatR8G8B8A8Uint = 180
+		formatZ32Float     = 18
+		bindDepthStencil   = 1 << 0
+		clampToBorder      = 3
+		mipNone            = 2
+		linear             = 1<<9 | 1<<13
+		compareLess        = 1<<15 | 1<<16
+		swizzleRGBA        = 0 | 1<<3 | 2<<6 | 3<<9
+		swizzleBGR1        = 2 | 1<<3 | 0<<6 | 5<<9
+	)
+	f := newFixture(t)
+	texture := func(format, bind uint32, texel []byte) *Resource {
+		mem := bytes.Repeat(texel, 4)
+		r, err := NewResource(f.id(), ResourceArgs{Target: target2D, Format: format, Bind: bind, Width: 2, Height: 2,
+			Depth: 1, ArraySize: 1}, mem, nil)
+		if err != nil {
+			t.Fatalf("NewResource: %v", err)
+		}
+		t.Cleanup(r.DecRef)
+		f.c.Attach(r)
+		if err := f.c.Transfer(r, TransferArgs{ToHost: true, W: 2, H: 2, D: 1}); err != nil {
+			t.Fatalf("Transfer: %v", err)
+		}
+		return r
+	}
+	color := texture(formatR8G8B8A8Unorm, bindSamplerView, []byte{10, 200, 30, 255})
+	integer := texture(formatR8G8B8A8Uint, bindSamplerView, []byte{1, 2, 3, 4})
+	depth := texture(formatZ32Float, bindSamplerView|bindDepthStencil, binary.LittleEndian.AppendUint32(nil, f32(0.9)))
+	const (
+		texFS = `FRAG
+DCL IN[0], GENERIC[0], PERSPECTIVE
+DCL OUT[0], COLOR
+DCL SAMP[0]
+DCL SVIEW[0], 2D, FLOAT
+  0: TEX OUT[0], IN[0], SAMP[0], 2D
+  1: END
+`
+		gatherFS = `FRAG
+DCL IN[0], GENERIC[0], PERSPECTIVE
+DCL OUT[0], COLOR
+DCL SAMP[0]
+DCL SVIEW[0], 2D, FLOAT
+IMM[0] UINT32 {1, 0, 0, 0}
+  0: TG4 OUT[0], IN[0], IMM[0].xxxx, SAMP[0], 2D
+  1: END
+`
+		uintFS = `FRAG
+DCL IN[0], GENERIC[0], PERSPECTIVE
+DCL OUT[0], COLOR
+DCL SAMP[0]
+DCL SVIEW[0], 2D, UINT
+DCL TEMP[0]
+IMM[0] FLT32 {0x3b808081, 0x00000000, 0x00000000, 0x00000000}
+  0: TEX TEMP[0], IN[0], SAMP[0], 2D
+  1: U2F TEMP[0], TEMP[0]
+  2: MUL OUT[0], TEMP[0], IMM[0].xxxx
+  3: END
+`
+		shadowFS = `FRAG
+DCL IN[0], GENERIC[0], PERSPECTIVE
+DCL OUT[0], COLOR
+DCL SAMP[0]
+DCL SVIEW[0], 2D, FLOAT
+  0: TEX OUT[0], IN[0], SAMP[0], SHADOW2D
+  1: END
+`
+	)
+	for _, tc := range []struct {
+		name            string
+		fs              string
+		res             *Resource
+		format, swizzle uint32
+		sampler         uint32
+		border          [4]float32
+		coord           [3]float32
+		want            [4]byte
+	}{
+		{"a color", texFS, color, formatR8G8B8A8Unorm, swizzleRGBA, 0, [4]float32{0.25, 0.5, 0.75, 1}, [3]float32{-0.5, -0.5, 0}, [4]byte{64, 128, 191, 255}},
+		{"the texture", texFS, color, formatR8G8B8A8Unorm, swizzleRGBA, 0, [4]float32{0.25, 0.5, 0.75, 1}, [3]float32{0.25, 0.25, 0}, [4]byte{10, 200, 30, 255}},
+		{"half the edge", texFS, color, formatR8G8B8A8Unorm, swizzleRGBA, linear, [4]float32{0.25, 0.5, 0.75, 1}, [3]float32{0, 0.25, 0}, [4]byte{37, 164, 111, 255}},
+		{"a gather", gatherFS, color, formatR8G8B8A8Unorm, swizzleRGBA, 0, [4]float32{0.25, 0.5, 0.75, 1}, [3]float32{-0.5, -0.5, 0}, [4]byte{128, 128, 128, 128}},
+		{"a swizzle", texFS, color, formatR8G8B8A8Unorm, swizzleBGR1, 0, [4]float32{0.25, 0.5, 0.75, 0}, [3]float32{-0.5, -0.5, 0}, [4]byte{191, 128, 64, 255}},
+		{"white", texFS, color, formatR8G8B8A8Unorm, swizzleRGBA, 0, [4]float32{1, 1, 1, 1}, [3]float32{-0.5, -0.5, 0}, [4]byte{255, 255, 255, 255}},
+		{"integers", uintFS, integer, formatR8G8B8A8Uint, swizzleRGBA, 0, [4]float32{}, [3]float32{-0.5, -0.5, 0}, [4]byte{7, 8, 9, 10}},
+		{"a passing comparison", shadowFS, depth, formatZ32Float, swizzleRGBA, compareLess, [4]float32{0.5}, [3]float32{-0.5, -0.5, 0.25}, [4]byte{255, 255, 255, 255}},
+		{"a failing comparison", shadowFS, depth, formatZ32Float, swizzleRGBA, compareLess, [4]float32{0.5}, [3]float32{-0.5, -0.5, 0.75}, [4]byte{0, 0, 0, 255}},
+	} {
+		border := [4]uint32{f32(tc.border[0]), f32(tc.border[1]), f32(tc.border[2]), f32(tc.border[3])}
+		if tc.res == integer {
+			border = [4]uint32{7, 8, 9, 10}
+		}
+		var s stream
+		f.setup(&s)
+		clearRed(&s)
+		vs, fs, view, samp := f.id(), f.id(), f.id(), f.id()
+		s.shader(vs, stageVertex, fmt.Sprintf(`VERT
+DCL IN[0]
+DCL OUT[0], POSITION
+DCL OUT[1], GENERIC[0]
+IMM[0] FLT32 {0x%08x, 0x%08x, 0x%08x, 0x3f800000}
+  0: MOV OUT[0], IN[0]
+  1: MOV OUT[1], IMM[0]
+  2: END
+`, f32(tc.coord[0]), f32(tc.coord[1]), f32(tc.coord[2])), 1<<16)
+		s.shader(fs, stageFragment, tc.fs, 1<<16)
+		s.cmd(cmdBindShader, 0, vs, stageVertex)
+		s.cmd(cmdBindShader, 0, fs, stageFragment)
+		s.cmd(cmdCreateObject, objectSamplerView, view, tc.res.ID(), tc.format|target2D<<24, 0, 0, tc.swizzle)
+		s.cmd(cmdCreateObject, objectSamplerState, samp, clampToBorder|clampToBorder<<3|clampToBorder<<6|mipNone<<11|tc.sampler,
+			0, 0, 0, border[0], border[1], border[2], border[3])
+		s.cmd(cmdSetSamplerViews, 0, stageFragment, 0, view)
+		s.cmd(cmdBindSamplerStates, 0, stageFragment, 0, samp)
+		drawTriangle(&s)
+		f.submit(t, s)
+		f.finish(t)
+		p := f.pixel(4, height/2)
+		for i := range p {
+			if d := int(p[i]) - int(tc.want[i]); d < -2 || d > 2 {
+				t.Errorf("%s: %v, want %v", tc.name, p, tc.want)
+				break
+			}
+		}
+	}
+}
+
 // TestTexture samples a texture, whose sampler TGSI's NIR names
 // "sampler", which Metal has for a type: MoltenVK failed to compile the
 // shader, and Zink crashed binding no pipeline.
@@ -1695,6 +1827,120 @@ func (f *fixture) readBuffer(t *testing.T, r *Resource, size int) {
 }
 
 const bindShaderBuffer = 1 << 14
+
+// TestIsNaN tests floats of a buffer for NaNs, as Mesa's virgl driver
+// compiles GLSL's isnan, of a comparison of each to itself, which Metal's
+// fast math folds to false.
+func TestIsNaN(t *testing.T) {
+	f := newFixture(t)
+	values := []uint32{0x7fc6ba82, f32(1), 0xfff5f113, 0x7f800000, 0xff800000, 0x7f800001, 0}
+	var in []byte
+	for _, v := range values {
+		in = binary.LittleEndian.AppendUint32(in, v)
+	}
+	out := make([]byte, len(in))
+	inBuf, outBuf := f.buffer(t, in), f.buffer(t, out)
+	var s stream
+	cs := f.id()
+	s.shader(cs, stageCompute, `COMP
+PROPERTY CS_FIXED_BLOCK_WIDTH 1
+PROPERTY CS_FIXED_BLOCK_HEIGHT 1
+PROPERTY CS_FIXED_BLOCK_DEPTH 1
+DCL SV[0], BLOCK_ID
+DCL BUFFER[0]
+DCL BUFFER[1]
+DCL TEMP[0..2], LOCAL
+IMM[0] UINT32 {2, 1, 0, 0}
+  0: SHL TEMP[0].x, SV[0].xxxx, IMM[0].xxxx
+  1: LOAD TEMP[1].x, BUFFER[1], TEMP[0].xxxx
+  2: FSNE_PRECISE TEMP[2].x, TEMP[1].xxxx, TEMP[1].xxxx
+  3: AND TEMP[2].x, TEMP[2].xxxx, IMM[0].yyyy
+  4: STORE BUFFER[0].x, TEMP[0].xxxx, TEMP[2].xxxx
+  5: END
+`, 1<<16)
+	s.cmd(cmdBindShader, 0, cs, stageCompute)
+	s.cmd(cmdSetShaderBuffers, 0, stageCompute, 0, 0, uint32(len(out)), outBuf.ID(), 0, uint32(len(in)), inBuf.ID())
+	s.cmd(cmdLaunchGrid, 0, 1, 1, 1, uint32(len(values)), 1, 1, 0, 0)
+	s.cmd(cmdMemoryBarrier, 0, 0xffffffff)
+	f.submit(t, s)
+	f.readBuffer(t, outBuf, len(out))
+	for i, v := range values {
+		nan := uint32(0)
+		if v&0x7fffffff > 0x7f800000 {
+			nan = 1
+		}
+		if got := binary.LittleEndian.Uint32(out[4*i:]); got != nan {
+			t.Errorf("isnan of %#x: %d, want %d", v, got, nan)
+		}
+	}
+}
+
+// TestShaderBuffersOfBindings reads a fragment shader's buffers as Mesa's
+// virgl driver numbers them, from the least binding of their blocks, here
+// 2, which it binds from slot 0, as virglrenderer reads them.
+func TestShaderBuffersOfBindings(t *testing.T) {
+	f := newFixture(t)
+	color := func(c [4]float32) *Resource {
+		var mem []byte
+		for _, v := range c {
+			mem = binary.LittleEndian.AppendUint32(mem, f32(v))
+		}
+		return f.buffer(t, mem)
+	}
+	blue, green := color([4]float32{0, 0, 1, 1}), color([4]float32{0, 1, 0, 1})
+	var s stream
+	f.setup(&s)
+	fs := f.id()
+	s.shader(fs, stageFragment, `FRAG
+DCL OUT[0], COLOR
+DCL BUFFER[2]
+DCL BUFFER[3]
+DCL TEMP[0]
+IMM[0] UINT32 {0, 0, 0, 0}
+  0: LOAD TEMP[0], BUFFER[3], IMM[0].xxxx
+  1: MOV OUT[0], TEMP[0]
+  2: END
+`, 1<<16)
+	s.cmd(cmdBindShader, 0, fs, stageFragment)
+	s.cmd(cmdSetShaderBuffers, 0, stageFragment, 0, 0, 16, blue.ID(), 0, 16, green.ID())
+	clearRed(&s)
+	drawTriangle(&s)
+	f.submit(t, s)
+	f.finish(t)
+	f.checkTriangle(t)
+}
+
+// TestSampleMaskOfSingleSamples draws the triangle of a fragment shader
+// that writes its sample mask, of a framebuffer of a sample each pixel,
+// whose masks OpenGL ignores, and Vulkan does not.
+func TestSampleMaskOfSingleSamples(t *testing.T) {
+	f := newFixture(t)
+	for _, tc := range []struct {
+		mask uint32
+		want [4]byte
+	}{{0, green}, {2, green}, {1, green}} {
+		var s stream
+		f.setup(&s)
+		fs := f.id()
+		s.shader(fs, stageFragment, fmt.Sprintf(`FRAG
+DCL OUT[0], COLOR
+DCL OUT[1], SAMPLEMASK
+IMM[0] FLT32 {    0.0000,     1.0000,     0.0000,     1.0000}
+IMM[1] UINT32 {%d, 0, 0, 0}
+  0: MOV OUT[0], IMM[0]
+  1: MOV OUT[1].x, IMM[1].xxxx
+  2: END
+`, tc.mask), 1<<16)
+		s.cmd(cmdBindShader, 0, fs, stageFragment)
+		clearRed(&s)
+		drawTriangle(&s)
+		f.submit(t, s)
+		f.finish(t)
+		if p := f.pixel(4, height/2); p != tc.want {
+			t.Errorf("of a mask of %#x: %v, want %v", tc.mask, p, tc.want)
+		}
+	}
+}
 
 // TestLaunchGrid launches a compute shader's grid, of a block of 64
 // invocations, which store their thread's IDs, thrice, to a shader buffer:

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"math/bits"
 	"strings"
 	"sync/atomic"
 
@@ -248,6 +249,10 @@ type vkglShader struct {
 	sint, uint uint32
 	so         *tospirv.StreamOutput
 	sharedMem  uint32
+	// samplers are the sampler slots that the shader declares, of bits,
+	// and writesSampleMask whether a fragment shader writes SAMPLEMASK.
+	samplers         uint32
+	writesSampleMask bool
 }
 
 // vkglView is a sampler view, and the resource that it holds a reference
@@ -258,10 +263,32 @@ type vkglView struct {
 	view *vkgl.SamplerView
 }
 
-// vkglSampler is a sampler state, and its Vulkan sampler.
+// vkglSampler is a sampler state, and its Vulkan sampler, of the border
+// color of Vulkan's nearest the state's, and others of other border
+// colors, VkBorderColor, as views' formats and translations' blending of
+// borders need them.
 type vkglSampler struct {
 	vkglRef
-	sampler *vkgl.Sampler
+	st       *vkgl.SamplerState
+	sampler  *vkgl.Sampler
+	variants map[uint32]*vkgl.Sampler
+}
+
+// variant returns the state's sampler of a border color, VkBorderColor,
+// creating it the first time.
+func (s *vkglSampler) variant(d *vkgl.Device, border uint32) (*vkgl.Sampler, error) {
+	if v := s.variants[border]; v != nil {
+		return v, nil
+	}
+	v, err := d.NewSamplerOfBorder(s.st, border)
+	if err != nil {
+		return nil, err
+	}
+	if s.variants == nil {
+		s.variants = make(map[uint32]*vkgl.Sampler)
+	}
+	s.variants[border] = v
+	return v, nil
 }
 
 // vkglVertexElements are vertex elements, of the vertex buffers' strides.
@@ -515,8 +542,13 @@ func (c *vkglContext) createSamplerState(d []uint32) any {
 		log.Printf("virgl: a sampler state of %+v: %v", *st, err)
 		return nil
 	}
-	o := &vkglSampler{sampler: s}
-	o.init(func() { c.b.d.DestroySampler(s) })
+	o := &vkglSampler{st: st, sampler: s}
+	o.init(func() {
+		c.b.d.DestroySampler(s)
+		for _, v := range o.variants {
+			c.b.d.DestroySampler(v)
+		}
+	})
 	return o
 }
 
@@ -546,6 +578,14 @@ func (c *vkglContext) createShader(stage uint32, code shaderCode, so []uint32, s
 		return nil, fmt.Errorf("TGSI of %v, of a shader of stage %d", vs.TGSI.Processor, stage)
 	}
 	s := &vkglShader{s: vs, stage: stage, sint: sintMask, uint: uintMask, sharedMem: sharedMem}
+	for _, d := range vs.TGSI.Declarations {
+		for i := d.First; d.File == tgsi.FileSampler && i <= d.Last && i < tospirv.StageBindings; i++ {
+			s.samplers |= 1 << i
+		}
+		if d.File == tgsi.FileOutput && d.HasSemantic && d.Semantic == tgsi.SemanticSampleMask {
+			s.writesSampleMask = true
+		}
+	}
 	if xfb {
 		var err error
 		if s.so, err = decodeStreamOutput(so); err != nil {
@@ -1135,8 +1175,10 @@ func (c *vkglContext) launchGrid(d []uint32, indirect backendResource) error {
 	}
 	// Of a shader of a fixed block, as OpenGL's are, which Gallium's
 	// block of the launch is of.
-	res, err := cs.s.Translate(tospirv.Options{SharedMemory: int(cs.sharedMem), WorkgroupFences: c.b.d.WorkgroupFences(),
-		FloatImageAtomics: c.b.d.FloatImageAtomics()})
+	opts := tospirv.Options{SharedMemory: int(cs.sharedMem), WorkgroupFences: c.b.d.WorkgroupFences(),
+		FloatImageAtomics: c.b.d.FloatImageAtomics()}
+	c.borders(stageCompute, cs, &opts)
+	res, err := cs.s.Translate(opts)
 	if err != nil {
 		return fmt.Errorf("the compute shader: %w", err)
 	}
@@ -1510,6 +1552,10 @@ func (c *vkglContext) draw(d []uint32, a drawArgs) error {
 		fsOpts.SpriteCoords, fsOpts.SpriteCoordsLowerLeft = c.rast.SpriteCoordEnable, c.rast.SpriteCoordMode == 1
 	}
 	fsOpts.DualSourceBlend = usesSrc1(c.blend)
+	fsOpts.SingleSampled = fs.writesSampleMask && c.fbSamples() == 1
+	fsOpts.SampleShading = c.minSamples > 1 && c.fbSamples() > 1
+	c.borders(stageVertex, vs, &vsOpts)
+	c.borders(stageFragment, fs, &fsOpts)
 	vsRes, err := vs.s.Translate(vsOpts)
 	if err != nil {
 		return fmt.Errorf("the vertex shader: %w", err)
@@ -1696,6 +1742,13 @@ type vkglBindings struct {
 // stage's shader uses: of the bound state, and of the backend's dummies
 // where it binds none.
 func (c *vkglContext) stageBindings(stage tgsi.Processor, virgl uint32, res *tospirv.Result, b *vkglBindings) error {
+	// The sampler slots whose borders the translation blends.
+	var bordered uint32
+	for _, r := range res.Resources {
+		if r.Kind == tospirv.BorderTexture {
+			bordered |= 1 << r.Slot
+		}
+	}
 	for _, r := range res.Resources {
 		for slot := r.Slot; slot < r.Slot+max(r.Count, 1); slot++ {
 			switch r.Kind {
@@ -1721,8 +1774,36 @@ func (c *vkglContext) stageBindings(stage tgsi.Processor, virgl uint32, res *tos
 						return err
 					}
 					tb.Sampler = s.sampler
+					if v := c.views[virgl][slot]; v != nil {
+						// Of the border color of the view's format's
+						// type, or of a transparent black border, of a
+						// translation that blends the border.
+						border, _ := v.view.Border(s.st)
+						if bordered&(1<<slot) != 0 {
+							border &= 1
+						}
+						var err error
+						if tb.Sampler, err = s.variant(c.b.d, border); err != nil {
+							return err
+						}
+					}
 				}
 				b.textures = append(b.textures, tb)
+			case tospirv.BorderTexture:
+				// The view, of the sampler of an opaque white border,
+				// of a slot whose border the translation blends, which
+				// has both (borders).
+				v, s := c.views[virgl][slot], c.samplers[virgl][slot]
+				if v == nil || s == nil {
+					return fmt.Errorf("a border of sampler slot %d of no view or sampler", slot)
+				}
+				border, _ := v.view.Border(s.st)
+				sampler, err := s.variant(c.b.d, border&1+vkgl.BorderOpaqueWhite)
+				if err != nil {
+					return err
+				}
+				b.textures = append(b.textures, vkgl.TextureBinding{Stage: stage, Slot: slot, View: v.view, Sampler: sampler,
+					Border: true})
 			case tospirv.StorageBuffer:
 				bb, err := c.storageBinding(stage, virgl, slot)
 				if err != nil {
@@ -1923,6 +2004,23 @@ func (c *vkglContext) dummyImage(target uint32, r tospirv.Resource) (*vkgl.Image
 	}
 	c.dummies[key] = vkglDummyImage{tex: tex, view: view}
 	return view, nil
+}
+
+// borders sets opts' borders of the sampler slots that shader sh of a
+// stage declares, of the views and samplers bound, whose border colors
+// Vulkan's are not, which the translation blends.
+func (c *vkglContext) borders(stage uint32, sh *vkglShader, opts *tospirv.Options) {
+	for slots := sh.samplers; slots != 0; slots &= slots - 1 {
+		slot := bits.TrailingZeros32(slots)
+		v, s := c.views[stage][slot], c.samplers[stage][slot]
+		if v == nil || s == nil {
+			continue
+		}
+		if _, b := v.view.Border(s.st); b != nil {
+			opts.BorderSlots |= 1 << slot
+			opts.Borders[slot] = *b
+		}
+	}
 }
 
 // vertexRange returns the vertices that the draw d of a fetches of an

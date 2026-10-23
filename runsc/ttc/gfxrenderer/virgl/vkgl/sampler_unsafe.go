@@ -10,6 +10,7 @@ import (
 
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/venus/vk"
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/venus/vn"
+	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/virgl/tospirv"
 )
 
 // Sampler is a sampler of the device's.
@@ -45,8 +46,15 @@ func (d *Device) NewSampler(desc SamplerDesc) (*Sampler, error) {
 	return &Sampler{sampler: *h}, nil
 }
 
-// NewSamplerOf returns a sampler of a Gallium sampler state's.
+// NewSamplerOf returns a sampler of a Gallium sampler state's, of the
+// border color of Vulkan's nearest its own.
 func (d *Device) NewSamplerOf(st *SamplerState) (*Sampler, error) {
+	return d.NewSamplerOfBorder(st, vkBorderColor(st.BorderColor))
+}
+
+// NewSamplerOfBorder returns a sampler of a Gallium sampler state's, of a
+// border color of Vulkan's, VkBorderColor.
+func (d *Device) NewSamplerOfBorder(st *SamplerState, border uint32) (*Sampler, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	a := d.a
@@ -79,7 +87,7 @@ func (d *Device) NewSamplerOf(st *SamplerState) (*Sampler, error) {
 		// Gallium's functions, PIPE_FUNC_*, are Vulkan's, VkCompareOp.
 		info.CompareEnable, info.CompareOp = 1, st.CompareFunc&7
 	}
-	info.BorderColor = vkBorderColor(st.BorderColor)
+	info.BorderColor = border
 	h := get[vn.Handle](a)
 	cs := get[vn.Args_vkCreateSampler](a)
 	cs.Device, cs.PCreateInfo, cs.PSampler = d.dev, unsafe.Pointer(info), unsafe.Pointer(h)
@@ -102,6 +110,93 @@ func vkBorderColor(c [4]uint32) uint32 {
 		return 2 // VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK
 	}
 	return 0 // VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK
+}
+
+// Vulkan's border colors, VkBorderColor, of floats; of integers, each
+// one more.
+const (
+	BorderTransparentBlack = 0
+	BorderOpaqueBlack      = 2
+	BorderOpaqueWhite      = 4
+)
+
+// UsesBorder reports whether samplers of st sample borders.
+func (st *SamplerState) UsesBorder() bool {
+	return st.WrapS == WrapClampToBorder || st.WrapT == WrapClampToBorder || st.WrapR == WrapClampToBorder
+}
+
+// Border returns the border color, VkBorderColor, of a sampler of st that
+// samples v, and, of a border color of the guest's that Vulkan's are not,
+// as v swizzles it, Vulkan's nearest, and the border that a shader's
+// translation blends (tospirv.Border), of v's samples of a transparent
+// black border, of the type of the color returned (its lowest bit), and of
+// an opaque white one, of its slot's BorderTexture.
+func (v *SamplerView) Border(st *SamplerState) (uint32, *tospirv.Border) {
+	f := v.Format
+	integer, _ := f.IsInteger()
+	base, one := uint32(BorderTransparentBlack), uint32(0x3f800000)
+	if integer || f.kind == kindStencil {
+		base, one = BorderTransparentBlack+1, 1
+	}
+	if !st.UsesBorder() {
+		return base, nil
+	}
+	c := st.BorderColor
+	if st.CompareMode && f.IsDepth() {
+		// Of the border's depth alone, which shadow samplers compare.
+		switch c[0] {
+		case 0:
+			return base, nil
+		case one:
+			return base + BorderOpaqueWhite, nil
+		}
+		return base, &tospirv.Border{Color: c, Compare: st.CompareFunc, ClampRef: unormDepth(f.VK)}
+	}
+	// Vulkan swizzles the border colors of views that swizzle their
+	// channels, but of 0 and 1, which it may not, as it may not swizzle
+	// opaque black.
+	m := vkComponents(v.Desc.Swizzle, f)
+	identity := m == vn.VkComponentMapping{R: 3, G: 4, B: 5, A: 6}
+	constants := false
+	for _, x := range []uint32{m.R, m.G, m.B, m.A} {
+		constants = constants || x == 1 || x == 2
+	}
+	switch {
+	case c == [4]uint32{} && !constants:
+		return base, nil
+	case c == [4]uint32{one, one, one, one} && !constants:
+		return base + BorderOpaqueWhite, nil
+	case c == [4]uint32{0, 0, 0, one} && identity:
+		return base + BorderOpaqueBlack, nil
+	}
+	nearest := base
+	switch {
+	case c == [4]uint32{one, one, one, one}:
+		nearest += BorderOpaqueWhite
+	case c[3] == one:
+		nearest += BorderOpaqueBlack
+	}
+	b := &tospirv.Border{}
+	for i, sw := range v.Desc.Swizzle {
+		switch sw {
+		case Swizzle0:
+		case Swizzle1:
+			b.Color[i] = one
+		default:
+			b.Color[i] = c[sw&3]
+		}
+	}
+	return nearest, b
+}
+
+// unormDepth reports whether a Vulkan format's depths are fixed-point,
+// whose comparisons' references Vulkan clamps to [0, 1].
+func unormDepth(vk uint32) bool {
+	switch vk {
+	case 124, 125, 128, 129: // D16_UNORM, X8_D24_UNORM_PACK32, D16_UNORM_S8_UINT, D24_UNORM_S8_UINT
+		return true
+	}
+	return false
 }
 
 // DestroySampler destroys s, which the GPU no longer uses.
