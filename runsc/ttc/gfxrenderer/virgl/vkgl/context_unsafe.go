@@ -6,7 +6,9 @@
 package vkgl
 
 import (
+	"encoding/binary"
 	"fmt"
+	"math"
 	"sync"
 	"unsafe"
 
@@ -516,7 +518,7 @@ func (t *Texture) checkBox(r TextureRegion) error {
 	if !t.Desc.boxOK(r.Level, b) {
 		return fmt.Errorf("a box %+v of level %d of %+v", b, r.Level, t.Desc)
 	}
-	if t.Format.IsDepth() && t.Format.IsStencil() {
+	if t.Format.IsDepth() && t.Format.IsStencil() && t.Format.BlockBytes != 4 && t.Format.BlockBytes != 8 {
 		return fmt.Errorf("transfers of %s", t.Format.Name)
 	}
 	if t.Desc.Samples > 1 {
@@ -608,13 +610,22 @@ func (c *Context) WriteTexture(t *Texture, r TextureRegion, data []byte, offset 
 	if t.floatDepth24 {
 		depth24ToFloat(s.Bytes()[:t.tightSize(r)])
 	}
+	regions := []vn.VkBufferImageCopy{t.copyRegion(r, 0)}
+	if t.packedDepthStencil() {
+		// Of planes of each aspect, after the guest's texels.
+		packed := append([]byte(nil), s.Bytes()[:t.tightSize(r)]...)
+		if s, err = c.staging(t.planesSize(r)); err != nil {
+			return err
+		}
+		regions = t.splitDepthStencil(r, packed, s.Bytes())
+	}
 	c.general(cmds, t)
 	cmds.barrier()
-	region := get[vn.VkBufferImageCopy](c.a)
-	*region = t.copyRegion(r, 0)
+	rs := array[vn.VkBufferImageCopy](c.a, len(regions))
+	copy(rs, regions)
 	ci := get[vn.Args_vkCmdCopyBufferToImage](c.a)
 	ci.SrcBuffer, ci.DstImage, ci.DstImageLayout = s.buf, t.img, t.layout
-	ci.RegionCount, ci.PRegions = 1, unsafe.Pointer(region)
+	ci.RegionCount, ci.PRegions = uint32(len(rs)), unsafe.Pointer(&rs[0])
 	cmds.call(vn.VK_COMMAND_TYPE_vkCmdCopyBufferToImage_EXT, unsafe.Pointer(ci))
 	cmds.barrier()
 	return nil
@@ -630,7 +641,13 @@ func (c *Context) ReadTexture(t *Texture, r TextureRegion, data []byte, offset u
 	if err != nil {
 		return err
 	}
-	s, err := c.d.NewBuffer(t.tightSize(r), BufferTransferSrc|BufferTransferDst, true)
+	size := t.tightSize(r)
+	regions := []vn.VkBufferImageCopy{t.copyRegion(r, 0)}
+	if t.packedDepthStencil() {
+		size = t.planesSize(r)
+		regions = t.planeRegions(r)
+	}
+	s, err := c.d.NewBuffer(size, BufferTransferSrc|BufferTransferDst, true)
 	if err != nil {
 		c.a.reset()
 		return err
@@ -638,11 +655,11 @@ func (c *Context) ReadTexture(t *Texture, r TextureRegion, data []byte, offset u
 	defer c.d.DestroyBuffer(s)
 	c.general(cmds, t)
 	cmds.barrier()
-	region := get[vn.VkBufferImageCopy](c.a)
-	*region = t.copyRegion(r, 0)
+	rs := array[vn.VkBufferImageCopy](c.a, len(regions))
+	copy(rs, regions)
 	ci := get[vn.Args_vkCmdCopyImageToBuffer](c.a)
 	ci.SrcImage, ci.SrcImageLayout, ci.DstBuffer = t.img, t.layout, s.buf
-	ci.RegionCount, ci.PRegions = 1, unsafe.Pointer(region)
+	ci.RegionCount, ci.PRegions = uint32(len(rs)), unsafe.Pointer(&rs[0])
 	cmds.call(vn.VK_COMMAND_TYPE_vkCmdCopyImageToBuffer_EXT, unsafe.Pointer(ci))
 	cmds.hostBarrier()
 	c.a.reset()
@@ -651,9 +668,91 @@ func (c *Context) ReadTexture(t *Texture, r TextureRegion, data []byte, offset u
 		return fmt.Errorf("reading a texture: the device is lost")
 	}
 	f.Wait()
-	if t.floatDepth24 {
-		floatToDepth24(s.Bytes()[:t.tightSize(r)])
+	texels := s.Bytes()
+	if t.packedDepthStencil() {
+		texels = t.joinDepthStencil(r, texels)
 	}
-	t.packRegion(r, data, offset, s.Bytes(), true)
+	if t.floatDepth24 {
+		floatToDepth24(texels[:t.tightSize(r)])
+	}
+	t.packRegion(r, data, offset, texels, true)
 	return nil
+}
+
+// packedDepthStencil reports whether t's format packs a depth and a
+// stencil in each texel, which Vulkan copies of planes of each aspect.
+func (t *Texture) packedDepthStencil() bool {
+	return t.Format.IsDepth() && t.Format.IsStencil()
+}
+
+// planesSize returns the bytes of a region's planes of a packed depth and
+// stencil format: of depths of 4 bytes, and of stencils of a byte, from a
+// multiple of 4.
+func (t *Texture) planesSize(r TextureRegion) uint64 {
+	n := uint64(r.Box.Width * r.Box.Height * r.Box.Depth)
+	return 4*n + n
+}
+
+// planeRegions returns the copies of a region's planes of a packed depth
+// and stencil format, as planesSize lays them out.
+func (t *Texture) planeRegions(r TextureRegion) []vn.VkBufferImageCopy {
+	n := uint64(r.Box.Width * r.Box.Height * r.Box.Depth)
+	depth, stencil := t.copyRegion(r, 0), t.copyRegion(r, 4*n)
+	depth.ImageSubresource.AspectMask, stencil.ImageSubresource.AspectMask = aspectDepth, aspectStencil
+	return []vn.VkBufferImageCopy{depth, stencil}
+}
+
+// splitDepthStencil splits a region's texels of a packed depth and stencil
+// format, packed tightly, as the guest's memory has them, into planes of
+// each aspect, as the image's format has them, in planes, and returns their
+// copies. The guest's formats are Gallium's: Z24_UNORM_S8_UINT, of a
+// depth's 24 low bits and a stencil's 8 high bits, and
+// Z32_FLOAT_S8X24_UINT, of a float and a stencil's byte after it; the
+// image's depths are of 24 bits, of 32 bits' low ones, or floats, of a
+// device that lacks those.
+func (t *Texture) splitDepthStencil(r TextureRegion, packed, planes []byte) []vn.VkBufferImageCopy {
+	n := int(r.Box.Width * r.Box.Height * r.Box.Depth)
+	floatDepths := t.Format.VK == vkD32S8
+	for i := 0; i < n; i++ {
+		var depth uint32
+		var stencil byte
+		if t.Format.BlockBytes == 8 {
+			depth, stencil = binary.LittleEndian.Uint32(packed[8*i:]), packed[8*i+4]
+		} else {
+			v := binary.LittleEndian.Uint32(packed[4*i:])
+			depth, stencil = v&depth24Mask, byte(v>>24)
+			if floatDepths {
+				depth = math.Float32bits(float32(depth) / depth24Mask)
+			}
+		}
+		binary.LittleEndian.PutUint32(planes[4*i:], depth)
+		planes[4*n+i] = stencil
+	}
+	return t.planeRegions(r)
+}
+
+// joinDepthStencil joins planes of a region's depths and stencils, as
+// planeRegions copies them, into texels of t's packed format, as
+// splitDepthStencil splits them, which it returns.
+func (t *Texture) joinDepthStencil(r TextureRegion, planes []byte) []byte {
+	n := int(r.Box.Width * r.Box.Height * r.Box.Depth)
+	packed := make([]byte, t.tightSize(r))
+	floatDepths := t.Format.VK == vkD32S8
+	for i := 0; i < n; i++ {
+		depth, stencil := binary.LittleEndian.Uint32(planes[4*i:]), planes[4*n+i]
+		if t.Format.BlockBytes == 8 {
+			binary.LittleEndian.PutUint32(packed[8*i:], depth)
+			packed[8*i+4] = stencil
+			continue
+		}
+		if floatDepths {
+			f := float64(math.Float32frombits(depth))
+			if !(f > 0) {
+				f = 0
+			}
+			depth = uint32(math.Round(min(f, 1) * depth24Mask))
+		}
+		binary.LittleEndian.PutUint32(packed[4*i:], depth&depth24Mask|uint32(stencil)<<24)
+	}
+	return packed
 }

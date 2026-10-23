@@ -193,3 +193,62 @@ func TestVertexLimits(t *testing.T) {
 		}
 	}
 }
+
+// TestRealignVertices copies vertex elements of addresses and strides of no
+// multiples of 4 to a buffer of multiples of 4, of the vertices that the
+// source has alone, whatever the range of the draw's.
+func TestRealignVertices(t *testing.T) {
+	d := newTestDevice(t)
+	c, err := d.NewContext()
+	if err != nil {
+		t.Fatalf("NewContext: %v", err)
+	}
+	defer c.Destroy()
+	src, err := d.NewBuffer(64, BufferTransferSrc|BufferTransferDst|BufferVertex, false)
+	if err != nil {
+		t.Fatalf("NewBuffer: %v", err)
+	}
+	defer d.DestroyBuffer(src)
+	data := make([]byte, 64)
+	for i := range data {
+		data[i] = byte(i + 1)
+	}
+	if err := c.WriteBuffer(src, 0, data); err != nil {
+		t.Fatalf("WriteBuffer: %v", err)
+	}
+	for _, tc := range []struct {
+		name                       string
+		offset                     uint64
+		stride, size, first, count uint32
+		wantStride                 uint32
+		want                       []byte
+	}{
+		// Elements of 3 bytes at 13, 19 and 25, of vertices 2 to 4.
+		{"a range", 1, 6, 3, 2, 3, 4, append(make([]byte, 8), 14, 15, 16, 0, 20, 21, 22, 0, 26, 27, 28, 0)},
+		// Of vertices 9 and 10 alone, of which the source has 3 bytes of
+		// the last's 4, at 61.
+		{"past the source", 1, 6, 4, 9, 100, 4, append(make([]byte, 36), 56, 57, 58, 59, 62, 63, 64, 0)},
+		// One element of all vertices.
+		{"a stride of 0", 5, 0, 4, 7, 9, 0, []byte{6, 7, 8, 9}},
+		// Of vertices past 32 bits' indexes, which the source has none of.
+		{"past 32 bits", 1, 6, 4, ^uint32(0) - 1, MaxRealigned, 4, make([]byte, 4)},
+	} {
+		dst, stride, err := c.RealignVertices(src, tc.offset, tc.stride, tc.size, tc.first, tc.count)
+		if err != nil {
+			t.Fatalf("%s: RealignVertices: %v", tc.name, err)
+		}
+		if stride != tc.wantStride || dst.Size() != uint64(len(tc.want)) {
+			t.Errorf("%s: a buffer of %d bytes of a stride of %d, want %d of %d", tc.name, dst.Size(), stride,
+				len(tc.want), tc.wantStride)
+			continue
+		}
+		got := make([]byte, len(tc.want))
+		if err := c.ReadBuffer(dst, 0, got); err != nil {
+			t.Fatalf("%s: ReadBuffer: %v", tc.name, err)
+		}
+		if !bytes.Equal(got, tc.want) {
+			t.Errorf("%s: %v, want %v", tc.name, got, tc.want)
+		}
+	}
+	c.Flush().Wait()
+}

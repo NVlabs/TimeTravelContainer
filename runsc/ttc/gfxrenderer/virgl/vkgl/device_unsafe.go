@@ -159,6 +159,18 @@ type Device struct {
 	// comparison samplers' descriptors, and attributes past their
 	// bindings' strides.
 	triangleFans, pointPolygons, samplerMipLodBias, separateStencilRef, multisampleArrays bool
+	// view2DOn3D is whether 3D images' slices are viewed as 2D images'
+	// layers, of images created to be.
+	view2DOn3D bool
+	// alignedVertices is whether the device fetches vertex elements of
+	// addresses and strides of multiples of 4 alone, as Metal does.
+	alignedVertices bool
+	// imageViews2DOf3D is whether shaders store to 2D views of 3D images'
+	// slices, of VK_EXT_image_2d_view_of_3d, of images created to be.
+	imageViews2DOf3D bool
+	// floatImageAtomics is whether shaders exchange texels of images of
+	// floats atomically, of VK_EXT_shader_atomic_float.
+	floatImageAtomics bool
 	// workgroupFences is whether shaders' fences of the device's scope are
 	// of the workgroup's, of MoltenVK: Apple's GPU compiler crashes of a
 	// fence of the device's scope before an atomic's read-modify-write of
@@ -444,6 +456,14 @@ func (d *Device) createDevice() error {
 	div.SType = vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES
 	divExt := ext("VK_KHR_vertex_attribute_divisor", "VK_EXT_vertex_attribute_divisor")
 	link(divExt, unsafe.Pointer(div), &div.PNext)
+	v3 := get[vn.VkPhysicalDeviceImage2DViewOf3DFeaturesEXT](a)
+	v3.SType = vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_2D_VIEW_OF_3D_FEATURES_EXT
+	v3Ext := ext("VK_EXT_image_2d_view_of_3d")
+	link(v3Ext, unsafe.Pointer(v3), &v3.PNext)
+	af := get[vn.VkPhysicalDeviceShaderAtomicFloatFeaturesEXT](a)
+	af.SType = vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT
+	afExt := ext("VK_EXT_shader_atomic_float")
+	link(afExt, unsafe.Pointer(af), &af.PNext)
 	ps := get[portabilitySubsetFeatures](a)
 	ps.SType = vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR
 	psExt := ext("VK_KHR_portability_subset")
@@ -468,6 +488,7 @@ func (d *Device) createDevice() error {
 	d.features13.PNext = nil
 	var exts []string
 	d.triangleFans, d.pointPolygons, d.samplerMipLodBias, d.separateStencilRef, d.multisampleArrays = true, true, true, true, true
+	d.view2DOn3D = true
 	if psExt != "" {
 		// Which a device that has it requires enabled.
 		exts = append(exts, psExt)
@@ -481,6 +502,8 @@ func (d *Device) createDevice() error {
 		d.samplerMipLodBias = ps.SamplerMipLodBias != 0
 		d.separateStencilRef = ps.SeparateStencilMaskRef != 0
 		d.multisampleArrays = ps.MultisampleArrayImage != 0
+		d.view2DOn3D = ps.ImageView2DOn3DImage != 0
+		d.alignedVertices = true
 		d.workgroupFences = true
 	}
 	d.initSubstitutes()
@@ -504,6 +527,14 @@ func (d *Device) createDevice() error {
 	if divExt != "" {
 		exts = append(exts, divExt)
 		d.divisors = div.VertexAttributeInstanceRateDivisor != 0
+	}
+	if afExt != "" {
+		exts = append(exts, afExt)
+		d.floatImageAtomics = af.ShaderImageFloat32Atomics != 0
+	}
+	if v3Ext != "" {
+		exts = append(exts, v3Ext)
+		d.imageViews2DOf3D = d.view2DOn3D && v3.Image2DViewOf3D != 0
 	}
 
 	priority := get[float32](a)
@@ -661,4 +692,10 @@ func (d *Device) UniformBufferAlignment() uint32 {
 // binding.
 func (d *Device) MaxUniformBufferRange() uint32 {
 	return d.props.Limits.MaxUniformBufferRange
+}
+
+// FloatImageAtomics reports whether shaders exchange texels of images of
+// floats atomically, as tospirv's Options.FloatImageAtomics.
+func (d *Device) FloatImageAtomics() bool {
+	return d.floatImageAtomics
 }

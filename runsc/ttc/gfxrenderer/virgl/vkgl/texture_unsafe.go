@@ -16,20 +16,22 @@ import (
 // Format features, of VkFormatFeatureFlagBits, and image creation flags,
 // of VkImageCreateFlagBits.
 const (
-	featureSampledImage    = 0x1
-	featureStorageImage    = 0x2
-	featureColorAttachment = 0x80
-	featureDepthStencil    = 0x200
-	featureTransferSrc     = 0x4000
-	featureTransferDst     = 0x8000
-	createMutableFormat    = 0x8
-	createCubeCompatible   = 0x10
-	createExtendedUsage    = 0x100
-	imageUsageDepthStencil = 0x20
-	imageType1D            = 0
-	imageType3D            = 2
-	aspectDepth            = 0x2
-	aspectStencil          = 0x4
+	featureSampledImage     = 0x1
+	featureStorageImage     = 0x2
+	featureColorAttachment  = 0x80
+	featureDepthStencil     = 0x200
+	featureTransferSrc      = 0x4000
+	featureTransferDst      = 0x8000
+	createMutableFormat     = 0x8
+	createCubeCompatible    = 0x10
+	create2DArrayCompatible = 0x20
+	create2DViewCompatible  = 0x20000
+	createExtendedUsage     = 0x100
+	imageUsageDepthStencil  = 0x20
+	imageType1D             = 0
+	imageType3D             = 2
+	aspectDepth             = 0x2
+	aspectStencil           = 0x4
 )
 
 // formatFeatures returns the features of a format's optimally tiled
@@ -84,6 +86,10 @@ type Texture struct {
 	// substitute of the format's 24-bit depths, of which the guest's
 	// memory has its texels.
 	floatDepth24 bool
+	// slices2D is whether surfaces view a 3D image's slices as layers, of
+	// which the image is compatible, and slices2DImages whether images
+	// view them as 2D images.
+	slices2D, slices2DImages bool
 }
 
 // NewTexture returns a texture of desc, a texture's, of a format that
@@ -156,6 +162,14 @@ func (d *Device) newTexture(desc ResourceDesc) (*Texture, error) {
 	case Target3D:
 		info.ImageType = imageType3D
 		info.Extent.Depth = desc.Depth
+		if d.view2DOn3D {
+			// Of surfaces of its slices, as OpenGL ES 3.0 renders to.
+			info.Flags |= create2DArrayCompatible
+		}
+		if d.imageViews2DOf3D && usage&ImageStorage != 0 {
+			// Of images of its slices, as OpenGL ES 3.1 binds them.
+			info.Flags |= create2DViewCompatible
+		}
 	case TargetCube, TargetCubeArray:
 		info.Flags |= createCubeCompatible
 	case Target2DArray:
@@ -177,7 +191,8 @@ func (d *Device) newTexture(desc ResourceDesc) (*Texture, error) {
 		return nil, fmt.Errorf("a texture of %+v, %s: %w", desc, f.Name, err)
 	}
 	t := &Texture{Desc: desc, Format: f, img: *h, layout: ImageLayoutUndefined, aspects: aspectColor, usage: usage,
-		floatDepth24: desc.Format == virglZ24X8 && f.VK == vkD32}
+		floatDepth24: desc.Format == virglZ24X8 && f.VK == vkD32, slices2D: info.Flags&create2DArrayCompatible != 0,
+		slices2DImages: info.Flags&create2DViewCompatible != 0}
 	switch {
 	case f.IsDepth() && f.IsStencil():
 		t.aspects = aspectDepth | aspectStencil

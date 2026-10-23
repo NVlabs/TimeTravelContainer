@@ -30,6 +30,20 @@ func (d *Device) Caps(set uint32, ubos, ssbos uint32) []byte {
 	if set == 1 {
 		v1.MaxVersion = 1
 	}
+	v1.MaxSamples = 1
+	for s := uint32(16); s > 1; s /= 2 {
+		if l.FramebufferColorSampleCounts&s != 0 {
+			v1.MaxSamples = s
+			break
+		}
+	}
+	// Formats are of multisampled textures, as guests' drivers take them,
+	// of every count of samples up to the most: of their renderings', and
+	// their samples', as shaders fetch them.
+	multisampled := func(counts uint32) bool {
+		want := (2*v1.MaxSamples - 1) &^ 1
+		return v1.MaxSamples > 1 && counts&want == want
+	}
 	for vf := range formats {
 		ft, _ := d.LookupFormat(vf)
 		props := d.formatProperties(ft.VK)
@@ -42,16 +56,34 @@ func (d *Device) Caps(set uint32, ubos, ssbos uint32) []byte {
 		case ft.IsDepth() || ft.IsStencil():
 			if opt&featureDepthStencil != 0 {
 				v1.DepthStencil.set(vf)
+				counts := ^uint32(0)
+				if ft.IsDepth() {
+					counts &= l.FramebufferDepthSampleCounts & l.SampledImageDepthSampleCounts
+				}
+				if ft.IsStencil() {
+					counts &= l.FramebufferStencilSampleCounts & l.SampledImageStencilSampleCounts
+				}
+				if multisampled(counts) {
+					c.SupportedMultisampleFormats.set(vf)
+				}
 			}
 		case opt&featureColorAttachment != 0 && !ft.Compressed:
 			v1.Render.set(vf)
-			if l.FramebufferColorSampleCounts&4 != 0 {
+			sampled := l.SampledImageColorSampleCounts
+			if integer, _ := ft.IsInteger(); integer {
+				sampled = l.SampledImageIntegerSampleCounts
+			}
+			if multisampled(l.FramebufferColorSampleCounts & sampled) {
 				c.SupportedMultisampleFormats.set(vf)
 			}
 		}
 		if props.BufferFeatures&featureVertexBuffer != 0 && ft.Swizzle == "XYZW" {
 			v1.VertexBuffer.set(vf)
 		}
+	}
+	// Of framebuffers of no attachments, PIPE_FORMAT_NONE's.
+	if multisampled(l.FramebufferNoAttachmentsSampleCounts) {
+		c.SupportedMultisampleFormats.set(0)
 	}
 	for vf := range viewFormats {
 		// Of views alone, which shaders sample.
@@ -96,13 +128,6 @@ func (d *Device) Caps(set uint32, ubos, ssbos uint32) []byte {
 		v1.MaxDualSourceRenderTargets = l.MaxFragmentDualSrcAttachments
 	}
 	v1.MaxRenderTargets = min(l.MaxColorAttachments, MaxColorBuffers)
-	v1.MaxSamples = 1
-	for s := uint32(16); s > 1; s /= 2 {
-		if l.FramebufferColorSampleCounts&s != 0 {
-			v1.MaxSamples = s
-			break
-		}
-	}
 	v1.PrimMask = vkPrimMask
 	if !d.triangleFans {
 		v1.PrimMask &^= 1 << primTriangleFan

@@ -338,4 +338,11 @@ func TestCaps(t *testing.T) {
 	}
 	t.Logf("renderer %q, %d render targets, %d samples, prim mask %#x", string(bytes.TrimRight(c.Renderer[:], "\x00")),
 		c.V1.MaxRenderTargets, c.V1.MaxSamples, c.V1.PrimMask)
+	// R8G8B8A8_UNORM, Z24_UNORM_S8_UINT and framebuffers of no attachments
+	// are multisampled.
+	for _, f := range []uint32{67, 19, 0} {
+		if !c.SupportedMultisampleFormats.has(f) {
+			t.Errorf("format %d is not multisampled", f)
+		}
+	}
 }

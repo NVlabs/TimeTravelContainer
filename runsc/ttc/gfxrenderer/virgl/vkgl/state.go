@@ -402,7 +402,9 @@ type VertexElement struct {
 	Offset          uint32
 	InstanceDivisor uint32
 	Buffer          uint32
-	Format          Format
+	// Format is the element's format, or none of a format that Vulkan has
+	// not, which Device.VertexFetch fetches of another.
+	Format Format
 	// VirglFormat is the element's format, as virgl numbers it.
 	VirglFormat uint32
 }
@@ -416,8 +418,8 @@ func DecodeVertexElements(elements []uint32) ([]VertexElement, error) {
 	ve := make([]VertexElement, len(elements)/4)
 	for i := range ve {
 		e := elements[4*i:]
-		f, ok := LookupFormat(e[3])
-		if !ok || e[2] >= MaxVertexElements {
+		f, _ := LookupFormat(e[3])
+		if !IsVertexFormat(e[3]) || e[2] >= MaxVertexElements {
 			return nil, errState
 		}
 		ve[i] = VertexElement{Offset: e[0], InstanceDivisor: e[1], Buffer: e[2], Format: f, VirglFormat: e[3]}

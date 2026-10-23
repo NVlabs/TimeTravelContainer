@@ -228,7 +228,7 @@ func (c *Context) ClearTexture(t *Texture, level uint32, box Box, texel []byte) 
 	f := t.Format
 	r := TextureRegion{Level: level, Box: box}
 	if box.Width < 0 || box.Height < 0 || box.Depth < 0 || uint32(len(texel)) < f.BlockBytes ||
-		t.usage&(ImageColorAttachment|imageUsageDepthStencil) == 0 {
+		t.usage&(ImageColorAttachment|imageUsageDepthStencil) == 0 || t.packedDepthStencil() {
 		return fmt.Errorf("a clear of %+v of level %d of %+v", box, level, t.Desc)
 	}
 	if box.Width == 0 || box.Height == 0 || box.Depth == 0 {

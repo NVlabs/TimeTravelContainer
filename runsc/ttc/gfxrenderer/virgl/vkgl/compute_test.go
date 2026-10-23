@@ -6,8 +6,10 @@
 package vkgl
 
 import (
+	"bytes"
 	"encoding/binary"
 	"math"
+	"strings"
 	"testing"
 
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/virgl/tgsi"
@@ -548,5 +550,223 @@ IMM[2] FLT32 {    1.0000,     0.0000,     0.0000,     0.0000}
 	// The sample's green, and red of the texture's 4 samples.
 	if got := pixel(px, 1, 0, 0); got != [4]byte{255, 255, 0, 255} {
 		t.Errorf("the sample: %v, want {255, 255, 0, 255}", got)
+	}
+}
+
+// TestFloatImageExchange exchanges a texel of an image of floats, as
+// OES_shader_image_atomic's exchange does: of atomics of images of floats
+// where the device has them, and of unsigned integers where it has not.
+func TestFloatImageExchange(t *testing.T) {
+	d := newTestDevice(t)
+	t.Logf("atomics of images of floats: %v", d.FloatImageAtomics())
+	c, err := d.NewContext()
+	if err != nil {
+		t.Fatalf("NewContext: %v", err)
+	}
+	defer c.Destroy()
+	r32f := formatByName(t, "R32_FLOAT")
+	const text = `COMP
+PROPERTY CS_FIXED_BLOCK_WIDTH 1
+PROPERTY CS_FIXED_BLOCK_HEIGHT 1
+PROPERTY CS_FIXED_BLOCK_DEPTH 1
+DCL IMAGE[0], 2D, PIPE_FORMAT_R32_FLOAT, WR
+DCL BUFFER[0]
+DCL TEMP[0], LOCAL
+IMM[0] UINT32 {0, 0, 0, 0}
+IMM[1] FLT32 {    2.5000,     0.0000,     0.0000,     0.0000}
+  0: ATOMXCHG TEMP[0].x, IMAGE[0], IMM[0].xxxx, IMM[1].xxxx, 2D, PIPE_FORMAT_R32_FLOAT
+  1: STORE BUFFER[0].x, IMM[0].xxxx, TEMP[0].xxxx
+  2: END
+`
+	for _, atomics := range []bool{d.FloatImageAtomics(), false} {
+		s, err := tgsi.Parse(text)
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		cs, err := tospirv.Translate(s, tospirv.Options{FloatImageAtomics: atomics, WorkgroupFences: d.WorkgroupFences()})
+		if err != nil {
+			t.Fatalf("Translate: %v", err)
+		}
+		var resources []StageResource
+		for _, r := range cs.Resources {
+			resources = append(resources, StageResource{tgsi.ProcessorCompute, r})
+		}
+		p, err := d.NewComputePipeline(ComputeDesc{CS: cs.Words, Resources: resources})
+		if err != nil {
+			t.Fatalf("NewComputePipeline of atomics %v: %v", atomics, err)
+		}
+		defer d.DestroyPipeline(p)
+		tex, err := d.NewTexture(ResourceDesc{Target: Target2D, Format: r32f, Width: 1, Height: 1})
+		if err != nil {
+			t.Fatalf("NewTexture: %v", err)
+		}
+		defer d.DestroyTexture(tex)
+		region := TextureRegion{Box: Box{Width: 1, Height: 1, Depth: 1}}
+		if err := c.WriteTexture(tex, region, binary.LittleEndian.AppendUint32(nil, math.Float32bits(1.5)), 0); err != nil {
+			t.Fatalf("WriteTexture: %v", err)
+		}
+		// Of the format of the translation's image, of floats' bits of
+		// unsigned integers of no atomics of floats.
+		format := r32f
+		for _, r := range cs.Resources {
+			if r.Kind == tospirv.StorageImage {
+				format = formatByName(t, strings.TrimPrefix(r.Format, "PIPE_FORMAT_"))
+			}
+		}
+		view, err := d.NewImageView(tex, ViewDesc{Format: format, Target: Target2D})
+		if err != nil {
+			t.Fatalf("NewImageView: %v", err)
+		}
+		defer d.DestroyImageView(view)
+		out, err := d.NewBuffer(16, BufferStorage|BufferTransferSrc|BufferTransferDst, false)
+		if err != nil {
+			t.Fatalf("NewBuffer: %v", err)
+		}
+		defer d.DestroyBuffer(out)
+		if err := c.Compute(func(cmds *Commands) error {
+			cmds.BindPipeline(p)
+			buffers := []BufferBinding{{tgsi.ProcessorCompute, tospirv.StorageBuffer, 0, out, 0, 16}}
+			if err := c.BindResources(cmds, p, buffers, nil, []ImageBinding{{tgsi.ProcessorCompute, 0, view}}); err != nil {
+				return err
+			}
+			cmds.Dispatch(1, 1, 1)
+			return nil
+		}); err != nil {
+			t.Fatalf("Compute: %v", err)
+		}
+		old := make([]byte, 4)
+		if err := c.ReadBuffer(out, 0, old); err != nil {
+			t.Fatalf("ReadBuffer: %v", err)
+		}
+		texel := make([]byte, 4)
+		if err := c.ReadTexture(tex, region, texel, 0); err != nil {
+			t.Fatalf("ReadTexture: %v", err)
+		}
+		if o, n := math.Float32frombits(binary.LittleEndian.Uint32(old)), math.Float32frombits(binary.LittleEndian.Uint32(texel)); o != 1.5 || n != 2.5 {
+			t.Errorf("an exchange of atomics %v: %v for %v, want 1.5 for 2.5", atomics, o, n)
+		}
+	}
+}
+
+// TestDepthStencilTransfers writes texels of packed depth and stencil
+// formats, which Vulkan copies of planes of each aspect, and reads them
+// back: Z24_UNORM_S8_UINT, of whatever depths the device has in its place,
+// and Z32_FLOAT_S8X24_UINT.
+func TestDepthStencilTransfers(t *testing.T) {
+	d := newTestDevice(t)
+	c, err := d.NewContext()
+	if err != nil {
+		t.Fatalf("NewContext: %v", err)
+	}
+	defer c.Destroy()
+	for _, tc := range []struct {
+		format uint32
+		texel  func(i int) []byte
+	}{
+		{19, func(i int) []byte {
+			z := uint32([]int{0, 1, 0x7fffff, 0xffffff, 12345}[i%5])
+			return binary.LittleEndian.AppendUint32(nil, z|uint32(i*37%256)<<24)
+		}},
+		{126, func(i int) []byte {
+			b := binary.LittleEndian.AppendUint32(nil, math.Float32bits(float32(i)/7))
+			return append(b, byte(i*37%256), 0, 0, 0)
+		}},
+	} {
+		tex, err := d.NewTexture(ResourceDesc{Target: Target2D, Format: tc.format, Width: 8, Height: 4})
+		if err != nil {
+			t.Fatalf("NewTexture(%d): %v", tc.format, err)
+		}
+		var data []byte
+		for i := 0; i < 15; i++ {
+			data = append(data, tc.texel(i)...)
+		}
+		// Of rows of the box's 5 texels.
+		r := TextureRegion{Box: Box{X: 2, Y: 1, Width: 5, Height: 3, Depth: 1}, Stride: uint32(len(data) / 3)}
+		if err := c.WriteTexture(tex, r, data, 0); err != nil {
+			t.Fatalf("WriteTexture(%d): %v", tc.format, err)
+		}
+		out := make([]byte, len(data))
+		if err := c.ReadTexture(tex, r, out, 0); err != nil {
+			t.Fatalf("ReadTexture(%d): %v", tc.format, err)
+		}
+		if !bytes.Equal(out, data) {
+			t.Errorf("format %d: read %x, want %x", tc.format, out, data)
+		}
+		d.DestroyTexture(tex)
+	}
+}
+
+// Test3DSlices renders to a slice of a 3D texture, of a surface of it, and
+// stores to another of a compute shader, of a 2D image of it, where the
+// device views 3D images' slices so.
+func Test3DSlices(t *testing.T) {
+	d := newTestDevice(t)
+	c, err := d.NewContext()
+	if err != nil {
+		t.Fatalf("NewContext: %v", err)
+	}
+	defer c.Destroy()
+	r32ui := formatByName(t, "R32_UINT")
+	tex, err := d.NewTexture(ResourceDesc{Target: Target3D, Format: r32ui, Width: 4, Height: 4, Depth: 4})
+	if err != nil {
+		t.Fatalf("NewTexture: %v", err)
+	}
+	defer d.DestroyTexture(tex)
+	region := TextureRegion{Box: Box{Width: 4, Height: 4, Depth: 4}}
+	if err := c.WriteTexture(tex, region, make([]byte, 4*4*4*4), 0); err != nil {
+		t.Fatalf("WriteTexture: %v", err)
+	}
+	want := make([]byte, 4*4*4*4)
+	if !tex.slices2D {
+		t.Logf("%s renders to no 3D images' slices", d.Name)
+	} else {
+		s, err := d.NewSurface(tex, r32ui, 0, 1, 1)
+		if err != nil {
+			t.Fatalf("NewSurface: %v", err)
+		}
+		defer d.DestroySurface(s)
+		if err := c.ClearSurface(s, ClearColor0, [4]uint32{5}, 0, 0, 0, 0, 4, 4); err != nil {
+			t.Fatalf("ClearSurface: %v", err)
+		}
+		for i := 16; i < 32; i++ {
+			binary.LittleEndian.PutUint32(want[4*i:], 5)
+		}
+	}
+	if !tex.slices2DImages {
+		t.Logf("%s stores to no 2D images of 3D images' slices", d.Name)
+	} else {
+		p := newComputePipeline(t, d, `COMP
+PROPERTY CS_FIXED_BLOCK_WIDTH 1
+PROPERTY CS_FIXED_BLOCK_HEIGHT 1
+PROPERTY CS_FIXED_BLOCK_DEPTH 1
+DCL IMAGE[0], 2D, PIPE_FORMAT_R32_UINT, WR
+IMM[0] UINT32 {1, 1, 0, 0}
+IMM[1] UINT32 {7, 0, 0, 0}
+  0: STORE IMAGE[0], IMM[0], IMM[1], 2D, PIPE_FORMAT_R32_UINT
+  1: END
+`, 0)
+		view, err := d.NewImageView(tex, ViewDesc{Format: r32ui, Target: Target2D, FirstLayer: 2, LastLayer: 2})
+		if err != nil {
+			t.Fatalf("NewImageView: %v", err)
+		}
+		defer d.DestroyImageView(view)
+		if err := c.Compute(func(cmds *Commands) error {
+			cmds.BindPipeline(p)
+			if err := c.BindResources(cmds, p, nil, nil, []ImageBinding{{tgsi.ProcessorCompute, 0, view}}); err != nil {
+				return err
+			}
+			cmds.Dispatch(1, 1, 1)
+			return nil
+		}); err != nil {
+			t.Fatalf("Compute: %v", err)
+		}
+		binary.LittleEndian.PutUint32(want[4*(32+4+1):], 7)
+	}
+	out := make([]byte, len(want))
+	if err := c.ReadTexture(tex, region, out, 0); err != nil {
+		t.Fatalf("ReadTexture: %v", err)
+	}
+	if !bytes.Equal(out, want) {
+		t.Errorf("the slices: %v, want %v", out, want)
 	}
 }

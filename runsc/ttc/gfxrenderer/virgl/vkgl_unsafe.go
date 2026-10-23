@@ -294,10 +294,7 @@ type vkglImage struct {
 	res                *vkglResource
 	format             uint32
 	level, first, last uint32
-	views              map[uint32]*vkgl.ImageView
-	// refused are the targets of views that the device refused, which
-	// the context logged.
-	refused map[uint32]bool
+	views              map[[2]uint32]*vkgl.ImageView
 }
 
 // free destroys the binding's views, of no references.
@@ -309,12 +306,13 @@ func (img *vkglImage) free() {
 	img.res.decRef()
 }
 
-// view returns the binding's view of target, a view type's.
-func (img *vkglImage) view(target uint32) (*vkgl.ImageView, error) {
-	if v := img.views[target]; v != nil {
+// view returns the binding's view of target, a view type's, as format.
+func (img *vkglImage) view(target, format uint32) (*vkgl.ImageView, error) {
+	key := [2]uint32{target, format}
+	if v := img.views[key]; v != nil {
 		return v, nil
 	}
-	desc := vkgl.ViewDesc{Format: img.format, Target: target, FirstLevel: img.level, LastLevel: img.level,
+	desc := vkgl.ViewDesc{Format: format, Target: target, FirstLevel: img.level, LastLevel: img.level,
 		FirstLayer: img.first, LastLayer: img.last}
 	switch target {
 	case vkgl.Target1D, vkgl.Target2D:
@@ -331,9 +329,9 @@ func (img *vkglImage) view(target uint32) (*vkgl.ImageView, error) {
 		return nil, err
 	}
 	if img.views == nil {
-		img.views = make(map[uint32]*vkgl.ImageView)
+		img.views = make(map[[2]uint32]*vkgl.ImageView)
 	}
-	img.views[target] = v
+	img.views[key] = v
 	return v, nil
 }
 
@@ -362,9 +360,11 @@ type vkglContext struct {
 	ssbos     [maxShaderStages][maxShaderBuffers]vkglRange
 	images    [maxShaderStages][maxShaderImages]*vkglImage
 	// dummies are the images of slots of no image, of their targets and
-	// formats.
-	dummies map[[2]uint32]vkglDummyImage
-	vbs     []vkglRange
+	// formats, and loggedZeros whether the context logged one in place of
+	// a view that the device refused.
+	dummies     map[[2]uint32]vkglDummyImage
+	loggedZeros bool
+	vbs         []vkglRange
 	// fb is the framebuffer, of fbRes's surfaces.
 	fb         vkgl.Framebuffer
 	fbRes      []*vkglResource
@@ -507,10 +507,12 @@ func (c *vkglContext) createDSA(d []uint32) any {
 func (c *vkglContext) createSamplerState(d []uint32) any {
 	st, err := vkgl.DecodeSamplerState(d)
 	if err != nil {
+		log.Printf("virgl: a sampler state of %#x: %v", d, err)
 		return nil
 	}
 	s, err := c.b.d.NewSamplerOf(st)
 	if err != nil {
+		log.Printf("virgl: a sampler state of %+v: %v", *st, err)
 		return nil
 	}
 	o := &vkglSampler{sampler: s}
@@ -521,6 +523,7 @@ func (c *vkglContext) createSamplerState(d []uint32) any {
 func (c *vkglContext) createVertexElements(elements []uint32, strides []uint32) any {
 	ve, err := vkgl.DecodeVertexElements(elements)
 	if err != nil {
+		log.Printf("virgl: vertex elements of %v: %v", elements, err)
 		return nil
 	}
 	return &vkglVertexElements{elements: ve, strides: append([]uint32(nil), strides...)}
@@ -585,6 +588,7 @@ func (c *vkglContext) createSamplerView(br backendResource, format, target, val0
 	}
 	view, err := c.b.d.NewSamplerView(r.tex, vkgl.DecodeViewDesc(format, target, val0, val1, swizzle))
 	if err != nil {
+		log.Printf("virgl: a sampler view: %v", err)
 		return nil
 	}
 	r.incRef()
@@ -1131,7 +1135,8 @@ func (c *vkglContext) launchGrid(d []uint32, indirect backendResource) error {
 	}
 	// Of a shader of a fixed block, as OpenGL's are, which Gallium's
 	// block of the launch is of.
-	res, err := cs.s.Translate(tospirv.Options{SharedMemory: int(cs.sharedMem), WorkgroupFences: c.b.d.WorkgroupFences()})
+	res, err := cs.s.Translate(tospirv.Options{SharedMemory: int(cs.sharedMem), WorkgroupFences: c.b.d.WorkgroupFences(),
+		FloatImageAtomics: c.b.d.FloatImageAtomics()})
 	if err != nil {
 		return fmt.Errorf("the compute shader: %w", err)
 	}
@@ -1465,14 +1470,22 @@ func (c *vkglContext) draw(d []uint32, a drawArgs) error {
 	}
 	colors, depthFormat, hasDepth, hasStencil, colorTypes := c.formats()
 
+	// The vertex elements' formats as the device fetches them, and the
+	// shader's conversions of those that it fetches not.
 	var vsOpts, fsOpts tospirv.Options
-	for i := range ve.elements {
+	fetchFormats := make([]uint32, len(ve.elements))
+	for i, e := range ve.elements {
 		switch {
 		case vs.sint&(1<<i) != 0:
 			vsOpts.InputTypes[i] = tospirv.Int
 		case vs.uint&(1<<i) != 0:
 			vsOpts.InputTypes[i] = tospirv.Uint
 		}
+		vk, fetch, ok := c.b.d.VertexFetch(e.VirglFormat)
+		if !ok {
+			return fmt.Errorf("vertex elements of format %d: %w", e.VirglFormat, errVkgl)
+		}
+		fetchFormats[i], vsOpts.VertexFetches[i] = vk, fetch
 	}
 	if !c.rast.PointSizePerVertex {
 		vsOpts.PointSize = c.rast.PointSize
@@ -1485,8 +1498,8 @@ func (c *vkglContext) draw(d []uint32, a drawArgs) error {
 	vsOpts.ClipDisable = uint8(^c.rast.ClipPlaneEnable)
 	vsOpts.StreamOutput = vs.so
 	vsOpts.GLClipZ = !c.rast.ClipHalfZ
-	vsOpts.WorkgroupFences = c.b.d.WorkgroupFences()
-	fsOpts.WorkgroupFences = vsOpts.WorkgroupFences
+	vsOpts.WorkgroupFences, vsOpts.FloatImageAtomics = c.b.d.WorkgroupFences(), c.b.d.FloatImageAtomics()
+	fsOpts.WorkgroupFences, fsOpts.FloatImageAtomics = vsOpts.WorkgroupFences, vsOpts.FloatImageAtomics
 	fsOpts.ColorBuffers = len(colors)
 	fsOpts.ColorTypes = colorTypes
 	fsOpts.FlatShade, fsOpts.TwoSided = c.rast.FlatShade, c.rast.LightTwoSide
@@ -1513,16 +1526,38 @@ func (c *vkglContext) draw(d []uint32, a drawArgs) error {
 		vkgl.Link(vsRes, fsRes)
 	}
 
+	// A binding of each element, of its vertex buffer, or of a realigned
+	// copy of the vertices that the draw fetches of it, of an address or
+	// a stride that the device fetches not.
 	var bindings []vkgl.VertexBinding
 	var inputs []vkgl.VertexInput
+	vbufs := make([]*vkgl.Buffer, len(ve.elements))
+	voffs := make([]uint64, len(ve.elements))
 	for i, e := range ve.elements {
+		if int(e.Buffer) >= len(c.vbs) || c.vbs[e.Buffer].res == nil || c.vbs[e.Buffer].res.buf == nil {
+			return nil
+		}
+		vb := c.vbs[e.Buffer]
+		if err := c.use(&vb.res.vkglRef); err != nil {
+			return err
+		}
 		stride := uint32(0)
 		if int(e.Buffer) < len(ve.strides) {
 			stride = ve.strides[e.Buffer]
 		}
+		buf, offset, elementOffset := vb.res.buf, uint64(vb.offset), e.Offset
+		if address := offset + uint64(e.Offset); !c.b.d.VertexAligned(address, stride) {
+			first, count := vertexRange(d, a, e.InstanceDivisor, buf.Size(), address, stride)
+			var err error
+			if buf, stride, err = c.ctx.RealignVertices(buf, address, stride, vkgl.VertexElementSize(e.VirglFormat), first, count); err != nil {
+				return err
+			}
+			offset, elementOffset = 0, 0
+		}
+		vbufs[i], voffs[i] = buf, offset
 		bindings = append(bindings, vkgl.VertexBinding{Binding: uint32(i), Stride: stride, Instance: e.InstanceDivisor != 0,
 			Divisor: e.InstanceDivisor})
-		inputs = append(inputs, vkgl.VertexInput{Location: uint32(i), Binding: uint32(i), Format: e.Format.VK, Offset: e.Offset})
+		inputs = append(inputs, vkgl.VertexInput{Location: uint32(i), Binding: uint32(i), Format: fetchFormats[i], Offset: elementOffset})
 	}
 	var resources []vkgl.StageResource
 	for _, sr := range []struct {
@@ -1555,18 +1590,6 @@ func (c *vkglContext) draw(d []uint32, a drawArgs) error {
 	}
 	if err := c.stageBindings(tgsi.ProcessorFragment, stageFragment, fsRes, &b); err != nil {
 		return err
-	}
-	vbufs := make([]*vkgl.Buffer, len(ve.elements))
-	voffs := make([]uint64, len(ve.elements))
-	for i, e := range ve.elements {
-		if int(e.Buffer) >= len(c.vbs) || c.vbs[e.Buffer].res == nil || c.vbs[e.Buffer].res.buf == nil {
-			return nil
-		}
-		vb := c.vbs[e.Buffer]
-		if err := c.use(&vb.res.vkglRef); err != nil {
-			return err
-		}
-		vbufs[i], voffs[i] = vb.res.buf, uint64(vb.offset)
 	}
 	width, height, _ := c.area()
 	if width == 0 || height == 0 {
@@ -1830,7 +1853,14 @@ func (c *vkglContext) imageBinding(stage tgsi.Processor, virgl uint32, r tospirv
 	}
 	if slot < maxShaderImages {
 		if img := c.images[virgl][slot]; img != nil {
-			v, err := img.view(target)
+			// The view is of the format that the shader declares, as
+			// OpenGL's image units' formats are, or of the binding's if
+			// it declares none.
+			format := img.format
+			if declared, ok := vkgl.FormatByName(r.Format); ok {
+				format = declared
+			}
+			v, err := img.view(target, format)
 			if err == nil {
 				if err := c.use(&img.vkglRef); err != nil {
 					return ib, err
@@ -1838,12 +1868,9 @@ func (c *vkglContext) imageBinding(stage tgsi.Processor, virgl uint32, r tospirv
 				ib.View = v
 				return ib, nil
 			}
-			if !img.refused[target] {
-				log.Printf("virgl: an image of zeros in place of %v: %v", r.Target, err)
-				if img.refused == nil {
-					img.refused = make(map[uint32]bool)
-				}
-				img.refused[target] = true
+			if !c.loggedZeros {
+				log.Printf("virgl: images of zeros in place of %v, and others: %v", r.Target, err)
+				c.loggedZeros = true
 			}
 		}
 	}
@@ -1896,4 +1923,32 @@ func (c *vkglContext) dummyImage(target uint32, r tospirv.Resource) (*vkgl.Image
 	}
 	c.dummies[key] = vkglDummyImage{tex: tex, view: view}
 	return view, nil
+}
+
+// vertexRange returns the vertices that the draw d of a fetches of an
+// element's vertex buffer of size bytes, from address, of stride bytes
+// each, of the element's instance divisor: the draw's vertices, its
+// instances, or its indexes' bounds; or, of an indirect draw or of indexes
+// of no bounds, all that the buffer has; of vkgl.MaxRealigned at most.
+func vertexRange(d []uint32, a drawArgs, divisor uint32, size, address uint64, stride uint32) (first, count uint32) {
+	defer func() { count = min(count, vkgl.MaxRealigned) }()
+	all := func() (uint32, uint32) {
+		if stride == 0 || address >= size {
+			return 0, 1
+		}
+		return 0, uint32(min((size-address)/uint64(stride)+1, vkgl.MaxRealigned))
+	}
+	switch {
+	case a.indirect != nil:
+		return all()
+	case divisor != 0:
+		return d[drawStartInstance], (max(d[drawInstances], 1) + divisor - 1) / divisor
+	case d[drawIndexed] == 0:
+		return d[drawStart], d[drawCount]
+	}
+	lo, hi, bias := d[drawMinIndex], d[drawMaxIndex], int64(int32(d[drawIndexBias]))
+	if hi == ^uint32(0) || lo > hi || int64(lo)+bias < 0 || int64(hi)+bias > int64(^uint32(0)) {
+		return all()
+	}
+	return uint32(int64(lo) + bias), hi - lo + 1
 }

@@ -34,9 +34,17 @@ func (t *Texture) CheckSurface(format, level, first, last uint32) error {
 	if !ok || !formatViewOK(t.Format, f) || level > t.Desc.LastLevel || first > last {
 		return bad()
 	}
-	// Vulkan views no 3D image's slices as layers, but of images that
-	// their creation let.
-	if t.Desc.Target == Target3D || last >= t.Desc.ArraySize {
+	// A 3D texture's slices are its layers, which Vulkan views of images
+	// that their creation let.
+	layers := t.Desc.ArraySize
+	if t.Desc.Target == Target3D {
+		if !t.slices2D {
+			return bad()
+		}
+		_, _, depth := t.Desc.levelExtent(level)
+		layers = uint32(depth)
+	}
+	if last >= layers {
 		return bad()
 	}
 	return nil

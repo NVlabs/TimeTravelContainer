@@ -209,7 +209,7 @@ func (d *Device) newView(t *Texture, desc ViewDesc, f Format, aspects, usage uin
 		BaseArrayLayer: desc.FirstLayer,
 		LayerCount:     desc.LastLayer - desc.FirstLayer + 1,
 	}
-	if t.Desc.Target == Target3D {
+	if t.Desc.Target == Target3D && desc.Target == Target3D {
 		info.SubresourceRange.BaseArrayLayer, info.SubresourceRange.LayerCount = 0, 1
 	}
 	if desc.Target == TargetCube {
@@ -254,7 +254,16 @@ type ImageView struct {
 // of storage.
 func (d *Device) NewImageView(t *Texture, desc ViewDesc) (*ImageView, error) {
 	desc.Swizzle = [4]uint32{SwizzleX, SwizzleY, SwizzleZ, SwizzleW}
-	if err := desc.check(t); err != nil {
+	if t.Desc.Target == Target3D && desc.Target == Target2D {
+		// A slice of a 3D texture, as a 2D image, of a texture whose
+		// creation let.
+		_, _, depth := t.Desc.levelExtent(desc.FirstLevel)
+		f, ok := LookupFormat(desc.Format)
+		if !t.slices2DImages || !ok || !formatViewOK(t.Format, f) || desc.FirstLevel > t.Desc.LastLevel ||
+			desc.FirstLayer != desc.LastLayer || int64(desc.FirstLayer) >= depth {
+			return nil, fmt.Errorf("an image view %+v of %+v", desc, t.Desc)
+		}
+	} else if err := desc.check(t); err != nil {
 		return nil, err
 	}
 	f, _ := d.LookupFormat(desc.Format)

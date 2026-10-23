@@ -573,6 +573,228 @@ DCL OUT[0], COLOR
 	}
 }
 
+// TestVertexFormats draws the triangle in green of colors of vertex
+// formats that Vulkan, or the device, fetches not, which Mesa's virgl
+// driver sends of OpenGL's vertex attributes as it offers them all:
+// 32-bit normalized and scaled channels, packed channels of 10, 10, 10 and
+// 2 bits, scaled, and 8-bit scaled channels.
+func TestVertexFormats(t *testing.T) {
+	f := newFixture(t)
+	const (
+		formatR32G32B32A32Unorm = 35
+		formatR32G32B32Uscaled  = 38
+		formatR32G32B32A32Snorm = 43
+		formatR10G10B10A2Uscale = 123
+		formatR10G10B10A2Snorm  = 173
+		formatR8G8B8A8Uscaled   = 72
+	)
+	u32s := func(ws ...uint32) []byte {
+		var b []byte
+		for _, w := range ws {
+			b = binary.LittleEndian.AppendUint32(b, w)
+		}
+		return b
+	}
+	for _, tc := range []struct {
+		name   string
+		format uint32
+		color  []byte
+	}{
+		{"R32G32B32A32_UNORM", formatR32G32B32A32Unorm, u32s(0, 0xffffffff, 0, 0xffffffff)},
+		{"R32G32B32_USCALED", formatR32G32B32Uscaled, u32s(0, 1, 0)},
+		{"R32G32B32A32_SNORM", formatR32G32B32A32Snorm, u32s(0, 0x7fffffff, 0, 0x7fffffff)},
+		{"R10G10B10A2_USCALED", formatR10G10B10A2Uscale, u32s(1<<10 | 1<<30)},
+		{"R10G10B10A2_SNORM", formatR10G10B10A2Snorm, u32s(511<<10 | 1<<30)},
+		{"R8G8B8A8_USCALED", formatR8G8B8A8Uscaled, []byte{0, 1, 0, 1}},
+	} {
+		colors := f.buffer(t, append(tc.color, make([]byte, 16-len(tc.color))...))
+		var s stream
+		f.setup(&s)
+		clearRed(&s)
+		vs, fs, ve := f.id(), f.id(), f.id()
+		s.shader(vs, stageVertex, `VERT
+DCL IN[0]
+DCL IN[1]
+DCL OUT[0], POSITION
+DCL OUT[1], GENERIC[0]
+  0: MOV OUT[0], IN[0]
+  1: MOV OUT[1], IN[1]
+  2: END
+`, 1<<16)
+		s.shader(fs, stageFragment, `FRAG
+DCL IN[0], GENERIC[0], PERSPECTIVE
+DCL OUT[0], COLOR
+  0: MOV OUT[0], IN[0]
+  1: END
+`, 1<<16)
+		s.cmd(cmdBindShader, 0, vs, stageVertex)
+		s.cmd(cmdBindShader, 0, fs, stageFragment)
+		// The color of vertex buffer 1, of a stride of 0: each vertex's.
+		s.cmd(cmdCreateObject, objectVertexElements, ve, 0, 0, 0, formatR32G32B32A32Float, 0, 0, 1, tc.format)
+		s.cmd(cmdBindObject, objectVertexElements, ve)
+		s.cmd(cmdSetVertexBuffers, 0, 16, 0, f.vb.ID(), 0, 0, colors.ID())
+		drawTriangle(&s)
+		f.submit(t, s)
+		f.finish(t)
+		if p := f.pixel(4, height/2); p != green {
+			t.Errorf("%s: inside the triangle: %v, want %v", tc.name, p, green)
+		}
+	}
+}
+
+// TestUnalignedVertices draws the triangle of positions of bytes at an
+// offset of no multiple of 4, as OpenGL's vertex attributes may be, of the
+// vertex buffer's offset and of the element's: Metal fetches vertex
+// buffers of offsets of multiples of 4 alone.
+func TestUnalignedVertices(t *testing.T) {
+	f := newFixture(t)
+	const formatR8G8B8A8Snorm = 77
+	// The fixture's triangle, of normalized bytes, after a byte.
+	posMem := []byte{0xaa, 0x81, 0x81, 0, 127, 0, 0x81, 0, 127, 0x81, 127, 0, 127}
+	pos, aligned := f.buffer(t, posMem), f.buffer(t, posMem[1:])
+	for _, tc := range []struct {
+		name           string
+		vb             *Resource
+		vbOffset, eOff uint32
+	}{{"aligned", aligned, 0, 0}, {"of the buffer's offset", pos, 1, 0}, {"of the element's", pos, 0, 1}} {
+		var s stream
+		f.setup(&s)
+		clearRed(&s)
+		ve := f.id()
+		s.cmd(cmdCreateObject, objectVertexElements, ve, tc.eOff, 0, 0, formatR8G8B8A8Snorm)
+		s.cmd(cmdBindObject, objectVertexElements, ve)
+		s.cmd(cmdSetVertexBuffers, 0, 4, tc.vbOffset, tc.vb.ID())
+		drawTriangle(&s)
+		f.submit(t, s)
+		f.finish(t)
+		if p := f.pixel(4, height/2); p != green {
+			t.Errorf("%s: inside the triangle: %v, want %v", tc.name, p, green)
+		}
+		if p := f.pixel(width-4, height/2); p != red {
+			t.Errorf("%s: outside the triangle: %v, want %v", tc.name, p, red)
+		}
+	}
+}
+
+// TestFanOfOffset draws the triangle of a triangle fan of a vertex buffer
+// of an offset, as Mesa's state tracker draws quads of uploads.
+func TestFanOfOffset(t *testing.T) {
+	f := newFixture(t)
+	vbMem := append(make([]byte, 144), f.vbMem...)
+	vb := f.buffer(t, vbMem)
+	for _, mode := range []uint32{primTriangles, primTriangleFan} {
+		var s stream
+		f.setup(&s)
+		clearRed(&s)
+		s.cmd(cmdSetVertexBuffers, 0, 16, 144, vb.ID())
+		s.cmd(cmdDrawVBO, 0, 0, 3, mode, 0, 1, 0, 0, 0, 0, 0, 0xffffffff, 0)
+		f.submit(t, s)
+		f.finish(t)
+		if p := f.pixel(4, height/2); p != green {
+			t.Errorf("mode %d: inside the triangle: %v, want %v", mode, p, green)
+		}
+	}
+}
+
+// TestStencilCellsAndSample replaces the stencil of a framebuffer's depth
+// and stencil texture of quads of references of their own, of triangle
+// fans, as Mesa's state tracker clears scissored stencils, and samples it,
+// of a view of the stencil alone, in one submission, as dEQP's stencil
+// texturing does. The quads wind either way: the one-sided test of back
+// faces uses the front's reference, the one Mesa's clears set.
+func TestStencilCellsAndSample(t *testing.T) {
+	f := newFixture(t)
+	const (
+		formatZ24S8      = 19
+		formatR32Uint    = 193
+		formatX24S8      = 136
+		bindDepthStencil = 1 << 0
+	)
+	zs, err := NewResource(f.id(), ResourceArgs{Target: target2D, Format: formatZ24S8, Bind: bindDepthStencil | bindSamplerView,
+		Width: width, Height: height, Depth: 1, ArraySize: 1}, make([]byte, width*height*4), nil)
+	if err != nil {
+		t.Fatalf("NewResource: %v", err)
+	}
+	defer zs.DecRef()
+	f.c.Attach(zs)
+	colorMem := make([]byte, width*height*4)
+	color, err := NewResource(f.id(), ResourceArgs{Target: target2D, Format: formatR32Uint, Bind: bindRenderTarget,
+		Width: width, Height: height, Depth: 1, ArraySize: 1}, colorMem, nil)
+	if err != nil {
+		t.Fatalf("NewResource: %v", err)
+	}
+	defer color.DecRef()
+	f.c.Attach(color)
+	// Two quads, of the left half and of the right, of fans of 4 vertices
+	// each, after 144 bytes; the right one's of the winding of Mesa's.
+	var quads []byte
+	for _, v := range []float32{-1, -1, 0, 1, 0, -1, 0, 1, 0, 1, 0, 1, -1, 1, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 1, -1, 0, 1, 0, -1, 0, 1} {
+		quads = binary.LittleEndian.AppendUint32(quads, math.Float32bits(v))
+	}
+	vb := f.buffer(t, append(make([]byte, 144), quads...))
+	ib := f.buffer(t, []byte{0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7})
+	var s stream
+	f.setup(&s)
+	csurf, zsurf, dsa, blend := f.id(), f.id(), f.id(), f.id()
+	s.cmd(cmdCreateObject, objectSurface, csurf, color.ID(), formatR32Uint, 0, 0)
+	s.cmd(cmdCreateObject, objectSurface, zsurf, zs.ID(), formatZ24S8, 0, 0)
+	s.cmd(cmdSetFramebufferState, 0, 1, zsurf, csurf)
+	s.cmd(cmdSetFramebufferNoAttach, 0, width|height<<16, 0)
+	s.cmd(cmdCreateObject, objectBlend, blend, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+	s.cmd(cmdBindObject, objectBlend, blend)
+	s.cmd(cmdCreateObject, objectDSA, dsa, 0, 536865071, 0, 0)
+	s.cmd(cmdBindObject, objectDSA, dsa)
+	// Of a back reference of 0, as Mesa's clears leave it.
+	for i, ref := range []uint32{157, 65} {
+		s.cmd(cmdSetStencilRef, 0, ref)
+		s.cmd(cmdSetVertexBuffers, 0, 16, uint32(144+64*i), vb.ID())
+		s.cmd(cmdDrawVBO, 0, 0, 4, primTriangleFan, 0, 1, 0, 0, 0, 0, 0, 3, 0)
+	}
+	// The stencil, sampled to the color.
+	fs, view, samp, blend2, dsa2 := f.id(), f.id(), f.id(), f.id(), f.id()
+	s.cmd(cmdDestroyObject, objectSurface, zsurf)
+	s.cmd(cmdSetFramebufferState, 0, 1, 0, csurf)
+	s.cmd(cmdSetFramebufferNoAttach, 0, width|height<<16, 0)
+	s.cmd(cmdCreateObject, objectBlend, blend2, 4, 0, 0xf<<27, 0, 0, 0, 0, 0, 0, 0)
+	s.cmd(cmdBindObject, objectBlend, blend2)
+	s.cmd(cmdCreateObject, objectDSA, dsa2, 0, 0, 0, 0)
+	s.cmd(cmdBindObject, objectDSA, dsa2)
+	s.shader(fs, stageFragment, `FRAG
+DCL IN[0], POSITION, LINEAR
+DCL OUT[0], COLOR
+DCL SAMP[0]
+DCL SVIEW[0], 2D, UINT
+DCL TEMP[0..1]
+IMM[0] UINT32 {0, 0, 0, 0}
+  0: F2I TEMP[0].xy, IN[0].xyyy
+  1: MOV TEMP[0].zw, IMM[0].xxxx
+  2: TXF TEMP[1], TEMP[0], SAMP[0], 2D
+  3: MOV OUT[0], TEMP[1]
+  4: END
+`, 1<<16)
+	s.cmd(cmdBindShader, 0, fs, stageFragment)
+	const swizzle = 0 | 4<<3 | 4<<6 | 5<<9
+	s.cmd(cmdCreateObject, objectSamplerView, view, zs.ID(), formatX24S8|target2D<<24, 0, 0, swizzle)
+	s.cmd(cmdCreateObject, objectSamplerState, samp, 0, 0, 0, 0, 0, 0, 0, 0)
+	s.cmd(cmdSetSamplerViews, 0, stageFragment, 0, view)
+	s.cmd(cmdBindSamplerStates, 0, stageFragment, 0, samp)
+	s.cmd(cmdSetVertexBuffers, 0, 16, 144, vb.ID())
+	// Of indexes of a byte, as dEQP draws them.
+	s.cmd(cmdSetIndexBuffer, 0, ib.ID(), 1, 0)
+	s.cmd(cmdDrawVBO, 0, 0, 12, primTriangles, 1, 1, 0, 0, 0, 0, 0, 0xffffffff, 0)
+	f.submit(t, s)
+	f.c.Flush().Wait()
+	if err := f.c.Transfer(color, TransferArgs{W: width, H: height, D: 1}); err != nil {
+		t.Fatalf("Transfer: %v", err)
+	}
+	if v := binary.LittleEndian.Uint32(colorMem[(height/2*width+4)*4:]); v != 157 {
+		t.Errorf("the stencil sampled of the left quad: %d, want 157", v)
+	}
+	if v := binary.LittleEndian.Uint32(colorMem[(height/2*width+width-4)*4:]); v != 65 {
+		t.Errorf("the stencil sampled of the right quad: %d, want 65", v)
+	}
+}
+
 // TestTransformFeedback captures a triangle's positions, which MoltenVK
 // cannot, appends a second capture, pauses, and draws what it captured.
 func TestTransformFeedback(t *testing.T) {
