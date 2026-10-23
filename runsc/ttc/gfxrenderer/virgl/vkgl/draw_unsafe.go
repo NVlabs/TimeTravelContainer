@@ -98,6 +98,19 @@ func (d *Device) NewPipeline(desc PipelineDesc) (*Pipeline, error) {
 	if desc.Rasterizer == nil || desc.DSA == nil || desc.Blend == nil {
 		return nil, fmt.Errorf("a pipeline of no rasterizer, depth-stencil-alpha or blend state")
 	}
+	// Of vertex input of the device's limits, which guests' drivers keep
+	// to, as the caps give them, but guests need not.
+	l := &d.props.Limits
+	for _, b := range desc.Bindings {
+		if b.Binding >= l.MaxVertexInputBindings || b.Stride > l.MaxVertexInputBindingStride {
+			return nil, fmt.Errorf("a vertex binding %+v of %s", b, d.Name)
+		}
+	}
+	for _, in := range desc.Inputs {
+		if in.Location >= l.MaxVertexInputAttributes || in.Offset > l.MaxVertexInputAttributeOffset {
+			return nil, fmt.Errorf("a vertex input %+v of %s", in, d.Name)
+		}
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	a := d.a

@@ -8,6 +8,7 @@ package vkgl
 import (
 	"bytes"
 	"encoding/binary"
+	"strings"
 	"testing"
 )
 
@@ -157,4 +158,38 @@ func TestWidenIndexes(t *testing.T) {
 		}
 	}
 	c.Flush().Wait()
+}
+
+// TestVertexLimits refuses pipelines of vertex input past the device's
+// limits, which guests' drivers keep to, as the caps give them, but guests
+// need not.
+func TestVertexLimits(t *testing.T) {
+	d := newTestDevice(t)
+	l := &d.props.Limits
+	t.Logf("%d bindings of strides of %d, %d attributes of offsets of %d", l.MaxVertexInputBindings,
+		l.MaxVertexInputBindingStride, l.MaxVertexInputAttributes, l.MaxVertexInputAttributeOffset)
+	for _, tc := range []struct {
+		name   string
+		limit  uint32
+		desc   PipelineDesc
+		wantIn string
+	}{
+		{"a binding", l.MaxVertexInputBindings, PipelineDesc{Bindings: []VertexBinding{{Binding: l.MaxVertexInputBindings}}}, "a vertex binding"},
+		{"a stride", l.MaxVertexInputBindingStride, PipelineDesc{Bindings: []VertexBinding{{Stride: l.MaxVertexInputBindingStride + 4}}}, "a vertex binding"},
+		{"a location", l.MaxVertexInputAttributes, PipelineDesc{Inputs: []VertexInput{{Location: l.MaxVertexInputAttributes}}}, "a vertex input"},
+		{"an offset", l.MaxVertexInputAttributeOffset, PipelineDesc{Inputs: []VertexInput{{Offset: l.MaxVertexInputAttributeOffset + 4}}}, "a vertex input"},
+	} {
+		if tc.limit > ^uint32(0)-4 {
+			// Of no value past the limit.
+			continue
+		}
+		tc.desc.Rasterizer, tc.desc.DSA, tc.desc.Blend = &Rasterizer{}, &DSA{}, &Blend{}
+		p, err := d.NewPipeline(tc.desc)
+		if err == nil {
+			d.DestroyPipeline(p)
+		}
+		if err == nil || !strings.Contains(err.Error(), tc.wantIn) {
+			t.Errorf("%s past the device's limit: %v, want an error of %q", tc.name, err, tc.wantIn)
+		}
+	}
 }
