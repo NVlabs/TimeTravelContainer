@@ -156,6 +156,16 @@ func spanOK(x, n, size int64) bool {
 	return x >= 0 && end <= size
 }
 
+// layersOK reports whether b's layers, or slices, are of level of d, of
+// rows and columns of any.
+func (d ResourceDesc) layersOK(level uint32, b Box) bool {
+	if level > d.LastLevel {
+		return false
+	}
+	_, _, depth := d.levelExtent(level)
+	return spanOK(b.Z, b.Depth, depth)
+}
+
 // boxOK reports whether b is of level of d.
 func (d ResourceDesc) boxOK(level uint32, b Box) bool {
 	if level > d.LastLevel {

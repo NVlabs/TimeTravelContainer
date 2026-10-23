@@ -49,13 +49,16 @@ type Blit struct {
 var ErrNotNative = errors.New("a blit that the device does not do")
 
 // check returns an error unless b is a blit, as the decoder's pipe.c
-// checks virgl's.
+// checks virgl's: of a source's box of the source, and a destination's of
+// its layers, but of rows and columns past its edges, as Gallium's may be,
+// which Mesa's state tracker keeps of scaled blits that it clips, of their
+// scissors.
 func (b *Blit) check() error {
 	bad := func() error { return fmt.Errorf("a blit %+v", *b) }
 	df, dok := LookupFormat(b.DstFormat)
 	sf, sok := LookupFormat(b.SrcFormat)
 	if !dok || !sok || !formatViewOK(b.Dst.Format, df) || !formatViewOK(b.Src.Format, sf) ||
-		!b.Dst.Desc.boxOK(b.DstLevel, b.DstBox) || !b.Src.Desc.boxOK(b.SrcLevel, b.SrcBox) {
+		!b.Dst.Desc.layersOK(b.DstLevel, b.DstBox) || !b.Src.Desc.boxOK(b.SrcLevel, b.SrcBox) {
 		return bad()
 	}
 	zs, color := b.Mask&(MaskZ|MaskS) != 0, b.Mask&MaskRGBA != 0
@@ -109,7 +112,8 @@ func (c *Context) Blit(b Blit) error {
 // nativeBlit blits b, a checked blit of a box of texels, of Vulkan's blits,
 // resolves or copies, or returns ErrNotNative of blits that they do not do.
 func (c *Context) nativeBlit(b Blit) error {
-	if b.Scissor != nil {
+	// Of a destination's box within it, of no scissor.
+	if b.Scissor != nil || !b.Dst.Desc.boxOK(b.DstLevel, b.DstBox) {
 		return ErrNotNative
 	}
 	d := c.d

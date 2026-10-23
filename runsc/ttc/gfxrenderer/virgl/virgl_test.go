@@ -321,6 +321,43 @@ IMM[0] FLT32 {0x00000000, 0x3f800000, 0x00000000, 0x00000000}
 	}
 }
 
+// TestBlitPastTheEdges blits a texture, scaled, to a box past every edge
+// of the render target, of a scissor of its left half, as Mesa's state
+// tracker clips scaled blits: the scissor clips the blit.
+func TestBlitPastTheEdges(t *testing.T) {
+	f := newFixture(t)
+	const scissorEnable = 1 << 10
+	mem := bytes.Repeat(green[:], 4*4)
+	src, err := NewResource(f.id(), ResourceArgs{Target: target2D, Format: formatR8G8B8A8Unorm, Bind: bindSamplerView,
+		Width: 4, Height: 4, Depth: 1, ArraySize: 1}, mem, nil)
+	if err != nil {
+		t.Fatalf("NewResource: %v", err)
+	}
+	defer src.DecRef()
+	f.c.Attach(src)
+	if err := f.c.Transfer(src, TransferArgs{ToHost: true, W: 4, H: 4, D: 1}); err != nil {
+		t.Fatalf("Transfer: %v", err)
+	}
+	edge := int32(-16)
+	var s stream
+	f.setup(&s)
+	clearRed(&s)
+	s.cmd(cmdBlit, 0, 0xf|scissorEnable, 0, width/2|height<<16, f.rt.ID(), 0, formatR8G8B8A8Unorm,
+		uint32(edge), uint32(edge), 0, width+32, height+32, 1, src.ID(), 0, formatR8G8B8A8Unorm, 0, 0, 0, 4, 4, 1)
+	f.submit(t, s)
+	f.finish(t)
+	for _, tc := range []struct {
+		x    int
+		want [4]byte
+	}{{0, green}, {width/2 - 1, green}, {width / 2, red}, {width - 1, red}} {
+		for _, y := range []int{0, height - 1} {
+			if p := f.pixel(tc.x, y); p != tc.want {
+				t.Errorf("at (%d, %d): %v, want %v", tc.x, y, p, tc.want)
+			}
+		}
+	}
+}
+
 // TestOneSidedStencilReference replaces the stencil of triangles of either
 // winding, of a one-sided stencil test of a back face's reference of 0, as
 // Mesa's state tracker clears scissored stencils of quads, and draws where
@@ -1570,8 +1607,8 @@ func TestInvalidCommands(t *testing.T) {
 		{"truncated", func(s *stream) { *s = append(*s, cmdClear|8<<16, 0) }},
 		{"unknown command", func(s *stream) { s.cmd(200, 0) }},
 		{"unknown resource", func(s *stream) { s.cmd(cmdCreateObject, objectSurface, 7, 999, formatR8G8B8A8Unorm, 0, 0) }},
-		{"blit beyond the target", func(s *stream) {
-			s.cmd(cmdBlit, 0, 0xf, 0, 0, f.rt.ID(), 0, formatR8G8B8A8Unorm, 0, 0, 0, width+1, height, 1,
+		{"blit of layers beyond the target", func(s *stream) {
+			s.cmd(cmdBlit, 0, 0xf, 0, 0, f.rt.ID(), 0, formatR8G8B8A8Unorm, 0, 0, 0, width, height, 2,
 				f.rt.ID(), 0, formatR8G8B8A8Unorm, 0, 0, 0, width, height, 1)
 		}},
 		{"transfer beyond the memory", func(s *stream) {
