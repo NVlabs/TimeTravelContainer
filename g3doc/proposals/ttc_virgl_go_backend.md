@@ -103,8 +103,12 @@ without translating again.
 
 The translator matches Zink's semantics where TGSI leaves a choice, as
 `tgsi_to_nir` makes it: modifiers by `tgsi_opcode_infer_src_type`,
-saturation of every result as floats, `MOD` as a signed remainder, shift
-counts masked, and indexes clamped to their arrays, as robust drivers read.
+saturation of every result as floats, shift counts masked, and indexes
+clamped to their arrays, as robust drivers read. `MOD` is NIR's `imod`, of
+which guests' `nir_to_tgsi` prints it, floored, of the divisor's sign, on
+every device: Vulkan leaves `OpSMod` and `OpSRem` of a negative operand
+undefined, NVIDIA's takes the operands as unsigned, and `tgsi_to_nir` gave
+Zink `umod`.
 
 ## The state tracker
 

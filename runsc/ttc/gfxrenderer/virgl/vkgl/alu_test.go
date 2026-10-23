@@ -125,7 +125,10 @@ func aluCases() []aluCase {
 		{"UMUL_HI TEMP[3], TEMP[0], TEMP[1]", [3][4]uint32{ia, ib}, uv(0, 2, 1<<30-1, 32), 0},
 		{"IDIV TEMP[3], TEMP[0], TEMP[1]", [3][4]uint32{ia, ib}, iv(3, -3, -(1 << 28), 0), 0},
 		{"UDIV TEMP[3], TEMP[0], TEMP[1]", [3][4]uint32{ia, ib}, uv(3, 0xfffffff7/3, 0, allOnes/33), 0},
-		{"MOD TEMP[3], TEMP[0], TEMP[1]", [3][4]uint32{ia, ib}, iv(1, 0, 0, -1), 0},
+		// NIR's imod, of the divisor's sign.
+		{"MOD TEMP[3], TEMP[0], TEMP[1]", [3][4]uint32{ia, ib}, iv(1, 0, 0, 32), 0},
+		{"MOD TEMP[3], TEMP[0], TEMP[1]", [3][4]uint32{iv(-7, 7, -7, math.MinInt32), iv(2, -2, -2, 3)}, iv(1, -1, -1, 1), 0},
+		{"MOD TEMP[3], TEMP[0], TEMP[1]", [3][4]uint32{iv(5, -5, 0, 9), iv(math.MinInt32, math.MinInt32, -3, -9)}, iv(-2147483643, -5, 0, 0), 0},
 		{"UMOD TEMP[3], TEMP[0], TEMP[1]", [3][4]uint32{ia, ib}, uv(1, 0xfffffff7%3, 1<<30, allOnes%33), 0},
 		{"AND TEMP[3], TEMP[0], TEMP[1]", [3][4]uint32{ia, ib}, iv(2, 3&-9, 1<<30, 33), 0},
 		{"OR TEMP[3], TEMP[0], TEMP[1]", [3][4]uint32{ia, ib}, iv(7, -9|3, -4, -1), 0},

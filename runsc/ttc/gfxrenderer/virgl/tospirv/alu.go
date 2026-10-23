@@ -35,7 +35,6 @@ var (
 		tgsi.OpUMUL: {spirv.OpIMul, Uint},
 		tgsi.OpIDIV: {spirv.OpSDiv, Int},
 		tgsi.OpUDIV: {spirv.OpUDiv, Uint},
-		tgsi.OpMOD:  {spirv.OpSRem, Int},
 		tgsi.OpUMOD: {spirv.OpUMod, Uint},
 		tgsi.OpAND:  {spirv.OpBitwiseAnd, Uint},
 		tgsi.OpOR:   {spirv.OpBitwiseOr, Uint},
@@ -176,6 +175,8 @@ func (t *translator) instruction(inst *tgsi.Instruction) bool {
 		t.dst(inst, 0, Int, t.f.Op(spirv.OpConvertFToS, t.tVec4I, uint32(t.src(inst, 0, Float))))
 	case tgsi.OpF2U:
 		t.dst(inst, 0, Uint, t.f.Op(spirv.OpConvertFToU, t.tVec4U, uint32(t.src(inst, 0, Float))))
+	case tgsi.OpMOD:
+		t.mod(inst)
 	case tgsi.OpINEG:
 		t.dst(inst, 0, Int, t.f.Op(spirv.OpSNegate, t.tVec4I, uint32(t.src(inst, 0, Int))))
 	case tgsi.OpIABS:
@@ -294,6 +295,29 @@ func (t *translator) shift(inst *tgsi.Instruction) {
 	mask := t.m.ConstantComposite(t.tVec4U, n31, n31, n31, n31)
 	count := t.f.Op(spirv.OpBitwiseAnd, t.tVec4U, uint32(t.src(inst, 1, Uint)), uint32(mask))
 	t.dst(inst, 0, b, t.f.Op(op, t.vecType(b), uint32(t.src(inst, 0, b)), uint32(count)))
+}
+
+// mod emits MOD, NIR's imod, of which guests' nir_to_tgsi prints it: the
+// remainder of signed integers' floored division, of the divisor's sign.
+// SPIR-V's OpSMod is it, but Vulkan leaves it, as OpSRem, undefined of a
+// negative operand, and NVIDIA's takes the operands as unsigned, as Mesa's
+// tgsi_to_nir gave Zink umod: it is the unsigned remainder of the operands'
+// magnitudes, of the divisor's magnitude less it where the signs differ,
+// and of the divisor's sign.
+func (t *translator) mod(inst *tgsi.Instruction) {
+	x, y := t.src(inst, 0, Int), t.src(inst, 1, Int)
+	zero := uint32(t.m.ConstantNull(t.tVec4I))
+	ax := t.bitcast(t.tVec4U, t.tVec4I, t.glsl(t.tVec4I, spirv.GLSLstd450SAbs, x))
+	ay := t.bitcast(t.tVec4U, t.tVec4I, t.glsl(t.tVec4I, spirv.GLSLstd450SAbs, y))
+	r := t.f.Op(spirv.OpUMod, t.tVec4U, uint32(ax), uint32(ay))
+	xNeg := t.f.Op(spirv.OpSLessThan, t.tVec4B, uint32(x), zero)
+	yNeg := t.f.Op(spirv.OpSLessThan, t.tVec4B, uint32(y), zero)
+	differ := t.f.Op(spirv.OpLogicalNotEqual, t.tVec4B, uint32(xNeg), uint32(yNeg))
+	some := t.f.Op(spirv.OpINotEqual, t.tVec4B, uint32(r), uint32(t.zero4U))
+	r = t.f.Op(spirv.OpSelect, t.tVec4U, uint32(t.f.Op(spirv.OpLogicalAnd, t.tVec4B, uint32(differ), uint32(some))),
+		uint32(t.f.Op(spirv.OpISub, t.tVec4U, uint32(ay), uint32(r))), uint32(r))
+	ri := t.bitcast(t.tVec4I, t.tVec4U, r)
+	t.dst(inst, 0, Int, t.f.Op(spirv.OpSelect, t.tVec4I, uint32(yNeg), uint32(t.f.Op(spirv.OpSNegate, t.tVec4I, uint32(ri))), uint32(ri)))
 }
 
 // mulHigh emits IMUL_HI or UMUL_HI: the high 32 bits of 64-bit products.
