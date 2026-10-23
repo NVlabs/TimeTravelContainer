@@ -5,6 +5,7 @@ package tospirv
 
 import (
 	"encoding/binary"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -617,4 +618,37 @@ func TestExtraOutputs(t *testing.T) {
 	}
 	translate(t, "gs-extra-outputs", shaders["gs-layered"], Options{ExtraOutputs: extra})
 	translate(t, "tcs-extra-outputs", shaders["tcs-patch"], Options{ExtraOutputs: extra})
+}
+
+// TestSampleShading translates a fragment shader of sample shading, of
+// which it interpolates its inputs at the samples' locations, as OpenGL
+// does, but its flat ones, which it interpolates not.
+func TestSampleShading(t *testing.T) {
+	text := `FRAG
+DCL IN[0], GENERIC[0], PERSPECTIVE
+DCL IN[1], GENERIC[1], LINEAR, CENTROID
+DCL IN[2], GENERIC[2], CONSTANT
+DCL OUT[0], COLOR
+DCL TEMP[0]
+  0: ADD TEMP[0], IN[0], IN[1]
+  1: ADD OUT[0], TEMP[0], IN[2]
+  2: END
+`
+	for _, shading := range []bool{false, true} {
+		res := translate(t, fmt.Sprintf("fs-sample-shading-%v", shading), text, Options{SampleShading: shading})
+		samples := 0
+		for i := 5; i < len(res.Words); {
+			n, op := res.Words[i]>>16, spirv.Op(res.Words[i]&0xffff)
+			if n == 0 {
+				t.Fatalf("an instruction of no words at %d", i)
+			}
+			if op == spirv.OpDecorate && spirv.Decoration(res.Words[i+2]) == spirv.DecorationSample {
+				samples++
+			}
+			i += int(n)
+		}
+		if want := map[bool]int{false: 0, true: 2}[shading]; samples != want {
+			t.Errorf("of sample shading %v: %d inputs of samples' locations, want %d", shading, samples, want)
+		}
+	}
 }

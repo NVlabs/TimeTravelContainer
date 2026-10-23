@@ -317,3 +317,45 @@ func (t *translator) blockSize() (x, y, z uint32) {
 	}
 	return
 }
+
+// buffersFromZero returns s, or, of a shader whose least BUFFER that it
+// declares is not 0, a copy of it whose BUFFERs are its guest's slots,
+// from 0, as virglrenderer reads them: Mesa's virgl driver numbers the
+// buffers of shaders of other stages than compute from the least binding
+// of their blocks (nir_to_tgsi's lower_ssbo_bindings, of hosts of feature
+// checks of version 16 or later), and binds them from slot 0.
+func buffersFromZero(s *tgsi.Shader) *tgsi.Shader {
+	first := -1
+	for _, d := range s.Declarations {
+		if d.File == tgsi.FileBuffer && (first < 0 || d.First < first) {
+			first = d.First
+		}
+	}
+	if first <= 0 {
+		return s
+	}
+	c := *s
+	c.Declarations = append([]tgsi.Declaration(nil), s.Declarations...)
+	for i := range c.Declarations {
+		if d := &c.Declarations[i]; d.File == tgsi.FileBuffer {
+			d.First, d.Last = d.First-first, d.Last-first
+		}
+	}
+	c.Instructions = append([]tgsi.Instruction(nil), s.Instructions...)
+	for i := range c.Instructions {
+		inst := &c.Instructions[i]
+		inst.Dst = append([]tgsi.DstRegister(nil), inst.Dst...)
+		for j := range inst.Dst {
+			if r := &inst.Dst[j].Register; r.File == tgsi.FileBuffer {
+				r.Index -= first
+			}
+		}
+		inst.Src = append([]tgsi.SrcRegister(nil), inst.Src...)
+		for j := range inst.Src {
+			if r := &inst.Src[j].Register; r.File == tgsi.FileBuffer {
+				r.Index -= first
+			}
+		}
+	}
+	return &c
+}

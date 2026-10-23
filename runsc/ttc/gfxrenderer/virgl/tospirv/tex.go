@@ -4,6 +4,8 @@
 package tospirv
 
 import (
+	"math"
+
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/virgl/spirv"
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/virgl/tgsi"
 )
@@ -132,6 +134,14 @@ func (t *translator) sampledImage(slot int, target tgsi.TextureTarget) *sampler 
 	s.v, s.array = t.descriptorVar(SampledTexture, slot, spirv.StorageClassUniformConstant, varType, SetSamplers)
 	t.samplers[key] = s
 	t.resource(Resource{Kind: SampledTexture, Slot: slot, Target: target, Type: typ}, s.array)
+	if t.opts.BorderSlots&(1<<slot) != 0 && s.array == nil && s.tSample != 0 && !ti.ms {
+		// The slot's view, of a sampler of an opaque white border.
+		s.border = t.m.Variable(s.tPtr, spirv.StorageClassUniformConstant)
+		t.m.Decorate(s.border, spirv.DecorationDescriptorSet, SetSamplers)
+		t.m.Decorate(s.border, spirv.DecorationBinding, ResourceBinding(t.s.Processor, BorderTexture, slot))
+		s.b = t.opts.Borders[slot]
+		t.resource(Resource{Kind: BorderTexture, Slot: slot, Target: target, Type: typ}, nil)
+	}
 	return s
 }
 
@@ -292,39 +302,111 @@ func (t *translator) sample(inst *tgsi.Instruction) {
 		return
 	}
 
-	typ := t.vecType(s.typ)
-	var result spirv.ID
-	args := []uint32{uint32(img), uint32(coord)}
+	typ, spvOp := t.vecType(s.typ), spirv.OpImageSampleImplicitLod
+	if explicit {
+		spvOp = spirv.OpImageSampleExplicitLod
+	}
 	if ti.shadow {
-		args = append(args, uint32(ref))
-		spvOp := spirv.OpImageSampleDrefImplicitLod
+		typ, spvOp = t.tF32, spirv.OpImageSampleDrefImplicitLod
 		if explicit {
 			spvOp = spirv.OpImageSampleDrefExplicitLod
 		}
-		if mask != 0 {
-			args = append(args, uint32(mask))
-			args = append(args, operands...)
-		}
-		r := t.f.Op(spvOp, t.tF32, args...)
-		// GL's legacy depth texture mode's LUMINANCE: (r, r, r, 1).
-		one := t.float32Const(1)
-		result = t.f.Op(spirv.OpCompositeConstruct, t.tVec4F, uint32(r), uint32(r), uint32(r), uint32(one))
-	} else {
-		spvOp := spirv.OpImageSampleImplicitLod
-		if explicit {
-			spvOp = spirv.OpImageSampleExplicitLod
+	}
+	sampleOf := func(img spirv.ID) spirv.ID {
+		args := []uint32{uint32(img), uint32(coord)}
+		if ti.shadow {
+			args = append(args, uint32(ref))
 		}
 		if mask != 0 {
 			args = append(args, uint32(mask))
 			args = append(args, operands...)
 		}
-		result = t.f.Op(spvOp, typ, args...)
+		return t.f.Op(spvOp, typ, args...)
+	}
+	result := sampleOf(img)
+	if s.border != 0 {
+		result = t.blendBorder(s, ti, result, sampleOf(t.load(s.tSample, s.border)), ref, false, 0)
 	}
 	if ti.shadow {
+		// GL's legacy depth texture mode's LUMINANCE: (r, r, r, 1).
+		one := t.float32Const(1)
+		result = t.f.Op(spirv.OpCompositeConstruct, t.tVec4F, uint32(result), uint32(result), uint32(result), uint32(one))
 		t.dst(inst, 0, Float, result)
 	} else {
 		t.dst(inst, 0, s.typ, result)
 	}
+}
+
+// blendBorder blends s's border color into tb, a sample of s of a sampler
+// of a transparent black border, by its difference from ow, a sample of
+// one of an opaque white border: of each channel, the border's weight. Of
+// a shadow sampler, of a reference ref, the samples' comparisons of their
+// borders' depths, 0 and 1, differ only where the comparison of s's
+// border's depth can, which replaces them. Of a gather, the samples are
+// of each texel's channel comp, or of their comparisons.
+func (t *translator) blendBorder(s *sampler, ti texInfo, tb, ow, ref spirv.ID, gather bool, comp uint32) spirv.ID {
+	b := s.b
+	var typ, w spirv.ID
+	sub, mul, add := spirv.OpFSub, spirv.OpFMul, spirv.OpFAdd
+	switch {
+	case ti.shadow:
+		if b.ClampRef {
+			ref = t.glsl(t.tF32, spirv.GLSLstd450FClamp, ref, t.float32Const(0), t.float32Const(1))
+		}
+		depth := math.Float32frombits(b.Color[0])
+		if b.ClampRef {
+			depth = min(max(depth, 0), 1)
+		}
+		black, white := t.compareRef(b.Compare, ref, 0), t.compareRef(b.Compare, ref, 1)
+		typ, w = t.tF32, t.f.Op(spirv.OpFMul, t.tF32,
+			uint32(t.f.Op(spirv.OpFSub, t.tF32, uint32(t.compareRef(b.Compare, ref, depth)), uint32(black))),
+			uint32(t.f.Op(spirv.OpFSub, t.tF32, uint32(white), uint32(black))))
+		if gather {
+			typ, w = t.tVec4F, t.splat(t.tVec4F, w)
+		}
+	default:
+		typ = t.vecType(s.typ)
+		var parts [4]spirv.ID
+		for i := range parts {
+			c := b.Color[i]
+			if gather {
+				c = b.Color[comp&3]
+			}
+			parts[i] = t.m.Constant(t.scalarType(s.typ), c)
+		}
+		w = t.m.ConstantComposite(typ, parts[:]...)
+		if s.typ != Float {
+			sub, mul, add = spirv.OpISub, spirv.OpIMul, spirv.OpIAdd
+		}
+	}
+	diff := t.f.Op(sub, typ, uint32(ow), uint32(tb))
+	return t.f.Op(add, typ, uint32(tb), uint32(t.f.Op(mul, typ, uint32(diff), uint32(w))))
+}
+
+// compareRef returns 1.0 where a shadow sampler's comparison, PIPE_FUNC_*,
+// of ref to depth passes, and 0.0 where it fails.
+func (t *translator) compareRef(fn uint32, ref spirv.ID, depth float32) spirv.ID {
+	var op spirv.Op
+	switch fn & 7 {
+	case 0:
+		return t.float32Const(0)
+	case 1:
+		op = spirv.OpFOrdLessThan
+	case 2:
+		op = spirv.OpFOrdEqual
+	case 3:
+		op = spirv.OpFOrdLessThanEqual
+	case 4:
+		op = spirv.OpFOrdGreaterThan
+	case 5:
+		op = spirv.OpFUnordNotEqual
+	case 6:
+		op = spirv.OpFOrdGreaterThanEqual
+	default:
+		return t.float32Const(1)
+	}
+	pass := t.f.Op(op, t.tBool, uint32(ref), uint32(t.float32Const(depth)))
+	return t.f.Op(spirv.OpSelect, t.tF32, uint32(pass), uint32(t.float32Const(1)), uint32(t.float32Const(0)))
 }
 
 // normalizeRect divides a rectangle texture's coordinates by its size, as
@@ -392,21 +474,25 @@ func (t *translator) gather(inst *tgsi.Instruction) {
 	}
 	args := []uint32{uint32(img), uint32(coord)}
 	op := spirv.OpImageGather
+	var ref spirv.ID
+	var comp uint32
 	switch {
 	case ti.shadow && n == 4:
 		// A cube array's reference is source 1's x.
 		op = spirv.OpImageDrefGather
-		args = append(args, uint32(t.f.Op(spirv.OpCompositeExtract, t.tF32, uint32(t.src(inst, 1, Float)), 0)))
+		ref = t.f.Op(spirv.OpCompositeExtract, t.tF32, uint32(t.src(inst, 1, Float)), 0)
+		args = append(args, uint32(ref))
 	case ti.shadow:
 		op = spirv.OpImageDrefGather
 		c := uint32(n)
 		if n < 2 {
 			c = 2
 		}
-		args = append(args, uint32(t.f.Op(spirv.OpCompositeExtract, t.tF32, uint32(src0), c)))
+		ref = t.f.Op(spirv.OpCompositeExtract, t.tF32, uint32(src0), c)
+		args = append(args, uint32(ref))
 	default:
 		// The channel, of source 1's immediate.
-		comp := t.immediateChannel(&inst.Src[1])
+		comp = t.immediateChannel(&inst.Src[1])
 		if comp > 3 {
 			t.fail("TG4 of channel %d", comp)
 		}
@@ -448,7 +534,12 @@ func (t *translator) gather(inst *tgsi.Instruction) {
 	default:
 		t.fail("TG4 of %d offsets", len(inst.TexOffset))
 	}
-	t.dst(inst, 0, s.typ, t.f.Op(op, t.vecType(s.typ), args...))
+	result := t.f.Op(op, t.vecType(s.typ), args...)
+	if s.border != 0 {
+		args[0] = uint32(t.load(s.tSample, s.border))
+		result = t.blendBorder(s, ti, result, t.f.Op(op, t.vecType(s.typ), args...), ref, true, comp)
+	}
+	t.dst(inst, 0, s.typ, result)
 }
 
 // querySamples emits TXQS: the number of a multisampled texture's samples.

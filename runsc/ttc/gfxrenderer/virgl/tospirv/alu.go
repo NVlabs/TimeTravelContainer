@@ -231,7 +231,21 @@ func (t *translator) instruction(inst *tgsi.Instruction) bool {
 // compare emits a componentwise comparison, whose result is floats of 1.0
 // or 0.0, or masks of ~0 or 0.
 func (t *translator) compare(inst *tgsi.Instruction, op spirv.Op, b BaseType, floats bool) {
-	cond := t.f.Op(op, t.tVec4B, uint32(t.src(inst, 0, b)), uint32(t.src(inst, 1, b)))
+	var cond spirv.ID
+	if op == spirv.OpFUnordNotEqual && sameSource(&inst.Src[0], &inst.Src[1]) {
+		// x != x, GLSL's isnan as Mesa compiles it: of the bits of NaNs'
+		// exponents and mantissas, which Metal's fast math, which assumes
+		// no NaNs, does not fold to false, as it folds the comparison.
+		bits := t.bitcast(t.tVec4U, t.tVec4F, t.src(inst, 0, Float))
+		splat := func(v uint32) spirv.ID {
+			c := t.m.ConstantUint(v)
+			return t.m.ConstantComposite(t.tVec4U, c, c, c, c)
+		}
+		abs := t.f.Op(spirv.OpBitwiseAnd, t.tVec4U, uint32(bits), uint32(splat(0x7fffffff)))
+		cond = t.f.Op(spirv.OpUGreaterThan, t.tVec4B, uint32(abs), uint32(splat(0x7f800000)))
+	} else {
+		cond = t.f.Op(op, t.tVec4B, uint32(t.src(inst, 0, b)), uint32(t.src(inst, 1, b)))
+	}
 	if floats {
 		t.dst(inst, 0, Float, t.f.Op(spirv.OpSelect, t.tVec4F, uint32(cond), uint32(t.constVec4F(1, 1, 1, 1)), uint32(t.constVec4F(0, 0, 0, 0))))
 		return
@@ -239,6 +253,12 @@ func (t *translator) compare(inst *tgsi.Instruction, op spirv.Op, b BaseType, fl
 	ones := t.m.ConstantUint(^uint32(0))
 	all := t.m.ConstantComposite(t.tVec4U, ones, ones, ones, ones)
 	t.dst(inst, 0, Uint, t.f.Op(spirv.OpSelect, t.tVec4U, uint32(cond), uint32(all), uint32(t.zero4U)))
+}
+
+// sameSource reports whether sources a and b read the same channels of
+// the same register, of the same modifiers.
+func sameSource(a, b *tgsi.SrcRegister) bool {
+	return a.Indirect == nil && a.DimIndirect == nil && *a == *b
 }
 
 // dot emits DP2, DP3 or DP4: the dot product of the sources' first

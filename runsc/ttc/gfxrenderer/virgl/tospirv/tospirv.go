@@ -114,6 +114,41 @@ type Options struct {
 	// Multisampled is whether a fragment shader's color buffers, which
 	// FBFETCH reads, are multisampled: it reads its sample's.
 	Multisampled bool
+	// SampleShading is whether a fragment shader shades the framebuffer's
+	// samples apart, as Gallium's min_samples of more than one do, of
+	// which it interpolates its inputs at the samples' locations, as
+	// OpenGL does: Metal shades samples apart, but interpolates inputs of
+	// no Sample decoration at the pixels' centers.
+	SampleShading bool
+	// SingleSampled is whether the framebuffer has a sample of each
+	// pixel, whose fragment shaders' SAMPLEMASK outputs OpenGL ignores,
+	// and Vulkan does not: the translation writes them to a variable of
+	// no built-in.
+	SingleSampled bool
+	// BorderSlots are the sampler slots, of bits, of Borders: of border
+	// colors that the device's samplers have not, which the translation
+	// blends of two samples, the slot's, of a sampler of a transparent
+	// black border, and its BorderTexture's, of an opaque white border,
+	// whose difference is the border's weight of each channel. Slots of
+	// arrays of samplers keep the slot's border.
+	BorderSlots uint32
+	Borders     [StageBindings]Border
+}
+
+// Border is a border color that a translation blends (Options.Borders).
+type Border struct {
+	// Color is the color, of the bits of the view's channels' type, as
+	// the view's swizzle swizzles it; or, of a shadow sampler, of the
+	// border's depth, first.
+	Color [4]uint32
+	// Compare is a shadow sampler's comparison, PIPE_FUNC_*, and ClampRef
+	// whether the device clamps its references to [0, 1], as of
+	// fixed-point depths, as the translation does the border's depth: of
+	// the comparisons of the samples' borders' depths, 0 and 1, the
+	// translation blends the comparison of the border's, which a
+	// comparison monotonic in the depth makes exact.
+	Compare  uint32
+	ClampRef bool
 }
 
 // MaxVertexInputs is the number of a vertex shader's inputs.
@@ -139,6 +174,19 @@ const SetInputAttachments = 4
 // Binding returns the binding of a stage's resource of slot.
 func Binding(stage tgsi.Processor, slot int) uint32 {
 	return uint32(int(stage)*StageBindings + slot)
+}
+
+// borderBindings is the first binding of BorderTexture resources, past
+// every stage's others.
+const borderBindings = (int(tgsi.ProcessorCompute) + 1) * StageBindings
+
+// ResourceBinding returns the binding of a stage's resource of kind of
+// slot: Binding's, but BorderTexture resources' past every stage's others.
+func ResourceBinding(stage tgsi.Processor, kind ResourceKind, slot int) uint32 {
+	if kind == BorderTexture {
+		return uint32(borderBindings) + Binding(stage, slot)
+	}
+	return Binding(stage, slot)
 }
 
 // Varying is an input or output of a shader that the pipeline links to
@@ -182,6 +230,9 @@ const (
 	// InputAttachment is a color buffer that a fragment shader reads, of
 	// its slot's index, and its Type.
 	InputAttachment
+	// BorderTexture is a sampler slot's view, of a sampler of an opaque
+	// white border, as Options.BorderSlots have it.
+	BorderTexture
 )
 
 // Result is a translated shader.
@@ -213,7 +264,7 @@ func (e *Error) Error() string {
 
 // Translate translates s to SPIR-V.
 func Translate(s *tgsi.Shader, opts Options) (res *Result, err error) {
-	t := newTranslator(s, opts)
+	t := newTranslator(buffersFromZero(s), opts)
 	defer func() {
 		if r := recover(); r != nil {
 			e, ok := r.(*Error)
@@ -329,6 +380,10 @@ type sampler struct {
 	array   *resArray
 	// tPtr is the type of a pointer to a descriptor.
 	tPtr spirv.ID
+	// border is the variable of the slot's BorderTexture, of a border
+	// color b that the translation blends, or 0.
+	border spirv.ID
+	b      Border
 }
 
 func newTranslator(s *tgsi.Shader, opts Options) *translator {

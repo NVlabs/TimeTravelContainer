@@ -445,7 +445,11 @@ func (t *translator) fragmentVarying(d *tgsi.Declaration, sem tgsi.Semantic, ind
 	} else if d.Interpolate && d.Interp == tgsi.InterpolateLinear {
 		t.m.Decorate(f.v, spirv.DecorationNoPerspective)
 	}
-	switch d.Location {
+	location := d.Location
+	if t.opts.SampleShading && !flat {
+		location = tgsi.LocationSample
+	}
+	switch location {
 	case tgsi.LocationCentroid:
 		t.m.Decorate(f.v, spirv.DecorationCentroid)
 	case tgsi.LocationSample:
@@ -594,6 +598,10 @@ func (t *translator) declareFragmentOutput(o *io) {
 		o.chans = t.scalarChannel(sc, spirv.BuiltInFragStencilRefEXT, t.tI32, tgsi.Y, 0)
 	case tgsi.SemanticSampleMask:
 		typ := t.m.TypeArray(t.tI32, t.m.ConstantUint(1))
+		if t.opts.SingleSampled {
+			o.chans[0] = channel{t.newIface(spirv.StorageClassPrivate, typ, t.tI32, 0, 0), 0}
+			break
+		}
 		o.chans[0] = channel{t.builtin(sc, spirv.BuiltInSampleMask, typ, t.tI32, 0, 0), 0}
 	default:
 		t.fail("fragment output %v", sem)
