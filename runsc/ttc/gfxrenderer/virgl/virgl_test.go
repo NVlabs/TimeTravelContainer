@@ -1261,6 +1261,40 @@ func TestVertexBufferPastItsEnd(t *testing.T) {
 	}
 }
 
+// TestIndexedDrawFromStart draws indexes from a start, as Mesa's virgl
+// driver sends a draw of them: of the index buffer's offset of the start,
+// and the start, which virglrenderer ignores of indexed draws. The
+// renderer took both, and drew the indexes past the draw's: of Android's
+// quick settings, slivers in place of their tiles.
+func TestIndexedDrawFromStart(t *testing.T) {
+	f := newFixture(t)
+	const bindIndexBuffer = 1 << 5
+	// Indexes of 16 bits: a degenerate triangle, the triangle, and another
+	// degenerate one.
+	var indexMem []byte
+	for _, i := range []uint16{0, 0, 0, 0, 1, 2, 0, 0, 0} {
+		indexMem = binary.LittleEndian.AppendUint16(indexMem, i)
+	}
+	ib, err := NewResource(6, ResourceArgs{Target: targetBuffer, Format: formatR8Unorm,
+		Bind: bindIndexBuffer, Width: uint32(len(indexMem)), Height: 1, Depth: 1, ArraySize: 1}, indexMem, nil)
+	if err != nil {
+		t.Fatalf("NewResource: %v", err)
+	}
+	defer ib.DecRef()
+	f.c.Attach(ib)
+	if err := f.c.Transfer(ib, TransferArgs{ToHost: true, W: uint32(len(indexMem)), H: 1, D: 1}); err != nil {
+		t.Fatalf("Transfer: %v", err)
+	}
+	var s stream
+	f.setup(&s)
+	clearRed(&s)
+	s.cmd(cmdSetIndexBuffer, 0, ib.ID(), 2, 3*2)
+	s.cmd(cmdDrawVBO, 0, 3, 3, primTriangles, 1, 1, 0, 0, 0, 0, 0, 0xffffffff, 0)
+	f.submit(t, s)
+	f.finish(t)
+	f.checkTriangle(t)
+}
+
 // Shaders read their constants, which the guest sets, and uniform buffers,
 // of resources, as Mesa's state tracker binds them: the vertex shader's
 // offsets the triangle, and the fragment shader's color it.

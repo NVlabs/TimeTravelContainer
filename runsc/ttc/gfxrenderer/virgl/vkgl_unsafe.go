@@ -1140,13 +1140,16 @@ func (c *vkglContext) draw(d []uint32, a drawArgs) error {
 		}
 		// Of indexes of the buffer, which it checks, and draws them:
 		// from the offset's index, which Vulkan binds them at a multiple
-		// of their size of.
+		// of their size of. The offset is that of the draw's first index:
+		// Mesa's virgl driver sets the index buffer's offset of the
+		// draw's start, which it sends too, and which virglrenderer, as
+		// the renderer, ignores of indexed draws.
 		size := index.buf.Size()
-		start := uint64(a.indexOffset) + uint64(d[drawStart])*uint64(indexSize)
-		if n := uint64(d[drawCount]) * uint64(indexSize); start > size || n > size-start {
-			return fmt.Errorf("%d indexes from %d of a buffer of %d bytes", d[drawCount], start, size)
+		start := uint64(a.indexOffset)
+		if n := uint64(d[drawCount]) * uint64(indexSize); start%uint64(indexSize) != 0 || start > size || n > size-start {
+			return fmt.Errorf("%d indexes of %d bytes from %d of a buffer of %d bytes", d[drawCount], indexSize, start, size)
 		}
-		firstIndex = uint32(a.indexOffset/indexSize) + d[drawStart]
+		firstIndex = a.indexOffset / indexSize
 		if err := c.use(&index.vkglRef); err != nil {
 			return err
 		}
