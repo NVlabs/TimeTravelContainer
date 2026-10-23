@@ -1291,7 +1291,14 @@ func (c *vkglContext) draw(d []uint32, a drawArgs) error {
 			cmds.SetScissor(0, 0, width, height)
 		}
 		cmds.SetBlendConstants(c.blendColor)
-		cmds.SetStencilReference(c.stencilRef[0], c.stencilRef[1])
+		// A one-sided stencil test uses the front's reference for both
+		// faces, as Gallium's drivers do: Mesa's state tracker leaves the
+		// back's unset for the quads of scissored clears.
+		back := c.stencilRef[1]
+		if !c.dsa.Stencil[1].Enable {
+			back = c.stencilRef[0]
+		}
+		cmds.SetStencilReference(c.stencilRef[0], back)
 		if err := c.ctx.BindResources(cmds, p, buffers, textures); err != nil {
 			return err
 		}

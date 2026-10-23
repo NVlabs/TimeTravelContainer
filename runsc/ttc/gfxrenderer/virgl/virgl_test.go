@@ -321,6 +321,93 @@ IMM[0] FLT32 {0x00000000, 0x3f800000, 0x00000000, 0x00000000}
 	}
 }
 
+// TestOneSidedStencilReference replaces the stencil of triangles of either
+// winding, of a one-sided stencil test of a back face's reference of 0, as
+// Mesa's state tracker clears scissored stencils of quads, and draws where
+// it replaced it, of a back face's reference of 2: back faces of one-sided
+// tests use the front's reference.
+func TestOneSidedStencilReference(t *testing.T) {
+	const (
+		formatZ24S8      = 19
+		bindDepthStencil = 1 << 0
+		clearStencil     = 1 << 1
+		// Stencil states of virgl's DSA: enabled, of ALWAYS, of REPLACE
+		// of each op, and of masks of 0xff; and enabled, of EQUAL, of
+		// KEEP, and of no writes.
+		stencilReplace = 1 | 7<<1 | 2<<4 | 2<<7 | 2<<10 | 0xff<<13 | 0xff<<21
+		stencilEqual   = 1 | 2<<1 | 0xff<<13
+	)
+	f := newFixture(t)
+	zs, err := NewResource(f.id(), ResourceArgs{Target: target2D, Format: formatZ24S8, Bind: bindDepthStencil,
+		Width: width, Height: height, Depth: 1, ArraySize: 1}, make([]byte, width*height*4), nil)
+	if err != nil {
+		t.Fatalf("NewResource: %v", err)
+	}
+	defer zs.DecRef()
+	f.c.Attach(zs)
+	// Quads of two triangles each: the left half's, winding one way, and
+	// the right half's, the other, as Mesa's clears' quads do.
+	var quadsMem []byte
+	for _, v := range []float32{
+		-1, -1, 0, 1, 0, -1, 0, 1, 0, 1, 0, 1, -1, -1, 0, 1, 0, 1, 0, 1, -1, 1, 0, 1,
+		0, 1, 0, 1, 1, 1, 0, 1, 1, -1, 0, 1, 0, 1, 0, 1, 1, -1, 0, 1, 0, -1, 0, 1,
+	} {
+		quadsMem = binary.LittleEndian.AppendUint32(quadsMem, math.Float32bits(v))
+	}
+	quads, err := NewResource(f.id(), ResourceArgs{Target: targetBuffer, Format: formatR8Unorm, Bind: bindVertexBuffer,
+		Width: uint32(len(quadsMem)), Height: 1, Depth: 1, ArraySize: 1}, quadsMem, nil)
+	if err != nil {
+		t.Fatalf("NewResource: %v", err)
+	}
+	defer quads.DecRef()
+	f.c.Attach(quads)
+	if err := f.c.Transfer(quads, TransferArgs{ToHost: true, W: uint32(len(quadsMem)), H: 1, D: 1}); err != nil {
+		t.Fatalf("Transfer: %v", err)
+	}
+	check := func(when string, want [4]byte) {
+		t.Helper()
+		for _, x := range []int{4, width - 4} {
+			if p := f.pixel(x, height/2); p != want {
+				t.Errorf("%s: at %d of the middle row: %v, want %v", when, x, p, want)
+			}
+		}
+	}
+	drawQuads := func(s *stream) {
+		s.cmd(cmdDrawVBO, 0, 0, 12, primTriangles, 0, 1, 0, 0, 0, 0, 0, 0xffffffff, 0)
+	}
+	// Green where the stencil is 1, of none yet.
+	var s stream
+	h := f.setup(&s)
+	zsurf, noColor, replace, equal := f.id(), f.id(), f.id(), f.id()
+	s.cmd(cmdCreateObject, objectSurface, zsurf, zs.ID(), formatZ24S8, 0, 0)
+	s.cmd(cmdSetFramebufferState, 0, 1, zsurf, h.surf)
+	s.cmd(cmdSetFramebufferNoAttach, 0, width|height<<16, 0)
+	s.cmd(cmdClear, 0, clearColor0|clearStencil, f32(1), f32(0), f32(0), f32(1), 0, 0, 0)
+	s.cmd(cmdSetVertexBuffers, 0, 16, 0, quads.ID())
+	s.cmd(cmdCreateObject, objectDSA, equal, 0, stencilEqual, 0, 0)
+	s.cmd(cmdBindObject, objectDSA, equal)
+	s.cmd(cmdSetStencilRef, 0, 1|2<<8)
+	drawQuads(&s)
+	f.submit(t, s)
+	f.finish(t)
+	check("of stencils of 0", red)
+	// Stencils of 1, of no colors, and green where they are.
+	s = nil
+	s.cmd(cmdCreateObject, objectBlend, noColor, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+	s.cmd(cmdBindObject, objectBlend, noColor)
+	s.cmd(cmdCreateObject, objectDSA, replace, 0, stencilReplace, 0, 0)
+	s.cmd(cmdBindObject, objectDSA, replace)
+	s.cmd(cmdSetStencilRef, 0, 1)
+	drawQuads(&s)
+	s.cmd(cmdBindObject, objectBlend, h.blend)
+	s.cmd(cmdBindObject, objectDSA, equal)
+	s.cmd(cmdSetStencilRef, 0, 1|2<<8)
+	drawQuads(&s)
+	f.submit(t, s)
+	f.finish(t)
+	check("of stencils of 1", green)
+}
+
 // TestTexture samples a texture, whose sampler TGSI's NIR names
 // "sampler", which Metal has for a type: MoltenVK failed to compile the
 // shader, and Zink crashed binding no pipeline.
