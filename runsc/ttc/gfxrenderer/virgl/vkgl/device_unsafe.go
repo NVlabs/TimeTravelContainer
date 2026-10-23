@@ -8,7 +8,6 @@ package vkgl
 import (
 	"errors"
 	"fmt"
-	"runtime"
 	"sync"
 	"unsafe"
 
@@ -240,7 +239,10 @@ func (d *Device) init() error {
 	info := get[vn.VkInstanceCreateInfo](a)
 	info.SType = vn.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
 	info.PApplicationInfo = unsafe.Pointer(app)
-	if runtime.GOOS == "darwin" {
+	// The loader lists the devices of VK_KHR_portability_subset, as
+	// MoltenVK, only to an instance that enumerates them; MoltenVK that
+	// the renderer links has no loader, nor the extension.
+	if d.instanceExtension("VK_KHR_portability_enumeration") {
 		info.Flags |= instanceCreateEnumeratePortability
 		info.EnabledExtensionCount = 1
 		info.PpEnabledExtensionNames = cstrings(a, []string{"VK_KHR_portability_enumeration"})
@@ -353,6 +355,31 @@ func (d *Device) chooseQueueFamily() (uint32, error) {
 }
 
 // extensions returns the names of the physical device's extensions.
+// instanceExtension reports whether Vulkan has an instance extension.
+func (d *Device) instanceExtension(name string) bool {
+	a := newArena()
+	defer a.release()
+	count := get[uint32](a)
+	ee := get[vn.Args_vkEnumerateInstanceExtensionProperties](a)
+	ee.PPropertyCount = unsafe.Pointer(count)
+	vk.Call(vn.VK_COMMAND_TYPE_vkEnumerateInstanceExtensionProperties_EXT, d.lib.Global(), unsafe.Pointer(ee))
+	if ee.Ret != vn.VK_SUCCESS || *count == 0 {
+		return false
+	}
+	props := array[vn.VkExtensionProperties](a, int(*count))
+	ee.PProperties = unsafe.Pointer(&props[0])
+	vk.Call(vn.VK_COMMAND_TYPE_vkEnumerateInstanceExtensionProperties_EXT, d.lib.Global(), unsafe.Pointer(ee))
+	if ee.Ret < 0 {
+		return false
+	}
+	for _, p := range props[:min(int(*count), len(props))] {
+		if cString(p.ExtensionName[:]) == name {
+			return true
+		}
+	}
+	return false
+}
+
 func (d *Device) extensions() map[string]bool {
 	a := d.a
 	has := make(map[string]bool)
