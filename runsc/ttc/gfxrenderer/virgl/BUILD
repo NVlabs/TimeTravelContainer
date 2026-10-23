@@ -12,35 +12,16 @@ go_library(
     name = "virgl",
     srcs = [
         "backend.go",
-        "backend_linux.go",
         "clone_unsafe.go",
         "context_unsafe.go",
-        "formats.c",
-        "pipe.c",
         "protocol.go",
-        "screen.c",
-        "screen_darwin.c",
-        "tgsi_check.c",
         "virgl.go",
-        "virgl.h",
-        "virgl_int.h",
         "virgl_other.go",
         "virgl_unsafe.go",
         "vkgl_unsafe.go",
-        "zink_unsafe.go",
     ],
-    # The renderer renders with vkgl, of no Mesa, and on macOS links Zink
-    # too (see tools/mesa/README.md), on the MoltenVK that the Venus
-    # renderer links, until vkgl is verified on MoltenVK. Zink's C files,
-    # and zink_unsafe.go, are of macOS's builds only.
-    bazel_cdeps = select({
-        "@platforms//os:macos": [
-            "@mesa//:gallium_api",
-            "@mesa//:zink",
-            "@moltenvk",
-        ],
-        "//conditions:default": [],
-    }),
+    # The renderer renders with vkgl, of no Mesa, on the Vulkan that the
+    # Venus renderer calls: package vkgl's cgo.
     bazel_cgo = True,
     stateify = False,
     visibility = ["//runsc/ttc/gfxrenderer:__subpackages__"],

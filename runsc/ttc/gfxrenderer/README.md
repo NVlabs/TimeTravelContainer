@@ -110,9 +110,9 @@ Applications need no change: Vulkan ones find the GPU, and OpenGL ones that
 use Mesa's EGL on its surfaceless platform render on it by Zink. On macOS,
 Zink on MoltenVK has only OpenGL 2.1 and OpenGL ES 2.0, as MoltenVK has
 neither transform feedback nor geometry shaders: there, Mesa's OpenGL drives
-the GPU with its virgl driver, which the renderer serves with Zink on the
-host (see [virgl](#virgl)), with OpenGL 3.1 and OpenGL ES 3.1, unless an
-application sets `MESA_LOADER_DRIVER_OVERRIDE=zink`, for Zink in the guest,
+the GPU with its virgl driver, which the renderer serves with vkgl on the
+host (see [virgl](#virgl)), with OpenGL ES 3.0, unless an application sets
+`MESA_LOADER_DRIVER_OVERRIDE=zink`, for Zink in the guest,
 or `LIBGL_ALWAYS_SOFTWARE=1`, for Mesa's llvmpipe, which has OpenGL 4.6 in
 software. Chromium renders on the GPU with ANGLE
 on Vulkan (`--use-angle=vulkan`), which offers OpenGL ES 3, and llama.cpp's
@@ -215,24 +215,16 @@ Gallium's calls, of Gallium's state objects and TGSI shaders:
 `virgl/context_unsafe.go` checks each command and resolves its handles, and
 executes it on a backend, Gallium on Vulkan (`virgl/backend.go`), as
 virglrenderer's vrend executes them on the host's OpenGL. A command that a
-guest's driver would not send ends its stream. The backends:
-
-*   **vkgl** (`virgl/vkgl`), the renderer's own, in Go, renders on Linux,
-    on the host's Vulkan loader, which the Venus renderer loads: on the
-    host's GPU, or, where the host has none, its CPU device, such as
-    lavapipe, as the Venus renderer gives guests. It translates guests'
-    TGSI to SPIR-V itself (`virgl/tospirv`), keeps Gallium's state as
-    Vulkan's (`virgl/vkgl_unsafe.go`), and checks what it takes against
-    Vulkan's rules. Linux's renderer links no Mesa.
-*   **Zink**, Mesa's Gallium driver on Vulkan, renders on macOS, where ttcd
-    links it (`tools/mesa/README.md`), on the MoltenVK that the Venus
-    renderer links (`virgl/screen_darwin.c`): `virgl/pipe.c` checks what
-    Zink trusts of the commands' fields, on which it could trap, and makes
-    the calls. `TTC_VIRGL_BACKEND=vkgl` in ttcd's environment, which the
-    renderer inherits, has macOS's renderer render with vkgl, which works
-    around what MoltenVK lacks of Vulkan. Once vkgl passes the Mac's tests,
-    it is macOS's too, and Mesa leaves the tree
-    (`g3doc/proposals/ttc_virgl_go_backend.md`).
+guest's driver would not send ends its stream. The backend is vkgl
+(`virgl/vkgl`), the renderer's own, in Go, on the Vulkan that the Venus
+renderer calls: on Linux, the host's loader, of the host's GPU, or, where
+the host has none, its CPU device, such as lavapipe, as the Venus renderer
+gives guests; on macOS, MoltenVK, which ttcd links, and whose lacks of
+Vulkan vkgl works around (`virgl/vkgl/device_unsafe.go`;
+[The Mac's tests](../../../g3doc/proposals/ttc_virgl_go_backend.md#the-macs-tests)).
+It translates guests' TGSI to SPIR-V itself (`virgl/tospirv`), keeps
+Gallium's state as Vulkan's (`virgl/vkgl_unsafe.go`), and checks what it
+takes against Vulkan's rules. The renderer links no Mesa.
 
 A virgl context's classic resources are the backend's, and the renderer's
 shared memory, which the guest maps, is the guest's memory of them:
@@ -246,9 +238,7 @@ Debian's and redroid's Mesa report `virgl (vkgl (DEVICE))`, with OpenGL ES
 atomic counters and indirect draws, which vkgl renders none of yet, and
 its capability sets offer none of (TODO:
 [OpenGL ES 3.1](../../../g3doc/proposals/ttc_virgl_go_backend.md#opengl-es-31)).
-On Zink, macOS's Debian reports `virgl (zink Vulkan 1.4(Apple M5 Pro
-(MOLTENVK)))`, with OpenGL 3.1 and OpenGL ES 3.1, more than Zink in the
-guest has. On Linux, ttcd's configuration of Mesa has applications use
+On Linux, ttcd's configuration of Mesa has applications use
 Zink in the guest instead, whose transform feedback is the host GPU's (see
 [The guest's driver](#the-guests-driver)); an application asks for virgl
 with `MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu`. redroid's image runs in its
@@ -271,10 +261,9 @@ than render in software: they can ask for Mesa's llvmpipe with
 `LIBGL_ALWAYS_SOFTWARE=1`.
 
 OpenGL 3.0 and OpenGL ES 3.0, which Android 14's HWUI requires, require
-transform feedback, which MoltenVK, and so Zink, has none of: the renderer
-emulates it, as ANGLE does on Vulkan without it, on both backends, so that
-guests capture alike everywhere, and forks keep what the decoder counted of
-a capture. A vertex shader with a stream output captures it itself: at its
+transform feedback, which MoltenVK has none of: the renderer emulates it,
+as ANGLE does on Vulkan without it, on every device, so that guests capture
+alike everywhere, and forks keep what the decoder counted of a capture. A vertex shader with a stream output captures it itself: at its
 end it stores its outputs to the targets' buffers, which the renderer binds
 as shader buffers, at its vertex's index among the draw's, which a uniform
 buffer of the draw's parameters gives. The renderer keeps those slots of the
@@ -285,30 +274,18 @@ triangles, of no indexed draw, of the vertex shader's stream 0; of OpenGL's
 indexed and strip draws, and of geometry and tessellation shaders' stream
 outputs, it captures nothing, and logs so.
 
-TGSI's shaders differ from what Zink's own frontends give it, in ways that
-MoltenVK refuses, which the renderer works around for Zink; vkgl's
-translation types its vertex inputs so too, and names nothing:
-
-*   TGSI's vertex inputs have no types, and Metal requires that shaders read
-    integer vertex formats as integers: draws bind a variant of the vertex
-    shader whose inputs have the types of the vertex elements bound, as
-    virglrenderer's vrend makes for OpenGL.
-*   Zink names SPIR-V's variables by TGSI's, which MoltenVK names Metal's
-    by, and Metal fails to compile a texture named `sampler`: the
-    renderer's Vulkan, for Zink, drops the names, which are for debuggers
-    only.
-
-Where MoltenVK still fails to create a pipeline, Zink binds none, and the
-renderer drops the draws that would use it, as virglrenderer drops draws
-that it cannot draw. The renderer's Vulkan for Zink logs only MoltenVK's
-errors, not the warning that MoltenVK logs of each of Zink's pipelines.
+TGSI's vertex inputs have no types, and Metal requires that shaders read
+integer vertex formats as integers: draws bind a variant of the vertex
+shader whose inputs have the types of the vertex elements bound, as
+virglrenderer's vrend makes for OpenGL. tospirv's SPIR-V names nothing,
+as MoltenVK names Metal's variables by SPIR-V's names, and Metal fails to
+compile a texture named `sampler`.
 
 A live fork with `--gfx-fork=snapshot` clones a branch's virgl contexts, as
 it clones Venus's (`virgl/clone_unsafe.go`): a clone's sub-contexts are
 Gallium contexts of their own, in which it creates the parent's objects
-again, of what the commands that created them carried, compiles their
-shaders again, which Zink's cache of live shaders finds compiled, and vkgl
-translates again, of pipelines that the child's draws compile, and binds
+again, of what the commands that created them carried, translates their
+shaders again, of pipelines that the child's draws compile, and binds
 and sets what the parent's state holds, of what the decoder keeps of it.
 Its resources are copies of the parent's memory and contents. A query that
 is active when the branch forks is begun again, and counts what the child

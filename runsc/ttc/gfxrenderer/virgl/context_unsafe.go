@@ -551,8 +551,8 @@ func (c *Context) resource(h uint32) (*Resource, error) {
 	return r, nil
 }
 
-// buffer returns resource h, which is a buffer, or nil if h is 0: Zink
-// binds a texture of no VkBuffer as no buffer.
+// buffer returns resource h, which is a buffer, or nil if h is 0: a
+// texture has no VkBuffer to bind.
 func (c *Context) buffer(h uint32) (*Resource, error) {
 	r, err := c.resource(h)
 	if err == nil && r != nil && r.res.target() != targetBuffer {
@@ -1687,15 +1687,15 @@ func (c *Context) bindVertexState() error {
 	if !sub.vbsDirty {
 		return nil
 	}
-	// Zink replaces the buffers of the slots below the count, and holds
-	// the others' until a later call replaces them.
+	// The backend replaces the buffers of the slots below the count, and
+	// holds the others' until a later call replaces them.
 	res := make([]backendResource, sub.numVBs)
 	offsets := make([]uint32, sub.numVBs)
 	old := make([]*Resource, sub.numVBs)
 	for i := 0; i < sub.numVBs; i++ {
 		vb := sub.vbs[i]
 		r := vb.res
-		// Zink binds a buffer from an offset, which Vulkan requires within
+		// Vulkan binds a buffer from an offset, which it requires within
 		// it, and, of buffers' addresses, of the size from the offset to
 		// the end, which an offset past it underflows, of which the GPU
 		// reads past the buffer: a slot of one has none, of zeros.

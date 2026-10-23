@@ -12,7 +12,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 )
@@ -450,8 +449,8 @@ DCL OUT[0], COLOR
 	}
 }
 
-// TestTransformFeedback captures a triangle's positions, which Zink cannot
-// here, appends a second capture, pauses, and draws what it captured.
+// TestTransformFeedback captures a triangle's positions, which MoltenVK
+// cannot, appends a second capture, pauses, and draws what it captured.
 func TestTransformFeedback(t *testing.T) {
 	f := newFixture(t)
 	if !xfbEmulated {
@@ -650,12 +649,6 @@ func TestTransformFeedbackLayout(t *testing.T) {
 	}
 }
 
-// onVkgl reports whether the tests render on the vkgl backend, as on
-// Linux, or on Zink, as on macOS unless TTC_VIRGL_BACKEND is "vkgl".
-func onVkgl() bool {
-	return runtime.GOOS != "darwin" || os.Getenv("TTC_VIRGL_BACKEND") == "vkgl"
-}
-
 func TestCapsets(t *testing.T) {
 	if err := Init(); err != nil {
 		t.Skipf("the backend is unavailable: %v", err)
@@ -673,12 +666,8 @@ func TestCapsets(t *testing.T) {
 	if binary.LittleEndian.Uint32(v2) != 2 {
 		t.Errorf("v2's max_version %d", binary.LittleEndian.Uint32(v2))
 	}
-	backend := "zink"
-	if onVkgl() {
-		backend = "vkgl"
-	}
-	if !strings.Contains(string(v2), backend) {
-		t.Errorf("v2 names no renderer of %s's", backend)
+	if !strings.Contains(string(v2), "vkgl") {
+		t.Errorf("v2 names no renderer of vkgl's")
 	}
 }
 
@@ -762,7 +751,7 @@ func TestInlineWriteAndRebind(t *testing.T) {
 	s.cmd(cmdResourceInlineWrite, 0, append([]uint32{vb.ID(), 0, 0, 0, 0, 0, 0, 0, 48, 1, 1}, verts...)...)
 	s.cmd(cmdSetVertexBuffers, 0, 16, 0, vb.ID())
 	drawTriangle(&s)
-	// Unbinding vertex buffers leaves Zink's slots as they are.
+	// Unbinding vertex buffers leaves the backend's slots as they are.
 	s.cmd(cmdSetVertexBuffers, 0)
 	f.submit(t, s)
 	f.c.Detach(vb.ID())
@@ -1432,8 +1421,8 @@ func TestInvalidCommands(t *testing.T) {
 	var s stream
 	drawTriangle(&s)
 	f.submit(t, s)
-	// Zink draws no line loops, which guests' drivers convert, as the
-	// capabilities ask. Nor did the errors keep the context from rendering.
+	// The backend draws no line loops, which guests' drivers convert, as
+	// the capabilities ask. Nor did the errors keep the context from rendering.
 	s = nil
 	f.setup(&s)
 	clearRed(&s)
@@ -1449,9 +1438,10 @@ func TestInvalidCommands(t *testing.T) {
 }
 
 // TestUntranslatableTGSI creates shaders that tgsi_to_nir, and
-// tgsi_scan_shader, which Zink translates TGSI with, aborted on, read or
+// tgsi_scan_shader, with which Zink translated TGSI, aborted on, read or
 // wrote past their arrays of, or that tgsi_sanity_check allocated without
-// end of: the renderer refuses them, and renders on.
+// end of: the renderer translates them within its limits, which tospirv's
+// tests check, or refuses them, and renders on.
 func TestUntranslatableTGSI(t *testing.T) {
 	f := newFixture(t)
 	const stageTessCtrl = 3
@@ -1510,13 +1500,7 @@ func TestUntranslatableTGSI(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var s stream
 			s.shader(f.id(), tc.stage, tc.text, 1<<16)
-			err := f.c.Submit(s.bytes())
-			// Of Zink's translator: vkgl's, tospirv, translates of its own
-			// limits, which its tests check, and of these, refuses some.
-			if err == nil && !onVkgl() {
-				t.Errorf("no error")
-			}
-			t.Logf("%v", err)
+			t.Logf("%v", f.c.Submit(s.bytes()))
 		})
 	}
 	// A property that the shader's code has, which tgsi_to_nir took for

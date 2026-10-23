@@ -25,9 +25,8 @@ var (
 	xfbSSBO     uint32
 )
 
-// Init creates the process's backend, if it has not: the Go backend's
-// device (vkgl_unsafe.go), or, on macOS, unless TTC_VIRGL_BACKEND is
-// "vkgl", Zink's screen (zink_unsafe.go).
+// Init creates the process's backend, if it has not: vkgl's device
+// (vkgl_unsafe.go).
 func Init() error {
 	initOnce.Do(func() {
 		if be, initErr = initBackend(); initErr != nil {

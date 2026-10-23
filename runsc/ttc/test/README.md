@@ -145,8 +145,7 @@ TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
     GPU, every pixel checked (`gfx/gloffscreen.c`). On macOS, where Zink has
     only OpenGL ES 2.0, the test opts in with `MESA_LOADER_DRIVER_OVERRIDE`.
     It must render the same by Mesa's virgl driver, which the renderer
-    serves with vkgl, or on macOS with Zink unless the daemon's environment
-    has `TTC_VIRGL_BACKEND=vkgl`;
+    serves with vkgl;
 *   a live fork with `--gfx-fork=device-lost` while the guest renders. In the
     child, the process that was rendering must die of `SIGBUS`, not hang, and
     a new one must render. The source must render on;
@@ -180,7 +179,7 @@ TTC_GFX_GUEST_DRIVER=/path/to/dir/of/libvulkan_virtio.so \
 host's architecture, whose init is the container's, in a family with
 `--gfx-fork=snapshot`. By default it boots redroid's own host mode, by flags
 alone: Android's Mesa renders with its virgl driver, which the renderer serves
-with vkgl, or on macOS with Zink unless `TTC_VIRGL_BACKEND=vkgl`. With
+with vkgl. With
 `REDROID_GPU_MODE=venus`, Android renders with ANGLE on Mesa's Venus Vulkan
 driver for Android, with `runsc/ttc/gfxrenderer/guest/redroid/gpu_config.sh`. It
 checks that SurfaceFlinger composes on the GPU, by the mode's driver and the

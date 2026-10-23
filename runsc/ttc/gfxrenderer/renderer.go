@@ -30,7 +30,7 @@ func Probe() ([]Capset, error) {
 		{ID: venus.CapsetCrossDomain, Data: venus.CrossDomainCapset()},
 	}
 	if virgl.Available() {
-		// Mesa's virgl OpenGL driver's, which Zink renders for.
+		// Mesa's virgl OpenGL driver's, which vkgl renders for.
 		vcs, err := virgl.Capsets()
 		if err != nil {
 			log.Printf("rendering for no virgl guest: %v", err)

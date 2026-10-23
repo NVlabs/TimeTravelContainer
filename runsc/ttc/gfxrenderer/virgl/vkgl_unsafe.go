@@ -21,9 +21,8 @@ import (
 
 // The backend of package vkgl: Gallium's state and TGSI's shaders on
 // Vulkan, in Go (g3doc/proposals/ttc_virgl_go_backend.md), which the
-// renderer renders with where TTC_VIRGL_BACKEND is "vkgl". It renders
-// what the decoder's tests draw so far, and refuses what it does not
-// render yet.
+// renderer renders with. It refuses what it does not render yet, as
+// errVkgl, of which its capability sets offer guests none.
 //
 // The GPU may use an object after the decoder lets it go: each object has
 // a count of references, of which the decoder holds one, and each batch
@@ -229,9 +228,9 @@ func (b *vkglBackend) parseShader(text string, numTokens uint32) (shaderCode, er
 	if err != nil {
 		return nil, err
 	}
-	// Of shaders that tospirv translates, before a draw, as pipe.c refuses
-	// those that Zink does not: once, of no options, of which draws find
-	// the translation.
+	// Of shaders that tospirv translates, before a draw, as the guest's
+	// commands refer to them: once, of no options, of which draws find the
+	// translation.
 	if _, err := s.Translate(tospirv.Options{}); err != nil {
 		return nil, err
 	}
@@ -538,7 +537,7 @@ func (c *vkglContext) createQuery(typ, index uint32) any {
 	default:
 		return nil
 	}
-	// A vertex stream's index, as pipe.c checks it.
+	// A vertex stream's index: Gallium's are 0 to 3.
 	if index > 3 {
 		return nil
 	}
@@ -837,7 +836,7 @@ func (c *vkglContext) clearSurface(s surface, d []uint32) error {
 		buffers = vkgl.ClearColor0
 	}
 	// Of a color of a color surface, and of depth and stencil of a depth
-	// and stencil one, as pipe.c checks them.
+	// and stencil one.
 	if zs := vs.Format.IsDepth() || vs.Format.IsStencil(); buffers != 0 && zs == (buffers == vkgl.ClearColor0) {
 		return fmt.Errorf("a clear of buffers %#x of a surface of %s", buffers, vs.Format.Name)
 	}
@@ -928,7 +927,7 @@ func (c *vkglContext) inlineWrite(br backendResource, d []uint32, data []byte) e
 	if r.buf == nil {
 		// The payload's box, whose z and depth are of 16 bits, as
 		// Gallium's boxes', of rows and layers that the guest packs, and
-		// says so, or of the box's size, as pipe.c takes them.
+		// says so, or of the box's size.
 		box := vkgl.Box{X: int64(int32(d[5])), Y: int64(int32(d[6])), Z: int64(int16(d[7])),
 			Width: int64(int32(d[8])), Height: int64(int32(d[9])), Depth: int64(int16(d[10]))}
 		if box.Width <= 0 || box.Height <= 0 || box.Depth <= 0 {
@@ -1139,7 +1138,7 @@ func (c *vkglContext) draw(d []uint32, a drawArgs) error {
 		if !widen && !c.b.d.IndexSizeOK(indexSize) {
 			return fmt.Errorf("indexes of %d bytes: %w", indexSize, errVkgl)
 		}
-		// Of indexes of the buffer, as pipe.c checks them, and draws them:
+		// Of indexes of the buffer, which it checks, and draws them:
 		// from the offset's index, which Vulkan binds them at a multiple
 		// of their size of.
 		size := index.buf.Size()

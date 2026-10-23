@@ -1,12 +1,10 @@
 # A Go backend for TTC's virgl renderer
 
-Status: in progress (2026-10-23). Stages 1 and 2, the shader translator and
-the state tracker, are done on Linux, where the renderer renders on the Go
-backend, vkgl, and links no Mesa. macOS's renders on Zink unless
-`TTC_VIRGL_BACKEND` is `vkgl`, until vkgl passes [the Mac's
-tests](#the-macs-tests); stage 3, Mesa's removal, follows them. vkgl offers
-guests OpenGL ES 3.0, where Zink offered 3.1: [OpenGL ES
-3.1](#opengl-es-31) is to do.
+Status: done (2026-10-23), but for OpenGL ES 3.1. Stages 1 to 3, the shader
+translator, the state tracker, and Mesa's removal, are done: the renderer
+renders on the Go backend, vkgl, on Linux and on macOS, which passed [the
+Mac's tests](#the-macs-tests), and links no Mesa. vkgl offers guests OpenGL
+ES 3.0, where Zink offered 3.1: [OpenGL ES 3.1](#opengl-es-31) is to do.
 
 ## Goal
 
@@ -116,7 +114,8 @@ Zink `umod`.
 
 ## The state tracker
 
-Stage 2 implements the decoder's backend (`virgl.h`'s operations) in Go:
+Stage 2 implements the decoder's backend (`virgl/backend.go`'s operations) in
+Go:
 
 *   **Resources:** buffers and images in device memory, of Vulkan formats
     that `vkgl`'s table gives virgl's, emulating alpha, luminance and
@@ -173,8 +172,9 @@ Stage 2 implements the decoder's backend (`virgl.h`'s operations) in Go:
     ran on lavapipe. Done on Linux since: vkgl is its backend, and its
     build has no Mesa, of which ttcd is 3.3 MB smaller and the renderer
     7.0 MB of 24.8, of glibc's functions of 2.4.)
-3.  Mesa removed: no `tools/mesa.BUILD`, no glibc shims for it. (Linux's
-    build has neither since 2026-10-23; macOS's awaits the Mac's tests.)
+3.  Mesa removed: no `tools/mesa.BUILD`, no glibc shims for it. (Done,
+    2026-10-23: Linux's build first, and then macOS's, of the Mac's tests,
+    of which ttcd is 14.2 MB smaller there, 61.6 MB of 75.8.)
 
 ## The Mac's tests
 
@@ -202,25 +202,35 @@ but for what MoltenVK lacks, which it works around
     own to every slot that a shader reads and a guest binds none to.
 
 `vkgl`'s `TestPortabilitySubset` forces the workarounds on the device it
-runs on. On a Mac, before Mesa leaves:
+runs on. The Mac's tests ran on an Apple M5 Pro, of MoltenVK 1.4.2, on
+2026-10-23, before Mesa left, and passed:
 
-1.  The unit tests on vkgl:
-    `bazel test --test_env=TTC_VIRGL_BACKEND=vkgl //runsc/ttc/gfxrenderer/virgl:virgl_test //runsc/ttc/gfxrenderer/virgl/vkgl:vkgl_test`,
-    and, of a corpus of guests' TGSI (see [Validation](#validation)),
-    `VIRGL_TGSI_CORPUS=DIR` and `VKGL_TGSI_CORPUS=DIR`, whose
-    `TestCorpusPipelines` compiles a pipeline of each vertex and fragment
-    shader.
-2.  `runsc/ttc/test/e2e_gfx.sh` and `runsc/ttc/test/e2e_redroid.sh`, with
-    `TTC_VIRGL_BACKEND=vkgl`, which the daemon and so the renderer
-    inherit, and without, on Zink: both check that guests render on the
-    backend asked for, and redroid's screenshots, in its `out/`, compare.
-3.  Then vkgl is every platform's backend (`virgl/backend_linux.go`'s
-    `initBackend`), and Mesa leaves: `tools/mesa.BUILD`, `tools/mesa/`,
-    `@mesa` and the Python modules of its code generators in
-    `MODULE.bazel`, the decoder's C (`pipe.c`, `formats.c`, `screen.c`,
-    `screen_darwin.c`, `tgsi_check.c`, `virgl.h`, `virgl_int.h`) and
-    `zink_unsafe.go`, and Mesa's components in `THIRD_PARTY_NOTICES.md`
-    (`tools/third_party_notices.py`).
+1.  The unit tests on vkgl, `//runsc/ttc/gfxrenderer/virgl:virgl_test` and
+    `//runsc/ttc/gfxrenderer/virgl/vkgl:vkgl_test`. None had run on a Mac:
+    vkgl asked MoltenVK, which the renderer links without Vulkan's loader,
+    for the loader's `VK_KHR_portability_enumeration`, and found no device;
+    it asks only where Vulkan has it now. Of the decoder's tests,
+    `TestSubContextsAndZombies` drew nothing in one run of four, as a
+    sub-context drew from a buffer whose upload another's unflushed batch
+    held: switching sub-contexts flushes the one left now.
+2.  A corpus of guests' TGSI captured on the Mac (see
+    [Validation](#validation)): shader-db's shaders through Debian's virgl
+    driver, and redroid's SurfaceFlinger's and Settings'. Its 3,647
+    shaders create (`VIRGL_TGSI_CORPUS=DIR`'s `TestTGSICorpus`), and
+    compile into pipelines (`VKGL_TGSI_CORPUS=DIR`'s
+    `TestCorpusPipelines`), of none of FBFETCH, which Zink offered guests
+    none of on MoltenVK.
+3.  `runsc/ttc/test/e2e_gfx.sh` and `runsc/ttc/test/e2e_redroid.sh`, on
+    vkgl, of the renderer's sandbox, and on Zink: redroid's Settings, of
+    each branch of its live fork, is Zink's to the pixel, but for the
+    status bar's clock.
+
+Then vkgl became every platform's backend (`virgl/backend.go`'s
+`initBackend`), and Mesa left: `tools/mesa.BUILD`, `tools/mesa/`, `@mesa`
+and the Python modules of its code generators in `MODULE.bazel`, the
+decoder's C and `zink_unsafe.go`, and Mesa's components in
+`THIRD_PARTY_NOTICES.md`. The checks above passed again of the build of no
+Mesa, as did the macOS check of CI.
 
 ## OpenGL ES 3.1
 

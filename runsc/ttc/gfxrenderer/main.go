@@ -91,7 +91,7 @@ func Main(args []string) int {
 
 // reserveStdout returns a file of the standard output, whose descriptor
 // then refers to the standard error: the probe's output is its capability
-// sets, which libraries that print to the standard output, as Zink does,
+// sets, which libraries that print to the standard output, as Zink did,
 // would corrupt.
 func reserveStdout() (*os.File, error) {
 	fd, err := unix.Dup(1)

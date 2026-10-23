@@ -175,16 +175,13 @@ case "$result" in
   *) fail "gloffscreen: $result" ;;
 esac
 # Debian's Mesa drives the GPU with its virgl driver, which the renderer
-# serves with vkgl on the host, or on macOS with Zink, unless the daemon's
-# environment has TTC_VIRGL_BACKEND=vkgl: the same render. It does by
-# default on macOS, and elsewhere where applications ask for it, rather
-# than for the daemon's configuration's Zink in the guest.
+# serves with vkgl on the host: the same render. It does by default on
+# macOS, and elsewhere where applications ask for it, rather than for the
+# daemon's configuration's Zink in the guest.
 VIRGL=MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu
-VIRGL_BACKEND=vkgl
-if [ "$(uname -s)" = Darwin ] && [ "${TTC_VIRGL_BACKEND:-}" != vkgl ]; then VIRGL_BACKEND=zink; fi
 result=$(ttc exec -e "$VIRGL" "$NAME@main" /work/gloffscreen 2>&1) || fail "gloffscreen by virgl: $result"
 case "$result" in
-  *"renderer virgl ($VIRGL_BACKEND"*"gloffscreen: ok checksum=$WANT_GL_CHECKSUM"*) ;;
+  *"renderer virgl (vkgl"*"gloffscreen: ok checksum=$WANT_GL_CHECKSUM"*) ;;
   *) fail "gloffscreen by virgl: $result" ;;
 esac
 

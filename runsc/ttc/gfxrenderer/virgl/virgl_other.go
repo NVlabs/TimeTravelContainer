@@ -7,7 +7,7 @@ package virgl
 
 import "errors"
 
-// The renderer links Zink on macOS and Linux, with cgo.
+// The renderer renders for virgl's guests on macOS and Linux, with cgo.
 var errUnavailable = errors.New("the renderer renders for virgl's guests only on macOS and Linux")
 
 // Init fails: see Available.

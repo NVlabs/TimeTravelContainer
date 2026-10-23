@@ -19,8 +19,8 @@ import (
 // A clone's sub-contexts are backend contexts of their own, of the parent's
 // IDs, in which the clone creates the parent's objects again, of what the
 // commands that created them carried, and binds and sets what the parent's
-// state holds, of what the decoder keeps of it. Its shaders are compiled
-// again of their TGSI, which Zink's cache of live shaders finds compiled.
+// state holds, of what the decoder keeps of it. Its shaders are translated
+// again of their TGSI, of pipelines that the clone's draws compile.
 // Its resources are copies, of their parameters and contents: those that
 // the guest has are the clones that the server makes of its resources, and
 // those that only the context holds, which the guest destroyed, copies of
