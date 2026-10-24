@@ -252,3 +252,49 @@ func TestRealignVertices(t *testing.T) {
 	}
 	c.Flush().Wait()
 }
+
+// TestVertexAlignment checks the alignments of vertex elements that Vulkan
+// requires, of their channels' sizes or of packed formats' wholes, of
+// which devices of no alignment of their own realign elements, and Metal's
+// of 4 bytes at least.
+func TestVertexAlignment(t *testing.T) {
+	for _, tc := range []struct {
+		vf, want uint32
+	}{
+		{66, 1},  // R8G8B8_UNORM
+		{67, 1},  // R8G8B8A8_UNORM
+		{48, 2},  // R16_UNORM
+		{57, 2},  // R16G16_SNORM
+		{94, 2},  // R16G16B16A16_FLOAT
+		{28, 4},  // R32_FLOAT
+		{31, 4},  // R32G32B32A32_FLOAT
+		{33, 4},  // R32G32_UNORM, of no Vulkan format
+		{7, 2},   // B5G6R5_UNORM, packed
+		{8, 4},   // R10G10B10A2_UNORM, packed
+		{131, 4}, // B10G10R10A2_UNORM, packed
+	} {
+		if got := VertexAlignment(tc.vf); got != tc.want {
+			t.Errorf("VertexAlignment(%d) = %d, want %d", tc.vf, got, tc.want)
+		}
+	}
+	d := newTestDevice(t)
+	for _, tc := range []struct {
+		address        uint64
+		stride, align  uint32
+		metal, aligned bool
+	}{
+		{1, 3, 1, false, true},
+		{2, 6, 2, false, true},
+		{1, 4, 2, false, false},
+		{2, 3, 2, false, false},
+		{4, 8, 4, false, true},
+		{2, 4, 4, false, false},
+		{2, 6, 2, true, false},
+		{4, 12, 1, true, true},
+	} {
+		d.alignedVertices = tc.metal
+		if got := d.VertexAligned(tc.address, tc.stride, tc.align); got != tc.aligned {
+			t.Errorf("VertexAligned(%d, %d, %d) of Metal %v = %v, want %v", tc.address, tc.stride, tc.align, tc.metal, got, tc.aligned)
+		}
+	}
+}

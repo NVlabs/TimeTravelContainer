@@ -59,10 +59,15 @@ func (d *Device) VertexFetch(vf uint32) (uint32, tospirv.VertexFetch, bool) {
 }
 
 // VertexAligned reports whether the device fetches vertex elements of an
-// address, of a buffer's offset and an element's, and a stride: of
-// multiples of 4, of Metal's, and of any of others.
-func (d *Device) VertexAligned(address uint64, stride uint32) bool {
-	return !d.alignedVertices || address%4 == 0 && stride%4 == 0
+// address, of a buffer's offset and an element's, and a stride, of
+// multiples of align, VertexAlignment's of the elements' format, as Vulkan
+// requires, and of 4 too on Metal.
+func (d *Device) VertexAligned(address uint64, stride, align uint32) bool {
+	a := uint64(max(align, 1))
+	if d.alignedVertices {
+		a = max(a, 4)
+	}
+	return address%a == 0 && uint64(stride)%a == 0
 }
 
 // RealignVertices copies the elements, of size bytes, of count vertices from

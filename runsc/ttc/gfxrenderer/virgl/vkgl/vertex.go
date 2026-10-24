@@ -5,6 +5,8 @@ package vkgl
 
 import (
 	"regexp"
+	"strconv"
+	"strings"
 
 	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer/virgl/tospirv"
 )
@@ -57,6 +59,34 @@ const (
 	MaxRealigned     = 1 << 20
 	maxRealignedSize = 1 << 28
 )
+
+// VertexAlignment returns the alignment of the addresses of vertex
+// elements of virgl's format vf, and so of their strides, that Vulkan
+// requires: of the size of each of its channels, or of a packed format's
+// whole.
+func VertexAlignment(vf uint32) uint32 {
+	if _, ok := fetch32(vf); ok {
+		return 4
+	}
+	f, ok := LookupFormat(vf)
+	if !ok {
+		return 1
+	}
+	layout, _, _ := strings.Cut(f.Name, "_")
+	bits := -1
+	for _, ch := range channelsRE.FindAllString(layout, -1) {
+		n, _ := strconv.Atoi(ch[1:])
+		if bits >= 0 && n != bits || n%8 != 0 {
+			// Of channels of no whole bytes, or of differing sizes.
+			return f.BlockBytes
+		}
+		bits = n
+	}
+	if bits <= 0 {
+		return f.BlockBytes
+	}
+	return uint32(bits / 8)
+}
 
 // VertexElementSize returns the bytes of a vertex element of virgl's
 // format vf.

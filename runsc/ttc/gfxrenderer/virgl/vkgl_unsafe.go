@@ -1594,7 +1594,7 @@ func (c *vkglContext) draw(d []uint32, a drawArgs) error {
 			stride = ve.strides[e.Buffer]
 		}
 		buf, offset, elementOffset := vb.res.buf, uint64(vb.offset), e.Offset
-		if address := offset + uint64(e.Offset); !c.b.d.VertexAligned(address, stride) {
+		if address := offset + uint64(e.Offset); !c.b.d.VertexAligned(address, stride, vkgl.VertexAlignment(e.VirglFormat)) {
 			first, count := vertexRange(d, a, e.InstanceDivisor, buf.Size(), address, stride)
 			var err error
 			if buf, stride, err = c.ctx.RealignVertices(buf, address, stride, vkgl.VertexElementSize(e.VirglFormat), first, count); err != nil {

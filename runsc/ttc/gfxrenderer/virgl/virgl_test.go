@@ -777,25 +777,41 @@ DCL OUT[0], COLOR
 // TestUnalignedVertices draws the triangle of positions of bytes at an
 // offset of no multiple of 4, as OpenGL's vertex attributes may be, of the
 // vertex buffer's offset and of the element's: Metal fetches vertex
-// buffers of offsets of multiples of 4 alone.
+// buffers of offsets of multiples of 4 alone. And of positions of 16-bit
+// channels at an odd offset, which no Vulkan device fetches.
 func TestUnalignedVertices(t *testing.T) {
 	f := newFixture(t)
-	const formatR8G8B8A8Snorm = 77
+	const (
+		formatR8G8B8A8Snorm     = 77
+		formatR16G16B16A16Snorm = 59
+	)
 	// The fixture's triangle, of normalized bytes, after a byte.
 	posMem := []byte{0xaa, 0x81, 0x81, 0, 127, 0, 0x81, 0, 127, 0x81, 127, 0, 127}
 	pos, aligned := f.buffer(t, posMem), f.buffer(t, posMem[1:])
+	// And of normalized 16-bit integers, after a byte.
+	var pos16Mem []byte
+	for _, b := range posMem[1:] {
+		pos16Mem = binary.LittleEndian.AppendUint16(pos16Mem, uint16(int16(int8(b))*258))
+	}
+	pos16 := f.buffer(t, append([]byte{0xaa}, pos16Mem...))
 	for _, tc := range []struct {
 		name           string
 		vb             *Resource
+		format, stride uint32
 		vbOffset, eOff uint32
-	}{{"aligned", aligned, 0, 0}, {"of the buffer's offset", pos, 1, 0}, {"of the element's", pos, 0, 1}} {
+	}{
+		{"aligned", aligned, formatR8G8B8A8Snorm, 4, 0, 0},
+		{"of the buffer's offset", pos, formatR8G8B8A8Snorm, 4, 1, 0},
+		{"of the element's", pos, formatR8G8B8A8Snorm, 4, 0, 1},
+		{"of 16-bit channels at an odd offset", pos16, formatR16G16B16A16Snorm, 8, 1, 0},
+	} {
 		var s stream
 		f.setup(&s)
 		clearRed(&s)
 		ve := f.id()
-		s.cmd(cmdCreateObject, objectVertexElements, ve, tc.eOff, 0, 0, formatR8G8B8A8Snorm)
+		s.cmd(cmdCreateObject, objectVertexElements, ve, tc.eOff, 0, 0, tc.format)
 		s.cmd(cmdBindObject, objectVertexElements, ve)
-		s.cmd(cmdSetVertexBuffers, 0, 4, tc.vbOffset, tc.vb.ID())
+		s.cmd(cmdSetVertexBuffers, 0, tc.stride, tc.vbOffset, tc.vb.ID())
 		drawTriangle(&s)
 		f.submit(t, s)
 		f.finish(t)
