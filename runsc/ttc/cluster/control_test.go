@@ -27,6 +27,9 @@ import (
 	"time"
 )
 
+// testClusterToken authenticates the tests' cluster peers.
+const testClusterToken = "test-cluster-token"
+
 type testDaemonProxy struct {
 	delay time.Duration
 }
@@ -50,12 +53,12 @@ func TestProxyDaemonUsesDedicatedNonReusedTransport(t *testing.T) {
 		t.Fatal(err)
 	}
 	control := &ControlPlane{
-		Store: store, MaxTransactions: 1, Now: time.Now,
+		AuthToken: testClusterToken, Store: store, MaxTransactions: 1, Now: time.Now,
 		CommandProxy: testDaemonProxy{delay: 10 * time.Millisecond},
 	}
 	server := httptest.NewServer(control)
 	defer server.Close()
-	client, err := NewPlainClient(server.URL, "source", "", time.Second)
+	client, err := NewPlainClient(server.URL, "source", testClusterToken, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +83,7 @@ func TestProxyDaemonIsFullDuplexBeforeUploadEOF(t *testing.T) {
 		t.Fatal(err)
 	}
 	control := &ControlPlane{
-		Store: store, MaxTransactions: 1, Now: time.Now,
+		AuthToken: testClusterToken, Store: store, MaxTransactions: 1, Now: time.Now,
 		CommandProxy: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			controller := http.NewResponseController(w)
 			if err := controller.EnableFullDuplex(); err != nil {
@@ -99,7 +102,7 @@ func TestProxyDaemonIsFullDuplexBeforeUploadEOF(t *testing.T) {
 	}
 	server := httptest.NewServer(control)
 	defer server.Close()
-	client, err := NewPlainClient(server.URL, "source", "", time.Second)
+	client, err := NewPlainClient(server.URL, "source", testClusterToken, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +139,7 @@ func TestRenewExecutionAuthorityRunsOnTarget(t *testing.T) {
 	}
 	var calls atomic.Int32
 	control := &ControlPlane{
-		Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1, Now: time.Now,
+		AuthToken: testClusterToken, Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1, Now: time.Now,
 		RenewExecution: func(context.Context) error {
 			calls.Add(1)
 			return nil
@@ -144,7 +147,7 @@ func TestRenewExecutionAuthorityRunsOnTarget(t *testing.T) {
 	}
 	server := httptest.NewServer(control)
 	defer server.Close()
-	client, err := NewPlainClient(server.URL, "source", "", time.Second)
+	client, err := NewPlainClient(server.URL, "source", testClusterToken, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +165,7 @@ func TestProxyPortCarriesBidirectionalStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	control := &ControlPlane{
-		Store: store, MaxTransactions: 1, Now: time.Now,
+		AuthToken: testClusterToken, Store: store, MaxTransactions: 1, Now: time.Now,
 		PortProxy: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if got := r.URL.Query().Get("family") + "@" + r.URL.Query().Get("branch") + ":" + r.URL.Query().Get("port"); got != "web@main:8080" {
 				t.Errorf("port target=%q", got)
@@ -174,7 +177,7 @@ func TestProxyPortCarriesBidirectionalStream(t *testing.T) {
 	}
 	server := httptest.NewServer(control)
 	defer server.Close()
-	client, err := NewPlainClient(server.URL, "source", "", time.Second)
+	client, err := NewPlainClient(server.URL, "source", testClusterToken, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +196,7 @@ func TestProxyPortIsFullDuplexBeforeUploadEOF(t *testing.T) {
 		t.Fatal(err)
 	}
 	control := &ControlPlane{
-		Store: store, MaxTransactions: 1, Now: time.Now,
+		AuthToken: testClusterToken, Store: store, MaxTransactions: 1, Now: time.Now,
 		PortProxy: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			controller := http.NewResponseController(w)
 			if err := controller.EnableFullDuplex(); err != nil {
@@ -212,7 +215,7 @@ func TestProxyPortIsFullDuplexBeforeUploadEOF(t *testing.T) {
 	}
 	server := httptest.NewServer(control)
 	defer server.Close()
-	client, err := NewPlainClient(server.URL, "source", "", time.Second)
+	client, err := NewPlainClient(server.URL, "source", testClusterToken, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -348,10 +351,10 @@ func TestSnapshotReferenceProviderReceivesBoundedOperation(t *testing.T) {
 		t.Fatal(err)
 	}
 	provider := &testSnapshotReferenceProvider{}
-	control := &ControlPlane{Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1, Now: time.Now, SnapshotReferences: provider}
+	control := &ControlPlane{AuthToken: testClusterToken, Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1, Now: time.Now, SnapshotReferences: provider}
 	server := httptest.NewServer(control)
 	defer server.Close()
-	client, err := NewPlainClient(server.URL, "target", "", time.Second)
+	client, err := NewPlainClient(server.URL, "target", testClusterToken, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -404,10 +407,10 @@ func TestSharedReferenceProviderReceivesImportAndCatchup(t *testing.T) {
 		t.Fatal(err)
 	}
 	provider := &testSharedReferenceProvider{}
-	control := &ControlPlane{Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1, Now: time.Now, SharedReferences: provider}
+	control := &ControlPlane{AuthToken: testClusterToken, Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1, Now: time.Now, SharedReferences: provider}
 	server := httptest.NewServer(control)
 	defer server.Close()
-	client, err := NewPlainClient(server.URL, "target", "", time.Second)
+	client, err := NewPlainClient(server.URL, "target", testClusterToken, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -443,10 +446,10 @@ func TestSnapshotReferenceInventoryRoundTrip(t *testing.T) {
 		Roots: []SnapshotRootBinding{{Slot: 3, Object: "000000000000002a-03-0000000000000001"}},
 	}}
 	inventory := &testReferenceInventory{inventory: SnapshotReferenceInventory{NodeID: "target", Incarnation: "target-boot", Claims: want}}
-	control := &ControlPlane{Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1, Now: time.Now, ReferenceInventory: inventory}
+	control := &ControlPlane{AuthToken: testClusterToken, Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1, Now: time.Now, ReferenceInventory: inventory}
 	server := httptest.NewServer(control)
 	defer server.Close()
-	client, err := NewPlainClient(server.URL, "coordinator", "", time.Second)
+	client, err := NewPlainClient(server.URL, "coordinator", testClusterToken, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -485,10 +488,10 @@ func TestImmutableSnapshotProviderStreamsExactCatalog(t *testing.T) {
 	}
 	provider := &testImmutableObjectProvider{data: []byte(`{"version":1,"snapshot":42,"objects":[]}`)}
 	provider.length = uint64(len(provider.data))
-	control := &ControlPlane{Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1, Now: time.Now, SnapshotProvider: provider}
+	control := &ControlPlane{AuthToken: testClusterToken, Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1, Now: time.Now, SnapshotProvider: provider}
 	server := httptest.NewServer(control)
 	defer server.Close()
-	client, err := NewPlainClient(server.URL, "source", "", time.Second)
+	client, err := NewPlainClient(server.URL, "source", testClusterToken, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -517,10 +520,10 @@ func TestImmutableSnapshotProviderStreamsOneMetadataObject(t *testing.T) {
 	}
 	provider := &testImmutableObjectProvider{data: []byte(`{"ID":{"Snapshot":42,"Ordinal":7,"Kind":4},"State":"live","Refs":1,"BulkLength":0,"Data":null,"Children":null}`)}
 	provider.length = uint64(len(provider.data))
-	control := &ControlPlane{Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1, Now: time.Now, SnapshotProvider: provider}
+	control := &ControlPlane{AuthToken: testClusterToken, Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1, Now: time.Now, SnapshotProvider: provider}
 	server := httptest.NewServer(control)
 	defer server.Close()
-	client, err := NewPlainClient(server.URL, "source", "", time.Second)
+	client, err := NewPlainClient(server.URL, "source", testClusterToken, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -550,10 +553,10 @@ func TestImmutableObjectProviderStreamsExactObject(t *testing.T) {
 	}
 	provider := &testImmutableObjectProvider{data: bytes.Repeat([]byte("object"), 1000)}
 	provider.length = uint64(len(provider.data))
-	control := &ControlPlane{Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1, Now: time.Now, ObjectProvider: provider}
+	control := &ControlPlane{AuthToken: testClusterToken, Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1, Now: time.Now, ObjectProvider: provider}
 	server := httptest.NewServer(control)
 	defer server.Close()
-	client, err := NewPlainClient(server.URL, "source", "", time.Second)
+	client, err := NewPlainClient(server.URL, "source", testClusterToken, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -813,7 +816,7 @@ func TestMutualTLSControlPlaneReservationStatusAndCancel(t *testing.T) {
 	}
 	now := time.Unix(2000, 0)
 	control := &ControlPlane{
-		Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1,
+		AuthToken: testClusterToken, Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1,
 		Now:           func() time.Time { now = now.Add(time.Second); return now },
 		TargetRuntime: &testTargetRuntime{},
 	}
@@ -874,12 +877,12 @@ func TestControlPlaneReservationResolvesLostAdvanceResponse(t *testing.T) {
 	}
 	store := &staleReservationStore{TransactionCatalog: base}
 	control := &ControlPlane{
-		Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1,
+		AuthToken: testClusterToken, Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1,
 		Now: time.Now, TargetRuntime: &testTargetRuntime{},
 	}
 	server := httptest.NewServer(control)
 	defer server.Close()
-	client, err := NewPlainClient(server.URL, "source", "", 5*time.Second)
+	client, err := NewPlainClient(server.URL, "source", testClusterToken, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -908,7 +911,7 @@ func TestCancelFailedPreparationReclaimsTargetWithoutRewritingFailure(t *testing
 	}
 	runtime := &testTargetRuntime{prepareErr: context.DeadlineExceeded}
 	control := &ControlPlane{
-		Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1,
+		AuthToken: testClusterToken, Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1,
 		Now: time.Now, TargetRuntime: runtime,
 	}
 	server := httptest.NewUnstartedServer(control)
@@ -965,7 +968,7 @@ func TestMutualTLSControlPlanePreparePublishAndDrain(t *testing.T) {
 	runtime := &testTargetRuntime{}
 	now := time.Unix(3000, 0)
 	control := &ControlPlane{
-		Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1,
+		AuthToken: testClusterToken, Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1,
 		Now: func() time.Time { now = now.Add(time.Second); return now }, TargetRuntime: runtime,
 	}
 	server := httptest.NewUnstartedServer(control)
@@ -1065,12 +1068,12 @@ func TestMigrationPublishRetryCannotActivateBeforeCutover(t *testing.T) {
 	}
 	runtime := &testTargetRuntime{}
 	control := &ControlPlane{
-		Capabilities: testCapabilities("target"), Store: &atomicTestTransactionStore{Store: store},
+		AuthToken: testClusterToken, Capabilities: testCapabilities("target"), Store: &atomicTestTransactionStore{Store: store},
 		MaxTransactions: 1, Now: time.Now, TargetRuntime: runtime,
 	}
 	server := httptest.NewServer(control)
 	defer server.Close()
-	client, err := NewPlainClient(server.URL, "source", "", 5*time.Second)
+	client, err := NewPlainClient(server.URL, "source", testClusterToken, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1121,10 +1124,10 @@ func TestTransactionLostResponsesRecoverAtEveryPersistentBoundary(t *testing.T) 
 	start := func(catalog TransactionCatalog) (*Client, func()) {
 		t.Helper()
 		server := httptest.NewServer(&ControlPlane{
-			Capabilities: testCapabilities("target"), Store: catalog,
+			AuthToken: testClusterToken, Capabilities: testCapabilities("target"), Store: catalog,
 			MaxTransactions: 1, Now: time.Now, TargetRuntime: runtime,
 		})
-		client, err := NewPlainClient(server.URL, "source", "", 5*time.Second)
+		client, err := NewPlainClient(server.URL, "source", testClusterToken, 5*time.Second)
 		if err != nil {
 			server.Close()
 			t.Fatal(err)
@@ -1242,7 +1245,7 @@ func TestMutualTLSControlPlaneGraphHandoffIsDurableAndIdempotent(t *testing.T) {
 	runtime := &testTargetRuntime{}
 	now := time.Unix(4000, 0)
 	control := &ControlPlane{
-		Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1,
+		AuthToken: testClusterToken, Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1,
 		Now: func() time.Time { now = now.Add(time.Second); return now }, TargetRuntime: runtime,
 	}
 	server := httptest.NewUnstartedServer(control)
@@ -1396,7 +1399,7 @@ func TestControlPlaneRejectsCertificateNodeMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	control := &ControlPlane{
-		Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1, Now: time.Now,
+		AuthToken: testClusterToken, Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1, Now: time.Now,
 	}
 	server := httptest.NewUnstartedServer(control)
 	server.TLS = serverTLS
@@ -1414,14 +1417,20 @@ func TestControlPlaneRejectsCertificateNodeMismatch(t *testing.T) {
 	}
 }
 
-func TestPlainControlPlaneOptionalToken(t *testing.T) {
+// TestPlainControlPlaneRequiresToken asks with the cluster's token, with
+// another, and with none: only the first is admitted. A control plane without
+// a token admits no one, not even a caller naming a node, as a cluster
+// without a token once did to whoever reached its listener, guests included.
+func TestPlainControlPlaneRequiresToken(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "transactions"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	proxied := false
 	control := &ControlPlane{
 		Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 2,
 		Now: time.Now, AuthToken: "cluster-secret", TargetRuntime: &testTargetRuntime{},
+		CommandProxy: http.HandlerFunc(func(http.ResponseWriter, *http.Request) { proxied = true }),
 	}
 	server := httptest.NewServer(control)
 	defer server.Close()
@@ -1444,6 +1453,35 @@ func TestPlainControlPlaneOptionalToken(t *testing.T) {
 		SourceCapabilities: testCapabilities("source"), Identity: identity, Family: testRemoteFamilyDescriptor(),
 	}); err == nil || !strings.Contains(err.Error(), "authentication token") {
 		t.Fatalf("wrong token error=%v", err)
+	}
+	if _, err := NewPlainClient(server.URL, "source", "", 5*time.Second); err == nil {
+		t.Fatal("a client without a token was made")
+	}
+	open := &ControlPlane{
+		Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 2,
+		Now: time.Now, TargetRuntime: &testTargetRuntime{}, CommandProxy: control.CommandProxy,
+	}
+	tokenless := httptest.NewServer(open)
+	defer tokenless.Close()
+	for _, url := range []string{server.URL, tokenless.URL} {
+		for _, authorization := range []string{"", "Bearer ", "Bearer wrong"} {
+			request, err := http.NewRequest(http.MethodPost, url+controlProxyPath, strings.NewReader("{}"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.Header.Set(controlNodeHeader, "source")
+			if authorization != "" {
+				request.Header.Set("Authorization", authorization)
+			}
+			response, err := http.DefaultClient.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response.Body.Close()
+			if response.StatusCode != http.StatusUnauthorized || proxied {
+				t.Fatalf("daemon proxy with authorization %q: status %d, proxied %t", authorization, response.StatusCode, proxied)
+			}
+		}
 	}
 }
 

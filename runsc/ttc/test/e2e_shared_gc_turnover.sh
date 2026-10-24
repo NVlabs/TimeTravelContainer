@@ -11,7 +11,6 @@ IMAGE=${TTC_SHARED_GC_TEST_IMAGE:-busybox:1.36}
 NAME=${TTC_SHARED_GC_TEST_NAME:-ttc-shared-gc-turnover-$$}
 ROOT=${TTC_SHARED_GC_TEST_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/ttc-shared-gc-turnover.XXXXXX")}
 SHARED=${TTC_SHARED_GC_TEST_SHARED_ROOT:-$ROOT/shared}
-TOKEN=ttc-shared-gc-turnover-$NAME
 PORT_A=${TTC_SHARED_GC_TEST_PORT_A:-20183}
 PORT_B=${TTC_SHARED_GC_TEST_PORT_B:-20193}
 PORT_C=${TTC_SHARED_GC_TEST_PORT_C:-20203}
@@ -85,7 +84,7 @@ start_node() {
 	shift 2
 	# A daemon's root holds its socket, and must be private.
 	mkdir -p -m 700 "$ROOT/local-$node"
-	TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$ROOT/local-$node TTC_CLUSTER_TOKEN=$TOKEN \
+	TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$ROOT/local-$node \
 		setsid "$TTCD" --node "node-$node" \
 		--listen "127.0.0.1:$port" --advertise "127.0.0.1:$port" \
 		--memory-target 64GiB --cluster-lease "$CLUSTER_LEASE" --unsafe-no-host-isolation "$@" \

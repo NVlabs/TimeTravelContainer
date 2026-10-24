@@ -18,7 +18,6 @@ SHARED=$ROOT/shared
 LOCAL=$ROOT/local
 SOCKET=$LOCAL/ttcd.sock
 PORT=${TTC_PUBLICATION_TEST_PORT:-29983}
-TOKEN=ttc-publication-restart-$NAME
 COMMAND_TIMEOUT=${TTC_E2E_COMMAND_TIMEOUT:-120s}
 KEEP_ROOT=${TTC_PUBLICATION_TEST_KEEP_ROOT:-}
 PID=
@@ -88,7 +87,7 @@ wait_active() {
 mkdir -p "$SHARED"
 # A daemon's root holds its socket, and must be private.
 mkdir -p -m 700 "$LOCAL"
-TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$LOCAL TTC_CLUSTER_TOKEN=$TOKEN \
+TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$LOCAL \
 	setsid "$TTCD" --node node-a --listen "127.0.0.1:$PORT" \
 	--advertise "127.0.0.1:$PORT" --unsafe-no-host-isolation \
 	>"$LOCAL/ttcd.log" 2>&1 &

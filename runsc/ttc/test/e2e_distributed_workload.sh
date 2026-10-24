@@ -17,7 +17,6 @@ ROOT=${TTC_DISTRIBUTED_WORKLOAD_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/ttc-distribut
 SHARED=${TTC_DISTRIBUTED_WORKLOAD_SHARED_ROOT:-$ROOT/shared}
 PORT_A=${TTC_DISTRIBUTED_WORKLOAD_PORT_A:-25883}
 PORT_B=${TTC_DISTRIBUTED_WORKLOAD_PORT_B:-25893}
-TOKEN=ttc-distributed-workload-$NAME
 COMMAND_TIMEOUT=${TTC_E2E_COMMAND_TIMEOUT:-300s}
 MEMORY_MIB=${TTC_DISTRIBUTED_WORKLOAD_MEMORY_MIB:-128}
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -85,7 +84,7 @@ start_node() {
 	shift 2
 	# A daemon's root holds its socket, and must be private.
 	mkdir -p -m 700 "$ROOT/local-$node"
-	TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$ROOT/local-$node TTC_CLUSTER_TOKEN=$TOKEN \
+	TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$ROOT/local-$node \
 		setsid "$TTCD" --node "node-$node" \
 		--listen "127.0.0.1:$port" --advertise "127.0.0.1:$port" \
 		--memory-target 8GiB --cluster-lease 15s --unsafe-no-host-isolation "$@" \

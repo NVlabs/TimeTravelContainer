@@ -13,7 +13,6 @@ NAME=${TTC_CLUSTER_RESTART_NAME:-ttc-cluster-restart-$$}
 ROOT=${TTC_CLUSTER_RESTART_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/ttc-cluster-restart.XXXXXX")}
 PORT_A=${TTC_CLUSTER_RESTART_PORT_A:-23583}
 PORT_B=${TTC_CLUSTER_RESTART_PORT_B:-23593}
-TOKEN=ttc-cluster-restart-$NAME
 KEEP_ROOT=${TTC_CLUSTER_RESTART_KEEP_ROOT:-}
 
 socket() { printf '%s/local-%s/ttcd.sock' "$ROOT" "$1"; }
@@ -27,7 +26,7 @@ start_node() {
 	node=$1
 	port=$2
 	shift 2
-	TTC_ROOT=$ROOT/shared TTC_LOCAL_ROOT=$ROOT/local-$node TTC_CLUSTER_TOKEN=$TOKEN \
+	TTC_ROOT=$ROOT/shared TTC_LOCAL_ROOT=$ROOT/local-$node \
 		timeout 60s "$TTC" daemon start \
 			--node "node-$node" --listen "127.0.0.1:$port" \
 			--advertise "127.0.0.1:$port" --memory-target 8GiB \

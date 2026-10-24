@@ -21,7 +21,6 @@ LOCAL_A=$ROOT/local-a
 LOCAL_B=$ROOT/local-b
 SOCKET_A=$LOCAL_A/ttcd.sock
 SOCKET_B=$LOCAL_B/ttcd.sock
-TOKEN=ttc-distributed-active-fs-$NAME
 PID_A=
 PID_B=
 
@@ -53,13 +52,13 @@ wait_ready() {
 mkdir -p "$SHARED"
 # A daemon's root holds its socket, and must be private.
 mkdir -p -m 700 "$LOCAL_A" "$LOCAL_B"
-TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$LOCAL_A TTC_CLUSTER_TOKEN=$TOKEN \
+TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$LOCAL_A \
 	"$TTCD" --node node-a \
 	--listen "127.0.0.1:$PORT_A" --advertise "127.0.0.1:$PORT_A" \
 	--memory-target 64GiB $DAEMON_EXTRA >"$LOCAL_A/ttcd.log" 2>&1 &
 PID_A=$!
 wait_ready "$LOCAL_A" "$LOCAL_A/ttcd.log"
-TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$LOCAL_B TTC_CLUSTER_TOKEN=$TOKEN \
+TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$LOCAL_B \
 	"$TTCD" --node node-b \
 	--listen "127.0.0.1:$PORT_B" --advertise "127.0.0.1:$PORT_B" \
 	--memory-target 64GiB $DAEMON_EXTRA >"$LOCAL_B/ttcd.log" 2>&1 &

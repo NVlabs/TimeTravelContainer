@@ -544,9 +544,10 @@ local or durable, the target no longer depends on the source process.
 The nodes must use the same shared TTC data root, run the exact same TTC build
 and architecture, and be able to reach each other's cluster addresses. TTC's
 cluster transport is plaintext because the cluster assumes an OpenMPI-style
-trusted private network. Set the same `TTC_CLUSTER_TOKEN` on every node when a
-shared bearer secret is useful; omit it only when every process that can reach
-the cluster network is trusted as a cluster administrator.
+trusted private network. The nodes authenticate one another with a token that
+the cluster's first daemon makes in the shared root, readable only by the
+root's owner: whoever can read the shared root administers the cluster. A
+request without the token, from another host or from a container, is refused.
 
 The shared root anchors the cluster, and every node starts alike, in any
 order and at any time, as the jobs of a batch system do:
@@ -554,7 +555,6 @@ order and at any time, as the jobs of a batch system do:
 ```shell
 export TTC_ROOT=/shared/ttc
 export TTC_LOCAL_ROOT=/local/scratch/ttc-node-a
-export TTC_CLUSTER_TOKEN='replace-with-a-cluster-secret' # optional, the same on every node
 ttc daemon start --node node-a \
   --listen 0.0.0.0:7443 --advertise node-a.example:7443 \
   --memory-target 64GiB
@@ -580,7 +580,6 @@ run an outbound-only gateway:
 ```shell
 export TTC_ROOT=/shared/ttc
 export TTC_LOCAL_ROOT=/local/scratch/ttc-login
-export TTC_CLUSTER_TOKEN='replace-with-a-cluster-secret' # same optional value
 ttc daemon start --control-only
 ```
 

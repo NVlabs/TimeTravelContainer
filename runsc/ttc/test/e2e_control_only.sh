@@ -15,7 +15,6 @@ ROOT=${TTC_CONTROL_ONLY_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/ttc-control-only.XXXX
 PORT_A=${TTC_CONTROL_ONLY_PORT_A:-28383}
 PORT_B=${TTC_CONTROL_ONLY_PORT_B:-28393}
 HOST_PORT=${TTC_CONTROL_ONLY_HOST_PORT:-28403}
-TOKEN=ttc-control-only-$NAME
 SUCCESS=
 PID_A=
 PID_B=
@@ -81,7 +80,7 @@ start_compute() {
 	mkdir -p "$ROOT/shared"
 	# A daemon's root holds its socket, and must be private.
 	mkdir -p -m 700 "$ROOT/local-$node"
-	TTC_ROOT=$ROOT/shared TTC_LOCAL_ROOT=$ROOT/local-$node TTC_CLUSTER_TOKEN=$TOKEN \
+	TTC_ROOT=$ROOT/shared TTC_LOCAL_ROOT=$ROOT/local-$node \
 		setsid "$TTCD" --node "node-$node" \
 		--listen "127.0.0.1:$port" --advertise "127.0.0.1:$port" \
 		--memory-target 8GiB --unsafe-no-host-isolation "$@" \
@@ -108,7 +107,7 @@ for _ in $(seq 1 300); do
 done
 test "$(client a node ls --json | jq 'length')" -eq 2 || fail "compute nodes did not converge"
 
-TTC_ROOT=$ROOT/shared TTC_LOCAL_ROOT=$ROOT/local-control TTC_CLUSTER_TOKEN=$TOKEN \
+TTC_ROOT=$ROOT/shared TTC_LOCAL_ROOT=$ROOT/local-control \
 	setsid "$TTCD" --control-only \
 	>"$ROOT/local-control/ttcd.log" 2>&1 &
 PID_CONTROL=$!

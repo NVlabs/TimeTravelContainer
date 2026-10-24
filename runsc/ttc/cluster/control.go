@@ -749,8 +749,9 @@ type ControlPlane struct {
 	// must not validate a newly committed joining identity against a stale
 	// read.
 	TopologyState func(context.Context) (*AuthorityState, error)
-	// AuthToken optionally authenticates peers on a trusted plaintext network.
-	// It provides admission control only; it does not provide confidentiality.
+	// AuthToken authenticates peers on a trusted plaintext network; without
+	// it, or a verified TLS client certificate, every request is refused. It
+	// provides admission control only; it does not provide confidentiality.
 	AuthToken string
 	// CommandProxy forwards the TTC daemon wire protocol after peer
 	// authentication. It is optional for non-elastic deployments.
@@ -881,7 +882,7 @@ func (c *ControlPlane) lockTransaction(id string) func() {
 }
 
 // ServeHTTP serves the versioned reservation/status/cancel API. TTC's daemon
-// uses plaintext HTTP on a trusted private network and may require AuthToken;
+// uses plaintext HTTP on a trusted private network and requires AuthToken;
 // TLS remains usable by embedders of this package.
 func (c *ControlPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if c.Store == nil || c.Now == nil || c.MaxTransactions <= 0 {
@@ -1887,11 +1888,14 @@ func verifiedPeerNodeID(r *http.Request, token string) (string, error) {
 		}
 		return nodeID, nil
 	}
-	if token != "" {
-		value := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if subtle.ConstantTimeCompare([]byte(value), []byte(token)) != 1 {
-			return "", errors.New("invalid cluster authentication token")
-		}
+	// Without a token, no peer is authenticated: a caller names whichever
+	// node it likes.
+	if token == "" {
+		return "", errors.New("cluster control plane has no authentication token")
+	}
+	value := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if subtle.ConstantTimeCompare([]byte(value), []byte(token)) != 1 {
+		return "", errors.New("invalid cluster authentication token")
 	}
 	nodeID := r.Header.Get(controlNodeHeader)
 	if nodeID == "" {
@@ -1938,8 +1942,8 @@ func NewPlainClient(baseURL, nodeID, authToken string, timeout time.Duration) (*
 	if err != nil || parsed.Scheme != "http" || parsed.Host == "" || parsed.Path != "" {
 		return nil, fmt.Errorf("invalid plaintext cluster peer URL %q", baseURL)
 	}
-	if nodeID == "" || timeout <= 0 {
-		return nil, errors.New("cluster client requires a node ID and positive timeout")
+	if nodeID == "" || authToken == "" || timeout <= 0 {
+		return nil, errors.New("cluster client requires a node ID, an authentication token and a positive timeout")
 	}
 	// Daemon tunnels are deliberately not pooled with bounded control calls or
 	// immutable-object reads. A tunnel can remain open for an interactive exec

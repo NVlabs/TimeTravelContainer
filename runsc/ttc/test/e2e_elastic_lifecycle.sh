@@ -12,7 +12,6 @@ NAME=${TTC_ELASTIC_TEST_NAME:-ttc-elastic-lifecycle-$$}
 FOREGROUND_NAME=$NAME-foreground
 ROOT=${TTC_ELASTIC_TEST_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/ttc-elastic-lifecycle.XXXXXX")}
 SHARED=${TTC_ELASTIC_TEST_SHARED_ROOT:-$ROOT/shared}
-TOKEN=ttc-elastic-lifecycle-$NAME
 PORT_A=${TTC_ELASTIC_TEST_PORT_A:-19883}
 PORT_B=${TTC_ELASTIC_TEST_PORT_B:-19893}
 PORT_C=${TTC_ELASTIC_TEST_PORT_C:-19903}
@@ -91,7 +90,7 @@ start_node() {
 	shift 2
 	# A daemon's root holds its socket, and must be private.
 	mkdir -p -m 700 "$ROOT/local-$node"
-	TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$ROOT/local-$node TTC_CLUSTER_TOKEN=$TOKEN \
+	TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$ROOT/local-$node \
 		setsid "$TTCD" --node "node-$node" \
 		--listen "127.0.0.1:$port" --advertise "127.0.0.1:$port" \
 		--memory-target 64GiB --cluster-lease 15s --unsafe-no-host-isolation "$@" \

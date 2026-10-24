@@ -11,7 +11,6 @@ IMAGE=${TTC_ELASTIC_DRAIN_IMAGE:-busybox:1.36}
 ROOT=${TTC_ELASTIC_DRAIN_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/ttc-elastic-drain.XXXXXX")}
 SHARED=${TTC_ELASTIC_DRAIN_SHARED_ROOT:-$ROOT/shared}
 NAME=drain-recovery-$$
-TOKEN=ttc-elastic-drain-$$
 COMMAND_TIMEOUT=${TTC_E2E_COMMAND_TIMEOUT:-120s}
 PORT_A=${TTC_ELASTIC_DRAIN_PORT_A:-20583}
 PORT_B=${TTC_ELASTIC_DRAIN_PORT_B:-20593}
@@ -78,7 +77,7 @@ start_node() {
 	shift 2
 	# A daemon's root holds its socket, and must be private.
 	mkdir -p -m 700 "$ROOT/local-$node"
-	TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$ROOT/local-$node TTC_CLUSTER_TOKEN=$TOKEN \
+	TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$ROOT/local-$node \
 		setsid "$TTCD" --node "node-$node" \
 		--listen "127.0.0.1:$port" --advertise "127.0.0.1:$port" \
 		--memory-target 64GiB --cluster-lease 6s --unsafe-no-host-isolation "$@" \

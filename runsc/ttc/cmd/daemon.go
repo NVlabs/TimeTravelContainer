@@ -795,7 +795,10 @@ func sharedRootComputePeers(sharedRoot string) []string {
 }
 
 func prepareControlOnlyCluster(opts daemonClusterOptions, sharedRoot string) (*controlOnlyCluster, error) {
-	control := &controlOnlyCluster{nodeID: opts.NodeID, repositoryID: opts.RepositoryID, authToken: os.Getenv("TTC_CLUSTER_TOKEN"), sharedRoot: sharedRoot}
+	if opts.AuthToken == "" {
+		return nil, errors.New("a control-only daemon needs its cluster's token")
+	}
+	control := &controlOnlyCluster{nodeID: opts.NodeID, repositoryID: opts.RepositoryID, authToken: opts.AuthToken, sharedRoot: sharedRoot}
 	if sharedRoot != "" {
 		control.shared = cluster.NewSharedCluster(sharedRoot).KeepFilesOpen()
 	}
@@ -4271,6 +4274,12 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 			}
 		}
 	}
+	if os.Getenv("TTC_CLUSTER_TOKEN") != "" {
+		// Earlier daemons took their cluster's token from here; none leaks
+		// to the processes the daemon starts.
+		fmt.Fprintln(stderr, "ttcd: warning: TTC_CLUSTER_TOKEN is ignored: a cluster's daemons authenticate with the token in its TTC_ROOT")
+		os.Unsetenv("TTC_CLUSTER_TOKEN")
+	}
 	if clusterOpts.Configured {
 		if err := resolveSimpleClusterOptions(&clusterOpts, roots); err != nil {
 			fmt.Fprintf(stderr, "ttcd: configuring cluster identity: %v\n", err)
@@ -4282,6 +4291,12 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "ttcd: --unsafe-no-host-isolation is not applicable to a control-only daemon")
 			return 2
 		}
+		token, err := clusterAuthToken(roots.shared)
+		if err != nil {
+			fmt.Fprintf(stderr, "ttcd: %v\n", err)
+			return 1
+		}
+		clusterOpts.AuthToken = token
 		control, err := prepareControlOnlyCluster(clusterOpts, roots.shared)
 		if err != nil {
 			fmt.Fprintf(stderr, "ttcd: configuring control-only cluster access: %v\n", err)
@@ -5249,7 +5264,11 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 	if opts.Listen == "" || opts.Advertise == "" || opts.NodeID == "" || opts.RepositoryID == "" {
 		return nil, errors.New("cluster mode requires listen/advertise addresses, node ID, and repository ID")
 	}
-	opts.AuthToken = os.Getenv("TTC_CLUSTER_TOKEN")
+	token, err := clusterAuthToken(dataRoot)
+	if err != nil {
+		return nil, err
+	}
+	opts.AuthToken = token
 	resolvedCPU, err := resolveDaemonCPUProfile(opts.CPUProfileMode, opts.CPUFeatures, runtimePlatform)
 	if err != nil {
 		return nil, fmt.Errorf("resolving cluster CPU profile: %w", err)
@@ -5732,6 +5751,50 @@ func applyImmutableClusterConfig(sharedRoot string, opts *daemonClusterOptions) 
 	opts.AutoRebalance = got.AutoRebalance
 	opts.ResolvedCPU = got.CPUProfile
 	return pending, nil
+}
+
+// clusterTokenFile, in a cluster's shared root, holds the token with which
+// the cluster's daemons authenticate one another. Whoever can read the shared
+// root administers the cluster: the token needs no other secret, and only the
+// root's owner can read it.
+const clusterTokenFile = ".ttc-cluster-token"
+
+// minClusterTokenLength is the shortest token a cluster takes.
+const minClusterTokenLength = 32
+
+// clusterAuthToken returns the token of the cluster sharedRoot anchors, which
+// the cluster's first daemon makes: 32 random bytes, in hexadecimal.
+func clusterAuthToken(sharedRoot string) (string, error) {
+	path := filepath.Join(sharedRoot, clusterTokenFile)
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		var secret [32]byte
+		if _, err := rand.Read(secret[:]); err != nil {
+			return "", fmt.Errorf("making the cluster's token: %w", err)
+		}
+		// Another daemon of a new cluster may make it first.
+		data, err = publishOnce(path, []byte(hex.EncodeToString(secret[:])+"\n"))
+	}
+	if err != nil {
+		return "", fmt.Errorf("reading the cluster's token: %w", err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", fmt.Errorf("reading the cluster's token: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("the cluster's token %s is not a regular file", path)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		if err := os.Chmod(path, 0o600); err != nil {
+			return "", fmt.Errorf("making the cluster's token readable by its owner alone: %w", err)
+		}
+	}
+	token := strings.TrimSpace(string(data))
+	if len(token) < minClusterTokenLength {
+		return "", fmt.Errorf("the cluster's token in %s is shorter than %d characters", path, minClusterTokenLength)
+	}
+	return token, nil
 }
 
 // publishOnce makes path hold data, unless another daemon made it first, and

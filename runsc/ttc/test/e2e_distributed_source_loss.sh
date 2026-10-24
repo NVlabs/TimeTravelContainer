@@ -12,7 +12,6 @@ NAME=${TTC_DISTRIBUTED_TEST_NAME:-ttc-distributed-source-loss-$$}
 SAFE_NAME=$NAME-independent
 ROOT=${TTC_DISTRIBUTED_TEST_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/ttc-distributed-source-loss.XXXXXX")}
 SHARED=${TTC_DISTRIBUTED_TEST_SHARED_ROOT:-$ROOT/shared}
-TOKEN=ttc-distributed-source-loss-$NAME
 PORT_A=${TTC_DISTRIBUTED_TEST_PORT_A:-17783}
 PORT_B=${TTC_DISTRIBUTED_TEST_PORT_B:-17793}
 PORT_C=${TTC_DISTRIBUTED_TEST_PORT_C:-17803}
@@ -84,7 +83,7 @@ start_node() {
 	shift 2
 	# A daemon's root holds its socket, and must be private.
 	mkdir -p -m 700 "$ROOT/local-$node"
-	TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$ROOT/local-$node TTC_CLUSTER_TOKEN=$TOKEN \
+	TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$ROOT/local-$node \
 		setsid "$TTCD" --node "node-$node" \
 		--listen "127.0.0.1:$port" --advertise "127.0.0.1:$port" \
 		--memory-target 64GiB --cluster-lease 15s --cluster-prefetch none \

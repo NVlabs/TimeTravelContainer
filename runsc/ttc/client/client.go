@@ -494,7 +494,9 @@ Environment:
                     standalone daemon keeps all of its files there
   TTC_LOCAL_ROOT    Required node-local root of a daemon of a cluster, which
                     keeps its node's files there
-  TTC_CLUSTER_TOKEN Optional shared cluster authentication token (default: none)
+
+A cluster's daemons authenticate one another with a token the first of them
+makes in TTC_ROOT, readable by the root's owner alone.
 
 With --control-only, the daemon finds the cluster's compute nodes in TTC_ROOT.
 It does not advertise a TCP endpoint, register a node, or accept container

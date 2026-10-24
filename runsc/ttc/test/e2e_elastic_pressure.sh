@@ -10,7 +10,6 @@ TTCD=${TTCD:-ttcd}
 IMAGE=${TTC_ELASTIC_PRESSURE_IMAGE:-busybox:1.36}
 ROOT=${TTC_ELASTIC_PRESSURE_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/ttc-elastic-pressure.XXXXXX")}
 SHARED=${TTC_ELASTIC_PRESSURE_SHARED_ROOT:-$ROOT/shared}
-TOKEN=ttc-elastic-pressure-$$
 COMMAND_TIMEOUT=${TTC_E2E_COMMAND_TIMEOUT:-120s}
 PORT_A=${TTC_ELASTIC_PRESSURE_PORT_A:-20383}
 PORT_B=${TTC_ELASTIC_PRESSURE_PORT_B:-20393}
@@ -83,7 +82,7 @@ start_node() {
 	shift 3
 	# A daemon's root holds its socket, and must be private.
 	mkdir -p -m 700 "$ROOT/local-$node"
-	TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$ROOT/local-$node TTC_CLUSTER_TOKEN=$TOKEN \
+	TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$ROOT/local-$node \
 		setsid "$TTCD" --node "node-$node" \
 		--listen "127.0.0.1:$port" --advertise "127.0.0.1:$port" \
 		--memory-target "$target" --cluster-lease 15s --unsafe-no-host-isolation "$@" \

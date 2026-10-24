@@ -14,7 +14,6 @@ TTCD=${TTCD:-ttcd}
 IMAGE=${TTC_LIFECYCLE_MATRIX_IMAGE:-busybox:1.36}
 NAME=${TTC_LIFECYCLE_MATRIX_NAME:-ttc-lifecycle-matrix-$$}
 ROOT=${TTC_LIFECYCLE_MATRIX_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/ttc-lifecycle-matrix.XXXXXX")}
-TOKEN=ttc-lifecycle-matrix-$NAME
 PORT_A=${TTC_LIFECYCLE_MATRIX_PORT_A:-24783}
 PORT_B=${TTC_LIFECYCLE_MATRIX_PORT_B:-24793}
 PORT_C=${TTC_LIFECYCLE_MATRIX_PORT_C:-24803}
@@ -89,7 +88,7 @@ start_node() {
 	shift 2
 	# A daemon's root holds its socket, and must be private.
 	mkdir -p -m 700 "$ROOT/local-$node"
-	TTC_ROOT=$ROOT/shared TTC_LOCAL_ROOT=$ROOT/local-$node TTC_CLUSTER_TOKEN=$TOKEN \
+	TTC_ROOT=$ROOT/shared TTC_LOCAL_ROOT=$ROOT/local-$node \
 		setsid "$TTCD" --node "node-$node" \
 		--listen "127.0.0.1:$port" --advertise "127.0.0.1:$port" \
 		--memory-target 8GiB --unsafe-no-host-isolation "$@" \

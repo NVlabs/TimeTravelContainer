@@ -996,7 +996,7 @@ func TestPublishRemoteTargetRetriesPausedAuthorityGap(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	peer, err := cluster.NewPlainClient(server.URL, "source", "", time.Second)
+	peer, err := cluster.NewPlainClient(server.URL, "source", "test-cluster-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1037,7 +1037,7 @@ func TestActivateRemoteMigrationRetriesAdvancedIndependentRevision(t *testing.T)
 		}
 	}))
 	defer server.Close()
-	peer, err := cluster.NewPlainClient(server.URL, "source", "", time.Second)
+	peer, err := cluster.NewPlainClient(server.URL, "source", "test-cluster-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1089,7 +1089,7 @@ func TestCancelRemoteForkTargetRetriesAdvancedRevision(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	peer, err := cluster.NewPlainClient(server.URL, "source", "", time.Second)
+	peer, err := cluster.NewPlainClient(server.URL, "source", "test-cluster-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

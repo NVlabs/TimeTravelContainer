@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2539,6 +2540,38 @@ func TestControlOnlyClusterOptions(t *testing.T) {
 	}
 }
 
+// TestClusterAuthToken makes a cluster's token in its shared root once, keeps
+// it readable by the root's owner alone, and refuses a token too short.
+func TestClusterAuthToken(t *testing.T) {
+	root := t.TempDir()
+	token, err := clusterAuthToken(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hex.DecodeString(token); err != nil || len(token) != 64 {
+		t.Fatalf("token %q, want 32 bytes in hexadecimal", token)
+	}
+	path := filepath.Join(root, clusterTokenFile)
+	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("token file: %v, %v", info, err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if again, err := clusterAuthToken(root); err != nil || again != token {
+		t.Fatalf("token read again: %q, %v; want %q", again, err, token)
+	}
+	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("token file after a read: %v, %v", info, err)
+	}
+	if err := os.WriteFile(path, []byte("short\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clusterAuthToken(root); err == nil {
+		t.Fatal("a short token was taken")
+	}
+}
+
 func TestPrepareControlOnlyClusterProbesComputeSeed(t *testing.T) {
 	var gotNode string
 	seed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2571,6 +2604,7 @@ func TestPrepareControlOnlyClusterProbesComputeSeed(t *testing.T) {
 	opts := defaultDaemonClusterOptions()
 	opts.Configured, opts.ControlOnly = true, true
 	opts.NodeID, opts.RepositoryID = "login-gateway", "repo-control"
+	opts.AuthToken = "test-cluster-token"
 	opts.Peers = []string{"seed=" + strings.TrimPrefix(seed.URL, "http://")}
 	control, err := prepareControlOnlyCluster(opts, "/shared/ttc")
 	if err != nil {
@@ -2606,14 +2640,14 @@ func TestJoinAuthorityWaitsForAHolder(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]string{"node_id": "joining"})
 	}))
 	defer seed.Close()
-	client, err := cluster.NewPlainClient(seed.URL, "joining", "", time.Second)
+	client, err := cluster.NewPlainClient(seed.URL, "joining", "test-cluster-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	request := cluster.AuthorityJoinRequest{NodeID: "joining"}
-	if err := joinAuthorityThroughSeed(ctx, client, request, "joining", ""); err != nil {
+	if err := joinAuthorityThroughSeed(ctx, client, request, "joining", "test-cluster-token"); err != nil {
 		t.Fatal(err)
 	}
 	if calls != 3 {
@@ -2628,7 +2662,7 @@ func TestJoinAuthorityWaitsForSeedListener(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]string{"node_id": "joining"})
 	}))
 	defer seed.Close()
-	client, err := cluster.NewPlainClient(seed.URL, "joining", "", time.Second)
+	client, err := cluster.NewPlainClient(seed.URL, "joining", "test-cluster-token", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2636,7 +2670,7 @@ func TestJoinAuthorityWaitsForSeedListener(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	request := cluster.AuthorityJoinRequest{NodeID: "joining"}
-	if err := joinAuthorityThroughSeed(ctx, client, request, "joining", ""); err != nil {
+	if err := joinAuthorityThroughSeed(ctx, client, request, "joining", "test-cluster-token"); err != nil {
 		t.Fatal(err)
 	}
 	if calls != 1 {
@@ -2684,6 +2718,7 @@ func TestControlOnlyClusterDiscoversComputePeers(t *testing.T) {
 	opts := defaultDaemonClusterOptions()
 	opts.Configured, opts.ControlOnly = true, true
 	opts.NodeID, opts.RepositoryID = "login-gateway", "repo-control"
+	opts.AuthToken = "test-cluster-token"
 	opts.Peers = []string{"seed=" + strings.TrimPrefix(seed.URL, "http://")}
 	control, err := prepareControlOnlyCluster(opts, "/shared/ttc")
 	if err != nil {
@@ -2737,6 +2772,7 @@ func TestControlOnlyClusterFollowsTheHolderRedirect(t *testing.T) {
 	opts := defaultDaemonClusterOptions()
 	opts.Configured, opts.ControlOnly = true, true
 	opts.NodeID, opts.RepositoryID = "login-gateway", "repo-control"
+	opts.AuthToken = "test-cluster-token"
 	opts.Peers = []string{"follower=" + strings.TrimPrefix(follower.URL, "http://")}
 	control, err := prepareControlOnlyCluster(opts, "/shared/ttc")
 	if err != nil {
@@ -3560,7 +3596,7 @@ func TestClaimedBranchAuthorityIsTakenOnce(t *testing.T) {
 func TestRoutedPeerChecksTheRecordReadWithThePlacement(t *testing.T) {
 	source := &distributedSourceRuntime{
 		capabilities: cluster.Capabilities{NodeID: "n1", RepositoryID: "repository", BuildID: "build"},
-		dynamicPeers: make(map[string]dynamicClusterPeer),
+		dynamicPeers: make(map[string]dynamicClusterPeer), authToken: "test-cluster-token",
 	}
 	server := &daemonServer{distributedSource: source}
 	live := cluster.NodeRecord{
