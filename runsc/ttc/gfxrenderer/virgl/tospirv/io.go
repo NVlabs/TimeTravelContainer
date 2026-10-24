@@ -126,7 +126,12 @@ func (t *translator) newIface(sc spirv.StorageClass, typ, scalar, vec spirv.ID, 
 		typ = t.m.TypeArray(typ, t.m.ConstantUint(uint32(vertices)))
 	}
 	f.v = t.m.Variable(t.m.TypePointer(sc, typ), sc)
-	t.interfaces = append(t.interfaces, f.v)
+	if sc == spirv.StorageClassInput || sc == spirv.StorageClassOutput {
+		// SPIR-V 1.3's entry points list their inputs and outputs alone,
+		// not the private variables that stand for outputs that the
+		// pipeline has none of.
+		t.interfaces = append(t.interfaces, f.v)
+	}
 	return f
 }
 

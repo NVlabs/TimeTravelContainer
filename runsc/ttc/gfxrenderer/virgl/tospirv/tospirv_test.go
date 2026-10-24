@@ -387,7 +387,39 @@ func translate(t *testing.T, name, text string, opts Options) *Result {
 			t.Fatal(err)
 		}
 	}
+	checkInterfaces(t, name, res.Words)
 	return res
+}
+
+// checkInterfaces fails t unless the entry points of words list variables
+// of inputs and outputs alone, as SPIR-V 1.3 requires.
+func checkInterfaces(t *testing.T, name string, words []uint32) {
+	t.Helper()
+	classes := make(map[uint32]spirv.StorageClass)
+	var listed []uint32
+	for i := 5; i < len(words); {
+		n, op := int(words[i]>>16), spirv.Op(words[i]&0xffff)
+		if n == 0 || i+n > len(words) {
+			t.Fatalf("%s: an instruction of %d words at %d", name, n, i)
+		}
+		switch op {
+		case spirv.OpVariable:
+			classes[words[i+2]] = spirv.StorageClass(words[i+3])
+		case spirv.OpEntryPoint:
+			// The name's words end of the one whose last byte is 0.
+			j := i + 3
+			for j < i+n && words[j]>>24 != 0 {
+				j++
+			}
+			listed = append(listed, words[j+1:i+n]...)
+		}
+		i += n
+	}
+	for _, id := range listed {
+		if c, ok := classes[id]; !ok || c != spirv.StorageClassInput && c != spirv.StorageClassOutput {
+			t.Errorf("%s: the entry point lists %%%d, a variable of storage class %d", name, id, c)
+		}
+	}
 }
 
 func TestTranslate(t *testing.T) {
@@ -618,6 +650,33 @@ func TestExtraOutputs(t *testing.T) {
 	}
 	translate(t, "gs-extra-outputs", shaders["gs-layered"], Options{ExtraOutputs: extra})
 	translate(t, "tcs-extra-outputs", shaders["tcs-patch"], Options{ExtraOutputs: extra})
+}
+
+// TestSingleSampled translates a fragment shader that writes a sample mask,
+// which a single-sampled framebuffer's pipeline ignores, as OpenGL does, of
+// a private variable rather than the built-in.
+func TestSingleSampled(t *testing.T) {
+	text := `FRAG
+DCL OUT[0], COLOR
+DCL OUT[1], SAMPLEMASK
+IMM[0] UINT32 {1, 0, 0, 0}
+  0: MOV OUT[0], IMM[0].xxxx
+  1: MOV OUT[1].x, IMM[0].xxxx
+  2: END
+`
+	for _, single := range []bool{false, true} {
+		res := translate(t, fmt.Sprintf("fs-single-sampled-%v", single), text, Options{ColorBuffers: 1, SingleSampled: single})
+		masks := 0
+		for i := 5; i < len(res.Words); i += int(res.Words[i] >> 16) {
+			if spirv.Op(res.Words[i]&0xffff) == spirv.OpDecorate && spirv.Decoration(res.Words[i+2]) == spirv.DecorationBuiltIn &&
+				spirv.BuiltIn(res.Words[i+3]) == spirv.BuiltInSampleMask {
+				masks++
+			}
+		}
+		if want := map[bool]int{false: 1, true: 0}[single]; masks != want {
+			t.Errorf("single-sampled %v: %d sample masks, want %d", single, masks, want)
+		}
+	}
 }
 
 // TestSampleShading translates a fragment shader of sample shading, of
