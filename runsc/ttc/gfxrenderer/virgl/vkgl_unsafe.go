@@ -776,7 +776,7 @@ func (c *vkglContext) setFramebufferNoAttach(width, height, layers, samples uint
 		// has attachments: only a framebuffer of none is of it.
 		return nil
 	}
-	c.fb = vkgl.Framebuffer{Width: width, Height: height, Layers: layers, Samples: samples}
+	c.fb = vkgl.Framebuffer{Width: width, Height: height, Layers: layers, Samples: c.b.d.NoAttachmentSamples(samples)}
 	c.ctx.SetFramebuffer(c.fb)
 	return nil
 }

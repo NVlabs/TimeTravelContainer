@@ -33,6 +33,41 @@ func newTestDevice(t *testing.T) *Device {
 	return d
 }
 
+// TestSampleCounts creates textures and framebuffers of no attachments of
+// each count of samples up to the most that the caps offer, which guests
+// may ask for any of, of the next count that the device has: lavapipe has
+// 4 samples, and not 2.
+func TestSampleCounts(t *testing.T) {
+	d := newTestDevice(t)
+	var c capsV2
+	if err := binary.Read(bytes.NewReader(d.Caps(2, 1, 4)), binary.LittleEndian, &c); err != nil {
+		t.Fatal(err)
+	}
+	f, _ := d.LookupFormat(virglR8G8B8A8Unorm)
+	counts := d.sampleCounts(f)
+	for n := uint32(2); n <= c.V1.MaxSamples; n *= 2 {
+		want := n
+		for counts&want == 0 {
+			want *= 2
+		}
+		tex, err := d.NewTexture(ResourceDesc{Target: Target2D, Format: virglR8G8B8A8Unorm, Width: 4, Height: 4, Samples: n})
+		if err != nil {
+			t.Fatalf("a texture of %d samples: %v", n, err)
+		}
+		if tex.Desc.Samples != want {
+			t.Errorf("a texture of %d samples has %d, want %d", n, tex.Desc.Samples, want)
+		}
+		d.DestroyTexture(tex)
+		if got := d.NoAttachmentSamples(n); got < n || d.props.Limits.FramebufferNoAttachmentsSampleCounts&got == 0 {
+			t.Errorf("a framebuffer of no attachments of %d samples has %d", n, got)
+		}
+	}
+	if _, err := d.NewTexture(ResourceDesc{Target: Target2D, Format: virglR8G8B8A8Unorm, Width: 4, Height: 4,
+		Samples: 2 * c.V1.MaxSamples}); err == nil && c.V1.MaxSamples < 32 {
+		t.Errorf("a texture of more samples than the most: no error")
+	}
+}
+
 func translate(t *testing.T, text string, opts tospirv.Options) *tospirv.Result {
 	t.Helper()
 	s, err := tgsi.Parse(text)

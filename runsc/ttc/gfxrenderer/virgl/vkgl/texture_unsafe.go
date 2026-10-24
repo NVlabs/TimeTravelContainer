@@ -125,6 +125,14 @@ func (d *Device) newTexture(desc ResourceDesc) (*Texture, error) {
 	if desc.Samples > 1 && desc.Target == Target2DArray && !d.multisampleArrays {
 		return nil, fmt.Errorf("a multisampled array %+v, which %s has none of", desc, d.Name)
 	}
+	if desc.Samples > 1 {
+		// Of the next count of samples that the device has.
+		n := roundSamples(d.sampleCounts(f), desc.Samples)
+		if n == 0 {
+			return nil, fmt.Errorf("a texture of %+v, of samples that %s has not of %s", desc, d.Name, f.Name)
+		}
+		desc.Samples = n
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	a := d.a

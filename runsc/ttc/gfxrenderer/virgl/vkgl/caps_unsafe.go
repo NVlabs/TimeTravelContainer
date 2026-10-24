@@ -38,11 +38,11 @@ func (d *Device) Caps(set uint32, ubos, ssbos uint32) []byte {
 		}
 	}
 	// Formats are of multisampled textures, as guests' drivers take them,
-	// of every count of samples up to the most: of their renderings', and
-	// their samples', as shaders fetch them.
+	// of every count of samples up to the most, of which textures are of
+	// the next count that the format has (roundSamples): of the most,
+	// then, of their renderings' and their samples', as shaders fetch them.
 	multisampled := func(counts uint32) bool {
-		want := (2*v1.MaxSamples - 1) &^ 1
-		return v1.MaxSamples > 1 && counts&want == want
+		return v1.MaxSamples > 1 && counts&v1.MaxSamples != 0
 	}
 	for vf := range formats {
 		ft, _ := d.LookupFormat(vf)
@@ -56,24 +56,13 @@ func (d *Device) Caps(set uint32, ubos, ssbos uint32) []byte {
 		case ft.IsDepth() || ft.IsStencil():
 			if opt&featureDepthStencil != 0 {
 				v1.DepthStencil.set(vf)
-				counts := ^uint32(0)
-				if ft.IsDepth() {
-					counts &= l.FramebufferDepthSampleCounts & l.SampledImageDepthSampleCounts
-				}
-				if ft.IsStencil() {
-					counts &= l.FramebufferStencilSampleCounts & l.SampledImageStencilSampleCounts
-				}
-				if multisampled(counts) {
+				if multisampled(d.sampleCounts(ft)) {
 					c.SupportedMultisampleFormats.set(vf)
 				}
 			}
 		case opt&featureColorAttachment != 0 && !ft.Compressed:
 			v1.Render.set(vf)
-			sampled := l.SampledImageColorSampleCounts
-			if integer, _ := ft.IsInteger(); integer {
-				sampled = l.SampledImageIntegerSampleCounts
-			}
-			if multisampled(l.FramebufferColorSampleCounts & sampled) {
+			if multisampled(d.sampleCounts(ft)) {
 				c.SupportedMultisampleFormats.set(vf)
 			}
 		}
@@ -256,4 +245,32 @@ func standardSampleLocations() [8]uint32 {
 		}
 	}
 	return words
+}
+
+// sampleCounts returns the counts of samples, of VkSampleCountFlagBits, of
+// which the device renders textures of ft, and shaders fetch them.
+func (d *Device) sampleCounts(ft Format) uint32 {
+	l := &d.props.Limits
+	if ft.IsDepth() || ft.IsStencil() {
+		counts := ^uint32(0)
+		if ft.IsDepth() {
+			counts &= l.FramebufferDepthSampleCounts & l.SampledImageDepthSampleCounts
+		}
+		if ft.IsStencil() {
+			counts &= l.FramebufferStencilSampleCounts & l.SampledImageStencilSampleCounts
+		}
+		return counts
+	}
+	sampled := l.SampledImageColorSampleCounts
+	if integer, _ := ft.IsInteger(); integer {
+		sampled = l.SampledImageIntegerSampleCounts
+	}
+	return l.FramebufferColorSampleCounts & sampled
+}
+
+// NoAttachmentSamples returns the samples of a framebuffer of no
+// attachments that a guest asked n of: the next count that the device
+// has, as of textures (roundSamples), or 1 of none.
+func (d *Device) NoAttachmentSamples(n uint32) uint32 {
+	return max(roundSamples(d.props.Limits.FramebufferNoAttachmentsSampleCounts, n), 1)
 }

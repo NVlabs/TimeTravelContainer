@@ -60,6 +60,25 @@ func (d ResourceDesc) normalize() ResourceDesc {
 	return d
 }
 
+// roundSamples returns the least count of samples of counts, of
+// VkSampleCountFlagBits, of at least n, a power of 2, or 0 of none: the
+// samples of a texture or a framebuffer that a guest asked n of. Guests'
+// drivers take a format that the caps multisample to have every count up
+// to the most, and a device may lack some, as lavapipe lacks 2, of which
+// the next serves, as OpenGL's drivers allocate at least the samples asked
+// for.
+func roundSamples(counts, n uint32) uint32 {
+	if n <= 1 {
+		return 1
+	}
+	for c := n; c != 0 && c <= 64; c *= 2 {
+		if counts&c != 0 {
+			return c
+		}
+	}
+	return 0
+}
+
 // minify returns the size of a level of a dimension of size.
 func minify(size, level uint32) uint32 {
 	if level >= 32 {
