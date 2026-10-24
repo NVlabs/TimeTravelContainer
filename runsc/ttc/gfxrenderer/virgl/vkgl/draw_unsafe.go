@@ -234,6 +234,19 @@ func (d *Device) NewPipeline(desc PipelineDesc) (*Pipeline, error) {
 		pv.ProvokingVertexMode = 1 // VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT
 		rs.PNext = unsafe.Pointer(pv)
 	}
+	if d.bresenhamLines && !r.LineSmooth && !r.Multisample && max(desc.Samples, 1) == 1 &&
+		!desc.Blend.AlphaToCoverage && !desc.Blend.AlphaToOne {
+		// Of aliased lines of OpenGL's rule, diamond exit, as Zink draws
+		// them, where Vulkan's are rectangles that light 2 pixels of some
+		// columns of an x-major line; OpenGL's smooth and multisampled
+		// lines are rectangles. Vulkan has none of sample shading or alpha
+		// to coverage of them.
+		ls := get[vn.VkPipelineRasterizationLineStateCreateInfo](a)
+		ls.SType = vn.VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO
+		ls.LineRasterizationMode = 2 // VK_LINE_RASTERIZATION_MODE_BRESENHAM
+		ls.PNext = rs.PNext
+		rs.PNext = unsafe.Pointer(ls)
+	}
 
 	ms := get[vn.VkPipelineMultisampleStateCreateInfo](a)
 	ms.SType = vn.VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO

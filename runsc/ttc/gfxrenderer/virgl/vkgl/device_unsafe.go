@@ -171,6 +171,10 @@ type Device struct {
 	// floatImageAtomics is whether shaders exchange texels of images of
 	// floats atomically, of VK_EXT_shader_atomic_float.
 	floatImageAtomics bool
+	// bresenhamLines is whether the device draws lines of Bresenham's
+	// rule, OpenGL's diamond exit, of VK_KHR_line_rasterization, rather
+	// than as rectangles, as Vulkan's lines are of none.
+	bresenhamLines bool
 	// workgroupFences is whether shaders' fences of the device's scope are
 	// of the workgroup's, of MoltenVK: Apple's GPU compiler crashes of a
 	// fence of the device's scope before an atomic's read-modify-write of
@@ -460,6 +464,10 @@ func (d *Device) createDevice() error {
 	v3.SType = vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_2D_VIEW_OF_3D_FEATURES_EXT
 	v3Ext := ext("VK_EXT_image_2d_view_of_3d")
 	link(v3Ext, unsafe.Pointer(v3), &v3.PNext)
+	lr := get[vn.VkPhysicalDeviceLineRasterizationFeatures](a)
+	lr.SType = vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES
+	lrExt := ext("VK_KHR_line_rasterization", "VK_EXT_line_rasterization")
+	link(lrExt, unsafe.Pointer(lr), &lr.PNext)
 	af := get[vn.VkPhysicalDeviceShaderAtomicFloatFeaturesEXT](a)
 	af.SType = vn.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT
 	afExt := ext("VK_EXT_shader_atomic_float")
@@ -527,6 +535,10 @@ func (d *Device) createDevice() error {
 	if divExt != "" {
 		exts = append(exts, divExt)
 		d.divisors = div.VertexAttributeInstanceRateDivisor != 0
+	}
+	if lrExt != "" {
+		exts = append(exts, lrExt)
+		d.bresenhamLines = lr.BresenhamLines != 0
 	}
 	if afExt != "" {
 		exts = append(exts, afExt)
