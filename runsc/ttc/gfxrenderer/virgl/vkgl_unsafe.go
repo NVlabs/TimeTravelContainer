@@ -824,10 +824,12 @@ func (c *vkglContext) setUniformBuffer(stage, index uint32, br backendResource, 
 		return errors.New("a uniform buffer of a texture")
 	}
 	// Of a range of the buffer, of an offset of Vulkan's alignment, as the
-	// caps have guests align them.
+	// caps have guests align them, but of a range of no bytes, which binds
+	// none, at a buffer's end, as Mesa's state tracker binds them.
 	if r != nil {
 		align := uint64(c.b.d.UniformBufferAlignment())
-		if n := r.buf.Size(); uint64(offset)%align != 0 || uint64(offset) > n || uint64(size) > n-uint64(offset) {
+		n := r.buf.Size()
+		if uint64(offset) > n || uint64(size) > n-uint64(offset) || size != 0 && uint64(offset)%align != 0 {
 			return fmt.Errorf("a uniform buffer of %d bytes at %d of a buffer of %d", size, offset, n)
 		}
 	}
