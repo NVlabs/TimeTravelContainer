@@ -7,12 +7,14 @@ package bundle
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 
 	units "github.com/docker/go-units"
 	mobysignal "github.com/moby/sys/signal"
@@ -564,6 +566,35 @@ func validateUserSpecNumericIDs(userSpec string) error {
 	return nil
 }
 
+// openImageAccounts opens name, an account file of the image, as the
+// container reaches it: its symbolic links resolve inside rootfs, as they
+// would in the container, and not on the host. It returns nil, as an image
+// without the file reads, if no regular file is there.
+func openImageAccounts(rootfs, name string) io.Reader {
+	relative, err := resolveInRootfs(rootfs, name)
+	if err != nil {
+		return nil
+	}
+	// O_NONBLOCK: a FIFO there must not hold the open until a writer comes.
+	file, err := os.OpenFile(filepath.Join(rootfs, relative), os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil
+	}
+	if info, err := file.Stat(); err != nil || !info.Mode().IsRegular() {
+		file.Close()
+		return nil
+	}
+	return file
+}
+
+func closeImageAccounts(readers ...io.Reader) {
+	for _, reader := range readers {
+		if file, ok := reader.(*os.File); ok {
+			file.Close()
+		}
+	}
+}
+
 // BuildSpec combines an OCI image configuration with ttc run overrides.
 func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 	if err := validateResourceLimits(opts); err != nil {
@@ -620,7 +651,9 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 	if err := validateUserSpecNumericIDs(userSpec); err != nil {
 		return nil, fmt.Errorf("resolving user %q: %w", userSpec, err)
 	}
-	resolvedUser, err := mobyuser.GetExecUserPath(userSpec, &mobyuser.ExecUser{}, filepath.Join(rootfs, "etc/passwd"), filepath.Join(rootfs, "etc/group"))
+	passwdAccounts, groupAccounts := openImageAccounts(rootfs, "/etc/passwd"), openImageAccounts(rootfs, "/etc/group")
+	resolvedUser, err := mobyuser.GetExecUser(userSpec, &mobyuser.ExecUser{}, passwdAccounts, groupAccounts)
+	closeImageAccounts(passwdAccounts, groupAccounts)
 	if err != nil {
 		return nil, fmt.Errorf("resolving user %q: %w", userSpec, err)
 	}
@@ -636,7 +669,9 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		if err := validateNumericID(group, "additional group ID"); err != nil {
 			return nil, fmt.Errorf("resolving additional group %q: %w", group, err)
 		}
-		gids, err := mobyuser.GetAdditionalGroupsPath([]string{group}, filepath.Join(rootfs, "etc/group"))
+		accounts := openImageAccounts(rootfs, "/etc/group")
+		gids, err := mobyuser.GetAdditionalGroups([]string{group}, accounts)
+		closeImageAccounts(accounts)
 		if err != nil {
 			return nil, fmt.Errorf("resolving additional group %q: %w", group, err)
 		}

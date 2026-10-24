@@ -3018,7 +3018,13 @@ type hostFileIdentity struct {
 // immutable image root into persistent opaque volume objects; tmpfs and tar
 // staging are deliberately not involved.
 func seedManagedVolume(repository *ttcvolume.Repository, rootfs, destination string, manifest *ownership.Manifest) error {
-	relativeDestination := strings.TrimPrefix(filepath.Clean(destination), string(filepath.Separator))
+	// The container mounts the volume where destination leads it, following
+	// the image's symbolic links inside its root; the volume is seeded from
+	// there, and never from where the links lead on the host.
+	relativeDestination, err := resolveInRootfs(rootfs, destination)
+	if err != nil {
+		return err
+	}
 	sourceRoot := filepath.Join(rootfs, relativeDestination)
 	rootInfo, err := os.Lstat(sourceRoot)
 	if os.IsNotExist(err) {

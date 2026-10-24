@@ -804,6 +804,127 @@ func TestDistributedForkAddsRemoteBranchToExistingFamily(t *testing.T) {
 	}
 }
 
+// TestBuildSpecReadsAccountsInsideTheImage links an image's account files
+// out of it: the links resolve inside the image, as in the container, and no
+// account of the host's files is found.
+func TestBuildSpecReadsAccountsInsideTheImage(t *testing.T) {
+	host := filepath.Join(t.TempDir(), "accounts")
+	root := t.TempDir()
+	for dir, files := range map[string][2]string{
+		host:                      {"hostonly:x:4242:4343::/:/bin/sh\n", "hostgroup:x:4545:hostonly,app\n"},
+		filepath.Join(root, host): {"app:x:123:456::/:/bin/sh\n", "app:x:456:\nextra:x:789:app\n"},
+	} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		for i, name := range []string{"passwd", "group"} {
+			if err := os.WriteFile(filepath.Join(dir, name), []byte(files[i]), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(root, "etc"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"passwd", "group"} {
+		if err := os.Symlink(filepath.Join(host, name), filepath.Join(root, "etc", name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manifest := ownership.NewManifest()
+	manifest.Entries["."] = ownership.Owner{}
+	if err := ownership.Write(ownership.ManifestPath(root), manifest); err != nil {
+		t.Fatal(err)
+	}
+	build := func(user string, groupAdd ...string) (*specs.Spec, error) {
+		return BuildSpec(ocispec.Image{Config: ocispec.ImageConfig{User: user, Cmd: []string{"/bin/true"}}},
+			SpecOptions{Name: "accounts", RootFS: root, GroupAdd: groupAdd})
+	}
+	if spec, err := build("app"); err != nil {
+		t.Fatal(err)
+	} else if got := spec.Process.User; got.UID != 123 || got.GID != 456 || !slices.Equal(got.AdditionalGids, []uint32{789}) {
+		t.Fatalf("the image's account: %+v", got)
+	}
+	if spec, err := build("hostonly"); err == nil {
+		t.Errorf("a host account resolved: %+v", spec.Process.User)
+	}
+	if spec, err := build("app", "hostgroup"); err == nil {
+		t.Errorf("a host group resolved: %+v", spec.Process.User)
+	}
+}
+
+// TestBuildSpecSkipsAccountFIFOs makes the image's /etc/passwd a FIFO, which
+// an open would wait on for a writer.
+func TestBuildSpecSkipsAccountFIFOs(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "etc"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mkfifo(filepath.Join(root, "etc", "passwd"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	manifest := ownership.NewManifest()
+	manifest.Entries["."] = ownership.Owner{}
+	if err := ownership.Write(ownership.ManifestPath(root), manifest); err != nil {
+		t.Fatal(err)
+	}
+	spec, err := BuildSpec(ocispec.Image{Config: ocispec.ImageConfig{Cmd: []string{"/bin/true"}}}, SpecOptions{Name: "fifo", RootFS: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := spec.Process.User; got.UID != 0 || got.GID != 0 {
+		t.Fatalf("user %+v, want root", got)
+	}
+}
+
+// TestSeedManagedVolumeStaysInsideTheImage declares a volume below an image
+// symbolic link out of the image: the volume is seeded from where the link
+// leads inside the image, as the container mounts it, and not from the host.
+func TestSeedManagedVolumeStaysInsideTheImage(t *testing.T) {
+	host := filepath.Join(t.TempDir(), "outside")
+	rootfs := t.TempDir()
+	for dir, data := range map[string]string{
+		filepath.Join(host, "data"):         "host secret",
+		filepath.Join(rootfs, host, "data"): "image data",
+	} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "file"), []byte(data), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(host, filepath.Join(rootfs, "pivot")); err != nil {
+		t.Fatal(err)
+	}
+	manifest := ownership.NewManifest()
+	manifest.Entries["."] = ownership.Owner{}
+	manager, err := ttcvolume.OpenManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := manager.Create("seed-inside")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	if err := seedManagedVolume(repository, rootfs, "/pivot/data", manifest); err != nil {
+		t.Fatal(err)
+	}
+	ino, err := repository.Lookup(ttcvolume.MainBranch, ttcvolume.RootInode, "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, 64)
+	n, err := repository.ReadAt(ttcvolume.MainBranch, ino, got, 0)
+	if err != nil && !errors.Is(err, io.EOF) {
+		t.Fatal(err)
+	}
+	if string(got[:n]) != "image data" {
+		t.Fatalf("the volume holds %q, want the image's data", got[:n])
+	}
+}
+
 func TestSeedManagedVolumeCopiesImageTreeDirectly(t *testing.T) {
 	imageDir := t.TempDir()
 	rootfs := filepath.Join(imageDir, "rootfs")
