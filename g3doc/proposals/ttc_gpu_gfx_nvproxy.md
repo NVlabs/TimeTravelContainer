@@ -536,12 +536,12 @@ with the daemon's host isolation on.
     (`seatbelt.RendererProfile`). It may read only system files, the package
     prefixes where the Vulkan loader and MoltenVK live, and its own and
     gfxstream's files. It gets the GPU's IOKit user clients and POSIX shared
-    memory of its own names; no writes, network, or processes. Metal needs no
-    Mach service beyond Apple's `system.sb`. macOS lets no process change its
-    profile, and ttcd's bars the GPU, so ttcd starts a launcher,
-    `ttc-gfx-renderer launch`, before it confines itself. The launcher, which
-    stays unconfined so that its children can confine themselves, starts the
-    renderers and probes. Findings on the way:
+    memory of its own names; no writes but to its caches (below), network, or
+    processes. Metal needs no Mach service beyond Apple's `system.sb`. macOS
+    lets no process change its profile, and ttcd's bars the GPU, so ttcd starts
+    a launcher, `ttc-gfx-renderer launch`, before it confines itself. The
+    launcher, which stays unconfined so that its children can confine
+    themselves, starts the renderers and probes. Findings on the way:
     *   gfxstream named its POSIX shared memory after resource IDs and
         per-process counters, and opened an existing object of the name.
         macOS's names are global to the user, so two renderers shared
@@ -554,6 +554,15 @@ with the daemon's host isolation on.
     *   CoreFoundation resolves the executable's path, and the Vulkan loader
         crashes without a main bundle, so the profile admits the metadata of
         the admitted paths' directories.
+    *   Metal keeps its compiled shaders, and its compiler's precompiled
+        headers, under the user's cache directory, in directories that all
+        of the user's programs of no bundle identifier share, which the
+        profile denied. Each shader compiled anew, its compiler parsing its
+        standard headers again, 0.2 to 0.5 s each, and Android stalled for
+        seconds whenever an app first drew (2026-10-24). ttcd now embeds an
+        Info.plist, of bundle identifier `com.nvidia.ttcd`, which gives it
+        caches of its own, `$(getconf DARWIN_USER_CACHE_DIR)/com.nvidia.ttcd`,
+        and the profile admits reading and writing them.
 *   The Linux side of A2 (Phase B) needs: the renderer built with cgo, and
     gfxstream on the host's Vulkan driver; blobs that gfxstream exports as
     shared memory or dma-bufs, which the Sentry maps through their

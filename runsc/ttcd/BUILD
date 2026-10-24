@@ -10,7 +10,10 @@ package(
 
 go_binary(
     name = "ttcd",
-    srcs = ["main.go"],
+    srcs = [
+        "bundle_darwin.go",
+        "main.go",
+    ],
     # Native macOS links Hypervisor.framework through the HVF backend. Linux
     # retains the repository's pure-Go default.
     pure = select_system(darwin = "off", linux = "auto"),
@@ -25,7 +28,10 @@ go_binary(
         "//runsc/ttc/gfxrenderer",
         "//runsc/ttc/hostbin",
         "//runsc/version",
-    ],
+    ] + select_system(
+        darwin = ["//runsc/ttcd/bundle"],
+        linux = [],
+    ),
 )
 
 go_test(
@@ -34,7 +40,14 @@ go_test(
     srcs = [
         "main.go",
         "main_test.go",
-    ],
+    ] + select_system(
+        darwin = ["info_plist_darwin_test.go"],
+        linux = [],
+    ),
+    data = select_system(
+        darwin = [":ttcd"],
+        linux = [],
+    ),
     deps = [
         "//runsc/cli/maincli",
         "//runsc/processutil",

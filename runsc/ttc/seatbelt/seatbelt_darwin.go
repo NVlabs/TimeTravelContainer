@@ -4,8 +4,11 @@
 package seatbelt
 
 /*
+#cgo LDFLAGS: -framework CoreFoundation
+#include <CoreFoundation/CoreFoundation.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 // <sandbox.h> marks sandbox_init deprecated, but it remains the interface for
 // applying a profile of one's own; declare it without the mark.
@@ -16,6 +19,9 @@ import "C"
 
 import (
 	"errors"
+	"fmt"
+	"path/filepath"
+	"strings"
 	"unsafe"
 )
 
@@ -34,4 +40,33 @@ func Apply(profile string) error {
 	}
 	defer C.sandbox_free_error(message)
 	return errors.New(C.GoString(message))
+}
+
+// BundleCacheDir returns the directory of the caches that Apple's frameworks
+// keep for this process, such as Metal's compiled shaders and its compiler's
+// precompiled headers: the user's cache directory (confstr's
+// _CS_DARWIN_USER_CACHE_DIR) and the identifier of the process's main
+// bundle, which an executable's embedded Info.plist gives it. It returns ""
+// of a process of no identifier, whose caches the frameworks keep in the
+// directories that they share among the user's programs of none.
+func BundleCacheDir() (string, error) {
+	ref := C.CFBundleGetIdentifier(C.CFBundleGetMainBundle())
+	if ref == 0 {
+		return "", nil
+	}
+	var buf [256]C.char
+	if C.CFStringGetCString(ref, &buf[0], C.CFIndex(len(buf)), C.kCFStringEncodingUTF8) == 0 {
+		return "", errors.New("the bundle identifier is not a string of 255 bytes or less")
+	}
+	id := C.GoString(&buf[0])
+	if id == "" || strings.ContainsAny(id, "/\x00") || strings.HasPrefix(id, ".") {
+		return "", fmt.Errorf("the bundle identifier %q names no directory", id)
+	}
+	n := C.confstr(C._CS_DARWIN_USER_CACHE_DIR, nil, 0)
+	if n == 0 {
+		return "", errors.New("the user has no cache directory")
+	}
+	dir := make([]byte, n)
+	C.confstr(C._CS_DARWIN_USER_CACHE_DIR, (*C.char)(unsafe.Pointer(&dir[0])), n)
+	return filepath.Join(string(dir[:n-1]), id), nil
 }

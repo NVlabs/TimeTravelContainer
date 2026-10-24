@@ -64,9 +64,23 @@ llvmpipe, where the host has a GPU.
 A renderer decodes guests' command streams, so it confines itself before it
 loads Vulkan or reads anything from its Sentry (`Confine`). On macOS it
 applies `seatbelt.RendererProfile`: reading only Apple's system files and
-its own files; the GPU's IOKit user clients; and POSIX shared memory of its
-own names. It cannot write files, use the network, or start processes.
+its own files; reading and writing the caches that Apple's frameworks keep
+for ttcd, such as Metal's compiled shaders and its compiler's precompiled
+headers; the GPU's IOKit user clients; and POSIX shared memory of its own
+names. It cannot write other files, use the network, or start processes.
 `--unconfined` skips this, as ttcd with `--unsafe-no-host-isolation` does.
+
+The caches are `$(getconf DARWIN_USER_CACHE_DIR)/com.nvidia.ttcd`, of ttcd's
+bundle identifier, which the Info.plist that ttcd embeds gives it
+(`//runsc/ttcd/bundle`). A program of no identifier shares Metal's caches
+with all of the user's others, which the profile cannot admit. Without the
+caches, Metal's compiler parsed its standard headers again for each shader,
+0.2 to 0.5 s each, and compiled every shader again in every renderer:
+Android stalled for seconds whenever an app first drew, or its notification
+shade first opened. With them, a pipeline new to the caches takes tens of
+milliseconds, and one that any renderer has compiled before, about 1 ms. The
+caches are what renderers share: one that a guest subverted could plant
+compiled shaders there that another loads.
 
 macOS lets no process change its sandbox profile, and ttcd's bars the GPU,
 so ttcd's children cannot confine themselves to the renderer's. A ttcd with

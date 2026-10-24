@@ -48,17 +48,24 @@ const DaemonProfile = `(version 1)
 //     the metadata of the directories above them, which resolving their
 //     paths reads: the renderer links MoltenVK, and loads no library but
 //     Apple's;
+//   - reading and writing caches, the directories of the caches that
+//     Apple's frameworks keep for the renderer alone (BundleCacheDir), such
+//     as Metal's compiled shaders and its compiler's precompiled headers:
+//     without them, Metal's compiler parses its headers again for each
+//     shader, and compiles each shader again in each renderer. They are
+//     what renderers share: one that a guest subverted could plant
+//     compiled shaders there that another loads;
 //   - the GPU's IOKit user clients, and IOSurface's;
 //   - POSIX shared memory of the names that the renderer gives it,
 //     "/ttcgfx.", random and unlinked at once.
 //
-// It denies the rest, such as writing files, the network, starting
+// It denies the rest, such as writing other files, the network, starting
 // processes, and the services of the system that Apple's system.sb does
 // not admit: Metal needs none of them.
 //
 // A path with a control character, which the profile cannot spell, is an
 // error.
-func RendererProfile(readable []string) (string, error) {
+func RendererProfile(readable, caches []string) (string, error) {
 	var b strings.Builder
 	b.WriteString(`(version 1)
 (deny default)
@@ -68,13 +75,21 @@ func RendererProfile(readable []string) (string, error) {
     (subpath "/usr/lib")
     (subpath "/usr/share")`)
 	ancestors := make(map[string]bool)
-	for _, path := range readable {
+	for _, path := range append(append([]string(nil), readable...), caches...) {
 		if strings.IndexFunc(path, unicode.IsControl) >= 0 {
 			return "", fmt.Errorf("path %q has a control character", path)
 		}
-		fmt.Fprintf(&b, "\n    (literal %s)", quote(path))
 		for dir := filepath.Dir(path); dir != "/" && dir != "."; dir = filepath.Dir(dir) {
 			ancestors[dir] = true
+		}
+	}
+	for _, path := range readable {
+		fmt.Fprintf(&b, "\n    (literal %s)", quote(path))
+	}
+	if len(caches) != 0 {
+		b.WriteString(")\n(allow file-read* file-write*")
+		for _, dir := range caches {
+			fmt.Fprintf(&b, "\n    (subpath %s)", quote(dir))
 		}
 	}
 	b.WriteString(")\n(allow file-read-metadata")

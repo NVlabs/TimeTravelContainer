@@ -12,3 +12,8 @@ import "errors"
 func Apply(string) error {
 	return errors.New("applying a Seatbelt profile requires a cgo build")
 }
+
+// BundleCacheDir returns "": finding the directory takes cgo.
+func BundleCacheDir() (string, error) {
+	return "", nil
+}

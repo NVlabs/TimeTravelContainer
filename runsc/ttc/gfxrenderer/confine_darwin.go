@@ -4,6 +4,7 @@
 package gfxrenderer
 
 import (
+	"log"
 	"os"
 	"path/filepath"
 
@@ -30,7 +31,21 @@ func Confine() error {
 			}
 		}
 	}
-	profile, err := seatbelt.RendererProfile(readable)
+	// It reads and writes the caches that Apple's frameworks keep for it,
+	// of its bundle identifier, as Metal's compiled shaders, by their path
+	// and the one that resolves: the user's cache directory is under a
+	// symbolic link, /var. Without them, rendering compiles each shader
+	// slowly, and anew in each renderer.
+	var caches []string
+	if dir, err := seatbelt.BundleCacheDir(); err != nil {
+		log.Printf("the GPU renderer keeps no caches: %v", err)
+	} else if dir != "" {
+		caches = append(caches, dir)
+		if parent, err := filepath.EvalSymlinks(filepath.Dir(dir)); err == nil && parent != filepath.Dir(dir) {
+			caches = append(caches, filepath.Join(parent, filepath.Base(dir)))
+		}
+	}
+	profile, err := seatbelt.RendererProfile(readable, caches)
 	if err != nil {
 		return err
 	}

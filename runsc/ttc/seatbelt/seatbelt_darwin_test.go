@@ -53,7 +53,8 @@ func TestHelperProcess(t *testing.T) {
 		// its own, as the renderer admits its executable.
 		linked := filepath.Join(dir, "link", "readable")
 		readable := filepath.Join(dir, "real", "readable")
-		profile, err := RendererProfile([]string{linked, readable})
+		cache := filepath.Join(dir, "cache")
+		profile, err := RendererProfile([]string{linked, readable}, []string{cache})
 		if err != nil {
 			fail("RendererProfile: %v", err)
 		}
@@ -76,6 +77,20 @@ func TestHelperProcess(t *testing.T) {
 		}
 		if err := os.WriteFile(filepath.Join(dir, "written"), []byte("x"), 0600); err == nil {
 			fail("wrote a file, which the profile denies")
+		}
+		// The cache, which the profile admits, but no sibling of it.
+		cached := filepath.Join(cache, "com.apple.metal", "cached")
+		if err := os.MkdirAll(filepath.Dir(cached), 0700); err != nil {
+			fail("making a directory of the cache: %v", err)
+		}
+		if err := os.WriteFile(cached, []byte("cached"), 0600); err != nil {
+			fail("writing a file of the cache: %v", err)
+		}
+		if data, err := os.ReadFile(cached); err != nil || string(data) != "cached" {
+			fail("reading a file of the cache: %q, %v", data, err)
+		}
+		if err := os.WriteFile(cache+"-sibling", []byte("x"), 0600); err == nil {
+			fail("wrote a sibling of the cache, which the profile denies")
 		}
 		if conn, err := net.Dial("tcp", address); err == nil {
 			conn.Close()
@@ -244,14 +259,27 @@ func TestRendererProfile(t *testing.T) {
 }
 
 func TestRendererProfileQuotes(t *testing.T) {
-	profile, err := RendererProfile([]string{`/a "b" \c`})
+	profile, err := RendererProfile([]string{`/a "b" \c`}, []string{`/d "e"`})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := `(literal "/a \"b\" \\c")`; !strings.Contains(profile, want) {
-		t.Errorf("profile has no %s:\n%s", want, profile)
+	for _, want := range []string{`(literal "/a \"b\" \\c")`, `(subpath "/d \"e\"")`} {
+		if !strings.Contains(profile, want) {
+			t.Errorf("profile has no %s:\n%s", want, profile)
+		}
 	}
-	if _, err := RendererProfile([]string{"/a\nb"}); err == nil {
+	if _, err := RendererProfile([]string{"/a\nb"}, nil); err == nil {
 		t.Error("a path with a newline was accepted")
+	}
+	if _, err := RendererProfile(nil, []string{"/a\nb"}); err == nil {
+		t.Error("a cache with a newline was accepted")
+	}
+}
+
+// TestBundleCacheDir finds no cache directory of the test, whose binary
+// embeds no Info.plist, and so has no bundle identifier.
+func TestBundleCacheDir(t *testing.T) {
+	if dir, err := BundleCacheDir(); dir != "" || err != nil {
+		t.Errorf("BundleCacheDir() = %q, %v, want \"\", nil", dir, err)
 	}
 }

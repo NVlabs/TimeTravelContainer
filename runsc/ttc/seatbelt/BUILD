@@ -16,6 +16,10 @@ go_library(
         "seatbelt_darwin_nocgo.go",
     ],
     bazel_cgo = True,
+    bazel_clinkopts = select_system(
+        darwin = ["-framework CoreFoundation"],
+        linux = [],
+    ),
     stateify = False,
     visibility = ["//runsc/ttc:__subpackages__"],
 )
