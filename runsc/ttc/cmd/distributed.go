@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -1183,7 +1184,7 @@ func (r *distributedPageRelay) serveArtifact(conn *net.TCPConn) {
 	}
 	r.mu.Lock()
 	payload, exists := r.artifacts[string(name)]
-	authorized := token == r.artifactToken && exists && !r.closed
+	authorized := subtle.ConstantTimeCompare(token[:], r.artifactToken[:]) == 1 && exists && !r.closed
 	r.mu.Unlock()
 	if !authorized {
 		_, _ = conn.Write([]byte{0})
@@ -1291,7 +1292,7 @@ func (r *distributedPageRelay) serveConsoleLog(conn *net.TCPConn) {
 	}
 	r.mu.Lock()
 	extents := append([]remoteConsoleLogExtent(nil), r.consoleLogs[string(idBytes)]...)
-	authorized := token == r.consoleToken && len(extents) != 0 && !r.closed
+	authorized := subtle.ConstantTimeCompare(token[:], r.consoleToken[:]) == 1 && len(extents) != 0 && !r.closed
 	r.mu.Unlock()
 	if !authorized {
 		return

@@ -4,6 +4,7 @@
 package ttcvolume
 
 import (
+	"crypto/subtle"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -239,7 +240,7 @@ func ServeRemoteObjects(conn io.ReadWriteCloser, token RemoteToken, sources []Re
 		if err != nil {
 			return err
 		}
-		if request.token != token {
+		if subtle.ConstantTimeCompare(request.token[:], token[:]) != 1 {
 			return writeRemoteFailure(conn, request, "invalid or unauthorized filesystem range request")
 		}
 		source, ok := byKey[request.source]

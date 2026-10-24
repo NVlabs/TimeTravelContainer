@@ -182,7 +182,7 @@ func (r *TCPPushReceiver) serveConn(conn io.ReadWriteCloser) {
 		if err != nil {
 			return
 		}
-		if header.token != r.token {
+		if !r.token.Equal(header.token) {
 			return
 		}
 		if header.type_ == tcpPushCommit {

@@ -5,6 +5,7 @@ package ttcremote
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -33,6 +34,11 @@ var tcpMagic = [4]byte{'T', 'T', 'C', 'P'}
 // SnapshotToken uniquely identifies a distributed memory snapshot. Tokens
 // must be unpredictable when peers are not connected through a private link.
 type SnapshotToken [16]byte
+
+// Equal compares t and other in time independent of their contents.
+func (t SnapshotToken) Equal(other SnapshotToken) bool {
+	return subtle.ConstantTimeCompare(t[:], other[:]) == 1
+}
 
 type tcpMessageType uint8
 
@@ -323,8 +329,9 @@ func (s *TCPPageServer) serveConn(conn io.ReadWriteCloser) {
 		if err != nil {
 			return
 		}
-		if header.token != s.token {
-			s.writeError(conn, header, errors.New("snapshot token does not match"))
+		if !s.token.Equal(header.token) {
+			// Every response carries the session's token, so a peer that
+			// has not shown it gets none: the connection just closes.
 			return
 		}
 		switch header.type_ {

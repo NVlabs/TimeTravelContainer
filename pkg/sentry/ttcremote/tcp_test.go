@@ -592,6 +592,51 @@ func TestTCPRemoteReaderRejectsWrongToken(t *testing.T) {
 	}
 }
 
+// TestTCPPageServerWrongTokenGetsNothing reads the raw stream a wrong token
+// gets, as an attacker would, rather than through the reader's checks: every
+// response header carries the session's token.
+func TestTCPPageServerWrongTokenGetsNothing(t *testing.T) {
+	mf, fr, _ := newTCPTestMemoryFile(t, 1)
+	snapshot, err := pgalloc.NewRemoteSnapshot([]pgalloc.RemoteSnapshotRegion{{ID: 1, File: mf, Range: fr}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := testSnapshotToken()
+	server, serveDone := startTCPTestServer(t, snapshot, token, hostarch.PageSize)
+	defer func() {
+		server.Close()
+		<-serveDone
+	}()
+	wrong := token
+	wrong[15]++
+	for _, request := range []tcpHeader{
+		{type_: tcpHello, token: wrong, requestID: 1},
+		{type_: tcpPull, token: wrong, requestID: 2, length: hostarch.PageSize},
+		{type_: tcpHello, token: wrong, requestID: 3, offset: 1},
+	} {
+		conn, err := net.Dial("tcp", server.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := writeTCPMessage(conn, request, nil); err != nil {
+			t.Fatal(err)
+		}
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		var got bytes.Buffer
+		_, err = got.ReadFrom(conn)
+		conn.Close()
+		if err != nil {
+			t.Fatalf("message %d: reading the server's answer: %v", request.type_, err)
+		}
+		if got.Len() != 0 {
+			t.Errorf("message %d with a wrong token got %d bytes (token present: %t), want none", request.type_, got.Len(), bytes.Contains(got.Bytes(), token[:]))
+		}
+	}
+	if stats := snapshot.Stats(); stats.PagesOutstanding != 1 {
+		t.Fatalf("wrong token released a source page: %+v", stats)
+	}
+}
+
 func TestTCPRemoteReaderRecoversLostAckOK(t *testing.T) {
 	mf, fr, want := newTCPTestMemoryFile(t, 1)
 	snapshot, err := pgalloc.NewRemoteSnapshot([]pgalloc.RemoteSnapshotRegion{{ID: 1, File: mf, Range: fr}})

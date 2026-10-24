@@ -5,6 +5,7 @@ package ttcsnapshot
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -37,7 +38,7 @@ func ServeObjectRelay(conn io.ReadWriteCloser, token ObjectRelayToken, source Ob
 			return err
 		}
 		if string(request[:8]) != string(objectRelayMagic[:]) || request[8] != objectRelayVersion || request[9] != 1 ||
-			string(request[16:32]) != string(token[:]) {
+			subtle.ConstantTimeCompare(request[16:32], token[:]) != 1 {
 			return errors.New("invalid TTC graph object request")
 		}
 		idLength := int(request[32])
