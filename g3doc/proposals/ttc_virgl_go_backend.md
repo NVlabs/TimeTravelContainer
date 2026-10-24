@@ -329,3 +329,39 @@ whose blend is exact of depths within it; and a negative test of Mesa's own
 order of errors (1). Not supported: tessellation shaders, texture buffers,
 `EXT_copy_image`, advanced blending, framebuffer fetch, GLSL ES 3.2, and
 more than 8 samples.
+
+On Linux, on lavapipe (`llvmpipe (LLVM 20.1.2, 256 bits)`), the same run,
+of a newer CTS's 37,943 cases, passes 18,078, fails 846, errs once, and
+finds the others not supported (2026-10-24). It, and the unit tests on
+lavapipe and on an NVIDIA GB300 (driver 610, arm64) under Vulkan's
+validation layer, found what devices other than Apple's do, which vkgl now
+does:
+
+*   formats multisampled of the most samples alone, of which textures and
+    framebuffers of no attachments of a count that the device has not are
+    of the next that it has: lavapipe has 4 samples, and not 2, and the
+    caps offered its guests no multisampled format;
+*   uniform buffers of no bytes at a buffer's end, of an offset of no
+    alignment of NVIDIA's 64;
+*   vertices realigned of Vulkan's alignments of their formats' channels
+    on every device, besides Metal's of 4;
+*   SPIR-V 1.3's entry points of inputs and outputs alone, not of the
+    private variable of a single-sampled framebuffer's sample mask;
+*   aliased lines of OpenGL's rule, diamond exit, of
+    `VK_KHR_line_rasterization`'s Bresenham lines, as Zink drew them;
+*   the Vulkan loader's drivers kept loaded for the process: NVIDIA's
+    driver loaded no more of the 16th instance created while none lived,
+    of glibc's static TLS, which a library's reloads take of and glibc
+    does not reclaim, and vkgl's tests ran on llvmpipe from their 16th
+    device.
+
+What fails yet: geometry shaders (816 cases, 32 of them of built-in
+constants, which the tests compile of every stage), as on MoltenVK, though
+Linux's GPUs have them; on lavapipe alone, centroids' interpolation, which
+it evaluates past the primitive at some edge pixels (18; of the tests'
+shader drawn on an NVIDIA GB300, no pixel is), and sample positions and
+masks of 1 and 2 samples
+(10), of textures of 4 samples, which guests take for 2; and, as on
+MoltenVK, the border depths of shadow gathers (2), and Mesa's order of
+errors (1). On Linux, `VK_EXT_custom_border_color`, which MoltenVK has not,
+would give border colors of Vulkan's own, of no blending.
