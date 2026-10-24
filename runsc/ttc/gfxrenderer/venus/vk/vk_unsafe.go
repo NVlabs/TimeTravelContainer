@@ -22,6 +22,21 @@ static PFN_vkGetInstanceProcAddr vk_gipa(void *lib) {
 	return (PFN_vkGetInstanceProcAddr)dlsym(lib, "vkGetInstanceProcAddr");
 }
 
+// vk_pin_drivers creates an instance that the process keeps, of which the
+// loader keeps its drivers loaded (see pinDrivers).
+static VkResult vk_pin_drivers(const struct vn_global_proc_table *t) {
+	VkApplicationInfo app = {
+		.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+		.apiVersion = VK_API_VERSION_1_0,
+	};
+	VkInstanceCreateInfo info = {
+		.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+		.pApplicationInfo = &app,
+	};
+	VkInstance instance;
+	return t->CreateInstance(&info, NULL, &instance);
+}
+
 static void vk_init_global(PFN_vkGetInstanceProcAddr gipa, struct vn_global_proc_table *t) {
 	vn_util_init_global_proc_table(gipa, t);
 }
@@ -64,6 +79,7 @@ import "C"
 import (
 	"errors"
 	"fmt"
+	"sync"
 	"unsafe"
 )
 
@@ -88,7 +104,18 @@ func newLibrary(handle unsafe.Pointer, gipa C.PFN_vkGetInstanceProcAddr) *Librar
 	return l
 }
 
-// Open loads the first of paths that loads.
+// pinDrivers creates, of the first library opened, an instance that the
+// process keeps. The loader loads its drivers for each instance, and unloads
+// them of the last, and glibc reclaims no static TLS of a library that it
+// unloads, of which NVIDIA's driver, libnvidia-tls, takes some each time
+// that it loads: of the 16th instance created while none lived, the driver
+// loads no more ("cannot allocate memory in static TLS block"), and Vulkan
+// has no NVIDIA GPU, as of guests' instances, which each serves one of, and
+// vkgl's tests' devices.
+var pinDrivers sync.Once
+
+// Open loads the first of paths that loads, a loader, whose drivers stay
+// loaded for the process (pinDrivers).
 func Open(paths ...string) (*Library, error) {
 	var errs []error
 	for _, path := range paths {
@@ -105,7 +132,12 @@ func Open(paths ...string) (*Library, error) {
 			errs = append(errs, fmt.Errorf("%s has no vkGetInstanceProcAddr", path))
 			continue
 		}
-		return newLibrary(h, gipa), nil
+		l := newLibrary(h, gipa)
+		pinDrivers.Do(func() {
+			// Of a loader of no drivers, nothing: no instance loads any.
+			C.vk_pin_drivers(l.global)
+		})
+		return l, nil
 	}
 	return nil, errors.Join(errs...)
 }

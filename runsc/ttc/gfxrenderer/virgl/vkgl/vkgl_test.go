@@ -68,6 +68,28 @@ func TestSampleCounts(t *testing.T) {
 	}
 }
 
+// TestDevicesOneAfterAnother creates devices one after another, none of
+// which lives as the next is created, as guests' Vulkan instances come and
+// go in a renderer, and finds the same GPU each time: NVIDIA's driver,
+// which the loader loaded anew for each, loaded no more of the 16th.
+func TestDevicesOneAfterAnother(t *testing.T) {
+	var first string
+	for i := 0; i < 20; i++ {
+		d, err := NewDevice()
+		if err != nil {
+			t.Skipf("no Vulkan device: %v", err)
+		}
+		name := d.Name
+		d.Destroy()
+		if i == 0 {
+			first = name
+			t.Logf("device: %s", name)
+		} else if name != first {
+			t.Fatalf("device %d: %s, where the first was %s", i, name, first)
+		}
+	}
+}
+
 func translate(t *testing.T, text string, opts tospirv.Options) *tospirv.Result {
 	t.Helper()
 	s, err := tgsi.Parse(text)
