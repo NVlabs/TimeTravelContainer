@@ -2999,7 +2999,7 @@ func (b *runtimeBackend) prepareColdDirectFilesystemSources(info ttcbundle.Conta
 		}
 		repositories = append(repositories, repository)
 		clients = append(clients, client)
-		sources = append(sources, ttcvolume.RemoteObjectSource{Key: key, Repository: repository})
+		sources = append(sources, ttcvolume.RemoteObjectSource{Key: key, Repository: repository, Branch: physicalBranch})
 	}
 	if len(sources) == 0 {
 		cleanup()
@@ -3045,13 +3045,14 @@ func (b *runtimeBackend) prepareLocalDirectFilesystemSources(info ttcbundle.Cont
 		if err != nil {
 			return fail(err)
 		}
-		if _, err := repository.DescribeRemoteSnapshot(repositoryPhysicalBranch(config, filesystemBranch)); err != nil {
+		physicalBranch := repositoryPhysicalBranch(config, filesystemBranch)
+		if _, err := repository.DescribeRemoteSnapshot(physicalBranch); err != nil {
 			_ = repository.Close()
 			return fail(fmt.Errorf("opening local filesystem generation %q: %w", config.Source, err))
 		}
 		repositories = append(repositories, repository)
 		key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(config.Source)))
-		sources = append(sources, ttcvolume.RemoteObjectSource{Key: key, Repository: repository})
+		sources = append(sources, ttcvolume.RemoteObjectSource{Key: key, Repository: repository, Branch: physicalBranch})
 	}
 	if len(sources) == 0 {
 		cleanup()

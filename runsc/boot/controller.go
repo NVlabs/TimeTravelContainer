@@ -1251,7 +1251,7 @@ func (cm *containerManager) ServeDistributedFilesystemConnection(args *Distribut
 	if args == nil || args.SessionID == "" || len(args.FilePayload.Files) != 1 {
 		return errors.New("distributed filesystem serving requires a session and one connected socket")
 	}
-	token, err := cm.l.family.DistributedForkFilesystemToken(args.SessionID)
+	token, branch, sourceBranch, err := cm.l.family.DistributedForkFilesystemSource(args.SessionID)
 	if err != nil {
 		return err
 	}
@@ -1262,7 +1262,7 @@ func (cm *containerManager) ServeDistributedFilesystemConnection(args *Distribut
 	sources := make([]ttcvolume.RemoteObjectSource, 0, len(cm.l.ttcVolumeRepositories))
 	for source, volume := range cm.l.ttcVolumeRepositories {
 		key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(source)))
-		sources = append(sources, ttcvolume.RemoteObjectSource{Key: key, Repository: volume.repository})
+		sources = append(sources, ttcvolume.RemoteObjectSource{Key: key, Repository: volume.repository, Branch: branch, BaseOf: sourceBranch})
 	}
 	go func() {
 		if err := ttcvolume.ServeRemoteObjects(conn, token, sources); err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {

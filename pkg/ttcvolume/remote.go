@@ -114,15 +114,22 @@ func writeAll(writer io.Writer, data []byte) error {
 }
 
 // RemoteObjectSource authorizes the immutable objects visible through one
-// sealed repository generation. Objects maps object IDs to their exact sizes.
+// sealed repository generation.
 type RemoteObjectSource struct {
 	Key        RemoteSourceKey
 	Repository *Repository
+	// Branch names the sealed branch of Repository the source serves: a client
+	// reads its roots and the objects below them, and no other branch's.
+	Branch string
+	// BaseOf names a branch whose diff base the client reads too: a
+	// migration gives its target the diff base of the branch it moves, not
+	// that of the branch it seals to move it.
+	BaseOf string
 	// Reader may serve immutable content from a shared pack rather than a live
-	// repository. Exactly one of Reader and Repository must be set.
+	// repository. Exactly one of Reader and Repository must be set. A Reader
+	// authorizes what it serves through Catalog, which must be set with it.
 	Reader  RemoteObjectReader
 	Catalog RemoteObjectCatalog
-	Objects map[string]int64
 }
 
 // RemoteObjectCatalog resolves immutable graph metadata without exposing the
@@ -158,10 +165,103 @@ func (r *Repository) AttachImmutableMetadataSource(branchID string, loader ttcsn
 	return r.graph.AttachDeferredResolver(branch.RemoteCatalog, ttcsnapshot.SnapshotID(branch.RemoteCatalogSnapshot), loader)
 }
 
-type repositoryObjectCatalog struct{ repository *Repository }
+// branchObjectCatalog serves the objects of one sealed branch of a
+// repository: the branch's roots, and the objects below objects it serves. A
+// repository holds every branch of its family, so an object it resolves is
+// not by that alone one the branch reaches.
+type branchObjectCatalog struct {
+	repository *Repository
+	mu         sync.Mutex
+	// allowed holds the objects the catalog serves.
+	allowed map[ttcsnapshot.ObjectID]struct{}
+	// unexpanded holds the allowed objects whose children are not allowed
+	// yet.
+	unexpanded []ttcsnapshot.ObjectID
+}
 
-func (c repositoryObjectCatalog) RemoteObject(id ttcsnapshot.ObjectID) (ttcsnapshot.Object, error) {
-	return c.repository.remoteGraphObject(id)
+func (r *Repository) newBranchObjectCatalog(branchID, baseOf string) (*branchObjectCatalog, error) {
+	if branchID == "" {
+		return nil, errors.New("filesystem source names no branch")
+	}
+	branch, err := r.Branch(branchID)
+	if err != nil {
+		return nil, err
+	}
+	names := []string{graphRootName(branchID)}
+	if branch.BaseRoot != "" {
+		names = append(names, graphBaseRootName(branchID))
+	}
+	if baseOf != "" && baseOf != branchID {
+		if other, err := r.Branch(baseOf); err == nil && other.BaseRoot != "" {
+			names = append(names, graphBaseRootName(baseOf))
+		}
+	}
+	c := &branchObjectCatalog{repository: r, allowed: make(map[ttcsnapshot.ObjectID]struct{}, len(names))}
+	for _, name := range names {
+		root, ok := r.graph.Root(name)
+		if !ok {
+			return nil, fmt.Errorf("branch %q has no snapshot graph root %q", branchID, name)
+		}
+		c.allowed[root] = struct{}{}
+		c.unexpanded = append(c.unexpanded, root)
+	}
+	return c, nil
+}
+
+// authorize reports whether the catalog serves id.
+func (c *branchObjectCatalog) authorize(id ttcsnapshot.ObjectID) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.allowed[id]; ok {
+		return true
+	}
+	// A client walks the tree down from the roots, so what it asks for is
+	// below an object it was served, unless it resumes below objects another
+	// stream served it. Look for id below the allowed objects, expanding each
+	// once at most.
+	for len(c.unexpanded) != 0 {
+		next := c.unexpanded[len(c.unexpanded)-1]
+		c.unexpanded = c.unexpanded[:len(c.unexpanded)-1]
+		if next.Kind == ttcsnapshot.ObjectKindFile {
+			continue
+		}
+		object, err := c.repository.graph.ResolveObject(next)
+		if err != nil {
+			continue
+		}
+		c.allowLocked(object)
+		if _, ok := c.allowed[id]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// allowLocked allows the children of object. A deferred object's foreign
+// identity names an object of another repository, and is not allowed.
+//
+// +checklocks:c.mu
+func (c *branchObjectCatalog) allowLocked(object ttcsnapshot.Object) {
+	for _, edge := range object.Children {
+		if _, ok := c.allowed[edge.Child]; !ok {
+			c.allowed[edge.Child] = struct{}{}
+			c.unexpanded = append(c.unexpanded, edge.Child)
+		}
+	}
+}
+
+func (c *branchObjectCatalog) RemoteObject(id ttcsnapshot.ObjectID) (ttcsnapshot.Object, error) {
+	if !c.authorize(id) {
+		return ttcsnapshot.Object{}, fmt.Errorf("filesystem object %s is outside the captured generation", id)
+	}
+	object, err := c.repository.remoteGraphObject(id)
+	if err != nil {
+		return ttcsnapshot.Object{}, err
+	}
+	c.mu.Lock()
+	c.allowLocked(object)
+	c.mu.Unlock()
+	return object, nil
 }
 
 func (r *Repository) remoteGraphObject(id ttcsnapshot.ObjectID) (ttcsnapshot.Object, error) {
@@ -219,18 +319,25 @@ func (r repositoryObjectReader) ReadObjectRange(object string, destination []byt
 }
 
 // ServeRemoteObjects serves range requests until conn closes. The token and
-// object allowlist fence a client to one captured fork generation.
+// each source's catalog fence a client to one captured fork generation.
 func ServeRemoteObjects(conn io.ReadWriteCloser, token RemoteToken, sources []RemoteObjectSource) error {
 	defer conn.Close()
 	byKey := make(map[RemoteSourceKey]RemoteObjectSource, len(sources))
 	for _, source := range sources {
-		if source.Reader == nil && source.Repository != nil {
+		if source.Repository != nil {
+			if source.Reader != nil || source.Catalog != nil {
+				continue
+			}
+			catalog, err := source.Repository.newBranchObjectCatalog(source.Branch, source.BaseOf)
+			if err != nil {
+				// The source serves nothing: what a client asks of it is
+				// outside the captured generation.
+				continue
+			}
 			source.Reader = repositoryObjectReader{repository: source.Repository}
+			source.Catalog = catalog
 		}
-		if source.Catalog == nil && source.Repository != nil {
-			source.Catalog = repositoryObjectCatalog{repository: source.Repository}
-		}
-		if source.Reader == nil {
+		if source.Reader == nil || source.Catalog == nil {
 			continue
 		}
 		byKey[source.Key] = source
@@ -250,7 +357,7 @@ func ServeRemoteObjects(conn io.ReadWriteCloser, token RemoteToken, sources []Re
 			return writeRemoteFailure(conn, request, "filesystem object or range is outside the captured generation")
 		}
 		if request.type_ == remoteMetadataPull {
-			if request.offset != 0 || request.length != 0 || source.Catalog == nil {
+			if request.offset != 0 || request.length != 0 {
 				return writeRemoteFailure(conn, request, "invalid filesystem metadata request")
 			}
 			metadata, err := source.Catalog.RemoteObject(id)
@@ -271,12 +378,11 @@ func ServeRemoteObjects(conn io.ReadWriteCloser, token RemoteToken, sources []Re
 		if request.type_ != remotePull || request.length == 0 || request.length > remoteExtentBytes || request.offset%remoteExtentBytes != 0 || id.Kind != ttcsnapshot.ObjectKindFile {
 			return writeRemoteFailure(conn, request, "invalid or unauthorized filesystem range request")
 		}
-		size, allowed := source.Objects[object]
-		if !allowed && source.Catalog != nil {
-			metadata, err := source.Catalog.RemoteObject(id)
-			if err == nil && metadata.BulkLength <= uint64(^uint64(0)>>1) {
-				size, allowed = int64(metadata.BulkLength), true
-			}
+		var size int64
+		metadata, err := source.Catalog.RemoteObject(id)
+		allowed := err == nil && metadata.BulkLength <= uint64(^uint64(0)>>1)
+		if allowed {
+			size = int64(metadata.BulkLength)
 		}
 		if !allowed || request.offset >= uint64(size) || uint64(request.length) > uint64(size)-request.offset {
 			return writeRemoteFailure(conn, request, "filesystem object or range is outside the captured generation")

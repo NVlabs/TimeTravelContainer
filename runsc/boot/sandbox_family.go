@@ -704,6 +704,10 @@ type distributedForkSession struct {
 	sparseSnapshot   *pgalloc.RemoteSnapshot
 	memoryBindings   []pgalloc.CapturedPageBinding
 	filesystemToken  ttcvolume.RemoteToken
+
+	// sourceFilesystemBranch is the repository branch of source when it was
+	// captured, whose diff base a migration's target receives.
+	sourceFilesystemBranch string
 }
 
 type distributedForkHandoff struct {
@@ -1086,6 +1090,7 @@ func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, ch
 			source: sourceID, address: address, filesystemBranch: volumeBranches[i],
 			resources: capture.FilesystemResources, server: server,
 			sparseSnapshot: handoffSnapshots[i], memoryBindings: capture.MemoryBindings,
+			sourceFilesystemBranch: source.filesystemBranch,
 		}
 		copy(sessions[i].filesystemToken[:], token[:])
 		if capture.HandoffSnapshot != nil {
@@ -1164,16 +1169,19 @@ func (f *SandboxFamily) ServeDistributedForkConnection(args *DistributedForkServ
 	return nil
 }
 
-// DistributedForkFilesystemToken returns the transaction-fenced token for a
-// live capture. The token remains valid exactly as long as the source session.
-func (f *SandboxFamily) DistributedForkFilesystemToken(id string) (ttcvolume.RemoteToken, error) {
+// DistributedForkFilesystemSource returns the transaction-fenced token for a
+// live capture, the repository branch the capture sealed, the one branch whose
+// files the token reads, and the source's own repository branch, whose diff
+// base the token reads too. The token remains valid exactly as long as the
+// source session.
+func (f *SandboxFamily) DistributedForkFilesystemSource(id string) (token ttcvolume.RemoteToken, branch, sourceBranch string, err error) {
 	f.mu.Lock()
 	session := f.distributedSessions[id]
 	f.mu.Unlock()
 	if session == nil {
-		return ttcvolume.RemoteToken{}, fmt.Errorf("distributed fork session %q does not exist", id)
+		return ttcvolume.RemoteToken{}, "", "", fmt.Errorf("distributed fork session %q does not exist", id)
 	}
-	return session.filesystemToken, nil
+	return session.filesystemToken, session.filesystemBranch, session.sourceFilesystemBranch, nil
 }
 
 // ExportDistributedForkSnapshot writes a session's immutable memory graph.

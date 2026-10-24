@@ -52,12 +52,7 @@ func attachTestRemote(t *testing.T, source, target *Repository, sourceBranch, ta
 	key := RemoteSourceKey(sha256.Sum256([]byte("rootfs-upper")))
 	serverErr := make(chan error, 1)
 	go func() {
-		objects, err := source.BranchObjects(sourceBranch)
-		if err != nil {
-			serverErr <- err
-			return
-		}
-		entry := RemoteObjectSource{Key: key, Repository: source, Objects: objects}
+		entry := RemoteObjectSource{Key: key, Repository: source, Branch: sourceBranch}
 		if reader != nil {
 			entry = RemoteObjectSource{Key: key, Reader: reader, Catalog: reader}
 		}
@@ -67,6 +62,110 @@ func attachTestRemote(t *testing.T, source, target *Repository, sourceBranch, ta
 		t.Fatal(err)
 	}
 	return serverErr
+}
+
+// TestRemoteSourceServesOnlyItsBranch serves one sealed branch of a
+// repository holding a sibling's private file: a client with the right token
+// reads the branch's files, and neither the sibling's file nor its tree.
+func TestRemoteSourceServesOnlyItsBranch(t *testing.T) {
+	manager := openTestManager(t)
+	source, err := manager.Create("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	write := func(branch, name string, mode uint32, data string) {
+		t.Helper()
+		ino, err := source.CreateRegular(branch, RootInode, name, mode, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n, _, err := source.WriteAt(branch, ino, []byte(data), 0); err != nil || n != len(data) {
+			t.Fatalf("WriteAt: %d, %v", n, err)
+		}
+	}
+	write(MainBranch, "shared", 0644, "bytes every branch has")
+	if err := source.Fork(MainBranch, "sibling"); err != nil {
+		t.Fatal(err)
+	}
+	write("sibling", "secret", 0600, "bytes only the sibling has")
+	for _, fork := range [][2]string{{"sibling", "sibling-sealed"}, {MainBranch, "sealed"}} {
+		if err := source.Fork(fork[0], fork[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	served, err := source.BranchObjects("sealed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	siblings, err := source.BranchObjects("sibling-sealed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var shared, secret string
+	for object := range siblings {
+		if _, ok := served[object]; ok {
+			shared = object
+		} else {
+			secret = object
+		}
+	}
+	siblingRoot, ok := source.graph.Root(graphRootName("sibling-sealed"))
+	if shared == "" || secret == "" || !ok {
+		t.Fatalf("objects: shared %q, sibling's own %q, sibling's root %t", shared, secret, ok)
+	}
+	var token RemoteToken
+	copy(token[:], []byte("one-branch-token"))
+	key := RemoteSourceKey(sha256.Sum256([]byte("rootfs-upper")))
+	request := func(kind remoteMessageType, object string, length uint32) ([]byte, error) {
+		server, client := net.Pipe()
+		defer client.Close()
+		go ServeRemoteObjects(server, token, []RemoteObjectSource{{Key: key, Repository: source, Branch: "sealed"}})
+		remote := &remoteObjectClient{conn: client, token: token, source: key}
+		return remote.request(kind, object, 0, length)
+	}
+	if got, err := request(remotePull, shared, uint32(served[shared])); err != nil || string(got) != "bytes every branch has" {
+		t.Fatalf("the branch's own file: %q, %v", got, err)
+	}
+	for _, denied := range []struct {
+		kind   remoteMessageType
+		object string
+		length uint32
+	}{
+		{remotePull, secret, uint32(siblings[secret])},
+		{remoteMetadataPull, secret, 0},
+		{remoteMetadataPull, siblingRoot.String(), 0},
+	} {
+		if got, err := request(denied.kind, denied.object, denied.length); err == nil {
+			t.Errorf("request %d of the sibling's %s served %q", denied.kind, denied.object, got)
+		}
+	}
+	// A migration's source serves the diff base of the branch it moves too.
+	siblingBase, ok := source.graph.Root(graphBaseRootName("sibling"))
+	if !ok {
+		t.Fatal("the sibling has no diff base")
+	}
+	withBase := func(kind remoteMessageType, object string, length uint32) ([]byte, error) {
+		server, client := net.Pipe()
+		defer client.Close()
+		go ServeRemoteObjects(server, token, []RemoteObjectSource{{Key: key, Repository: source, Branch: "sealed", BaseOf: "sibling"}})
+		remote := &remoteObjectClient{conn: client, token: token, source: key}
+		return remote.request(kind, object, 0, length)
+	}
+	if _, err := withBase(remoteMetadataPull, siblingBase.String(), 0); err != nil {
+		t.Errorf("the moved branch's diff base: %v", err)
+	}
+	if got, err := withBase(remotePull, secret, uint32(siblings[secret])); err == nil {
+		t.Errorf("a source with the sibling's diff base served its file %q", got)
+	}
+	// A source names the branch it serves, or serves nothing.
+	server, client := net.Pipe()
+	defer client.Close()
+	go ServeRemoteObjects(server, token, []RemoteObjectSource{{Key: key, Repository: source}})
+	remote := &remoteObjectClient{conn: client, token: token, source: key}
+	if got, err := remote.request(remotePull, shared, 0, uint32(served[shared])); err == nil {
+		t.Errorf("a source of no branch served %q", got)
+	}
 }
 
 func TestRemoteClientPreservesFirstTerminalProtocolError(t *testing.T) {
