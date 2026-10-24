@@ -1267,6 +1267,12 @@ host loopback DNS resolver such as `127.0.0.53` to its corresponding
 the proxy. NAT is currently IPv4-only and implements TCP plus short-lived UDP
 mappings; ICMP forwarding is not provided.
 
+With `--nat`, the container's subnet aliases the host's loopback: the gateway,
+`10.0.2.2`, is the host's `127.0.0.1`, and `10.0.2.x` is `127.0.0.x`. A
+container can therefore connect to every service that listens on the host's
+loopback addresses, as any local process can. Run untrusted containers with
+`--nat` only on hosts whose loopback services authenticate their clients.
+
 Publish a container TCP port with Docker-style `-p`/`--publish`:
 
 ```shell
