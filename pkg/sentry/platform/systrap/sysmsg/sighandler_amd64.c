@@ -232,6 +232,19 @@ struct thread_context *switch_context_amd64(
 static void prep_fpstate_for_sigframe(void *buf, uint32_t user_size,
                                       bool use_xsave);
 
+// record_frame records the frame the handler resumes a context from, unless
+// the signal interrupted code on the alternate stack: its frame is below
+// that code's.
+static void record_frame(struct sysmsg *sysmsg, ucontext_t *ucontext,
+                         siginfo_t *siginfo) {
+  if (on_alt_stack(sysmsg, ucontext->uc_mcontext.gregs[REG_RSP])) {
+    return;
+  }
+  sysmsg->frame = ucontext;
+  sysmsg->frame_siginfo = siginfo;
+  atomic_store(&sysmsg->frame_scrubbed, 0);
+}
+
 void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
   ucontext_t *ucontext = _ucontext;
   void *sp = sysmsg_sp();
@@ -247,6 +260,7 @@ void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
   uint64_t gs_base = (uint64_t)sysmsg;
 
   if (thread_state == THREAD_STATE_INITIALIZING) {
+    record_frame(sysmsg, ucontext, siginfo);
     // Find a new context and exit to restore it.
     init_new_thread();
     goto init;
@@ -266,6 +280,7 @@ void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
     sysmsg->fault_jump = 0;
     return;
   }
+  record_frame(sysmsg, ucontext, siginfo);
 
   fs_base = get_fsbase();
   if (ctx->guest_gs) {
@@ -389,6 +404,10 @@ void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
 
 init:
   ctx = switch_context_amd64(sysmsg, ctx, ctx_state);
+  if (atomic_load(&sysmsg->frame_scrubbed)) {
+    // The frame's own floating point state is zeroed.
+    atomic_store(&ctx->fpstate_changed, 1);
+  }
   if (fs_base != ctx->ptregs.fs_base) {
     set_fsbase(ctx->ptregs.fs_base);
   }
@@ -545,6 +564,31 @@ struct __fpstate {
   uint32_t reserved2[12];
   struct __fpx_sw_bytes sw_reserved;
 };
+
+void scrub_frame(struct sysmsg *sysmsg) {
+  ucontext_t *ucontext = sysmsg->frame;
+  if (ucontext == NULL) {
+    return;
+  }
+  // The handler rewrites every register sigreturn restores from the context
+  // it resumes (ptregs_to_gregs).
+  zero(ucontext->uc_mcontext.gregs, sizeof(ucontext->uc_mcontext.gregs));
+  // The frame's own floating point state, which uc_mcontext.fpregs points to
+  // until the handler resumes a context from the context's (see
+  // __export_sighandler).
+  struct __fpstate *fpstate = (struct __fpstate *)ucontext->uc_mcontext.fpregs;
+  if (fpstate != NULL) {
+    // The legacy FXSAVE area, or the XSAVE area the frame describes.
+    size_t size = 512;
+    if (fpstate->sw_reserved.magic1 == FP_XSTATE_MAGIC1 &&
+        fpstate->sw_reserved.xstate_size <= __export_arch_state.fp_len) {
+      size = fpstate->sw_reserved.xstate_size;
+    }
+    zero(fpstate, size);
+  }
+  zero(sysmsg->frame_siginfo, sizeof(siginfo_t));
+  atomic_store(&sysmsg->frame_scrubbed, 1);
+}
 
 // The kernel expects to see some additional info in an FPU state. More details
 // can be found in arch/x86/kernel/fpu/signal.c:check_xstate_in_sigframe.

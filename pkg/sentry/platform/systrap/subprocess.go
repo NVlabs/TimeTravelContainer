@@ -23,6 +23,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -152,6 +153,10 @@ type subprocess struct {
 	// threadContextRegion defines the ThreadContext memory region start
 	// within the sentry address space.
 	threadContextRegion uintptr
+
+	// threadContextFR is the range of memoryFile that backs the
+	// ThreadContext region.
+	threadContextFR memmap.FileRange
 
 	// memoryFile is used to allocate a sysmsg stack which is shared between a
 	// stub process and the Sentry.
@@ -353,6 +358,30 @@ func (s *subprocess) handlePtraceSyscallRequest(req any) {
 	}
 }
 
+// stubThreadsAsleepTimeout bounds how long the stub threads of a pooled
+// subprocess take to fall asleep. With no context to run, a stub thread spins
+// for twice deepSleepTimeout at most.
+const stubThreadsAsleepTimeout = time.Second
+
+// waitStubThreadsAsleep waits until every stub thread of s sleeps. A stub
+// thread zeroes what its stacks keep of the contexts it ran before it says it
+// sleeps (see sysmsg_lib.c:scrub_stacks). It reports false if one does not
+// sleep in stubThreadsAsleepTimeout.
+func (s *subprocess) waitStubThreadsAsleep() bool {
+	deadline := time.Now().Add(stubThreadsAsleepTimeout)
+	s.sysmsgThreadsMu.RLock()
+	defer s.sysmsgThreadsMu.RUnlock()
+	for _, t := range s.sysmsgThreads {
+		for t.msg.State.Get() != sysmsg.ThreadStateAsleep {
+			if time.Now().After(deadline) {
+				return false
+			}
+			runtime.Gosched()
+		}
+	}
+	return true
+}
+
 // newSubprocess returns a usable subprocess.
 //
 // This will either be a newly created subprocess, or one from the global pool.
@@ -371,6 +400,18 @@ func newSubprocess(create func() (*thread, error), memoryFile *pgalloc.MemoryFil
 			sp.release()
 			continue
 		}
+		// The address space the subprocess served before may be another
+		// branch's, or another user's process, and the new one can read
+		// the stacks of its stub threads and every context slot: wait for
+		// the threads to zero what their stacks keep of it, and zero the
+		// registers its contexts left.
+		if !sp.waitStubThreadsAsleep() {
+			log.Warningf("Stub threads of a pooled subprocess did not fall asleep; killing it")
+			sp.syscallThread.thread.kill()
+			sp.release()
+			continue
+		}
+		sp.memoryFile.Decommit(sp.threadContextFR)
 		sp.subprocessRefs.InitRefs()
 		sp.usertrap = usertrap.New()
 		return sp, nil
@@ -499,6 +540,7 @@ func (s *subprocess) mapSharedRegions() {
 	}
 
 	s.threadContextRegion = sentryThreadContextRegionAddr
+	s.threadContextFR = threadContextFR
 }
 
 func (s *subprocess) mapPrivateRegions() {

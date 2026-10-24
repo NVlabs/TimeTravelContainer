@@ -97,6 +97,28 @@ void __export_start(struct sysmsg *sysmsg, void *_ucontext) {
   panic(0x11111111, 0);
 }
 
+void scrub_frame(struct sysmsg *sysmsg) {
+  ucontext_t *ucontext = sysmsg->frame;
+  if (ucontext == NULL) {
+    return;
+  }
+  // The handler rewrites every register sigreturn restores from the context
+  // it resumes (ptregs_to_gregs).
+  ucontext->uc_mcontext.fault_address = 0;
+  zero(ucontext->uc_mcontext.regs, sizeof(ucontext->uc_mcontext.regs));
+  ucontext->uc_mcontext.sp = 0;
+  ucontext->uc_mcontext.pc = 0;
+  // Keep the header of the floating point record, into which the handler
+  // copies the floating point state of the context it resumes: what follows
+  // it, the record's own state and the records after it, is zeroed. The
+  // handler ends the records after the floating point one (restore_state).
+  struct _aarch64_ctx *head =
+      (struct _aarch64_ctx *)&ucontext->uc_mcontext.__reserved;
+  zero(head + 1, sizeof(ucontext->uc_mcontext.__reserved) - sizeof(*head));
+  zero(sysmsg->frame_siginfo, sizeof(siginfo_t));
+  atomic_store(&sysmsg->frame_scrubbed, 1);
+}
+
 void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
   ucontext_t *ucontext = _ucontext;
   void *sp = sysmsg_sp();
@@ -104,6 +126,13 @@ void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
 
   if (sysmsg != sysmsg->self) panic(STUB_ERROR_BAD_SYSMSG, 0);
   int32_t thread_state = atomic_load(&sysmsg->state);
+  // Record the frame the handler resumes a context from, unless the signal
+  // interrupted code on the alternate stack: its frame is below that code's.
+  if (!on_alt_stack(sysmsg, ucontext->uc_mcontext.sp)) {
+    sysmsg->frame = ucontext;
+    sysmsg->frame_siginfo = siginfo;
+    atomic_store(&sysmsg->frame_scrubbed, 0);
+  }
 
   uint32_t ctx_state = CONTEXT_STATE_INVALID;
   struct thread_context *ctx = NULL, *old_ctx = NULL;
@@ -196,7 +225,9 @@ init:
     }
   }
 
-  if (old_ctx != ctx || ctx->last_thread_id != sysmsg->thread_id) {
+  // A scrubbed frame's own floating point state is zeroed.
+  if (old_ctx != ctx || ctx->last_thread_id != sysmsg->thread_id ||
+      atomic_load(&sysmsg->frame_scrubbed)) {
     ctx->fpstate_changed = 1;
   }
   restore_state(sysmsg, ctx, _ucontext);

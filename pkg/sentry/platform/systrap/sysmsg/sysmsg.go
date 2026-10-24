@@ -169,6 +169,12 @@ type Msg struct {
 	// PlacementID is the placement this sysmsg thread last confined itself
 	// to; see ThreadContext.PlacementID.
 	PlacementID uint32
+	// Frame, FrameSigInfo and FrameScrubbed locate the signal frame that the
+	// stub thread zeroes the registers of before it sleeps; see sysmsg.h.
+	// Only the stub uses them.
+	Frame         uint64
+	FrameSigInfo  uint64
+	FrameScrubbed uint32
 }
 
 // ContextState defines the reason the context has exited back to the sentry,

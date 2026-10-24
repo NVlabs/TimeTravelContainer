@@ -20,6 +20,7 @@
 #ifndef THIRD_PARTY_GVISOR_PKG_SENTRY_PLATFORM_SYSTRAP_SYSMSG_SYSMSG_H_
 #define THIRD_PARTY_GVISOR_PKG_SENTRY_PLATFORM_SYSTRAP_SYSMSG_SYSMSG_H_
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <sys/types.h>
 #include <sys/user.h>
@@ -76,6 +77,16 @@ struct sysmsg {
   // placement_id is the placement this thread last confined itself to; see
   // thread_context.placement_id.
   uint32_t placement_id;
+  // frame and frame_siginfo locate the signal frame and its siginfo, at the
+  // top of the alternate stack, of the last signal the handler resumes a
+  // context from. The frame keeps the registers of the context it
+  // interrupted until another signal replaces them; frame_scrubbed is set
+  // once the thread zeroed them (see scrub_stacks), and makes the handler
+  // restore the floating point state of the context it resumes from the
+  // context.
+  void *frame;
+  void *frame_siginfo;
+  uint32_t frame_scrubbed;
 };
 
 enum context_state {
@@ -148,6 +159,17 @@ enum stub_error {
 #define GUARD_SIZE (PAGE_SIZE)
 #define MSG_OFFSET_FROM_START (PER_THREAD_MEM_SIZE - PAGE_SIZE)
 
+// The private stack the syscall handler runs on, and the alternate stack the
+// signal handler runs on, below the sysmsg structure.
+#define PER_THREAD_PRIVATE_STACK_OFFSET GUARD_SIZE
+#if PAGE_SIZE == 65536
+#define PER_THREAD_PRIVATE_STACK_SIZE (1 * PAGE_SIZE)
+#define PER_THREAD_SHARED_STACK_OFFSET (3 * PAGE_SIZE)
+#else
+#define PER_THREAD_PRIVATE_STACK_SIZE (2 * PAGE_SIZE)
+#define PER_THREAD_SHARED_STACK_OFFSET (4 * PAGE_SIZE)
+#endif
+
 #define SPINNING_QUEUE_MEM_SIZE PAGE_SIZE
 // LINT.ThenChange(sysmsg.go)
 
@@ -179,6 +201,14 @@ static struct sysmsg *sysmsg_addr(void *sp) {
   return (struct sysmsg *)(sp + MSG_OFFSET_FROM_START);
 }
 
+// on_alt_stack reports whether addr is in the alternate stack of the thread
+// of sysmsg, below the sysmsg structure.
+static bool on_alt_stack(struct sysmsg *sysmsg, uint64_t addr) {
+  uint64_t start = (uint64_t)sysmsg - MSG_OFFSET_FROM_START +
+                   PER_THREAD_SHARED_STACK_OFFSET;
+  return addr >= start && addr < (uint64_t)sysmsg;
+}
+
 long __syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6);
 
 struct __kernel_timespec;
@@ -207,6 +237,13 @@ static void __panic(int err, int err_additional, long line) {
 }
 
 void memcpy(uint8_t *dest, uint8_t *src, size_t n);
+
+// zero zeroes n bytes at dest, which are 8-byte aligned, as memset does.
+void zero(void *dest, size_t n);
+
+// scrub_frame zeroes the registers that the signal frame of sysmsg->frame
+// keeps and the handler does not need to resume a context from it.
+void scrub_frame(struct sysmsg *sysmsg);
 
 void __export_start(struct sysmsg *sysmsg, void *_ucontext);
 

@@ -115,6 +115,47 @@ void memcpy(uint8_t *dest, uint8_t *src, size_t n) {
   }
 }
 
+void zero(void *dest, size_t n) {
+  // Through a volatile pointer, the compiler cannot make the loop a memset
+  // call, which the stub has none of.
+  volatile uint64_t *p = dest;
+  for (size_t i = 0; i < n / sizeof(*p); i++) {
+    p[i] = 0;
+  }
+}
+
+// scrub_stacks zeroes what the stacks of the thread keep of the contexts it
+// ran: the signal frame on the alternate stack keeps the registers of the
+// context the signal interrupted, and the stack the thread does not run on
+// keeps what a handler last left there. A stub process serves one address
+// space after another, and an address space can read the stacks of all the
+// threads of its stub process. A thread scrubs them before it sleeps: the
+// Sentry gives a stub process to another address space only once all its
+// threads sleep.
+static void scrub_stacks(struct sysmsg *sysmsg) {
+  uint8_t *start = (uint8_t *)sysmsg - MSG_OFFSET_FROM_START;
+  uint8_t *private_stack = start + PER_THREAD_PRIVATE_STACK_OFFSET;
+  uint8_t *alt_stack = start + PER_THREAD_SHARED_STACK_OFFSET;
+  uint8_t here;
+
+  if (on_alt_stack(sysmsg, (uint64_t)&here)) {
+    // The signal handler runs on the alternate stack, and resumes a context
+    // from its frame.
+    scrub_frame(sysmsg);
+    zero(private_stack, PER_THREAD_PRIVATE_STACK_SIZE);
+  } else {
+    zero(alt_stack, (uint8_t *)sysmsg - alt_stack);
+    atomic_store(&sysmsg->frame_scrubbed, 1);
+  }
+  // The stack and instruction pointers of the last fast syscall, and the
+  // name of the last context, are rewritten before they are used again.
+  sysmsg->app_stack = 0;
+  sysmsg->ret_addr = 0;
+  for (size_t i = 0; i < sizeof(sysmsg->thread_name); i++) {
+    ((volatile char *)sysmsg->thread_name)[i] = 0;
+  }
+}
+
 // update_thread_name makes host process monitors identify an executing
 // systrap worker by the guest context it currently runs. Linux task names are
 // limited to 15 visible bytes; thread_context.thread_name is always NUL
@@ -425,6 +466,8 @@ struct thread_context *get_context(struct sysmsg *sysmsg) {
     }
 
     atomic_sub(&queue->num_spinning_threads, 1);
+    // A thread scrubs its stacks before it says it sleeps.
+    scrub_stacks(sysmsg);
     atomic_store(&sysmsg->state, THREAD_STATE_ASLEEP);
     uint32_t nr_active_contexts = atomic_load(&queue->num_active_contexts);
     // We have to make another attempt to get a context here to prevent TOCTTOU
