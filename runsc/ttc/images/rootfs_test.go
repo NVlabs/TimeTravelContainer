@@ -119,6 +119,52 @@ func TestApplyLayerDefersRestrictiveDirectoryModes(t *testing.T) {
 	}
 }
 
+// TestApplyLayerRestoresNoModeThroughSymlinks replaces a directory a layer
+// recorded with a symbolic link, out of the image or in it: the mode recorded
+// for the directory beneath it reaches no directory through the link.
+func TestApplyLayerRestoresNoModeThroughSymlinks(t *testing.T) {
+	host := t.TempDir()
+	for _, name := range []string{"absolute", "relative"} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			outside := filepath.Join(host, name)
+			if err := os.MkdirAll(filepath.Join(outside, "target"), 0755); err != nil {
+				t.Fatal(err)
+			}
+			target := outside
+			if name == "relative" {
+				target = "elsewhere"
+			}
+			base := makeLayer(t, false, []tarEntry{
+				{name: "pivot/", mode: 0755},
+				{name: "pivot/target/", mode: 0},
+				{name: "elsewhere/", mode: 0755},
+				{name: "elsewhere/target/", mode: 0751},
+			})
+			if err := applyLayer(context.Background(), root, bytes.NewReader(base)); err != nil {
+				t.Fatal(err)
+			}
+			upper := makeLayer(t, false, []tarEntry{
+				{name: ".wh.pivot", mode: 0644},
+				{name: "pivot", typeflag: tar.TypeSymlink, linkname: target, mode: 0777},
+			})
+			if err := applyLayer(context.Background(), root, bytes.NewReader(upper)); err != nil {
+				t.Fatal(err)
+			}
+			for path, want := range map[string]os.FileMode{
+				filepath.Join(outside, "target"):            0755,
+				filepath.Join(root, "elsewhere", "target"): 0751,
+			} {
+				if info, err := os.Stat(path); err != nil {
+					t.Error(err)
+				} else if got := info.Mode().Perm(); got != want {
+					t.Errorf("%s: mode %#o, want %#o", path, got, want)
+				}
+			}
+		})
+	}
+}
+
 func TestApplyLayerPreservesEmptyDirectory(t *testing.T) {
 	root := t.TempDir()
 	layer := makeLayer(t, true, []tarEntry{

@@ -23,6 +23,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/archive"
 	"github.com/containerd/containerd/v2/pkg/archive/compression"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/runsc/ttc/ownership"
 )
 
@@ -322,23 +323,53 @@ func (m layerDirectoryModes) restore(root string) error {
 		}
 		return paths[i] < paths[j]
 	})
+	rootDir, err := os.Open(root)
+	if err != nil {
+		return err
+	}
+	defer rootDir.Close()
 	for _, relative := range paths {
-		current := filepath.Join(root, filepath.FromSlash(relative))
-		info, err := os.Lstat(current)
-		if os.IsNotExist(err) {
-			continue
-		}
+		dir, err := openDirectoryBeneath(rootDir, relative)
 		if err != nil {
 			return err
 		}
-		if !info.IsDir() {
+		if dir == nil {
 			continue
 		}
-		if err := os.Chmod(current, m[relative]); err != nil {
+		err = dir.Chmod(m[relative])
+		dir.Close()
+		if err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// openDirectoryBeneath opens the directory at relative, a slash-separated
+// path beneath root, through no symbolic link: a layer may have replaced a
+// directory recorded before it was applied, or one of its ancestors, with a
+// link, even one out of the image, and what is now at the path is not the
+// directory recorded. It returns nil if no directory is there so.
+func openDirectoryBeneath(root *os.File, relative string) (*os.File, error) {
+	fd, err := unix.Dup(int(root.Fd()))
+	if err != nil {
+		return nil, err
+	}
+	for _, component := range strings.Split(relative, "/") {
+		if component == "." || component == "" {
+			continue
+		}
+		next, err := unix.Openat(fd, component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		unix.Close(fd)
+		if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ENOTDIR) || errors.Is(err, unix.ELOOP) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("opening %q: %w", relative, err)
+		}
+		fd = next
+	}
+	return os.NewFile(uintptr(fd), relative), nil
 }
 
 type ownershipRecord struct {
