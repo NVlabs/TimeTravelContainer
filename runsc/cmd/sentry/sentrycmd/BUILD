@@ -35,6 +35,7 @@ go_library(
         "//pkg/prometheus",
         "//pkg/rdma",
         "//pkg/ring0",
+        "//pkg/sentry/devices/nvproxy",
         "//pkg/sentry/devices/nvproxy/nvconf",
         "//pkg/sentry/hostmm",
         "//pkg/sentry/platform",
@@ -60,7 +61,7 @@ go_test(
     name = "sentrycmd_test",
     size = "small",
     srcs = ["chroot_test.go"],
-    library = ":sentrycmd",
+    embed = [":sentrycmd"],
     deps = [
         "//runsc/config",
         "//runsc/specutils",

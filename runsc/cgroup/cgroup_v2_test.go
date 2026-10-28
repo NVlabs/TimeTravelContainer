@@ -21,7 +21,6 @@ package cgroup
 import (
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -46,10 +45,10 @@ func TestIO(t *testing.T) {
 		{
 			name: "simple",
 			spec: &specs.LinuxBlockIO{
-				Weight: uint16Ptr(1),
+				Weight: uint16Ptr(750),
 			},
 			path:  "io.weight",
-			wants: strconv.FormatUint(convertBlkIOToIOWeightValue(1), 10),
+			wants: "7475",
 		},
 		{
 			name: "bfq",

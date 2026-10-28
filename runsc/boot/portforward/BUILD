@@ -19,6 +19,7 @@ go_library(
         "portforward_netstack.go",
         "portforward_test_util.go",
     ],
+    importpath = "gvisor.dev/gvisor/runsc/boot/portforward",
     visibility = [
         "//runsc:__subpackages__",
     ],
@@ -46,7 +47,7 @@ go_test(
         "portforward_hostinet_test.go",
         "portforward_netstack_test.go",
     ],
-    library = ":portforward",
+    embed = [":portforward"],
     tags = [
         "requires-net:ipv4",
         "requires-net:loopback",

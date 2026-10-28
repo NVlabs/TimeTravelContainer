@@ -25,7 +25,7 @@ go_test(
     name = "fdchannel_test",
     size = "small",
     srcs = ["fdchannel_test.go"],
-    library = ":fdchannel",
+    embed = [":fdchannel"],
     deps = [
         "//pkg/sync",
         "@org_golang_x_sys//unix:go_default_library",

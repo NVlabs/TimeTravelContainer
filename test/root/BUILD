@@ -34,10 +34,10 @@ go_test(
     data = [
         "//:release",
     ],
-    library = ":root",
+    embed = [":root"],
+    local = True,
     pure = True,
     tags = [
-        "local",
         "manual",
     ],
     visibility = ["//:sandbox"],
@@ -70,10 +70,10 @@ go_test(
     data = [
         "//:release",
     ],
-    library = ":root",
+    embed = [":root"],
+    local = True,
     pure = True,
     tags = [
-        "local",
         "manual",
     ],
     visibility = ["//:sandbox"],
@@ -93,9 +93,9 @@ go_test(
 go_test(
     name = "portforward_test",
     srcs = ["portforward_test.go"],
+    local = True,
     pure = True,
     tags = [
-        "local",
         "manual",
     ],
     visibility = ["//:sandbox"],

@@ -128,6 +128,7 @@ go_test(
         "install_test.go",
         "list_test.go",
         "mitigate_test.go",
+        "passfd_test.go",
         "pidfile_test.go",
         "read_test.go",
         "sandboxexec_test.go",
@@ -136,7 +137,7 @@ go_test(
     data = [
         "//runsc",  # keep
     ],
-    library = ":cmd",
+    embed = [":cmd"],
     deps = [
         "//pkg/abi/linux",
         "//pkg/log",
@@ -153,6 +154,7 @@ go_test(
         "//runsc/container",
         "//runsc/flag",
         "//runsc/mitigate",
+        "//runsc/sandbox",
         "//runsc/specutils",
         "//runsc/ttc/ownership",
         "//sandboxexec/proto:sandbox_options_go_proto",

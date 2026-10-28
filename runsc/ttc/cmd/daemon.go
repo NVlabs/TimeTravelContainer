@@ -36,6 +36,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/cputopology"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/sentry/hostmm"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
@@ -1623,7 +1624,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 					if err != nil {
 						return fmt.Errorf("creating durable distributed peer memory %d: %w", i, err)
 					}
-					pgalloc.IMAWorkAroundForMemFile(file.Fd())
+					hostmm.IMAWorkAroundForMemFile(file.Fd())
 					durableTargets = append(durableTargets, file)
 				}
 				files = append(files, durableTargets...)

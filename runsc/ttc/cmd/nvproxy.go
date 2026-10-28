@@ -192,7 +192,7 @@ func (s *nvproxyService) find() (*nvidiaHost, error) {
 }
 
 func findNVIDIAHost() (*nvidiaHost, error) {
-	hostVersion, err := nvproxy.HostDriverVersion()
+	hostVersion, err := nvconf.HostDriverVersion()
 	if err != nil {
 		return nil, err
 	}

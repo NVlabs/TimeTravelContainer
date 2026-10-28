@@ -81,6 +81,8 @@ func (mm *MemoryManager) ValidateLiveForkMappings() []LiveForkMappingIssue {
 
 // InvalidateUnsavable invokes memmap.Mappable.InvalidateUnsavable on all
 // Mappables mapped by mm.
+//
+// +checklocksexclude:mm.mappingMu
 func (mm *MemoryManager) InvalidateUnsavable(ctx context.Context) error {
 	mappables := make(UnsavableMappables)
 	mm.AddUnsavableMappables(mappables)

@@ -1284,7 +1284,7 @@ func (k *Kernel) validateLiveForkResources() error {
 		}
 		seenTables[root.table] = struct{}{}
 		root.table.mu.Lock()
-		root.table.ForEach(k.SupervisorContext(), func(fd int32, file *vfs.FileDescription, _ FDFlags) bool {
+		root.table.forEach(k.SupervisorContext(), func(fd int32, file *vfs.FileDescription, _ FDFlags) bool {
 			visited := make(map[*vfs.FileDescription]struct{})
 			var validate func(*vfs.FileDescription)
 			validate = func(current *vfs.FileDescription) {
@@ -1524,7 +1524,7 @@ func (k *Kernel) captureFileDescriptionMemory(capture *pgalloc.MemoryRangeCaptur
 		visitedTables[root.table] = struct{}{}
 		var captureErr error
 		root.table.mu.Lock()
-		root.table.ForEach(k.SupervisorContext(), func(_ int32, file *vfs.FileDescription, _ FDFlags) bool {
+		root.table.forEach(k.SupervisorContext(), func(_ int32, file *vfs.FileDescription, _ FDFlags) bool {
 			if err := captureFile(file); err != nil {
 				captureErr = err
 				return false

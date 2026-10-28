@@ -118,6 +118,10 @@ const (
 	// field when the execution platform does not virtualize them.
 	NT_ARM_HW_BREAK = 0x402
 	NT_ARM_HW_WATCH = 0x403
+
+	// NT_ARM_PAC_ENABLED_KEYS is for controlling which ARM
+	// pointer authentication keys are enabled.
+	NT_ARM_PAC_ENABLED_KEYS = 0x40a
 )
 
 // ElfHeader64 is the ELF64 file header.

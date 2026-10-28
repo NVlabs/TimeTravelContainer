@@ -15,6 +15,7 @@ go_library(
         "host_eventfd_linux.go",
         "save_restore.go",
     ],
+    importpath = "gvisor.dev/gvisor/pkg/sentry/fsimpl/eventfd",
     visibility = ["//pkg/sentry:internal"],
     deps = [
         "//pkg/abi/linux",
@@ -35,7 +36,7 @@ go_test(
     name = "eventfd_test",
     size = "small",
     srcs = ["eventfd_test.go"],
-    library = ":eventfd",
+    embed = [":eventfd"],
     deps = [
         "//pkg/abi/linux",
         "//pkg/sentry/contexttest",

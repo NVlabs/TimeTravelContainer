@@ -291,6 +291,8 @@ type Loader struct {
 	// sandboxID is the ID for the whole sandbox.
 	sandboxID string
 
+	noRootContainer noRootContainer
+
 	// mountHints provides extra information about mounts for containers that
 	// apply to the entire pod.
 	mountHints *PodMountHints
@@ -395,6 +397,8 @@ type Loader struct {
 
 	// networkArgs contains the routes and links which were scraped from the
 	// host network namespace during sandbox creation.
+	//
+	// +checklocks:mu
 	networkArgs *CreateLinksAndRoutesArgs
 
 	// pinRing accumulates host FDs to pin before seccomp filters are
@@ -402,6 +406,8 @@ type Loader struct {
 	pinRing pinring.PinRing
 
 	// fsSaveFDs are FDs used for user-triggered filesystem checkpoint saving.
+	//
+	// +checklocks:mu
 	fsSaveFDs []*fd.FD
 
 	// fsSaveCheckpointGofer is true if fsSaveFDs contains only one FD, which
@@ -409,10 +415,32 @@ type Loader struct {
 	fsSaveCheckpointGofer bool
 
 	// hostinetNetDevFile is the pre-opened /proc/net/dev file for hostinet restore.
+	//
+	// Restore initializes both hostinet files before taking mu.
+	// ConfigureNetwork transfers them while mu is held; restore closes
+	// any unconsumed files without mu. checklocks cannot express this
+	// phase-dependent ownership.
 	hostinetNetDevFile *os.File
 
 	// hostinetNetSNMPFile is the pre-opened /proc/net/snmp file for hostinet restore.
 	hostinetNetSNMPFile *os.File
+}
+
+// noRootContainer is the state of a sandbox with no root container.
+type noRootContainer struct {
+	enabled  bool
+	exit     chan struct{}
+	exitOnce sync.Once
+}
+
+// stop releases waitExit. It is idempotent.
+func (n *noRootContainer) stop() {
+	n.exitOnce.Do(func() { close(n.exit) })
+}
+
+// waitExit blocks until stop is called. Tasks can still be running.
+func (n *noRootContainer) waitExit() {
+	<-n.exit
 }
 
 // execID uniquely identifies a sentry process that is executed in a container.
@@ -599,6 +627,9 @@ type Args struct {
 	// MountTarOnExitFDs and ready FDs are ordered by MountTarOnExitPaths.
 	MountTarOnExitFDs      []int
 	MountTarOnExitReadyFDs []int
+	// NoRootContainer boots without a root container; Spec then has neither
+	// Process nor Root. See Loader.noRootContainer.
+	NoRootContainer bool
 
 	// StartupTimer tracks overall sandbox startup.
 	// The `Loader` records midpoints on it as it goes through loader creation
@@ -757,7 +788,11 @@ func New(args Args) (*Loader, error) {
 
 	eid := execID{cid: args.ID}
 	l := &Loader{
-		sandboxID:             args.ID,
+		sandboxID: args.ID,
+		noRootContainer: noRootContainer{
+			enabled: args.NoRootContainer,
+			exit:    make(chan struct{}),
+		},
 		processes:             map[execID]*execProcess{eid: {}},
 		sharedMounts:          make(map[string]*vfs.Mount),
 		stopProfiling:         stopProfiling,
@@ -1000,12 +1035,16 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("enabling strace: %w", err)
 	}
 
-	creds, err := getRootCredentials(args.Spec, args.Conf, nil /* UserNamespace */)
-	if err != nil {
-		return nil, fmt.Errorf("getting root credentials: %w", err)
+	rootUserNs := auth.NewRootUserNamespace()
+	var creds *auth.Credentials
+	if !args.NoRootContainer {
+		creds, err = getRootCredentials(args.Spec, args.Conf, rootUserNs)
+		if err != nil {
+			return nil, fmt.Errorf("getting root credentials: %w", err)
+		}
 	}
 	// Create root network namespace/stack.
-	netns, err := newRootNetworkNamespace(args.Conf, tk.TCPIPClock(), creds.UserNamespace, l.k)
+	netns, err := newRootNetworkNamespace(args.Conf, tk.TCPIPClock(), rootUserNs, l.k)
 	if err != nil {
 		return nil, fmt.Errorf("creating network: %w", err)
 	}
@@ -1069,19 +1108,20 @@ func New(args Args) (*Loader, error) {
 	if err = l.k.Init(kernel.InitKernelArgs{
 		FeatureSet:           cpufs.Fixed(),
 		Timekeeper:           tk,
-		RootUserNamespace:    creds.UserNamespace,
+		RootUserNamespace:    rootUserNs,
 		RootNetworkNamespace: netns,
 		ApplicationCores:     uint(args.NumCPU),
 		Vdso:                 vdso,
 		VdsoParams:           params,
-		RootUTSNamespace:     kernel.NewUTSNamespace(args.Spec.Hostname, args.Spec.Domainname, creds.UserNamespace),
-		RootIPCNamespace:     kernel.NewIPCNamespace(creds.UserNamespace),
-		RootPIDNamespace:     kernel.NewRootPIDNamespace(creds.UserNamespace),
+		RootUTSNamespace:     kernel.NewUTSNamespace(args.Spec.Hostname, args.Spec.Domainname, rootUserNs),
+		RootIPCNamespace:     kernel.NewIPCNamespace(rootUserNs),
+		RootPIDNamespace:     kernel.NewRootPIDNamespace(rootUserNs),
 		MaxFDLimit:           maxFDLimit,
 		MaxTasks:             maxTasks,
 		Cgroup2FSInit:        cgroup2fs.NewFilesystem,
 		CPUTopology:          cpuTopology,
 		SignalUnkillable:     signalUnkillablePolicy(args.Conf.SignalUnkillablePolicy),
+		DumpGoroutinesSignal: linux.Signal(args.Conf.DumpGoroutinesSignal),
 	}); err != nil {
 		return nil, fmt.Errorf("initializing kernel: %w", err)
 	}
@@ -1172,19 +1212,29 @@ func New(args Args) (*Loader, error) {
 		sniffer.LogPackets.Store(0)
 	}
 
-	procArgs, err := createProcessArgs(args.ID, args.Spec, args.Conf, creds, l.k, l.k.RootPIDNamespace())
-	if err != nil {
-		return nil, fmt.Errorf("creating init process for root container: %w", err)
+	// Populate the default limit set: it needs getrlimit(2), which the seccomp
+	// filters later deny.
+	if _, err := defaults.get(); err != nil {
+		return nil, fmt.Errorf("getting default limits: %w", err)
 	}
-	l.root.procArgs = procArgs
-	if args.Spec.Annotations[InternalConsoleAnnotation] != "" && !args.Spec.Process.Terminal {
-		fdTable, err := l.newInternalConsoleFDTable(&l.root)
+
+	if !args.NoRootContainer {
+		procArgs, err := createProcessArgs(args.ID, args.Spec, args.Conf, creds, l.k, l.k.RootPIDNamespace())
 		if err != nil {
-			return nil, fmt.Errorf("preparing root internal console: %w", err)
+			return nil, fmt.Errorf("creating init process for root container: %w", err)
 		}
-		// createContainerProcess consumes this reference when StartRoot creates
-		// the init task. Until then, control RPCs can attach to the console.
-		l.root.procArgs.FDTable = fdTable
+		l.root.procArgs = procArgs
+		if args.Spec.Annotations[InternalConsoleAnnotation] != "" && !args.Spec.Process.Terminal {
+			fdTable, err := l.newInternalConsoleFDTable(&l.root)
+			if err != nil {
+				return nil, fmt.Errorf("preparing root internal console: %w", err)
+			}
+			// createContainerProcess consumes this reference when StartRoot creates
+			// the init task. Until then, control RPCs can attach to the console.
+			l.root.procArgs.FDTable = fdTable
+		}
+	} else {
+		l.k.RootPIDNamespace().ReserveInitTID()
 	}
 	args.StartupTimer.Reached("process args created")
 
@@ -1268,6 +1318,13 @@ func (l *Loader) setLoaderKernel(k *kernel.Kernel, dog *watchdog.Watchdog) {
 }
 
 // ConfigureNetwork implements inet.NetworkArgs.ConfigureNetwork.
+//
+// Startup calls this directly before installing seccomp filters. Restore
+// calls it synchronously through Kernel.LoadFrom after installing filters.
+// Both callers hold l.mu, but the restore interface call cannot convey this
+// concrete lock contract to checklocks.
+//
+// +checklocks:l.mu
 func (l *Loader) ConfigureNetwork(s inet.Stack) error {
 	return l.configureNetwork(l.k, s)
 }
@@ -1386,7 +1443,11 @@ func createProcessArgs(id string, spec *specs.Spec, conf *config.Config, creds *
 // Note that this will block until all open control server connections have
 // been closed. For that reason, this should NOT be called in a defer, because
 // a panic in a control server rpc would then hang forever.
+//
+// +checklocksexclude:l.mu
+// +checklocksexclude:l.k.fsSaveMu
 func (l *Loader) Destroy() {
+	l.noRootContainer.stop()
 	if l.stopSignalForwarding != nil {
 		l.stopSignalForwarding()
 	}
@@ -1591,7 +1652,7 @@ func createMemoryFileFromFile(appHugePages bool, hostTHP HostTHP, memfile *os.Fi
 }
 
 // createPrePrimedMemoryFileFromFile creates a MemoryFile for a backing file on
-// which pgalloc.IMAWorkAroundForMemFile has already been called outside the
+// which hostmm.IMAWorkAroundForMemFile has already been called outside the
 // sandbox. Raw executable mmap is unsafe after systrap has installed its
 // application address-space mappings, so peer restore must use this path.
 func createPrePrimedMemoryFileFromFile(appHugePages bool, hostTHP HostTHP, memfile *os.File, diskBacked bool) (*pgalloc.MemoryFile, error) {
@@ -1714,6 +1775,8 @@ func (l *Loader) installSeccompFilters() error {
 }
 
 // Run runs the root container.
+//
+// +checklocksexclude:l.mu
 func (l *Loader) Run() error {
 	err := l.run()
 	l.ctrl.manager.startResultChan <- err
@@ -1728,6 +1791,7 @@ func (l *Loader) Run() error {
 	return nil
 }
 
+// +checklocksexclude:l.mu
 func (l *Loader) run() error {
 	if l.root.conf.Network == config.NetworkHost {
 		// Delay host network configuration to this point because network namespace
@@ -1773,37 +1837,39 @@ func (l *Loader) run() error {
 		}
 		l.startupTimer.Reached("seccomp filters installed")
 
-		// Create the root container init task. It will begin running
-		// when the kernel is started.
-		l.root.procArgs.StartupTimeline = l.startupTimer.Fork("root container")
-		var (
-			tg  *kernel.ThreadGroup
-			err error
-		)
-		tg, ep.tty, err = l.createContainerProcess(&l.root)
-		if err != nil {
-			return err
-		}
-		l.startupTimer.Reached("root container created")
+		if !l.noRootContainer.enabled {
+			// Create the root container init task. It will begin running
+			// when the kernel is started.
+			l.root.procArgs.StartupTimeline = l.startupTimer.Fork("root container")
+			var (
+				tg  *kernel.ThreadGroup
+				err error
+			)
+			tg, ep.tty, err = l.createContainerProcess(&l.root)
+			if err != nil {
+				return err
+			}
+			l.startupTimer.Reached("root container created")
 
-		if seccheck.Global.Enabled(seccheck.PointContainerStart) {
-			evt := pb.Start{
-				Id:       l.sandboxID,
-				Cwd:      l.root.spec.Process.Cwd,
-				Args:     l.root.spec.Process.Args,
-				Terminal: l.root.spec.Process.Terminal,
+			if seccheck.Global.Enabled(seccheck.PointContainerStart) {
+				evt := pb.Start{
+					Id:       l.sandboxID,
+					Cwd:      l.root.spec.Process.Cwd,
+					Args:     l.root.spec.Process.Args,
+					Terminal: l.root.spec.Process.Terminal,
+				}
+				fields := seccheck.Global.GetFieldSet(seccheck.PointContainerStart)
+				if fields.Local.Contains(seccheck.FieldContainerStartEnv) {
+					evt.Env = l.root.spec.Process.Env
+				}
+				if !fields.Context.Empty() {
+					evt.ContextData = &pb.ContextData{}
+					kernel.LoadSeccheckData(tg.Leader(), fields.Context, evt.ContextData)
+				}
+				_ = seccheck.Global.SentToSinks(func(c seccheck.Sink) error {
+					return c.ContainerStart(context.Background(), fields, &evt)
+				})
 			}
-			fields := seccheck.Global.GetFieldSet(seccheck.PointContainerStart)
-			if fields.Local.Contains(seccheck.FieldContainerStartEnv) {
-				evt.Env = l.root.spec.Process.Env
-			}
-			if !fields.Context.Empty() {
-				evt.ContextData = &pb.ContextData{}
-				kernel.LoadSeccheckData(tg.Leader(), fields.Context, evt.ContextData)
-			}
-			_ = seccheck.Global.SentToSinks(func(c seccheck.Sink) error {
-				return c.ContainerStart(context.Background(), fields, &evt)
-			})
 		}
 	case restoringUnstarted:
 		// If we are restoring, we do not want to create a process.
@@ -1811,8 +1877,10 @@ func (l *Loader) run() error {
 		return fmt.Errorf("Loader.Run() called in unexpected state=%s", l.state)
 	}
 
-	ep.tg = l.k.GlobalInit()
-	if len(l.finalMountExports) != 0 {
+	if !l.noRootContainer.enabled {
+		ep.tg = l.k.GlobalInit()
+	}
+	if ep.tg != nil && len(l.finalMountExports) != 0 {
 		mntns := ep.tg.Leader().MountNamespace()
 		if mntns == nil || !mntns.TryIncRef() {
 			return fmt.Errorf("retaining root mount namespace for final mount exports")
@@ -1834,6 +1902,24 @@ func (l *Loader) run() error {
 		// Panic signal should cause a panic.
 		if l.root.conf.PanicSignal != -1 && sig == linux.Signal(l.root.conf.PanicSignal) {
 			panic("Signal-induced panic")
+		}
+
+		if l.root.conf.DumpGoroutinesSignal > 0 && sig == linux.Signal(l.root.conf.DumpGoroutinesSignal) {
+			log.TracebackAll("Received non-fatal dump signal %s (%d)", unix.Signal(sig), sig)
+			return
+		}
+
+		// No root container to forward to: SIGTERM and SIGINT stop the
+		// sandbox, the rest are dropped.
+		if l.noRootContainer.enabled {
+			switch sig {
+			case linux.SIGTERM, linux.SIGINT:
+				log.Infof("Received external signal %d, stopping sandbox", sig)
+				l.noRootContainer.stop()
+			default:
+				log.Infof("Received external signal %d, ignoring: sandbox has no root container", sig)
+			}
+			return
 		}
 
 		// Otherwise forward to root container.
@@ -1900,6 +1986,8 @@ func (l *Loader) run() error {
 }
 
 // createSubcontainer creates a new container inside the sandbox.
+//
+// +checklocksexclude:l.mu
 func (l *Loader) createSubcontainer(cid string, tty *fd.FD) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -1915,6 +2003,8 @@ func (l *Loader) createSubcontainer(cid string, tty *fd.FD) error {
 // startSubcontainer starts a child container. It returns the thread group ID of
 // the newly created process. Used FDs are either closed or released. It's safe
 // for the caller to close any remaining files upon return.
+//
+// +checklocksexclude:l.mu
 func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid string, stdioFDs, goferFDs, goferFilestoreFDs []*fd.FD, devGoferFD *fd.FD, goferMountConfs []specutils.GoferMountConf, rootfsUpperTarFD *fd.FD) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -1940,11 +2030,21 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 	var pidns *kernel.PIDNamespace
 	if ns, ok := specutils.GetNS(specs.PIDNamespace, spec); ok {
 		if ns.Path != "" {
-			for _, p := range l.processes {
-				if ns.Path == p.pidnsPath {
+			for eid, p := range l.processes {
+				if ns.Path != p.pidnsPath {
+					continue
+				}
+				if p.tg != nil {
 					log.Debugf("Joining PID namespace named %q", ns.Path)
 					pidns = p.pidns
 					pidns.IncRef()
+					break
+				}
+				// The sandbox's entry has no thread group; its PID namespace
+				// is the root one.
+				if l.noRootContainer.enabled && eid.cid == l.sandboxID {
+					log.Debugf("Joining sandbox PID namespace named %q", ns.Path)
+					pidns = l.k.RootPIDNamespace()
 					break
 				}
 			}
@@ -2251,6 +2351,8 @@ func (l *Loader) startGoferMonitor(info *containerInfo) {
 
 // destroySubcontainer stops a container if it is still running and cleans up
 // its filesystem.
+//
+// +checklocksexclude:l.mu
 func (l *Loader) destroySubcontainer(cid string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -2295,6 +2397,7 @@ func (l *Loader) destroySubcontainer(cid string) error {
 	return nil
 }
 
+// +checklocksexclude:l.mu
 func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 	branchID := args.BranchID
 	if branchID == "" {
@@ -2440,13 +2543,19 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 		}
 	}
 
-	args.Limits, err = createLimitSet(l.root.spec, specutils.TPUProxyEnabled(l.root.spec, l.root.conf))
+	containerName := targetKernel.ContainerName(args.ContainerID)
+	spec := l.containerSpecs[containerName]
+	limitSpec := spec
+	if limitSpec == nil {
+		// A branch that has no spec of the container execs with the root
+		// container's limits.
+		limitSpec = l.root.spec
+	}
+	args.Limits, err = createLimitSet(limitSpec, specutils.TPUProxyEnabled(limitSpec, l.root.conf))
 	if err != nil {
 		return 0, fmt.Errorf("creating limits: %w", err)
 	}
 
-	containerName := targetKernel.ContainerName(args.ContainerID)
-	spec := l.containerSpecs[containerName]
 	if spec != nil {
 		seccompProgram, err := buildOCISeccompProgram(l.root.conf, spec)
 		if err != nil {
@@ -2511,7 +2620,16 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 }
 
 // waitContainer waits for the init process of a container to exit.
+//
+// +checklocksexclude:l.mu
 func (l *Loader) waitContainer(cid string, waitStatus *uint32) error {
+	if l.noRootContainer.enabled && cid == l.sandboxID {
+		// No init to wait on; the only event left is the sandbox going away.
+		l.noRootContainer.waitExit()
+		*waitStatus = 0
+		return nil
+	}
+
 	l.mu.Lock()
 	state := l.state
 	if state == restoringUnstarted {
@@ -2565,6 +2683,7 @@ func (l *Loader) waitContainer(cid string, waitStatus *uint32) error {
 	return nil
 }
 
+// +checklocksexclude:l.mu
 func (l *Loader) waitRestore() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -2579,6 +2698,7 @@ func (l *Loader) waitRestore() error {
 	return l.restoreErr
 }
 
+// +checklocksexclude:l.mu
 func (l *Loader) waitPID(tgid kernel.ThreadID, cid string, waitStatus *uint32) error {
 	if tgid <= 0 {
 		return fmt.Errorf("PID (%d) must be positive", tgid)
@@ -2628,8 +2748,19 @@ func (l *Loader) WaitForStartSignal() {
 	<-l.ctrl.manager.startChan
 }
 
-// WaitExit waits for the root container to exit, and returns its exit status.
+// WaitExit waits for the sandbox to finish and returns the root container's
+// exit status, or zero if there is no root container.
 func (l *Loader) WaitExit() linux.WaitStatus {
+	if l.noRootContainer.enabled {
+		// Not k.WaitExited(): it returns as soon as nothing is running and
+		// blocks new tasks, so the sandbox could never take another container.
+		l.noRootContainer.waitExit()
+		// Kill whatever is left and wait for it: Destroy releases the kernel
+		// next.
+		l.k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+		l.k.WaitExited()
+		return 0
+	}
 	return l.family.WaitDefaultExit()
 }
 
@@ -2818,6 +2949,8 @@ func (c *sandboxNetstackCreator) CreateStack() (inet.Stack, error) {
 // option, the signal may be sent directly to the indicated process, to all
 // processes in the container, or to the foreground process group. pid is
 // relative to the root PID namespace, not the container's.
+//
+// +checklocksexclude:l.mu
 func (l *Loader) signal(cid string, pid, signo int32, mode SignalDeliveryMode) error {
 	if pid < 0 {
 		return fmt.Errorf("PID (%d) must be positive", pid)
@@ -2865,6 +2998,8 @@ func (l *Loader) signal(cid string, pid, signo int32, mode SignalDeliveryMode) e
 
 // signalProcess sends signal to process in the given container. tgid is
 // relative to the root PID namespace, not the container's.
+//
+// +checklocksexclude:l.mu
 func (l *Loader) signalProcess(cid string, tgid kernel.ThreadID, signo int32) error {
 	execTG, err := l.threadGroupFromID(execID{cid: cid, pid: tgid})
 	if err == nil {
@@ -2887,6 +3022,8 @@ func (l *Loader) signalProcess(cid string, tgid kernel.ThreadID, signo int32) er
 
 // signalForegrondProcessGroup looks up foreground process group from the TTY
 // for the given "tgid" inside container "cid", and send the signal to it.
+//
+// +checklocksexclude:l.mu
 func (l *Loader) signalForegrondProcessGroup(cid string, tgid kernel.ThreadID, signo int32) error {
 	l.mu.Lock()
 	tg, err := l.tryThreadGroupFromIDLocked(execID{cid: cid, pid: tgid})
@@ -2962,6 +3099,8 @@ func (l *Loader) signalProcessGroup(cid string, pgid kernel.ProcessGroupID, sign
 // threadGroupFromID is similar to tryThreadGroupFromIDLocked except that it
 // acquires mutex before calling it and fails in case container hasn't started
 // yet.
+//
+// +checklocksexclude:l.mu
 func (l *Loader) threadGroupFromID(key execID) (*kernel.ThreadGroup, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -3041,6 +3180,8 @@ func createFDTable(ctx context.Context, console bool, stdioFDs []*fd.FD, passFDs
 // represent a two connections each copying to each other (read ends to write ends) in goroutines.
 // The proxies are stored and can be cleaned up, or clean up after themselves if the connection
 // is broken.
+//
+// +checklocksexclude:l.mu
 func (l *Loader) portForward(opts *PortForwardOpts) error {
 	// Validate that we have a stream FD to write to. If this happens then
 	// it means there is a misbehaved urpc client or a bug has occurred.
@@ -3147,6 +3288,7 @@ func importFD(ctx context.Context, k *kernel.Kernel, f *os.File) (*vfs.FileDescr
 	return fd, nil
 }
 
+// +checklocksexclude:l.mu
 func (l *Loader) containerCount() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -3162,6 +3304,7 @@ func (l *Loader) containerCount() int {
 	return containers
 }
 
+// +checklocksexclude:l.mu
 func (l *Loader) pidsCount(cid string) (int, error) {
 	l.mu.Lock()
 	_, err := l.tryThreadGroupFromIDLocked(execID{cid: cid})
@@ -3205,6 +3348,7 @@ func (l *Loader) findProcessLocked(key execID) (*execProcess, error) {
 	return ep, nil
 }
 
+// +checklocksexclude:l.mu
 func (l *Loader) registerContainer(spec *specs.Spec, cid string) string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -3226,6 +3370,7 @@ func (l *Loader) registerContainerLocked(spec *specs.Spec, cid string) string {
 	return containerName
 }
 
+// +checklocksexclude:l.mu
 func (l *Loader) getContainerSpec(containerName string) *specs.Spec {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -3234,15 +3379,21 @@ func (l *Loader) getContainerSpec(containerName string) *specs.Spec {
 
 // SpecEnviron returns the environment variables for the given container from
 // the container spec it was created with.
+//
+// +checklocksexclude:l.mu
 func (l *Loader) SpecEnviron(containerName string) []string {
 	spec := l.getContainerSpec(containerName)
 	if spec == nil {
 		log.Warningf("Container spec not found for container %q", containerName)
 		return nil
 	}
+	if spec.Process == nil {
+		return nil
+	}
 	return spec.Process.Env
 }
 
+// +checklocksexclude:l.mu
 func (l *Loader) containerRuntimeState(cid string) ContainerRuntimeState {
 	if l.restoring.Load() {
 		// The container is being created until the restore finishes, as it
@@ -3277,6 +3428,8 @@ func (l *Loader) containerRuntimeState(cid string) ContainerRuntimeState {
 }
 
 // GetContainerSpecs returns the container specs map.
+//
+// +checklocksexclude:l.mu
 func (l *Loader) GetContainerSpecs() map[string]*specs.Spec {
 	l.mu.Lock()
 	defer l.mu.Unlock()

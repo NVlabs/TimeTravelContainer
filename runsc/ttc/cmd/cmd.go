@@ -42,6 +42,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
+	"gvisor.dev/gvisor/pkg/sentry/hostmm"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
@@ -19290,7 +19291,7 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 		// Peer restore constructs its MemoryFiles after systrap has reserved the
 		// Sentry's application address range. Perform the executable mmap used
 		// to prime host IMA here, before donating the file to the sandbox.
-		pgalloc.IMAWorkAroundForMemFile(file.Fd())
+		hostmm.IMAWorkAroundForMemFile(file.Fd())
 		targets = append(targets, file)
 	}
 	restoreArgs := boot.DurableDehydrationRestoreArgs{

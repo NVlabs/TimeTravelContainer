@@ -18,6 +18,7 @@ go_library(
         "eventfd_mmio_linux_unsafe.go",
         "eventfd_unsafe.go",
     ],
+    importpath = "gvisor.dev/gvisor/pkg/eventfd",
     visibility = [
         "//:sandbox",
         "//cloud/cluster/node/network/client/go:__pkg__",
@@ -34,6 +35,6 @@ go_library(
 go_test(
     name = "eventfd_test",
     srcs = ["eventfd_test.go"],
-    library = ":eventfd",
+    embed = [":eventfd"],
     deps = ["@org_golang_x_sys//unix:go_default_library"],
 )

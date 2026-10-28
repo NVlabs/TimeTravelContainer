@@ -19,6 +19,7 @@ go_library(
         "contexttest_darwin.go",
         "contexttest_linux.go",
     ],
+    importpath = "gvisor.dev/gvisor/pkg/sentry/contexttest",
     visibility = ["//pkg/sentry:internal"],
     deps = [
         "//pkg/atomicbitops",

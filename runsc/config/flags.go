@@ -51,6 +51,7 @@ const (
 	flagQDiscTBFRate            = "qdisc-tbf-rate"
 	flagQDiscTBFBurst           = "qdisc-tbf-burst"
 	flagInSandboxCgroup         = "in-sandbox-cgroup"
+	flagNetworkProxyPath        = "network-proxy-path"
 
 	maxQDiscTBFBurst     = uint64(1<<32 - 1)
 	defaultQDiscTBFRate  = uint64(0)
@@ -106,6 +107,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.String("platform_device_path", "", "path to a platform-specific device file (e.g. /dev/kvm for KVM platform). If unset, will use a sane platform-specific default.")
 	flagSet.String("watchdog-action", "log", "sets what action the watchdog takes when triggered: log (default), panic.")
 	flagSet.Int("panic-signal", -1, "register signal handling that panics. Usually set to SIGUSR2(12) to troubleshoot hangs. -1 disables it.")
+	flagSet.Int("dump-goroutines-signal", -1, "register signal handling that dumps all goroutine stacks. -1 disables it.")
 	flagSet.Bool("profile", false, "prepares the sandbox to use Golang profiler. Note that enabling profiler loosens the seccomp protection added to the sandbox (DO NOT USE IN PRODUCTION).")
 	flagSet.String("profile-block", "", "collects a block profile to this file path for the duration of the container execution. Requires -profile=true.")
 	flagSet.String("profile-cpu", "", "collects a CPU profile to this file path for the duration of the container execution. Requires -profile=true.")
@@ -174,6 +176,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.BoolVar(ttcNetworkNAT, "ttos-network-nat", hostDefaultTTCNetworkNAT, "deprecated alias for --ttc-network-nat")
 	flagSet.StringVar(ttcNetworkIP, "ttos-network-ip", "", "deprecated alias for --ttc-network-ip")
 	flagSet.StringVar(ttcNetworkMAC, "ttos-network-mac", "", "deprecated alias for --ttc-network-mac")
+	flagSet.String(flagNetworkProxyPath, "", "EXPERIMENTAL. Path of an external SOCK_SEQPACKET Unix domain socket to attach the sandbox's primary network interface to, instead of an AF_PACKET socket.")
 	flagSet.Var(goferNetworkNamespacePtr(GoferNetworkNamespaceNull), "gofer-network-namespace", "network namespace for gofers: null (default; an empty namespace shared by all gofers using the same --shared-root, which defaults to --root), new (a new empty namespace per gofer), host (the current namespace), or an absolute path to an existing namespace.")
 	flagSet.Bool("net-raw", false, "enable raw sockets. When false, raw sockets are disabled by removing CAP_NET_RAW from containers (`runsc exec` will still be able to utilize raw sockets). Raw sockets allow malicious containers to craft packets and potentially attack the network.")
 	flagSet.Bool("allow-packet-socket-write", false, "allow writes on AF_PACKET sockets. When false, writes on AF_PACKET sockets will fail. When turned on, untrusted workloads may potentially attack the network because of the ability to craft arbitrary packets.")

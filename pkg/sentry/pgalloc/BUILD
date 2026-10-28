@@ -270,7 +270,7 @@ go_test(
         "slot_identity_test.go",
         "sparse_import_test.go",
     ],
-    library = ":pgalloc",
+    embed = [":pgalloc"],
     deps = [
         "//pkg/context",
         "//pkg/hostarch",

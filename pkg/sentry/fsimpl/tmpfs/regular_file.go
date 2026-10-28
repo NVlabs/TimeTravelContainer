@@ -1253,6 +1253,7 @@ func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint
 		// Advance curPgStart.
 		curPgStart = curPgEnd
 	}
+	f.inode.touchCMtimeLocked()
 	return nil
 }
 

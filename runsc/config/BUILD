@@ -20,6 +20,7 @@ go_library(
         "flags.go",
         "flags_graveyard.go",
     ],
+    importpath = "gvisor.dev/gvisor/runsc/config",
     visibility = ["//:sandbox"],
     deps = [
         "//pkg/log",
@@ -39,7 +40,7 @@ go_test(
         "config_test.go",
         "flags_test.go",
     ],
-    library = ":config",
+    embed = [":config"],
     deps = [
         "//runsc/flag",
         "@com_github_google_go_cmp//cmp:go_default_library",

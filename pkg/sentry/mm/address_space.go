@@ -47,10 +47,11 @@ func (mm *MemoryManager) UsesAddressSpace(as platform.AddressSpace) bool {
 // mapASLocked maps addresses in ar into mm.as.
 //
 // Preconditions:
-//   - mm.activeMu must be locked.
 //   - ar.Length() != 0.
 //   - ar must be page-aligned.
 //   - pseg == mm.pmas.LowerBoundSegment(ar.Start).
+//
+// +checklocksread:mm.activeMu
 func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar hostarch.AddrRange, platformEffect memmap.MMapPlatformEffect) error {
 	return mm.mapASWindowLocked(ctx, pseg, ar, platformEffect, hostarch.AddrRange{})
 }
@@ -209,7 +210,7 @@ func (mm *MemoryManager) mapFileLocked(addr hostarch.Addr, f memmap.File, fr mem
 
 // unmapASLocked removes all AddressSpace mappings for addresses in ar.
 //
-// Preconditions: mm.activeMu must be locked.
+// +checklocksread:mm.activeMu
 func (mm *MemoryManager) unmapASLocked(ar hostarch.AddrRange) {
 	if ar.Length() == 0 {
 		return

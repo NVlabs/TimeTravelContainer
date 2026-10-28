@@ -42,7 +42,7 @@ go_library(
 go_test(
     name = "xdp_test",
     srcs = ["endpoint_test.go"],
-    library = ":xdp",
+    embed = [":xdp"],
     deps = ["//pkg/tcpip"],
     target_compatible_with = ["@platforms//os:linux"],
 )

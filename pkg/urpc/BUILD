@@ -11,6 +11,7 @@ package(
 go_library(
     name = "urpc",
     srcs = ["urpc.go"],
+    importpath = "gvisor.dev/gvisor/pkg/urpc",
     visibility = ["//:sandbox"],
     deps = [
         "//pkg/fd",
@@ -25,6 +26,6 @@ go_test(
     name = "urpc_test",
     size = "small",
     srcs = ["urpc_test.go"],
-    library = ":urpc",
+    embed = [":urpc"],
     deps = ["//pkg/unet"],
 )

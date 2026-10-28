@@ -16,6 +16,7 @@ go_library(
         "fsutil_darwin.go",
         "fsutil_unsafe.go",
     ],
+    importpath = "gvisor.dev/gvisor/pkg/fsutil",
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/abi/linux",

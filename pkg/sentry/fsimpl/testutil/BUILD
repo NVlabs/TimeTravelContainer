@@ -19,6 +19,7 @@ go_library(
         "kernel_linux.go",
         "testutil.go",
     ],
+    importpath = "gvisor.dev/gvisor/pkg/sentry/fsimpl/testutil",
     visibility = ["//pkg/sentry:internal"],
     deps = [
         "//pkg/abi/linux",

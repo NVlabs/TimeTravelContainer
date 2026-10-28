@@ -21,6 +21,7 @@ package config
 
 import (
 	"golang.org/x/sys/unix"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/pkg/tcpip/link/fdbased"
@@ -469,6 +470,11 @@ func hostFilesystemFilters() seccomp.SyscallRules {
 			seccomp.AnyValue{},
 			seccomp.AnyValue{},
 			seccomp.AnyValue{},
+		},
+		unix.SYS_STATX: seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.AnyValue{},
+			seccomp.EqualTo(unix.AT_SYMLINK_NOFOLLOW | unix.AT_NO_AUTOMOUNT),
 		},
 		unix.SYS_UTIMENSAT: seccomp.PerArg{
 			seccomp.NonNegativeFD{},

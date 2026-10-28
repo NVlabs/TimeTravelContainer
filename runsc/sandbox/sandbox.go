@@ -30,6 +30,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -51,7 +52,6 @@ import (
 	"gvisor.dev/gvisor/pkg/prometheus"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/control"
-	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -265,6 +265,10 @@ type Sandbox struct {
 	// StartTime is the time the sandbox was started.
 	StartTime time.Time `json:"startTime"`
 
+	// NoRootContainer records how the sandbox was booted. See
+	// Args.NoRootContainer.
+	NoRootContainer bool `json:"noRootContainer"`
+
 	// rootDir is the same as config.Config.RootDir. It represents the runtime
 	// root directory being used by the current runsc invocation. It's not saved
 	// to json, because the RootDir can change across runsc invocations.
@@ -382,6 +386,10 @@ type Args struct {
 	// open filesystem checkpoint files using O_DIRECT.
 	FSRestoreImagePath string
 	FSRestoreDirect    bool
+
+	// NoRootContainer boots without a root container: no gofer FDs, no root
+	// process. See container.Args.NoRootContainer.
+	NoRootContainer bool
 }
 
 // New creates the sandbox process. The caller must call Destroy() on the
@@ -398,6 +406,7 @@ func New(conf *config.Config, args *Args) (*Sandbox, error) {
 		MetricServerAddress: conf.MetricServer,
 		MountHints:          args.MountHints,
 		StartTime:           starttime.Get(),
+		NoRootContainer:     args.NoRootContainer,
 	}
 	if args.Spec != nil && args.Spec.Annotations != nil {
 		s.PodName = args.Spec.Annotations[podNameAnnotation]
@@ -1005,6 +1014,13 @@ func sandboxProcessEnv(conf *config.Config, opts sandboxProcessEnvOptions) []str
 	return env
 }
 
+// sentryExeFD is the FD at which the prewarmer inherits the Sentry binary.
+// Must match `SENTRY_EXE_FD` in `runsc/prewarmer/prewarmer.c`.
+// LINT.IfChange
+const sentryExeFD = 3
+
+// LINT.ThenChange(../prewarmer/prewarmer.c)
+
 // createSandboxProcess starts the sandbox as a subprocess by running the "boot"
 // command, passing in the bundle dir.
 func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyncFile *os.File) error {
@@ -1097,9 +1113,30 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	} else {
 		return fmt.Errorf("sidecar %q not usable (%v) and --sidecar-usage-policy is set to STRICT", sentryBin.Name, err)
 	}
+	// Open with `O_PATH`, which is sufficient for exec and makes the FD
+	// effectively execute-only (no read/write).
+	bootBin, err := os.OpenFile(bootBinPath, unix.O_PATH, 0)
+	if err != nil {
+		return fmt.Errorf("cannot open boot binary %q: %w", bootBinPath, err)
+	}
+	defer bootBin.Close()
+	// Without the prewarmer, as in a TTC install, the boot binary runs
+	// directly, and its FD table grows as it needs to.
+	cmdPath := bootBinPath
+	if prewarmerPath, err := gvisorbinaries.GvisorSentryPrewarmer.Path(); err == nil {
+		log.Infof("Sidecar %q found: prepending Sentry boot command with %s", gvisorbinaries.GvisorSentryPrewarmer.Name, prewarmerPath)
+		cmdPath = prewarmerPath
+	} else if conf.SidecarUsagePolicy.AllowEmbeddedFallback() {
+		log.Infof("Sidecar %q not usable (%v): executing the boot binary directly", gvisorbinaries.GvisorSentryPrewarmer.Name, err)
+	} else {
+		return fmt.Errorf("sidecar %q not usable: %w", gvisorbinaries.GvisorSentryPrewarmer.Name, err)
+	}
 
 	// Relay all the config flags to the sandbox process.
-	cmd := exec.Command(bootBinPath, conf.ToFlags()...)
+	cmd := exec.Command(cmdPath, conf.ToFlags()...)
+	// The prewarmer execs the boot binary at FD `sentryExeFD`; without it,
+	// the FD keeps the donated FDs' numbers.
+	cmd.ExtraFiles = []*os.File{bootBin}
 	cmd.SysProcAttr = &unix.SysProcAttr{
 		// Detach from this session, otherwise cmd will get SIGHUP and SIGCONT
 		// when re-parented.
@@ -1114,26 +1151,16 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	// guest PID. Give its host-visible command line the stable family name.
 	cmd.Args[0] = sandboxProcessArgv0(args.Spec, s.ID)
 
-	// If the prewarmer sidecar is available, exec it ahead of the boot binary.
-	// Its argv is `gvisor-prewarmer <binary> <argv[0]> [argv[1:]...]`.
-	if p, err := gvisorbinaries.GvisorSentryPrewarmer.Path(); err == nil {
-		log.Infof("Sidecar %q found: prepending Sentry boot command with %s", gvisorbinaries.GvisorSentryPrewarmer.Name, p)
-		cmd.Args = append([]string{p, cmd.Path}, cmd.Args[0:]...)
-		cmd.Path = p
-	} else if conf.SidecarUsagePolicy != config.SidecarUsageStrict {
-		gvisorbinaries.GvisorSentryPrewarmer.WarnUnavailable(fmt.Sprintf("Sidecar %q not found or usable (%v). This slows down gVisor startup significantly", gvisorbinaries.GvisorSentryPrewarmer.Name, err))
-	} else {
-		return fmt.Errorf("sidecar %q not usable (%v) and --sidecar-usage-policy is set to STRICT", gvisorbinaries.GvisorSentryPrewarmer.Name, err)
-	}
-
 	// Transfer FDs that need to be present before the "boot" command.
-	// Start at 3 because 0, 1, and 2 are taken by stdin/out/err.
-	nextFD := donations.Transfer(cmd, 3)
+	nextFD := donations.Transfer(cmd, sentryExeFD+1)
 
 	// Add the "boot" command to the args.
 	//
 	// All flags after this must be for the boot command
 	cmd.Args = append(cmd.Args, "boot", "--bundle="+args.BundleDir)
+	if args.NoRootContainer {
+		cmd.Args = append(cmd.Args, "--no-root-container")
+	}
 
 	cmd.Env = sandboxProcessEnv(conf, sandboxProcessEnvOptions{
 		enforceRelease: bootBinPath != specutils.ExePath,
@@ -1214,7 +1241,9 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	}
 
 	// Pass gofer mount configs.
-	cmd.Args = append(cmd.Args, "--gofer-mount-confs="+args.GoferMountConfs.String())
+	if len(args.GoferMountConfs) > 0 {
+		cmd.Args = append(cmd.Args, "--gofer-mount-confs="+args.GoferMountConfs.String())
+	}
 
 	// Create a socket for the control server and donate it to the sandbox.
 	controlSocketPath, sockFD, err := createControlSocket(conf.RootDir, s.ID)
@@ -1448,7 +1477,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 
 	// If the console control socket file is provided, then create a new
 	// pty master/replica pair and set the TTY on the sandbox process.
-	if args.Spec.Process.Terminal && args.ConsoleSocket != "" {
+	if args.Spec.Process != nil && args.Spec.Process.Terminal && args.ConsoleSocket != "" {
 		// console.NewWithSocket will send the master on the given
 		// socket, and return the replica.
 		tty, err := console.NewWithSocket(args.ConsoleSocket)
@@ -1526,34 +1555,9 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		}
 	}
 	if s.CgroupJSON.Cgroup != nil {
-		cpuNum, err := s.CgroupJSON.Cgroup.NumCPU()
+		cpuNum, cpuQuota, cpuPeriod, err := calculateCPUNum(s.CgroupJSON.Cgroup, conf.CPUNumFromQuota)
 		if err != nil {
-			return fmt.Errorf("getting cpu count from cgroups: %v", err)
-		}
-		cpuQuota, err := s.CgroupJSON.Cgroup.CPUQuota()
-		if err != nil {
-			return fmt.Errorf("getting raw cpu quota from cgroups: %v", err)
-		}
-		cpuPeriod, err := s.CgroupJSON.Cgroup.CPUPeriod()
-		if err != nil {
-			return fmt.Errorf("getting raw cpu period from cgroups: %v", err)
-		}
-		if conf.CPUNumFromQuota && cpuQuota > 0 && cpuPeriod > 0 {
-			// Dropping below 2 CPUs can trigger application to disable
-			// locks that can lead do hard to debug errors, so just
-			// leaving two cores as reasonable default.
-			const minCPUs = 2
-
-			quota := float64(cpuQuota) / float64(cpuPeriod)
-			if n := int(math.Ceil(quota)); n > 0 {
-				if n < minCPUs {
-					n = minCPUs
-				}
-				if n < cpuNum {
-					// Only lower the cpu number.
-					cpuNum = n
-				}
-			}
+			return err
 		}
 		cmd.Args = append(cmd.Args, "--cpu-num", strconv.Itoa(cpuNum))
 		if cpuQuota > 0 {
@@ -1683,6 +1687,42 @@ func sandboxUsesHostNetworkNamespace(conf *config.Config) bool {
 		(conf.Network == config.NetworkTimeTravel && conf.TimeTravelNetworkNAT)
 }
 
+// calculateCPUNum calculates the number of CPUs to configure for the sandbox,
+// along with the cgroup CPU quota and period.
+func calculateCPUNum(cg cgroup.Cgroup, cpuNumFromQuota bool) (int, int64, int64, error) {
+	cpuNum, err := cg.NumCPU()
+	if err != nil {
+		log.Warningf("Failed to get cpu count from cgroups: %v. Falling back to runtime.NumCPU()", err)
+		cpuNum = runtime.NumCPU()
+	}
+	cpuQuota, err := cg.CPUQuota()
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("getting raw cpu quota from cgroups: %v", err)
+	}
+	cpuPeriod, err := cg.CPUPeriod()
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("getting raw cpu period from cgroups: %v", err)
+	}
+	if cpuNumFromQuota && cpuQuota > 0 && cpuPeriod > 0 {
+		// Dropping below 2 CPUs can trigger application to disable
+		// locks that can lead do hard to debug errors, so just
+		// leaving two cores as reasonable default.
+		const minCPUs = 2
+
+		quota := float64(cpuQuota) / float64(cpuPeriod)
+		if n := int(math.Ceil(quota)); n > 0 {
+			if n < minCPUs {
+				n = minCPUs
+			}
+			if n < cpuNum {
+				// Only lower the cpu number.
+				cpuNum = n
+			}
+		}
+	}
+	return cpuNum, cpuQuota, cpuPeriod, nil
+}
+
 func rootMappedInContainer(IDMap []specs.LinuxIDMapping) bool {
 	for _, idMap := range IDMap {
 		if idMap.ContainerID == 0 {
@@ -1695,6 +1735,10 @@ func rootMappedInContainer(IDMap []specs.LinuxIDMapping) bool {
 func SandboxUserGroupIDs(spec *specs.Spec) (uint32, uint32) {
 	uid := uint32(0)
 	gid := uint32(0)
+
+	if spec.Process == nil {
+		return uid, gid
+	}
 
 	if !rootMappedInContainer(spec.Linux.UIDMappings) {
 		uid = spec.Process.User.UID
@@ -1752,6 +1796,9 @@ func (s *Sandbox) Wait(cid string) (unix.WaitStatus, error) {
 		return unix.WaitStatus(0), err
 	}
 	if !s.child {
+		if s.NoRootContainer && s.IsRootContainer(cid) {
+			return unix.WaitStatus(0), nil
+		}
 		return unix.WaitStatus(0), fmt.Errorf("sandbox no longer running and its exit status is unavailable")
 	}
 
@@ -3213,14 +3260,13 @@ func deviceFileForPlatform(name, devicePath string) (*fd.FD, error) {
 }
 
 // getNvproxyDriverVersion returns the NVIDIA driver ABI version to use by
-// nvproxy.
+// nvproxy, or "latest", which the sentry resolves to the newest supported ABI.
 func getNvproxyDriverVersion(conf *config.Config) (string, error) {
 	switch conf.NVProxyDriverVersion {
 	case "":
-		return nvproxy.HostDriverVersion()
+		return nvconf.HostDriverVersion()
 	case "latest":
-		nvproxy.Init()
-		return nvproxy.LatestDriver().String(), nil
+		return conf.NVProxyDriverVersion, nil
 	default:
 		version, err := nvconf.DriverVersionFrom(conf.NVProxyDriverVersion)
 		return version.String(), err

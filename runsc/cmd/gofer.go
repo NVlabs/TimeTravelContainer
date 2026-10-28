@@ -207,7 +207,7 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 			_ = specFile.Close()
 		}
 	}()
-	spec, err := specutils.ReadSpecFromFile(g.bundleDir, specFile, conf)
+	spec, err := specutils.ReadSpecFromFile(g.bundleDir, specFile, specutils.SpecOpts{Conf: conf})
 	if err != nil {
 		util.Fatalf("reading spec: %v", err)
 	}

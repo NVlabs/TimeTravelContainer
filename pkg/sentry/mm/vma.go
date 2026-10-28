@@ -37,9 +37,10 @@ import (
 // calls to functions that drop mapping identities within a scope should reuse
 // the same slice.
 //
-// Preconditions:
-//   - mm.mappingMu must be locked for writing.
-//   - opts must be valid as defined by the checks in MMap.
+// Preconditions: opts must be valid as defined by the checks in MMap.
+//
+// +checklocks:mm.mappingMu
+// +checklocksexclude:mm.activeMu
 func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOpts, droppedIDs []memmap.MappingIdentity) (vmaIterator, hostarch.AddrRange, []memmap.MappingIdentity, error) {
 	if opts.MaxPerms != opts.MaxPerms.Effective() {
 		panic(fmt.Sprintf("Non-effective MaxPerms %s cannot be enforced", opts.MaxPerms))
@@ -97,6 +98,9 @@ func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOp
 	// file->f_op->mmap().
 	var vgap vmaGapIterator
 	if opts.Unmap {
+		if mm.isSealedLocked(ar) {
+			return vmaIterator{}, hostarch.AddrRange{}, droppedIDs, linuxerr.EPERM
+		}
 		vgap, droppedIDs = mm.unmapLocked(ctx, ar, droppedIDs)
 	} else {
 		vgap = mm.vmas.FindGap(ar.Start)
@@ -127,6 +131,8 @@ func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOp
 		private:        opts.Private,
 		growsDown:      opts.GrowsDown,
 		isStack:        opts.Stack,
+		eagerForkCopy:  opts.EagerForkCopy,
+		sealed:         opts.Sealed,
 		mlockMode:      opts.MLockMode,
 		numaPolicy:     linux.MPOL_DEFAULT,
 		id:             opts.MappingIdentity,
@@ -175,7 +181,7 @@ const (
 
 // findAvailableLocked finds an allocatable range.
 //
-// Preconditions: mm.mappingMu must be locked.
+// +checklocksread:mm.mappingMu
 func (mm *MemoryManager) findAvailableLocked(length uint64, opts findAvailableOpts) (hostarch.Addr, error) {
 	if opts.Fixed {
 		opts.Map32Bit = false
@@ -234,7 +240,7 @@ func (mm *MemoryManager) applicationAddrRange() hostarch.AddrRange {
 	return hostarch.AddrRange{mm.layout.MinAddr, mm.layout.MaxAddr}
 }
 
-// Preconditions: mm.mappingMu must be locked.
+// +checklocksread:mm.mappingMu
 func (mm *MemoryManager) findLowestAvailableLocked(length, alignment uint64, bounds hostarch.AddrRange) (hostarch.Addr, error) {
 	for gap := mm.vmas.LowerBoundGap(bounds.Start); gap.Ok() && gap.Start() < bounds.End; gap = gap.NextLargeEnoughGap(hostarch.Addr(length)) {
 		if gr := gap.availableRange().Intersect(bounds); uint64(gr.Length()) >= length {
@@ -253,7 +259,7 @@ func (mm *MemoryManager) findLowestAvailableLocked(length, alignment uint64, bou
 	return 0, linuxerr.ENOMEM
 }
 
-// Preconditions: mm.mappingMu must be locked.
+// +checklocksread:mm.mappingMu
 func (mm *MemoryManager) findHighestAvailableLocked(length, alignment uint64, bounds hostarch.AddrRange) (hostarch.Addr, error) {
 	for gap := mm.vmas.UpperBoundGap(bounds.End); gap.Ok() && gap.End() > bounds.Start; gap = gap.PrevLargeEnoughGap(hostarch.Addr(length)) {
 		if gr := gap.availableRange().Intersect(bounds); uint64(gr.Length()) >= length {
@@ -273,7 +279,7 @@ func (mm *MemoryManager) findHighestAvailableLocked(length, alignment uint64, bo
 	return 0, linuxerr.ENOMEM
 }
 
-// Preconditions: mm.mappingMu must be locked.
+// +checklocksread:mm.mappingMu
 func (mm *MemoryManager) mlockedBytesRangeLocked(ar hostarch.AddrRange) uint64 {
 	var total uint64
 	for vseg := mm.vmas.LowerBoundSegment(ar.Start); vseg.Ok() && vseg.Start() < ar.End; vseg = vseg.NextSegment() {
@@ -299,6 +305,8 @@ func (mm *MemoryManager) mlockedBytesRangeLocked(ar hostarch.AddrRange) uint64 {
 // Preconditions:
 //   - mm.mappingMu must be locked for reading; it may be temporarily unlocked.
 //   - ar.Length() != 0.
+//
+// +checklocksread:mm.mappingMu
 func (mm *MemoryManager) getVMAsLocked(ctx context.Context, ar hostarch.AddrRange, at hostarch.AccessType, ignorePermissions bool) (vmaIterator, vmaGapIterator, error) {
 	if checkInvariants {
 		if !ar.WellFormed() || ar.Length() == 0 {
@@ -355,6 +363,8 @@ func (mm *MemoryManager) getVMAsLocked(ctx context.Context, ar hostarch.AddrRang
 // temporarily unlocked.
 //
 // Postconditions: ars is not mutated.
+//
+// +checklocksread:mm.mappingMu
 func (mm *MemoryManager) getVecVMAsLocked(ctx context.Context, ars hostarch.AddrRangeSeq, at hostarch.AccessType, ignorePermissions bool) (hostarch.AddrRangeSeq, error) {
 	for arsit := ars; !arsit.IsEmpty(); arsit = arsit.Tail() {
 		ar := arsit.Head()
@@ -386,9 +396,11 @@ const guardBytes = 256 * hostarch.PageSize
 // the same slice.
 //
 // Preconditions:
-//   - mm.mappingMu must be locked for writing.
 //   - ar.Length() != 0.
 //   - ar must be page-aligned.
+//
+// +checklocks:mm.mappingMu
+// +checklocksexclude:mm.activeMu
 func (mm *MemoryManager) unmapLocked(ctx context.Context, ar hostarch.AddrRange, droppedIDs []memmap.MappingIdentity) (vmaGapIterator, []memmap.MappingIdentity) {
 	if checkInvariants {
 		if !ar.WellFormed() || ar.Length() == 0 || !ar.IsPageAligned() {
@@ -412,15 +424,19 @@ func (mm *MemoryManager) unmapLocked(ctx context.Context, ar hostarch.AddrRange,
 // the same slice.
 //
 // Preconditions:
-//   - mm.mappingMu must be locked for writing.
 //   - ar.Length() != 0.
 //   - ar must be page-aligned.
+//
+// +checklocks:mm.mappingMu
 func (mm *MemoryManager) removeVMAsLocked(ctx context.Context, ar hostarch.AddrRange, droppedIDs []memmap.MappingIdentity) (vmaGapIterator, []memmap.MappingIdentity) {
 	if checkInvariants {
 		if !ar.WellFormed() || ar.Length() == 0 || !ar.IsPageAligned() {
 			panic(fmt.Sprintf("invalid ar: %v", ar))
 		}
 	}
+	// RemoveRangeWith invokes this callback synchronously, so this method's
+	// entry ownership contract covers its updates. checklocks does not
+	// propagate that contract into a passed callback.
 	vgap := mm.vmas.RemoveRangeWith(ar, func(vseg vmaIterator) {
 		vmaAR := vseg.Range()
 		vma := vseg.ValuePtr()
@@ -430,15 +446,30 @@ func (mm *MemoryManager) removeVMAsLocked(ctx context.Context, ar hostarch.AddrR
 		if vma.id != nil {
 			droppedIDs = append(droppedIDs, vma.id)
 		}
-		mm.usageAS -= uint64(vmaAR.Length())
+		mm.usageAS -= uint64(vmaAR.Length()) // +checklocksignore
 		if vma.isPrivateDataLocked() {
-			mm.dataAS -= uint64(vmaAR.Length())
+			mm.dataAS -= uint64(vmaAR.Length()) // +checklocksignore
 		}
 		if vma.mlockMode != memmap.MLockNone {
-			mm.lockedAS -= uint64(vmaAR.Length())
+			mm.lockedAS -= uint64(vmaAR.Length()) // +checklocksignore
 		}
 	})
 	return vgap, droppedIDs
+}
+
+// isSealedLocked returns true if any vma overlapping ar is sealed (see
+// memmap.MMapOpts.Sealed). Operations that would modify a sealed vma on
+// behalf of the application must check this before making any changes, and
+// fail with EPERM.
+//
+// +checklocksread:mm.mappingMu
+func (mm *MemoryManager) isSealedLocked(ar hostarch.AddrRange) bool {
+	for vseg := mm.vmas.LowerBoundSegment(ar.Start); vseg.Ok() && vseg.Start() < ar.End; vseg = vseg.NextSegment() {
+		if vseg.ValuePtr().sealed {
+			return true
+		}
+	}
+	return false
 }
 
 // canWriteMappableLocked returns true if it is possible for vma.mappable to be
@@ -449,14 +480,23 @@ func (mm *MemoryManager) removeVMAsLocked(ctx context.Context, ar hostarch.AddrR
 //
 // canWriteMappableLocked is equivalent to Linux's VM_SHARED.
 //
-// Preconditions: mm.mappingMu must be locked.
+// Preconditions: the owning MemoryManager's mappingMu is held at least for
+// reading, or v is exclusively owned (a detached copy or construction-owned
+// VMA).
+//
+// The vma type describes the missing owner link for checklocks.
 func (v *vma) canWriteMappableLocked() bool {
 	return !v.private && v.maxPerms.Write
 }
 
-// isPrivateDataLocked identify the data segments - private, writable, not stack
+// isPrivateDataLocked reports whether v is a private, writable, non-stack
+// data segment.
 //
-// Preconditions: mm.mappingMu must be locked.
+// Preconditions: the owning MemoryManager's mappingMu is held at least for
+// reading, or v is exclusively owned (a detached copy or construction-owned
+// VMA).
+//
+// The vma type describes the missing owner link for checklocks.
 func (v *vma) isPrivateDataLocked() bool {
 	return v.realPerms.Write && v.private && !v.growsDown
 }
@@ -493,6 +533,8 @@ func (vmaSetFunctions) Merge(ar1 hostarch.AddrRange, vma1 vma, ar2 hostarch.Addr
 		vma1.numaPolicy != vma2.numaPolicy ||
 		vma1.numaNodemask != vma2.numaNodemask ||
 		vma1.dontfork != vma2.dontfork ||
+		vma1.eagerForkCopy != vma2.eagerForkCopy ||
+		vma1.sealed != vma2.sealed ||
 		vma1.id != vma2.id ||
 		vma1.name != vma2.name ||
 		vma1.nameMut != vma2.nameMut {
@@ -603,10 +645,11 @@ func (vseg vmaIterator) addrRangeOf(mr memmap.MappableRange) hostarch.AddrRange 
 }
 
 // seekNextLowerBound returns mm.vmas.LowerBoundSegment(addr), but does so by
-// scanning linearly forward from vseg.
+// scanning linearly forward from vseg. The generated iterator has no
+// MemoryManager reference, so checklocks cannot name the owning mutex.
 //
 // Preconditions:
-//   - mm.mappingMu must be locked.
+//   - The owning MemoryManager's mappingMu is held at least for reading.
 //   - addr >= vseg.Start().
 func (vseg vmaIterator) seekNextLowerBound(addr hostarch.Addr) vmaIterator {
 	if checkInvariants {

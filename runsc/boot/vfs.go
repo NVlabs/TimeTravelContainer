@@ -1364,7 +1364,7 @@ func createEmptyPrivateMemoryFile(file *os.File, resourceID checkpoint.ResourceI
 		// Disk backed files need to be decommited on destroy to release disk space.
 		DecommitOnDestroy: true,
 		// sentry's seccomp filters don't allow the mmap(2) syscalls that
-		// pgalloc.IMAWorkAroundForMemFile() uses. Users of private memory files
+		// hostmm.IMAWorkAroundForMemFile() uses. Users of private memory files
 		// are expected to have performed the work around outside the sandbox.
 		DisableIMAWorkAround: true,
 		// Private memory files need to be restored correctly using this ID.

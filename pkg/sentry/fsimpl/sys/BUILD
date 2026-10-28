@@ -61,7 +61,7 @@ go_library(
 go_test(
     name = "sys_test",
     srcs = ["sys_test.go"],
-    library = ":sys",
+    embed = [":sys"],
 )
 
 go_test(

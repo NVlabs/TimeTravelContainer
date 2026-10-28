@@ -28,7 +28,7 @@ go_test(
     srcs = [
         "coretag_test.go",
     ],
-    library = ":coretag",
+    embed = [":coretag"],
     deps = [
         "//pkg/hostos",
     ],

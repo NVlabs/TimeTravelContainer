@@ -205,13 +205,11 @@ dev: $(RUNTIME_BIN) ## Installs a set of local runtimes. Requires sudo.
 .PHONY: dev
 
 governance-regen: ## Regenerates the files derived from governance/maintainers.yaml and governance/areas.yaml.
-	@$(call run,//governance/tools/maintainers:maintainers_gen,-input governance/maintainers.yaml -areas governance/areas.yaml -format MAINTAINERS.md -output MAINTAINERS.md)
-	@$(call run,//governance/tools/maintainers:maintainers_gen,-input governance/maintainers.yaml -areas governance/areas.yaml -format CODEOWNERS -output CODEOWNERS)
+	@$(call wrapper,$(BAZEL) run $(BASE_OPTIONS) $(BAZEL_OPTIONS) //:governance-regen)
 .PHONY: governance-regen
 
-governance-check: governance-regen ## Checks that the files derived from governance/*.yaml are in sync. Can't be a bazel test because it requires visibility across the whole codebase to check for subdirectories' existence.
-	@git diff --exit-code -- CODEOWNERS MAINTAINERS.md || \
-		(echo "Generated governance files are out of sync. Please run \`make governance-regen\`." >&2; exit 1)
+governance-check: ## Checks that the files derived from governance data are in sync.
+	@$(call test,//:governance-check)
 .PHONY: governance-check
 
 license-check: ## Checks that tools/licensecheck/dependencies.yaml has an entry for every dependency.
@@ -330,6 +328,15 @@ RUNTIME_TESTS_FLAKY_SHORT_CIRCUIT ?= true
 	@$(call install_runtime,$(RUNTIME),--watchdog-action=panic --platform=systrap)
 	@IMAGE_TAG=$(call tag,runtimes_$*) && \
 	$(call test_runtime_cached,$(RUNTIME),--test_timeout=1800 --test_env=RUNTIME_TESTS_FILTER=$(RUNTIME_TESTS_FILTER) --test_env=RUNTIME_TESTS_PER_TEST_TIMEOUT=$(RUNTIME_TESTS_PER_TEST_TIMEOUT) --test_env=RUNTIME_TESTS_RUNS_PER_TEST=$(RUNTIME_TESTS_RUNS_PER_TEST) --test_env=RUNTIME_TESTS_FLAKY_IS_ERROR=$(RUNTIME_TESTS_FLAKY_IS_ERROR) --test_env=RUNTIME_TESTS_FLAKY_SHORT_CIRCUIT=$(RUNTIME_TESTS_FLAKY_SHORT_CIRCUIT) --test_env=IMAGE_TAG=$${IMAGE_TAG} //test/runtimes:$*)
+
+# Moby(dockerd) in gvisor/runc tests.
+moby-tests: load-moby $(if $(filter-out runc,$(RUNTIME)),$(RUNTIME_BIN))
+ifneq ($(RUNTIME),runc)
+	@$(call install_runtime,$(RUNTIME),--net-raw --allow-packet-socket-write --TESTONLY-nftables)
+endif
+	@IMAGE_TAG=$(call tag,moby) && \
+	$(call test_runtime_cached,$(RUNTIME),--test_timeout=360 --test_env=RUNTIME_TESTS_FILTER=$(RUNTIME_TESTS_FILTER) --test_env=IMAGE_TAG=$${IMAGE_TAG} -- //test/moby:moby)
+.PHONY: moby-tests
 
 do-tests: $(RUNTIME_BIN)
 	@$(RUNTIME_BIN) --rootless do true
@@ -457,6 +464,10 @@ root-tests: load-basic_alpine $(RUNTIME_BIN)
 # Standard integration targets.
 INTEGRATION_TARGETS := //test/image:image_test //test/e2e:integration_test
 
+# Socket that the external network proxy in //test/e2e:uds_proxy_test listens
+# on. Must match externalUDSSocketPath in test/e2e/uds_proxy_test.go.
+NET_PROXY_SOCKET := /tmp/gvisor-net-uds/proxy.sock
+
 docker-tests: integration-test-images $(RUNTIME_BIN)
 	@$(call install_runtime_noreload,$(RUNTIME),) # Clear flags.
 	@$(call install_runtime_noreload,$(RUNTIME)-docker,--net-raw --allow-packet-socket-write) # Used by TestDocker*.
@@ -464,8 +475,9 @@ docker-tests: integration-test-images $(RUNTIME_BIN)
 	@$(call install_runtime_noreload,$(RUNTIME)-dcache,--fdlimit=2000 --dcache=100) # Used by TestDentryCacheLimit.
 	@$(call install_runtime_noreload,$(RUNTIME)-host-uds,--host-uds=all) # Used by TestHostSocketConnect.
 	@$(call install_runtime_noreload,$(RUNTIME)-overlay,--overlay2=all:self) # Used by TestOverlay*.
+	@$(call install_runtime_noreload,$(RUNTIME)-net-uds,--network-proxy-path=$(NET_PROXY_SOCKET)) # Used by TestExternalUDSProxy*.
 	@$(call install_runtime,$(RUNTIME)-cgroupv2,--in-sandbox-cgroup=v2) # Used by TestSystemd* and TestPIDFDSelftests.
-	@$(call test_runtime_cached,$(RUNTIME),$(INTEGRATION_TARGETS) --test_env=TEST_SAVE_RESTORE_NETSTACK=true //test/e2e:integration_runtime_test //test/e2e:runtime_in_docker_test)
+	@$(call test_runtime_cached,$(RUNTIME),--test_env=TEST_SAVE_RESTORE_NETSTACK=true -- $(INTEGRATION_TARGETS) //test/e2e:integration_runtime_test //test/e2e:runtime_in_docker_test //test/e2e:uds_proxy_test)
 .PHONY: docker-tests
 
 plugin-network-tests: integration-test-images $(RUNTIME_BIN)
@@ -605,9 +617,32 @@ run_benchmark = \
 	($(call header,BENCHMARK $(1)); \
 	set -euo pipefail; \
 	export T=$$(mktemp --tmpdir logs.$(1).XXXXXX); \
+	trap 'rm -rf "$$T"' EXIT; \
 	export UNSANDBOXED_RUNTIME; \
-	if test "$(1)" = "runc"; then $(call sudo,$(BENCHMARKS_TARGETS),-runtime=$(1) $(BENCHMARKS_ARGS)) | tee $$T; fi; \
-	if test "$(1)" != "runc"; then $(call sudo,$(BENCHMARKS_TARGETS),-runtime=$(1) $(BENCHMARKS_ARGS) $(BENCHMARKS_PROFILE)) | tee $$T; fi; \
+	export RUNTIME="$(1)"; \
+	exit_code=0; \
+	if test "$(1)" = "runc"; then \
+	  $(call sudo,$(BENCHMARKS_TARGETS),-runtime=$(1) $(BENCHMARKS_ARGS)) | tee $$T || exit_code=$$?; \
+	else \
+	  $(call sudo,$(BENCHMARKS_TARGETS),-runtime=$(1) $(BENCHMARKS_ARGS) $(BENCHMARKS_PROFILE)) | tee $$T || exit_code=$$?; \
+	fi; \
+	if test "$(BENCHMARKS_UPLOAD)" = "true"; then \
+	  upload_ret=0; \
+	  $(call run,tools/parsers:parser,parse --debug --file=$$T --runtime=$(1) --suite_name=$(BENCHMARKS_SUITE) --project=$(BENCHMARKS_PROJECT) --dataset=$(BENCHMARKS_DATASET) --table=$(BENCHMARKS_TABLE) --official=$(BENCHMARKS_OFFICIAL)) || upload_ret=$$?; \
+	  if test "$$upload_ret" -ne 0 && test "$$exit_code" -eq 0; then \
+	    exit_code=$$upload_ret; \
+	  fi; \
+	fi; \
+	exit $$exit_code)
+
+# $(1) is the platform name.
+# TODO: b/567563387 - consider not using --runtime here to describe the platform
+# in the BigQuery parser for these non-docker tests.
+run_platform_benchmark = \
+	($(call header,BENCHMARK $(1)); \
+	set -euo pipefail; \
+	export T=$$(mktemp --tmpdir logs.$(1).XXXXXX); \
+	$(call sudo,$(BENCHMARKS_TARGETS),--test_platforms=$(1) $(BENCHMARKS_ARGS) $(BENCHMARKS_PROFILE)) | tee $$T; \
 	if test "$(BENCHMARKS_UPLOAD)" = "true"; then \
 	  $(call run,tools/parsers:parser,parse --debug --file=$$T --runtime=$(1) --suite_name=$(BENCHMARKS_SUITE) --project=$(BENCHMARKS_PROJECT) --dataset=$(BENCHMARKS_DATASET) --table=$(BENCHMARKS_TABLE) --official=$(BENCHMARKS_OFFICIAL)); \
 	fi; \
@@ -638,6 +673,18 @@ benchmark-platforms: load-benchmarks $(RUNTIME_BIN) ## Runs benchmarks for runc 
 	  $(call run_benchmark,runc); \
 	fi
 .PHONY: benchmark-platforms
+
+# TODO: b/529809802 - Enable benchmarks for slimvm.
+benchmark-platforms-nodocker: $(RUNTIME_BIN) ## Runs non-Docker benchmarks for all (selected) platforms.
+	@set -xe; \
+	for PLATFORM in $$(if test -z "$(BENCHMARKS_PLATFORMS)"; then $(RUNTIME_BIN) help platforms; else echo $(BENCHMARKS_PLATFORMS); fi); do \
+	  if test "$${PLATFORM}" = "slimvm"; then \
+	    continue; \
+	  fi; \
+	  export PLATFORM; \
+	  $(call run_platform_benchmark,$${PLATFORM}); \
+	done
+.PHONY: benchmark-platforms-nodocker
 
 run-benchmark: load-benchmarks ## Runs single benchmark and optionally sends data to BigQuery.
 	@$(call run_benchmark,$(RUNTIME))
@@ -752,7 +799,19 @@ seccomp-sentry-filters:  # Dumps seccomp-bpf program for the Sentry binary.
 SYZKALLER_IMAGE     ?= gcr.io/syzkaller/syzbot:latest
 SYZKALLER_CONTAINER ?= gvisor-syz-$(HASH)-$(ARCH)
 SYZKALLER_REPO_URL  ?= https://github.com/google/syzkaller
-syzkaller-smoke-test: $(RUNTIME_BIN)
+SYZKALLER_BRANCH    ?= master
+SYZKALLER_TARBALL   ?= $(RUNTIME_DIR)/$(if $(STAGED_BINARIES),$(notdir $(STAGED_BINARIES)),gvisor.tar.bz2)
+
+$(SYZKALLER_TARBALL):
+	@mkdir -p "$(dir $(SYZKALLER_TARBALL))"
+ifeq (,$(STAGED_BINARIES))
+	@$(call copy,//debian:gvisor-release-tar-bz2,$(SYZKALLER_TARBALL))
+else
+	@gcloud storage cp "$(STAGED_BINARIES)" "$(SYZKALLER_TARBALL)"
+endif
+.PHONY: $(SYZKALLER_TARBALL)
+
+syzkaller-smoke-test: $(SYZKALLER_TARBALL)
 	@docker rm -f $(SYZKALLER_CONTAINER) 2>/dev/null || true && \
 	docker run --rm \
 		--name="$(SYZKALLER_CONTAINER)" \
@@ -760,13 +819,13 @@ syzkaller-smoke-test: $(RUNTIME_BIN)
 		--hostname="$(SYZKALLER_CONTAINER)" \
 		$(DOCKER_PRIVILEGED) \
 		--pid=host \
-		-v "$(RUNTIME_DIR):$(RUNTIME_DIR):ro" \
+		-v "$(SYZKALLER_TARBALL):$(SYZKALLER_TARBALL):ro" \
 		-e "GOPATH=/__w/syzkaller/syzkaller/gopath" \
-		-e "GVISOR_VMLINUX_PATH=$(RUNTIME_BIN)" \
+		-e "GVISOR_TARBALL_PATH=$(SYZKALLER_TARBALL)" \
 		"$(SYZKALLER_IMAGE)" \
 		/bin/bash -xeuc ' \
 			mkdir -p "$$GOPATH/src/github.com/google" && \
-			git clone --depth=1 https://github.com/google/syzkaller "$$GOPATH/src/github.com/google/syzkaller" && \
+			git clone --depth=1 --branch "$(SYZKALLER_BRANCH)" "$(SYZKALLER_REPO_URL)" "$$GOPATH/src/github.com/google/syzkaller" && \
 			cd "$$GOPATH/src/github.com/google/syzkaller" && \
 			make && \
 			bash tools/gvisor-smoke-test.sh \

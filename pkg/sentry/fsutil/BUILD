@@ -165,7 +165,7 @@ go_test(
         "dirty_set_test.go",
         "file_range_set_test.go",
     ],
-    library = ":fsutil",
+    embed = [":fsutil"],
     deps = [
         "//pkg/hostarch",
         "//pkg/sentry/contexttest",

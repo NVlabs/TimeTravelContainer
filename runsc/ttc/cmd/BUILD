@@ -71,6 +71,7 @@ go_library(
         "//pkg/sentry/devices/nvproxy",
         "//pkg/sentry/devices/nvproxy/nvconf",
         "//pkg/sentry/kernel",
+        "//pkg/sentry/hostmm",
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/ttcchunk",
         "//pkg/sentry/ttcremote",

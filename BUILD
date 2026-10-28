@@ -1,8 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+load("@bazel_skylib//rules:native_binary.bzl", "native_test")
+load("@bazel_skylib//rules:write_file.bzl", "write_file")
 load("@rules_license//rules:license.bzl", "license")
 load("//tools:defs.bzl", "build_test", "gazelle", "go_path")
+load("//tools:gazelle.bzl", "GAZELLE_PACKAGES")
 load("//tools:release.bzl", "RELEASE_RUNSC", "RELEASE_SIDECARS", "release_files")
 load("//tools/nogo:defs.bzl", "nogo_config")
 load("//tools/yamltest:defs.bzl", "yaml_test")
@@ -18,6 +21,7 @@ license(
 )
 
 exports_files([
+    "CODEOWNERS",
     "LICENSE",
     "README.md",
     "SECURITY.md",
@@ -52,10 +56,53 @@ yaml_test(
     schema = "//tools/nogo/config:schema.json",
 )
 
+GITHUB_WORKFLOWS = glob(
+    [
+        ".github/workflows/**/*.yaml",
+        ".github/workflows/**/*.yml",
+    ],
+    allow_empty = True,
+) or fail("No GitHub workflow YAML files were found")
+
+filegroup(
+    name = "github_workflows",
+    srcs = GITHUB_WORKFLOWS,
+)
+
 yaml_test(
     name = "github_workflows_test",
-    srcs = glob([".github/workflows/*.yml"]),
+    srcs = [":github_workflows"],
     schema = "@github_workflow_schema//file",
+)
+
+# actionlint discovers project configuration and local actions by finding .git.
+# It only stats the marker; Git metadata and history are not needed.
+write_file(
+    name = "actionlint_project_marker",
+    out = ".git",
+    content = [],
+)
+
+# A real runfiles tree is needed for project/configuration discovery. On
+# Windows, enable Bazel symlink support and pass --enable_runfiles.
+native_test(
+    name = "github_actions_test",
+    src = "//tools/actionlint",
+    args = [
+        "-no-color",
+        "-oneline",
+        "-shellcheck=",
+        "-pyflakes=",
+    ] + ['"$(rootpath %s)"' % workflow for workflow in GITHUB_WORKFLOWS],
+    # These optional configuration files may be absent.
+    # buildifier: disable=constant-glob
+    data = GITHUB_WORKFLOWS + [":actionlint_project_marker"] + glob(
+        [
+            ".github/actionlint.yaml",
+            ".github/actionlint.yml",
+        ],
+        allow_empty = True,
+    ),
 )
 
 # The sandbox filegroup is used for sandbox-internal dependencies.
@@ -107,6 +154,9 @@ go_path(
         # binaries have been factored into a cli package, which is
         # a good practice in any case.
         "//runsc/cli/maincli",
+        "//runsc/cli/sentrycli",
+        "//shim/v1/cli",
+        "//webhook/pkg/cli",
         "//tools/checklocks",
 
         # Packages that are not dependencies of the above.
@@ -127,6 +177,7 @@ go_path(
         "//pkg/tcpip/sample/tun_tcp_echo",
         "//pkg/tcpip/transport/tcpconntrack",
         "//sandboxexec/sandbox",
+        "//tools/xdp/cmd",
     ],
 )
 
@@ -152,11 +203,47 @@ toolchain(
     toolchain_type = "@bazel_tools//tools/cpp:toolchain_type",
 )
 
-# gazelle is a set of build tools.
+# gazelle generates Go BUILD rules from sources.
 #
-# To update the WORKSPACE from go.mod, use:
-#   bazel run //:gazelle -- update-repos -from_file=go.mod
+# Packages listed in GAZELLE_PACKAGES must match gazelle's output; presubmit
+# runs //:gazelle_check to enforce this. To fix them, run:
+#   bazel run //:gazelle_fix
+#
+# gazelle:prefix gvisor.dev/gvisor
+# gazelle:go_naming_convention import
+# gazelle:go_naming_convention_external go_default_library
+# gazelle:map_kind go_binary go_binary //tools:defs.bzl
+# gazelle:map_kind go_library go_library //tools:defs.bzl
+# gazelle:map_kind go_test go_test //tools:defs.bzl
+#
+# proto_library is a macro whose Go targets gazelle cannot see.
+# gazelle:proto disable_global
+# gazelle:resolve_regexp go ^gvisor\.dev/gvisor/(.+)/([^/]+)_go_proto$ //$1:${2}_go_proto
+#
+# These packages name a proto_library and a go_library alike, which gazelle
+# rejects when loading the BUILD file.
+# gazelle:exclude pkg/eventchannel
+# gazelle:exclude pkg/metric
+# gazelle:exclude pkg/sentry/strace
 gazelle(name = "gazelle")
+
+# Gazelle indexes go_library rules by importpath, which unmigrated BUILD files
+# omit, so resolve gvisor.dev/gvisor imports by path instead (-index=none).
+GAZELLE_ARGS = [
+    "-index=none",
+    "-r=false",
+] + GAZELLE_PACKAGES
+
+gazelle(
+    name = "gazelle_check",
+    args = GAZELLE_ARGS,
+    mode = "diff",
+)
+
+gazelle(
+    name = "gazelle_fix",
+    args = GAZELLE_ARGS,
+)
 
 exports_files([
     "go.sum",

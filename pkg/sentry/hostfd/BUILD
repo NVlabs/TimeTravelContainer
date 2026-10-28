@@ -15,6 +15,7 @@ go_library(
         "hostfd_linux.go",
         "hostfd_unsafe.go",
     ],
+    importpath = "gvisor.dev/gvisor/pkg/sentry/hostfd",
     visibility = ["//pkg/sentry:internal"],
     deps = [
         "//pkg/safemem",
@@ -27,7 +28,7 @@ go_test(
     name = "hostfd_test",
     size = "small",
     srcs = ["hostfd_test.go"],
-    library = ":hostfd",
+    embed = [":hostfd"],
     deps = [
         "@org_golang_x_sys//unix:go_default_library",
     ],

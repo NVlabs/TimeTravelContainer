@@ -15,6 +15,7 @@ go_library(
         "memory_darwin.go",
         "memory_linux.go",
     ],
+    importpath = "gvisor.dev/gvisor/pkg/hostos",
     visibility = ["//:sandbox"],
     deps = [
         "@org_golang_x_mod//semver:go_default_library",
@@ -25,5 +26,5 @@ go_library(
 go_test(
     name = "hostos_test",
     srcs = ["hostos_test.go"],
-    library = ":hostos",
+    embed = [":hostos"],
 )

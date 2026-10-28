@@ -34,7 +34,7 @@ go_library(
 go_test(
     name = "maincli_test",
     srcs = ["maincli_test.go"],
-    library = ":maincli",
+    embed = [":maincli"],
     deps = [
         "//runsc/cmd",
         "//runsc/flag",

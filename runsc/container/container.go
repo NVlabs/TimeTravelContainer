@@ -41,7 +41,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
-	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/hostmm"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/sighandling"
 	"gvisor.dev/gvisor/pkg/unet"
@@ -199,7 +199,7 @@ type Args struct {
 	Attached bool
 
 	// PassFiles are user-supplied files from the host to be exposed to the
-	// sandboxed app.
+	// sandboxed app. They are supported only for the sandbox's root container.
 	PassFiles map[int]*os.File
 
 	// ExecFile is the host file used for program execution.
@@ -214,6 +214,11 @@ type Args struct {
 	// CheckpointDirPath is the path to the sentry checkpoint directory.
 	// Used to default FSRestoreImagePath if it is empty.
 	CheckpointDirPath string
+
+	// NoRootContainer creates a sandbox with no root container: Spec has
+	// neither Process nor Root, and no gofer is started. Only valid when ID is
+	// the sandbox ID.
+	NoRootContainer bool
 }
 
 // New creates the container in a new Sandbox process, unless the metadata
@@ -232,6 +237,10 @@ func New(conf *config.Config, args Args) (*Container, error) {
 
 	if err := validateID(args.ID); err != nil {
 		return nil, err
+	}
+
+	if len(args.PassFiles) != 0 && !specutils.IsRootContainer(args.Spec) {
+		return nil, fmt.Errorf("passed files are supported only when creating a new sandbox")
 	}
 
 	if err := os.MkdirAll(conf.RootDir, 0711); err != nil {
@@ -254,6 +263,23 @@ func New(conf *config.Config, args Args) (*Container, error) {
 		}
 	}
 
+	if args.NoRootContainer {
+		if !specutils.IsRootContainer(args.Spec) {
+			return nil, fmt.Errorf("NoRootContainer can only be set when creating the sandbox, not a subcontainer")
+		}
+		if args.ConsoleSocket != "" {
+			return nil, fmt.Errorf("ConsoleSocket cannot be set with NoRootContainer: there is no root container process to give a terminal to")
+		}
+		// TODO(gvisor.dev/issue/13948): Allow this once checkpoint/restore supports
+		// sandboxes with no root container.
+		if args.FSRestoreImagePath != "" {
+			return nil, fmt.Errorf("FSRestoreImagePath cannot be set with NoRootContainer: checkpoint/restore is not supported for a sandbox with no root container")
+		}
+		if len(args.PassFiles) > 0 || args.ExecFile != nil {
+			return nil, fmt.Errorf("PassFiles and ExecFile cannot be set with NoRootContainer: there is no root container process to pass them to")
+		}
+	}
+
 	c := &Container{
 		ID:            args.ID,
 		Spec:          args.Spec,
@@ -270,9 +296,21 @@ func New(conf *config.Config, args Args) (*Container, error) {
 			},
 		},
 	}
-	// The Cleanup object cleans up partially created containers when an error
-	// occurs. Any errors occurring during cleanup itself are ignored.
-	cu := cleanup.Make(func() { _ = c.Destroy() })
+	// Clean up partially created containers on error. Log cleanup failures while
+	// preserving the original creation error so callers see why New failed.
+	var rootCgroup cgroup.Cgroup
+	cu := cleanup.Make(func() {
+		if err := c.Destroy(); err != nil {
+			log.Warningf("destroying container after failed creation: %v", err)
+		}
+		// Failed sandbox creation has no Sandbox to retain the root cgroup.
+		// Stop the gofer above before removing the group it was running in.
+		if rootCgroup != nil {
+			if err := rootCgroup.Uninstall(); err != nil {
+				log.Warningf("removing cgroup after failed container creation: %v", err)
+			}
+		}
+	})
 	defer cu.Clean()
 
 	// Lock the container metadata file to prevent concurrent creations of
@@ -297,7 +335,9 @@ func New(conf *config.Config, args Args) (*Container, error) {
 	//      already started sandbox. In this case, container ID is different than
 	//      the sandbox ID.
 	if specutils.IsRootContainer(args.Spec) {
-		if err := c.createRoot(conf, args, sandboxID); err != nil {
+		var err error
+		rootCgroup, err = c.createRoot(conf, args, sandboxID)
+		if err != nil {
 			return nil, err
 		}
 
@@ -356,7 +396,9 @@ func New(conf *config.Config, args Args) (*Container, error) {
 	return c, nil
 }
 
-func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string) error {
+// createRoot returns a cgroup that still needs rollback if creation fails.
+// The caller must stop partially created processes before uninstalling it.
+func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string) (cgroup.Cgroup, error) {
 	log.Debugf("Creating new sandbox for container, cid: %s", args.ID)
 
 	if args.Spec.Linux == nil {
@@ -374,7 +416,7 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 		// part of the cgroup from the start (and all their children processes).
 		parentCgroup, subCgroup, err = c.setupCgroupForRoot(conf, args.Spec)
 		if err != nil {
-			return fmt.Errorf("cannot set up cgroup for root: %w", err)
+			return nil, fmt.Errorf("cannot set up cgroup for root: %w", err)
 		}
 		c.unownedCgroup = parentCgroup
 		// Join the child cgroup when using cgroupfs. Joining non leaf-node
@@ -388,15 +430,26 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 	c.CompatCgroup = cgroup.CgroupJSON{Cgroup: subCgroup}
 	mountHints, err := boot.NewPodMountHints(args.Spec)
 	if err != nil {
-		return fmt.Errorf("error creating pod mount hints: %w", err)
+		return parentCgroup, fmt.Errorf("error creating pod mount hints: %w", err)
 	}
 	if err := nvProxyPreGoferHostSetup(args.Spec, conf); err != nil {
-		return err
+		return parentCgroup, err
 	}
 	if err := cgroup.RunInCgroup(containerCgroup, func(cloneIntoCgroupFD *os.File) error {
-		ioFiles, goferFilestores, devIOFile, specFile, err := c.createGoferProcess(conf, mountHints, args.Attached, cloneIntoCgroupFD)
-		if err != nil {
-			return fmt.Errorf("cannot create gofer process: %w", err)
+		// No rootfs and no mounts, so nothing for a gofer to serve.
+		// Subcontainers get their own.
+		var (
+			ioFiles         []*os.File
+			goferFilestores []*os.File
+			devIOFile       *os.File
+			specFile        *os.File
+		)
+		if !args.NoRootContainer {
+			var err error
+			ioFiles, goferFilestores, devIOFile, specFile, err = c.createGoferProcess(conf, mountHints, args.Attached, cloneIntoCgroupFD)
+			if err != nil {
+				return fmt.Errorf("cannot create gofer process: %w", err)
+			}
 		}
 
 		// Start a new sandbox for this container. Any errors after this point
@@ -420,6 +473,7 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 			ExecFile:            args.ExecFile,
 			FSRestoreImagePath:  args.FSRestoreImagePath,
 			FSRestoreDirect:     args.FSRestoreDirect,
+			NoRootContainer:     args.NoRootContainer,
 		}
 		sand, err := sandbox.New(conf, sandArgs)
 		if err != nil {
@@ -430,9 +484,9 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 		return nil
 
 	}); err != nil {
-		return err
+		return parentCgroup, err
 	}
-	return nil
+	return nil, nil
 }
 
 func (c *Container) createSubcontainer(conf *config.Config, spec *specs.Spec) error {
@@ -472,6 +526,9 @@ func (c *Container) Start(conf *config.Config) error {
 // to restore a container from its state file.
 func (c *Container) Restore(conf *config.Config, imagePath string, direct, background bool, networkArgs *boot.CreateLinksAndRoutesArgs) error {
 	log.Debugf("Restore container, cid: %s", c.ID)
+	if err := c.checkpointRestoreSupported("restore"); err != nil {
+		return err
+	}
 
 	restore := func(conf *config.Config, spec *specs.Spec) error {
 		return c.Sandbox.Restore(conf, spec, c.ID, imagePath, direct, background, networkArgs)
@@ -592,7 +649,7 @@ func Run(conf *config.Config, args Args) (unix.WaitStatus, error) {
 	// If we allocate a terminal, forward signals to the sandbox process.
 	// Otherwise, Ctrl+C will terminate this process and its children,
 	// including the terminal.
-	if c.Spec.Process.Terminal {
+	if c.Spec.Process != nil && c.Spec.Process.Terminal {
 		stopForwarding := c.ForwardSignals(0, true /* fgProcess */)
 		defer stopForwarding()
 	}
@@ -833,6 +890,9 @@ func (c *Container) signalRunning(sig unix.Signal, all bool) error {
 	if err := c.CheckSandboxRunning(); err != nil {
 		return err
 	}
+	if c.Sandbox.NoRootContainer && c.Sandbox.IsRootContainer(c.ID) {
+		return fmt.Errorf("cannot signal sandbox %q: it was booted without a root container process; use `runsc delete` to stop it", c.ID)
+	}
 	return c.Sandbox.SignalContainer(c.ID, sig, all)
 }
 
@@ -921,6 +981,9 @@ func (c *Container) ForwardSignals(pid int32, fgProcess bool) func() {
 // The statefile will be written to f, the file at the specified image-path.
 func (c *Container) Checkpoint(conf *config.Config, imagePath string, opts sandbox.CheckpointOpts) error {
 	log.Debugf("Checkpoint container, cid: %s", c.ID)
+	if err := c.checkpointRestoreSupported("checkpoint"); err != nil {
+		return err
+	}
 	if err := c.requireStatus("checkpoint", Created, Running, Paused); err != nil {
 		return err
 	}
@@ -1262,7 +1325,7 @@ func (c *Container) createGoferFilestores(ovlConf config.Overlay2, mountHints *b
 	for _, filestore := range goferFilestores {
 		// Perform this work around outside the sandbox. The sandbox may already be
 		// running with seccomp filters that do not allow this.
-		pgalloc.IMAWorkAroundForMemFile(filestore.Fd())
+		hostmm.IMAWorkAroundForMemFile(filestore.Fd())
 	}
 	return goferFilestores, nil
 }
@@ -1943,6 +2006,9 @@ func (c *Container) CheckSandboxRunning() error {
 // HasCapabilityInAnySet returns true if the given capability is in any of the
 // capability sets of the container process.
 func (c *Container) HasCapabilityInAnySet(capability linux.Capability) bool {
+	if c.Spec.Process == nil {
+		return false
+	}
 	capString := capability.String()
 	for _, set := range [5][]string{
 		c.Spec.Process.Capabilities.Bounding,
@@ -1962,6 +2028,9 @@ func (c *Container) HasCapabilityInAnySet(capability linux.Capability) bool {
 
 // RunsAsUID0 returns true if the container process runs with UID 0 (root).
 func (c *Container) RunsAsUID0() bool {
+	if c.Spec.Process == nil {
+		return false
+	}
 	return c.Spec.Process.User.UID == 0
 }
 
@@ -1972,6 +2041,16 @@ func (c *Container) requireStatus(action string, statuses ...Status) error {
 		}
 	}
 	return fmt.Errorf("cannot %s container %q in state %s", action, c.ID, c.Status)
+}
+
+// checkpointRestoreSupported returns an error if the sandbox has no root
+// container: restore gives every container a gofer, so the image would not be
+// restorable.
+func (c *Container) checkpointRestoreSupported(action string) error {
+	if c.Sandbox != nil && c.Sandbox.NoRootContainer {
+		return fmt.Errorf("cannot %s container %q: not supported for a sandbox booted without a root container", action, c.ID)
+	}
+	return nil
 }
 
 // IsSandboxRoot returns true if this container is its sandbox's root container.
@@ -2023,6 +2102,12 @@ func adjustSandboxOOMScoreAdj(s *sandbox.Sandbox, spec *specs.Spec, rootDir stri
 		// We will use OOMScoreAdj in the single-container case where the
 		// containerd container-type annotation is not present.
 		if specutils.SpecContainerType(container.Spec) == specutils.ContainerTypeSandbox {
+			continue
+		}
+
+		// The annotation check above usually catches the sandbox, but
+		// annotations are not mandatory.
+		if container.Spec.Process == nil {
 			continue
 		}
 
@@ -2196,8 +2281,29 @@ func (c *Container) setupCgroupForSubcontainer(conf *config.Config, spec *specs.
 	if cg == nil || err != nil {
 		return nil, err
 	}
-	// Use empty resources, just want the directory structure created.
-	return cgroupInstall(conf, cg, &specs.LinuxResources{})
+	// Create the directory (and populate the spec-limit files from the OCI
+	// resources) so cAdvisor and other inotify-based tools can discover the
+	// subcontainer and report its container_spec_* series. The compat cgroup
+	// is process-less, so these limits have no kernel-side effect.
+	// InstallSubcontainerCompatDir handles the systemd v2 case (where Install
+	// does not create the directory) while keeping the existing cgroupfs
+	// behavior for v1 / non-systemd v2.
+	if err := cgroup.InstallSubcontainerCompatDir(cg, spec.Linux.Resources); err != nil {
+		return nil, handleCgroupInstallErr(conf, "subcontainer cgroup", err)
+	}
+	return cg, nil
+}
+
+// handleCgroupInstallErr maps an error from a cgroup install operation. In
+// rootless mode, EACCES/EROFS mean we lack permission to configure cgroups,
+// which is non-fatal: it logs and returns nil so the caller proceeds without a
+// cgroup. All other errors are wrapped with what.
+func handleCgroupInstallErr(conf *config.Config, what string, err error) error {
+	if (errors.Is(err, unix.EACCES) || errors.Is(err, unix.EROFS)) && conf.Rootless {
+		log.Warningf("Skipping %s configuration in rootless mode: %v", what, err)
+		return nil
+	}
+	return fmt.Errorf("configuring %s: %v", what, err)
 }
 
 // cgroupInstall creates cgroups dir structure and sets their respective
@@ -2207,13 +2313,7 @@ func (c *Container) setupCgroupForSubcontainer(conf *config.Config, spec *specs.
 // no cgroups was configured.
 func cgroupInstall(conf *config.Config, cg cgroup.Cgroup, res *specs.LinuxResources) (cgroup.Cgroup, error) {
 	if err := cg.Install(res); err != nil {
-		switch {
-		case (errors.Is(err, unix.EACCES) || errors.Is(err, unix.EROFS)) && conf.Rootless:
-			log.Warningf("Skipping cgroup configuration in rootless mode: %v", err)
-			return nil, nil
-		default:
-			return nil, fmt.Errorf("configuring cgroup: %v", err)
-		}
+		return nil, handleCgroupInstallErr(conf, "cgroup", err)
 	}
 	return cg, nil
 }

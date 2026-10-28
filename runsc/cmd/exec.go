@@ -308,6 +308,10 @@ func (ex *Exec) prepare(conf *config.Config, f *flag.FlagSet) (*container.Contai
 		return nil, nil, fmt.Errorf("loading container failed: %v", err)
 	}
 
+	if c.Spec.Process == nil {
+		return nil, nil, fmt.Errorf("cannot exec in %q: it is a sandbox booted without a root container; exec into its containers by their own IDs instead", c.ID)
+	}
+
 	e, err := ex.parseArgs(f, c.Spec.Process, conf.EnableRaw)
 	if err != nil {
 		return nil, nil, fmt.Errorf("parsing process spec: %v", err)

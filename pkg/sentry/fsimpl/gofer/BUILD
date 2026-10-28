@@ -147,7 +147,7 @@ go_library(
 go_test(
     name = "gofer_test",
     srcs = ["gofer_test.go"],
-    library = ":gofer",
+    embed = [":gofer"],
     deps = [
         "//pkg/abi/linux",
         "//pkg/lisafs",

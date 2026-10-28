@@ -80,7 +80,7 @@ go_test(
         "service_test.go",
         "state_test.go",
     ],
-    library = ":runsc",
+    embed = [":runsc"],
     deps = [
         "//pkg/shim/v1/proc",
         "//pkg/shim/v1/runsccmd",

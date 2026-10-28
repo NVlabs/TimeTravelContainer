@@ -16,6 +16,7 @@ go_library(
         "registry.go",
         "types.go",
     ],
+    importpath = "gvisor.dev/gvisor/pkg/ebpf",
     imports = ["gvisor.dev/gvisor/pkg/abi/linux"],
     visibility = ["//visibility:public"],
     deps = [

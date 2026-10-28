@@ -103,7 +103,7 @@ go_test(
         "fs_test.go",
         "proc_test.go",
     ],
-    library = ":control",
+    embed = [":control"],
     deps = [
         "//pkg/abi/linux",
         "//pkg/context",

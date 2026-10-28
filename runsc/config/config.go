@@ -200,6 +200,11 @@ type Config struct {
 	// PCAP is a file to which network packets should be logged in PCAP format.
 	PCAP string `flag:"pcap-log"`
 
+	// NetworkProxyPath, if set, is the path of an external UDS that the
+	// sentry attaches its primary network interface to instead of creating
+	// an AF_PACKET socket.
+	NetworkProxyPath string `flag:"network-proxy-path"`
+
 	// Platform is the platform to run on.
 	Platform string `flag:"platform"`
 
@@ -278,6 +283,10 @@ type Config struct {
 	// PanicSignal registers signal handling that panics. Usually set to
 	// SIGUSR2(12) to troubleshoot hangs. -1 disables it.
 	PanicSignal int `flag:"panic-signal"`
+
+	// DumpGoroutinesSignal registers signal handling that dumps all goroutine
+	// stacks without exiting. -1 disables it.
+	DumpGoroutinesSignal int `flag:"dump-goroutines-signal"`
 
 	// ProfileEnable is set to prepare the sandbox to be profiled.
 	ProfileEnable bool `flag:"profile"`
@@ -579,6 +588,12 @@ func (c *Config) AllowRunAsCurrentUserWithoutChroot() bool {
 	return c.UnsafeNoHostIsolation || c.TestOnlyAllowRunAsCurrentUserWithoutChroot
 }
 
+// UseNetworkProxy reports whether the primary sandbox network interface should
+// be attached to a unix domain socket instead of AF_PACKET socket.
+func (c *Config) UseNetworkProxy() bool {
+	return c.NetworkProxyPath != ""
+}
+
 // Validate checks that the Config is in a consistent state, e.g. that no
 // interdependent or mutually-exclusive flag values conflict. Note that
 // Config.Override does not validate, so callers must call Validate once they
@@ -630,6 +645,17 @@ func (c *Config) Validate() error {
 		}
 		if err := ValidateNetworkInterfaceName(c.TimeTravelNetworkInterface); err != nil {
 			return fmt.Errorf("ttc-network-interface: %w", err)
+		}
+	}
+	if c.UseNetworkProxy() {
+		if !filepath.IsAbs(c.NetworkProxyPath) {
+			return fmt.Errorf("network-proxy-path must be an absolute path, got %q", c.NetworkProxyPath)
+		}
+		if c.Network != NetworkSandbox {
+			return fmt.Errorf("network-proxy-path flag is only supported with sandbox networking")
+		}
+		if c.XDP.Mode != XDPModeOff {
+			return fmt.Errorf("network-proxy-path flag is incompatible with XDP")
 		}
 	}
 	if c.TBFBurst > maxQDiscTBFBurst {
@@ -1435,6 +1461,7 @@ func (o *Overlay2) RootOverlayMedium() OverlayMedium {
 	return o.medium
 }
 
+// RootOverlaySize returns the overlay size config of the root mount.
 func (o *Overlay2) RootOverlaySize() string {
 	if !o.rootMount {
 		return ""
@@ -1450,6 +1477,7 @@ func (o *Overlay2) SubMountOverlayMedium() OverlayMedium {
 	return o.medium
 }
 
+// SubMountOverlaySize returns the overlay size config of submounts.
 func (o *Overlay2) SubMountOverlaySize() string {
 	if !o.subMounts {
 		return ""

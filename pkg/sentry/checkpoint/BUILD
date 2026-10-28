@@ -13,6 +13,7 @@ go_library(
         "checkpoint.go",
         "portable.go",
     ],
+    importpath = "gvisor.dev/gvisor/pkg/sentry/checkpoint",
     visibility = ["//pkg/sentry:internal"],
 )
 
@@ -23,5 +24,5 @@ go_test(
         "checkpoint_test.go",
         "portable_test.go",
     ],
-    library = ":checkpoint",
+    embed = [":checkpoint"],
 )

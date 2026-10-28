@@ -15,6 +15,7 @@ go_library(
         "iptables.go",
         "iptables_unsafe.go",
         "iptables_util.go",
+        "mangle.go",
         "nat.go",
         "reject.go",
     ],
@@ -22,7 +23,9 @@ go_library(
     deps = [
         "//pkg/binary",
         "//pkg/hostarch",
+        "//pkg/test/testutil",
         "//test/netutils",
+        "@com_github_vishvananda_netlink//:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )
@@ -34,16 +37,16 @@ go_test(
         "iptables_test.go",
     ],
     data = ["//test/iptables/runner"],
-    library = ":iptables",
+    embed = [":iptables"],
+    local = True,
     tags = [
-        "local",
         "manual",
     ],
     deps = [
         "//pkg/log",
         "//pkg/test/dockerutil",
-        "//pkg/test/testutil",
         "//test/netutils",
+        "//test/netutils/container",
     ],
 )
 
@@ -55,16 +58,16 @@ go_test(
     ],
     args = ["-iptables-nft=true"],
     data = ["//test/iptables/runner"],
-    library = ":iptables",
+    embed = [":iptables"],
+    local = True,
     tags = [
-        "local",
         "manual",
     ],
     deps = [
         "//pkg/log",
         "//pkg/test/dockerutil",
-        "//pkg/test/testutil",
         "//test/netutils",
+        "//test/netutils/container",
     ],
 )
 

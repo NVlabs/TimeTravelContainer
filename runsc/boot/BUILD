@@ -216,7 +216,7 @@ go_test(
         "loader_host_test_linux.go",
         "loader_test.go",
     ]),
-    library = ":boot",
+    embed = [":boot"],
     deps = [
         "//pkg/abi/linux",
         "//pkg/context",

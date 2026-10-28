@@ -14,6 +14,7 @@ go_library(
         "seccomp_filter_darwin.go",
         "tpuproxy.go",
     ],
+    importpath = "gvisor.dev/gvisor/pkg/sentry/devices/tpuproxy",
     visibility = [
         "//pkg/sentry:internal",
     ],

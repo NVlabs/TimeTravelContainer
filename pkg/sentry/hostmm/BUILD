@@ -16,10 +16,12 @@ go_library(
         "membarrier.go",
         "membarrier_darwin.go",
     ],
+    importpath = "gvisor.dev/gvisor/pkg/sentry/hostmm",
     visibility = ["//pkg/sentry:internal"],
     deps = [
         "//pkg/abi/linux",
         "//pkg/eventfd",
+        "//pkg/hostarch",
         "//pkg/log",
         "@org_golang_x_sys//unix:go_default_library",
     ],

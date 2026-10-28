@@ -14,6 +14,7 @@ go_library(
         "tcp_conntrack.go",
         "tcp_conntrack_state.go",
     ],
+    importpath = "gvisor.dev/gvisor/pkg/tcpip/transport/tcpconntrack",
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/tcpip/header",

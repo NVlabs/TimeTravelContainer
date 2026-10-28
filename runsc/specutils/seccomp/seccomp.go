@@ -37,6 +37,7 @@ var (
 	// runc always returns EPERM as the errorcode for SECCOMP_RET_TRACE
 	traceAction = seccomp.Trace.Code(uint16(unix.EPERM))
 	allowAction = seccomp.Allow
+	logAction   = seccomp.Log
 )
 
 // BuildProgram generates a bpf program based on the given OCI seccomp
@@ -82,7 +83,7 @@ func lookupSyscallNo(arch uint32, name string) (uint32, error) {
 	case linux.AUDIT_ARCH_AARCH64:
 		table = slinux.ARM64
 	}
-	// LINT.ThenChange(:KnownArchs)
+	// LINT.ThenChange(../seccomp.go:knownSeccompArchs)
 	if table == nil {
 		return 0, fmt.Errorf("unsupported architecture: %d", arch)
 	}
@@ -106,12 +107,14 @@ func convertAction(act specs.LinuxSeccompAction) (seccomp.Action, error) {
 		return errnoAction, nil
 	case specs.ActTrace:
 		return traceAction, nil
+	case specs.ActLog:
+		return logAction, nil
 	case specs.ActAllow:
 		return allowAction, nil
 	default:
 		return seccomp.Default, fmt.Errorf("invalid action: %v", act)
 	}
-	// LINT.ThenChange(:KnownActions)
+	// LINT.ThenChange(../seccomp.go:knownSeccompActions)
 }
 
 // convertRules converts OCI linux seccomp rules into RuleSets that can be used by
@@ -235,68 +238,6 @@ func convertRule(arg specs.LinuxSeccompArg, perArg *seccomp.PerArg) error {
 	default:
 		return fmt.Errorf("unsupported operand: %q", arg.Op)
 	}
-	// LINT.ThenChange(:KnownOperators)
+	// LINT.ThenChange(../seccomp.go:knownSeccompOperators)
 	return nil
-}
-
-// KnownActions returns a list of all supported seccomp actions.
-// Used by `runsc features`.
-func KnownActions() []string {
-	// LINT.IfChange
-	return []string{
-		string(specs.ActKill),
-		string(specs.ActTrap),
-		string(specs.ActErrno),
-		string(specs.ActTrace),
-		string(specs.ActAllow),
-	}
-	// LINT.ThenChange(:convertAction)
-}
-
-// KnownOperators returns a list of all supported seccomp operators.
-// Used by `runsc features`.
-func KnownOperators() []string {
-	// LINT.IfChange
-	return []string{
-		string(specs.OpEqualTo),
-		string(specs.OpNotEqual),
-		string(specs.OpGreaterThan),
-		string(specs.OpGreaterEqual),
-		string(specs.OpLessThan),
-		string(specs.OpLessEqual),
-		string(specs.OpMaskedEqual),
-	}
-	// LINT.ThenChange(:convertRule)
-}
-
-// KnownArchs returns a list of all supported seccomp architectures.
-// Used by `runsc features`.
-func KnownArchs() []string {
-	// LINT.IfChange
-	return []string{
-		string(specs.ArchX86_64),
-		string(specs.ArchAARCH64),
-	}
-	// LINT.ThenChange(:lookupSyscallNo)
-}
-
-// KnownFlags returns a list of all supported seccomp flags.
-// Used by `runsc features`.
-func KnownFlags() []string {
-	// LINT.IfChange
-	return []string{
-		"SECCOMP_FILTER_FLAG_TSYNC",
-	}
-	// LINT.ThenChange(../../../test/syscalls/linux/seccomp.cc)
-}
-
-// SupportedFlags returns a list of all supported seccomp flags.
-// This list may be a subset of one returned by KnownFlags.
-// Used by `runsc features`.
-func SupportedFlags() []string {
-	// LINT.IfChange
-	return []string{
-		"SECCOMP_FILTER_FLAG_TSYNC",
-	}
-	// LINT.ThenChange(../../../test/syscalls/linux/seccomp.cc)
 }

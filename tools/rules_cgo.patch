@@ -1,7 +1,8 @@
 diff --git a/go/private/rules/cgo.bzl b/go/private/rules/cgo.bzl
+index 541b2fec..dc12ed51 100644
 --- a/go/private/rules/cgo.bzl
 +++ b/go/private/rules/cgo.bzl
-@@ -144,7 +144,16 @@ def cgo_configure(go, srcs, cdeps, cppopts, copts, cxxopts, clinkopts):
+@@ -157,7 +157,16 @@ def cgo_configure(go, srcs, cdeps, cppopts, copts, cxxopts, clinkopts):
                          # libclntsh.dylib.12.1, users have to create a unversioned symbolic link,
                          # so it can be treated as a simple shared library too.
                          continue
@@ -15,6 +16,6 @@ diff --git a/go/private/rules/cgo.bzl b/go/private/rules/cgo.bzl
 +                if whole_archive:
 +                    # Disable whole-archive for other libraries.
 +                    lib_opts.append("-Wl,--no-whole-archive")
-             clinkopts.extend(cc_link_flags)
- 
-         elif hasattr(d, "objc"):
+                 if lib.basename.endswith(".a"):
+                     # Match cgo2's heuristic: static cdeps may need the C++ runtime.
+                     needs_cxx_runtime = True

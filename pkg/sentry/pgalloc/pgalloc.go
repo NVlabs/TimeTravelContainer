@@ -975,7 +975,7 @@ type MemoryFileOpts struct {
 	DecommitOnDestroy bool
 
 	// If DisableIMAWorkAround is true, NewMemoryFile will not call
-	// IMAWorkAroundForMemFile().
+	// hostmm.IMAWorkAroundForMemFile().
 	DisableIMAWorkAround bool
 
 	// DiskBackedFile indicates that the MemoryFile is backed by a file on disk.
@@ -1103,7 +1103,7 @@ func NewMemoryFile(file *os.File, opts MemoryFileOpts) (*MemoryFile, error) {
 	go f.releaserMain() // S/R-SAFE: f.mu
 
 	if file != nil && !opts.DisableIMAWorkAround {
-		IMAWorkAroundForMemFile(file.Fd())
+		hostmm.IMAWorkAroundForMemFile(file.Fd())
 	}
 	return f, nil
 }
@@ -1129,41 +1129,6 @@ func (f *MemoryFile) initFields() {
 	f.nextPageVersion = 0
 	chunks := []chunkInfo(nil)
 	f.chunks.Store(&chunks)
-}
-
-// IMAWorkAroundForMemFile works around IMA by immediately creating a temporary
-// PROT_EXEC mapping, while the backing file is still small. IMA will ignore
-// any future mappings.
-//
-// The Linux kernel contains an optional feature called "Integrity
-// Measurement Architecture" (IMA). If IMA is enabled, it will checksum
-// binaries the first time they are mapped PROT_EXEC. This is bad news for
-// executable pages mapped from our backing file, which can grow to
-// terabytes in (sparse) size. If IMA attempts to checksum a file that
-// large, it will allocate all of the sparse pages and quickly exhaust all
-// memory.
-func IMAWorkAroundForMemFile(fd uintptr) {
-	m, _, errno := unix.Syscall6(
-		unix.SYS_MMAP,
-		0,
-		hostarch.PageSize,
-		unix.PROT_EXEC,
-		unix.MAP_SHARED,
-		fd,
-		0)
-	if errno != 0 {
-		// This isn't fatal (IMA may not even be in use). Log the error, but
-		// don't return it.
-		log.Warningf("Failed to pre-map MemoryFile PROT_EXEC: %v", errno)
-	} else {
-		if _, _, errno := unix.Syscall(
-			unix.SYS_MUNMAP,
-			m,
-			hostarch.PageSize,
-			0); errno != 0 {
-			panic(fmt.Sprintf("failed to unmap PROT_EXEC MemoryFile mapping: %v", errno))
-		}
-	}
 }
 
 // IncOwner adds an owner of f. Each successful call must be paired with a

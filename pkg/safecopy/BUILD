@@ -47,7 +47,7 @@ go_test(
     ],
     # Darwin fault recovery uses the Mach exception server in machexc.
     pure = select_system(darwin = "off", linux = "auto"),
-    library = ":safecopy",
+    embed = [":safecopy"],
     deps = [
         "@org_golang_x_sys//unix:go_default_library",
     ] + select_system(linux = [], darwin = ["//pkg/safecopy/machexc"]),

@@ -1,4 +1,4 @@
-// Copyright 2022 The gVisor Authors.
+// Copyright 2026 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,9 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package checkescape
+// Proctor runs tests for a language runtime inside a Docker container.
+package main
 
-// fixOffset does nothing on amd64.
-func fixOffset(fields []string, target string) (string, error) {
-	return target, nil
+import (
+	"log/slog"
+	"os"
+
+	"gvisor.dev/gvisor/test/runtimes/proctor"
+)
+
+func main() {
+	if err := proctor.Run(nil); err != nil {
+		slog.Error("proctor failed", "err", err)
+		os.Exit(1)
+	}
 }

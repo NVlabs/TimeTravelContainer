@@ -221,6 +221,7 @@ func Init() {
 				controlCmd: map[uint32]controlCmdHandler{
 					nvgpu.NV0000_CTRL_CMD_CLIENT_GET_ADDR_SPACE_TYPE:                       ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV0000_CTRL_CMD_CLIENT_SET_INHERITED_SHARE_POLICY:                ctrlHandler(rmControlSimple, compUtil),
+					nvgpu.NV0000_CTRL_CMD_EVENT_SET_NOTIFICATION:                           ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV0000_CTRL_CMD_GPU_GET_ATTACHED_IDS:                             ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV0000_CTRL_CMD_GPU_GET_DEVICE_IDS:                               ctrlHandler(rmControlSimple, compUtil|nvconf.CapGraphics),
 					nvgpu.NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2:                               ctrlHandler(rmControlSimple, compUtil),
@@ -551,6 +552,7 @@ func Init() {
 						ControlInfos: map[uint32]IoctlInfo{
 							nvgpu.NV0000_CTRL_CMD_CLIENT_GET_ADDR_SPACE_TYPE:                       simpleIoctlInfo("NV0000_CTRL_CMD_CLIENT_GET_ADDR_SPACE_TYPE", "NV0000_CTRL_CLIENT_GET_ADDR_SPACE_TYPE_PARAMS"),
 							nvgpu.NV0000_CTRL_CMD_CLIENT_SET_INHERITED_SHARE_POLICY:                simpleIoctlInfo("NV0000_CTRL_CMD_CLIENT_SET_INHERITED_SHARE_POLICY", "NV0000_CTRL_CLIENT_SET_INHERITED_SHARE_POLICY_PARAMS"),
+							nvgpu.NV0000_CTRL_CMD_EVENT_SET_NOTIFICATION:                           simpleIoctlInfo("NV0000_CTRL_CMD_EVENT_SET_NOTIFICATION", "NV0000_CTRL_EVENT_SET_NOTIFICATION_PARAMS"),
 							nvgpu.NV0000_CTRL_CMD_GPU_GET_ATTACHED_IDS:                             simpleIoctlInfo("NV0000_CTRL_CMD_GPU_GET_ATTACHED_IDS", "NV0000_CTRL_GPU_GET_ATTACHED_IDS_PARAMS"),
 							nvgpu.NV0000_CTRL_CMD_GPU_GET_DEVICE_IDS:                               simpleIoctlInfo("NV0000_CTRL_CMD_GPU_GET_DEVICE_IDS", "NV0000_CTRL_GPU_GET_DEVICE_IDS_PARAMS"),
 							nvgpu.NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2:                               simpleIoctlInfo("NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2", "NV0000_CTRL_GPU_GET_ID_INFO_V2_PARAMS"),
@@ -1288,7 +1290,7 @@ func Init() {
 			}
 			return abi
 		})
-		_ = addDriverABI(620, 30, 0, ChecksumNoDriver, "d7f6cad7861c3b4faea8b539af72da98a5a72c60665f4779ca0c6f1e1660856d", func() *driverABI {
+		v620_30_00 := addDriverABI(620, 30, 0, ChecksumNoDriver, "d7f6cad7861c3b4faea8b539af72da98a5a72c60665f4779ca0c6f1e1660856d", func() *driverABI {
 			abi := v620_06_00()
 			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_NVLINK_SET_NVLE_READY] = ctrlHandler(rmControlSimple, nvconf.CapFabricIMEXManagement)
 
@@ -1300,6 +1302,9 @@ func Init() {
 			}
 			return abi
 		})
+		v620_32_00 := addDriverABI(620, 32, 00, ChecksumNoDriver, "48b576150f3d25219162912a4a1e457c678ab13761350ef770f6ef6e8c44483b", v620_30_00)
+		v620_47_00 := addDriverABI(620, 47, 00, ChecksumNoDriver, "866b5775ee3bb95c07b90252fa238b538aeabda038a0566590c16b13e16193cc", v620_32_00)
+		_ = addDriverABI(620, 51, 0, ChecksumNoDriver, "cf761f39bffc561f6529171e342b5ecfdb4fabcc8dff4159f9400432bf7dc2e8", v620_47_00)
 	})
 }
 

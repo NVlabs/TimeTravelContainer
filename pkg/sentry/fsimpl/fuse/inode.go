@@ -108,6 +108,9 @@ type inode struct {
 	// +checklocks:attrMu
 	size atomicbitops.Uint64
 
+	// +checklocks:attrMu
+	blocks atomicbitops.Uint64
+
 	// nlink counts the number of hard links to this inode. It's updated and
 	// accessed used atomic operations but not protected by attrMu.
 	nlink atomicbitops.Uint32
@@ -276,10 +279,11 @@ func (i *inode) newEntry(ctx context.Context, name string, fileType linux.FileMo
 func (i *inode) getFUSEAttr() linux.FUSEAttr {
 	ns := time.Second.Nanoseconds()
 	return linux.FUSEAttr{
-		Ino:       i.nodeID,
+		Ino:       i.ino.Load(),
 		UID:       i.uid.Load(),
 		GID:       i.gid.Load(),
 		Size:      i.size.Load(),
+		Blocks:    i.blocks.Load(),
 		Mode:      uint32(i.filemode()),
 		BlkSize:   i.blockSize.Load(),
 		Atime:     uint64(i.atime.Load() / ns),
@@ -301,7 +305,7 @@ func statFromFUSEAttr(attr linux.FUSEAttr, mask, devMinor uint32) linux.Statx {
 	rdevMajor, rdevMinor := linux.DecodeDeviceID(attr.Rdev)
 	stat.RdevMajor, stat.RdevMinor = uint32(rdevMajor), rdevMinor
 
-	if mask&(linux.STATX_TYPE|linux.STATX_MODE) != 0 {
+	if mask&(linux.STATX_MODE|linux.STATX_TYPE) != 0 {
 		stat.Mode = uint16(attr.Mode)
 	}
 	if mask&linux.STATX_NLINK != 0 {
@@ -465,6 +469,7 @@ func (i *inode) updateAttrs(attr linux.FUSEAttr, validSec, validNSec int64) {
 	i.ctime.Store(attr.CTimeNsec())
 
 	i.size.Store(attr.Size)
+	i.blocks.Store(attr.Blocks)
 	i.nlink.Store(attr.Nlink)
 
 	if !i.fs.opts.defaultPermissions {
@@ -506,18 +511,13 @@ func (i *inode) CheckPermissions(ctx context.Context, creds *auth.Credentials, a
 	}
 
 	if ats.MayRead() || ats.MayWrite() || ats.MayExec() {
-		i.fs.conn.mu.Lock()
-		noAccess := i.fs.conn.noAccess
-		i.fs.conn.mu.Unlock()
-		if noAccess {
+		if i.fs.conn.noAccess.Load() {
 			return nil
 		}
 		in := linux.FUSEAccessIn{Mask: uint32(ats)}
 		err := i.callNoReply(ctx, linux.FUSE_ACCESS, &in)
 		if linuxerr.Equals(linuxerr.ENOSYS, err) {
-			i.fs.conn.mu.Lock()
-			i.fs.conn.noAccess = true
-			i.fs.conn.mu.Unlock()
+			i.fs.conn.noAccess.Store(true)
 			return nil
 		}
 		return err

@@ -20,6 +20,7 @@ go_library(
         "packet_window_host_darwin.go",
         "packet_window_host_linux.go",
     ],
+    importpath = "gvisor.dev/gvisor/pkg/flipcall",
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/abi/linux",
@@ -38,6 +39,6 @@ go_test(
         "flipcall_example_test.go",
         "flipcall_test.go",
     ],
-    library = ":flipcall",
+    embed = [":flipcall"],
     deps = ["//pkg/sync"],
 )

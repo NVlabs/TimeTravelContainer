@@ -14,6 +14,7 @@ go_library(
         "internal.go",
         "linuxerr.go",
     ],
+    importpath = "gvisor.dev/gvisor/pkg/errors/linuxerr",
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/abi/linux/errno",

@@ -25,5 +25,5 @@ go_test(
     name = "p9_test",
     size = "small",
     srcs = ["p9_test.go"],
-    library = ":p9",
+    embed = [":p9"],
 )

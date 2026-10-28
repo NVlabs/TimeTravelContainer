@@ -123,7 +123,7 @@ go_test(
         "live_fork_test.go",
         "queue_test.go",
     ],
-    library = ":transport",
+    embed = [":transport"],
     deps = [
         "//pkg/abi/linux",
         "//pkg/abi/linux/errno",

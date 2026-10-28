@@ -119,6 +119,6 @@ go_test(
         "drm_test.go",
         "netfilter_test.go",
     ],
-    library = ":linux",
+    embed = [":linux"],
     deps = ["//pkg/marshal"],
 )

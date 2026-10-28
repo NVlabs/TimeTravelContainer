@@ -1,21 +1,21 @@
 diff --git a/src/runtime/os_darwin.go b/src/runtime/os_darwin.go
 --- a/src/runtime/os_darwin.go
 +++ b/src/runtime/os_darwin.go
-@@ -16,6 +16,13 @@
+@@ -15,6 +15,13 @@
+ 	mutex       pthreadmutex
  	cond        pthreadcond
  	count       int
- 
++
 +	// ttcSemaReady is set, atomically, once mutex and cond are initialized;
 +	// see ttcWakeIdleThreads.
 +	ttcSemaReady uint32
 +	// ttcParked is set while the thread keeps a vCPU that no residency uses;
 +	// see ttcRuntimeBeforeSyscall. Only the thread itself accesses it.
 +	ttcParked uint32
-+
- 	// address of errno variable for this thread.
- 	// This is an optimization to avoid calling libc_error
- 	// on every syscall_rawsyscalln.
-@@ -39,6 +46,7 @@
+ }
+ 
+ func unimplemented(name string) {
+@@ -34,6 +41,7 @@
  	if err := pthread_cond_init(&mp.cond, nil); err != 0 {
  		throw("pthread_cond_init")
  	}
@@ -23,15 +23,14 @@ diff --git a/src/runtime/os_darwin.go b/src/runtime/os_darwin.go
  }
  
  //go:nosplit
-@@ -346,6 +354,7 @@
+@@ -342,12 +350,14 @@
  	}
  	minitSignalMask()
  	getg().m.procid = uint64(pthread_self())
 +	ttcVMMemoryStack(ttcVMMemoryStackResume)
- 	libc_error_addr(&getg().m.errnoAddr)
  }
  
-@@ -353,6 +362,7 @@
+ // Called from dropm to undo the effect of an minit.
  //
  //go:nosplit
  func unminit() {
@@ -42,7 +41,7 @@ diff --git a/src/runtime/os_darwin.go b/src/runtime/os_darwin.go
 diff --git a/src/runtime/proc.go b/src/runtime/proc.go
 --- a/src/runtime/proc.go
 +++ b/src/runtime/proc.go
-@@ -4525,6 +4525,7 @@
+@@ -4540,6 +4540,7 @@
  	gp.bubble = nil
  	gp.fipsOnlyBypass = false
  	gp.secret = 0
@@ -53,7 +52,7 @@ diff --git a/src/runtime/proc.go b/src/runtime/proc.go
 diff --git a/src/runtime/runtime2.go b/src/runtime/runtime2.go
 --- a/src/runtime/runtime2.go
 +++ b/src/runtime/runtime2.go
-@@ -595,6 +595,10 @@
+@@ -593,6 +593,10 @@
  	// valgrindStackID is used to track what memory is used for stacks when a program is
  	// built with the "valgrind" build tag, otherwise it is unused.
  	valgrindStackID uintptr
@@ -67,7 +66,7 @@ diff --git a/src/runtime/runtime2.go b/src/runtime/runtime2.go
 diff --git a/src/runtime/sys_darwin.go b/src/runtime/sys_darwin.go
 --- a/src/runtime/sys_darwin.go
 +++ b/src/runtime/sys_darwin.go
-@@ -35,6 +35,7 @@
+@@ -24,6 +24,7 @@
  //go:nosplit
  //go:uintptrkeepalive
  func syscall_syscalln(fn uintptr, args ...uintptr) (r1, r2, err uintptr) {
@@ -75,7 +74,7 @@ diff --git a/src/runtime/sys_darwin.go b/src/runtime/sys_darwin.go
  	entersyscall()
  	r1, r2, err = syscall_rawsyscalln(fn, args...)
  	exitsyscall()
-@@ -80,6 +81,7 @@
+@@ -62,6 +63,7 @@
  		f1                     float64
  		r1                     uintptr
  	}{fn, a1, a2, a3, a4, a5, f1, r1}
@@ -83,7 +82,7 @@ diff --git a/src/runtime/sys_darwin.go b/src/runtime/sys_darwin.go
  	entersyscall()
  	libcCall(unsafe.Pointer(abi.FuncPCABI0(syscall_x509)), unsafe.Pointer(&args))
  	exitsyscall()
-@@ -198,6 +200,21 @@
+@@ -180,6 +182,21 @@
  //
  //go:nosplit
  func mmap(addr unsafe.Pointer, n uintptr, prot, flags, fd int32, off uint32) (unsafe.Pointer, int) {
@@ -105,7 +104,7 @@ diff --git a/src/runtime/sys_darwin.go b/src/runtime/sys_darwin.go
  	args := struct {
  		addr            unsafe.Pointer
  		n               uintptr
-@@ -207,6 +224,10 @@
+@@ -189,6 +206,10 @@
  		ret2            int
  	}{addr, n, prot, flags, fd, off, nil, 0}
  	libcCall(unsafe.Pointer(abi.FuncPCABI0(mmap_trampoline)), unsafe.Pointer(&args))
@@ -116,7 +115,7 @@ diff --git a/src/runtime/sys_darwin.go b/src/runtime/sys_darwin.go
  	return args.ret1, args.ret2
  }
  func mmap_trampoline()
-@@ -214,7 +235,19 @@
+@@ -196,7 +217,19 @@
  //go:nosplit
  //go:cgo_unsafe_args
  func munmap(addr unsafe.Pointer, n uintptr) {
@@ -137,7 +136,7 @@ diff --git a/src/runtime/sys_darwin.go b/src/runtime/sys_darwin.go
  	KeepAlive(addr) // Just for consistency. Hopefully addr is not a Go address.
  }
  func munmap_trampoline()
-@@ -222,7 +255,20 @@
+@@ -204,7 +237,20 @@
  //go:nosplit
  //go:cgo_unsafe_args
  func madvise(addr unsafe.Pointer, n uintptr, flags int32) {
@@ -159,7 +158,7 @@ diff --git a/src/runtime/sys_darwin.go b/src/runtime/sys_darwin.go
  	KeepAlive(addr) // Just for consistency. Hopefully addr is not a Go address.
  }
  func madvise_trampoline()
-@@ -302,6 +348,9 @@
+@@ -284,6 +330,9 @@
  //go:nosplit
  //go:cgo_unsafe_args
  func nanotime1() int64 {
@@ -169,7 +168,7 @@ diff --git a/src/runtime/sys_darwin.go b/src/runtime/sys_darwin.go
  	var r struct {
  		t            int64  // raw timer
  		numer, denom uint32 // conversion factors. nanoseconds = t * numer / denom.
-@@ -333,6 +382,9 @@
+@@ -315,6 +364,9 @@
  //go:nosplit
  //go:cgo_unsafe_args
  func walltime() (int64, int32) {

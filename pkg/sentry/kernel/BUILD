@@ -463,6 +463,7 @@ go_test(
         "cpu_topology_test.go",
         "distributed_fork_test.go",
         "fd_table_test.go",
+        "kernel_restore_test.go",
         "memory_limit_test.go",
         "pending_signals_test.go",
         "syslog_test.go",
@@ -470,7 +471,7 @@ go_test(
         "task_signals_test.go",
         "task_test.go",
     ],
-    library = ":kernel",
+    embed = [":kernel"],
     deps = [
         "//pkg/abi",
         "//pkg/abi/linux",

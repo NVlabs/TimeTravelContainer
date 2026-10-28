@@ -24,8 +24,10 @@ go_library(
         "nvidia.go",
         "rdma.go",
         "restore.go",
+        "seccomp.go",
         "specutils.go",
     ],
+    importpath = "gvisor.dev/gvisor/runsc/specutils",
     visibility = ["//:sandbox"],
     deps = [
         "//pkg/abi/linux",
@@ -36,7 +38,6 @@ go_library(
         "//pkg/sentry/kernel/auth",
         "//runsc/config",
         "//runsc/flag",
-        "//runsc/specutils/seccomp",
         "@com_github_cenkalti_backoff//:go_default_library",
         "@com_github_moby_sys_capability//:go_default_library",
         "@com_github_mohae_deepcopy//:go_default_library",
@@ -53,7 +54,7 @@ go_test(
         "gofer_conf_test.go",
         "specutils_test.go",
     ],
-    library = ":specutils",
+    embed = [":specutils"],
     deps = [
         "//pkg/sentry/devices/nvproxy/nvconf",
         "//runsc/config",

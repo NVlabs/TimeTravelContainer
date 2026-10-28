@@ -119,7 +119,7 @@ go_test(
         "kvm_test.go",
         "virtual_map_test.go",
     ],
-    library = ":kvm",
+    embed = [":kvm"],
     # FIXME(gvisor.dev/issue/3374): Not working with all build systems.
     nogo = False,
     pure = True,
@@ -157,7 +157,7 @@ go_test(
         "kvm_test.go",
         "virtual_map_test.go",
     ],
-    library = ":kvm",
+    embed = [":kvm"],
     # FIXME(gvisor.dev/issue/3374): Not working with all build systems.
     nogo = False,
     tags = [
