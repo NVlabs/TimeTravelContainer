@@ -29,9 +29,13 @@ import (
 //	x := make([]Foo, l, c)
 //	a := ([l]Foo*)(unsafe.Pointer(x[0]))
 func arrayFromSlice(obj reflect.Value) reflect.Value {
-	return reflect.NewAt(
+	arr := reflect.NewAt(
 		reflect.ArrayOf(obj.Cap(), obj.Type().Elem()),
 		unsafe.Pointer(obj.Pointer()))
+	if obj.Len() < obj.Cap() {
+		arr.Elem().Slice(obj.Len(), obj.Cap()).Clear()
+	}
+	return arr
 }
 
 // byteType is the type of the elements of arrays of bytes.

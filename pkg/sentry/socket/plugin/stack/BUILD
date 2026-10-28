@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-load("//tools:defs.bzl", "go_library")
+load("//tools:defs.bzl", "go_library", "go_test")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -22,6 +22,7 @@ go_library(
     deps = [
         "//pkg/abi/linux",
         "//pkg/abi/linux/errno",
+        "//pkg/atomicbitops",
         "//pkg/binary",
         "//pkg/context",
         "//pkg/errors/linuxerr",
@@ -48,4 +49,15 @@ go_library(
         "@org_golang_x_sys//unix:go_default_library",
     ],
     target_compatible_with = ["@platforms//os:linux"],
+)
+
+go_test(
+    name = "stack_test",
+    size = "small",
+    srcs = [
+        "socket_noplugin_test.go",
+        "socket_test.go",
+    ],
+    library = ":stack",
+    deps = ["//pkg/waiter"],
 )

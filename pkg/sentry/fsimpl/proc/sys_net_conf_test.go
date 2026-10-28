@@ -21,7 +21,7 @@ import (
 func TestNetConfSet(t *testing.T) {
 	ctx := contexttest.Context(t)
 	fs := &filesystem{}
-	set := fs.newNetConfSet(ctx, auth.CredentialsFromContext(ctx), netConfIPv6, map[string]int32{"mtu": 9000}).(*netConfSet)
+	set := fs.newNetConfSet(ctx, auth.CredentialsFromContext(ctx), netConfIPv6, map[string]int32{"mtu": 9000})
 	lookup := func(name string) *netConfFile {
 		t.Helper()
 		inode, err := set.Lookup(ctx, name)

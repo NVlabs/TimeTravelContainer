@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -37,11 +38,11 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/pinring"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/sighandling"
 	"gvisor.dev/gvisor/pkg/unet"
 	"gvisor.dev/gvisor/pkg/urpc"
@@ -165,15 +166,6 @@ type Container struct {
 	// A creation that fails in between leaves it for stop, which removes it
 	// once the gofer running inside it is gone.
 	unownedCgroup cgroup.Cgroup `nojson:"true"`
-	// sentryExitSock is the creator's end of the root gofer's
-	// `--sync-sentry-exit-fd` socket,
-	// A pidfd of the sandbox process is sent over it once the sandbox has been
-	// spawned, and then it is closed.
-	sentryExitSock *os.File `nojson:"true"`
-
-	// pinRingFile is the pin ring (see `//pkg/pinring`)
-	// It is held between the gofer and the boot process's spawn.
-	pinRingFile *os.File `nojson:"true"`
 }
 
 // Args is used to configure a new container.
@@ -218,6 +210,10 @@ type Args struct {
 	// for containers in a new Sandbox process.
 	FSRestoreImagePath string
 	FSRestoreDirect    bool
+
+	// CheckpointDirPath is the path to the sentry checkpoint directory.
+	// Used to default FSRestoreImagePath if it is empty.
+	CheckpointDirPath string
 }
 
 // New creates the container in a new Sandbox process, unless the metadata
@@ -225,6 +221,15 @@ type Args struct {
 // Destroy() on the container.
 func New(conf *config.Config, args Args) (*Container, error) {
 	log.Debugf("Create container, cid: %s, rootDir: %q", args.ID, conf.RootDir)
+
+	if specutils.IsRootContainer(args.Spec) && args.FSRestoreImagePath == "" && args.CheckpointDirPath != "" {
+		defaultFSDir := filepath.Join(args.CheckpointDirPath, checkpointfiles.FSCheckpointDir)
+		manifestPath := filepath.Join(defaultFSDir, checkpointfiles.FSCheckpointManifestFileName)
+		if _, err := os.Stat(manifestPath); err == nil {
+			args.FSRestoreImagePath = defaultFSDir
+		}
+	}
+
 	if err := validateID(args.ID); err != nil {
 		return nil, err
 	}
@@ -415,7 +420,6 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 			ExecFile:            args.ExecFile,
 			FSRestoreImagePath:  args.FSRestoreImagePath,
 			FSRestoreDirect:     args.FSRestoreDirect,
-			PinRingFile:         c.pinRingFile,
 		}
 		sand, err := sandbox.New(conf, sandArgs)
 		if err != nil {
@@ -423,16 +427,6 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 		}
 		c.Sandbox = sand
 		c.unownedCgroup = nil
-		c.pinRingFile = nil // Now owned by the sandbox's donation agency.
-		if c.sentryExitSock != nil {
-			// The gofer waits on this pidfd before exiting, so it is
-			// always the last holder of the pin ring.
-			if err := pinring.SendPidfd(c.sentryExitSock, sand.Pid.Load()); err != nil {
-				log.Warningf("Cannot send the sandbox's pidfd to the gofer (gofer exit may race the sandbox's): %v", err)
-			}
-			c.sentryExitSock.Close()
-			c.sentryExitSock = nil
-		}
 		return nil
 
 	}); err != nil {
@@ -733,8 +727,8 @@ func (c *Container) Wait() (unix.WaitStatus, error) {
 // returns its WaitStatus.
 func (c *Container) WaitRootPID(pid int32) (unix.WaitStatus, error) {
 	log.Debugf("Wait on process %d in sandbox, cid: %s", pid, c.Sandbox.ID)
-	if !c.IsSandboxRunning() {
-		return 0, fmt.Errorf("sandbox is not running")
+	if err := c.CheckSandboxRunning(); err != nil {
+		return 0, err
 	}
 	return c.Sandbox.WaitPID(c.Sandbox.ID, pid)
 }
@@ -743,8 +737,8 @@ func (c *Container) WaitRootPID(pid int32) (unix.WaitStatus, error) {
 // its WaitStatus.
 func (c *Container) WaitPID(pid int32) (unix.WaitStatus, error) {
 	log.Debugf("Wait on process %d in container, cid: %s", pid, c.ID)
-	if !c.IsSandboxRunning() {
-		return 0, fmt.Errorf("sandbox is not running")
+	if err := c.CheckSandboxRunning(); err != nil {
+		return 0, err
 	}
 	return c.Sandbox.WaitPID(c.ID, pid)
 }
@@ -753,8 +747,8 @@ func (c *Container) WaitPID(pid int32) (unix.WaitStatus, error) {
 // wait status.
 func (c *Container) WaitBranchPID(branchID string, pid int32) (unix.WaitStatus, error) {
 	log.Debugf("Wait on process %d in branch %q, cid: %s", pid, branchID, c.ID)
-	if !c.IsSandboxRunning() {
-		return 0, fmt.Errorf("sandbox is not running")
+	if err := c.CheckSandboxRunning(); err != nil {
+		return 0, err
 	}
 	status, err := c.Sandbox.WaitBranch(&boot.BranchWaitArgs{
 		BranchID: branchID,
@@ -767,8 +761,8 @@ func (c *Container) WaitBranchPID(branchID string, pid int32) (unix.WaitStatus, 
 // WaitCheckpoint waits for the Kernel to have been successfully checkpointed.
 func (c *Container) WaitCheckpoint() error {
 	log.Debugf("Waiting for checkpoint to complete in container, cid: %s", c.ID)
-	if !c.IsSandboxRunning() {
-		return fmt.Errorf("sandbox is not running")
+	if err := c.CheckSandboxRunning(); err != nil {
+		return err
 	}
 	return c.Sandbox.WaitCheckpoint()
 }
@@ -776,8 +770,8 @@ func (c *Container) WaitCheckpoint() error {
 // WaitRestore waits for the Kernel to have been successfully restored.
 func (c *Container) WaitRestore() error {
 	log.Debugf("Waiting for restore to complete in container, cid: %s", c.ID)
-	if !c.IsSandboxRunning() {
-		return fmt.Errorf("sandbox is not running")
+	if err := c.CheckSandboxRunning(); err != nil {
+		return err
 	}
 	return c.Sandbox.WaitRestore()
 }
@@ -786,8 +780,8 @@ func (c *Container) WaitRestore() error {
 // saved.
 func (c *Container) WaitFSCheckpoint() error {
 	log.Debugf("Waiting for filesystem checkpoint to complete in container, cid: %s", c.ID)
-	if !c.IsSandboxRunning() {
-		return fmt.Errorf("sandbox is not running")
+	if err := c.CheckSandboxRunning(); err != nil {
+		return err
 	}
 	return c.Sandbox.WaitFSCheckpoint()
 }
@@ -796,8 +790,8 @@ func (c *Container) WaitFSCheckpoint() error {
 // checkpoint.
 func (c *Container) WaitFSRestore() error {
 	log.Debugf("Waiting for filesystem restore to complete in container, cid: %s", c.ID)
-	if !c.IsSandboxRunning() {
-		return fmt.Errorf("sandbox is not running")
+	if err := c.CheckSandboxRunning(); err != nil {
+		return err
 	}
 	return c.Sandbox.WaitFSRestore(c.ID)
 }
@@ -807,8 +801,8 @@ func (c *Container) WaitFSRestore() error {
 // to outFD.
 func (c *Container) TarRootfsUpperLayer(outFD *os.File) error {
 	log.Debugf("TarRootfsUpperLayer, cid: %s", c.ID)
-	if !c.IsSandboxRunning() {
-		return fmt.Errorf("sandbox is not running")
+	if err := c.CheckSandboxRunning(); err != nil {
+		return err
 	}
 	return c.Sandbox.TarRootfsUpperLayer(c.ID, outFD)
 }
@@ -819,6 +813,15 @@ func (c *Container) TarRootfsUpperLayer(outFD *os.File) error {
 // TODO(b/113680494): Distinguish different error types.
 func (c *Container) SignalContainer(sig unix.Signal, all bool) error {
 	log.Debugf("Signal container, cid: %s, signal: %v (%d)", c.ID, sig, sig)
+	if c.Status == Created {
+		return c.signalCreated(sig, all)
+	}
+	return c.signalRunning(sig, all)
+}
+
+// signalRunning delivers a signal to the processes of a Running (or Stopped)
+// container via the sandbox.
+func (c *Container) signalRunning(sig unix.Signal, all bool) error {
 	// Signaling container in Stopped state is allowed. When all=false,
 	// an error will be returned anyway; when all=true, this allows
 	// sending signal to other processes inside the container even
@@ -827,10 +830,49 @@ func (c *Container) SignalContainer(sig unix.Signal, all bool) error {
 	if err := c.requireStatus("signal", Running, Stopped); err != nil {
 		return err
 	}
-	if !c.IsSandboxRunning() {
-		return fmt.Errorf("sandbox is not running")
+	if err := c.CheckSandboxRunning(); err != nil {
+		return err
 	}
 	return c.Sandbox.SignalContainer(c.ID, sig, all)
+}
+
+// signalCreated handles a signal sent to a container that appears to be in the
+// Created state (start was never called). Such a container has no process to
+// receive the signal, so a terminating signal (SIGKILL/SIGTERM) is honored by
+// stopping the container.
+func (c *Container) signalCreated(sig unix.Signal, all bool) error {
+	if err := c.Saver.lock(BlockAcquire); err != nil {
+		return err
+	}
+	defer c.Saver.UnlockOrDie()
+	// The status read before acquiring the lock may be stale: a concurrent start
+	// could have moved the container to Running (or a kill/delete to Stopped).
+	// Re-read the persisted state under the lock before acting on it.
+	reloaded := &Container{}
+	if err := c.Saver.loadLocked(reloaded); err != nil {
+		return err
+	}
+	c.Status = reloaded.Status
+	if c.Status != Created {
+		// The container now has a process (or has already stopped), so deliver
+		// the signal normally.
+		return c.signalRunning(sig, all)
+	}
+	// Still Created: only a terminating signal is actionable; there is nothing
+	// to deliver other signals to, so drop them.
+	if sig != unix.SIGKILL && sig != unix.SIGTERM {
+		return nil
+	}
+	// Tear down the container. For the root container this SIGKILLs the sandbox
+	// (boot) process; for a subcontainer it destroys the not-yet-started
+	// container in the sentry.
+	if c.Sandbox != nil {
+		if err := c.Sandbox.DestroyContainer(c.ID); err != nil {
+			return fmt.Errorf("destroying created container %q: %w", c.ID, err)
+		}
+	}
+	c.changeStatus(Stopped)
+	return c.saveLocked()
 }
 
 // SignalProcess sends sig to a specific process in the container.
@@ -839,8 +881,8 @@ func (c *Container) SignalProcess(sig unix.Signal, pid int32) error {
 	if err := c.requireStatus("signal a process inside", Running); err != nil {
 		return err
 	}
-	if !c.IsSandboxRunning() {
-		return fmt.Errorf("sandbox is not running")
+	if err := c.CheckSandboxRunning(); err != nil {
+		return err
 	}
 	return c.Sandbox.SignalProcess(c.ID, int32(pid), sig, false)
 }
@@ -852,8 +894,8 @@ func (c *Container) SignalProcessGroup(sig unix.Signal, pgid int32) error {
 	if err := c.requireStatus("signal a process group inside", Running); err != nil {
 		return err
 	}
-	if !c.IsSandboxRunning() {
-		return fmt.Errorf("sandbox is not running")
+	if err := c.CheckSandboxRunning(); err != nil {
+		return err
 	}
 	return c.Sandbox.SignalProcessGroup(c.ID, pgid, sig)
 }
@@ -1389,7 +1431,11 @@ func (c *Container) waitForStopped() error {
 		return nil
 	}
 
-	if c.IsSandboxRunning() {
+	running, err := c.IsSandboxRunning()
+	if err != nil {
+		return fmt.Errorf("checking if sandbox is running: %w", err)
+	}
+	if running {
 		if err := c.SignalContainer(unix.Signal(0), false); err == nil {
 			return fmt.Errorf("container is still running")
 		}
@@ -1402,12 +1448,10 @@ func (c *Container) waitForStopped() error {
 		if _, err := unix.Wait4(int(goferPid), nil, 0, nil); err != nil && !errors.Is(err, unix.ECHILD) {
 			return fmt.Errorf("error waiting the gofer process: %v", err)
 		}
-		c.GoferPid.Store(0)
-		return nil
-	}
-
-	if err := specutils.WaitForNonChildExit(int(goferPid), 5*time.Second); err != nil {
-		return fmt.Errorf("waiting for gofer (PID %d) to exit: %v", goferPid, err)
+	} else {
+		if err := specutils.WaitForNonChildExit(int(goferPid), 5*time.Second); err != nil {
+			return fmt.Errorf("waiting for gofer (PID %d) to exit: %v", goferPid, err)
+		}
 	}
 	c.GoferPid.Store(0)
 	return nil
@@ -1553,7 +1597,7 @@ func (c *Container) createGoferProcess(conf *config.Config, mountHints *boot.Pod
 	// shown as `exe`.
 	cmd.Args[0] = "runsc-gofer"
 
-	// Tranfer FDs that need to be present before the "gofer" command.
+	// Transfer FDs that need to be present before the "gofer" command.
 	// Start at 3 because 0, 1, and 2 are taken by stdin/out/err.
 	nextFD := donations.Transfer(cmd, 3)
 
@@ -1598,19 +1642,6 @@ func (c *Container) createGoferProcess(conf *config.Config, mountHints *boot.Pod
 		s.Register(&goferToHostRPC{goferPID: pid})
 		s.StartHandling(rpcServ)
 	}()
-
-	if ring, err := pinring.NewDisabledIOURing(); err != nil {
-		log.Warningf("Cannot create disabled io_uring ring: %v. This slows down gVisor sandbox teardown.", err)
-	} else {
-		donations.Donate("pin-ring-fd", ring)
-		c.pinRingFile = ring
-		fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
-		if err != nil {
-			return nil, nil, nil, nil, err
-		}
-		donations.DonateAndClose("sync-sentry-exit-fd", os.NewFile(uintptr(fds[1]), "sentry exit sync gofer FD"))
-		c.sentryExitSock = os.NewFile(uintptr(fds[0]), "sentry exit sync runsc FD")
-	}
 
 	// Count the number of mounts that needs an IO file.
 	ioFileCount := 0
@@ -1890,8 +1921,23 @@ func (c *Container) changeStatus(s Status) {
 }
 
 // IsSandboxRunning returns true if the sandbox exists and is running.
-func (c *Container) IsSandboxRunning() bool {
-	return c.Sandbox != nil && c.Sandbox.IsRunning()
+func (c *Container) IsSandboxRunning() (bool, error) {
+	if c.Sandbox == nil {
+		return false, nil
+	}
+	return c.Sandbox.IsRunning()
+}
+
+// CheckSandboxRunning returns an error if the sandbox does not exist or is not running.
+func (c *Container) CheckSandboxRunning() error {
+	running, err := c.IsSandboxRunning()
+	if err != nil {
+		return fmt.Errorf("checking if sandbox is running: %w", err)
+	}
+	if !running {
+		return fmt.Errorf("sandbox is not running")
+	}
+	return nil
 }
 
 // HasCapabilityInAnySet returns true if the given capability is in any of the
@@ -2457,10 +2503,14 @@ func nvidiaContainerCliConfigureNeedsCudaCompatModeFlag(cliPath string) bool {
 }
 
 // CheckStopped checks if the container is stopped and updates its status.
-func (c *Container) CheckStopped() {
+func (c *Container) CheckStopped() error {
 	if state, err := c.Sandbox.ContainerRuntimeState(c.ID); err != nil {
 		log.Warningf("Cannot find if container %v exists, checking if sandbox %v is running, err: %v", c.ID, c.Sandbox.ID, err)
-		if !c.IsSandboxRunning() {
+		running, err := c.IsSandboxRunning()
+		if err != nil {
+			return fmt.Errorf("checking if sandbox %v is running: %w", c.Sandbox.ID, err)
+		}
+		if !running {
 			log.Warningf("Sandbox isn't running anymore, marking container %v as stopped:", c.ID)
 			c.changeStatus(Stopped)
 		}
@@ -2470,13 +2520,14 @@ func (c *Container) CheckStopped() {
 			c.changeStatus(Stopped)
 		}
 	}
+	return nil
 }
 
 // GetNetworkConfig returns the network configuration.
 func (c *Container) GetNetworkConfig() (*boot.CreateLinksAndRoutesArgs, error) {
 	log.Debugf("Returns network config, cid: %s", c.ID)
-	if !c.IsSandboxRunning() {
-		return nil, fmt.Errorf("sandbox is not running")
+	if err := c.CheckSandboxRunning(); err != nil {
+		return nil, err
 	}
 	return c.Sandbox.GetNetworkConfig()
 }

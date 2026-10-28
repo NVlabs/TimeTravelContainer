@@ -27,6 +27,10 @@ func (fd *growthControlFD) FD() *ControlFD { return &fd.ControlFD }
 
 func (fd *growthControlFD) Close() {}
 
+// Mount implements ConnectionImpl.Mount.
+//
+// +checklocksread:c.server.renameMu
+// +checklocksexclude:c.fdsMu
 func (growthConn) Mount(c *Connection, mountNode *Node) (*ControlFD, Statx, int, error) {
 	root := &growthControlFD{}
 	mountNode.IncRef() // Ref is transferred to ControlFD.

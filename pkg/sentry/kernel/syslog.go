@@ -56,7 +56,6 @@ const (
 //
 // +stateify savable
 type syslog struct {
-	// mu protects the below.
 	mu sync.Mutex `state:"nosave"`
 
 	// initialized is whether records has the easter egg's messages.

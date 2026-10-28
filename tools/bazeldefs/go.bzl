@@ -14,6 +14,7 @@ gazelle = _gazelle
 
 go_path = _go_path
 go_cov = native.genrule
+cov_available = True
 
 def _go_proto_or_grpc_library(go_library_func, name, **kwargs):
     if "importpath" in kwargs:
@@ -94,6 +95,9 @@ def go_binary(name, static = False, pure = False, x_defs = None, **kwargs):
         "//tools/bazeldefs:pagesize_64k": base_gotags + ["pagesize_64k"],
         "//tools:debug": base_gotags + ["debug"],
         "//conditions:default": base_gotags,
+    }) + select({
+        "//tools:lockdep": ["lockdep"],
+        "//conditions:default": [],
     })
     _go_binary(
         name = name,
@@ -112,9 +116,9 @@ def go_library(name, bazel_cgo = False, bazel_cdeps = [], bazel_clinkopts = [], 
     Args:
         name: name of the target.
         bazel_cgo: if True, build with cgo.
-        cgo_cdeps: cgo deps to pass to `go_library`.
-        cgo_clinkopts: cgo linkopts to pass to `go_library`.
-        cgo_copts: cgo opts to pass to `go_library`.
+        bazel_cdeps: cgo deps to pass to `go_library`.
+        bazel_clinkopts: cgo linkopts to pass to `go_library`.
+        bazel_copts: cgo opts to pass to `go_library`.
         **kwargs: rest of the arguments are passed to `go_library`.
     """
     _go_library(
@@ -155,6 +159,9 @@ def go_test(name, static = False, pure = False, library = None, **kwargs):
         "//tools/bazeldefs:pagesize_64k": base_gotags + ["pagesize_64k"],
         "//tools:debug": base_gotags + ["debug"],
         "//conditions:default": base_gotags,
+    }) + select({
+        "//tools:lockdep": ["lockdep"],
+        "//conditions:default": [],
     })
     _go_test(
         name = name,
@@ -319,5 +326,5 @@ def go_imports(name, src, out):
         out = out,
     )
 
-def nogo_extra_proto_deps(target):
+def nogo_extra_proto_deps(target):  # buildifier: disable=unused-variable
     return []

@@ -81,6 +81,7 @@ go_library(
         "//pkg/atomicbitops",
         "//pkg/bits",
         "//pkg/bpf",
+        "//pkg/cleanup",
         "//pkg/context",
         "//pkg/ebpf",
         "//pkg/errors/linuxerr",
@@ -148,13 +149,7 @@ go_test(
         "linux64_amd64_test.go",
         "linux64_arm64_test.go",
         "linux64_test.go",
-        "sys_file_openat2_test.go",
     ],
     library = ":linux",
-    deps = [
-        "//pkg/abi/linux",
-        "//pkg/errors/linuxerr",
-        "//pkg/hostarch",
-        "//pkg/sentry/seccheck",
-    ],
+    deps = ["//pkg/sentry/seccheck"],
 )

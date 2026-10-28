@@ -12,14 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <fcntl.h>
 #include <poll.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <unistd.h>
 
+#include <cerrno>
+#include <climits>
 #include <cstdint>
 #include <functional>
+#include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -59,9 +64,7 @@ TEST_P(StreamUnixSocketPairTest, RecvmsgOneSideClosed) {
   auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
 
   // Set timeout so that it will not wait for ever.
-  struct timeval tv {
-    .tv_sec = 0, .tv_usec = 10
-  };
+  struct timeval tv{.tv_sec = 0, .tv_usec = 10};
   EXPECT_THAT(setsockopt(sockets->second_fd(), SOL_SOCKET, SO_RCVTIMEO, &tv,
                          sizeof(tv)),
               SyscallSucceeds());

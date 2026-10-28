@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <linux/sched.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdint.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>

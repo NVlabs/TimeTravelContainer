@@ -802,7 +802,7 @@ func bpfObjPin(t *kernel.Task, attr *linux.BPFAttrObj) error {
 	case ".", "..":
 		return linuxerr.EEXIST
 	}
-	tpop, err := getTaskPathOperation(t, dirfd, fspath.Parse(dir), disallowEmptyPath, followFinalSymlink)
+	tpop, err := getTaskPathOperation(t, dirfd, fspath.Parse(dir), disallowEmptyPath, followFinalSymlink, 0)
 	if err != nil {
 		return err
 	}
@@ -838,7 +838,7 @@ func bpfObjGet(t *kernel.Task, attr *linux.BPFAttrObj) (uintptr, error) {
 	if err != nil {
 		return 0, err
 	}
-	tpop, err := getTaskPathOperation(t, dirfd, path, disallowEmptyPath, followFinalSymlink)
+	tpop, err := getTaskPathOperation(t, dirfd, path, disallowEmptyPath, followFinalSymlink, 0)
 	if err != nil {
 		return 0, err
 	}

@@ -1064,6 +1064,11 @@ type inode struct {
 
 	locks vfs.FileLocks
 
+	// writeCount tracks write access to this inode's contents, and is used to
+	// prevent a file from being written while it is being executed. See
+	// vfs.WriteCount.
+	writeCount vfs.WriteCount
+
 	// Inotify watches for this inode.
 	//
 	// Note that inotify may behave unexpectedly in the presence of hard links,
@@ -1296,6 +1301,11 @@ func (d *dentry) init() {
 	refs.Register(d)
 }
 
+// WriteCount implements vfs.WriteCounter.WriteCount.
+func (d *dentry) WriteCount() *vfs.WriteCount {
+	return &d.inode.writeCount
+}
+
 // Preconditions: !d.inode.isSynthetic().
 // Preconditions: d.inode.metadataMu is locked.
 // +checklocks:d.inode.metadataMu
@@ -1378,6 +1388,14 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, opts *vfs
 	mode := linux.FileMode(d.inode.mode.Load())
 	if err := vfs.CheckSetStat(ctx, creds, opts, mode, nil, auth.KUID(d.inode.uid.Load()), auth.KGID(d.inode.gid.Load())); err != nil {
 		return err
+	}
+	if opts.NeedWritePerm {
+		// truncate(2), unlike ftruncate(2), acquires write access to the file
+		// and so fails with ETXTBSY if it is being executed. See
+		// fs/open.c:do_sys_truncate().
+		if err := d.inode.writeCount.CheckWrite(); err != nil {
+			return err
+		}
 	}
 	if err := mnt.CheckBeginWrite(); err != nil {
 		return err
@@ -1728,10 +1746,32 @@ func (d *dentry) Watches() *vfs.Watches {
 	return &d.inode.watches
 }
 
+// contextID is this package's type for context.Context.Value keys.
+type contextID int
+
+const (
+	// CtxCheckCachingList is a Context.Value key for a **[]*dentry. While
+	// fs.renameMu is held, inotify notifications are sent with this key set so
+	// that OnZeroWatches appends dentries to the list instead of checking them
+	// under the caller's lock; the caller checks the list once it unlocks.
+	CtxCheckCachingList contextID = iota
+)
+
+// withCheckCachingList returns ctx with CtxCheckCachingList set to ds.
+//
+// Preconditions: fs.renameMu must be locked.
+func withCheckCachingList(ctx context.Context, ds **[]*dentry) context.Context {
+	return context.WithValue(ctx, CtxCheckCachingList, ds)
+}
+
 // OnZeroWatches implements vfs.DentryImpl.OnZeroWatches.
 //
 // If no watches are left on this dentry and it has no references, cache it.
 func (d *dentry) OnZeroWatches(ctx context.Context) {
+	if ds, ok := ctx.Value(CtxCheckCachingList).(**[]*dentry); ok {
+		*ds = appendDentry(*ds, d)
+		return
+	}
 	d.checkCachingLocked(ctx, false /* renameMuWriteLocked */)
 }
 

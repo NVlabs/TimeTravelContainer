@@ -402,6 +402,8 @@ func (t *Task) StateStatus() string {
 }
 
 // CPUMask returns a copy of t's allowed CPU mask.
+//
+// +checklocksexclude:t.mu
 func (t *Task) CPUMask() sched.CPUSet {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -413,6 +415,9 @@ func (t *Task) CPUMask() sched.CPUSet {
 //
 // Preconditions: mask.Size() ==
 // sched.CPUSetSize(t.Kernel().ApplicationCores()).
+//
+// +checklocksexclude:t.mu
+// +checklocksexclude:t.tg.pidns.owner.mu
 func (t *Task) SetCPUMask(mask sched.CPUSet) error {
 	if want := sched.CPUSetSize(t.k.applicationCores); mask.Size() != want {
 		panic(fmt.Sprintf("Invalid CPUSet %v (expected %d bytes)", mask, want))
@@ -488,6 +493,8 @@ func assignCPU(allowed sched.CPUSet, tid ThreadID) (cpu int32) {
 }
 
 // Niceness returns t's niceness.
+//
+// +checklocksexclude:t.mu
 func (t *Task) Niceness() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -497,6 +504,8 @@ func (t *Task) Niceness() int {
 // Priority returns t's priority, as /proc/[pid]/stat shows it: -1 less the
 // real-time priority for real-time policies, and the niceness plus 20 for
 // others. See kernel/sched/syscalls.c:task_prio().
+//
+// +checklocksexclude:t.mu
 func (t *Task) Priority() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -508,6 +517,8 @@ func (t *Task) Priority() int {
 
 // SetNiceness sets t's niceness to n.
 // Values outside of [-20, 19] are clamped to fit within the range.
+//
+// +checklocksexclude:t.mu
 func (t *Task) SetNiceness(n int) {
 	if n < -20 {
 		n = -20
@@ -521,6 +532,8 @@ func (t *Task) SetNiceness(n int) {
 }
 
 // SetIOPrio sets t's ioprio.
+//
+// +checklocksexclude:t.mu
 func (t *Task) SetIOPrio(ioprio int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -528,6 +541,8 @@ func (t *Task) SetIOPrio(ioprio int) {
 }
 
 // GetIOPrio fetches t's ioprio.
+//
+// +checklocksexclude:t.mu
 func (t *Task) GetIOPrio() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -589,6 +604,8 @@ func (t *Task) childSchedPolicy() (SchedPolicy, int) {
 }
 
 // NumaPolicy returns t's current numa policy.
+//
+// +checklocksexclude:t.mu
 func (t *Task) NumaPolicy() (policy linux.NumaPolicy, nodeMask uint64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -596,6 +613,8 @@ func (t *Task) NumaPolicy() (policy linux.NumaPolicy, nodeMask uint64) {
 }
 
 // SetNumaPolicy sets t's numa policy.
+//
+// +checklocksexclude:t.mu
 func (t *Task) SetNumaPolicy(policy linux.NumaPolicy, nodeMask uint64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()

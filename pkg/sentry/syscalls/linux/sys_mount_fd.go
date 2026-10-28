@@ -279,7 +279,7 @@ func MoveMount(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintp
 	if err != nil {
 		return 0, nil, err
 	}
-	from, err := getTaskPathOperation(t, fromDirfd, fromPath, shouldAllowEmptyPath(flags&linux.MOVE_MOUNT_F_EMPTY_PATH != 0), shouldFollowFinalSymlink(flags&linux.MOVE_MOUNT_F_SYMLINKS != 0))
+	from, err := getTaskPathOperation(t, fromDirfd, fromPath, shouldAllowEmptyPath(flags&linux.MOVE_MOUNT_F_EMPTY_PATH != 0), shouldFollowFinalSymlink(flags&linux.MOVE_MOUNT_F_SYMLINKS != 0), 0)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -288,7 +288,7 @@ func MoveMount(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintp
 	if err != nil {
 		return 0, nil, err
 	}
-	to, err := getTaskPathOperation(t, toDirfd, toPath, shouldAllowEmptyPath(flags&linux.MOVE_MOUNT_T_EMPTY_PATH != 0), shouldFollowFinalSymlink(flags&linux.MOVE_MOUNT_T_SYMLINKS != 0))
+	to, err := getTaskPathOperation(t, toDirfd, toPath, shouldAllowEmptyPath(flags&linux.MOVE_MOUNT_T_EMPTY_PATH != 0), shouldFollowFinalSymlink(flags&linux.MOVE_MOUNT_T_SYMLINKS != 0), 0)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -340,7 +340,7 @@ func OpenTree(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintpt
 	if err != nil {
 		return 0, nil, err
 	}
-	from, err := getTaskPathOperation(t, dirfd, fromPath, shouldAllowEmptyPath(emptyPath), shouldFollowFinalSymlink(!noFollow))
+	from, err := getTaskPathOperation(t, dirfd, fromPath, shouldAllowEmptyPath(emptyPath), shouldFollowFinalSymlink(!noFollow), 0)
 	if err != nil {
 		return 0, nil, err
 	}

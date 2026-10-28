@@ -19,8 +19,8 @@ package stack
 
 import (
 	"context"
+	"encoding/binary"
 	"math/rand"
-	"time"
 
 	cryptorand "gvisor.dev/gvisor/pkg/rand"
 )
@@ -53,6 +53,11 @@ func (s *Stack) beforeSave() {
 // afterLoad is invoked by stateify.
 func (s *Stack) afterLoad(context.Context) {
 	// The stack's users share its source, so it is locked, as New's is.
-	s.insecureRNG = rand.New(&lockedRandomSource{src: rand.NewSource(time.Now().UnixNano())})
+	var v int64
+	if err := binary.Read(cryptorand.Reader, binary.LittleEndian, &v); err != nil {
+		panic(err)
+	}
+	randSrc := &lockedRandomSource{src: rand.NewSource(v)}
+	s.insecureRNG = rand.New(randSrc)
 	s.secureRNG = cryptorand.RNGFrom(cryptorand.Reader)
 }

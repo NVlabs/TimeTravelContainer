@@ -80,6 +80,10 @@ query: ## Runs a bazel query. E.g. make query TARGETS=//test/...
 	@$(call query,$(OPTIONS) $(TARGETS))
 .PHONY: query
 
+mod: ## Runs a bazel mod command. E.g. make mod TARGETS="deps --output json"
+	@$(call mod,$(OPTIONS) $(TARGETS))
+.PHONY: mod
+
 sudo: ## Runs the given $(TARGETS) as per run, but using "sudo -E". E.g. make sudo TARGETS=test/root:root_test ARGS=-test.v
 	@$(call sudo,$(TARGETS),$(ARGS))
 .PHONY: sudo
@@ -136,7 +140,7 @@ CGROUPV2 := false
 endif
 
 $(RUNTIME_BIN): # See below.
-	@mkdir -p "$(RUNTIME_DIR)"
+	@mkdir -p -m 0755 "$(RUNTIME_DIR)" && chmod a+rx "$(RUNTIME_DIR)"
 ifeq (,$(STAGED_BINARIES))
 	@$(call copy,//:release,$(RUNTIME_DIR))
 	@$(if $(filter-out //runsc,$(RUNSC_TARGET)),$(call copy,$(RUNSC_TARGET),$(RUNTIME_BIN)))
@@ -152,7 +156,7 @@ endif
 configure_noreload = \
   $(call header,CONFIGURE $(1) → $(RUNTIME_BIN) $(RUNTIME_ARGS) $(2)); \
   sudo $(RUNTIME_BIN) install --config_file="$(DOCKER_DAEMON_CONFIG_PATH)" --experimental=true --runtime="$(1)" -- $(RUNTIME_ARGS) --debug-log "$(RUNTIME_LOGS)" --allow-suid $(2) && \
-  sudo rm -rf "$(RUNTIME_LOG_DIR)" && mkdir -p "$(RUNTIME_LOG_DIR)"
+  sudo rm -rf "$(RUNTIME_LOG_DIR)" && mkdir -p "$(RUNTIME_LOG_DIR)" && chmod 0777 "$(RUNTIME_LOG_DIR)"
 
 reload_docker = \
   $(call header,DOCKER RELOAD); \
@@ -197,18 +201,22 @@ dev: $(RUNTIME_BIN) ## Installs a set of local runtimes. Requires sudo.
 	@# Docker In Gvisor(ding) version.
 	@$(call configure_noreload,$(RUNTIME)-ding,--TESTONLY-nftables --allow-packet-socket-write=true --net-raw)
 	@$(call reload_docker)
+	@$(call wait_for_runtime,$(RUNTIME))
 .PHONY: dev
 
 governance-regen: ## Regenerates the files derived from governance/maintainers.yaml and governance/areas.yaml.
-	@$(call run,//governance/tools/maintainers:maintainers_gen,-input governance/maintainers.yaml -areas governance/areas.yaml -format reviewer.json -output .github/reviewer.json)
 	@$(call run,//governance/tools/maintainers:maintainers_gen,-input governance/maintainers.yaml -areas governance/areas.yaml -format MAINTAINERS.md -output MAINTAINERS.md)
 	@$(call run,//governance/tools/maintainers:maintainers_gen,-input governance/maintainers.yaml -areas governance/areas.yaml -format CODEOWNERS -output CODEOWNERS)
 .PHONY: governance-regen
 
 governance-check: governance-regen ## Checks that the files derived from governance/*.yaml are in sync. Can't be a bazel test because it requires visibility across the whole codebase to check for subdirectories' existence.
-	@git diff --exit-code -- CODEOWNERS MAINTAINERS.md .github/reviewer.json || \
+	@git diff --exit-code -- CODEOWNERS MAINTAINERS.md || \
 		(echo "Generated governance files are out of sync. Please run \`make governance-regen\`." >&2; exit 1)
 .PHONY: governance-check
+
+license-check: ## Checks that tools/licensecheck/dependencies.yaml has an entry for every dependency.
+	@$(call run,//tools/licensecheck/main:licensecheck,--mode=verify)
+.PHONY: license-check
 
 ##
 ## Canonical build and test targets.
@@ -236,7 +244,7 @@ ttc: ## Builds the TimeTravelContainer client and service/runtime binaries.
 .PHONY: ttc
 
 nogo-tests:
-	@$(call test,--test_tag_filters=nogo //:all pkg/... tools/...)
+	@$(call test,--test_tag_filters=nogo --build_tests_only //...)
 .PHONY: nogo-tests
 
 # For unit tests, we take everything in the root, pkg/... and tools/..., and
@@ -259,26 +267,53 @@ tests: unit-tests nogo-tests container-tests syscall-tests
 integration-tests: ## Run all standard integration tests.
 integration-tests: docker-tests overlay-tests hostnet-tests swgso-tests
 integration-tests: do-tests kvm-tests containerd-tests-min
-integration-tests: sandbox-posture-tests
+integration-tests: root-tests sandbox-posture-tests
 .PHONY: integration-tests
 
-integration-test-images: load-image-test load-basic load-systemd-integ load-systemd-services load-ubi10-init
+integration-test-images: load-image-test load-basic load-systemd-integ load-systemd-services load-ubi10-init $(if $(filter x86_64,$(ARCH)),load-arch-systemd)
 .PHONY: integration-test-images
 
 network-tests: ## Run all networking integration tests.
 network-tests: iptables-tests packetdrill-tests packetimpact-tests
 .PHONY: network-tests
 
-# `make syscall-tests` runs all system call tests.
+HOST_KERNEL ?= $(shell uname -r)
+
+# To run all system call tests:
+#   make syscall-tests
 # To run a single syscall test:
 #   make syscall-tests TARGETS=//test/syscalls:signalfd_test_runsc_systrap_shared
 # To run a single syscall test without caching:
 #   make syscall-tests TARGETS=//test/syscalls:signalfd_test_runsc_systrap_shared OPTIONS=--nocache_test_results
 # To run multiple specific syscall tests:
 #   make syscall-tests TARGETS="//test/syscalls:signalfd_test_runsc_systrap_shared //test/syscalls:link_test_runsc_systrap_shared"
+# To run a single syscall test with the lockdep lock-order checker (use
+# BAZEL_OPTIONS, not OPTIONS, so the runtime under test is rebuilt):
+#   make syscall-tests TARGETS=//test/syscalls:signalfd_test_runsc_systrap_shared BAZEL_OPTIONS=--config=lockdep OPTIONS=--nocache_test_results
+# To run a single syscall test with the Go race detector in runsc and the Sentry:
+#   make syscall-tests TARGETS=//test/syscalls:signalfd_test_runsc_systrap_shared BAZEL_OPTIONS=--config=race OPTIONS=--nocache_test_results
+# To also stop the Sentry at the first race it finds:
+#   make syscall-tests TARGETS=//test/syscalls:signalfd_test_runsc_systrap_shared BAZEL_OPTIONS=--config=race OPTIONS="--nocache_test_results --test_env=GORACE=halt_on_error=1"
+# To find the boot log of a run (e.g. to read a sentry panic). TEST= is a
+# substring of the test name, so a prefix like "signalfd" matches
+# signalfd_test_runsc_systrap_shared:
+#   make syscall-test-boot-log TEST=signalfd
+# To run a native (non-runsc) test's root cases as real root on the host
+# (sudo make syscall-tests strips privileges, so use the sudo rule; ARGS are
+# gtest flags):
+#   make sudo TARGETS=//test/syscalls/linux:chown_test ARGS='--gtest_filter=*Root*'
 syscall-tests: $(RUNTIME_BIN)
-	@$(call test,$(OPTIONS) --test_env=RUNTIME=$(RUNTIME_BIN) --test_env=GVISOR_SIDECAR_BINARIES_DIR=$(RUNTIME_DIR)/gvisor-bin --cxxopt=-Werror $(PARTITIONS) $(if $(TARGETS),-- $(TARGETS),test/syscalls/... test/rtnetlink/...))
+	@$(call test,$(OPTIONS) --test_env=RUNTIME=$(RUNTIME_BIN) --test_env=GVISOR_SIDECAR_BINARIES_DIR=$(RUNTIME_DIR)/gvisor-bin --test_env=HOST_KERNEL=$(HOST_KERNEL) --cxxopt=-Werror $(PARTITIONS) $(if $(TARGETS),-- $(TARGETS),test/syscalls/... test/rtnetlink/...))
 .PHONY: syscall-tests
+
+# `make syscall-test-boot-log` prints the newest runsc boot log written by a
+# syscall test, so you can inspect a sentry panic or crash. Optionally filter by
+# TEST=, a substring of the test name, e.g.
+# `make syscall-test-boot-log TEST=uidgid`.
+syscall-test-boot-log: ## Print the path to the newest runsc boot log. Usage: make syscall-test-boot-log [TEST=<name>].
+	@find $(HOME)/.cache/bazel/*/*/execroot/_main/bazel-out/*/testlogs/test/syscalls/*$(TEST)*/test.outputs \
+	  -name 'runsc.log.*.boot.txt' -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-
+.PHONY: syscall-test-boot-log
 
 packetimpact-tests:
 	@$(call test,--jobs=HOST_CPUS*3 --local_test_jobs=HOST_CPUS*3 //test/packetimpact/tests:all_tests)
@@ -413,6 +448,11 @@ sandbox-posture-tests: load-basic_alpine $(RUNTIME_BIN)
 	@$(call install_runtime,$(RUNTIME)-posture-kvm,--platform=kvm)
 	@$(call sudo,test/root:root_test,--runtime=$(RUNTIME)-posture-kvm --platform=kvm $(POSTURE_TEST_ARGS) $(ARGS))
 .PHONY: sandbox-posture-tests
+
+root-tests: load-basic_alpine $(RUNTIME_BIN)
+	@$(call install_runtime,$(RUNTIME),) # Clear flags.
+	@$(call sudo,test/root:root_test,--runtime=$(RUNTIME) -test.v $(ARGS))
+.PHONY: root-tests
 
 # Standard integration targets.
 INTEGRATION_TARGETS := //test/image:image_test //test/e2e:integration_test
@@ -720,7 +760,7 @@ syzkaller-smoke-test: $(RUNTIME_BIN)
 		--hostname="$(SYZKALLER_CONTAINER)" \
 		$(DOCKER_PRIVILEGED) \
 		--pid=host \
-		-v "$(RUNTIME_BIN):$(RUNTIME_BIN):ro" \
+		-v "$(RUNTIME_DIR):$(RUNTIME_DIR):ro" \
 		-e "GOPATH=/__w/syzkaller/syzkaller/gopath" \
 		-e "GVISOR_VMLINUX_PATH=$(RUNTIME_BIN)" \
 		"$(SYZKALLER_IMAGE)" \
@@ -733,6 +773,20 @@ syzkaller-smoke-test: $(RUNTIME_BIN)
 		'
 .PHONY: syzkaller-smoke-test
 
-codespell:
-	codespell
-.PHONY: codespell
+##
+## Lint targets.
+##
+##   These run the source-level linters that live outside the Bazel build.
+##   Deep Go analysis is owned by gVisor nogo.
+##
+lint: ## Runs the source linters.
+	@tools/lint.sh
+.PHONY: lint
+
+lint-fix: ## Reformats sources in place.
+	@tools/lint.sh --fix
+.PHONY: lint-fix
+
+lint-cc: ensure-bazel-server ## Runs clang-tidy over the C++ sources; needs bazel for compile_commands.json.
+	@$(call wrapper,tools/lint.sh clang-tidy)
+.PHONY: lint-cc

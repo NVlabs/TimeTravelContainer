@@ -481,6 +481,8 @@ func (t *Task) SetSecurebits(arg2 uint64) error {
 }
 
 // SetNoNewPrivs will set the no new privileges flag PR_SET_NO_NEW_PRIVS.
+//
+// +checklocksexclude:t.mu
 func (t *Task) SetNoNewPrivs() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -488,6 +490,8 @@ func (t *Task) SetNoNewPrivs() {
 }
 
 // GetNoNewPrivs returns true if the prctl flag NO_NEW_PRIVS is set.
+//
+// +checklocksexclude:t.mu
 func (t *Task) GetNoNewPrivs() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()

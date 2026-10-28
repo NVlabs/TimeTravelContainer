@@ -116,6 +116,11 @@ type Cgroup2 interface {
 	// It helps prevent fork()s racing with cgroup.kill.
 	KillSeq() uint64
 
+	// ApplyFreezeCreditDelta adjusts this cgroup's freeze-credit counter
+	// by delta, self-acquiring its lock. Caller must pass the cgroup a
+	// prior applyFreezeSigLocked/resolveFreezeCreditSigLocked returned.
+	ApplyFreezeCreditDelta(ctx context.Context, delta FreezeCreditDelta)
+
 	// Deleted returns true if the cgroup has been deleted.
 	Deleted() bool
 
@@ -158,10 +163,14 @@ type Cgroup2FS interface {
 	RUnlockTree()
 
 	// StealControllerLocked transfers ownership of the controller
-	// away from the v2 hierarchy if a v1 hierarchy mounts it.
+	// away from the v2 hierarchy if a v1 hierarchy mounts it. Callers
+	// must have called LockTree, and must not hold CgroupRegistry.mu:
+	// the implementation acquires cgroup2fs task locks, which may not
+	// be taken under the (leaf) registry mutex.
 	StealControllerLocked(ctx context.Context, cType Cgroup2Ctrl) error
 	// ReturnControllerLocked returns ownership of the controller
-	// to the v2 hierarchy when a v1 hierarchy unmounts it.
+	// to the v2 hierarchy when a v1 hierarchy unmounts it. The locking
+	// preconditions of StealControllerLocked apply.
 	ReturnControllerLocked(ctx context.Context, cType Cgroup2Ctrl)
 }
 

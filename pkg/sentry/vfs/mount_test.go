@@ -753,7 +753,7 @@ func TestFormatProcMountOptions(t *testing.T) {
 			name:     "all restrictions",
 			readOnly: true,
 			flags:    MountFlags{NoATime: true, NoExec: true, NoSUID: true, NoDev: true},
-			want:     "ro,noatime,noexec,nosuid,nodev",
+			want:     "ro,nosuid,nodev,noexec,noatime",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

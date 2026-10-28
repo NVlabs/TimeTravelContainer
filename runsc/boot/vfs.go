@@ -22,7 +22,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -74,7 +73,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/timing"
-	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
@@ -831,7 +829,7 @@ func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Co
 	if filestoreFD != nil {
 		// Create memory file for disk-backed overlays.
 		resourceID := checkpoint.ResourceID{ContainerName: c.containerName, Path: dst}
-		mf, err := createPrivateMemoryFile(filestoreFD.ReleaseToFile("overlay-filestore"), resourceID, c.containerID, c.l.fsRestore)
+		mf, _, err := createPrivateMemoryFile(filestoreFD.ReleaseToFile("overlay-filestore"), resourceID, c.containerID, c.l.fsRestore)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to create memory file for overlay: %v", err)
 		}
@@ -1182,7 +1180,7 @@ func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo,
 		}
 		if m.filestoreFD != nil {
 			resourceID := checkpoint.ResourceID{ContainerName: containerName, Path: m.mount.Destination}
-			mf, err := createPrivateMemoryFile(m.filestoreFD.ReleaseToFile("tmpfs-filestore"), resourceID, containerID, fsr)
+			mf, _, err := createPrivateMemoryFile(m.filestoreFD.ReleaseToFile("tmpfs-filestore"), resourceID, containerID, fsr)
 			if err != nil {
 				return "", nil, fmt.Errorf("failed to create memory file for tmpfs: %w", err)
 			}
@@ -1194,6 +1192,9 @@ func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo,
 			}
 			sourceTar, err := fsr.tmpfsSourceTar(resourceID, containerID)
 			if err != nil {
+				if !mf.IsAsyncLoading() {
+					mf.Destroy()
+				}
 				return "", nil, fmt.Errorf("failed to get tar archive from filesystem checkpoint: %w", err)
 			}
 			if sourceTar != nil {
@@ -1320,17 +1321,28 @@ func parseKeyValue(s string) (string, string, bool) {
 	return strings.TrimSpace(tokens[0]), strings.TrimSpace(tokens[1]), true
 }
 
-func createPrivateMemoryFile(file *os.File, resourceID checkpoint.ResourceID, cid string, fsr *fsRestore) (*pgalloc.MemoryFile, error) {
+// createPrivateMemoryFile creates or loads a private memory file.
+// It returns:
+//   - The created pgalloc.MemoryFile.
+//   - A boolean indicating if the memory file was successfully loaded
+//     (restored) from the checkpoint.
+//   - An error if creation or restoration failed.
+func createPrivateMemoryFile(file *os.File, resourceID checkpoint.ResourceID, cid string, fsr *fsRestore) (*pgalloc.MemoryFile, bool, error) {
+	cleanFile := cleanup.Make(func() { file.Close() })
+	defer cleanFile.Clean()
+
 	pagesMetadataReader, pagesFileOffset, onLoadEnd, err := fsr.memoryFileLoadArgs(resourceID, cid)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
+	loaded := pagesMetadataReader != nil
 	mf, err := createEmptyPrivateMemoryFile(file, resourceID)
 	if err != nil {
 		onLoadEnd(err)
-		return mf, err
+		return nil, false, err
 	}
-	if pagesMetadataReader != nil {
+	cleanFile.Release()
+	if loaded {
 		log.Infof("Loading filesystem checkpoint data for %q", resourceID)
 		if err := mf.LoadFrom(context.Background(), pagesMetadataReader, &pgalloc.LoadOpts{
 			PagesFile:       fsr.apfl,
@@ -1338,10 +1350,10 @@ func createPrivateMemoryFile(file *os.File, resourceID checkpoint.ResourceID, ci
 			DoneCallback:    onLoadEnd,
 		}); err != nil {
 			mf.Destroy()
-			return nil, err
+			return nil, false, err
 		}
 	}
-	return mf, nil
+	return mf, loaded, nil
 }
 
 func createEmptyPrivateMemoryFile(file *os.File, resourceID checkpoint.ResourceID) (*pgalloc.MemoryFile, error) {
@@ -1358,11 +1370,7 @@ func createEmptyPrivateMemoryFile(file *os.File, resourceID checkpoint.ResourceI
 		// Private memory files need to be restored correctly using this ID.
 		ResourceID: resourceID,
 	}
-	mf, err := pgalloc.NewMemoryFile(file, mfOpts)
-	if err != nil {
-		return mf, err
-	}
-	return mf, nil
+	return pgalloc.NewMemoryFile(file, mfOpts)
 }
 
 // mountTmp mounts an internal tmpfs at '/tmp' if it's safe to do so.
@@ -1476,29 +1484,11 @@ func (c *containerMounter) getSharedMount(ctx context.Context, spec *specs.Spec,
 //
 // +checklocks:l.mu
 func (l *Loader) setupCgroup2() error {
-	l.cgroup2Mount = cgroup2fs.NewInternalMount(l.k, l.k.VFS())
-	cgroup2fs.SetNSDelegate(l.k, true)
-
-	// Enable all supported controllers for per-container child cgroups. The
-	// root cgroup is exempt from the no-internal-processes rule, and no
-	// application tasks exist yet at this point anyway.
-	ctx := l.k.SupervisorContext()
-	creds := auth.NewRootCredentials(l.k.RootUserNamespace())
-	root := vfs.MakeVirtualDentry(l.cgroup2Mount, l.cgroup2Mount.Root())
-	pop := vfs.PathOperation{
-		Root:  root,
-		Start: root,
-		Path:  fspath.Parse("cgroup.subtree_control"),
-	}
-	fd, err := l.k.VFS().OpenAt(ctx, creds, &pop, &vfs.OpenOptions{Flags: linux.O_WRONLY})
+	cg2Mount, err := cgroup2fs.InitHierarchy(l.k.SupervisorContext(), l.k)
 	if err != nil {
-		return fmt.Errorf("opening cgroup.subtree_control: %w", err)
+		return err
 	}
-	defer fd.DecRef(ctx)
-	data := []byte("+cpu +memory +pids +cpuset")
-	if _, err := fd.Write(ctx, usermem.BytesIOSequence(data), vfs.WriteOptions{}); err != nil {
-		return fmt.Errorf("enabling cgroup2 controllers: %w", err)
-	}
+	l.cgroup2Mount = cg2Mount
 	return nil
 }
 
@@ -1914,11 +1904,14 @@ func (c *containerMounter) configureRestore(restoreMnts *restoreMounts) error {
 	restoreMnts.fdmap[rootKey] = c.goferFDs.remove()
 
 	if rootfsConf := c.goferMountConfs[0]; rootfsConf.IsFilestorePresent() {
-		mf, err := createPrivateMemoryFile(c.goferFilestoreFDs.removeAsFD().ReleaseToFile("overlay-filestore"), rootKey, c.containerID, c.l.fsRestore)
+		mf, loaded, err := createPrivateMemoryFile(c.goferFilestoreFDs.removeAsFD().ReleaseToFile("overlay-filestore"), rootKey, c.containerID, c.l.fsRestore)
 		if err != nil {
 			return fmt.Errorf("failed to create private memory file for mount rootfs: %w", err)
 		}
 		restoreMnts.mfmap[rootKey] = mf
+		if loaded {
+			restoreMnts.fsCheckpointedMfs[rootKey] = struct{}{}
+		}
 	}
 	// prepareMounts() consumes the remaining FDs for submounts.
 	mounts, err := c.prepareMounts()
@@ -1944,17 +1937,19 @@ func (c *containerMounter) configureRestore(restoreMnts *restoreMounts) error {
 			restoreMnts.sharedMfs[submount.hint.Name] = true
 		}
 
+		key := checkpoint.ResourceID{ContainerName: c.containerName, Path: submount.mount.Destination}
 		if submount.goferFD != nil {
-			key := checkpoint.ResourceID{ContainerName: c.containerName, Path: submount.mount.Destination}
 			restoreMnts.fdmap[key] = submount.goferFD.Release()
 		}
 		if submount.filestoreFD != nil {
-			key := checkpoint.ResourceID{ContainerName: c.containerName, Path: submount.mount.Destination}
-			mf, err := createPrivateMemoryFile(submount.filestoreFD.ReleaseToFile("overlay-filestore"), key, c.containerID, c.l.fsRestore)
+			mf, loaded, err := createPrivateMemoryFile(submount.filestoreFD.ReleaseToFile("overlay-filestore"), key, c.containerID, c.l.fsRestore)
 			if err != nil {
 				return fmt.Errorf("failed to create private memory file for mount %q: %w", submount.mount.Destination, err)
 			}
 			restoreMnts.mfmap[key] = mf
+			if loaded {
+				restoreMnts.fsCheckpointedMfs[key] = struct{}{}
+			}
 		}
 	}
 	return nil
@@ -1997,23 +1992,11 @@ func createDeviceFiles(ctx context.Context, creds *auth.Credentials, info *conta
 		if devClient == nil {
 			return fmt.Errorf("dev gofer client not found in context")
 		}
-		names, err := devClient.DirentNames(ctx)
+		minors, err := nvidiaRegularDeviceMinorsFromGofer(ctx, devClient)
 		if err != nil {
-			return fmt.Errorf("failed to get names of dirents from dev gofer: %w", err)
+			return err
 		}
-		nvidiaDeviceRegex := regexp.MustCompile(`^nvidia(\d+)$`)
-		for _, name := range names {
-			ms := nvidiaDeviceRegex.FindStringSubmatch(name)
-			if ms == nil {
-				continue
-			}
-			minor, err := strconv.ParseUint(ms[1], 10, 32)
-			if err != nil {
-				return fmt.Errorf("invalid nvidia device name %q: %w", name, err)
-			}
-			if minor > nvgpu.NV_MINOR_DEVICE_NUMBER_REGULAR_MAX {
-				return fmt.Errorf("invalid nvidia regular minor device number %d", minor)
-			}
+		for _, minor := range minors {
 			nvidiaDevs = append(nvidiaDevs, specs.LinuxDevice{Path: fmt.Sprintf("/dev/nvidia%d", minor), Type: "c", Major: nvgpu.NV_MAJOR_DEVICE_NUMBER, Minor: int64(minor)})
 		}
 		for _, nvidiaDev := range nvidiaDevs {

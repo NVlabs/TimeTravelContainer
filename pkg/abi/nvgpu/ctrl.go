@@ -81,9 +81,10 @@ const (
 	NV0000_CTRL_CMD_GPU_ASYNC_ATTACH_ID       = 0x289
 	NV0000_CTRL_CMD_GPU_WAIT_ATTACH_ID        = 0x290
 
-	NV0000_CTRL_GPU_INVALID_ID      = 0xffffffff
-	NV0000_CTRL_GPU_MAX_PROBED_GPUS = NV_MAX_DEVICES
-	NV0000_GPU_MAX_GID_LENGTH       = 0x100
+	NV0000_CTRL_GPU_INVALID_ID        = 0xffffffff
+	NV0000_CTRL_GPU_MAX_PROBED_GPUS   = NV_MAX_DEVICES
+	NV0000_CTRL_GPU_MAX_ATTACHED_GPUS = 32
+	NV0000_GPU_MAX_GID_LENGTH         = 0x100
 )
 
 // From src/common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000gpuacct.h:
@@ -181,9 +182,12 @@ const (
 	NV0000_CTRL_CMD_OS_UNIX_GET_EXPORT_OBJECT_INFO       = 0x3d08
 	NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECTS_TO_FD         = 0x3d0b
 	NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECTS_FROM_FD       = 0x3d0c
+	NV0000_CTRL_OS_UNIX_CMD_MEMACCT_GET_LIMITS           = 0x3d0e
+	NV0000_CTRL_OS_UNIX_CMD_MEMACCT_GET_IMPL             = 0x3d0f
 	NV0000_OS_UNIX_EXPORT_OBJECT_FD_BUFFER_SIZE          = 64
 	NV0000_CTRL_OS_UNIX_EXPORT_OBJECTS_TO_FD_MAX_OBJECTS = 512
 	NV0000_CTRL_OS_UNIX_IMPORT_OBJECTS_TO_FD_MAX_OBJECTS = 128
+	NV0000_CTRL_CMD_OS_UNIX_MEMACCT_CURRENT_PROCESS      = -1
 )
 
 // +marshal
@@ -311,6 +315,31 @@ func (p *NV0000_CTRL_OS_UNIX_IMPORT_OBJECTS_FROM_FD_PARAMS) GetFrontendFD() int3
 // SetFrontendFD implements HasFrontendFD.SetFrontendFD.
 func (p *NV0000_CTRL_OS_UNIX_IMPORT_OBJECTS_FROM_FD_PARAMS) SetFrontendFD(fd int32) {
 	p.FD = fd
+}
+
+// NV0000_CTRL_OS_UNIX_MEMACCT_LIMITS is from
+// src/common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000unix.h.
+//
+// +marshal
+type NV0000_CTRL_OS_UNIX_MEMACCT_LIMITS struct {
+	_       structs.HostLayout
+	GpuID   uint32
+	Pad     [4]byte
+	Soft    uint64
+	Hard    uint64
+	Current uint64
+}
+
+// NV0000_CTRL_OS_UNIX_MEMACCT_GET_LIMITS_PARAMS is the param type for
+// NV0000_CTRL_OS_UNIX_CMD_MEMACCT_GET_LIMITS, from
+// src/common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000unix.h.
+//
+// +marshal
+type NV0000_CTRL_OS_UNIX_MEMACCT_GET_LIMITS_PARAMS struct {
+	_        structs.HostLayout
+	CgroupFD int32
+	Count    uint32
+	Limits   [NV0000_CTRL_GPU_MAX_ATTACHED_GPUS]NV0000_CTRL_OS_UNIX_MEMACCT_LIMITS
 }
 
 // +marshal
@@ -554,9 +583,10 @@ const (
 
 // From src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080ce.h:
 const (
-	NV2080_CTRL_CMD_CE_GET_CE_PCE_MASK = 0x20802a02
-	NV2080_CTRL_CMD_CE_GET_CAPS_V2     = 0x20802a03
-	NV2080_CTRL_CMD_CE_GET_ALL_CAPS    = 0x20802a0a
+	NV2080_CTRL_CMD_CE_GET_CE_PCE_MASK   = 0x20802a02
+	NV2080_CTRL_CMD_CE_GET_CAPS_V2       = 0x20802a03
+	NV2080_CTRL_CMD_CE_GET_ALL_CAPS      = 0x20802a0a
+	NV2080_CTRL_CMD_CE_GET_LCE_SHIM_INFO = 0x20802a0c
 )
 
 // From src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080event.h:
@@ -599,6 +629,11 @@ const (
 	NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS = 0x2080110b
 
 	NV2080_CTRL_FIFO_DISABLE_CHANNELS_MAX_ENTRIES = 64
+)
+
+// From src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080fla.h:
+const (
+	NV2080_CTRL_CMD_FLA_GET_FABRIC_MEM_STATS = 0x20803504
 )
 
 // From src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080flcn.h:
@@ -758,7 +793,29 @@ const (
 	NV2080_CTRL_CMD_NVLINK_GET_REMAP_TABLE_INFO_V2   = 0x208030a1
 	NV2080_CTRL_CMD_NVLINK_GET_UPDATE_NVLE_LIDS_V2   = 0x208030a2
 	NV2080_CTRL_CMD_NVLINK_GET_UPDATE_NVLE_LIDS_V3   = 0x208030a3
+	NV2080_CTRL_CMD_NVLINK_SET_NVLE_READY            = 0x208030a5
 )
+
+// Constants from src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080nvlink.h.
+const (
+	NV2080_CTRL_NVLINK_MAX_REMAP_TABLE_ENTRIES_V2 = 4096
+	NV2080_CTRL_NVLINK_REMAP_TABLE_ENTRIES_CHUNK  = 128
+)
+
+// NV2080_CTRL_NVLINK_GET_REMAP_TABLE_INFO_V2_PARAMS is the params type for
+// NV2080_CTRL_CMD_NVLINK_GET_REMAP_TABLE_INFO_V2, from
+// src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080nvlink.h.
+//
+// +marshal
+type NV2080_CTRL_NVLINK_GET_REMAP_TABLE_INFO_V2_PARAMS struct {
+	_               structs.HostLayout
+	Alid            uint32
+	FlaRemapTabAddr [NV2080_CTRL_NVLINK_REMAP_TABLE_ENTRIES_CHUNK]uint32
+	GpaRemapTabAddr [NV2080_CTRL_NVLINK_REMAP_TABLE_ENTRIES_CHUNK]uint32
+	RemapTabSize    uint32
+	RemapEntryStart uint32
+	RemapEntryEnd   uint32
+}
 
 // From src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080perf.h:
 const (
@@ -903,6 +960,7 @@ const (
 	NVB0CC_CTRL_CMD_GET_TOTAL_HS_CREDITS       = 0xb0cc010d
 	NVB0CC_CTRL_CMD_SET_HS_CREDITS             = 0xb0cc010e
 	NVB0CC_CTRL_CMD_GET_CHIPLET_HS_CREDIT_POOL = 0xb0cc0115
+	NVB0CC_CTRL_CMD_GET_HS_CREDITS_MAPPING     = 0xb0cc0116
 	NVB0CC_CTRL_CMD_RESERVE_CCU_PROF           = 0xb0cc0119
 	NVB0CC_CTRL_CMD_POWER_REQUEST_FEATURES     = 0xb0cc0301
 	NVB0CC_CTRL_CMD_POWER_RELEASE_FEATURES     = 0xb0cc0302
@@ -914,6 +972,12 @@ const (
 	NV_CONF_COMPUTE_CTRL_CMD_SYSTEM_GET_GPUS_STATE       = 0xcb330104
 	NV_CONF_COMPUTE_CTRL_CMD_GPU_GET_NUM_SECURE_CHANNELS = 0xcb33010b
 	NV_CONF_COMPUTE_CTRL_CMD_GPU_GET_KEY_ROTATION_STATE  = 0xcb33010c
+)
+
+// From src/common/sdk/nvidia/inc/ctrl/ctrl00fe.h:
+const (
+	NV00FE_CTRL_CMD_SUBMIT_OPERATIONS = 0xfe0101
+	NV00FE_CTRL_CMD_RESIZE_QUEUE      = 0xfe0102
 )
 
 // The following IOCTLs are not found in the OSS repo.

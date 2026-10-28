@@ -215,6 +215,7 @@ func (c *Command) ExitCode(ctx context.Context) (int, error) {
 		c.mu.Unlock()
 		return 0, errors.New("command not started")
 	}
+	c.mu.Unlock()
 	select {
 	case <-ctx.Done():
 		return 0, ctx.Err()
@@ -241,8 +242,14 @@ func (c *Command) Wait(ctx context.Context) ([]string, []string, error) {
 	}
 	c.mu.Unlock()
 	select {
-	case <-ctx.Done():
 	case <-c.Done():
+	case <-ctx.Done():
+		// Prefer the command's result if it finished concurrently.
+		select {
+		case <-c.Done():
+		default:
+			return c.Stdout(), c.Stderr(), fmt.Errorf("command did not complete: %w", ctx.Err())
+		}
 	}
 	stdout := c.Stdout()
 	stderr := c.Stderr()
@@ -702,6 +709,9 @@ func (st *SampleTest) State(ctx context.Context) (*SampleState, error) {
 	executables := make(map[string]struct{})
 	err := filepath.Walk(st.dir(), func(path string, info fs.FileInfo, err error) error {
 		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
 			return fmt.Errorf("cannot walk %q (%q): %w", st.dir(), path, err)
 		}
 		if !info.IsDir() && info.Mode()&0111 != 0 {
@@ -780,7 +790,7 @@ func (st *SampleTest) Run(ctx context.Context) error {
 	}
 
 	if _, _, err := st.cmd(ctx, st.testBin).Run(ctx); err != nil {
-		fmt.Errorf("failed to run bin %q: %v", st.testBin, err)
+		return fmt.Errorf("failed to run bin %q: %w", st.testBin, err)
 	}
 	return nil
 }

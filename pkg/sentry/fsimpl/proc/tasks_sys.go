@@ -38,6 +38,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/version"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -113,6 +114,9 @@ func (fs *filesystem) newSysDir(ctx context.Context, root *auth.Credentials, k *
 			"overcommit_memory":    fs.newInode(ctx, root, 0444, newStaticFile("0\n")),
 		}),
 		"net": fs.newSysNetDir(ctx, root, k),
+		"user": fs.newStaticDir(ctx, root, map[string]kernfs.Inode{
+			"max_user_namespaces": fs.newInode(ctx, root, 0644, &maxUserNamespacesData{}),
+		}),
 	})
 }
 
@@ -124,7 +128,7 @@ func (fs *filesystem) newSysNetDir(ctx context.Context, root *auth.Credentials, 
 	// network namespace of the calling process.
 	if stack := k.RootNetworkNamespace().Stack(); stack != nil {
 		ipv4Contents := map[string]kernfs.Inode{
-			"ip_forward":          fs.newInode(ctx, root, 0444, &ipForwarding{stack: stack}),
+			"ip_forward":          fs.newInode(ctx, root, 0644, &ipForwarding{stack: stack, protocol: ipv4.ProtocolNumber}),
 			"ip_local_port_range": fs.newInode(ctx, root, 0644, &portRange{stack: stack}),
 			"tcp_recovery":        fs.newInode(ctx, root, 0644, &tcpRecoveryData{stack: stack}),
 			"tcp_rmem":            fs.newInode(ctx, root, 0644, &tcpMemData{stack: stack, dir: tcpRMem}),
@@ -172,7 +176,6 @@ func (fs *filesystem) newSysNetDir(ctx context.Context, root *auth.Credentials, 
 			"tcp_timestamps":            fs.newInode(ctx, root, 0444, newStaticFile("1")),
 		}
 		if _, ok := stack.(tcpSysctlStack); ok {
-			ipv4Contents["ip_forward"] = fs.newInode(ctx, root, 0644, &ipForwarding{stack: stack})
 			ipv4Contents["tcp_available_congestion_control"] = fs.newInode(ctx, root, 0444, &tcpCongestionControlData{stack: stack, available: true})
 			ipv4Contents["tcp_congestion_control"] = fs.newInode(ctx, root, 0644, &tcpCongestionControlData{stack: stack})
 			ipv4Contents["tcp_syn_retries"] = fs.newInode(ctx, root, 0644, &tcpRetriesData{stack: stack, kind: tcpSynRetries})
@@ -195,18 +198,16 @@ func (fs *filesystem) newSysNetDir(ctx context.Context, root *auth.Credentials, 
 				"wmem_default":     fs.newInode(ctx, root, 0444, newStaticFile("212992")),
 				"wmem_max":         fs.newInode(ctx, root, 0444, newStaticFile("212992")),
 			}),
-			"ipv6": fs.newStaticDir(ctx, root, map[string]kernfs.Inode{
-				"bindv6only":       fs.newInode(ctx, root, 0444, newStaticFile("0")),
-				"ip6frag_time":     fs.newInode(ctx, root, 0444, newStaticFile("60")),
-				"ip_nonlocal_bind": fs.newInode(ctx, root, 0444, newStaticFile("0")),
-				"auto_flowlabels":  fs.newInode(ctx, root, 0444, newStaticFile("1")),
-			}),
 		}
 		if stack.SupportsIPv6() {
 			ipv6Conf, ipv6Neigh := fs.newNetConfDirs(ctx, root, stack, true /* ipv6 */)
 			contents["ipv6"] = fs.newStaticDir(ctx, root, map[string]kernfs.Inode{
-				"conf":  ipv6Conf,
-				"neigh": ipv6Neigh,
+				"auto_flowlabels":  fs.newInode(ctx, root, 0444, newStaticFile("1")),
+				"bindv6only":       fs.newInode(ctx, root, 0444, newStaticFile("0")),
+				"conf":             ipv6Conf,
+				"ip6frag_time":     fs.newInode(ctx, root, 0444, newStaticFile("60")),
+				"ip_nonlocal_bind": fs.newInode(ctx, root, 0444, newStaticFile("0")),
+				"neigh":            ipv6Neigh,
 			})
 		}
 	}
@@ -361,6 +362,53 @@ func (*uuidData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 // GetDynamicBytesPoller implements vfs.PollableDynamicBytesSource.GetDynamicBytesPoller.
 func (*domainnameData) GetDynamicBytesPoller(ctx context.Context) *vfs.DynamicBytesPoller {
 	return &kernel.KernelFromContext(ctx).DomainNamePoller
+}
+
+// maxUserNamespacesData implements vfs.WritableDynamicBytesSource for
+// /proc/sys/user/max_user_namespaces.
+//
+// +stateify savable
+type maxUserNamespacesData struct {
+	kernfs.DynamicBytesFile
+}
+
+var _ vfs.WritableDynamicBytesSource = (*maxUserNamespacesData)(nil)
+
+// CheckPermissions implements kernfs.Inode.CheckPermissions.
+//
+// In Linux, this file's access can be granted via CAP_SYS_RESOURCE
+// in the caller's user namespace, and read-only access otherwise.
+func (*maxUserNamespacesData) CheckPermissions(ctx context.Context, creds *auth.Credentials, ats vfs.AccessTypes) error {
+	if (ats.MayWrite() && !creds.HasSelfCapability(linux.CAP_SYS_RESOURCE)) || ats.MayExec() {
+		return linuxerr.EACCES
+	}
+	return nil
+}
+
+// Generate implements vfs.DynamicBytesSource.Generate.
+func (*maxUserNamespacesData) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	userns := auth.CredentialsFromContext(ctx).UserNamespace
+	_, err := fmt.Fprintf(buf, "%d\n", userns.MaxUserNamespaces())
+	return err
+}
+
+// Write implements vfs.WritableDynamicBytesSource.Write.
+func (*maxUserNamespacesData) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
+	if offset != 0 {
+		// Ignore partial writes.
+		return 0, linuxerr.EINVAL
+	}
+	var buf [1]int32
+	n, err := ParseInt32Vec(ctx, src, buf[:])
+	if err != nil || n == 0 {
+		return 0, err
+	}
+	// The limit is a non-negative count.
+	if buf[0] < 0 {
+		return 0, linuxerr.EINVAL
+	}
+	auth.CredentialsFromContext(ctx).UserNamespace.SetMaxUserNamespaces(buf[0])
+	return n, nil
 }
 
 // tcpSackData implements vfs.WritableDynamicBytesSource for
@@ -670,14 +718,15 @@ func (d *tcpMemData) writeSizeLocked(size inet.TCPBufferSize) error {
 }
 
 // ipForwarding implements vfs.WritableDynamicBytesSource for
-// /proc/sys/net/ipv4/ip_forward.
+// /proc/sys/net/ipv4/ip_forward and /proc/sys/net/ipv6/conf/all/forwarding.
 //
 // +stateify savable
 type ipForwarding struct {
 	kernfs.DynamicBytesFile
 
-	stack inet.Stack `state:"wait"`
-	mu    sync.Mutex `state:"nosave"`
+	stack    inet.Stack `state:"wait"`
+	mu       sync.Mutex `state:"nosave"`
+	protocol tcpip.NetworkProtocolNumber
 
 	// enabled is the last value successfully written here, which may differ
 	// from the forwarding state of individual interfaces.
@@ -722,10 +771,55 @@ func (ipf *ipForwarding) Write(ctx context.Context, _ *vfs.FileDescription, src 
 	enabled := buf[0] != 0
 	ipf.mu.Lock()
 	defer ipf.mu.Unlock()
-	if err := ipf.stack.SetForwarding(ipv4.ProtocolNumber, enabled); err != nil {
+	if err := ipf.stack.SetForwarding(ipf.protocol, enabled); err != nil {
 		return 0, err
 	}
 	ipf.enabled = enabled
+	return n, nil
+}
+
+// routeLocalnetData implements vfs.WritableDynamicBytesSource for
+// /proc/sys/net/ipv4/conf/{all,default}/route_localnet. Enabling it accepts
+// martian loopback packets (IPv4 AllowExternalLoopbackTraffic), matching
+// Linux's net.ipv4.conf.*.route_localnet.
+//
+// +stateify savable
+type routeLocalnetData struct {
+	kernfs.DynamicBytesFile
+
+	stack inet.Stack `state:"wait"`
+}
+
+var _ vfs.WritableDynamicBytesSource = (*routeLocalnetData)(nil)
+
+// Generate implements vfs.DynamicBytesSource.Generate.
+func (rl *routeLocalnetData) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	enabled, err := rl.stack.GetAllowExternalLoopbackTraffic(ipv4.ProtocolNumber)
+	if err != nil {
+		return err
+	}
+	val := "0\n"
+	if enabled {
+		val = "1\n"
+	}
+	buf.WriteString(val)
+	return nil
+}
+
+// Write implements vfs.WritableDynamicBytesSource.Write.
+func (rl *routeLocalnetData) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
+	if offset != 0 {
+		// No need to handle partial writes thus far.
+		return 0, linuxerr.EINVAL
+	}
+	buf := make([]int32, 1)
+	n, err := ParseInt32Vec(ctx, src, buf)
+	if err != nil || n == 0 {
+		return 0, err
+	}
+	if err := rl.stack.SetAllowExternalLoopbackTraffic(ipv4.ProtocolNumber, buf[0] != 0); err != nil {
+		return 0, err
+	}
 	return n, nil
 }
 

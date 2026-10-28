@@ -46,7 +46,10 @@
 //
 //	subprocessPool.mu
 //		subprocess.mu
-//			platformContext.mu
+//
+//	subprocess.aliveMu
+//		subprocess.syscallThreadMu
+//		subprocess.sysmsgThreadsMu
 //
 // +checkalignedignore
 package systrap
@@ -141,9 +144,9 @@ type platformContext struct {
 
 	// sharedContext is everything related to this platformContext that is resident in
 	// shared memory with the stub thread.
-	// sharedContext is only accessed on the Task goroutine, therefore it is not
-	// mutex protected.
-	sharedContext *sharedContext
+	// sharedContext is only written on the Task goroutine, but atomic because
+	// NotifyInterrupt may read it from any goroutines.
+	sharedContext atomic.Pointer[sharedContext]
 
 	// needRestoreFPState indicates that the FPU state has been changed by
 	// the Sentry and has to be updated on the stub thread.
@@ -176,14 +179,15 @@ func (c *platformContext) place(ctx pkgcontext.Context) {
 		return
 	}
 	id, mask := placer.HostCPUPlacement()
-	shared := c.sharedContext.shared
-	if id == c.sharedContext.placementID {
+	sc := c.sharedContext.Load()
+	if id == sc.placementID {
 		return
 	}
+	shared := sc.shared
 	n := copy(shared.CPUMask[:], mask)
 	clear(shared.CPUMask[n:])
 	atomic.StoreUint32(&shared.PlacementID, id)
-	c.sharedContext.placementID = id
+	sc.placementID = id
 }
 
 // PullFullState implements platform.Context.PullFullState.
@@ -209,6 +213,9 @@ func (c *platformContext) FullStateChanged() {
 func (c *platformContext) Switch(ctx pkgcontext.Context, mm platform.MemoryManager, ac *arch.Context64, cpu int32) (*linux.SignalInfo, hostarch.AccessType, error) {
 	as := mm.AddressSpace()
 	s := as.(*subprocess)
+	if s.dead.Load() {
+		return nil, hostarch.NoAccess, errDeadSubprocessContext
+	}
 	if err := s.activateContext(c); err != nil {
 		return nil, hostarch.NoAccess, err
 	}
@@ -216,8 +223,9 @@ func (c *platformContext) Switch(ctx pkgcontext.Context, mm platform.MemoryManag
 	if named, ok := ctx.(interface{ Name() string }); ok {
 		name = named.Name()
 	}
-	c.sharedContext.shared.ThreadName = [linux.TASK_COMM_LEN]byte{}
-	copy(c.sharedContext.shared.ThreadName[:linux.TASK_COMM_LEN-1], name)
+	shared := c.sharedContext.Load().shared
+	shared.ThreadName = [linux.TASK_COMM_LEN]byte{}
+	copy(shared.ThreadName[:linux.TASK_COMM_LEN-1], name)
 	c.place(ctx)
 	guestGS := disableSyscallPatching
 	if !guestGS {
@@ -228,16 +236,16 @@ func (c *platformContext) Switch(ctx pkgcontext.Context, mm platform.MemoryManag
 		}
 	}
 	if guestGS {
-		atomic.StoreUint32(&c.sharedContext.shared.GuestGS, 1)
+		atomic.StoreUint32(&shared.GuestGS, 1)
 	} else {
-		atomic.StoreUint32(&c.sharedContext.shared.GuestGS, 0)
+		atomic.StoreUint32(&shared.GuestGS, 0)
 	}
 
 restart:
 	isSyscall, needPatch, at, err := s.switchToApp(c, ac)
-	if c.sharedContext.placementID != 0 {
+	if sc := c.sharedContext.Load(); sc != nil && sc.placementID != 0 {
 		// Before CPUID emulation, which reports the CPU.
-		c.hostCPU.Store(atomic.LoadUint32(&c.sharedContext.shared.HostCPU))
+		c.hostCPU.Store(atomic.LoadUint32(&sc.shared.HostCPU))
 	}
 	if err != nil {
 		return nil, hostarch.NoAccess, err
@@ -279,17 +287,23 @@ func (c *platformContext) Interrupt() {
 // Preempt implements platform.Context.Preempt.
 func (c *platformContext) Preempt() {}
 
+// NotifyInterrupt implements interrupt.Receiver.NotifyInterrupt.
+func (c *platformContext) NotifyInterrupt() {
+	if sc := c.sharedContext.Load(); sc != nil {
+		sc.NotifyInterrupt()
+	}
+}
+
 // Release releases all platform resources used by the platformContext.
 func (c *platformContext) Release() {
-	if c.sharedContext != nil {
-		c.sharedContext.release()
-		c.sharedContext = nil
+	if sc := c.sharedContext.Swap(nil); sc != nil {
+		sc.release()
 	}
 }
 
 // PrepareSleep implements platform.Context.PrepareSleep.
 func (c *platformContext) PrepareSleep() {
-	ctx := c.sharedContext
+	ctx := c.sharedContext.Load()
 	if ctx == nil {
 		return
 	}
@@ -445,6 +459,7 @@ func (*Systrap) NewContext(ctx pkgcontext.Context) platform.Context {
 		needToPullFullState: false,
 	}
 	c.hostCPU.Store(sysmsg.HostCPUUnknown)
+	c.interrupt.Dst = c
 	return c
 }
 
@@ -466,7 +481,8 @@ func (*constructor) OpenDevice(_ string) (*fd.FD, error) {
 // Requirements implements platform.Constructor.Requirements().
 func (*constructor) Requirements() platform.Requirements {
 	return platform.Requirements{
-		RequiresCapSysPtrace: true,
+		RequiresCapSysPtrace:      true,
+		FrequentHostThreadWakeups: true,
 	}
 }
 

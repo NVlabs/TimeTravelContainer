@@ -1,5 +1,5 @@
 load("//pkg/sync/locking:locking.bzl", "declare_mutex", "declare_rwmutex")
-load("//tools:defs.bzl", "go_library")
+load("//tools:defs.bzl", "go_library", "go_test")
 
 package(default_applicable_licenses = ["//:license"])
 
@@ -14,6 +14,7 @@ go_library(
         "cpu.go",
         "cpu_mutex.go",
         "cpuset.go",
+        "cpuset_mutex.go",
         "event.go",
         "filesystem.go",
         "memory.go",
@@ -47,6 +48,17 @@ go_library(
     ],
 )
 
+go_test(
+    name = "cgroup2fs_test",
+    size = "small",
+    srcs = ["cgroup_freeze_credit_test.go"],
+    library = ":cgroup2fs",
+    deps = [
+        "//pkg/context",
+        "//pkg/sentry/kernel",
+    ],
+)
+
 declare_rwmutex(
     name = "tree_mutex",
     out = "tree_mutex.go",
@@ -73,4 +85,11 @@ declare_mutex(
     out = "cpu_mutex.go",
     package = "cgroup2fs",
     prefix = "cpu",
+)
+
+declare_mutex(
+    name = "cpuset_mutex",
+    out = "cpuset_mutex.go",
+    package = "cgroup2fs",
+    prefix = "cpuset",
 )

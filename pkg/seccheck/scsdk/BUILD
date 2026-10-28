@@ -18,8 +18,8 @@ go_library(
     visibility = ["//:sandbox"],
     deps = [
         "//pkg/abi/linux",
+        "//pkg/control/api",
         "//pkg/control/client",
-        "//pkg/sentry/control",
         "//pkg/sentry/seccheck/points:points_go_proto",
         "//pkg/urpc",
         "@org_golang_x_sys//unix:go_default_library",
@@ -33,7 +33,7 @@ go_test(
     srcs = ["fs_test.go"],
     library = ":scsdk",
     deps = [
-        "//pkg/sentry/control",
+        "//pkg/control/api",
         "//pkg/unet",
         "//pkg/urpc",
         "@org_golang_x_sys//unix:go_default_library",

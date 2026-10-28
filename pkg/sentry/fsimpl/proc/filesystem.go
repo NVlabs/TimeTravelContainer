@@ -16,6 +16,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package proc implements a partial in-memory file system for procfs.
+//
+// Task-mutex exclusions on concrete proc methods also apply through
+// kernfs.Inode, kernfs.DataSourceProvider, and vfs.DynamicBytesSource.
+// These interfaces do not expose the concrete task owner to checklocks.
 package proc
 
 import (

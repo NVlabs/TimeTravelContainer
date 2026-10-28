@@ -169,25 +169,23 @@ func (rfd *replicaFileDescription) Ioctl(ctx context.Context, io usermem.IO, sys
 	case linux.TCGETS2:
 		return rfd.inode.t.ld.getTermios2(t, args)
 	case linux.TCSETS:
-		return rfd.inode.t.ld.setTermios(t, args)
+		return rfd.inode.t.ld.setTermios(t, args, false /* flushInput */)
 	case linux.TCSETSW:
-		// Note that this should drain the output queue first, but we
-		// don't implement that yet.
-		return rfd.inode.t.ld.setTermios(t, args)
+		// Draining output is a no-op for PTYs.
+		return rfd.inode.t.ld.setTermios(t, args, false /* flushInput */)
 	case linux.TCSETSF:
-		// This should drain the output queue and clear the input queue
-		// first, but we don't implement that yet.
-		return rfd.inode.t.ld.setTermios(t, args)
+		// Draining output is a no-op for PTYs, but pending input must be
+		// discarded.
+		return rfd.inode.t.ld.setTermios(t, args, true /* flushInput */)
 	case linux.TCSETS2:
-		return rfd.inode.t.ld.setTermios2(t, args)
+		return rfd.inode.t.ld.setTermios2(t, args, false /* flushInput */)
 	case linux.TCSETSW2:
-		// Note that this should drain the output queue first, but we
-		// don't implement that yet.
-		return rfd.inode.t.ld.setTermios2(t, args)
+		// Draining output is a no-op for PTYs.
+		return rfd.inode.t.ld.setTermios2(t, args, false /* flushInput */)
 	case linux.TCSETSF2:
-		// This should drain the output queue and clear the input queue
-		// first, but we don't implement that yet.
-		return rfd.inode.t.ld.setTermios2(t, args)
+		// Draining output is a no-op for PTYs, but pending input must be
+		// discarded.
+		return rfd.inode.t.ld.setTermios2(t, args, true /* flushInput */)
 	case linux.TCSBRK:
 		// TCSBRK with arg != 0 is tcdrain, which waits for output to
 		// drain. For a pty with no real hardware, this is a no-op.
@@ -231,6 +229,16 @@ func (rfd *replicaFileDescription) Ioctl(ctx context.Context, io usermem.IO, sys
 		}
 		rfd.inode.t.ld.observeForeground(int32(pgid))
 		return 0, nil
+	case linux.TIOCGSID:
+		// Get the session id. The replica must be the caller's
+		// controlling terminal.
+		sid, err := t.ThreadGroup().SessionID(rfd.inode.t.replicaKTTY, true /* requireCtty */)
+		if err != nil {
+			return 0, err
+		}
+		ret := primitive.Int32(sid)
+		_, err = ret.CopyOut(t, args[2].Pointer())
+		return 0, err
 	default:
 		maybeEmitUnimplementedEvent(ctx, sysno, cmd)
 		return 0, linuxerr.ENOTTY

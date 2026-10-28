@@ -70,6 +70,7 @@ func (fd *regularFileFD) getCurrentFD(ctx context.Context) (*vfs.FileDescription
 	return wrappedFD, nil
 }
 
+// +checklocks:fd.mu
 func (fd *regularFileFD) currentFDLocked(ctx context.Context) (*vfs.FileDescription, error) {
 	d := fd.dentry()
 	statusFlags := fd.vfsfd.StatusFlags()
@@ -148,6 +149,10 @@ func (fd *regularFileFD) Stat(ctx context.Context, opts vfs.StatOptions) (linux.
 		if err != nil {
 			return linux.Statx{}, err
 		}
+		// The layer's STATX_ATTR_MOUNT_ROOT refers to the layer mount, not
+		// the overlay mount; FileDescription.Stat sets it for fd.
+		stat.Attributes &^= linux.STATX_ATTR_MOUNT_ROOT
+		stat.AttributesMask &^= linux.STATX_ATTR_MOUNT_ROOT
 	}
 	fd.dentry().statInternalTo(ctx, &opts, &stat)
 	return stat, nil
@@ -175,17 +180,24 @@ func (fd *regularFileFD) SetStat(ctx context.Context, opts vfs.SetStatOptions) e
 		return err
 	}
 	defer mnt.EndWrite()
-	if err := d.copyUpLocked(ctx); err != nil {
-		return err
+	// d.copiedUp is never cleared once set, so this check can be safely
+	// performed without holding locks.
+	if !d.isCopiedUp() {
+		d.fs.renameMu.RLock()
+		err := d.copyUpLocked(ctx)
+		d.fs.renameMu.RUnlock()
+		if err != nil {
+			return err
+		}
 	}
-	// Changes to d's attributes are serialized by d.copyMu.
-	d.copyMu.Lock()
-	defer d.copyMu.Unlock()
 	wrappedFD, err := fd.getCurrentFD(ctx)
 	if err != nil {
 		return err
 	}
 	defer wrappedFD.DecRef(ctx)
+	// Changes to d's attributes are serialized by d.copyMu.
+	d.copyMu.Lock()
+	defer d.copyMu.Unlock()
 	if err := wrappedFD.SetStat(ctx, opts); err != nil {
 		return err
 	}

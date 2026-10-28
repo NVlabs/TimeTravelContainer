@@ -205,6 +205,45 @@ func TestAdd(t *testing.T) {
 	}
 }
 
+func TestX86Family(t *testing.T) {
+	tests := []struct {
+		name string
+		sig  uint32
+		want uint32
+	}{
+		{name: "Family6", sig: 0x6 << 8, want: 6},
+		{name: "Family6IgnoresExtendedFamily", sig: 0x0a<<20 | 0x6<<8, want: 6},
+		{name: "Family0Fh", sig: 0xf << 8, want: 15},
+		{name: "Family19h", sig: 0x0a<<20 | 0xf<<8, want: 25},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := x86Family(tc.sig); got != tc.want {
+				t.Errorf("x86Family(%#x) = %d, want %d", tc.sig, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWriteCPUInfoFamilyEPYC(t *testing.T) {
+	// Overlay an AMD EPYC 7R13-like signature (family 19h) on the host
+	// feature set so WriteCPUInfoTo has the rest of the leaves it needs.
+	s := HostFeatureSet().ToStatic()
+	in := In{Eax: uint32(featureInfo)}
+	out := s.Query(in)
+	const familyMask = 0x0ff00f00 // extended family 27:20 and family 11:8
+	out.Eax = (out.Eax &^ familyMask) | 0x0a<<20 | 0xf<<8
+	s.Set(in, out)
+
+	var buf strings.Builder
+	s.ToFeatureSet().WriteCPUInfoTo(0, 1, &buf)
+	got := buf.String()
+	const want = "cpu family\t: 25\n"
+	if !strings.Contains(got, want) {
+		t.Errorf("WriteCPUInfoTo() missing %q, got:\n%s", want, got)
+	}
+}
+
 func TestRemove(t *testing.T) {
 	// Try removing the last feature.
 	testFeatures := makeFeatureSet(X86FeatureFPU, X86FeaturePAE)
@@ -220,18 +259,18 @@ func TestRemove(t *testing.T) {
 	}
 }
 
-func TestWithoutFSGSBASE(t *testing.T) {
+func TestUnsetFSGSBASEHWCap(t *testing.T) {
 	fs := makeFeatureSet(X86FeatureFSGSBase, X86FeatureFPU)
 	fs.hwCap.hwCap2 = HWCAP2_FSGSBASE
-	masked := fs.WithoutFSGSBASE()
+	masked := fs.UnsetFSGSBASE()
 	if masked.HasFeature(X86FeatureFSGSBase) {
-		t.Fatalf("WithoutFSGSBASE left CPUID feature enabled: %q", masked.FlagString())
+		t.Fatalf("UnsetFSGSBASE left CPUID feature enabled: %q", masked.FlagString())
 	}
 	if masked.hwCap.hwCap2&HWCAP2_FSGSBASE != 0 {
-		t.Fatalf("WithoutFSGSBASE left AT_HWCAP2 bit enabled: %#x", masked.hwCap.hwCap2)
+		t.Fatalf("UnsetFSGSBASE left AT_HWCAP2 bit enabled: %#x", masked.hwCap.hwCap2)
 	}
 	if !masked.HasFeature(X86FeatureFPU) {
-		t.Fatalf("WithoutFSGSBASE removed unrelated features: %q", masked.FlagString())
+		t.Fatalf("UnsetFSGSBASE removed unrelated features: %q", masked.FlagString())
 	}
 }
 
@@ -270,5 +309,19 @@ func TestHostCPUIDFeatures(t *testing.T) {
 	}
 	if again := HostCPUIDFeatures(); again != got {
 		t.Fatalf("HostCPUIDFeatures changed from %q to %q", got, again)
+	}
+}
+
+func TestUnsetFSGSBASE(t *testing.T) {
+	hostFeatures := HostFeatureSet()
+	guestFeatures := hostFeatures.UnsetFSGSBASE()
+
+	if guestFeatures.HasFeature(X86FeatureFSGSBase) {
+		t.Errorf("UnsetFSGSBASE failed: X86FeatureFSGSBase should be disabled")
+	}
+
+	out := guestFeatures.Query(In{Eax: 7, Ecx: 0})
+	if out.Ebx&1 != 0 {
+		t.Errorf("UnsetFSGSBASE failed: CPUID.(EAX=7, ECX=0).EBX bit 0 (FSGSBASE) should be 0, got %x", out.Ebx)
 	}
 }

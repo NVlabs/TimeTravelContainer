@@ -129,8 +129,8 @@ go_test(
         "//pkg/abi/linux/errno",
         "//pkg/context",
         "//pkg/syserr",
-        "@org_golang_x_sys//unix:go_default_library",
         "//pkg/tcpip",
         "//pkg/waiter",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )

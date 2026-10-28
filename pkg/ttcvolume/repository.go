@@ -3158,6 +3158,79 @@ func (r *Repository) Rename(branchID string, oldParent uint64, oldName string, n
 	})
 }
 
+// Exchange swaps the files that oldName in oldParent and newName in newParent
+// name, as rename(2) with RENAME_EXCHANGE does: both must exist, and either
+// may be a directory, empty or not.
+func (r *Repository) Exchange(branchID string, oldParent uint64, oldName string, newParent uint64, newName string) error {
+	if err := validateEntryName(oldName); err != nil {
+		return err
+	}
+	if err := validateEntryName(newName); err != nil {
+		return err
+	}
+	return r.withLock(func() error {
+		branch, err := r.readBranch(branchID)
+		if err != nil {
+			return err
+		}
+		state, err := r.metadataForBranch(branch)
+		if err != nil {
+			return err
+		}
+		oldParentInode, err := r.metadataInode(state, oldParent)
+		if err != nil {
+			return err
+		}
+		newParentInode, err := r.metadataInode(state, newParent)
+		if err != nil {
+			return err
+		}
+		if oldParentInode.Type != "directory" || newParentInode.Type != "directory" {
+			return syscall.ENOTDIR
+		}
+		oldIno, err := r.metadataLookup(state, oldParent, oldName)
+		if err != nil {
+			return err
+		}
+		newIno, err := r.metadataLookup(state, newParent, newName)
+		if err != nil {
+			return err
+		}
+		if oldIno == newIno {
+			return nil
+		}
+		oldInode, err := r.metadataInode(state, oldIno)
+		if err != nil {
+			return err
+		}
+		newInode, err := r.metadataInode(state, newIno)
+		if err != nil {
+			return err
+		}
+		ops := []metadataOp{
+			{Kind: metadataSetEntry, Parent: oldParent, Entry: &DirectoryEntry{Name: oldName, Inode: newIno}},
+			{Kind: metadataSetEntry, Parent: newParent, Entry: &DirectoryEntry{Name: newName, Inode: oldIno}},
+		}
+		// A directory's ".." moves to its new parent with it: the parents'
+		// link counts change if only one of the files is a directory.
+		oldDir, newDir := oldInode.Type == "directory", newInode.Type == "directory"
+		if oldParent != newParent && oldDir != newDir {
+			from, to := &oldParentInode, &newParentInode
+			if newDir {
+				from, to = to, from
+			}
+			if from.Nlink > 0 {
+				from.Nlink--
+			}
+			to.Nlink++
+			ops = append(ops,
+				metadataOp{Kind: metadataSetInode, Inode: &oldParentInode},
+				metadataOp{Kind: metadataSetInode, Inode: &newParentInode})
+		}
+		return r.commitMetadata(&branch, state, ops)
+	})
+}
+
 // UpdateMetadata replaces branch-local metadata fields while retaining
 // identity, type, link count, data object and generation.
 func (r *Repository) UpdateMetadata(branchID string, updated Inode) error {

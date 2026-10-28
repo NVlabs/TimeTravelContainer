@@ -49,6 +49,7 @@ package ptrace
 
 import (
 	"math"
+	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	pkgcontext "gvisor.dev/gvisor/pkg/context"
@@ -86,6 +87,9 @@ type context struct {
 	// interrupt is the interrupt context.
 	interrupt interrupt.Forwarder
 
+	// thread is the subprocess thread this context used for its last switch.
+	thread atomic.Pointer[thread]
+
 	// mu protects the following fields.
 	mu sync.Mutex
 
@@ -107,7 +111,15 @@ type context struct {
 func (*PTrace) NewContext(ctx pkgcontext.Context) platform.Context {
 	c := new(context)
 	c.archContext.init(ctx)
+	c.interrupt.Dst = c
 	return c
+}
+
+// NotifyInterrupt implements interrupt.Receiver.NotifyInterrupt.
+func (c *context) NotifyInterrupt() {
+	if t := c.thread.Load(); t != nil {
+		t.NotifyInterrupt()
+	}
 }
 
 // Switch runs the provided context in the given address space.

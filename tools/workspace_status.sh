@@ -23,7 +23,7 @@
 # identity and TTC's exact client/daemon and daemon/daemon compatibility fence
 # could accept them. Include a deterministic digest of every tracked change
 # and every non-ignored untracked file instead.
-if base=$(git describe --always --tags --abbrev=12 2>/dev/null); then
+if base=$(git describe --always --tags --exclude 'release-*-staging' --abbrev=12 2>/dev/null); then
   changed=false
   if ! git diff --quiet HEAD -- || ! git diff --cached --quiet HEAD --; then
     changed=true

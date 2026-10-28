@@ -369,6 +369,19 @@ func (fs FeatureSet) HasFeature(feature Feature) bool {
 	return feature.check(fs)
 }
 
+// x86Family returns the CPU family printed in /proc/cpuinfo from a CPUID
+// leaf 1 EAX signature.
+//
+// This matches Linux arch/x86/lib/cpu.c:x86_family(). When the 4-bit
+// family ID is 0xf, the 8-bit extended family is added.
+func x86Family(sig uint32) uint32 {
+	family := (sig >> 8) & 0xf
+	if family == 0xf {
+		family += (sig >> 20) & 0xff
+	}
+	return family
+}
+
 // WriteCPUInfoTo is to generate a section of one cpu in /proc/cpuinfo. This is
 // a minimal /proc/cpuinfo, it is missing some fields like "microcode" that are
 // not always printed in Linux. Several fields are simply made up.
@@ -652,19 +665,6 @@ func (fs FeatureSet) UseFSGSBASE() bool {
 	return fs.HasFeature(X86FeatureFSGSBase) && ((fs.hwCap.hwCap2 & HWCAP2_FSGSBASE) != 0)
 }
 
-// WithoutFSGSBASE returns fs without advertising userspace FSGSBASE
-// instructions through CPUID or AT_HWCAP2. This is used by systrap while its
-// syscall-patching fast path temporarily owns GS; conforming applications then
-// request GS changes through arch_prctl, where systrap can transition safely.
-func (fs FeatureSet) WithoutFSGSBASE() FeatureSet {
-	static := fs.ToStatic()
-	static.Remove(X86FeatureFSGSBase)
-	masked := static.ToFeatureSet()
-	masked.hwCap = fs.hwCap
-	masked.hwCap.hwCap2 &^= HWCAP2_FSGSBASE
-	return masked
-}
-
 // WithoutAVX512 returns fs without advertising AVX-512 instructions. This is
 // useful for execution backends that intentionally preserve only the portable
 // x87/SSE/AVX subset of userspace XSAVE state.
@@ -724,4 +724,19 @@ func (fs FeatureSet) AllowedHWCap1() uint64 {
 func (fs FeatureSet) AllowedHWCap2() uint64 {
 	// HWCAPS are not supported on amd64.
 	return 0
+}
+
+// UnsetFSGSBASE returns fs without advertising userspace FSGSBASE
+// instructions through CPUID or AT_HWCAP2. This is used by systrap while its
+// syscall-patching fast path temporarily owns GS; conforming applications then
+// request GS changes through arch_prctl, where systrap can transition safely.
+// If userspace used WRGSBASE without the Sentry's knowledge, it would corrupt
+// the GS register used by systrap for syscall patching.
+func (fs FeatureSet) UnsetFSGSBASE() FeatureSet {
+	s := fs.ToStatic()
+	X86FeatureFSGSBase.Unset(s)
+	sfs := s.ToFeatureSet()
+	sfs.hwCap = fs.hwCap
+	sfs.hwCap.hwCap2 &^= HWCAP2_FSGSBASE
+	return sfs
 }

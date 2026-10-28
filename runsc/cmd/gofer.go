@@ -25,7 +25,6 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strconv"
-	"time"
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -33,7 +32,6 @@ import (
 
 	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/pinring"
 	"gvisor.dev/gvisor/pkg/ttcpack"
 	"gvisor.dev/gvisor/pkg/unet"
 	"gvisor.dev/gvisor/pkg/urpc"
@@ -132,16 +130,6 @@ type Gofer struct {
 	profileFDs        profile.FDArgs
 	syncFDs           goferSyncFDs
 	stopProfiling     func()
-
-	// pinRingFD is the donated pin ring (see `//pkg/pinring`).
-	// Never used (on purpose), and never closed.
-	// It must stay open until this process exits to reap the benefits.
-	// See `--pin-ring-fd`.
-	pinRingFD int
-
-	// sentryExitSyncFD receives a pidfd of the sandbox process.
-	// The gofer waits on it before exiting. See `--sync-sentry-exit-fd`.
-	sentryExitSyncFD int
 }
 
 // Name implements subcommands.Command.
@@ -177,8 +165,6 @@ func (g *Gofer) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&g.lazyPrefix, "ttc-lazy-prefix", "", "optional TTC image pack path prefix preserved across gofer re-exec")
 	f.IntVar(&g.mountsFD, "mounts-fd", -1, "mountsFD is the file descriptor to write list of mounts after they have been resolved (direct paths, no symlinks).")
 	f.IntVar(&g.goferToHostRPCFD, "rpc-fd", -1, "gofer-to-host RPC file descriptor.")
-	f.IntVar(&g.pinRingFD, "pin-ring-fd", -1, "FD of a disabled io_uring with slow-to-release sandbox FDs pinned to it. Deliberately held open and unused by the gofer such that the sandbox process is not the last ref holder to them, making their release asynchronous.")
-	f.IntVar(&g.sentryExitSyncFD, "sync-sentry-exit-fd", -1, "socket FD over which a pidfd of the sandbox process is received. Used by the gofer to wait for the sandbox to fully exit before exiting itself.")
 
 	// IDs to run gofer as.
 	f.IntVar(&g.uid, "uid", 0, "User ID")
@@ -660,11 +646,6 @@ func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid i
 	server.Wait()
 	server.Destroy()
 	log.Infof("All lisafs servers exited.")
-	if g.sentryExitSyncFD >= 0 {
-		if !pinring.WaitExit(g.sentryExitSyncFD, 500*time.Millisecond) {
-			log.Warningf("Sandbox still running 500ms after its gofer connections closed; something is slowing down sandbox teardown more than necessary. Exiting anyway.")
-		}
-	}
 	if g.stopProfiling != nil {
 		g.stopProfiling()
 	}

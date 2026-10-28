@@ -108,6 +108,7 @@ const (
 	AMPERE_COMPUTE_A                 = 0x0000c6c0
 	NVC6FA_VIDEO_OFA                 = 0x0000c6fa
 	BLACKWELL_USERMODE_A             = 0x0000c761
+	AMPERE_B                         = 0x0000c797
 	NVC7B0_VIDEO_DECODER             = 0x0000c7b0
 	AMPERE_DMA_COPY_B                = 0x0000c7b5
 	NVC7B7_VIDEO_ENCODER             = 0x0000c7b7
@@ -440,6 +441,17 @@ type NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS struct {
 	EngineType                  uint32
 	BIsCallingContextVgpuPlugin uint8
 	Pad0                        [3]byte
+}
+
+// NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS_V615 is the updated version of
+// NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS since 615.71.09.
+//
+// +marshal
+type NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS_V615 struct {
+	_ structs.HostLayout
+	NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS
+	Reserved      uint32
+	InternalFlags uint32
 }
 
 // NV_MEMORY_DESC_PARAMS is from

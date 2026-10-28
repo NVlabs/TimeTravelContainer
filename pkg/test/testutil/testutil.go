@@ -288,6 +288,36 @@ func TestConfig(t *testing.T) *config.Config {
 	return conf
 }
 
+// ConfigForBenchmark returns the default configuration to use in benchmarks.
+// Debugging, tracing, and logging are disabled to ensure accurate performance
+// measurements.
+func ConfigForBenchmark(b *testing.B) *config.Config {
+	testFlags := flag.NewFlagSet("bench", flag.ContinueOnError)
+	config.RegisterFlags(testFlags)
+	conf, err := config.NewFromFlags(testFlags)
+	if err != nil {
+		b.Fatalf("error loading configuration from flags: %v", err)
+	}
+	conf.Debug = false
+	conf.Strace = false
+	conf.LogPackets = false
+	conf.Network = config.NetworkNone
+	conf.TestOnlyAllowRunAsCurrentUserWithoutChroot = true
+	conf.WatchdogAction = "panic"
+	return conf
+}
+
+// Measure executes fn while the benchmark timer is running. It starts the timer
+// immediately before calling fn, pauses it when fn returns (even if fn panics or
+// fails), and returns the elapsed duration of fn.
+func Measure(b *testing.B, fn func()) time.Duration {
+	b.StartTimer()
+	start := time.Now()
+	defer b.StopTimer()
+	fn()
+	return time.Since(start)
+}
+
 // NewSpecWithArgs creates a simple spec with the given args suitable for use
 // in tests.
 func NewSpecWithArgs(args ...string) *specs.Spec {
@@ -549,38 +579,45 @@ func StartReaper() func() {
 }
 
 // WaitUntilRead reads from the given reader until the wanted string is found
-// or until timeout.
+// or until timeout. The caller owns r; after a timeout, it must release any
+// blocked Read (for example by closing the reader) to let the scanner exit.
 func WaitUntilRead(r io.Reader, want string, timeout time.Duration) error {
-	sc := bufio.NewScanner(r)
-	// done must be accessed atomically. A value greater than 0 indicates
-	// that the read loop can exit.
-	doneCh := make(chan bool)
-	defer close(doneCh)
-	go func() {
-		for sc.Scan() {
-			t := sc.Text()
-			if strings.Contains(t, want) {
-				doneCh <- true
-				return
-			}
-			select {
-			case <-doneCh:
-				return
-			default:
-			}
-		}
-		doneCh <- false
-	}()
-
+	cancel := make(chan struct{})
+	defer close(cancel)
+	result := readUntil(r, want, cancel)
 	select {
 	case <-time.After(timeout):
 		return fmt.Errorf("timeout waiting to read %q", want)
-	case res := <-doneCh:
-		if !res {
+	case found := <-result:
+		if !found {
 			return fmt.Errorf("reader closed while waiting to read %q", want)
 		}
 		return nil
 	}
+}
+
+// readUntil owns the scanner and result channel. Its single result can be
+// published even after the waiter has canceled and stopped receiving.
+func readUntil(r io.Reader, want string, cancel <-chan struct{}) <-chan bool {
+	sc := bufio.NewScanner(r)
+	result := make(chan bool, 1)
+	go func() {
+		defer close(result)
+		for sc.Scan() {
+			t := sc.Text()
+			if strings.Contains(t, want) {
+				result <- true
+				return
+			}
+			select {
+			case <-cancel:
+				return
+			default:
+			}
+		}
+		result <- false
+	}()
+	return result
 }
 
 // KillCommand kills the process running cmd unless it hasn't been started. It

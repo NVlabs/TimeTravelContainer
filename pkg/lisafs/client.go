@@ -56,9 +56,15 @@ type Client struct {
 
 	// channelsMu protects channels, availableChannels, growing and full.
 	channelsMu sync.Mutex
+
 	// channels tracks all the channels.
+	//
+	// +checklocks:channelsMu
 	channels []*channel
+
 	// availableChannels is a LIFO (stack) of channels available to be used.
+	//
+	// +checklocks:channelsMu
 	availableChannels []*channel
 	// growing is whether a channel is being made for requests that found
 	// every channel in use, and full whether the server takes no more: see
@@ -78,10 +84,13 @@ type Client struct {
 	// It is initialized on Mount and is immutable.
 	maxMessageSize uint32
 
+	fdsMu sync.Mutex
+
 	// fdsToClose tracks the FDs to close. It caches the FDs no longer being used
 	// by the client and closes them in one shot. It is not preserved across
 	// checkpoint/restore as FDIDs are not preserved.
-	fdsMu      sync.Mutex
+	//
+	// +checklocks:fdsMu
 	fdsToClose []FDID
 }
 
@@ -129,6 +138,9 @@ func NewClient(sock *unet.Socket) (*Client, Inode, int, error) {
 // thread while it waits for a request, and a mount whose requests come one at
 // a time, as those of a container's files bound into it do, held as many
 // threads as the server takes channels.
+//
+// +checklocksexclude:c.channelsMu
+// +checklocksexclude:c.sockMu
 func (c *Client) StartChannels() error {
 	maxChans := maxChannels()
 	c.channelsMu.Lock()
@@ -203,6 +215,7 @@ func (c *Client) watchdog() {
 	c.sockComm.destroy()
 }
 
+// +checklocksexclude:c.channelsMu
 func (c *Client) shutdownActiveChans() {
 	c.channelsMu.Lock()
 	defer c.channelsMu.Unlock()
@@ -224,6 +237,9 @@ func (c *Client) shutdownActiveChans() {
 }
 
 // Close shuts down the main socket and waits for the watchdog to clean up.
+// The watchdog acquires channelsMu while shutting down and destroying channels.
+//
+// +checklocksexclude:c.channelsMu
 func (c *Client) Close() {
 	// This shutdown has no effect if the watchdog has already fired and closed
 	// the main socket.
@@ -231,6 +247,8 @@ func (c *Client) Close() {
 	c.watchdogWg.Wait()
 }
 
+// +checklocksexclude:c.channelsMu
+// +checklocksexclude:c.sockMu
 func (c *Client) createChannel() (*channel, error) {
 	var (
 		chanReq  ChannelReq
@@ -276,6 +294,10 @@ func (c *Client) IsSupported(m MID) bool {
 // CloseFD either queues the passed FD to be closed or makes a batch
 // RPC to close all the accumulated FDs-to-close. If flush is true, the RPC
 // is made immediately.
+//
+// +checklocksexclude:c.channelsMu
+// +checklocksexclude:c.sockMu
+// +checklocksexclude:c.fdsMu
 func (c *Client) CloseFD(ctx context.Context, fd FDID, flush bool) {
 	c.fdsMu.Lock()
 	c.fdsToClose = append(c.fdsToClose, fd)
@@ -339,6 +361,9 @@ func (c *Client) FlushCloseFDs(ctx context.Context) {
 }
 
 // SyncFDs makes a Fsync RPC to sync multiple FDs.
+//
+// +checklocksexclude:c.channelsMu
+// +checklocksexclude:c.sockMu
 func (c *Client) SyncFDs(ctx context.Context, fds []FDID) error {
 	if len(fds) == 0 {
 		return nil
@@ -360,6 +385,9 @@ func (c *Client) SyncFDs(ctx context.Context, fds []FDID) error {
 // combining these functions into an interface type.
 //
 // Precondition: function arguments must be non-nil.
+//
+// +checklocksexclude:c.channelsMu
+// +checklocksexclude:c.sockMu
 func (c *Client) SndRcvMessage(m MID, payloadLen uint32, reqMarshal marshalFunc, respUnmarshal unmarshalFunc, respFDs []int, reqString debugStringer, respString debugStringer) error {
 	if !c.IsSupported(m) {
 		return unix.EOPNOTSUPP
@@ -458,7 +486,14 @@ func debugf(action string, comm Communicator, debugMsg debugStringer) {
 	}
 }
 
-// Postcondition: releaseCommunicator() must be called on the returned value.
+// acquireCommunicator borrows a channel or locks the main socket. It holds
+// sockMu on return only for a *sockCommunicator; checklocks cannot express
+// a lock effect conditional on the returned interface's dynamic type.
+//
+// Postcondition: c.releaseCommunicator must be called on the returned value.
+//
+// +checklocksexclude:c.channelsMu
+// +checklocksexclude:c.sockMu
 func (c *Client) acquireCommunicator() Communicator {
 	// Prefer using channel over socket because:
 	//	- Channel uses a shared memory region for passing messages. IO from shared
@@ -473,7 +508,12 @@ func (c *Client) acquireCommunicator() Communicator {
 	return c.sockComm
 }
 
-// Precondition: comm must have been acquired via acquireCommunicator().
+// releaseCommunicator ends a use begun by c.acquireCommunicator.
+//
+// Precondition: comm was returned by this c's acquireCommunicator and has
+// not yet been released. For a *sockCommunicator, c.sockMu is still held.
+//
+// +checklocksexclude:c.channelsMu
 func (c *Client) releaseCommunicator(comm Communicator) {
 	switch t := comm.(type) {
 	case *sockCommunicator:
@@ -488,6 +528,8 @@ func (c *Client) releaseCommunicator(comm Communicator) {
 // getChannel pops a channel from the available channels stack. The caller must
 // release the channel after use. If every channel is in use, it returns nil,
 // and has one more made for the requests to come, up to maxChannels().
+//
+// +checklocksexclude:c.channelsMu
 func (c *Client) getChannel() *channel {
 	c.channelsMu.Lock()
 	defer c.channelsMu.Unlock()
@@ -506,8 +548,10 @@ func (c *Client) getChannel() *channel {
 	return ch
 }
 
-// releaseChannel pushes the passed channel onto the available channel stack if
-// reinsert is true.
+// releaseChannel ends a channel use and makes the channel available again
+// unless the channel is dead or the client is shutting down.
+//
+// +checklocksexclude:c.channelsMu
 func (c *Client) releaseChannel(ch *channel) {
 	c.channelsMu.Lock()
 	defer c.channelsMu.Unlock()

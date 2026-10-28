@@ -446,7 +446,7 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 				child.releaseLoaded(opts.Clocks)
 			} else {
 				if child != nil {
-					child.cleaupDevGofers()
+					child.cleanupDevGofers()
 				}
 				if remotePageLoad != nil {
 					remotePageLoad.Cancel()
@@ -839,7 +839,7 @@ func (k *Kernel) loadCapturedLiveForkChild(
 		if childLoaded {
 			return
 		}
-		child.cleaupDevGofers()
+		child.cleanupDevGofers()
 		k.mf.Destroy()
 	}()
 	mfs := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile)

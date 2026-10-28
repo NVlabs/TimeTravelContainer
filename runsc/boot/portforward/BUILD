@@ -56,7 +56,6 @@ go_test(
         "//pkg/buffer",
         "//pkg/context",
         "//pkg/errors/linuxerr",
-        "//pkg/sentry/contexttest",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/vfs",
         "//pkg/tcpip",

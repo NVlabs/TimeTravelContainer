@@ -84,15 +84,17 @@ type Task struct {
 
 	// taskWorkCount represents the current size of the task work queue. It is
 	// used to avoid acquiring taskWorkMu when the queue is empty.
+	//
+	// +checkatomic
+	// +checklocks:taskWorkMu
 	taskWorkCount atomicbitops.Int32
 
-	// taskWorkMu protects taskWork.
 	taskWorkMu taskWorkMutex `state:"nosave"`
 
 	// taskWork is a queue of work to be executed before resuming user execution.
 	// It is similar to the task_work mechanism in Linux.
 	//
-	// taskWork is exclusive to the task goroutine.
+	// +checklocks:taskWorkMu
 	taskWork []TaskWorker
 
 	// haveSyscallReturn is true if image.Arch().Return() represents a value
@@ -204,6 +206,30 @@ type Task struct {
 	// groupStopPending is protected by the signal mutex.
 	groupStopPending bool
 
+	// freezeOrdered mirrors t's cgroup's effective cgroup.freeze state;
+	// runInterrupt parks t in frozenStop when set. Relayed by cgroup2fs
+	// (Task.ApplyFreezeTasksLocked) to avoid a signalHandlers.mu ->
+	// fs.tasksMu deadlock.
+	//
+	// Protected by the signal mutex.
+	freezeOrdered bool
+
+	// hasFreezeCredit: t owes a cgroup a resolution, paid by parking,
+	// thaw, exit, or migration. Not inferable from t.stop's type: a
+	// killable stop force-ends (killLocked) even post-resolution, so
+	// t.stop can't distinguish "never parked" from "parked, then killed".
+	//
+	// Protected by the signal mutex.
+	hasFreezeCredit bool
+
+	// freezeCreditCgroup is the cgroup that issued the outstanding
+	// credit -- always use it, never re-derive via Cgroup2(): cgroup2Mu
+	// isn't nested under signalHandlers.mu, so a fresh lookup racing a
+	// migration could credit/debit the wrong cgroup.
+	//
+	// Protected by the signal mutex.
+	freezeCreditCgroup Cgroup2
+
 	// If groupStopAcknowledged is true, the task has already acknowledged that
 	// it is entering the most recent group stop that has been initiated on its
 	// thread group.
@@ -268,7 +294,9 @@ type Task struct {
 
 	// exitStatus is the task's exit status.
 	//
-	// exitStatus is protected by the signal mutex.
+	// The task goroutine writes exitStatus under the signal mutex. After
+	// TaskExitZombie it is immutable and may be read with only TaskSet.mu.
+	// checklocks cannot express this lifecycle-dependent locking rule.
 	exitStatus linux.WaitStatus
 
 	// syscallRestartBlock represents a custom restart function to run in
@@ -479,7 +507,7 @@ type Task struct {
 
 	// noNewPrivs determines whether the task is allowed to gain new privileges.
 	//
-	// noNewPrivs is protected by mu.
+	// +checklocks:mu
 	noNewPrivs bool
 
 	// utsns is the task's UTS namespace.
@@ -526,9 +554,9 @@ type Task struct {
 	// a mask of host CPUs, which confine the task's application thread.
 	//
 	// Invariant: allowedCPUMask.Size() ==
-	// sched.CPUMaskSize(Kernel.applicationCores).
+	// sched.CPUSetSize(Kernel.applicationCores).
 	//
-	// allowedCPUMask is protected by mu.
+	// +checklocks:mu
 	allowedCPUMask sched.CPUSet
 
 	// placement is allowedCPUMask as a platform.HostCPUPlacer placement, or
@@ -545,7 +573,7 @@ type Task struct {
 	// runtime schedules tasks, and only provides reasonable results for
 	// sched_getscheduler(2), sched_getattr(2), and similar.
 	//
-	// sched is protected by mu.
+	// +checklocks:mu
 	sched SchedPolicy
 
 	// This is used to keep track of changes made to a process' priority/niceness.
@@ -555,13 +583,13 @@ type Task struct {
 	// NOTE: This represents the userspace view of priority (nice).
 	// This means that the value should be in the range [-20, 19].
 	//
-	// niceness is protected by mu.
+	// +checklocks:mu
 	niceness int
 
 	// This is used to keep track of a process's IO class and priority.
 	// It is only used to provide a reasonable return value for ioprio_get().
 	//
-	// ioprio is protected by mu.
+	// +checklocks:mu
 	ioprio int
 
 	// This is used to track the numa policy for the current thread. This can be
@@ -573,8 +601,10 @@ type Task struct {
 	// always report a single node so never need to save more than a single
 	// bit.
 	//
-	// numaPolicy and numaNodeMask are protected by mu.
-	numaPolicy   linux.NumaPolicy
+	// +checklocks:mu
+	numaPolicy linux.NumaPolicy
+
+	// +checklocks:mu
 	numaNodeMask uint64
 
 	// numaPolicyNow and numaNodeMaskNow are numaPolicy and numaNodeMask, for
@@ -698,7 +728,10 @@ type Task struct {
 	Origin TaskOrigin
 
 	// onDestroyAction is a set of callbacks that are executed when the
-	// task is destroyed.
+	// task is destroyed. The map is detached under mu before callbacks run
+	// asynchronously without mu.
+	//
+	// +checklocks:mu
 	onDestroyAction map[TaskDestroyAction]struct{}
 
 	// Helps serializes an execve(2) with a PTRACE_ATTACH and seccomp tsync. See the comment for
@@ -887,7 +920,9 @@ func (t *Task) NewFDAt(fd int32, file *vfs.FileDescription, flags FDFlags) (*vfs
 	return t.fdTable.NewFDAt(t, fd, file, flags)
 }
 
-// WithMuLocked executes f with t.mu locked.
+// WithMuLocked acquires t.mu, calls f synchronously, and releases t.mu.
+//
+// +checklocksexclude:t.mu
 func (t *Task) WithMuLocked(f func(*Task)) {
 	t.mu.Lock()
 	f(t)
@@ -955,6 +990,8 @@ func (t *Task) SetKcov(k *Kcov) {
 }
 
 // ResetKcov clears the kcov instance associated with t.
+//
+// +checklocksexclude:t.kcov.mu
 func (t *Task) ResetKcov() {
 	if t.kcov != nil {
 		t.kcov.OnTaskExit()

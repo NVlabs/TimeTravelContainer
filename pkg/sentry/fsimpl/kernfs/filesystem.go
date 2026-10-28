@@ -59,17 +59,18 @@ func (fs *Filesystem) stepExistingLocked(ctx context.Context, rp *vfs.ResolvingP
 		return d, false, nil
 	}
 	if name == ".." {
+		parent := d.parent.Load()
 		if isRoot, err := rp.CheckRoot(ctx, d.VFSDentry()); err != nil {
 			return nil, false, err
-		} else if isRoot || d.parent.Load() == nil {
+		} else if isRoot || parent == nil {
 			rp.Advance()
 			return d, false, nil
 		}
-		if err := rp.CheckMount(ctx, d.Parent().VFSDentry()); err != nil {
+		if err := rp.CheckMount(ctx, parent.VFSDentry()); err != nil {
 			return nil, false, err
 		}
 		rp.Advance()
-		return d.parent.Load(), false, nil
+		return parent, false, nil
 	}
 	if len(name) > linux.NAME_MAX {
 		return nil, false, linuxerr.ENAMETOOLONG
@@ -364,10 +365,7 @@ func (fs *Filesystem) AccessAt(ctx context.Context, rp *vfs.ResolvingPath, creds
 	if err := d.inode.CheckPermissions(ctx, creds, ats); err != nil {
 		return err
 	}
-	if ats.MayWrite() && rp.Mount().ReadOnly() {
-		return linuxerr.EROFS
-	}
-	return nil
+	return vfs.CheckMountAccess(rp, ats, d.inode.Mode())
 }
 
 // GetDentryAt implements vfs.FilesystemImpl.GetDentryAt.
@@ -845,14 +843,16 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	}
 
 	srcVFSD := src.VFSDentry()
-	if err := virtfs.PrepareRenameDentry(mntns, srcVFSD, dstVFSD); err != nil {
+	handle, err := virtfs.PrepareRenameDentry(mntns, srcVFSD, dstVFSD)
+	if err != nil {
 		return err
 	}
 	err = srcDir.inode.Rename(ctx, src.name, newName, src.inode, dstDir.inode)
 	if err != nil {
-		virtfs.AbortRenameDentry(srcVFSD, dstVFSD)
+		virtfs.AbortRenameDentry(&handle, srcVFSD, dstVFSD)
 		return err
 	}
+	virtfs.RenameBegin(&handle)
 	delete(srcDir.children, src.name)
 	if srcDir != dstDir {
 		fs.deferDecRef(srcDir) // child (src) drops ref on old parent.
@@ -873,7 +873,7 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		replaced.setDeleted()
 	}
 	vfs.InotifyRename(ctx, src.inode.Watches(), srcDir.inode.Watches(), dstDir.inode.Watches(), oldName, newName, src.isDir())
-	for _, rc := range virtfs.CommitRenameReplaceDentry(ctx, srcVFSD, replaceVFSD) { // +checklocksforce: to may be nil, that's okay.
+	for _, rc := range virtfs.CommitRenameReplaceDentry(ctx, &handle, srcVFSD, replaceVFSD) { // +checklocksforce: to may be nil, that's okay.
 		fs.deferDecRef(rc)
 	}
 	return nil
@@ -974,7 +974,12 @@ func (fs *Filesystem) SetStatAt(ctx context.Context, rp *vfs.ResolvingPath, opts
 // StatAt implements vfs.FilesystemImpl.StatAt.
 func (fs *Filesystem) StatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.StatOptions) (linux.Statx, error) {
 	if rp.Done() && opts.Sync == linux.AT_STATX_DONT_SYNC {
-		return rp.Start().Impl().(*Dentry).inode.Stat(ctx, fs.VFSFilesystem(), opts)
+		stat, err := rp.Start().Impl().(*Dentry).inode.Stat(ctx, fs.VFSFilesystem(), opts)
+		if err != nil {
+			return linux.Statx{}, err
+		}
+		rp.AddMountRootAttr(rp.Start(), &stat)
+		return stat, nil
 	}
 
 	fs.mu.RLock()
@@ -984,7 +989,12 @@ func (fs *Filesystem) StatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 	if err != nil {
 		return linux.Statx{}, err
 	}
-	return d.inode.Stat(ctx, fs.VFSFilesystem(), opts)
+	stat, err := d.inode.Stat(ctx, fs.VFSFilesystem(), opts)
+	if err != nil {
+		return linux.Statx{}, err
+	}
+	rp.AddMountRootAttr(d.VFSDentry(), &stat)
+	return stat, nil
 }
 
 // StatFSAt implements vfs.FilesystemImpl.StatFSAt.

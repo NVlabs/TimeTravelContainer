@@ -53,7 +53,7 @@ func (*Systrap) SanitizeFeatureSet(fs cpuid.FeatureSet) cpuid.FeatureSet {
 	if disableSyscallPatching {
 		return fs
 	}
-	return fs.WithoutFSGSBASE()
+	return fs.UnsetFSGSBASE()
 }
 
 func stackPointer(r *arch.Registers) uintptr {

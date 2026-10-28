@@ -565,7 +565,7 @@ type AddressSpaceDeathNotifier interface {
 // AddressSpaceIO supports IO through the memory mappings installed in an
 // AddressSpace.
 //
-// AddressSpaceIO implementors are responsible for ensuring that address ranges
+// AddressSpaceIO implementers are responsible for ensuring that address ranges
 // are application-mappable.
 type AddressSpaceIO interface {
 	// CopyOut copies len(src) bytes from src to the memory mapped at addr. It
@@ -664,6 +664,10 @@ type Requirements struct {
 	// RequiresCapSysPtrace indicates that the sandbox has to be started with
 	// the CAP_SYS_PTRACE capability.
 	RequiresCapSysPtrace bool
+
+	// FrequentHostThreadWakeups indicates that the platform wakes sleeping
+	// host threads at a very high rate.
+	FrequentHostThreadWakeups bool
 }
 
 // SeccompInfo represents seccomp-bpf data for a given platform.

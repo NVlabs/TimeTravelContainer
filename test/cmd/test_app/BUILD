@@ -13,6 +13,7 @@ go_binary(
     testonly = 1,
     srcs = [
         "chardev.go",
+        "exec_thread.go",
         "fds.go",
         "hostinet_sr.go",
         "main.go",

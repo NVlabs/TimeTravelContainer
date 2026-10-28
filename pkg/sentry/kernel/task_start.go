@@ -155,6 +155,12 @@ func (ts *TaskSet) taskLimitReachedLocked() bool {
 //
 // If successful, NewTask transfers references held by cfg to the new task.
 // Otherwise, NewTask releases them.
+//
+// Preconditions: cfg.Kernel.tasks must be ts. cfg.ThreadGroup and any
+// non-nil cfg.Parent or cfg.InheritParent must belong to ts.
+//
+// +checklocksexclude:ts.mu
+// +checklocksexclude:cfg.ThreadGroup.signalHandlers.mu
 func (ts *TaskSet) NewTask(ctx context.Context, cfg *TaskConfig) (*Task, error) {
 	var err error
 	cleanup := func() {
@@ -185,6 +191,11 @@ func (ts *TaskSet) NewTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 
 // newTask is a helper for TaskSet.NewTask that only takes ownership of parts
 // of cfg if it succeeds.
+//
+// Preconditions: As for NewTask.
+//
+// +checklocksexclude:ts.mu
+// +checklocksexclude:cfg.ThreadGroup.signalHandlers.mu
 func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) {
 	srcT := TaskFromContext(ctx)
 	tg := cfg.ThreadGroup
@@ -339,7 +350,7 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 	// current->signal->tty, which differs from the parent's under
 	// CLONE_PARENT.
 	if srcT != nil {
-		inhTTY = srcT.tg.GetTTY() // Takes a ref, balanced in defer, or transfered to tg.tty.
+		inhTTY = srcT.tg.GetTTY() // Takes a ref, balanced in defer, or transferred to tg.tty.
 	}
 
 	// For the standard, non-cloneIntoCgroup fork case, we have to do this
@@ -353,6 +364,9 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 		} else if cfg.InitialCgroupV2 != nil {
 			// Container start or exec into an existing container.
 			cgroup2 = cfg.InitialCgroupV2
+		} else if cfg.CgroupNamespace != nil {
+			// Container start with dedicated cgroup namespace.
+			cgroup2 = cfg.CgroupNamespace.Root()
 		} else {
 			// Direct exec into the sandbox.
 			cgroup2 = cfg.Kernel.Cgroup2FS().RootCgroup()
@@ -432,7 +446,7 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 		// New thread group.
 		tg.leader = t
 		if parentPG := tg.parentPG(); parentPG == nil {
-			tg.createSession()
+			tg.createSession() // +checklocksforce: ts.mu is tg.pidns.owner.mu.
 		} else {
 			// Inherit the process group and terminal.
 			parentPG.incRefWithParent(parentPG)

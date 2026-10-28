@@ -315,6 +315,16 @@ type Loader struct {
 
 	hostTHP HostTHP
 
+	// saveMu serializes save operations. Saves can be requested concurrently:
+	// autosave in save-resume mode is triggered by any task executing the
+	// trigger syscall, and checkpoints may be requested concurrently via the
+	// control API. Overlapping saves race: post-save cleanup
+	// (Kernel.BeforeResume) runs outside Kernel.extMu, so save N's cleanup can
+	// clear state that save N+1's in-progress Kernel.SaveTo has just set up.
+	//
+	// Lock order: saveMu is taken before mu.
+	saveMu sync.Mutex
+
 	// mu guards the fields below.
 	mu sync.Mutex
 
@@ -433,6 +443,19 @@ type execProcess struct {
 	// pidnsPath is the pid namespace path in spec
 	pidnsPath string
 
+	// pidns is the PID namespace that pidnsPath refers to. It is set together
+	// with pidnsPath, before the container's process is created, and holds a
+	// reference that is released when this execProcess is removed from
+	// Loader.processes (or by Loader.Destroy).
+	//
+	// Containers joining a PID namespace look this up instead of deriving it
+	// from tg, which is nil until the container actually starts. Keeping the
+	// namespace here means the mapping stays valid even if the container that
+	// created it never starts, and that the namespace is not leaked.
+	//
+	// Invariant: pidns is non-nil whenever pidnsPath has been set.
+	pidns *kernel.PIDNamespace
+
 	// cgroupnsPath is the cgroup namespace path in spec
 	cgroupnsPath string
 
@@ -440,6 +463,14 @@ type execProcess struct {
 	// TTY file is passed during container create and must be saved until
 	// container start.
 	hostTTY *fd.FD
+}
+
+// releasePIDNamespace drops the PID namespace reference held by ep, if any.
+func (ep *execProcess) releasePIDNamespace(ctx context.Context) {
+	if ep.pidns != nil {
+		ep.pidns.DecRef(ctx)
+		ep.pidns = nil
+	}
 }
 
 // fdMapping maps guest to host file descriptors. Guest file descriptors are
@@ -472,6 +503,10 @@ type Args struct {
 	// its expensive-to-release files into. See `//pkg/pinring`.
 	// -1 if there is no ring.
 	PinRingFD int
+	// CPUDMALatencyFD is an FD for /dev/cpu_dma_latency that the boot
+	// process opened to cap host CPU idle states. The Loader takes
+	// ownership of it. -1 if unset.
+	CPUDMALatencyFD int
 	// Device is an optional argument that is passed to the platform. The Loader
 	// takes ownership of this file and may close it at any time.
 	Device *fd.FD
@@ -883,6 +918,14 @@ func New(args Args) (*Loader, error) {
 
 	// Create kernel and platform.
 	l.pinRing.FD = args.PinRingFD
+	if args.CPUDMALatencyFD >= 0 {
+		if l.pinRing.Exists() {
+			l.pinRing.Add(args.CPUDMALatencyFD)
+		} else {
+			log.Infof("No pin ring to hold /dev/cpu_dma_latency; not capping host CPU idle states")
+		}
+		unix.Close(args.CPUDMALatencyFD)
+	}
 	p, err := createPlatform(args.Conf, args.NumCPU, args.Device, args.ID, args.StartupTimer, &l.pinRing)
 	if err != nil {
 		return nil, fmt.Errorf("creating platform: %w", err)
@@ -983,7 +1026,7 @@ func New(args Args) (*Loader, error) {
 
 	cpufs := cpuid.HostFeatureSet()
 	if args.Conf.Platform == "systrap" && !args.Conf.SystrapDisableSyscallPatching {
-		cpufs = cpufs.WithoutFSGSBASE()
+		cpufs = cpufs.UnsetFSGSBASE()
 	}
 	if value, ok := args.Spec.Annotations[specutils.AnnotationCPUFeatures]; ok {
 		allowedFeatures := make(map[cpuid.Feature]struct{})
@@ -1038,6 +1081,7 @@ func New(args Args) (*Loader, error) {
 		MaxTasks:             maxTasks,
 		Cgroup2FSInit:        cgroup2fs.NewFilesystem,
 		CPUTopology:          cpuTopology,
+		SignalUnkillable:     signalUnkillablePolicy(args.Conf.SignalUnkillablePolicy),
 	}); err != nil {
 		return nil, fmt.Errorf("initializing kernel: %w", err)
 	}
@@ -1357,6 +1401,11 @@ func (l *Loader) Destroy() {
 	l.mu.Lock()
 	for _, m := range l.sharedMounts {
 		m.DecRef(ctx)
+	}
+	// Release PID namespaces held by containers that were never destroyed
+	// individually, e.g. the root container.
+	for _, ep := range l.processes {
+		ep.releasePIDNamespace(ctx)
 	}
 	if l.cgroup2Mount != nil {
 		l.cgroup2Mount.DecRef(ctx)
@@ -1771,7 +1820,12 @@ func (l *Loader) run() error {
 		l.finalMountNamespace = mntns
 	}
 	if ns, ok := specutils.GetNS(specs.PIDNamespace, l.root.spec); ok {
+		// The root container's process always runs in the root PID namespace.
+		// Record it alongside the path so that a subcontainer naming the same
+		// path joins it.
 		ep.pidnsPath = ns.Path
+		ep.pidns = l.k.RootPIDNamespace()
+		ep.pidns.IncRef()
 	}
 
 	// Handle signals by forwarding them to the root container process
@@ -1889,7 +1943,8 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 			for _, p := range l.processes {
 				if ns.Path == p.pidnsPath {
 					log.Debugf("Joining PID namespace named %q", ns.Path)
-					pidns = p.tg.PIDNamespace()
+					pidns = p.pidns
+					pidns.IncRef()
 					break
 				}
 			}
@@ -1898,7 +1953,10 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 			log.Warningf("PID namespace %q not found, running in new PID namespace", ns.Path)
 			pidns = l.k.RootPIDNamespace().NewChild(l.k.SupervisorContext(), l.k, l.k.RootUserNamespace())
 		}
+		// Publish the namespace, not just the path, so that containers joining it
+		// do not depend on this container ever starting.
 		ep.pidnsPath = ns.Path
+		ep.pidns = pidns
 	} else {
 		pidns = l.k.RootPIDNamespace()
 	}
@@ -2180,16 +2238,13 @@ func (l *Loader) startGoferMonitor(info *containerInfo) {
 			panic(fmt.Sprintf("Error monitoring gofer FDs: %s", err))
 		}
 
-		l.mu.Lock()
-		defer l.mu.Unlock()
-
-		// The gofer could have been stopped due to a normal container shutdown.
-		// Check if the container has not stopped yet.
-		if tg, _ := l.tryThreadGroupFromIDLocked(execID{cid: info.cid}); tg != nil {
-			log.Infof("Gofer socket disconnected, killing container %q", info.cid)
-			if err := l.signalAllProcesses(info.cid, int32(linux.SIGKILL)); err != nil {
-				log.Warningf("Error killing container %q after gofer stopped: %s", info.cid, err)
-			}
+		tg, _ := l.threadGroupFromID(execID{cid: info.cid})
+		if tg == nil {
+			return
+		}
+		log.Infof("Gofer socket disconnected, killing container %q", info.cid)
+		if err := l.signalAllProcesses(info.cid, int32(linux.SIGKILL)); err != nil {
+			log.Warningf("Error killing container %q after gofer stopped: %s", info.cid, err)
 		}
 	}()
 }
@@ -2223,8 +2278,9 @@ func (l *Loader) destroySubcontainer(cid string) error {
 	// No more failure from this point on.
 
 	// Remove all container thread groups from the map.
-	for key := range l.processes {
+	for key, ep := range l.processes {
 		if key.cid == cid {
+			ep.releasePIDNamespace(l.k.SupervisorContext())
 			delete(l.processes, key)
 		}
 	}
@@ -3212,8 +3268,8 @@ func (l *Loader) containerRuntimeState(cid string) ContainerRuntimeState {
 		// Container has no thread group assigned, so it has not started yet.
 		return RuntimeStateCreating
 	}
-	if exec.tg.Leader().ExitState() == kernel.TaskExitNone {
-		// Init process is still running.
+	if exec.tg.HasNonExitingTasks() {
+		// Init process thread group is still running.
 		return RuntimeStateRunning
 	}
 	// Init process has stopped, but no one has called wait on it yet.
@@ -3225,4 +3281,17 @@ func (l *Loader) GetContainerSpecs() map[string]*specs.Spec {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.containerSpecs
+}
+
+// signalUnkillablePolicy maps the runsc config signal-unkillable policy
+// to the corresponding kernel policy.
+func signalUnkillablePolicy(p config.SignalUnkillablePolicy) kernel.SignalUnkillablePolicy {
+	switch p {
+	case config.SignalUnkillableLinux:
+		return kernel.SignalUnkillableLinux
+	case config.SignalUnkillableNone:
+		return kernel.SignalUnkillableNone
+	default:
+		return kernel.SignalUnkillableNone
+	}
 }

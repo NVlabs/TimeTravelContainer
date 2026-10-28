@@ -56,14 +56,14 @@ struct thread_context;
 
 // sysmsg contains the current state of the sysmsg thread. See: sysmsg.go:Msg
 struct sysmsg {
-  struct sysmsg *self;
+  struct sysmsg* self;
   uint64_t ret_addr;
   uint64_t syshandler;
   uint64_t syshandler_stack;
   uint64_t app_stack;
   uint32_t interrupt;
   uint32_t state;
-  struct thread_context *context;
+  struct thread_context* context;
 
   // The fields above have offsets defined in sysmsg_offsets*.h
 
@@ -183,13 +183,13 @@ extern uint64_t __export_pr_sched_core;
 extern uint64_t __export_deep_sleep_timeout;
 extern struct arch_state __export_arch_state;
 struct context_queue;
-extern struct context_queue *__export_context_queue_addr;
+extern struct context_queue* __export_context_queue_addr;
 
 // NOLINTBEGIN(runtime/int)
-static void *sysmsg_sp() {
+static void* sysmsg_sp() {
   volatile int p;
-  void *sp =
-      (struct sysmsg *)(((long)&p) / PER_THREAD_MEM_SIZE * PER_THREAD_MEM_SIZE);
+  void* sp =
+      (struct sysmsg*)(((long)&p) / PER_THREAD_MEM_SIZE * PER_THREAD_MEM_SIZE);
 
   _Static_assert(
       sizeof(struct sysmsg) < (PER_THREAD_MEM_SIZE - MSG_OFFSET_FROM_START),
@@ -197,8 +197,8 @@ static void *sysmsg_sp() {
   return sp;
 }
 
-static struct sysmsg *sysmsg_addr(void *sp) {
-  return (struct sysmsg *)(sp + MSG_OFFSET_FROM_START);
+static struct sysmsg* sysmsg_addr(void* sp) {
+  return (struct sysmsg*)(sp + MSG_OFFSET_FROM_START);
 }
 
 // on_alt_stack reports whether addr is in the alternate stack of the thread
@@ -212,18 +212,19 @@ static bool on_alt_stack(struct sysmsg *sysmsg, uint64_t addr) {
 long __syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6);
 
 struct __kernel_timespec;
-long sys_futex(uint32_t *addr, int op, int val, struct __kernel_timespec *tv,
-               uint32_t *addr2, int val3);
+long sys_futex(uint32_t* addr, int op, int val, struct __kernel_timespec* tv,
+               uint32_t* addr2, int val3);
 
 static void __panic(int err, int err_additional, long line) {
-  void *sp = sysmsg_sp();
-  struct sysmsg *sysmsg = sysmsg_addr(sp);
-  struct thread_context *ctx = sysmsg->context;
+  void* sp = sysmsg_sp();
+  struct sysmsg* sysmsg = sysmsg_addr(sp);
+  struct thread_context* ctx = sysmsg->context;
   sysmsg->err = err;
   sysmsg->err_additional = err_additional;
   sysmsg->err_line = line;
   // Wake up the goroutine waiting on the current context.
-  __atomic_store_n(&ctx->state, CONTEXT_STATE_FAULT, __ATOMIC_RELEASE);
+  __atomic_store_n(&ctx->state, CONTEXT_STATE_UNEXPECTED_DEATH,
+                   __ATOMIC_RELEASE);
   sys_futex(&ctx->state, FUTEX_WAKE, 1, NULL, NULL, 666);
   // crash the stub process.
   //
@@ -232,11 +233,11 @@ static void __panic(int err, int err_additional, long line) {
   // process with a segfault.
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Warray-bounds"
-  *(int *)(line % 4096) = err;
+  *(int*)(line % 4096) = err;
 #pragma GCC diagnostic pop
 }
 
-void memcpy(uint8_t *dest, uint8_t *src, size_t n);
+void memcpy(uint8_t* dest, uint8_t* src, size_t n);
 
 // zero zeroes n bytes at dest, which are 8-byte aligned, as memset does.
 void zero(void *dest, size_t n);
@@ -245,16 +246,16 @@ void zero(void *dest, size_t n);
 // keeps and the handler does not need to resume a context from it.
 void scrub_frame(struct sysmsg *sysmsg);
 
-void __export_start(struct sysmsg *sysmsg, void *_ucontext);
+void __export_start(struct sysmsg* sysmsg, void* _ucontext);
 
-void restore_state(struct sysmsg *sysmsg, struct thread_context *ctx,
-                   void *_ucontext);
+void restore_state(struct sysmsg* sysmsg, struct thread_context* ctx,
+                   void* _ucontext);
 
-struct thread_context *switch_context(struct sysmsg *sysmsg,
-                                      struct thread_context *ctx,
+struct thread_context* switch_context(struct sysmsg* sysmsg,
+                                      struct thread_context* ctx,
                                       enum context_state new_context_state);
 
-int wait_state(struct sysmsg *sysmsg, enum thread_state new_thread_state);
+int wait_state(struct sysmsg* sysmsg, enum thread_state new_thread_state);
 void init_new_thread(void);
 
 #define panic(err, err_additional) __panic(err, err_additional, __LINE__)

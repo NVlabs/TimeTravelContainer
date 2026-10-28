@@ -679,6 +679,15 @@ type dentry struct {
 
 	locks vfs.FileLocks
 
+	// writeCount tracks write access to the file represented by this dentry,
+	// and is used to prevent a file from being written while it is being
+	// executed. See vfs.WriteCount.
+	//
+	// Note that, as with watches below, hard links to the same file do not
+	// share a writeCount, because this overlay implementation has no inode
+	// structures.
+	writeCount vfs.WriteCount
+
 	// watches is the set of inotify watches on the file represented by this dentry.
 	//
 	// Note that hard links to the same file will not share the same set of
@@ -866,13 +875,36 @@ func (d *dentry) Watches() *vfs.Watches {
 	return &d.watches
 }
 
+// contextID is this package's type for context.Context.Value keys.
+type contextID int
+
+const (
+	// CtxDropList is a Context.Value key for a **[]*dentry. While fs.renameMu
+	// is held, inotify notifications are sent with this key set so that
+	// OnZeroWatches appends dentries to the list instead of locking
+	// fs.renameMu itself; the caller drops them once it unlocks.
+	CtxDropList contextID = iota
+)
+
+// withDropList returns ctx with CtxDropList set to ds.
+//
+// Preconditions: fs.renameMu must be locked.
+func withDropList(ctx context.Context, ds **[]*dentry) context.Context {
+	return context.WithValue(ctx, CtxDropList, ds)
+}
+
 // OnZeroWatches implements vfs.DentryImpl.OnZeroWatches.
 func (d *dentry) OnZeroWatches(ctx context.Context) {
-	if d.refs.Load() == 0 {
-		d.fs.renameMu.Lock()
-		d.checkDropLocked(ctx)
-		d.fs.renameMu.Unlock()
+	if d.refs.Load() != 0 {
+		return
 	}
+	if ds, ok := ctx.Value(CtxDropList).(**[]*dentry); ok {
+		*ds = appendDentry(*ds, d)
+		return
+	}
+	d.fs.renameMu.Lock()
+	d.checkDropLocked(ctx)
+	d.fs.renameMu.Unlock()
 }
 
 // iterLayers invokes yield on each layer comprising d, from top to bottom. If
@@ -907,6 +939,11 @@ func (d *dentry) topLookupLayer() lookupLayer {
 		return lookupLayerUpper
 	}
 	return lookupLayerLower
+}
+
+// WriteCount implements vfs.WriteCounter.WriteCount.
+func (d *dentry) WriteCount() *vfs.WriteCount {
+	return &d.writeCount
 }
 
 func (d *dentry) checkPermissions(creds *auth.Credentials, ats vfs.AccessTypes) error {
@@ -945,6 +982,7 @@ func (d *dentry) statInternalTo(ctx context.Context, opts *vfs.StatOptions, stat
 }
 
 // Preconditions: d.copyMu must be locked for writing.
+// +checklocks:d.copyMu
 func (d *dentry) updateAfterSetStatLocked(opts *vfs.SetStatOptions) {
 	if opts.Stat.Mask&linux.STATX_MODE != 0 {
 		// If the mode was changed, the underlying file's ACL may have changed,

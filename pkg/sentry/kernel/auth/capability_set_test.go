@@ -140,7 +140,7 @@ func TestComputeCredsForExec(t *testing.T) {
 			wantEffective: false,
 		},
 		{
-			name: "TestAmbientCapsPreservedWithFileCapsAndNoNewPrivs",
+			name: "TestAmbientCapsClearedWithFileCapsAndNoNewPrivs",
 			filePrivs: FilePrivileges{
 				HasCaps:         true,
 				Effective:       false,
@@ -149,8 +149,32 @@ func TestComputeCredsForExec(t *testing.T) {
 			},
 			creds:         credentialsWithCaps(AllCapabilities, AllCapabilities, AllCapabilities, CapabilitySetOf(linux.CAP_NET_ADMIN)),
 			noNewPrivs:    true,
-			wantPermitted: CapabilitySetOf(linux.CAP_NET_ADMIN),
+			wantPermitted: CapabilitySetOf(linux.CAP_CHOWN),
+			wantEffective: false,
+		},
+		{
+			name: "TestFileCapsAlreadyHeldKeptWithNoNewPrivs",
+			filePrivs: FilePrivileges{
+				HasCaps:       true,
+				Effective:     true,
+				PermittedCaps: CapabilitySetOf(linux.CAP_NET_BIND_SERVICE),
+			},
+			creds:         credentialsWithCaps(CapabilitySetOf(linux.CAP_NET_BIND_SERVICE), 0, AllCapabilities, 0),
+			noNewPrivs:    true,
+			wantPermitted: CapabilitySetOf(linux.CAP_NET_BIND_SERVICE),
 			wantEffective: true,
+		},
+		{
+			name: "TestFileCapsNotGainedWithNoNewPrivs",
+			filePrivs: FilePrivileges{
+				HasCaps:       true,
+				Effective:     true,
+				PermittedCaps: CapabilitySetOf(linux.CAP_NET_BIND_SERVICE),
+			},
+			creds:         credentialsWithCaps(0, 0, AllCapabilities, 0),
+			noNewPrivs:    true,
+			wantPermitted: 0,
+			wantEffective: false,
 		},
 		{
 			name: "TestAmbientCapsClearedWithSUIDNonRoot",

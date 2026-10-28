@@ -15,12 +15,16 @@
 // All tests in this file rely on being about to mount and unmount cgroupfs,
 // which isn't expected to work, or be safe on a general linux system.
 
+#include <fcntl.h>
 #include <limits.h>
+#include <linux/capability.h>
 #include <linux/magic.h>
 #include <poll.h>
 #include <sys/inotify.h>
 #include <sys/mount.h>
+#include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -498,6 +502,16 @@ TEST(Cgroup, NamedHierarchies) {
   EXPECT_TRUE(entries.contains("name=h2"));
   EXPECT_NO_ERRNO(c1.ContainsCallingProcess());
   EXPECT_NO_ERRNO(c2.ContainsCallingProcess());
+}
+
+TEST(Cgroup, NamedHierarchyRemount) {
+  SKIP_IF(!CgroupsAvailable());
+
+  Mounter m(ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir()));
+  Cgroup c = ASSERT_NO_ERRNO_AND_VALUE(m.MountCgroupfs("none,name=h1"));
+  ASSERT_NO_ERRNO(m.Unmount(c));
+  // Once the hierarchy is gone, its name is free for reuse.
+  EXPECT_NO_ERRNO(m.MountCgroupfs("none,name=h1"));
 }
 
 TEST(Cgroup, NoneExclusiveWithAnyController) {

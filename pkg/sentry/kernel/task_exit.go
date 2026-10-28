@@ -498,6 +498,14 @@ func (tg *ThreadGroup) anyNonExitingTaskLocked() *Task {
 	return nil
 }
 
+// HasNonExitingTasks returns true if any task in tg has not yet begun
+// exiting.
+func (tg *ThreadGroup) HasNonExitingTasks() bool {
+	tg.pidns.owner.mu.RLock()
+	defer tg.pidns.owner.mu.RUnlock()
+	return tg.anyNonExitingTaskLocked() != nil
+}
+
 // reparentLocked changes t's parent. The new parent may be nil.
 //
 // Preconditions: The TaskSet mutex must be locked for writing.
@@ -664,6 +672,8 @@ func (*runExitNotify) execute(t *Task) taskRunState {
 // termination signal is.
 //
 // Preconditions: The TaskSet mutex must be locked for writing.
+//
+// +checklocksexclude:t.mu
 func (t *Task) exitNotifyLocked(fromPtraceDetach bool) {
 	if t.exitStateLocked() != TaskExitZombie {
 		return
@@ -816,6 +826,8 @@ type TaskDestroyAction interface {
 //
 // It returns true if the action was successfully registered.
 // If the task is already terminated, it returns false.
+//
+// +checklocksexclude:t.mu
 func (t *Task) RegisterOnDestroyAction(act TaskDestroyAction) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -828,12 +840,15 @@ func (t *Task) RegisterOnDestroyAction(act TaskDestroyAction) bool {
 
 // UnregisterOnDestroyAction unregisters an action previously registered with
 // RegisterOnDestroyAction.
+//
+// +checklocksexclude:t.mu
 func (t *Task) UnregisterOnDestroyAction(key TaskDestroyAction) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.onDestroyAction, key)
 }
 
+// +checklocksexclude:t.mu
 func (t *Task) execOnDestroyActions() {
 	t.mu.Lock()
 	actions := t.onDestroyAction

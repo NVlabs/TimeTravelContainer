@@ -595,6 +595,28 @@ func (s *Stack) setLinkLocked(ctx context.Context, id tcpip.NICID, linkAttrs map
 
 const defaultMTU = 1500
 
+// allocDeviceName returns the first name of the form prefix+index, counting
+// from zero, that no device in the stack has, the way Linux's dev_alloc_name
+// names devices created without one. When the device is about to be moved to
+// dstNs, the name has to be free there too.
+func (s *Stack) allocDeviceName(prefix string, dstNs *inet.Namespace) string {
+	taken := make(map[string]struct{})
+	for _, nicInfo := range s.Stack.NICInfo() {
+		taken[nicInfo.Name] = struct{}{}
+	}
+	if dstNs != nil {
+		for _, nicInfo := range dstNs.Stack().(*Stack).Stack.NICInfo() {
+			taken[nicInfo.Name] = struct{}{}
+		}
+	}
+	for i := 0; ; i++ {
+		name := fmt.Sprintf("%s%d", prefix, i)
+		if _, ok := taken[name]; !ok {
+			return name
+		}
+	}
+}
+
 func (s *Stack) newVeth(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesView, linkInfoAttrs map[uint16]nlmsg.BytesView) *syserr.Error {
 	var (
 		linkInfoData  map[uint16]nlmsg.BytesView
@@ -615,10 +637,10 @@ func (s *Stack) newVeth(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesVie
 			return syserr.ErrInvalidArgument
 		}
 		if v, ok := linkInfoData[linux.VETH_INFO_PEER]; ok {
-			attrsView := nlmsg.AttrsView(v[ifinfomsg.SizeBytes():])
-			if !ok {
+			if len(v) < ifinfomsg.SizeBytes() {
 				return syserr.ErrInvalidArgument
 			}
+			attrsView := nlmsg.AttrsView(v[ifinfomsg.SizeBytes():])
 			peerLinkAttrs, ok = attrsView.Parse()
 			if !ok {
 				return syserr.ErrInvalidArgument
@@ -653,7 +675,7 @@ func (s *Stack) newVeth(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesVie
 	id := s.Stack.NextNICID()
 	peerID := peerStack.Stack.NextNICID()
 	if ifname == "" {
-		ifname = fmt.Sprintf("veth%d", id)
+		ifname = s.allocDeviceName("veth", dstNs)
 	}
 	err := s.Stack.CreateNICWithOptions(id, packetsocket.New(ethernet.New(ep)), stack.NICOptions{
 		Name: ifname,
@@ -661,6 +683,7 @@ func (s *Stack) newVeth(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesVie
 	})
 	if err != nil {
 		s.unlockSrcAndDst(ctx, dstNs)
+		peerEP.Close()
 		return syserr.TranslateNetstackError(err)
 	}
 	if err := s.setLinkLocked(ctx, id, linkAttrs, dstNs); err != nil {
@@ -670,14 +693,16 @@ func (s *Stack) newVeth(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesVie
 	}
 	s.unlockSrcAndDst(ctx, dstNs)
 
-	if peerName == "" {
-		peerName = fmt.Sprintf("veth%d", peerID)
-	}
 	peerDstNs, sysErr := peerStack.lockSrcAndDst(ctx, peerLinkAttrs)
 	if sysErr != nil {
+		peerEP.Close()
 		return sysErr
 	}
 	defer peerStack.unlockSrcAndDst(ctx, peerDstNs)
+
+	if peerName == "" {
+		peerName = peerStack.allocDeviceName("veth", peerDstNs)
+	}
 
 	err = peerStack.Stack.CreateNICWithOptions(peerID, packetsocket.New(ethernet.New(peerEP)), stack.NICOptions{
 		Name: peerName,
@@ -709,6 +734,9 @@ func (s *Stack) newBridge(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesV
 
 	if v, ok := linkAttrs[linux.IFLA_IFNAME]; ok {
 		ifname = v.String()
+	}
+	if ifname == "" {
+		ifname = s.allocDeviceName("bridge", dstNs)
 	}
 	ep := stack.NewBridgeEndpoint(defaultMTU)
 	id := s.Stack.NextNICID()
@@ -1390,6 +1418,24 @@ func (s *Stack) RestoreCleanupEndpoints(es []stack.TransportEndpoint) {
 func (s *Stack) SetForwarding(protocol tcpip.NetworkProtocolNumber, enable bool) error {
 	if err := s.Stack.SetForwardingDefaultAndAllNICs(protocol, enable); err != nil {
 		return fmt.Errorf("SetForwardingDefaultAndAllNICs(%d, %t): %s", protocol, enable, err)
+	}
+	return nil
+}
+
+// GetAllowExternalLoopbackTraffic implements inet.Stack.GetAllowExternalLoopbackTraffic.
+func (s *Stack) GetAllowExternalLoopbackTraffic(protocol tcpip.NetworkProtocolNumber) (bool, error) {
+	var opt tcpip.AllowExternalLoopbackTrafficOption
+	if err := s.Stack.NetworkProtocolOption(protocol, &opt); err != nil {
+		return false, fmt.Errorf("NetworkProtocolOption(%d, ...): %s", protocol, err)
+	}
+	return bool(opt), nil
+}
+
+// SetAllowExternalLoopbackTraffic implements inet.Stack.SetAllowExternalLoopbackTraffic.
+func (s *Stack) SetAllowExternalLoopbackTraffic(protocol tcpip.NetworkProtocolNumber, enable bool) error {
+	opt := tcpip.AllowExternalLoopbackTrafficOption(enable)
+	if err := s.Stack.SetNetworkProtocolOption(protocol, &opt); err != nil {
+		return fmt.Errorf("SetNetworkProtocolOption(%d, &%t): %s", protocol, enable, err)
 	}
 	return nil
 }

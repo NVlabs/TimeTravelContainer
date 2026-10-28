@@ -1676,17 +1676,18 @@ func formatProcMountOptions(readOnly bool, flags MountFlags) string {
 	if readOnly {
 		opts = "ro"
 	}
-	if flags.NoATime {
-		opts += ",noatime"
-	}
-	if flags.NoExec {
-		opts += ",noexec"
-	}
+	// In the order of Linux's fs/proc_namespace.c:show_mnt_opts().
 	if flags.NoSUID {
 		opts += ",nosuid"
 	}
 	if flags.NoDev {
 		opts += ",nodev"
+	}
+	if flags.NoExec {
+		opts += ",noexec"
+	}
+	if flags.NoATime {
+		opts += ",noatime"
 	}
 	return opts
 }
@@ -1752,7 +1753,7 @@ func (vfs *VirtualFilesystem) GenerateProcMountInfo(ctx context.Context, taskRoo
 			continue
 		}
 		if mp := vfs.getMountPromise(mntRootVD); mp != nil && !mp.resolved.Load() {
-			// If the caller is reponsible for resolving the mount promise,
+			// If the caller is responsible for resolving the mount promise,
 			// blocking below in StatAt will result in deadlock. Some
 			// applications expect mount promises to appear in /proc/mountinfo
 			// (b/388102869), so generate fake information to avoid this.
@@ -1804,7 +1805,8 @@ func (vfs *VirtualFilesystem) GenerateProcMountInfo(ctx context.Context, taskRoo
 		fmt.Fprintf(buf, "%s ", manglePath(pathFromRoot))
 
 		// (6) Mount options.
-		opts := formatProcMountOptions(mnt.ReadOnly(), mnt.flags)
+		mntOpts := mnt.Options()
+		opts := formatProcMountOptions(mntOpts.ReadOnly, mntOpts.Flags)
 		fmt.Fprintf(buf, "%s ", opts)
 
 		// (7) Optional fields: zero or more fields of the form "tag[:value]".

@@ -16,6 +16,7 @@ package kernel
 
 import (
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/ipc"
 )
 
@@ -41,10 +42,19 @@ const (
 
 	// CtxCgroupNamespace is a Context.Value key for a CgroupNamespace.
 	CtxCgroupNamespace
+
+	// CtxFSRestore is a Context.Value key for mapping of FS-checkpointed MemoryFiles.
+	CtxFSRestore
 )
 
 // ContextCanTrace returns true if ctx is permitted to trace t, in the same sense
 // as kernel.Task.CanTrace.
+//
+// The function obtained from CtxCanTrace has Task.CanTrace's lock
+// requirements; checklocks does not propagate contracts through this
+// context function value.
+//
+// +checklocksexclude:t.mu
 func ContextCanTrace(ctx context.Context, t *Task, attach bool) bool {
 	if v := ctx.Value(CtxCanTrace); v != nil {
 		return v.(func(*Task, bool) bool)(t, attach)
@@ -89,12 +99,16 @@ func IPCNamespaceFromContext(ctx context.Context) *IPCNamespace {
 	return nil
 }
 
-// CgroupNamespaceFromContext returns the cgroup namespace in which ctx is
-// executing, or nil if there is no such cgroup namespace. No reference is
-// transferred: the returned namespace is only valid while ctx is.
-func CgroupNamespaceFromContext(ctx context.Context) *CgroupNamespace {
+// GetCgroupNamespaceFromContext returns the cgroup namespace in which ctx is
+// executing, or nil if there is no such cgroup namespace. A reference is taken
+// on the returned namespace.
+func GetCgroupNamespaceFromContext(ctx context.Context) *CgroupNamespace {
 	if v := ctx.Value(CtxCgroupNamespace); v != nil {
-		return v.(*CgroupNamespace)
+		cgns := v.(*CgroupNamespace)
+		if cgns != nil {
+			cgns.IncRef()
+			return cgns
+		}
 	}
 	return nil
 }
@@ -104,6 +118,24 @@ func CgroupNamespaceFromContext(ctx context.Context) *CgroupNamespace {
 func TaskFromContext(ctx context.Context) *Task {
 	if v := ctx.Value(CtxTask); v != nil {
 		return v.(*Task)
+	}
+	return nil
+}
+
+// WithFSRestore returns a copy of ctx containing the filesystem-checkpointed
+// MemoryFile resource IDs.
+func WithFSRestore(ctx context.Context, mfs map[checkpoint.ResourceID]struct{}) context.Context {
+	return context.WithValue(ctx, CtxFSRestore, mfs)
+}
+
+// FSCheckpointedMemoryFilesFromContext returns the set of MemoryFiles restored
+// from the filesystem checkpoint, or nil if split filesystem restore is not active.
+func FSCheckpointedMemoryFilesFromContext(ctx context.Context) map[checkpoint.ResourceID]struct{} {
+	if ctx == nil {
+		return nil
+	}
+	if v := ctx.Value(CtxFSRestore); v != nil {
+		return v.(map[checkpoint.ResourceID]struct{})
 	}
 	return nil
 }

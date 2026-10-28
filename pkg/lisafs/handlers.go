@@ -49,6 +49,10 @@ const (
 //   - Marshalling the response into the communicator's payload buffer.
 //   - Return the number of payload bytes written.
 //   - Donate any FDs (if needed) to comm which will in turn donate it to client.
+//
+// Handlers run without the connection's channelsMu, fdsMu, or server.renameMu
+// held. checklocks does not transfer concrete handler contracts through this
+// function type.
 type RPCHandler func(c *Connection, comm Communicator, payloadLen uint32) (uint32, error)
 
 var handlers = [...]RPCHandler{
@@ -98,6 +102,9 @@ func ErrorHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, 
 // executions of MountHandler on a connection because the connection enforces
 // that Mount is the first message on the connection. Only after the connection
 // has been successfully mounted can other channels be created.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func MountHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	var (
 		mountPointFD     *ControlFD
@@ -171,6 +178,8 @@ func MountHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, 
 }
 
 // ChannelHandler handles the Channel RPC.
+//
+// +checklocksexclude:c.channelsMu
 func ChannelHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	ch, desc, fdSock, err := c.createChannel(c.maxMessageSize)
 	if err != nil {
@@ -221,6 +230,9 @@ func ChannelHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32
 }
 
 // FStatHandler handles the FStat RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func FStatHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	var req StatReq
 	if _, ok := req.CheckedUnmarshal(comm.PayloadBuf(payloadLen)); !ok {
@@ -257,6 +269,9 @@ func FStatHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, 
 }
 
 // SetStatHandler handles the SetStat RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func SetStatHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	if c.opts.Readonly {
 		return 0, unix.EROFS
@@ -297,6 +312,9 @@ func SetStatHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32
 }
 
 // WalkHandler handles the Walk RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func WalkHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	var req WalkReq
 	if _, ok := req.CheckedUnmarshal(comm.PayloadBuf(payloadLen)); !ok {
@@ -335,7 +353,9 @@ func WalkHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, e
 			var curIno Inode
 			for i := 0; i < int(numInodes); i++ {
 				buf = curIno.UnmarshalBytes(buf)
-				c.removeControlFDLocked(curIno.ControlFD)
+				// Cleanup runs before withRenameReadLock releases the mutex;
+				// checklocks cannot propagate it into these passed callbacks.
+				c.removeControlFDLocked(curIno.ControlFD) // +checklocksignore
 			}
 		})
 		defer cu.Clean()
@@ -388,6 +408,9 @@ func WalkHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, e
 }
 
 // WalkStatHandler handles the WalkStat RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func WalkStatHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	var req WalkReq
 	if _, ok := req.CheckedUnmarshal(comm.PayloadBuf(payloadLen)); !ok {
@@ -461,7 +484,9 @@ func WalkStatHandler(c *Connection, comm Communicator, payloadLen uint32) (uint3
 		parent := startDir
 		closeParent := func() {
 			if parent != startDir {
-				c.removeControlFDLocked(parent.id)
+				// Both direct and deferred cleanup run inside withRenameReadLock;
+				// checklocks does not retain that callback's lock state.
+				c.removeControlFDLocked(parent.id) // +checklocksignore
 			}
 		}
 		defer closeParent()
@@ -509,6 +534,9 @@ func WalkStatHandler(c *Connection, comm Communicator, payloadLen uint32) (uint3
 }
 
 // OpenAtHandler handles the OpenAt RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func OpenAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	var req OpenAtReq
 	if _, ok := req.CheckedUnmarshal(comm.PayloadBuf(payloadLen)); !ok {
@@ -566,6 +594,9 @@ func OpenAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32,
 }
 
 // OpenCreateAtHandler handles the OpenCreateAt RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func OpenCreateAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	if c.opts.Readonly {
 		return 0, unix.EROFS
@@ -627,6 +658,9 @@ func OpenCreateAtHandler(c *Connection, comm Communicator, payloadLen uint32) (u
 }
 
 // CloseHandler handles the Close RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func CloseHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	var req CloseReq
 	if _, ok := req.CheckedUnmarshal(comm.PayloadBuf(payloadLen)); !ok {
@@ -641,6 +675,9 @@ func CloseHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, 
 }
 
 // FSyncHandler handles the FSync RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func FSyncHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	var req FsyncReq
 	if _, ok := req.CheckedUnmarshal(comm.PayloadBuf(payloadLen)); !ok {
@@ -660,6 +697,8 @@ func FSyncHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, 
 	return 0, retErr
 }
 
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func (c *Connection) fsyncFD(id FDID) error {
 	fd, err := c.lookupOpenFD(id)
 	if err != nil {
@@ -672,6 +711,9 @@ func (c *Connection) fsyncFD(id FDID) error {
 }
 
 // PWriteHandler handles the PWrite RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func PWriteHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	if c.opts.Readonly {
 		return 0, unix.EROFS
@@ -706,6 +748,9 @@ func PWriteHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32,
 }
 
 // PReadHandler handles the PRead RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func PReadHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	var req PReadReq
 	if _, ok := req.CheckedUnmarshal(comm.PayloadBuf(payloadLen)); !ok {
@@ -746,6 +791,9 @@ func PReadHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, 
 }
 
 // MkdirAtHandler handles the MkdirAt RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func MkdirAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	if c.opts.Readonly {
 		return 0, unix.EROFS
@@ -794,6 +842,9 @@ func MkdirAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32
 }
 
 // MknodAtHandler handles the MknodAt RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func MknodAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	if c.opts.Readonly {
 		return 0, unix.EROFS
@@ -841,6 +892,9 @@ func MknodAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32
 }
 
 // SymlinkAtHandler handles the SymlinkAt RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func SymlinkAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	if c.opts.Readonly {
 		return 0, unix.EROFS
@@ -888,6 +942,9 @@ func SymlinkAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint
 }
 
 // LinkAtHandler handles the LinkAt RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func LinkAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	if c.opts.Readonly {
 		return 0, unix.EROFS
@@ -954,6 +1011,9 @@ func LinkAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32,
 }
 
 // FStatFSHandler handles the FStatFS RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func FStatFSHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	var req FStatFSReq
 	if _, ok := req.CheckedUnmarshal(comm.PayloadBuf(payloadLen)); !ok {
@@ -978,6 +1038,9 @@ func FStatFSHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32
 }
 
 // FAllocateHandler handles the FAllocate RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func FAllocateHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	if c.opts.Readonly {
 		return 0, unix.EROFS
@@ -1005,6 +1068,9 @@ func FAllocateHandler(c *Connection, comm Communicator, payloadLen uint32) (uint
 }
 
 // ReadLinkAtHandler handles the ReadLinkAt RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func ReadLinkAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	var req ReadLinkAtReq
 	if _, ok := req.CheckedUnmarshal(comm.PayloadBuf(payloadLen)); !ok {
@@ -1045,6 +1111,9 @@ func ReadLinkAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uin
 }
 
 // FlushHandler handles the Flush RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func FlushHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	var req FlushReq
 	if _, ok := req.CheckedUnmarshal(comm.PayloadBuf(payloadLen)); !ok {
@@ -1063,6 +1132,9 @@ func FlushHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, 
 }
 
 // ConnectHandler handles the Connect RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func ConnectHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	var req ConnectReq
 	if _, ok := req.CheckedUnmarshal(comm.PayloadBuf(payloadLen)); !ok {
@@ -1093,6 +1165,9 @@ func ConnectHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32
 }
 
 // ConnectWithCredsHandler handles the ConnectWithCreds RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func ConnectWithCredsHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	var req ConnectWithCredsReq
 	if _, ok := req.CheckedUnmarshal(comm.PayloadBuf(payloadLen)); !ok {
@@ -1123,6 +1198,9 @@ func ConnectWithCredsHandler(c *Connection, comm Communicator, payloadLen uint32
 }
 
 // BindAtHandler handles the BindAt RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func BindAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	if c.opts.Readonly {
 		return 0, unix.EROFS
@@ -1177,6 +1255,9 @@ func BindAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32,
 }
 
 // ListenHandler handles the Listen RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func ListenHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	var req ListenReq
 	if _, ok := req.CheckedUnmarshal(comm.PayloadBuf(payloadLen)); !ok {
@@ -1198,6 +1279,9 @@ func ListenHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32,
 }
 
 // AcceptHandler handles the Accept RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func AcceptHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	var req AcceptReq
 	if _, ok := req.CheckedUnmarshal(comm.PayloadBuf(payloadLen)); !ok {
@@ -1231,6 +1315,9 @@ func AcceptHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32,
 }
 
 // UnlinkAtHandler handles the UnlinkAt RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func UnlinkAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	if c.opts.Readonly {
 		return 0, unix.EROFS
@@ -1287,6 +1374,9 @@ func UnlinkAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint3
 }
 
 // RenameAt2Handler handles the RenameAt2 RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func RenameAt2Handler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	if c.opts.Readonly {
 		return 0, unix.EROFS
@@ -1299,6 +1389,9 @@ func RenameAt2Handler(c *Connection, comm Communicator, payloadLen uint32) (uint
 }
 
 // RenameAtHandler handles the RenameAt RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func RenameAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	if c.opts.Readonly {
 		return 0, unix.EROFS
@@ -1311,6 +1404,9 @@ func RenameAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint3
 }
 
 // renameAtCommon is the common implementation for RenameAt and RenameAt2.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func renameAtCommon(c *Connection, comm Communicator, payloadLen uint32, oldDirFD, newDirFD FDID, oldName, newName string, flags uint32) (uint32, error) {
 	if err := checkSafeName(oldName); err != nil {
 		return 0, err
@@ -1418,6 +1514,9 @@ func notifyRenameRecursive(n *Node) {
 }
 
 // Getdents64Handler handles the Getdents64 RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func Getdents64Handler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	var req Getdents64Req
 	if _, ok := req.CheckedUnmarshal(comm.PayloadBuf(payloadLen)); !ok {
@@ -1474,6 +1573,9 @@ func Getdents64Handler(c *Connection, comm Communicator, payloadLen uint32) (uin
 }
 
 // FGetXattrHandler handles the FGetXattr RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func FGetXattrHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	var req FGetXattrReq
 	if _, ok := req.CheckedUnmarshal(comm.PayloadBuf(payloadLen)); !ok {
@@ -1509,6 +1611,9 @@ func FGetXattrHandler(c *Connection, comm Communicator, payloadLen uint32) (uint
 }
 
 // FSetXattrHandler handles the FSetXattr RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func FSetXattrHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	if c.opts.Readonly {
 		return 0, unix.EROFS
@@ -1532,6 +1637,9 @@ func FSetXattrHandler(c *Connection, comm Communicator, payloadLen uint32) (uint
 }
 
 // FListXattrHandler handles the FListXattr RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func FListXattrHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	var req FListXattrReq
 	if _, ok := req.CheckedUnmarshal(comm.PayloadBuf(payloadLen)); !ok {
@@ -1560,6 +1668,9 @@ func FListXattrHandler(c *Connection, comm Communicator, payloadLen uint32) (uin
 }
 
 // FRemoveXattrHandler handles the FRemoveXattr RPC.
+//
+// +checklocksexclude:c.fdsMu
+// +checklocksexclude:c.server.renameMu
 func FRemoveXattrHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	if c.opts.Readonly {
 		return 0, unix.EROFS

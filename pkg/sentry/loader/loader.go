@@ -374,6 +374,12 @@ func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *V
 	}
 	random := stack.Bottom
 
+	// Push the platform string which AT_PLATFORM will point to.
+	if _, err = stack.PushNullTerminatedByteSlice([]byte(loaded.arch.Platform())); err != nil {
+		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("Failed to push platform string: %v", err), syserr.FromError(err).ToLinux())
+	}
+	platform := stack.Bottom
+
 	c := executable.creds
 	secureExec := executable.secureExec
 	secureExecInt := 0
@@ -391,6 +397,7 @@ func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *V
 		arch.AuxEntry{linux.AT_CLKTCK, linux.CLOCKS_PER_SEC},
 		arch.AuxEntry{linux.AT_EXECFN, execfn},
 		arch.AuxEntry{linux.AT_RANDOM, random},
+		arch.AuxEntry{linux.AT_PLATFORM, platform},
 		arch.AuxEntry{linux.AT_PAGESZ, hostarch.PageSize},
 		arch.AuxEntry{linux.AT_SYSINFO_EHDR, vdsoAddr},
 		arch.AuxEntry{linux.AT_HWCAP, hostarch.Addr(args.Features.AllowedHWCap1())},

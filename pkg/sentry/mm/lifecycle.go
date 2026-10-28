@@ -509,6 +509,7 @@ func (mm *MemoryManager) Fork(ctx context.Context) (*MemoryManager, error) {
 
 	if mm2.executable != nil {
 		mm2.executable.IncRef()
+		mm2.executable.DenyWriteAccess()
 	}
 	return mm2, nil
 }
@@ -587,6 +588,7 @@ func (mm *MemoryManager) DecUsers(ctx context.Context) {
 	mm.executable = nil
 	mm.metadataMu.Unlock()
 	if exe != nil {
+		exe.AllowWriteAccess()
 		exe.DecRef(ctx)
 	}
 

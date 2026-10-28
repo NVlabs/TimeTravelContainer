@@ -226,6 +226,7 @@ func createLoaderWithGoferMountConfs(conf *config.Config, spec *specs.Spec, moun
 		PodInitConfigFD:  -1,
 		ExecFD:           -1,
 		RootfsUpperTarFD: -1,
+		CPUDMALatencyFD:  -1,
 	}
 	l, err := New(args)
 	if err != nil {
@@ -2954,6 +2955,7 @@ func TestHostnetWithRawSockets(t *testing.T) {
 		DevGoferFD:      -1,
 		PodInitConfigFD: -1,
 		ExecFD:          -1,
+		CPUDMALatencyFD: -1,
 	})
 	if err == nil {
 		l.Destroy()
@@ -3340,5 +3342,20 @@ func TestNetworkConfig(t *testing.T) {
 	}
 	if diff := cmp.Diff(networkArgs.LoopbackLinks, args.LoopbackLinks); diff != "" {
 		t.Errorf("Network config content mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestSignalUnkillablePolicyMapping(t *testing.T) {
+	for _, tc := range []struct {
+		confPolicy   config.SignalUnkillablePolicy
+		kernelPolicy kernel.SignalUnkillablePolicy
+	}{
+		{config.SignalUnkillableNone, kernel.SignalUnkillableNone},
+		{config.SignalUnkillableLinux, kernel.SignalUnkillableLinux},
+		{config.SignalUnkillablePolicy(-1), kernel.SignalUnkillableNone},
+	} {
+		if got := signalUnkillablePolicy(tc.confPolicy); got != tc.kernelPolicy {
+			t.Errorf("signalUnkillablePolicy(%v) = %v, want %v", tc.confPolicy, got, tc.kernelPolicy)
+		}
 	}
 }

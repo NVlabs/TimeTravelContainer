@@ -1,4 +1,9 @@
 groups:
+  # Checklocks fixtures contain intentional violations. Check their analyzer
+  # output without the suppressions used for production code.
+  - name: checklocks_tests
+    regex: "^tools/checklocks/test/"
+    default: false
   # We define three basic groups: generated (all generated files),
   # external (all files outside the repository), and internal (all
   # files within the local repository). We can't enforce many style
@@ -93,8 +98,6 @@ analyzers:
     internal:
       suppress:
         # Valid reasons to break the rules.
-        - "xsetbv: invalid MOVL of value"
-        - "xsetbv: invalid offset value"
         - "xgetbv: invalid MOVL of ret"
         - "xgetbv: invalid offset ret"
         - "wrmsr: invalid MOVL of value"
@@ -121,6 +124,7 @@ analyzers:
   cgocall:
     external: # Enabled.
   checklocks:
+    checklocks_tests: # Enabled.
     internal:
       exclude:
         - "^-$" # b/181776900: analyzer fails on buildkite.
@@ -166,6 +170,8 @@ analyzers:
         # but go vet cannot infer their formatting contract under Go 1.26.
         - "io_etcd_go_bbolt/db.go"
         - "io_etcd_go_bbolt/tx.go"
+        # Starting in 1.27, printf reports misuse of %d with pointers.
+        - route.go # github.com/vishvananda/netlink
   shift:
     generated: # Disabled for generated code; these shifts are well-defined.
       exclude: [".*"]
@@ -267,10 +273,18 @@ analyzers:
         - pkg/sentry/fs/gofer/inode.go # Intentional.
         - pkg/refs/refcounter_test.go  # Intentional.
         - runsc/ttc/cmd/distributed.go # Intentional: awaitOriginAllocations is a barrier.
+  SA4006: # Unused value assigned to variable.
+    internal:
+      exclude:
+        - runsc/boot/network.go # Pattern increments fdOffset after every use.
   SA4016: # Useless bitwise operations.
     internal:
       exclude:
         - pkg/gohacks/noescape_unsafe.go # x ^ 0 always equals x.
+  SA4023: # Impossible condition.
+    internal:
+      exclude:
+        - runsc/sandbox/network.go # Stubs in no_xdp.go always return error when built without XDP.
   ST1019: # Multiple imports of the same package.
     generated:
       exclude:

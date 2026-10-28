@@ -35,19 +35,20 @@ var _ Stack = (*TestStack)(nil)
 
 // TestStack is a dummy implementation of Stack for tests.
 type TestStack struct {
-	InterfacesMap     map[int32]Interface
-	InterfaceAddrsMap map[int32][]InterfaceAddr
-	RouteList         []Route
-	SupportsIPv6Flag  bool
-	TCPRecvBufSize    TCPBufferSize
-	TCPSendBufSize    TCPBufferSize
-	TCPSACKFlag       bool
-	Recovery          TCPLossRecovery
-	IPForwarding      bool
-	CongestionControl string
-	AvailableCC       string
-	SynRetries        uint8
-	MaxRetries        uint8
+	InterfacesMap                map[int32]Interface
+	InterfaceAddrsMap            map[int32][]InterfaceAddr
+	RouteList                    []Route
+	SupportsIPv6Flag             bool
+	TCPRecvBufSize               TCPBufferSize
+	TCPSendBufSize               TCPBufferSize
+	TCPSACKFlag                  bool
+	Recovery                     TCPLossRecovery
+	IPForwarding                 bool
+	AllowExternalLoopbackTraffic bool
+	CongestionControl            string
+	AvailableCC                  string
+	SynRetries                   uint8
+	MaxRetries                   uint8
 }
 
 // NewTestStack returns a TestStack with no network interfaces. The value of
@@ -255,6 +256,17 @@ func (s *TestStack) RestoreCleanupEndpoints([]stack.TransportEndpoint) {}
 // SetForwarding implements Stack.
 func (s *TestStack) SetForwarding(protocol tcpip.NetworkProtocolNumber, enable bool) error {
 	s.IPForwarding = enable
+	return nil
+}
+
+// GetAllowExternalLoopbackTraffic implements Stack.
+func (s *TestStack) GetAllowExternalLoopbackTraffic(protocol tcpip.NetworkProtocolNumber) (bool, error) {
+	return s.AllowExternalLoopbackTraffic, nil
+}
+
+// SetAllowExternalLoopbackTraffic implements Stack.
+func (s *TestStack) SetAllowExternalLoopbackTraffic(protocol tcpip.NetworkProtocolNumber, enable bool) error {
+	s.AllowExternalLoopbackTraffic = enable
 	return nil
 }
 

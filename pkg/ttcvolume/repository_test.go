@@ -629,6 +629,82 @@ func TestMetadataBatchDropsDeletedTransientSubtree(t *testing.T) {
 	}
 }
 
+func TestExchange(t *testing.T) {
+	manager, err := OpenManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := manager.Create("exchange")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := repo.CreateDirectory(MainBranch, RootInode, "a", 0755, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := repo.CreateDirectory(MainBranch, RootInode, "b", 0755, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := repo.CreateRegular(MainBranch, a, "x", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := repo.CreateDirectory(MainBranch, b, "y", 0755, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner, err := repo.CreateRegular(MainBranch, dir, "inner", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Exchange(MainBranch, a, "x", b, "missing"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("exchange with a missing file: %v, want not found", err)
+	}
+	if err := repo.Exchange(MainBranch, a, "x", b, "y"); err != nil {
+		t.Fatal(err)
+	}
+	check := func(repo *Repository, branch, when string) {
+		t.Helper()
+		for _, want := range []struct {
+			parent uint64
+			name   string
+			ino    uint64
+		}{{a, "x", dir}, {b, "y", file}, {dir, "inner", inner}} {
+			if got, err := repo.Lookup(branch, want.parent, want.name); err != nil || got != want.ino {
+				t.Fatalf("%s: lookup of %s = %d, %v, want %d", when, want.name, got, err, want.ino)
+			}
+		}
+		// The directory's ".." moved from b to a.
+		for _, want := range []struct {
+			ino   uint64
+			nlink uint32
+		}{{a, 3}, {b, 2}} {
+			inode, err := repo.Inode(branch, want.ino)
+			if err != nil || inode.Nlink != want.nlink {
+				t.Fatalf("%s: inode %d has %d links, %v, want %d", when, want.ino, inode.Nlink, err, want.nlink)
+			}
+		}
+	}
+	check(repo, MainBranch, "after the exchange")
+	if err := repo.Fork(MainBranch, "child"); err != nil {
+		t.Fatal(err)
+	}
+	check(repo, "child", "in a fork")
+	if err := repo.SyncMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	repo, err = manager.Open("exchange")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	check(repo, MainBranch, "reopened")
+}
+
 func TestNewDirectoryLookupsAgreeWithTheGraph(t *testing.T) {
 	manager, err := OpenManager(t.TempDir())
 	if err != nil {

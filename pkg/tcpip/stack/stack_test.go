@@ -44,6 +44,25 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 )
 
+func TestClockResolution(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		got  time.Duration
+		want time.Duration
+	}{
+		{name: "default"},
+		{name: "positive", got: 500 * time.Microsecond, want: 500 * time.Microsecond},
+		{name: "negative", got: -time.Nanosecond},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := stack.New(stack.Options{ClockResolution: test.got})
+			if got := s.ClockResolution(); got != test.want {
+				t.Errorf("ClockResolution() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 const (
 	fakeNetNumber        tcpip.NetworkProtocolNumber = math.MaxUint32
 	fakeNetHeaderLen                                 = 12
@@ -1062,7 +1081,7 @@ func TestRouteWithDownNIC(t *testing.T) {
 	nic2Dst := tcpip.AddrFrom4Slice([]byte("\x06\x00\x00\x00"))
 	nic1RouteMTU := 1500
 	nic2RouteMTU := 1460
-	// These are set in setup function, because they depend on protocl being used.
+	// These are set in setup function, because they depend on protocol being used.
 	nic1RouteMTUAtNetworkLayer := 0
 	nic2RouteMTUAtNetworkLayer := 0
 

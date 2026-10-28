@@ -3,6 +3,7 @@
 load("@bazel_skylib//:bzl_library.bzl", _bzl_library = "bzl_library")
 load("@bazel_skylib//rules:build_test.bzl", _build_test = "build_test")
 load("@bazel_skylib//rules:common_settings.bzl", _BuildSettingInfo = "BuildSettingInfo", _bool_flag = "bool_flag")
+load("@com_google_protobuf//bazel:proto_library.bzl", _proto_library = "proto_library")
 
 build_test = _build_test
 bzl_library = _bzl_library
@@ -15,8 +16,8 @@ version = "//tools/bazeldefs:version"
 def short_path(path):
     return path
 
-def proto_library(name, has_services = None, **kwargs):
-    native.proto_library(
+def proto_library(name, has_services = None, **kwargs):  # buildifier: disable=unused-variable
+    _proto_library(
         name = name,
         **kwargs
     )
@@ -27,6 +28,7 @@ def select_arch(amd64 = None, arm64 = None, riscv64 = None, default = None, **kw
     Args:
       amd64: the option if the architecture is amd64.
       arm64: the option if the architecture is arm64.
+      riscv64: the option if the architecture is riscv64.
       default: the option if no matching architecture is provided.
       **kwargs: extra select arguments.
 
@@ -43,7 +45,7 @@ def select_arch(amd64 = None, arm64 = None, riscv64 = None, default = None, **kw
         values["//conditions:default"] = default
     return select(values, **kwargs)
 
-def select_system(linux = ["__linux__"], darwin = [], **kwargs):
+def select_system(linux = ["__linux__"], darwin = [], **_kwargs):
     return select({
         "@bazel_tools//src/conditions:darwin": darwin,
         "//conditions:default": linux,
@@ -56,7 +58,7 @@ arch_config = [
     "//command_line_option:platforms",
 ]
 
-def arm64_config(settings, attr):
+def arm64_config(_settings, _attr):
     return {
         # Race builds are always disabled for cross-architecture generation. We
         # can't run it locally anyways, what value can this provide?
@@ -66,7 +68,7 @@ def arm64_config(settings, attr):
         "//command_line_option:platforms": "@io_bazel_rules_go//go/toolchain:linux_arm64",
     }
 
-def amd64_config(settings, attr):
+def amd64_config(_settings, _attr):
     return {
         # See above.
         "@io_bazel_rules_go//go/config:race": False,

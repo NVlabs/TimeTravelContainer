@@ -18,29 +18,43 @@
  */
 
 #include <elf.h>
+#include <fcntl.h>
+#include <linux/capability.h>
+#include <linux/prctl.h>
 #include <signal.h>
 #include <stddef.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cerrno>
+#include <cstdint>
+#include <cstdio>
 #include <iostream>
 #include <memory>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/flags/flag.h"
+#include "absl/strings/numbers.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "test/util/capability_util.h"
+#include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
+#include "test/util/linux_capability_util.h"
 #include "test/util/logging.h"
 #include "test/util/memory_util.h"
 #include "test/util/multiprocess_util.h"
@@ -1172,8 +1186,7 @@ TEST(PtraceTest, GetSigMask) {
 
     // Install a signal handler for kBlockSignal to avoid termination and block
     // it.
-    TEST_PCHECK(signal(
-                    kBlockSignal, +[](int signo) {}) != SIG_ERR);
+    TEST_PCHECK(signal(kBlockSignal, +[](int signo) {}) != SIG_ERR);
     MaybeSave();
     TEST_PCHECK(sigprocmask(SIG_SETMASK, &blocked, nullptr) == 0);
     MaybeSave();
@@ -2520,6 +2533,8 @@ TEST(PtraceTest, ExecvePtraceLockStress) {
 }  // namespace testing
 }  // namespace gvisor
 
+using gvisor::testing::RunPrctlSetPtracerDoesNotPersistPastNonLeaderExec;
+
 int main(int argc, char** argv) {
   gvisor::testing::TestInit(&argc, &argv);
 
@@ -2547,8 +2562,7 @@ int main(int argc, char** argv) {
   }
 
   if (absl::GetFlag(FLAGS_ptrace_test_prctl_set_ptracer_and_exec_non_leader)) {
-    gvisor::testing::RunPrctlSetPtracerDoesNotPersistPastNonLeaderExec(
-        fd);
+    RunPrctlSetPtracerDoesNotPersistPastNonLeaderExec(fd);
   }
 
   if (absl::GetFlag(

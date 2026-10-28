@@ -33,8 +33,8 @@ import (
 
 const stateFileExtension = "state"
 
-// ErrStateFileLocked is returned by Load() when the state file is locked
-// and TryLock is enabled.
+// ErrStateFileLocked indicates that a state file is locked and TryLock is
+// enabled. Callers can identify wrapped lock errors with errors.Is.
 var ErrStateFileLocked = errors.New("state file locked")
 
 // TryLock represents whether we should block waiting for the lock to be acquired or not.
@@ -53,7 +53,7 @@ type LoadOpts struct {
 	// Exact tells whether the search should be exact. See Load() for more.
 	Exact bool
 
-	// SkipCheck tells Load() to skip checking if container is runnning.
+	// SkipCheck tells Load() to skip checking if container is running.
 	SkipCheck bool
 
 	// TryLock tells Load() to fail if the container state file cannot be locked,
@@ -116,7 +116,9 @@ func Load(rootDir string, id FullID, opts LoadOpts) (*Container, error) {
 		// This is inherently racy.
 		switch c.Status {
 		case Created, Running:
-			c.CheckStopped()
+			if err := c.CheckStopped(); err != nil {
+				return nil, fmt.Errorf("checking if container is stopped: %w", err)
+			}
 		}
 	}
 
@@ -192,7 +194,7 @@ func LoadSandbox(rootDir, id string, opts LoadOpts) ([]*Container, error) {
 			if os.IsNotExist(err) {
 				continue
 			}
-			return nil, fmt.Errorf("loading sandbox %q, failed to load container %q: %v", id, cid, err)
+			return nil, fmt.Errorf("loading sandbox %q, failed to load container %q: %w", id, cid, err)
 		}
 		containers = append(containers, container)
 	}
@@ -389,7 +391,13 @@ func (s *StateFile) load(v any, opts LoadOpts) error {
 		return err
 	}
 	defer s.UnlockOrDie()
+	return s.loadLocked(v)
+}
 
+// loadLocked reads and decodes the state file into v.
+//
+// Preconditions: lock(*) must have been called.
+func (s *StateFile) loadLocked(v any) error {
 	path := s.statePath()
 	metaBytes, err := os.ReadFile(path)
 	if err != nil {

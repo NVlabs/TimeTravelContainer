@@ -69,15 +69,15 @@ struct context_queue {
   uint64_t ringbuffer[MAX_CONTEXT_QUEUE_ENTRIES];
 } __attribute__((aligned(CACHE_LINE_SIZE)));
 
-struct context_queue *__export_context_queue_addr;
+struct context_queue* __export_context_queue_addr;
 
 // LINT.ThenChange(../context_queue.go)
 
-uint32_t is_empty(struct context_queue *queue) {
+uint32_t is_empty(struct context_queue* queue) {
   return atomic_load(&queue->start) == atomic_load(&queue->end);
 }
 
-int32_t queued_contexts(struct context_queue *queue) {
+int32_t queued_contexts(struct context_queue* queue) {
   return (atomic_load(&queue->end) + MAX_CONTEXT_QUEUE_ENTRIES -
           atomic_load(&queue->start)) %
          MAX_CONTEXT_QUEUE_ENTRIES;
@@ -101,15 +101,15 @@ static __inline__ unsigned long rdtsc(void) {
 static __inline__ void spinloop(void) { asm volatile("yield" : : : "memory"); }
 #endif
 
-void *__export_context_region;
+void* __export_context_region;
 
-static struct thread_context *thread_context_addr(uint32_t tcid) {
-  return (struct thread_context *)(__export_context_region +
-                                   tcid *
-                                       ALLOCATED_SIZEOF_THREAD_CONTEXT_STRUCT);
+static struct thread_context* thread_context_addr(uint32_t tcid) {
+  return (struct thread_context*)(__export_context_region +
+                                  tcid *
+                                      ALLOCATED_SIZEOF_THREAD_CONTEXT_STRUCT);
 }
 
-void memcpy(uint8_t *dest, uint8_t *src, size_t n) {
+void memcpy(uint8_t* dest, uint8_t* src, size_t n) {
   for (size_t i = 0; i < n; i += 1) {
     dest[i] = src[i];
   }
@@ -237,14 +237,14 @@ struct spinning_queue {
   uint8_t num_times_re_enqueued[SPINNING_QUEUE_SIZE];
 };
 
-struct spinning_queue *__export_spinning_queue_addr;
+struct spinning_queue* __export_spinning_queue_addr;
 
 // spinning_queue_push adds a new thread to the queue. It returns false if the
 // queue is full, or if re_enqueue_times has reached MAX_RE_ENQUEUE.
 static bool spinning_queue_push(uint8_t re_enqueue_times)
     __attribute__((warn_unused_result));
 static bool spinning_queue_push(uint8_t re_enqueue_times) {
-  struct spinning_queue *queue = __export_spinning_queue_addr;
+  struct spinning_queue* queue = __export_spinning_queue_addr;
   uint32_t idx, end, len;
 
   BUILD_BUG_ON(sizeof(struct spinning_queue) > SPINNING_QUEUE_MEM_SIZE);
@@ -270,7 +270,7 @@ static bool spinning_queue_push(uint8_t re_enqueue_times) {
 // the shortest time.
 // However it doesn't take into account the spinning re-enqueue.
 static void spinning_queue_pop() {
-  struct spinning_queue *queue = __export_spinning_queue_addr;
+  struct spinning_queue* queue = __export_spinning_queue_addr;
 
   atomic_sub(&queue->end, 1);
   atomic_sub(&queue->len, 1);
@@ -285,7 +285,7 @@ static void spinning_queue_pop() {
 static bool spinning_queue_remove_first(uint64_t timeout)
     __attribute__((warn_unused_result));
 static bool spinning_queue_remove_first(uint64_t timeout) {
-  struct spinning_queue *queue = __export_spinning_queue_addr;
+  struct spinning_queue* queue = __export_spinning_queue_addr;
   uint64_t ts;
   uint8_t re_enqueue = 0;
 
@@ -320,8 +320,8 @@ static bool spinning_queue_remove_first(uint64_t timeout) {
 
 // queue_get_context takes the next context from the queue. If picky is true,
 // it leaves one with a placement other than the thread's.
-struct thread_context *queue_get_context(struct sysmsg *sysmsg, bool picky) {
-  struct context_queue *queue = __export_context_queue_addr;
+struct thread_context* queue_get_context(struct sysmsg* sysmsg, bool picky) {
+  struct context_queue* queue = __export_context_queue_addr;
 
   // Indexes should not jump when start or end are overflowed.
   BUILD_BUG_ON(UINT32_MAX % MAX_CONTEXT_QUEUE_ENTRIES !=
@@ -354,19 +354,19 @@ struct thread_context *queue_get_context(struct sysmsg *sysmsg, bool picky) {
     if (context_id > MAX_GUEST_CONTEXTS) {
       panic(STUB_ERROR_BAD_CONTEXT_ID, context_id);
     }
-    struct thread_context *ctx = thread_context_addr(context_id);
+    struct thread_context* ctx = thread_context_addr(context_id);
     sysmsg->context = ctx;
-    atomic_store(&ctx->acked_time, rdtsc());
     atomic_store(&ctx->thread_id, sysmsg->thread_id);
+    atomic_store(&ctx->acked_time, rdtsc());
     return ctx;
   }
   return NULL;
 }
 
 // get_context_fast sets nr_active_threads_p only if it deactivates the thread.
-static struct thread_context *get_context_fast(struct sysmsg *sysmsg,
-                                               struct context_queue *queue,
-                                               uint32_t *nr_active_threads_p) {
+static struct thread_context* get_context_fast(struct sysmsg* sysmsg,
+                                               struct context_queue* queue,
+                                               uint32_t* nr_active_threads_p) {
   uint32_t nr_active_threads, nr_awake_contexts;
 
   if (!spinning_queue_push(0)) return NULL;
@@ -374,7 +374,7 @@ static struct thread_context *get_context_fast(struct sysmsg *sysmsg,
 
   uint64_t spin_start = rdtsc();
   while (1) {
-    struct thread_context *ctx;
+    struct thread_context* ctx;
 
     ctx = queue_get_context(sysmsg, rdtsc() - spin_start < PICKY_TICKS);
     if (ctx) {
@@ -418,7 +418,7 @@ static bool fast_path_enabled_hint(struct context_queue *queue) {
   return atomic_load(&queue->fast_path_disabled) == 0;
 }
 
-static bool try_to_dec_threads_to_wakeup(struct context_queue *queue) {
+static bool try_to_dec_threads_to_wakeup(struct context_queue* queue) {
   while (1) {
     uint32_t nr = atomic_load(&queue->num_threads_to_wakeup);
     if (nr == 0) {
@@ -431,7 +431,7 @@ static bool try_to_dec_threads_to_wakeup(struct context_queue *queue) {
 }
 
 void init_new_thread() {
-  struct context_queue *queue = __export_context_queue_addr;
+  struct context_queue* queue = __export_context_queue_addr;
 
   atomic_add(&queue->num_active_threads, 1);
   try_to_dec_threads_to_wakeup(queue);
@@ -439,11 +439,11 @@ void init_new_thread() {
 
 // get_context retrieves a context that is ready to be restored to the user.
 // This populates sysmsg->thread_context_id.
-struct thread_context *get_context(struct sysmsg *sysmsg) {
-  struct context_queue *queue = __export_context_queue_addr;
+struct thread_context* get_context(struct sysmsg* sysmsg) {
+  struct context_queue* queue = __export_context_queue_addr;
   uint32_t nr_active_threads;
 
-  struct thread_context *ctx;
+  struct thread_context* ctx;
   for (;;) {
     atomic_add(&queue->num_spinning_threads, 1);
 
@@ -505,20 +505,20 @@ exit:
 
 // switch_context signals the sentry that the old context is ready to be worked
 // on and retrieves a new context to switch to.
-struct thread_context *switch_context(struct sysmsg *sysmsg,
-                                      struct thread_context *ctx,
+struct thread_context* switch_context(struct sysmsg* sysmsg,
+                                      struct thread_context* ctx,
                                       enum context_state new_context_state) {
-  struct context_queue *queue = __export_context_queue_addr;
+  struct context_queue* queue = __export_context_queue_addr;
 
   if (ctx) {
     if (atomic_load(&ctx->placement_id) != 0) {
       atomic_store(&ctx->host_cpu, read_host_cpu());
     }
     atomic_sub(&queue->num_active_contexts, 1);
-    atomic_store(&ctx->thread_id, INVALID_THREAD_ID);
     atomic_store(&ctx->last_thread_id, sysmsg->thread_id);
     atomic_store(&ctx->state_changed_time, rdtsc());
     atomic_store(&ctx->state, new_context_state);
+    atomic_store(&ctx->thread_id, INVALID_THREAD_ID);
     if (atomic_load(&ctx->sentry_fast_path) == 0) {
       int ret = sys_futex(&ctx->state, FUTEX_WAKE, 1, NULL, NULL, 0);
       if (ret < 0) {

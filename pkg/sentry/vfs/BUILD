@@ -172,6 +172,7 @@ go_library(
         "save_restore.go",
         "vfs.go",
         "virtual_filesystem_mutex.go",
+        "write_count.go",
     ],
     visibility = ["//pkg/sentry:internal"],
     deps = [
@@ -216,6 +217,7 @@ go_test(
     size = "small",
     srcs = [
         "dentry_state_test.go",
+        "dentry_test.go",
         "device_test.go",
         "file_description_impl_util_test.go",
         "mount_test.go",

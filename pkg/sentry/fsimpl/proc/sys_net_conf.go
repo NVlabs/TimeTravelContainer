@@ -16,6 +16,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
+	netipv6 "gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
@@ -173,9 +174,21 @@ func (fs *filesystem) newNetConfDirs(ctx context.Context, root *auth.Credentials
 	if ipv6 {
 		kind = netConfIPv6
 	}
+	all := fs.newNetConfSet(ctx, root, kind, nil)
+	defaults := fs.newNetConfSet(ctx, root, kind, nil)
+	// The stack keeps some of the settings for all interfaces itself: IPv4's
+	// route_localnet, also the default of new interfaces, which has it accept
+	// martian loopback packets on other interfaces (kube-proxy enables it),
+	// and IPv6's forwarding.
+	if ipv6 {
+		all.link(ctx, "forwarding", &ipForwarding{stack: stack, protocol: netipv6.ProtocolNumber})
+	} else {
+		all.link(ctx, "route_localnet", &routeLocalnetData{stack: stack})
+		defaults.link(ctx, "route_localnet", &routeLocalnetData{stack: stack})
+	}
 	confDirs := map[string]kernfs.Inode{
-		"all":     fs.newNetConfSet(ctx, root, kind, nil),
-		"default": fs.newNetConfSet(ctx, root, kind, nil),
+		"all":     all,
+		"default": defaults,
 	}
 	neighDirs := map[string]kernfs.Inode{
 		"default": fs.newNetConfSet(ctx, root, netConfNeigh, nil),
@@ -212,9 +225,12 @@ type netConfSet struct {
 	inos   []uint64
 	valsMu sync.Mutex `state:"nosave"`
 	vals   []int32
+	// linked are the files of the settings that the stack keeps, by name:
+	// see link.
+	linked map[string]kernfs.Inode
 }
 
-func (fs *filesystem) newNetConfSet(ctx context.Context, root *auth.Credentials, kind netConfKind, overrides map[string]int32) kernfs.Inode {
+func (fs *filesystem) newNetConfSet(ctx context.Context, root *auth.Credentials, kind netConfKind, overrides map[string]int32) *netConfSet {
 	names := netConfNames[kind]
 	set := &netConfSet{
 		fs:    fs,
@@ -239,11 +255,28 @@ func (fs *filesystem) newNetConfSet(ctx context.Context, root *auth.Credentials,
 	return set
 }
 
+// link has the setting name of s kept by f, a file of the stack's own
+// setting, instead of s.
+func (s *netConfSet) link(ctx context.Context, name string, f dynamicInode) {
+	i, ok := slices.BinarySearch(netConfNames[s.kind], name)
+	if !ok {
+		panic(fmt.Sprintf("no network setting %q", name))
+	}
+	f.Init(ctx, s.owner, linux.UNNAMED_MAJOR, s.fs.devMinor, s.inos[i], f, 0644)
+	if s.linked == nil {
+		s.linked = make(map[string]kernfs.Inode)
+	}
+	s.linked[name] = f
+}
+
 // Lookup implements kernfs.inodeDirectory.Lookup.
 func (s *netConfSet) Lookup(ctx context.Context, name string) (kernfs.Inode, error) {
 	i, ok := slices.BinarySearch(netConfNames[s.kind], name)
 	if !ok {
 		return nil, linuxerr.ENOENT
+	}
+	if f, ok := s.linked[name]; ok {
+		return f, nil
 	}
 	mode := linux.FileMode(0644)
 	if name == "mc_forwarding" {

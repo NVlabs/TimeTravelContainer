@@ -18,6 +18,7 @@
 package sys_test
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -25,6 +26,8 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"golang.org/x/sys/unix"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/rdma"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sys"
@@ -432,7 +435,11 @@ func newRDMATestSnapshot() *rdma.Snapshot {
 					CounterNames: []string{"port_rcv_data"},
 				},
 			},
-			NetDevs: []rdma.NetDev{{Name: "eth1", Attrs: map[string]string{"mtu": "9000\n"}}},
+			NetDevs: []rdma.NetDev{{
+				Name:     "eth1",
+				Attrs:    map[string]string{"mtu": "9000\n"},
+				ErrAttrs: map[string]int32{"speed": int32(unix.EINVAL)},
+			}},
 		}},
 		NUMA: &rdma.NUMA{
 			// Two-node host (aggregate ranges "0-1"): the sandbox must
@@ -505,6 +512,7 @@ func TestRDMASysfs(t *testing.T) {
 		},
 		nicLeaf + "/net/eth1": {
 			"mtu":    linux.DT_REG,
+			"speed":  linux.DT_REG,
 			"device": linux.DT_LNK,
 		},
 		// Extended-domain (VMD-style) GPU root.
@@ -573,6 +581,12 @@ func TestRDMASysfs(t *testing.T) {
 		if got != want {
 			t.Errorf("%q contains %q, want %q", p, got, want)
 		}
+	}
+
+	// An attribute whose host read failed exists but fails reads with the
+	// host's errno.
+	if _, err := readTestFile(s, nicLeaf+"/net/eth1/speed"); !errors.Is(err, unix.EINVAL) {
+		t.Errorf("reading speed of a down link returned %v, want EINVAL", err)
 	}
 }
 

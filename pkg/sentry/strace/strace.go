@@ -436,6 +436,8 @@ func (i *SyscallInfo) pre(t *kernel.Task, args arch.SyscallArguments, maximumBlo
 			output = append(output, CloneFlagSet.Parse(uint64(args[arg].Uint())))
 		case OpenFlags:
 			output = append(output, open(uint64(args[arg].Uint())))
+		case OpenHow:
+			output = append(output, openHow(t, args[arg].Pointer(), args[arg+1].SizeT()))
 		case Mode:
 			output = append(output, linux.FileMode(args[arg].ModeT()).String())
 		case FutexOp:
@@ -623,6 +625,7 @@ func (i *SyscallInfo) sendEnter(t *kernel.Task, args arch.SyscallArguments) []st
 	event := pb.Strace{
 		Process:  t.Name(),
 		Function: i.name,
+		Tid:      int32(t.ThreadID()),
 		Info: &pb.Strace_Enter{
 			Enter: &pb.StraceEnter{},
 		},
@@ -651,6 +654,7 @@ func (i *SyscallInfo) sendExit(t *kernel.Task, elapsed time.Duration, output []s
 	event := pb.Strace{
 		Process:  t.Name(),
 		Function: i.name,
+		Tid:      int32(t.ThreadID()),
 		Info:     &pb.Strace_Exit{Exit: exit},
 	}
 	event.Args = append(event.Args, output...)

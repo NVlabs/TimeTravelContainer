@@ -48,6 +48,8 @@ type taskInode struct {
 
 	dentriesMu dentriesRWMutex `state:"nosave"`
 	// dentries is a list of dentries to be invalidated when the task is destroyed.
+	//
+	// +checklocks:dentriesMu
 	dentries map[*kernfs.Dentry]struct{}
 }
 
@@ -127,9 +129,12 @@ func (fs *filesystem) newTaskInode(ctx context.Context, task *kernel.Task, pidns
 	return inode, nil
 }
 
+// +checklocksexclude:i.dentriesMu
 func (i *taskInode) TaskDestroyAction(ctx context.Context) {
 	i.dentriesMu.Lock()
 	dentries := i.dentries
+	// Detach the map before invalidation callbacks run. RegisterDentry cannot
+	// repopulate a nil map, so this loop exclusively owns the old entries.
 	i.dentries = nil
 	i.dentriesMu.Unlock()
 
@@ -139,6 +144,8 @@ func (i *taskInode) TaskDestroyAction(ctx context.Context) {
 }
 
 // RegisterDentry implements kernfs.Inode.RegisterDentry.
+//
+// +checklocksexclude:i.dentriesMu
 func (i *taskInode) RegisterDentry(d *kernfs.Dentry) {
 	i.dentriesMu.Lock()
 	defer i.dentriesMu.Unlock()
@@ -155,6 +162,8 @@ func (i *taskInode) RegisterDentry(d *kernfs.Dentry) {
 }
 
 // UnregisterDentry implements kernfs.Inode.RegisterDentry.
+//
+// +checklocksexclude:i.dentriesMu
 func (i *taskInode) UnregisterDentry(d *kernfs.Dentry) {
 	i.dentriesMu.Lock()
 	defer i.dentriesMu.Unlock()
@@ -193,6 +202,7 @@ func (i *taskInode) DecRef(ctx context.Context) {
 	i.taskInodeRefs.DecRef(func() { i.Destroy(ctx) })
 }
 
+// +checklocksexclude:i.dentriesMu
 func (i *taskInode) Lookup(ctx context.Context, name string) (kernfs.Inode, error) {
 	i.dentriesMu.RLock()
 	if i.dentries == nil {
@@ -246,6 +256,8 @@ func (i *taskOwnedInode) Valid(ctx context.Context, parent *kernfs.Dentry, name 
 }
 
 // Stat implements kernfs.Inode.Stat.
+//
+// +checklocksexclude:i.owner.mu
 func (i *taskOwnedInode) Stat(ctx context.Context, fs *vfs.Filesystem, opts vfs.StatOptions) (linux.Statx, error) {
 	stat, err := i.Inode.Stat(ctx, fs, opts)
 	if err != nil {
@@ -264,12 +276,15 @@ func (i *taskOwnedInode) Stat(ctx context.Context, fs *vfs.Filesystem, opts vfs.
 }
 
 // CheckPermissions implements kernfs.Inode.CheckPermissions.
+//
+// +checklocksexclude:i.owner.mu
 func (i *taskOwnedInode) CheckPermissions(ctx context.Context, creds *auth.Credentials, ats vfs.AccessTypes) error {
 	mode := i.Mode()
 	uid, gid := i.getOwner(mode)
 	return vfs.GenericCheckPermissions(creds, ats, mode, nil, uid, gid)
 }
 
+// +checklocksexclude:i.owner.mu
 func (i *taskOwnedInode) getOwner(mode linux.FileMode) (auth.KUID, auth.KGID) {
 	// By default, set the task owner as the file owner.
 	creds := i.owner.Credentials()

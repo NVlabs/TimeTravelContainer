@@ -28,6 +28,8 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
@@ -163,13 +165,26 @@ func TestTCPSACKReadback(t *testing.T) {
 	}
 }
 
+type forwardingTestStack struct {
+	*inet.TestStack
+	forwarding map[tcpip.NetworkProtocolNumber]bool
+}
+
+func (s *forwardingTestStack) SetForwarding(protocol tcpip.NetworkProtocolNumber, enable bool) error {
+	s.forwarding[protocol] = enable
+	return s.TestStack.SetForwarding(protocol, enable)
+}
+
 // TestConfigureIPForwarding tests the implementation of
-// /proc/sys/net/ipv4/ip_forward.
+// /proc/sys/net/ipv4/ip_forward and /proc/sys/net/ipv6/conf/{all,default}/forwarding.
 func TestConfigureIPForwarding(t *testing.T) {
 	ctx := context.Background()
-	s := inet.NewTestStack()
+	s := &forwardingTestStack{
+		TestStack:  inet.NewTestStack(),
+		forwarding: make(map[tcpip.NetworkProtocolNumber]bool),
+	}
 
-	var cases = []struct {
+	cases := []struct {
 		comment string
 		initial bool
 		str     string
@@ -212,21 +227,32 @@ func TestConfigureIPForwarding(t *testing.T) {
 			final:   true,
 		},
 	}
-	for _, c := range cases {
-		t.Run(c.comment, func(t *testing.T) {
-			s.IPForwarding = c.initial
+	for _, proto := range []struct {
+		name     string
+		protocol tcpip.NetworkProtocolNumber
+	}{
+		{name: "IPv4", protocol: ipv4.ProtocolNumber},
+		{name: "IPv6", protocol: ipv6.ProtocolNumber},
+	} {
+		t.Run(proto.name, func(t *testing.T) {
+			for _, c := range cases {
+				t.Run(c.comment, func(t *testing.T) {
+					clear(s.forwarding)
+					s.forwarding[proto.protocol] = c.initial
 
-			file := &ipForwarding{stack: s, enabled: c.initial}
+					file := &ipForwarding{stack: s, protocol: proto.protocol, enabled: c.initial}
 
-			// Write the values.
-			src := usermem.BytesIOSequence([]byte(c.str))
-			if n, err := file.Write(ctx, nil, src, 0); n != int64(len(c.str)) || err != nil {
-				t.Errorf("file.Write(ctx, nil, %q, 0) = (%d, %v); want (%d, nil)", c.str, n, err, len(c.str))
-			}
+					// Write the values.
+					src := usermem.BytesIOSequence([]byte(c.str))
+					if n, err := file.Write(ctx, nil, src, 0); n != int64(len(c.str)) || err != nil {
+						t.Errorf("file.Write(ctx, nil, %q, 0) = (%d, %v); want (%d, nil)", c.str, n, err, len(c.str))
+					}
 
-			// Read the values from the stack and check them.
-			if got, want := s.IPForwarding, c.final; got != want {
-				t.Errorf("s.IPForwarding incorrect; got: %v, want: %v", got, want)
+					// Read the values from the stack and check them.
+					if got, want := s.forwarding[proto.protocol], c.final; got != want {
+						t.Errorf("s.forwarding[%v] incorrect; got: %v, want: %v", proto.protocol, got, want)
+					}
+				})
 			}
 		})
 	}
@@ -315,6 +341,66 @@ func TestPortRangeSharedStack(t *testing.T) {
 	}
 	if got := buf.String(); got != updated {
 		t.Errorf("Generate() = %q, want %q", got, updated)
+	}
+}
+
+// TestConfigureRouteLocalnet tests the implementation of
+// /proc/sys/net/ipv4/conf/{all,default}/route_localnet.
+func TestConfigureRouteLocalnet(t *testing.T) {
+	ctx := context.Background()
+	s := inet.NewTestStack()
+
+	var cases = []struct {
+		comment string
+		initial bool
+		str     string
+		final   bool
+	}{
+		{comment: `disabled; write 1 enables`, initial: false, str: "1", final: true},
+		{comment: `disabled; write 0 stays disabled`, initial: false, str: "0", final: false},
+		{comment: `enabled; write 0 disables`, initial: true, str: "0", final: false},
+		{comment: `enabled; write 1 stays enabled`, initial: true, str: "1", final: true},
+		{comment: `disabled; nonzero enables`, initial: false, str: "2404", final: true},
+	}
+	for _, c := range cases {
+		t.Run(c.comment, func(t *testing.T) {
+			s.AllowExternalLoopbackTraffic = c.initial
+
+			file := &routeLocalnetData{stack: s}
+
+			var initialBuf bytes.Buffer
+			if err := file.Generate(ctx, &initialBuf); err != nil {
+				t.Fatalf("file.Generate(ctx, &initialBuf) = %v, want nil", err)
+			}
+			initialWant := "0\n"
+			if c.initial {
+				initialWant = "1\n"
+			}
+			if got := initialBuf.String(); got != initialWant {
+				t.Errorf("file.Generate initial got %q, want %q", got, initialWant)
+			}
+
+			src := usermem.BytesIOSequence([]byte(c.str))
+			if n, err := file.Write(ctx, nil, src, 0); n != int64(len(c.str)) || err != nil {
+				t.Errorf("file.Write(ctx, nil, %q, 0) = (%d, %v); want (%d, nil)", c.str, n, err, len(c.str))
+			}
+
+			if got, want := s.AllowExternalLoopbackTraffic, c.final; got != want {
+				t.Errorf("s.AllowExternalLoopbackTraffic incorrect; got: %v, want: %v", got, want)
+			}
+
+			var finalBuf bytes.Buffer
+			if err := file.Generate(ctx, &finalBuf); err != nil {
+				t.Fatalf("file.Generate(ctx, &finalBuf) = %v, want nil", err)
+			}
+			finalWant := "0\n"
+			if c.final {
+				finalWant = "1\n"
+			}
+			if got := finalBuf.String(); got != finalWant {
+				t.Errorf("file.Generate final got %q, want %q", got, finalWant)
+			}
+		})
 	}
 }
 

@@ -187,6 +187,9 @@ func (fs *filesystem) AccessAt(ctx context.Context, rp *vfs.ResolvingPath, creds
 		return err
 	}
 	defer d.DecRef(ctx)
+	if err := vfs.CheckMountAccess(rp, ats, linux.FileMode(d.inode.Mode())); err != nil {
+		return err
+	}
 	if ats.MayWrite() {
 		return linuxerr.EROFS
 	}
@@ -386,6 +389,7 @@ func (fs *filesystem) StatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 	defer d.DecRef(ctx)
 	var stat linux.Statx
 	d.inode.statTo(&stat)
+	rp.AddMountRootAttr(&d.vfsd, &stat)
 	return stat, nil
 }
 
