@@ -158,6 +158,7 @@ go_test(
         "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/vfs",
+        "//pkg/tcpip",
         "//pkg/usermem",
     ],
 )

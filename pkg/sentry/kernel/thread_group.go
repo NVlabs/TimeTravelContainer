@@ -386,6 +386,7 @@ func (tg *ThreadGroup) Release(ctx context.Context) {
 		}
 		tg.signalHandlers.mu.Unlock()
 		tty.mu.Unlock()
+		tty.DecRef(ctx)
 	}
 	for _, it := range its {
 		it.DestroyTimer()
@@ -427,15 +428,39 @@ func (tg *ThreadGroup) walkDescendantThreadGroupsLocked(visitor func(*ThreadGrou
 }
 
 // TTY returns the thread group's controlling terminal. If nil, there is no
-// controlling terminal.
+// controlling terminal. No reference is taken; the returned TTY is only safe
+// to use while the caller can otherwise guarantee it stays alive. Callers that
+// open the TTY must use GetTTY instead.
 func (tg *ThreadGroup) TTY() *TTY {
 	sh := tg.signalLock()
 	defer sh.mu.Unlock()
 	return tg.tty
 }
 
+// GetTTY returns the thread group's controlling terminal with a
+// reference taken on it, or nil if there is no controlling terminal. The
+// caller must DecRef the returned TTY when done with it.
+func (tg *ThreadGroup) GetTTY() *TTY {
+	sh := tg.signalLock()
+	defer sh.mu.Unlock()
+	if tg.tty == nil {
+		return nil
+	}
+	tg.tty.IncRef()
+	return tg.tty
+}
+
 // SetControllingTTY sets tty as the controlling terminal of tg.
 func (tg *ThreadGroup) SetControllingTTY(ctx context.Context, tty *TTY, steal bool, isReadable bool) error {
+	var toDecRef []*TTY
+	defer func() {
+		for _, t := range toDecRef {
+			if t != nil {
+				t.DecRef(ctx)
+			}
+		}
+	}()
+
 	tty.mu.Lock()
 	defer tty.mu.Unlock()
 
@@ -479,6 +504,9 @@ func (tg *ThreadGroup) SetControllingTTY(ctx context.Context, tty *TTY, steal bo
 			//		group.
 			if othertg.processGroup.session == tty.tg.processGroup.session {
 				othertg.signalHandlers.mu.NestedLock(signalHandlersLockTg)
+				if othertg.tty != nil {
+					toDecRef = append(toDecRef, othertg.tty)
+				}
 				othertg.tty = nil
 				othertg.signalHandlers.mu.NestedUnlock(signalHandlersLockTg)
 			}
@@ -490,6 +518,10 @@ func (tg *ThreadGroup) SetControllingTTY(ctx context.Context, tty *TTY, steal bo
 	}
 
 	// Set the controlling terminal and foreground process group.
+	if tg.tty != nil {
+		toDecRef = append(toDecRef, tg.tty)
+	}
+	tty.IncRef()
 	tg.tty = tty
 	tg.processGroup.session.foreground = tg.processGroup
 	// Set this as the controlling process of the terminal.
@@ -499,7 +531,16 @@ func (tg *ThreadGroup) SetControllingTTY(ctx context.Context, tty *TTY, steal bo
 }
 
 // ReleaseControllingTTY gives up tty as the controlling tty of tg.
-func (tg *ThreadGroup) ReleaseControllingTTY(tty *TTY) error {
+func (tg *ThreadGroup) ReleaseControllingTTY(ctx context.Context, tty *TTY) error {
+	var toDecRef []*TTY
+	defer func() {
+		for _, t := range toDecRef {
+			if t != nil {
+				t.DecRef(ctx)
+			}
+		}
+	}()
+
 	tty.mu.Lock()
 	defer tty.mu.Unlock()
 
@@ -525,6 +566,9 @@ func (tg *ThreadGroup) ReleaseControllingTTY(tty *TTY) error {
 
 	// If we're not the session leader, we don't have to do much.
 	if tty.tg != tg {
+		if tg.tty != nil {
+			toDecRef = append(toDecRef, tg.tty)
+		}
 		tg.tty = nil
 		tg.signalHandlers.mu.Unlock()
 		return nil
@@ -538,6 +582,9 @@ func (tg *ThreadGroup) ReleaseControllingTTY(tty *TTY) error {
 	for othertg := range tg.pidns.owner.Root.tgids {
 		if othertg.processGroup.session == tg.processGroup.session {
 			othertg.signalHandlers.mu.Lock()
+			if othertg.tty != nil {
+				toDecRef = append(toDecRef, othertg.tty)
+			}
 			othertg.tty = nil
 			if othertg.processGroup == tg.processGroup.session.foreground {
 				if err := othertg.leader.sendSignalLocked(&linux.SignalInfo{Signo: int32(linux.SIGHUP)}, true /* group */); err != nil {

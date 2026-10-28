@@ -216,6 +216,7 @@ go_test(
     size = "small",
     srcs = [
         "dentry_state_test.go",
+        "device_test.go",
         "file_description_impl_util_test.go",
         "mount_test.go",
         "permissions_test.go",
@@ -228,6 +229,7 @@ go_test(
         "//pkg/context",
         "//pkg/errors",
         "//pkg/errors/linuxerr",
+        "//pkg/fspath",
         "//pkg/sentry/contexttest",
         "//pkg/sentry/kernel/auth",
         "//pkg/state",

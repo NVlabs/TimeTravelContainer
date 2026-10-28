@@ -34,7 +34,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
-	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -430,7 +429,7 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	}
 	fdmapOwned = false // Load/CompleteRestore owns or consumes these descriptors.
 	loadOpts := kernel.DistributedForkLoadOptions{
-		Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: args.TargetBranchID,
+		Clocks: l.newCalibratedClocks(), ChildBranchID: args.TargetBranchID,
 		Quarantined: args.Quarantined, OverrideQuarantine: true,
 		RestoreFilesystemResources: resources, RestoreFilesystemFDMap: fdmap,
 		DemandOnly: true, PrefetchBytes: args.PrefetchBytes, PrefetchBehindBytes: args.PrefetchBehindBytes,
@@ -467,7 +466,7 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		targetMFOwned = false // LoadGraphDurableDehydration consumes all files.
 		mfmapOwned = false    // LoadGraphDurableDehydration consumes all files.
 		durableOpts := kernel.DurableDehydrationLoadOptions{
-			Clocks: sentrytime.NewCalibratedClocks(), BranchID: filesystemBranch,
+			Clocks: l.newCalibratedClocks(), BranchID: filesystemBranch,
 			Quarantined: args.Quarantined, OverrideQuarantine: true,
 			RestoreFilesystemResources: resources, RestoreFilesystemFDMap: fdmap,
 			ConfigureNetwork: l.configureNetwork,
@@ -775,7 +774,7 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (_
 			// ChildBranchID selects the prepared persistent filesystem branch
 			// during an in-Sentry restore. TargetBranchID is the immutable remote
 			// transaction identity and is deliberately not a repository branch.
-			Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: args.FilesystemBranch,
+			Clocks: l.newCalibratedClocks(), ChildBranchID: args.FilesystemBranch,
 			Quarantined: args.Quarantined, OverrideQuarantine: true,
 			FilesystemResources: resources, DemandOnly: true,
 			PrefetchBytes: args.PrefetchBytes, PrefetchBehindBytes: args.PrefetchBehindBytes,
@@ -980,7 +979,7 @@ func (l *Loader) restoreDistributedDurablePeer(args *DistributedForkRestoreArgs)
 			memories[resource] = mf
 		}
 		loadOpts := kernel.DurableDehydrationLoadOptions{
-			Clocks: sentrytime.NewCalibratedClocks(), BranchID: args.FilesystemBranch,
+			Clocks: l.newCalibratedClocks(), BranchID: args.FilesystemBranch,
 			Quarantined: args.Quarantined, OverrideQuarantine: true,
 			FilesystemResources: resources, ConfigureNetwork: l.configureNetwork,
 		}

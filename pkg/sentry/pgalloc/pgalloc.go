@@ -1993,6 +1993,35 @@ func (f *MemoryFile) hasUniqueRefLocked(fr memmap.FileRange) bool {
 	return hasUniqueRef
 }
 
+// FirstSharedRange returns the first subrange of fr on which more than one
+// reference is held, and true if such a subrange exists. As for HasUniqueRef,
+// if the caller holds a reference on the given range and is preventing other
+// goroutines from copying it, then subranges reported as unshared (i.e. not
+// contained in the returned range) are not racy.
+//
+// Preconditions: At least one reference must be held on all pages in fr.
+func (f *MemoryFile) FirstSharedRange(fr memmap.FileRange) (memmap.FileRange, bool) {
+	var sr memmap.FileRange
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// visitRefsLocked counts the references of pages in homes too.
+	f.visitRefsLocked(fr, func(r memmap.FileRange, refs uint64) bool {
+		if refs > 1 {
+			if sr.Length() == 0 {
+				sr = r
+				return true
+			}
+			if sr.End == r.Start {
+				sr.End = r.End
+				return true
+			}
+			return false
+		}
+		return sr.Length() == 0
+	})
+	return sr, sr.Length() != 0
+}
+
 // IncRef implements memmap.File.IncRef.
 func (f *MemoryFile) IncRef(fr memmap.FileRange, memCgID uint32) {
 	if !fr.WellFormed() || fr.Length() == 0 || !hostarch.IsPageAligned(fr.Start) || !hostarch.IsPageAligned(fr.End) {

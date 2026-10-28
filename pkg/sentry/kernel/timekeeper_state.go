@@ -21,6 +21,7 @@ import (
 	"context"
 
 	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sync"
 )
@@ -66,4 +67,6 @@ func (t *Timekeeper) afterLoad(context.Context) {
 	t.timer = nil
 	t.params = nil
 	t.restored = make(chan struct{})
+	t.pausableClock = &ktime.SyntheticClock{}
+	t.afterFuncSchedulerWakeCh = make(chan struct{}, 1)
 }

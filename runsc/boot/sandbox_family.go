@@ -692,6 +692,9 @@ type SandboxFamily struct {
 	discardFilesystemBranch        func(string)
 	reclaimFilesystemBranch        func(string) error
 	holdsTransactionSources        func() bool
+	// clockMonotonicRaw is whether the clocks of new branches' Kernels
+	// track host CLOCK_MONOTONIC_RAW, as the loader's do.
+	clockMonotonicRaw bool
 }
 
 type distributedForkSession struct {
@@ -760,6 +763,9 @@ type SandboxFamilyOptions struct {
 	// HoldsTransactionSources reports whether the Sentry's repositories still
 	// read a remote fork's import from its provider: see WaitDefaultExit.
 	HoldsTransactionSources func() bool
+	// ClockMonotonicRaw is whether the clocks of new branches' Kernels track
+	// host CLOCK_MONOTONIC_RAW, as the loader's do.
+	ClockMonotonicRaw bool
 	// InitialBranchID and InitialFilesystemBranch identify the branch represented
 	// by the Loader's bootstrap Kernel. Empty values retain the canonical main
 	// defaults used by ordinary OCI creation.
@@ -822,6 +828,7 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 		forgetFilesystemBranch:         opts.ForgetFilesystemBranch,
 		discardFilesystemBranch:        opts.DiscardFilesystemBranch,
 		reclaimFilesystemBranch:        opts.ReclaimFilesystemBranch,
+		clockMonotonicRaw:              opts.ClockMonotonicRaw,
 		holdsTransactionSources:        opts.HoldsTransactionSources,
 		defaultStarted:                 make(chan struct{}),
 		distributedSessions:            make(map[string]*distributedForkSession),
@@ -2032,7 +2039,7 @@ func (f *SandboxFamily) ForkMany(args *ForkBranchesArgs) ([]BranchInfo, error) {
 	kernelOpts := make([]kernel.LiveForkOptions, len(childBranches))
 	for i, childBranch := range childBranches {
 		kernelOpts[i] = kernel.LiveForkOptions{
-			Clocks:                         sentrytime.NewCalibratedClocks(),
+			Clocks:                         sentrytime.NewCalibratedClocks(f.clockMonotonicRaw),
 			ChildBranchID:                  childBranch.filesystemBranch,
 			AllowNetworkStack:              f.allowNetworkStack,
 			AllowSharedFilesystemResources: f.allowSharedFilesystemResources,
@@ -2770,7 +2777,7 @@ func (f *SandboxFamily) Rehydrate(id string) error {
 		filesystemBranch = f.volumeBranchID(b.id)
 	}
 	child, err := kernel.LoadDehydration(context.Background(), d.platform, d.image, kernel.DehydrationLoadOptions{
-		Clocks: sentrytime.NewCalibratedClocks(), BranchID: filesystemBranch,
+		Clocks: sentrytime.NewCalibratedClocks(f.clockMonotonicRaw), BranchID: filesystemBranch,
 		Quarantined: b.quarantined, OverrideQuarantine: true,
 		ConfigureNetwork: f.configureNetwork,
 	})

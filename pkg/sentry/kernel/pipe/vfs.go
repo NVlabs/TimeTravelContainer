@@ -50,6 +50,11 @@ func NewVFSPipe(isNamed bool, sizeBytes int64) *VFSPipe {
 	return &vp
 }
 
+// Pipe returns the underlying Pipe object.
+func (vp *VFSPipe) Pipe() *Pipe {
+	return &vp.pipe
+}
+
 // ReaderWriterPair returns read-only and write-only FDs for vp.
 //
 // Preconditions: statusFlags should not contain an open access mode.
@@ -182,6 +187,11 @@ type VFSPipeFD struct {
 // buffers, and waiter queues are wholly represented in Sentry state.
 func (*VFSPipeFD) ValidateLiveFork() ([]*vfs.FileDescription, error) {
 	return nil, nil
+}
+
+// Pipe returns the underlying Pipe object.
+func (fd *VFSPipeFD) Pipe() *Pipe {
+	return fd.pipe
 }
 
 // Release implements vfs.FileDescriptionImpl.Release.

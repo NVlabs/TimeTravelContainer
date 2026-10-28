@@ -56,7 +56,7 @@ func (mm *MemoryManager) PageNode(ctx context.Context, addr hostarch.Addr, alloc
 			return 0, linuxerr.ENOENT
 		}
 		var err error
-		if pseg, _, err = mm.getPMAsLocked(ctx, vseg, ar, hostarch.Read, false /* callerIndirectCommit */); err != nil {
+		if pseg, _, err = mm.getPMAsLocked(ctx, vseg, ar, hostarch.Read, false /* callerIndirectCommit */, false /* forPin */); err != nil {
 			return 0, err
 		}
 	}

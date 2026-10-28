@@ -88,6 +88,7 @@ go_library(
         "//visibility:public",
     ],
     deps = [
+        "//pkg/gohacks",
         "//pkg/state/wire",
     ],
 )

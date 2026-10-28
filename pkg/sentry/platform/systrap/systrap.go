@@ -59,6 +59,7 @@ import (
 	"sync/atomic"
 
 	"golang.org/x/sys/unix"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	pkgcontext "gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fd"
@@ -350,6 +351,7 @@ func New(opts platform.Options) (*Systrap, error) {
 	if err != nil {
 		return nil, err
 	}
+	opts.StartupTimer.Reached("systrap memory file created")
 
 	var stubErr error
 	stubInitialized.Do(func() {
@@ -367,6 +369,7 @@ func New(opts platform.Options) (*Systrap, error) {
 
 		// Initialize the stub.
 		stubInit()
+		opts.StartupTimer.Reached("systrap stub initialized")
 
 		// Create the source process for the global pool. This must be
 		// done before initializing any other processes.
@@ -375,6 +378,7 @@ func New(opts platform.Options) (*Systrap, error) {
 			stubErr = fmt.Errorf("initialize systrap: %w", err)
 			return
 		}
+		opts.StartupTimer.Reached("systrap source process created")
 		// The source subprocess is never released explicitly by a MM.
 		source.DecRef(nil)
 
@@ -397,8 +401,11 @@ func New(opts platform.Options) (*Systrap, error) {
 		})
 	}
 
+	opts.StartupTimer.Reached("waiting for membarrier")
+	memBarrier := <-mbCh
+	opts.StartupTimer.Reached("host membarrier probed")
 	return &Systrap{
-		UseHostGlobalMemoryBarrier: platform.UseHostGlobalMemoryBarrier{MemBarrier: <-mbCh},
+		UseHostGlobalMemoryBarrier: platform.UseHostGlobalMemoryBarrier{MemBarrier: memBarrier},
 		memoryFile:                 mf,
 	}, nil
 }

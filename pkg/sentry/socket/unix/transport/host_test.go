@@ -33,9 +33,9 @@ func TestHostConnectedEndpointLinuxErrorTranslation(t *testing.T) {
 	defer unix.Close(fds[0])
 	defer unix.Close(fds[1])
 
-	ep, serr := NewHostConnectedEndpoint(fds[0], "test")
+	ep, serr := NewHostSender(fds[0], "test")
 	if serr != nil {
-		t.Fatalf("NewHostConnectedEndpoint: %v", serr)
+		t.Fatalf("NewHostSender: %v", serr)
 	}
 	// Force fdReadVec's pre-syscall truncation path. The resulting buildIovec
 	// error is a Linux EAGAIN, not a host errno. On Darwin, interpreting its
@@ -58,9 +58,9 @@ func TestHostConnectedEndpointWouldBlock(t *testing.T) {
 	defer unix.Close(fds[0])
 	defer unix.Close(fds[1])
 
-	ep, serr := NewHostConnectedEndpoint(fds[0], "test")
+	ep, serr := NewHostSender(fds[0], "test")
 	if serr != nil {
-		t.Fatalf("NewHostConnectedEndpoint: %v", serr)
+		t.Fatalf("NewHostSender: %v", serr)
 	}
 	_, _, serr = ep.Recv(context.Background(), [][]byte{make([]byte, 8)}, RecvArgs{})
 	if serr == nil {
@@ -79,9 +79,9 @@ func TestHostConnectedEndpointRoundTrip(t *testing.T) {
 	defer unix.Close(fds[0])
 	defer unix.Close(fds[1])
 
-	ep, serr := NewHostConnectedEndpoint(fds[0], "test")
+	ep, serr := NewHostSender(fds[0], "test")
 	if serr != nil {
-		t.Fatalf("NewHostConnectedEndpoint: %v", serr)
+		t.Fatalf("NewHostSender: %v", serr)
 	}
 	want := []byte("host socket transport")
 	if _, err := unix.Write(fds[1], want); err != nil {
@@ -125,9 +125,9 @@ func TestHostConnectedEndpointShutdownAfterPeerDisconnect(t *testing.T) {
 	}
 	defer unix.Close(fds[0])
 
-	ep, serr := NewHostConnectedEndpoint(fds[0], "test")
+	ep, serr := NewHostSender(fds[0], "test")
 	if serr != nil {
-		t.Fatalf("NewHostConnectedEndpoint: %v", serr)
+		t.Fatalf("NewHostSender: %v", serr)
 	}
 	if err := unix.Close(fds[1]); err != nil {
 		t.Fatalf("closing peer: %v", err)

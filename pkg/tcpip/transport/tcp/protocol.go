@@ -101,24 +101,42 @@ type protocol struct {
 	// in one Sentry process (for example, a batch live fork).
 	restore restoreCoordinator `state:"nosave"`
 
-	mu                         protocolRWMutex `state:"nosave"`
-	sackEnabled                bool
-	recovery                   tcpip.TCPRecovery
-	delayEnabled               bool
-	alwaysUseSynCookies        bool
-	sendBufferSize             tcpip.TCPSendBufferSizeRangeOption
-	recvBufferSize             tcpip.TCPReceiveBufferSizeRangeOption
-	congestionControl          string
+	mu protocolRWMutex `state:"nosave"`
+
+	// +checklocks:mu
+	sackEnabled bool
+	// +checklocks:mu
+	recovery tcpip.TCPRecovery
+	// +checklocks:mu
+	delayEnabled bool
+	// +checklocks:mu
+	alwaysUseSynCookies bool
+	// +checklocks:mu
+	sendBufferSize tcpip.TCPSendBufferSizeRangeOption
+	// +checklocks:mu
+	recvBufferSize tcpip.TCPReceiveBufferSizeRangeOption
+	// +checklocks:mu
+	congestionControl string
+	// availableCongestionControl is immutable after construction.
 	availableCongestionControl []string
-	moderateReceiveBuffer      bool
-	lingerTimeout              time.Duration
-	timeWaitTimeout            time.Duration
-	timeWaitReuse              tcpip.TCPTimeWaitReuseOption
-	minRTO                     time.Duration
-	maxRTO                     time.Duration
-	maxRetries                 uint32
-	synRetries                 uint8
-	dispatcher                 dispatcher
+	// +checklocks:mu
+	moderateReceiveBuffer bool
+	// +checklocks:mu
+	lingerTimeout time.Duration
+	// +checklocks:mu
+	timeWaitTimeout time.Duration
+	// +checklocks:mu
+	timeWaitReuse tcpip.TCPTimeWaitReuseOption
+	// +checklocks:mu
+	minRTO time.Duration
+	// +checklocks:mu
+	maxRTO time.Duration
+	// +checklocks:mu
+	maxRetries uint32
+	// +checklocks:mu
+	synRetries uint8
+
+	dispatcher dispatcher
 
 	// probe, if not nil, will be invoked any time an endpoint receives a
 	// TCP segment.
@@ -278,6 +296,8 @@ func replyWithReset(st *stack.Stack, s *segment, tos, ipv4TTL uint8, ipv6HopLimi
 }
 
 // SetOption implements stack.TransportProtocol.SetOption.
+//
+// +checklocksexclude:p.mu
 func (p *protocol) SetOption(option tcpip.SettableTransportProtocolOption) tcpip.Error {
 	switch v := option.(type) {
 	case *tcpip.TCPSACKEnabled:
@@ -415,6 +435,8 @@ func (p *protocol) SetOption(option tcpip.SettableTransportProtocolOption) tcpip
 }
 
 // Option implements stack.TransportProtocol.Option.
+//
+// +checklocksexclude:p.mu
 func (p *protocol) Option(option tcpip.GettableTransportProtocolOption) tcpip.Error {
 	switch v := option.(type) {
 	case *tcpip.TCPSACKEnabled:
@@ -519,6 +541,8 @@ func (p *protocol) Option(option tcpip.GettableTransportProtocolOption) tcpip.Er
 }
 
 // SendBufferSize implements stack.SendBufSizeProto.
+//
+// +checklocksexclude:p.mu
 func (p *protocol) SendBufferSize() tcpip.TCPSendBufferSizeRangeOption {
 	p.mu.RLock()
 	defer p.mu.RUnlock()

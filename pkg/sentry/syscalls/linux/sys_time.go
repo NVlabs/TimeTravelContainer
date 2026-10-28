@@ -129,9 +129,10 @@ func getClock(t *kernel.Task, clockID int32) (ktime.Clock, error) {
 		// timers would also wake the system from suspend, which gVisor
 		// lacks.
 		return t.Kernel().RealtimeClock(), nil
+	case linux.CLOCK_MONOTONIC_RAW:
+		return t.Kernel().MonotonicRawClock(), nil
 	case linux.CLOCK_MONOTONIC, linux.CLOCK_MONOTONIC_COARSE,
-		linux.CLOCK_MONOTONIC_RAW, linux.CLOCK_BOOTTIME, linux.CLOCK_BOOTTIME_ALARM:
-		// CLOCK_MONOTONIC approximates CLOCK_MONOTONIC_RAW.
+		linux.CLOCK_BOOTTIME, linux.CLOCK_BOOTTIME_ALARM:
 		// CLOCK_BOOTTIME is internally mapped to CLOCK_MONOTONIC, as:
 		//	- CLOCK_BOOTTIME should behave as CLOCK_MONOTONIC while also
 		//		including suspend time.

@@ -69,7 +69,7 @@ type RouteProtocol interface {
 	// AddAddrMessage appends an RTM_NEWADDR message for an address of the
 	// given interface into the message set, or with added false, an
 	// RTM_DELADDR message.
-	AddAddrMessage(ms *nlmsg.MessageSet, idx int32, addr inet.InterfaceAddr, added bool)
+	AddAddrMessage(ms *nlmsg.MessageSet, idx int32, addr inet.InterfaceAddr, label string, added bool)
 }
 
 // Provider is a function that creates a new Protocol for a specific netlink

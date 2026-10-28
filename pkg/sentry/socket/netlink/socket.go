@@ -107,7 +107,7 @@ type Socket struct {
 
 	// connection is the kernel's connection to ep, used to write messages
 	// sent to userspace.
-	connection transport.ConnectedEndpoint
+	connection transport.Sender
 
 	// netns is the network namespace associated with the socket.
 	// A netlink socket is immutably bound to a network namespace.
@@ -498,7 +498,11 @@ func (s *Socket) HandleInterfaceAddrEvent(ctx context.Context, idx int32, addr i
 
 	// Multicast messages from the kernel leave hdr->nlmsg_pid at 0.
 	ms := nlmsg.NewMessageSet(0 /*portID*/, 0 /*seq*/)
-	routeProtocol.AddAddrMessage(ms, idx, addr, added)
+	label := ""
+	if stack := inet.StackFromContext(ctx); stack != nil {
+		label = stack.Interfaces()[idx].Name
+	}
+	routeProtocol.AddAddrMessage(ms, idx, addr, label, added)
 	s.SendResponse(ctx, ms)
 }
 
@@ -957,7 +961,7 @@ func (s *Socket) sendBufs(ctx context.Context, bufs [][]byte, cms transport.Cont
 		return err
 	}
 	if notify {
-		s.connection.SendNotify()
+		s.connection.NotifyDataReady()
 	}
 	return nil
 }

@@ -9,7 +9,7 @@ import "syscall"
 
 func fillHostStatAttr(attr *Attr, stat *syscall.Stat_t, req AttrMask) {
 	if req.RDev {
-		attr.RDev = stat.Dev
+		attr.RDev = stat.Rdev
 	}
 	if req.ATime {
 		attr.ATimeSeconds = uint64(stat.Atim.Sec)

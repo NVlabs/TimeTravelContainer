@@ -37,6 +37,7 @@ go_test(
     srcs = [
         "config_host_darwin_test.go",
         "config_test.go",
+        "flags_test.go",
     ],
     library = ":config",
     deps = [

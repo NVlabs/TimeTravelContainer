@@ -70,6 +70,7 @@ go_library(
 		"//pkg/ttcpack",
 		"//pkg/ttcsnapshot",
         "//pkg/metric",
+        "//pkg/pinring",
         "//pkg/prometheus",
         "//pkg/sentry/checkpoint",
         "//pkg/sentry/control",

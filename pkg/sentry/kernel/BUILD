@@ -148,13 +148,6 @@ declare_mutex(
 )
 
 declare_mutex(
-    name = "timekeeper_tcpip_timer_mutex",
-    out = "timekeeper_tcpip_timer_mutex.go",
-    package = "kernel",
-    prefix = "timekeeperTcpipTimer",
-)
-
-declare_mutex(
     name = "cgroup_mounts_mutex",
     out = "cgroup_mounts_mutex.go",
     package = "kernel",
@@ -357,13 +350,11 @@ go_library(
         "threads_impl.go",
         "timekeeper.go",
         "timekeeper_state.go",
-        "timekeeper_tcpip_timer_mutex.go",
         "tty.go",
         "task_wait_info_mutex.go",
         "user_counters_mutex.go",
         "uts_namespace.go",
         "vdso.go",
-        "version.go",
     ],
     imports = [
         "gvisor.dev/gvisor/pkg/bpf",
@@ -409,6 +400,7 @@ go_library(
         "//pkg/sentry/devices/nvproxy/nvconf",
         "//pkg/sentry/fdcollector",
         "//pkg/sentry/fscheckpoint",
+        "//pkg/sentry/fscheckpoint:fscheckpoint_proto_go_proto",
         "//pkg/sentry/fsimpl/kernfs",
         "//pkg/sentry/fsimpl/lock",
         "//pkg/sentry/fsimpl/mqfs",
@@ -487,31 +479,48 @@ go_test(
         "//pkg/sentry/contexttest",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/kernel/sched",
+        "//pkg/sentry/ktime",
         "//pkg/sentry/limits",
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/state/stateio",
+        "//pkg/sentry/seccheck",
+        "//pkg/sentry/seccheck/points:points_go_proto",
         "//pkg/sentry/time",
         "//pkg/sentry/ttcchunk",
         "//pkg/sentry/usage",
         "//pkg/sentry/vfs",
         "//pkg/state",
         "//pkg/sync",
+        "//pkg/tcpip",
+        "@org_golang_google_protobuf//proto:go_default_library",
     ],
 )
 
 go_test(
     name = "timekeeper_test",
     size = "small",
-    srcs = ["timekeeper_test.go"],
+    srcs = [
+        "task_syscall_benchmark_test.go",
+        "timekeeper_test.go",
+    ],
     library = ":kernel",
     deps = [
         "//pkg/errors/linuxerr",
         "//pkg/hostarch",
         "//pkg/memutil",
+        "//pkg/sentry/arch",
+        "//pkg/sentry/contexttest",
+        "//pkg/sentry/kernel/auth",
+        "//pkg/sentry/ktime",
         "//pkg/sentry/pgalloc",
+        "//pkg/sentry/seccheck",
+        "//pkg/sentry/seccheck/points:points_go_proto",
         "//pkg/sentry/time",
         "//pkg/sentry/usage",
         "//pkg/state",
+        "//pkg/sync",
+        "//pkg/tcpip",
+        "@org_golang_google_protobuf//proto:go_default_library",
     ],
 )
 

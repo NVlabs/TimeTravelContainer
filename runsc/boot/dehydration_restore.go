@@ -35,7 +35,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
-	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
@@ -230,7 +229,7 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 		return nil, err
 	}
 	loadOptions := kernel.DurableDehydrationLoadOptions{
-		Clocks: sentrytime.NewCalibratedClocks(), BranchID: args.FilesystemBranch,
+		Clocks: l.newCalibratedClocks(), BranchID: args.FilesystemBranch,
 		Quarantined: args.Quarantined, OverrideQuarantine: true,
 		RestoreFilesystemResources: resources, RestoreFilesystemFDMap: restoreMnts.fdmap,
 		ConfigureNetwork: func(k *kernel.Kernel, stack inet.Stack) error {
@@ -485,7 +484,7 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 		// stub mapping and source subprocess are process-global; constructing a
 		// second platform here can collide with the active platform's mappings.
 		loadOptions := kernel.DurableDehydrationLoadOptions{
-			Clocks: sentrytime.NewCalibratedClocks(), BranchID: args.FilesystemBranch,
+			Clocks: l.newCalibratedClocks(), BranchID: args.FilesystemBranch,
 			Quarantined: args.Quarantined, OverrideQuarantine: true,
 			FilesystemResources: resources, ConfigureNetwork: func(k *kernel.Kernel, stack inet.Stack) error {
 				return l.configureNetworkWithArgs(k, stack, args.NetworkArgs)

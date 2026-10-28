@@ -15,10 +15,12 @@ go_library(
         "cgroup_host_darwin.go",
         "cgroup_host_linux.go",
         "cgroup_v2.go",
+        "cgroup_v2_unsafe.go",
         "systemd.go",
     ],
     visibility = ["//:sandbox"],
     deps = [
+        "//pkg/abi/linux",
         "//pkg/cleanup",
         "//pkg/log",
         "@com_github_cenkalti_backoff//:go_default_library",

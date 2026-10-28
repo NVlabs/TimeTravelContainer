@@ -65,7 +65,7 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 	}
 	remap := faultRemap{ar: ar}
 	defer remap.release()
-	pseg, pend, err := mm.getPMAsRemappingLocked(ctx, vseg, ar, at, true /* callerIndirectCommit */, &remap)
+	pseg, pend, err := mm.getPMAsRemappingLocked(ctx, vseg, ar, at, true /* callerIndirectCommit */, false /* forPin */, &remap)
 	mm.mappingMu.RUnlock()
 	if err != nil {
 		if pend.Start() < faulted.End {
@@ -150,6 +150,9 @@ func (mm *MemoryManager) MMap(ctx context.Context, opts memmap.MMapOpts) (hostar
 	if opts.Unmap && !opts.Fixed {
 		return 0, linuxerr.EINVAL
 	}
+	if opts.NoReplace && (!opts.Fixed || opts.Unmap) {
+		return 0, linuxerr.EINVAL
+	}
 	if opts.GrowsDown && opts.Mappable != nil {
 		return 0, linuxerr.EINVAL
 	}
@@ -232,7 +235,7 @@ func (mm *MemoryManager) populateVMA(ctx context.Context, vseg vmaIterator, ar h
 	}
 
 	// Ensure that we have usable pmas.
-	pseg, _, err := mm.getPMAsLocked(ctx, vseg, ar, hostarch.NoAccess, platformEffect == memmap.PlatformEffectCommit)
+	pseg, _, err := mm.getPMAsLocked(ctx, vseg, ar, hostarch.NoAccess, platformEffect == memmap.PlatformEffectCommit, false /* forPin */)
 	if err != nil {
 		mm.activeMu.Unlock()
 		return err
@@ -278,7 +281,7 @@ func (mm *MemoryManager) populateVMAAndUnlock(ctx context.Context, vseg vmaItera
 	// mm.mappingMu doesn't need to be write-locked for getPMAsLocked, and it
 	// isn't needed at all for mapASLocked.
 	mm.mappingMu.DowngradeLock()
-	pseg, _, err := mm.getPMAsLocked(ctx, vseg, ar, hostarch.NoAccess, platformEffect == memmap.PlatformEffectCommit)
+	pseg, _, err := mm.getPMAsLocked(ctx, vseg, ar, hostarch.NoAccess, platformEffect == memmap.PlatformEffectCommit, false /* forPin */)
 	mm.mappingMu.RUnlock()
 	if err != nil {
 		// mm/util.c:vm_mmap_pgoff() ignores the error, if any, from
@@ -442,6 +445,14 @@ func (mm *MemoryManager) MRemap(ctx context.Context, oldAddr hostarch.Addr, oldS
 		return 0, linuxerr.EFAULT
 	}
 
+	if vma := vseg.ValuePtr(); newSize > oldSize && vma.mappable != nil {
+		// Check that offset+length does not overflow.
+		offset := vseg.mappableOffsetAt(oldAddr)
+		if offset+newSize < offset {
+			return 0, linuxerr.EINVAL
+		}
+	}
+
 	// Behavior matrix:
 	//
 	// Move     | oldSize = 0 | oldSize < newSize | oldSize = newSize | oldSize > newSize
@@ -591,10 +602,6 @@ func (mm *MemoryManager) MRemap(ctx context.Context, oldAddr hostarch.Addr, oldS
 	}
 
 	if vma := vseg.ValuePtr(); vma.mappable != nil {
-		// Check that offset+length does not overflow.
-		if vma.off+uint64(newAR.Length()) < vma.off {
-			return 0, linuxerr.EINVAL
-		}
 		// Inform the Mappable, if any, of the new mapping.
 		if err := vma.mappable.CopyMapping(ctx, mm, oldAR, newAR, vseg.mappableOffsetAt(oldAR.Start), vma.canWriteMappableLocked()); err != nil {
 			return 0, err
@@ -954,7 +961,7 @@ func (mm *MemoryManager) MLock(ctx context.Context, addr hostarch.Addr, length u
 				mm.mappingMu.RUnlock()
 				return linuxerr.ENOMEM
 			}
-			_, _, err := mm.getPMAsLocked(ctx, vseg, vseg.Range().Intersect(ar), hostarch.NoAccess, true /* callerIndirectCommit */)
+			_, _, err := mm.getPMAsLocked(ctx, vseg, vseg.Range().Intersect(ar), hostarch.NoAccess, true /* callerIndirectCommit */, false /* forPin */)
 			if err != nil {
 				mm.activeMu.Unlock()
 				mm.mappingMu.RUnlock()
@@ -1049,7 +1056,7 @@ func (mm *MemoryManager) MLockAll(ctx context.Context, opts MLockAllOpts) error 
 		mm.mappingMu.DowngradeLock()
 		for vseg := mm.vmas.FirstSegment(); vseg.Ok(); vseg = vseg.NextSegment() {
 			if vseg.ValuePtr().effectivePerms.Any() {
-				mm.getPMAsLocked(ctx, vseg, vseg.Range(), hostarch.NoAccess, true /* callerIndirectCommit */)
+				mm.getPMAsLocked(ctx, vseg, vseg.Range(), hostarch.NoAccess, true /* callerIndirectCommit */, false /* forPin */)
 			}
 		}
 
@@ -1172,9 +1179,10 @@ func (mm *MemoryManager) Decommit(addr hostarch.Addr, length uint64) error {
 	//	- If at least one byte in ar is not covered by a vma, decommit the rest
 	//	but return ENOMEM.
 	//
-	//	- If we would invalidate only part of a huge page that we own (is not
-	//	copy-on-write), use MemoryFile.Decommit() instead to keep the allocated
-	//	huge page intact for future use.
+	//	- If we would invalidate only part of a huge page backing a private
+	//	anonymous mapping that we own (is not copy-on-write), use
+	//	MemoryFile.Decommit() instead to keep the allocated huge page intact for
+	//	future use.
 	didUnmapAS := false
 	pseg := mm.pmas.LowerBoundSegment(ar.Start)
 	vseg := mm.vmas.LowerBoundSegment(ar.Start)
@@ -1197,7 +1205,7 @@ func (mm *MemoryManager) Decommit(addr hostarch.Addr, length uint64) error {
 		}
 		for pseg.Ok() && pseg.Start() < vsegAR.End {
 			pma := pseg.ValuePtr()
-			if pma.huge && !mm.isPMACopyOnWriteLocked(vseg, pseg) {
+			if vma.mappable == nil && pma.huge && !mm.isPMACopyOnWriteLocked(vseg, pseg) {
 				psegAR := pseg.Range().Intersect(vsegAR)
 				if !psegAR.IsHugePageAligned() {
 					firstHugeStart := psegAR.Start.HugeRoundDown()

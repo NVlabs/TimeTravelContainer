@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 load("//pkg/sync/locking:locking.bzl", "declare_mutex")
-load("//tools:defs.bzl", "go_library", "go_test")
+load("//tools:defs.bzl", "go_library", "go_test", "proto_library")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
 package(
@@ -279,4 +279,9 @@ go_test(
         "//pkg/sentry/usage",
         "@org_golang_x_sys//unix:go_default_library",
     ],
+)
+
+proto_library(
+    name = "pgalloc_metadata",
+    srcs = ["pgalloc.proto"],
 )
