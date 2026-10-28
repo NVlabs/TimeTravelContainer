@@ -55,6 +55,7 @@ import (
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/pkg/urpc"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
 )
 
@@ -450,7 +451,7 @@ type BranchSignalArgs struct {
 	CID      string
 	Signo    int32
 	PID      int32
-	Mode     SignalDeliveryMode
+	Mode     sentryapi.SignalDeliveryMode
 }
 
 // ConsoleReadArgs selects one output stream of a branch-local internal console.
@@ -3538,7 +3539,7 @@ func (f *SandboxFamily) ResidentMemory(args *FamilyResidentMemoryArgs, out *Fami
 
 // Signal sends a signal within one branch. Foreground process-group delivery
 // resolves the controlling TTY from branch-local cloned Sentry state.
-func (f *SandboxFamily) Signal(id, cid string, pid, signo int32, mode SignalDeliveryMode) error {
+func (f *SandboxFamily) Signal(id, cid string, pid, signo int32, mode sentryapi.SignalDeliveryMode) error {
 	b, done, err := f.beginControl(id)
 	if err != nil {
 		return err
@@ -3547,13 +3548,13 @@ func (f *SandboxFamily) Signal(id, cid string, pid, signo int32, mode SignalDeli
 
 	k := b.k
 	switch mode {
-	case DeliverToProcess:
+	case sentryapi.DeliverToProcess:
 		tg, err := branchThreadGroup(k, cid, kernel.ThreadID(pid))
 		if err != nil {
 			return err
 		}
 		return k.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: signo})
-	case DeliverToAllProcesses:
+	case sentryapi.DeliverToAllProcesses:
 		if pid != 0 {
 			return fmt.Errorf("PID (%d) cannot be set when signaling all processes", pid)
 		}
@@ -3563,7 +3564,7 @@ func (f *SandboxFamily) Signal(id, cid string, pid, signo int32, mode SignalDeli
 		k.Pause()
 		defer k.Unpause()
 		return k.SendContainerSignal(cid, &linux.SignalInfo{Signo: signo})
-	case DeliverToProcessGroup:
+	case sentryapi.DeliverToProcessGroup:
 		if pid <= 0 {
 			return fmt.Errorf("PGID must be positive")
 		}
@@ -3578,7 +3579,7 @@ func (f *SandboxFamily) Signal(id, cid string, pid, signo int32, mode SignalDeli
 			}
 		}
 		return fmt.Errorf("process group %d does not belong to container %q", pgid, cid)
-	case DeliverToForegroundProcessGroup:
+	case sentryapi.DeliverToForegroundProcessGroup:
 		tg, err := branchThreadGroup(k, cid, kernel.ThreadID(pid))
 		if err != nil {
 			return err

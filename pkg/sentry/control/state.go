@@ -24,8 +24,8 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/fdcollector"
+	"gvisor.dev/gvisor/pkg/sentry/fscheckpoint"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/pipefs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
@@ -109,10 +109,10 @@ type SaveOpts struct {
 	// sequentially (rather than in parallel).
 	CudaCheckpointSequential bool `json:"cuda_checkpoint_sequential"`
 
-	// SplitFSCheckpointPaths is the list of paths to include in the filesystem
-	// for split checkpoint. If non-empty, split filesystem checkpoint is enabled.
-	// For capturing all of tmpfs, the ResourceID Path should be "all-tmpfs".
-	SplitFSCheckpointPaths []checkpoint.ResourceID `json:"split_fs_checkpoint_paths"`
+	// SplitFSCheckpointPaths lists the filesystem checkpoint bundles to save in
+	// separate files. Filesystems not in any bundle are saved in the regular
+	// checkpoint files. Use the path "all-tmpfs" to include all tmpfs mounts.
+	SplitFSCheckpointPaths []fscheckpoint.Bundle `json:"split_fs_checkpoint_paths"`
 
 	// RunscVersion is the runsc binary version.
 	RunscVersion string `json:"runsc_version"`
@@ -206,7 +206,7 @@ func setSaveOptsForLocalCheckpointFiles(o *SaveOpts, saveOpts *state.SaveOpts) e
 	if len(o.SplitFSCheckpointPaths) > 0 {
 		saveOpts.FSSaveOpts = &kernel.FSSaveOpts{
 			RunscVersion: o.RunscVersion,
-			Paths:        o.SplitFSCheckpointPaths,
+			Paths:        o.SplitFSCheckpointPaths[0].Paths,
 		}
 		manifestFile, err := o.ReleaseFD(fsFilesStart)
 		if err != nil {
@@ -292,23 +292,22 @@ func (s *State) Save(o *SaveOpts, _ *struct{}) (err error) {
 	}
 	defer saveOpts.Close()
 
-	return s.SaveWithOpts(saveOpts, &o.ExecOpts)
+	if err := s.SaveWithOpts(saveOpts, &o.ExecOpts); err != nil {
+		return err
+	}
+	if saveOpts.Resume {
+		return PostResume(s.Kernel, nil)
+	}
+	return nil
 }
 
-// SaveWithOpts saves the running system with the given options.
+// SaveWithOpts saves the running system with the given options. If
+// saveOpts.Resume is true, the caller must call PostResume afterwards.
 func (s *State) SaveWithOpts(saveOpts *state.SaveOpts, execOpts *SaveRestoreExecOpts) error {
 	if err := preSave(s.Kernel, saveOpts, execOpts); err != nil {
 		return err
 	}
-	if err := saveOpts.Save(s.Kernel.SupervisorContext(), s.Kernel, s.Watchdog); err != nil {
-		return err
-	}
-	if saveOpts.Resume {
-		if err := PostResume(s.Kernel, nil); err != nil {
-			return err
-		}
-	}
-	return nil
+	return saveOpts.Save(s.Kernel.SupervisorContext(), s.Kernel, s.Watchdog)
 }
 
 // preSave is called before saving the kernel.
@@ -467,7 +466,7 @@ func SaveRestoreExec(k *kernel.Kernel, mode SaveRestoreExecMode) error {
 			return fmt.Errorf("%v exited with non-zero status %d", argv[0], tg.ExitStatus())
 		}
 	case <-time.After(timeout):
-		tg.SendSignal(&linux.SignalInfo{Signo: int32(linux.SIGKILL)})
+		tg.SendForcedSignal(&linux.SignalInfo{Signo: int32(linux.SIGKILL)})
 		return fmt.Errorf("%s timed out after %v", argv[0], timeout)
 	}
 	log.Debugf("save/restore binary %s output: %s", argv[0], execOut.String())

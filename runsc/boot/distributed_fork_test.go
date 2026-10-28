@@ -9,6 +9,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 )
 
 func TestAliasLiveForkFilesystemResources(t *testing.T) {
@@ -76,12 +77,12 @@ func TestContainerRuntimeStateDuringRestore(t *testing.T) {
 	defer l.mu.Unlock()
 	l.restoring.Store(true)
 	defer l.restoring.Store(false)
-	answered := make(chan ContainerRuntimeState, 1)
+	answered := make(chan sentryapi.ContainerRuntimeState, 1)
 	go func() { answered <- l.containerRuntimeState("restoring") }()
 	select {
 	case state := <-answered:
-		if state != RuntimeStateCreating {
-			t.Errorf("containerRuntimeState during a restore=%v, want %v", state, RuntimeStateCreating)
+		if state != sentryapi.RuntimeStateCreating {
+			t.Errorf("containerRuntimeState during a restore=%v, want %v", state, sentryapi.RuntimeStateCreating)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("containerRuntimeState waited for the restore")

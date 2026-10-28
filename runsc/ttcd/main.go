@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/runsc/cli/maincli"
+	"gvisor.dev/gvisor/runsc/cli/sentrycli"
+	"gvisor.dev/gvisor/runsc/gvisorbinaries"
 	"gvisor.dev/gvisor/runsc/processutil"
 	"gvisor.dev/gvisor/runsc/ttc/cmd"
 	"gvisor.dev/gvisor/runsc/ttc/copyguest"
@@ -26,6 +28,16 @@ func main() {
 	}
 	cmd.SetGuestCopyHelper(copyguest.Binary())
 	cmd.SetCarriedHelpers(hostbin.GFXRenderer(), hostbin.CUDACheckpoint())
+	// ttcd carries the sidecars that the runtime, the gofer and the Sentry
+	// execute, and is the Sentry itself.
+	cmd.SetCarriedSidecars(hostbin.Sidecars())
+	gvisorbinaries.Provider = cmd.CarriedSidecar
+	if sentryArgv0(os.Args[0]) {
+		// The runtime boots the Sentry as the Sentry sidecar, which ttcd is.
+		_ = os.Setenv("TTC_EMBEDDED_RUNTIME", "1")
+		sentrycli.Main(&gvisorbinaries.GvisorSentry)
+		return
+	}
 	if len(os.Args) >= 2 && os.Args[1] == "_cp-helper" {
 		os.Exit(cmd.RunCopyHelper(os.Args[2:], os.Stdin, os.Stdout, os.Stderr))
 	}
@@ -133,6 +145,15 @@ func rendererArgs(args []string) ([]string, bool) {
 func embeddedRuntimeArgv0(argv0 string) bool {
 	base := filepath.Base(argv0)
 	return base == "runsc" ||
-		strings.HasPrefix(base, "runsc-") ||
+		strings.HasPrefix(base, "runsc-")
+}
+
+// sentryArgv0 reports whether ttcd runs as the Sentry: as the sandbox
+// process, which TTC names after its family (see the sandbox package's
+// sandboxProcessArgv0), or as the Sentry sidecar that the runtime forwards
+// commands to.
+func sentryArgv0(argv0 string) bool {
+	base := filepath.Base(argv0)
+	return base == gvisorbinaries.GvisorSentry.Name ||
 		strings.HasPrefix(base, "ttc-sentry[")
 }

@@ -301,6 +301,9 @@ func FromError(err error) *Error {
 	case unix.Errno:
 		return FromHost(e)
 	case *errors.Error:
+		if linuxerr.IsRestartError(e) {
+			return ErrInterrupted
+		}
 		// errors.Error contains a Linux ABI errno, not a host errno. Treating
 		// it as unix.Errno is only valid when the Sentry host is Linux. On
 		// Darwin, for example, Linux EAGAIN (11) is host EDEADLK.

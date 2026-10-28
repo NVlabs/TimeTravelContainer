@@ -41,6 +41,7 @@ import (
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/pkg/urpc"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 )
 
 // DurableDehydrationRestoreArgs installs one process-independent branch into
@@ -57,7 +58,7 @@ type DurableDehydrationRestoreArgs struct {
 	// NetworkArgs reconstructs target-local links after the saved netstack has
 	// been loaded. Cold restore runs before Loader.Run, so it cannot rely on
 	// SetNetworkArgs having reached the Loader yet.
-	NetworkArgs *CreateLinksAndRoutesArgs
+	NetworkArgs *sentryapi.CreateLinksAndRoutesArgs
 	// UseDonatedMemoryFiles selects peer import into an already-running Sentry.
 	// Files then contains graph sources followed by empty target files. When
 	// application memory is reused, only N-1 private target files are donated.

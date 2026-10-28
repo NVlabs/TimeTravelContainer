@@ -17,13 +17,31 @@ func TestEmbeddedRuntimeArgv0(t *testing.T) {
 		{"/usr/local/bin/runsc", true},
 		{"runsc-gofer", true},
 		{"runsc-exec", true},
-		{"ttc-sentry[demo@family]", true},
+		{"ttc-sentry[demo@family]", false},
 		{"/usr/local/bin/ttcd", false},
 		{"ttcd-runsc", false},
 		{"unrelated-runsc-gofer", false},
 	} {
 		if got := embeddedRuntimeArgv0(test.argv0); got != test.want {
 			t.Errorf("embeddedRuntimeArgv0(%q) = %t, want %t", test.argv0, got, test.want)
+		}
+	}
+}
+
+func TestSentryArgv0(t *testing.T) {
+	for _, test := range []struct {
+		argv0 string
+		want  bool
+	}{
+		{"ttc-sentry[demo@family]", true},
+		{"gvisor_sentry", true},
+		{"/some/dir/gvisor_sentry", true},
+		{"runsc-gofer", false},
+		{"/usr/local/bin/ttcd", false},
+		{"ttc-sentry", false},
+	} {
+		if got := sentryArgv0(test.argv0); got != test.want {
+			t.Errorf("sentryArgv0(%q) = %t, want %t", test.argv0, got, test.want)
 		}
 	}
 }

@@ -38,6 +38,7 @@ go_library(
         "//pkg/sentry/mm",
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/platform",
+        "//pkg/sentry/platform/platformdesc",
         "//pkg/sentry/seccheck",
         "//pkg/sentry/time",
         "//pkg/sentry/usage",

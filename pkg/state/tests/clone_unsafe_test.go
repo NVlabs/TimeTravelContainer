@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 	"unsafe"
 
 	"gvisor.dev/gvisor/pkg/state"
@@ -116,6 +117,34 @@ func TestCloneAliases(t *testing.T) {
 	g.check(t, &c)
 }
 
+// TestSaveKeepsSharedArrays checks that a save leaves alone the unused
+// capacity of a slice where another slice of the same array holds live
+// elements, and that a load keeps them and the slices' sharing. (The encoder,
+// unlike a clone, has no way to refer to an array from inside another one, so
+// the slices start together.)
+func TestSaveKeepsSharedArrays(t *testing.T) {
+	n := &cloneNode{buf: make([]byte, 8, 16)}
+	copy(n.buf, "abcdefgh")
+	n.view = n.buf[:4]
+	var saved bytes.Buffer
+	if _, err := state.Save(context.Background(), &saved, n); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if string(n.buf) != "abcdefgh" {
+		t.Errorf("the save changed buf to %q", n.buf)
+	}
+	var c cloneNode
+	if _, err := state.Load(context.Background(), &saved, &c); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if string(c.buf) != "abcdefgh" || cap(c.buf) != 16 {
+		t.Errorf("loaded buf is %q of capacity %d", c.buf, cap(c.buf))
+	}
+	if string(c.view) != "abcd" || cap(c.view) != 16 || &c.view[0] != &c.buf[0] {
+		t.Errorf("loaded view %q of capacity %d does not share buf's array", c.view, cap(c.view))
+	}
+}
+
 // TestRecordingCopies checks that copies of a recording, made at once, are
 // each a copy of the source as it was recorded, of its own.
 func TestRecordingCopies(t *testing.T) {
@@ -158,6 +187,40 @@ func TestRecordingCopies(t *testing.T) {
 	}
 }
 
+// TestCloneBinaryTime checks that a clone copies a time.Time, which the
+// encoder saves through its binary codec, as a save and a load do: the same
+// instant and zone offset, without the monotonic reading, and pointers to it
+// still point to it.
+func TestCloneBinaryTime(t *testing.T) {
+	for name, timestamp := range map[string]time.Time{
+		"zero":      {},
+		"zone":      time.Date(2026, time.October, 7, 12, 0, 0, 1, time.FixedZone("offset", 3661)),
+		"monotonic": time.Now(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			original := timeContainer{timestamp: timestamp}
+			original.pointer = &original.timestamp
+			var c timeContainer
+			if _, err := state.Clone(context.Background(), context.Background(), &original, &c, state.SaveOptions{}); err != nil {
+				t.Fatalf("Clone: %v", err)
+			}
+			if !c.timestamp.Equal(timestamp) {
+				t.Errorf("timestamp = %v, want %v", c.timestamp, timestamp)
+			}
+			_, wantOffset := timestamp.Zone()
+			if _, gotOffset := c.timestamp.Zone(); gotOffset != wantOffset {
+				t.Errorf("zone offset = %d, want %d", gotOffset, wantOffset)
+			}
+			if c.timestamp != c.timestamp.Round(0) {
+				t.Errorf("cloned timestamp contains a monotonic reading: %v", c.timestamp)
+			}
+			if c.pointer != &c.timestamp {
+				t.Errorf("pointer = %p, want alias %p", c.pointer, &c.timestamp)
+			}
+		})
+	}
+}
+
 // TestCloneRejectsSecondRoot checks that a clone, like a save, refuses a
 // graph that reaches another object of the root's type.
 func TestCloneRejectsSecondRoot(t *testing.T) {
@@ -172,18 +235,15 @@ func TestCloneRejectsSecondRoot(t *testing.T) {
 func BenchmarkClone(b *testing.B) {
 	for objName, objInfo := range allObjects {
 		b.Run(objName, func(b *testing.B) {
-			b.StopTimer()
-			n, v := buildObjects(b.N, objInfo.New)
+			v := objInfo.New(1024)
 			b.ReportAllocs()
-			b.StartTimer()
-			for i := 0; i < n; i++ {
+			for b.Loop() {
 				// v points to the object.
 				dst := reflect.New(reflect.TypeOf(v).Elem())
 				if _, err := state.Clone(context.Background(), context.Background(), v, dst.Interface(), state.SaveOptions{}); err != nil {
 					b.Errorf("clone failed: %v", err)
 				}
 			}
-			b.StopTimer()
 		})
 	}
 }

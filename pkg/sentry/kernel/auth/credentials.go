@@ -178,6 +178,7 @@ func (c *Credentials) ForkIntoUserNamespace(ns *UserNamespace) *Credentials {
 	// values (all flags disabled) in the child (for clone(2)) or caller (for
 	// unshare(2), or setns(2)." - user_namespaces(7)
 	nc.KeepCaps = false
+	nc.SecureBits = 0
 	return nc
 }
 

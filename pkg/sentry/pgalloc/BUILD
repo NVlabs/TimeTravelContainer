@@ -274,6 +274,7 @@ go_test(
     deps = [
         "//pkg/context",
         "//pkg/hostarch",
+        "//pkg/memutil",
         "//pkg/safemem",
         "//pkg/sentry/memmap",
         "//pkg/sentry/usage",

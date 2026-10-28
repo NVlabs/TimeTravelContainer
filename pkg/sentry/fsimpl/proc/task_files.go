@@ -529,8 +529,14 @@ func (f *memInode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.De
 	if err := checkTaskState(f.task); err != nil {
 		return nil, err
 	}
+	// The file must use the mm that the access check above was performed
+	// against: a concurrent execve may have already substituted a new,
+	// possibly non-dumpable mm that the check did not apply to. Linux's
+	// proc_mem_open() similarly captures the mm returned by mm_access(). No
+	// user reference is held; as in Linux, reads fail once the mm has no
+	// users left (see PRead).
 	fd := &memFD{
-		mm: getMM(f.task),
+		mm: m,
 	}
 	if err := fd.Init(rp.Mount(), d, f, opts.Flags, rp.Credentials()); err != nil {
 		return nil, err
@@ -853,7 +859,11 @@ func (s *taskStatData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	fmt.Fprintf(buf, "%d ", s.pidns.IDOfProcessGroup(s.task.ThreadGroup().ProcessGroup()))
 	fmt.Fprintf(buf, "%d ", s.pidns.IDOfSession(s.task.ThreadGroup().Session()))
 	fmt.Fprintf(buf, "0 0 " /* tty_nr tpgid */)
-	fmt.Fprintf(buf, "0 " /* flags */)
+	flags := 0
+	if s.task.ExitState() >= kernel.TaskExitInitiated {
+		flags |= linux.PF_EXITING
+	}
+	fmt.Fprintf(buf, "%d ", flags)
 	fmt.Fprintf(buf, "0 0 0 0 " /* minflt cminflt majflt cmajflt */)
 	var cputime usage.CPUStats
 	if s.tgstats {

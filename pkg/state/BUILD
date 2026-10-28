@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-load("//tools:defs.bzl", "go_library")
+load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
 package(
@@ -92,4 +92,11 @@ go_library(
         "//pkg/gohacks",
         "//pkg/state/wire",
     ],
+)
+
+go_test(
+    name = "state_test",
+    size = "small",
+    srcs = ["types_test.go"],
+    embed = [":state"],
 )

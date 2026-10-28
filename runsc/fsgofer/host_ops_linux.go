@@ -35,6 +35,12 @@ func reopenFD(fd int, flags int) (int, error) {
 	return unix.Openat(int(procSelfFD.FD()), strconv.Itoa(fd), flags, 0)
 }
 
+// fchmodPathFD changes the mode of the file that fd, a path reference,
+// refers to: fchmodat(2) of its /proc/self/fd entry follows it to the file.
+func fchmodPathFD(fd *controlFDLisa, mode uint32) error {
+	return unix.Fchmodat(int(procSelfFD.FD()), strconv.Itoa(fd.hostFD), mode, 0 /* flags */)
+}
+
 func omitTimespec() unix.Timespec {
 	return unix.Timespec{Nsec: unix.UTIME_OMIT}
 }

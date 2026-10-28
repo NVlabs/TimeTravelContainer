@@ -28,14 +28,14 @@ import (
 //
 //	x := make([]Foo, l, c)
 //	a := ([l]Foo*)(unsafe.Pointer(x[0]))
+//
+// The array includes the slice's unused capacity, which it does not clear:
+// another slice of the same array may hold live elements there, and a save
+// must not change what it saves (the source of a live fork runs on).
 func arrayFromSlice(obj reflect.Value) reflect.Value {
-	arr := reflect.NewAt(
+	return reflect.NewAt(
 		reflect.ArrayOf(obj.Cap(), obj.Type().Elem()),
 		unsafe.Pointer(obj.Pointer()))
-	if obj.Len() < obj.Cap() {
-		arr.Elem().Slice(obj.Len(), obj.Cap()).Clear()
-	}
-	return arr
 }
 
 // byteType is the type of the elements of arrays of bytes.

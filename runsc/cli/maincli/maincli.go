@@ -25,7 +25,6 @@ import (
 	"gvisor.dev/gvisor/runsc/cmd/alias"
 	"gvisor.dev/gvisor/runsc/cmd/nvproxy"
 	"gvisor.dev/gvisor/runsc/cmd/profile"
-	"gvisor.dev/gvisor/runsc/cmd/sentry/sentrycmd"
 	"gvisor.dev/gvisor/runsc/cmd/trace"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 )
@@ -97,9 +96,7 @@ func commands() (map[util.SubCommand]string, []subcommands.Command) {
 		new(cmd.MetricServer):   metricGroup,
 
 		// Internal commands.
-		new(sentrycmd.Boot):   internalGroup,
-		new(cmd.Gofer):        internalGroup,
-		new(sentrycmd.Umount): internalGroup,
+		new(cmd.Gofer): internalGroup,
 	}
 
 	// Merge alias commands.

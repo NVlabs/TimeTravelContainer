@@ -208,6 +208,10 @@ recovery, and nested execution.
 - [Security, performance, and compatibility audit (August 2026)](g3doc/proposals/timetravel_ttc_audit.md)
 - [Upstream gVisor documentation](https://gvisor.dev/docs/)
 
+## Releases
+
+See [Releases](g3doc/release.md).
+
 ## Contributing
 
 Commits must be signed off under the Developer Certificate of Origin; see

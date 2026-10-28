@@ -58,7 +58,6 @@ import (
 	"gvisor.dev/gvisor/pkg/eventchannel"
 	"gvisor.dev/gvisor/pkg/fdnotifier"
 	"gvisor.dev/gvisor/pkg/fspath"
-	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
@@ -979,10 +978,6 @@ func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCl
 	}
 	defer fsCleanup.Clean()
 
-	if hostarch.PageSize != 4096 {
-		return fmt.Errorf("save is not supported with %dK page size", hostarch.PageSize/1024)
-	}
-
 	return k.quiescePausedAnd(ctx, func() error {
 		return k.saveToLocked(ctx, stateFile, pagesMetadata, pagesFile, appMFExcludeCommittedZeroPages, resume, fsOpts, &stateFileCleanup, &pagesCleanup, &fsCleanup)
 	})
@@ -1251,9 +1246,6 @@ func (k *Kernel) DropInternalMappingsForCompaction() error {
 // Preconditions: k is not in use.
 func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, asyncMFLoader *AsyncMFLoader, timeReady chan struct{}, networkArgs inet.NetworkArgs, clocks sentrytime.Clocks, vfsOpts *vfs.CompleteRestoreOptions, timeline *timing.Timeline) error {
 	defer timeline.End()
-	if hostarch.PageSize != 4096 {
-		return fmt.Errorf("restore is not supported with %dK page size", hostarch.PageSize/1024)
-	}
 	loadStart := time.Now()
 
 	k.initRuntimeFields()
@@ -1355,9 +1347,6 @@ func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, asyncMFLoader *Async
 //
 // Preconditions: k is not in use.
 func (k *Kernel) ExtractRootfsUpperLayer(ctx context.Context, r io.Reader, asyncMFLoader *AsyncMFLoader, timeReady chan struct{}, clocks sentrytime.Clocks, outFD *os.File) error {
-	if hostarch.PageSize != 4096 {
-		return fmt.Errorf("restore is not supported with %dK page size", hostarch.PageSize/1024)
-	}
 	loadStart := time.Now()
 
 	k.initRuntimeFields()
@@ -2203,18 +2192,6 @@ func (k *Kernel) SendExternalSignal(info *linux.SignalInfo, context string) {
 	k.sendExternalSignal(info, context)
 }
 
-// maybeForceInitSignal marks external signals to the root-namespace init as
-// privileged (SI_KERNEL) so host/control-plane signals take effect under
-// SIGNAL_UNKILLABLE protection. The input info is not mutated.
-func (k *Kernel) maybeForceInitSignal(tg *ThreadGroup, info *linux.SignalInfo) *linux.SignalInfo {
-	if k.signalUnkillable == SignalUnkillableNone || tg != k.globalInit || info.Code != linux.SI_USER {
-		return info
-	}
-	forced := *info
-	forced.Code = linux.SI_KERNEL
-	return &forced
-}
-
 // SendExternalSignalThreadGroup injects a signal into an specific ThreadGroup.
 //
 // This function doesn't skip signals like SendExternalSignal does. Like every
@@ -2228,7 +2205,7 @@ func (k *Kernel) maybeForceInitSignal(tg *ThreadGroup, info *linux.SignalInfo) *
 func (k *Kernel) SendExternalSignalThreadGroup(tg *ThreadGroup, info *linux.SignalInfo) error {
 	k.extMu.Lock()
 	defer k.extMu.Unlock()
-	return tg.sendExternalSignal(k.maybeForceInitSignal(tg, info))
+	return tg.sendExternalSignal(info)
 }
 
 // SendExternalSignalProcessGroup sends a signal to all ThreadGroups in the
@@ -2251,7 +2228,7 @@ func (k *Kernel) SendExternalSignalProcessGroup(pg *ProcessGroup, info *linux.Si
 		if tg.ProcessGroup() != pg {
 			continue
 		}
-		if err := tg.sendExternalSignal(k.maybeForceInitSignal(tg, info)); err != nil && firstErr == nil {
+		if err := tg.sendExternalSignal(info); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -2273,8 +2250,8 @@ func (k *Kernel) SendContainerSignal(cid string, info *linux.SignalInfo) error {
 			if sig := linux.Signal(info.Signo); tg.externalSignalIgnoredLocked(sig) {
 				tg.applySignalSideEffectsLocked(sig)
 			} else {
-				infoCopy := *k.maybeForceInitSignal(tg, info)
-				if err := tg.leader.sendSignalLocked(&infoCopy, true /*group*/); err != nil {
+				infoCopy := *info
+				if err := tg.leader.sendForcedSignalLocked(&infoCopy, true /*group*/); err != nil {
 					lastErr = err
 				}
 			}

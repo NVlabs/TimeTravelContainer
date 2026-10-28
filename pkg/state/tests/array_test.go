@@ -124,7 +124,9 @@ func TestSliceContainers(t *testing.T) {
 		nilSlice            []any
 		emptySlice          = make([]any, 0)
 		fullSlice           = []any{nil}
-		unusedCapacitySlice = []any{savableEmptyStruct{}, unregisteredEmptyStruct{}}[:1]
+		// A save keeps the unused capacity, which another slice of the
+		// array may use, so what it holds must be savable too.
+		unusedCapacitySlice = []any{savableEmptyStruct{}, savableEmptyStruct{}}[:1]
 	)
 	runTestCases(t, false, "", []any{
 		sliceContainer{v: nilSlice},

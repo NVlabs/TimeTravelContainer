@@ -47,6 +47,18 @@ func reopenFD(fd int, flags int) (int, error) {
 	return unix.Open(unix.ByteSliceToString(path[:]), flags, 0)
 }
 
+// fchmodPathFD changes the mode of the file that fd, a path reference,
+// refers to, by its name in its parent: Darwin's /dev/fd entries are the
+// descriptors, not the files.
+func fchmodPathFD(fd *controlFDLisa, mode uint32) error {
+	parent, name, err := fd.getParentFD()
+	if err != nil {
+		return err
+	}
+	defer unix.Close(parent)
+	return unix.Fchmodat(parent, name, mode, 0 /* flags */)
+}
+
 func omitTimespec() unix.Timespec {
 	return unix.Timespec{Nsec: darwinUtimeOmit}
 }

@@ -50,6 +50,7 @@ import (
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 
 	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/flag"
@@ -19388,14 +19389,14 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	return b.ensurePublishedPortsForBranch(info, target.branch)
 }
 
-func dehydrationNetworkArgs(info ttcbundle.ContainerInfo) (*boot.CreateLinksAndRoutesArgs, error) {
-	link := boot.DefaultLoopbackLink
-	args := &boot.CreateLinksAndRoutesArgs{LoopbackLinks: []boot.LoopbackLink{link}, IsRestore: true}
+func dehydrationNetworkArgs(info ttcbundle.ContainerInfo) (*sentryapi.CreateLinksAndRoutesArgs, error) {
+	link := sentryapi.DefaultLoopbackLink
+	args := &sentryapi.CreateLinksAndRoutesArgs{LoopbackLinks: []sentryapi.LoopbackLink{link}, IsRestore: true}
 	switch info.NetworkMode {
 	case "none":
 		return args, nil
 	case "ttc":
-		cfg := &boot.TimeTravelNetworkConfig{NAT: info.NetworkNAT, InterfaceName: info.TTCNetworkInterface()}
+		cfg := &sentryapi.TimeTravelNetworkConfig{NAT: info.NetworkNAT, InterfaceName: info.TTCNetworkInterface()}
 		if info.NetworkIP != "" {
 			cfg.GuestIP = net.ParseIP(info.NetworkIP)
 			if cfg.GuestIP == nil {

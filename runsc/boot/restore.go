@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	time2 "time"
@@ -53,6 +54,7 @@ import (
 	"gvisor.dev/gvisor/pkg/timing"
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot/pprof"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/runsc/starttime"
@@ -73,78 +75,43 @@ const (
 	// upstream behavior that terminates restored exec processes.
 	TTCExecSessionsKey = "ttc_exec_sessions"
 
-	annotationCheckpointPrefix = "dev.gvisor.internal.checkpoint."
-
-	// annotationCheckpointPath is the path to the directory where the checkpoint files will be
-	// created. When present, it allows for the workload running inside to trigger a checkpoint
-	// without having to use the runsc CLI.
-	annotationCheckpointPath = annotationCheckpointPrefix + "path"
-
 	// annotationCheckpointResume indicates whether the sandbox should continue running after the
 	// checkpoint. Optional, defaults to false.
-	annotationCheckpointResume = annotationCheckpointPrefix + "resume"
-
-	// annotationCheckpointCompression is the compression to use for the checkpoint file. Optional,
-	// defaults to best speed compression.
-	annotationCheckpointCompression = annotationCheckpointPrefix + "compression"
-
-	// annotationCheckpointDirect indicates whether the checkpoint IOs should use O_DIRECT. Optional,
-	// defaults to false.
-	annotationCheckpointDirect = annotationCheckpointPrefix + "direct"
+	annotationCheckpointResume = sentryapi.AnnotationCheckpointPrefix + "resume"
 
 	// annotationCheckpointExcludeCommittedZeroPages indicates whether the checkpoint should exclude
 	// committed zero pages. Optional, defaults to false.
-	annotationCheckpointExcludeCommittedZeroPages = annotationCheckpointPrefix + "exclude-committed-zero-pages"
+	annotationCheckpointExcludeCommittedZeroPages = sentryapi.AnnotationCheckpointPrefix + "exclude-committed-zero-pages"
 
 	// annotationCheckpointCudaCheckpointPath is the path to the cuda-checkpoint binary. It's required
 	// if the workload has CUDA processes.
-	annotationCheckpointCudaCheckpointPath = annotationCheckpointPrefix + "cuda-checkpoint-path"
+	annotationCheckpointCudaCheckpointPath = sentryapi.AnnotationCheckpointPrefix + "cuda-checkpoint-path"
 
 	// annotationCheckpointCudaCheckpointSequential indicates whether cuda-checkpoint should be run
 	// sequentially. Optional, defaults to false.
-	annotationCheckpointCudaCheckpointSequential = annotationCheckpointPrefix + "cuda-checkpoint-sequential"
+	annotationCheckpointCudaCheckpointSequential = sentryapi.AnnotationCheckpointPrefix + "cuda-checkpoint-sequential"
 
 	// annotationCheckpointEnable indicates whether files under /proc/gvisor should be present in
 	// the container to allow the workload to trigger a checkpoint.
-	annotationCheckpointEnable = annotationCheckpointPrefix + "enable"
+	annotationCheckpointEnable = sentryapi.AnnotationCheckpointPrefix + "enable"
 
 	// annotationSaveRestoreExecArgv is the argv to use for the save/restore exec
 	// binary.
-	annotationSaveRestoreExecArgv = annotationCheckpointPrefix + "save-restore-exec-argv"
+	annotationSaveRestoreExecArgv = sentryapi.AnnotationCheckpointPrefix + "save-restore-exec-argv"
 
 	// annotationSaveRestoreExecTimeout is the timeout to use for the save/restore
 	// exec binary.
-	annotationSaveRestoreExecTimeout = annotationCheckpointPrefix + "save-restore-exec-timeout"
+	annotationSaveRestoreExecTimeout = sentryapi.AnnotationCheckpointPrefix + "save-restore-exec-timeout"
 
 	networkKey = "network"
+
+	// noRootContainerKey marks a checkpoint of a sandbox with no root container.
+	noRootContainerKey = "no_root_container"
 )
 
 var portableSentryCapabilities = []string{
 	"logical-memory-4k",
 	"portable-state-v1",
-}
-
-// GetAnnotationCheckpointPath returns the checkpoint path specified in the
-// container annotation. Return empty string if no annotation is specified.
-func GetAnnotationCheckpointPath(conf *config.Config, spec *specs.Spec) (string, error) {
-	path := spec.Annotations[annotationCheckpointPath]
-	if len(path) != 0 {
-		if len(conf.TestOnlyAutosaveImagePath) != 0 {
-			return "", fmt.Errorf("autosave is not supported with %q annotation", annotationCheckpointPath)
-		}
-	}
-	return path, nil
-}
-
-// GetAnnotationCheckpointCompression returns the checkpoint compression level
-// specified in the container annotation.
-func GetAnnotationCheckpointCompression(spec *specs.Spec) (statefile.CompressionLevel, error) {
-	return statefile.CompressionLevelFromString(spec.Annotations[annotationCheckpointCompression])
-}
-
-// GetAnnotationCheckpointDirect returns true if the checkpoint is direct.
-func GetAnnotationCheckpointDirect(spec *specs.Spec) bool {
-	return specutils.AnnotationToBool(spec, annotationCheckpointDirect)
 }
 
 // SaveAsync starts a goroutine to save the kernel. Implements kernel.Saver.
@@ -197,7 +164,7 @@ func saveOptsFromSpec(spec *specs.Spec, fds []*fd.FD, useCheckpointGofer bool) (
 		}
 	}
 
-	comp, err := GetAnnotationCheckpointCompression(spec)
+	comp, err := sentryapi.GetAnnotationCheckpointCompression(spec)
 	if err != nil {
 		return nil, err
 	}
@@ -305,7 +272,7 @@ type restorer struct {
 
 // restoreSubcontainer restores a subcontainer.
 func (r *restorer) restoreSubcontainer(spec *specs.Spec, conf *config.Config, l *Loader, cid string, stdioFDs, goferFDs, goferFilestoreFDs []*fd.FD, devGoferFD *fd.FD, goferMountConfs []specutils.GoferMountConf) error {
-	containerName := l.registerContainer(spec, cid)
+	containerName := r.registerContainer(l, spec, cid)
 	info := &containerInfo{
 		cid:               cid,
 		containerName:     containerName,
@@ -318,6 +285,33 @@ func (r *restorer) restoreSubcontainer(spec *specs.Spec, conf *config.Config, l 
 		goferMountConfs:   goferMountConfs,
 	}
 	return r.restoreContainerInfo(l, info)
+}
+
+// registerContainer registers container cid. A container without a name gets
+// the lowest unnamed container name in the checkpoint that is not yet taken.
+//
+// +checklocksexclude:l.mu
+func (r *restorer) registerContainer(l *Loader, spec *specs.Spec, cid string) string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if specutils.ContainerName(spec) != "" {
+		return l.registerContainerLocked(spec, cid)
+	}
+	var free []int
+	for name := range r.checkpointedSpecs {
+		if n, ok := unnamedContainerNumber(name); ok {
+			if _, taken := l.containerIDs[name]; !taken {
+				free = append(free, n)
+			}
+		}
+	}
+	if len(free) == 0 {
+		return l.registerContainerLocked(spec, cid)
+	}
+	containerName := unnamedContainerPrefix + strconv.Itoa(slices.Min(free))
+	l.registerContainerNameLocked(spec, cid, containerName)
+	return containerName
 }
 
 // restoreContainerInfo restores a container.
@@ -522,6 +516,10 @@ func (r *restorer) restore(l *Loader) error {
 		}
 	}
 	for _, cont := range r.containers {
+		// The sandbox has no filesystem or stdios to restore.
+		if l.noRootContainer.enabled && cont.cid == l.root.cid {
+			continue
+		}
 		// TODO(b/298078576): Need to process hints here probably
 		mntr := l.newContainerMounter(cont)
 		if err = mntr.configureRestore(&restoreMnts); err != nil {
@@ -639,6 +637,10 @@ func (r *restorer) restore(l *Loader) error {
 	}
 
 	// Rebuild `processes` map with containers' root process from the restored kernel.
+	specsByCID := make(map[string]*specs.Spec, len(l.containerIDs))
+	for name, cid := range l.containerIDs {
+		specsByCID[cid] = l.containerSpecs[name]
+	}
 	for _, tg := range l.k.RootPIDNamespace().ThreadGroups() {
 		// Find all processes with no parent (root of execution), that were not started
 		// via a call to `exec`.
@@ -649,6 +651,7 @@ func (r *restorer) restore(l *Loader) error {
 				return fmt.Errorf("unable to find container root process with CID %q, processes: %v", cid, l.processes)
 			}
 			proc.tg = tg
+			l.restoreNamespacePathsLocked(proc, specsByCID[cid], cid == l.root.cid)
 		}
 	}
 
@@ -718,6 +721,21 @@ func (r *restorer) restore(l *Loader) error {
 	return nil
 }
 
+// restoreNamespacePathsLocked lets containers started after restore join the
+// namespaces of the restored container proc by path.
+//
+// +checklocks:l.mu
+func (l *Loader) restoreNamespacePathsLocked(proc *execProcess, spec *specs.Spec, isRoot bool) {
+	if ns, ok := specutils.GetNS(specs.PIDNamespace, spec); ok && !isRoot && proc.pidns == nil {
+		proc.pidnsPath = ns.Path
+		proc.pidns = proc.tg.PIDNamespace()
+		proc.pidns.IncRef()
+	}
+	if ns, ok := specutils.GetNS(specs.CgroupNamespace, spec); ok {
+		proc.cgroupnsPath = ns.Path
+	}
+}
+
 func (r *restorer) postRestore(k *kernel.Kernel, timeline *timing.Timeline, timer *timing.Timer) {
 	defer timer.Log()
 	defer timeline.End()
@@ -727,6 +745,7 @@ func (r *restorer) postRestore(k *kernel.Kernel, timeline *timing.Timeline, time
 		r.cm.onRestoreFailed(fmt.Errorf("post restore work failed: %w", err))
 		log.Warningf("Killing the sandbox after post restore work failed: %v", err)
 		k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+		r.cm.l.stopIfKilled()
 		return
 	}
 	timeline.Reached("post restore done")
@@ -744,11 +763,12 @@ func (r *restorer) postRestore(k *kernel.Kernel, timeline *timing.Timeline, time
 			r.cm.onRestoreFailed(fmt.Errorf("async MemoryFile loading failed: %w", err))
 			log.Warningf("Killing the sandbox after MemoryFile page loading failed: %v", err)
 			k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+			r.cm.l.stopIfKilled()
 			return
 		}
 	}
 
-	var s Savings
+	var s sentryapi.Savings
 	if err := r.calculateCPUSavings(&s); err != nil {
 		log.Warningf("Failed to calculate CPU savings: %v", err)
 	}
@@ -762,7 +782,7 @@ func (r *restorer) postRestore(k *kernel.Kernel, timeline *timing.Timeline, time
 }
 
 // Calculate the CPU time saved for restore.
-func (r *restorer) calculateCPUSavings(s *Savings) error {
+func (r *restorer) calculateCPUSavings(s *sentryapi.Savings) error {
 	t, err := state.CPUTime()
 	if err != nil {
 		return fmt.Errorf("failed to get CPU time usage for restore, err: %w", err)
@@ -782,7 +802,7 @@ func (r *restorer) calculateCPUSavings(s *Savings) error {
 }
 
 // Calculate the walltime saved for restore.
-func (r *restorer) calculateWallTimeSavings(s *Savings) error {
+func (r *restorer) calculateWallTimeSavings(s *sentryapi.Savings) error {
 	savedWtStr, ok := r.metadata[state.GvisorWallTimeKey]
 	if !ok {
 		return fmt.Errorf("failed to retrieve walltime from the metadata")
@@ -828,7 +848,11 @@ func (l *Loader) saveKernelWithOpts(k *kernel.Kernel, dog *watchdog.Watchdog, ex
 	hasFSSave := saveOpts.FSSaveOpts != nil
 	defer func() {
 		// This closure is required to capture the final value of err.
-		k.OnCheckpointAttempt(err)
+		if err == nil && saveOpts.Resume {
+			go l.postResume(k)
+		} else {
+			k.OnCheckpointAttempt(err)
+		}
 		if hasFSSave {
 			k.SignalAllFSSaveWaiters(err)
 		}
@@ -857,6 +881,9 @@ func (l *Loader) saveKernelWithOpts(k *kernel.Kernel, dog *watchdog.Watchdog, ex
 	}
 
 	saveOpts.Metadata[networkKey] = l.root.conf.Network.String()
+	if l.noRootContainer.enabled {
+		saveOpts.Metadata[noRootContainerKey] = "true"
+	}
 
 	// Save container specs.
 	specsStr, err := specutils.ConvertSpecsToString(l.GetContainerSpecs())
@@ -886,7 +913,19 @@ func (l *Loader) saveKernelWithOpts(k *kernel.Kernel, dog *watchdog.Watchdog, ex
 		Kernel:   k,
 		Watchdog: dog,
 	}
+	defer l.stopIfKilled()
 	return state.SaveWithOpts(saveOpts, execOpts)
+}
+
+// postResume runs post-resume work on k and then completes the checkpoint
+// attempt.
+func (l *Loader) postResume(k *kernel.Kernel) {
+	err := control.PostResume(k, nil)
+	k.OnCheckpointAttempt(err)
+	if err != nil {
+		log.Warningf("Killing the sandbox after post resume work failed: %v", err)
+		k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+	}
 }
 
 func procFiles(conf *config.Config) []string {

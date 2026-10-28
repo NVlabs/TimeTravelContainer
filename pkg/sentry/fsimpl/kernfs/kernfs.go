@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package kernfs provides the tools to implement inode-based filesystems.
 // Kernfs has two main features:
 //
@@ -181,6 +184,9 @@ func (fs *Filesystem) processDeferredDecRefs(ctx context.Context) {
 		// when DecRef is called.
 		defer d.DecRef(ctx)
 	}
+	// Drop the references, so that a save does not reach the destroyed
+	// dentries through the slice's unused capacity.
+	clear(fs.deferredDecRefs)
 	fs.deferredDecRefs = fs.deferredDecRefs[:0] // Keep slice memory for reuse.
 	fs.deferredDecRefsMu.Unlock()
 }
@@ -188,6 +194,11 @@ func (fs *Filesystem) processDeferredDecRefs(ctx context.Context) {
 // VFSFilesystem returns the generic vfs filesystem object.
 func (fs *Filesystem) VFSFilesystem() *vfs.Filesystem {
 	return &fs.vfsfs
+}
+
+// RootDentry returns the root dentry of this filesystem.
+func (fs *Filesystem) RootDentry() *Dentry {
+	return fs.root
 }
 
 // NextIno allocates a new inode number on this filesystem.
@@ -337,6 +348,24 @@ func (d *Dentry) Invalidate(ctx context.Context) {
 	}
 	delete(parent.children, d.name)
 	parent.dirMu.Unlock()
+
+	d.fs.invalidateRemovedChildLocked(ctx, d.fs.vfsfs.VirtualFilesystem(), child)
+}
+
+// InvalidateChild invalidates the cached child dentry with the given name and
+// all of its descendants, if present.
+func (d *Dentry) InvalidateChild(ctx context.Context, name string) {
+	d.fs.mu.RLock()
+	defer d.fs.processDeferredDecRefs(ctx)
+	defer d.fs.mu.RUnlock()
+	d.dirMu.Lock()
+	child, ok := d.children[name]
+	if !ok {
+		d.dirMu.Unlock()
+		return
+	}
+	delete(d.children, name)
+	d.dirMu.Unlock()
 
 	d.fs.invalidateRemovedChildLocked(ctx, d.fs.vfsfs.VirtualFilesystem(), child)
 }

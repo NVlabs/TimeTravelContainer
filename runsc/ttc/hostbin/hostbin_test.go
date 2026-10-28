@@ -121,3 +121,24 @@ func TestHelpersRun(t *testing.T) {
 		})
 	}
 }
+
+// TestSidecarsAreStatic checks that each carried sidecar is a static
+// executable, which runs wherever ttcd does.
+func TestSidecarsAreStatic(t *testing.T) {
+	sidecars := Sidecars()
+	if len(sidecars) == 0 {
+		t.Skip("this build carries no sidecars")
+	}
+	for name, gz := range sidecars {
+		content := unpack(t, helper{name: name, gz: gz})
+		f, err := elf.NewFile(bytes.NewReader(content))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		for _, p := range f.Progs {
+			if p.Type == elf.PT_INTERP {
+				t.Errorf("%s has an interpreter", name)
+			}
+		}
+	}
+}

@@ -35,6 +35,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
@@ -270,7 +271,7 @@ func (p *PortForward) doStream(ctx context.Context, port string, c *container.Co
 	}
 	defer f.Close()
 
-	if err := c.PortForward(&boot.PortForwardOpts{
+	if err := c.PortForward(&sentryapi.PortForwardOpts{
 		Port:                  uint16(p.portNum),
 		ContainerID:           c.ID,
 		BranchID:              p.branch,
@@ -309,7 +310,7 @@ func portCopy(ctx context.Context, c *container.Container, branch string, allowS
 	// Request port forwarding from the sentry. This request will return
 	// immediately after port forwarding is started and connection state is
 	// handled via the UDS from then on.
-	if err := c.PortForward(&boot.PortForwardOpts{
+	if err := c.PortForward(&sentryapi.PortForwardOpts{
 		Port:                  port,
 		BranchID:              branch,
 		AllowStoppedContainer: allowStoppedSandbox,

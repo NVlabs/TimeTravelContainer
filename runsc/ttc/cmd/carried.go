@@ -8,6 +8,10 @@ import (
 	"compress/gzip"
 	"io"
 	"sync"
+
+	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/runsc/gvisorbinaries"
+	"gvisor.dev/gvisor/runsc/specutils"
 )
 
 // carriedHelpers are the executables that ttcd carries, gzip-compressed: on
@@ -60,6 +64,56 @@ func carriedCUDACheckpoint(dir string) (string, error) {
 		return "", err
 	}
 	return writeContainerFile(dir, cudaCheckpointName, content, 0555)
+}
+
+// carriedSidecars are the C sidecars of gvisorbinaries that ttcd carries,
+// gzip-compressed, by name, and the paths from which they run, once made.
+var carriedSidecars struct {
+	mu    sync.Mutex
+	gz    map[string][]byte
+	paths map[string]string
+}
+
+// SetCarriedSidecars registers the C sidecars that ttcd carries,
+// gzip-compressed, by name. It must be called before ttcd runs anything.
+func SetCarriedSidecars(gz map[string][]byte) {
+	carriedSidecars.mu.Lock()
+	defer carriedSidecars.mu.Unlock()
+	carriedSidecars.gz = gz
+}
+
+// CarriedSidecar implements gvisorbinaries.Provider for ttcd, which carries
+// its sidecars rather than installing them beside itself: ttcd is the Sentry,
+// and each C sidecar that it carries runs from a sealed memory file that the
+// process asking for it makes, once, and keeps open.
+func CarriedSidecar(name string) (string, bool) {
+	if name == gvisorbinaries.GvisorSentry.Name {
+		return specutils.ExePath, true
+	}
+	carriedSidecars.mu.Lock()
+	defer carriedSidecars.mu.Unlock()
+	if path, ok := carriedSidecars.paths[name]; ok {
+		return path, true
+	}
+	gz := carriedSidecars.gz[name]
+	if len(gz) == 0 {
+		return "", false
+	}
+	content, err := gunzip(gz)
+	if err != nil {
+		log.Warningf("Unpacking the carried sidecar %q: %v", name, err)
+		return "", false
+	}
+	path, err := runnableExecutable(name, content, "")
+	if err != nil {
+		log.Warningf("Making the carried sidecar %q runnable: %v", name, err)
+		return "", false
+	}
+	if carriedSidecars.paths == nil {
+		carriedSidecars.paths = make(map[string]string)
+	}
+	carriedSidecars.paths[name] = path
+	return path, true
 }
 
 // gunzip decompresses gzip-compressed b.

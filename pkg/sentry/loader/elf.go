@@ -650,7 +650,7 @@ func loadInterpreterELF(ctx context.Context, m *mm.MemoryManager, fd *vfs.FileDe
 // path and argv.
 //
 // Preconditions: args.File is an ELF file.
-func loadELF(ctx context.Context, args LoadArgs) (loadedELF, *arch.Context64, error) {
+func loadELF(ctx context.Context, args LoadArgs, wds *wouldDumpState) (loadedELF, *arch.Context64, error) {
 	bin, ac, err := loadInitialELF(ctx, args.MemoryManager, args.Features, args.File, args.Personality, args.RandomizeVASpace)
 	if err != nil {
 		ctx.Infof("Error loading binary: %v", err)
@@ -673,6 +673,7 @@ func loadELF(ctx context.Context, args LoadArgs) (loadedELF, *arch.Context64, er
 		}
 		defer intFile.DecRef(ctx)
 
+		wouldDump(ctx, intFile, wds)
 		interp, err = loadInterpreterELF(ctx, args.MemoryManager, intFile, bin)
 		if err != nil {
 			ctx.Infof("Error loading interpreter: %v", err)

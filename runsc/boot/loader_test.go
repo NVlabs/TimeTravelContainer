@@ -69,6 +69,7 @@ import (
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/fsgofer"
@@ -788,10 +789,10 @@ func TestRunInternalTTYLiveFork(t *testing.T) {
 		t.Fatalf("resuming child after exec wait cancellation: %v", err)
 	}
 
-	if err := manager.Signal(&SignalArgs{BranchID: childInfo.ID, CID: l.sandboxID, Signo: int32(linux.SIGWINCH), Mode: DeliverToForegroundProcessGroup}, &struct{}{}); err != nil {
+	if err := manager.Signal(&sentryapi.SignalArgs{BranchID: childInfo.ID, CID: l.sandboxID, Signo: int32(linux.SIGWINCH), Mode: sentryapi.DeliverToForegroundProcessGroup}, &struct{}{}); err != nil {
 		t.Fatalf("signaling child foreground process group: %v", err)
 	}
-	if err := manager.Signal(&SignalArgs{BranchID: childInfo.ID, CID: l.sandboxID, PID: int32(execPID), Signo: int32(linux.SIGKILL), Mode: DeliverToProcess}, &struct{}{}); err != nil {
+	if err := manager.Signal(&sentryapi.SignalArgs{BranchID: childInfo.ID, CID: l.sandboxID, PID: int32(execPID), Signo: int32(linux.SIGKILL), Mode: sentryapi.DeliverToProcess}, &struct{}{}); err != nil {
 		t.Fatalf("signaling child exec through general RPC: %v", err)
 	}
 	status, err := l.family.WaitExecSession(&ExecSessionArgs{BranchID: childInfo.ID, ExecID: execSessionID}, nil)
@@ -1057,8 +1058,8 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	sysMount.DecRef(ctx)
 
 	networkStack := l.k.RootNetworkNamespace().Stack().(*sentrynetstack.Stack)
-	if err := (&Network{Stack: networkStack.Stack, Kernel: l.k}).CreateLinksAndRoutes(&CreateLinksAndRoutesArgs{
-		LoopbackLinks: []LoopbackLink{DefaultLoopbackLink},
+	if err := (&Network{Stack: networkStack.Stack, Kernel: l.k}).CreateLinksAndRoutes(&sentryapi.CreateLinksAndRoutesArgs{
+		LoopbackLinks: []sentryapi.LoopbackLink{sentryapi.DefaultLoopbackLink},
 	}, &struct{}{}); err != nil {
 		t.Fatalf("configuring contained loopback network: %v", err)
 	}
@@ -2121,7 +2122,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	if childListed == nil || childListed.InitPID != 1 || childListed.InitState != string(BranchRunning) || !childListed.SharesMemory {
 		t.Errorf("live child diagnostics: %+v", childListed)
 	}
-	if err := l.family.Signal(childInfo.ID, l.root.cid, 0, int32(linux.SIGKILL), DeliverToProcess); err != nil {
+	if err := l.family.Signal(childInfo.ID, l.root.cid, 0, int32(linux.SIGKILL), sentryapi.DeliverToProcess); err != nil {
 		t.Fatalf("signaling child init: %v", err)
 	}
 	status, err := l.family.Wait(childInfo.ID, l.root.cid, 0)
@@ -3330,14 +3331,14 @@ func TestNetworkConfig(t *testing.T) {
 		l.ctrl.manager.startResultChan <- nil
 	}()
 
-	args := &CreateLinksAndRoutesArgs{
-		LoopbackLinks: []LoopbackLink{
+	args := &sentryapi.CreateLinksAndRoutesArgs{
+		LoopbackLinks: []sentryapi.LoopbackLink{
 			{
 				Name: "lo",
-				Addresses: []IPWithPrefix{
+				Addresses: []sentryapi.IPWithPrefix{
 					{Address: net.IP("\x7f\x00\x00\x01"), PrefixLen: 8},
 				},
-				Routes: []Route{
+				Routes: []sentryapi.Route{
 					{
 						Destination: net.IPNet{
 							IP:   net.IP{127, 0, 0, 0},
@@ -3351,7 +3352,7 @@ func TestNetworkConfig(t *testing.T) {
 	if err := l.ctrl.manager.SetNetworkArgs(args, nil); err != nil {
 		t.Errorf("error calling SetNetworkConfig: %v", err)
 	}
-	var networkArgs CreateLinksAndRoutesArgs
+	var networkArgs sentryapi.CreateLinksAndRoutesArgs
 	if err := l.ctrl.manager.GetNetworkConfig(nil, &networkArgs); err != nil {
 		t.Errorf("error calling NetworkConfig: %v", err)
 	}

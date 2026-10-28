@@ -286,9 +286,9 @@ func (cs *cloneState) newTypeInfo(typ reflect.Type) *cloneTypeInfo {
 }
 
 // cloneStructFields holds, by rtypeOf, the cloneStructFieldsOf each struct
-// type that a clone met. Each clone learns its types anew, and
-// lookupNameFields, which copies a type's fields' names and sorts them to
-// check them, was half of that, a twentieth of a small branch's fork.
+// type that a clone met. Each clone learns its types anew, and looking up
+// each type's state type information was half of that, a twentieth of a
+// small branch's fork.
 var cloneStructFields sync.Map
 
 // cloneStructFieldsOf returns whether typ, a struct type, has state type
@@ -298,8 +298,8 @@ func cloneStructFieldsOf(typ reflect.Type) cloneStructInfo {
 	if info, ok := cloneStructFields.Load(tid); ok {
 		return info.(cloneStructInfo)
 	}
-	_, fields, ok := lookupNameFields(typ)
-	info := cloneStructInfo{registered: ok, n: len(fields)}
+	typeInfo, ok := lookupTypeInfo(typ)
+	info := cloneStructInfo{registered: ok, n: len(typeInfo.Fields)}
 	cloneStructFields.Store(tid, info)
 	return info
 }
@@ -590,7 +590,8 @@ func (cs *cloneState) visitStruct(obj reflect.Value) {
 	}
 	ti := cs.typeInfo(typ)
 	sl, ok := obj.Addr().Interface().(SaverLoader)
-	if !ok || !ti.registered {
+	bo, binary := obj.Addr().Interface().(binaryObject)
+	if (!ok && !binary) || !ti.registered {
 		if obj.NumField() == 0 {
 			// An anonymous empty struct, as the encoder allows.
 			rec := cs.newStructRecord(0)
@@ -612,7 +613,17 @@ func (cs *cloneState) visitStruct(obj reflect.Value) {
 	cr.base = obj.UnsafeAddr()
 	cr.size = obj.Type().Size()
 	cr.snap = nil
-	sl.StateSave(Sink{internal: objectEncoder{cr: cr}})
+	if ok {
+		sl.StateSave(Sink{internal: objectEncoder{cr: cr}})
+	} else {
+		// A foreign struct, which the encoder saves as its binary
+		// representation, as the copy loads it.
+		data, err := bo.AppendBinary(nil)
+		if err != nil {
+			Failf("encoding %v: %w", typ, err)
+		}
+		Sink{internal: objectEncoder{cr: cr}}.SaveValue(0, string(data))
+	}
 	cs.popRecorder(cr)
 }
 
@@ -910,10 +921,16 @@ func (r *copyRun) copyValue(oes *objectEncodeState, dst, src reflect.Value, wait
 			Failf("struct %v at %#x was not recorded", src.Type(), src.UnsafeAddr())
 		}
 		if !rec.empty {
-			if sl, ok := dst.Addr().Interface().(SaverLoader); ok {
+			switch v := dst.Addr().Interface().(type) {
+			case SaverLoader:
 				cl := r.pushLoader()
 				cl.oes, cl.rec = oes, rec
-				sl.StateLoad(r.ctx, Source{internal: objectDecoder{cl: cl}})
+				v.StateLoad(r.ctx, Source{internal: objectDecoder{cl: cl}})
+				r.popLoader(cl)
+			case binaryObject:
+				cl := r.pushLoader()
+				cl.oes, cl.rec = oes, rec
+				loadBinary(v, src.Type().String(), Source{internal: objectDecoder{cl: cl}})
 				r.popLoader(cl)
 			}
 		}

@@ -14,6 +14,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 )
 
 type nestedNetworkTestIDProvider struct {
@@ -41,8 +42,8 @@ func TestNestedNetworkStackStartsWithUnconfiguredLoopback(t *testing.T) {
 	if !ok {
 		t.Fatalf("interfaces = %+v, want loopback index %d", ifaces, linux.LOOPBACK_IFINDEX)
 	}
-	if loopback.Name != DefaultLoopbackLink.Name {
-		t.Fatalf("loopback name = %q, want %q", loopback.Name, DefaultLoopbackLink.Name)
+	if loopback.Name != sentryapi.DefaultLoopbackLink.Name {
+		t.Fatalf("loopback name = %q, want %q", loopback.Name, sentryapi.DefaultLoopbackLink.Name)
 	}
 	if loopback.Flags&linux.IFF_LOOPBACK == 0 || loopback.Flags&(linux.IFF_UP|linux.IFF_RUNNING) != 0 {
 		t.Fatalf("new namespace loopback flags = %#x, want down loopback", loopback.Flags)

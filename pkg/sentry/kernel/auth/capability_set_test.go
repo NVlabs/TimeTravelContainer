@@ -175,6 +175,10 @@ func TestComputeCredsForExec(t *testing.T) {
 			noNewPrivs:    true,
 			wantPermitted: 0,
 			wantEffective: false,
+			// Linux's cap_bprm_creds_from_file() clears the personality
+			// when the file's capabilities would add any, before the
+			// no_new_privs downgrade takes them away.
+			wantClear: true,
 		},
 		{
 			name: "TestAmbientCapsClearedWithSUIDNonRoot",

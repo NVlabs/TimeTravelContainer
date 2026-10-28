@@ -9,4 +9,4 @@ import "golang.org/x/sys/unix"
 
 func mirrorMapping(_, _, _ uintptr) unix.Errno { return unix.EOPNOTSUPP }
 
-func advisePopulateWrite(_, _ uintptr) unix.Errno { return unix.EOPNOTSUPP }
+func advisePopulate(_, _ uintptr, _ bool) unix.Errno { return unix.EOPNOTSUPP }

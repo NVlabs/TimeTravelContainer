@@ -50,13 +50,12 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/pinring"
 	"gvisor.dev/gvisor/pkg/prometheus"
-	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
-	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
+	"gvisor.dev/gvisor/pkg/sentry/fscheckpoint"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
-	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/platform/platformdesc"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/state/statefile"
@@ -64,6 +63,7 @@ import (
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/boot/procfs"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/cgroup"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/console"
@@ -256,7 +256,7 @@ type Sandbox struct {
 
 	// MountHints provides extra information about container mounts that apply
 	// to the entire pod.
-	MountHints *boot.PodMountHints `json:"mountHints"`
+	MountHints *sentryapi.PodMountHints `json:"mountHints"`
 
 	// FSRestore indicates whether filesystem restore files were donated to the
 	// sandbox during creation.
@@ -352,7 +352,7 @@ type Args struct {
 
 	// MountHints provides extra information about containers mounts that apply
 	// to the entire pod.
-	MountHints *boot.PodMountHints
+	MountHints *sentryapi.PodMountHints
 
 	// MountsFile is a file container mount information from the spec. It's
 	// equivalent to the mounts from the spec, except that all paths have been
@@ -423,7 +423,7 @@ func New(conf *config.Config, args *Args) (*Sandbox, error) {
 	defer c.Clean()
 
 	if len(conf.PodInitConfig) > 0 {
-		initConf, err := boot.LoadInitConfig(conf.PodInitConfig)
+		initConf, err := sentryapi.LoadInitConfig(conf.PodInitConfig)
 		if err != nil {
 			return nil, fmt.Errorf("loading init config file: %w", err)
 		}
@@ -472,7 +472,7 @@ func New(conf *config.Config, args *Args) (*Sandbox, error) {
 		// We must gather data about registered metrics prior to any process starting in the sandbox.
 		log.Debugf("Getting metric registration information from sandbox %q", s.ID)
 		var registeredMetrics control.MetricsRegistrationResponse
-		if err := s.call(boot.MetricsGetRegistered, nil, &registeredMetrics); err != nil {
+		if err := s.call(sentryapi.MetricsGetRegistered, nil, &registeredMetrics); err != nil {
 			return nil, fmt.Errorf("cannot get registered metrics: %v", err)
 		}
 		s.RegisteredMetrics = registeredMetrics.RegisteredMetrics
@@ -494,11 +494,11 @@ func (s *Sandbox) CreateSubcontainer(conf *config.Config, cid string, tty *os.Fi
 		return err
 	}
 
-	args := boot.CreateArgs{
+	args := sentryapi.CreateArgs{
 		CID:         cid,
 		FilePayload: urpc.FilePayload{Files: files},
 	}
-	if err := s.call(boot.ContMgrCreateSubcontainer, &args, nil); err != nil {
+	if err := s.call(sentryapi.ContMgrCreateSubcontainer, &args, nil); err != nil {
 		return fmt.Errorf("creating sub-container %q: %w", cid, err)
 	}
 	return nil
@@ -543,7 +543,7 @@ func (s *Sandbox) StartRoot(conf *config.Config, spec *specs.Spec) error {
 	}
 
 	// Send a message to the sandbox control server to start the root container.
-	if err := conn.Call(boot.ContMgrRootContainerStart, &s.ID, nil); err != nil {
+	if err := conn.Call(sentryapi.ContMgrRootContainerStart, &s.ID, nil); err != nil {
 		return fmt.Errorf("starting root container: %w", err)
 	}
 
@@ -562,7 +562,7 @@ func (s *Sandbox) StartSubcontainer(spec *specs.Spec, conf *config.Config, cid s
 	var rootfsUpperTarFile *os.File
 	if path := specutils.RootfsTarUpperPath(spec); path != "" {
 		var err error
-		rootfsUpperTarFile, err = os.OpenFile(path, os.O_RDONLY, 0644)
+		rootfsUpperTarFile, err = os.OpenFile(path, rootfsUpperTarFlags(path), 0644)
 		if err != nil {
 			return fmt.Errorf("opening rootfs upper tar file: %v", err)
 		}
@@ -589,7 +589,7 @@ func (s *Sandbox) StartSubcontainer(spec *specs.Spec, conf *config.Config, cid s
 	payload.Files = append(payload.Files, goferFiles...)
 
 	// Start running the container.
-	args := boot.StartArgs{
+	args := sentryapi.StartArgs{
 		Spec:                        spec,
 		Conf:                        conf,
 		CID:                         cid,
@@ -599,29 +599,25 @@ func (s *Sandbox) StartSubcontainer(spec *specs.Spec, conf *config.Config, cid s
 		IsRootfsUpperTarFilePresent: rootfsUpperTarFile != nil,
 		FilePayload:                 payload,
 	}
-	if err := s.call(boot.ContMgrStartSubcontainer, &args, nil); err != nil {
+	if err := s.call(sentryapi.ContMgrStartSubcontainer, &args, nil); err != nil {
 		return fmt.Errorf("starting sub-container %v: %w", spec.Process.Args, err)
 	}
 	return nil
 }
 
 // Restore sends the restore call for a container in the sandbox.
-func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, imagePath string, direct, background bool, networkArgs *boot.CreateLinksAndRoutesArgs) error {
+func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, imagePath string, direct, background bool, networkArgs *sentryapi.CreateLinksAndRoutesArgs) error {
 	if err := hostsettings.Handle(conf); err != nil {
 		return fmt.Errorf("host settings: %w (use --host-settings=ignore to bypass)", err)
 	}
 
 	log.Debugf("Restore sandbox %q from path %q", s.ID, imagePath)
 
-	if !s.FSRestore && imagePath != "" {
-		fsDir := filepath.Join(imagePath, checkpointfiles.FSCheckpointDir)
-		manifestPath := filepath.Join(fsDir, checkpointfiles.FSCheckpointManifestFileName)
-		if _, err := os.Stat(manifestPath); err == nil {
-			return fmt.Errorf("cannot restore split filesystem checkpoint: sandbox was created without filesystem restore support")
-		}
+	if !s.FSRestore && HasFSCheckpointManifest(imagePath) {
+		return fmt.Errorf("cannot restore split filesystem checkpoint: sandbox was created without filesystem restore support")
 	}
 
-	opt := boot.RestoreOpts{
+	opt := sentryapi.RestoreOpts{
 		Background:     background,
 		SplitFSRestore: s.FSRestore,
 	}
@@ -635,7 +631,7 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	}
 
 	// If the platform needs a device FD we must pass it in.
-	if deviceFile, err := deviceFileForPlatform(conf.Platform, conf.PlatformDevicePath); err != nil {
+	if deviceFile, err := deviceFileForPlatform(conf.Platform, conf.PlatformDeviceFor(conf.Platform)); err != nil {
 		return err
 	} else if deviceFile != nil {
 		defer deviceFile.Close()
@@ -664,13 +660,13 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 		// When network args is not nil, set it in the loader which will be used
 		// during restore to configure the loaded stack.
 		log.Debugf("Setting up network args, config: %+v", networkArgs)
-		if err := conn.Call(boot.ContMgrSetNetworkArgs, networkArgs, nil); err != nil {
+		if err := conn.Call(sentryapi.ContMgrSetNetworkArgs, networkArgs, nil); err != nil {
 			return fmt.Errorf("setting network args: %w", err)
 		}
 	}
 
 	// Restore the container and start the root container.
-	if err := conn.Call(boot.ContMgrRestore, &opt, nil); err != nil {
+	if err := conn.Call(sentryapi.ContMgrRestore, &opt, nil); err != nil {
 		if opt.UseCheckpointGofer {
 			if target := getGCSURIFromImagePath(imagePath); target != "" {
 				return fmt.Errorf("restoring container %q from %s: %w", cid, target, err)
@@ -682,7 +678,7 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	return nil
 }
 
-func (s *Sandbox) setRestoreOpts(conf *config.Config, imagePath string, direct bool, opt *boot.RestoreOpts) error {
+func (s *Sandbox) setRestoreOpts(conf *config.Config, imagePath string, direct bool, opt *sentryapi.RestoreOpts) error {
 	clientSockFile, err := s.maybeStartCheckpointGoferAndGetSocket(conf, s.CgroupJSON.Cgroup, imagePath, "-allow-checkpoint-reads")
 	if err != nil {
 		return err
@@ -696,33 +692,86 @@ func (s *Sandbox) setRestoreOpts(conf *config.Config, imagePath string, direct b
 	return nil
 }
 
-func (s *Sandbox) setRestoreOptsForLocalCheckpointFiles(conf *config.Config, imagePath string, direct bool, opt *boot.RestoreOpts) error {
-	stateFileName := path.Join(imagePath, checkpointfiles.StateFileName)
-	sf, err := os.Open(stateFileName)
+// openReadOnlyTree returns an FD for a detached, read-only copy of the mount
+// of dir, rooted at dir. Files opened through it refer to a read-only mount,
+// so they can not be opened for writing again, by anyone, through any path.
+// The copy stays alive as long as any file opened through it does.
+func openReadOnlyTree(dir string) (int, error) {
+	treeFD, err := unix.OpenTree(unix.AT_FDCWD, dir, unix.OPEN_TREE_CLONE|unix.OPEN_TREE_CLOEXEC)
 	if err != nil {
-		return fmt.Errorf("opening state file %q failed: %w", stateFileName, err)
+		return -1, err
+	}
+	attr := unix.MountAttr{Attr_set: unix.MOUNT_ATTR_RDONLY}
+	if err := unix.MountSetattr(treeFD, "", unix.AT_EMPTY_PATH, &attr); err != nil {
+		unix.Close(treeFD)
+		return -1, err
+	}
+	return treeFD, nil
+}
+
+// openRestoreDir returns an FD for the checkpoint directory dir through which
+// the files handed to the sandbox for a restore are opened. The sandbox only
+// reads them and must not be able to modify them, which file permissions do
+// not guarantee since it may run as root with CAP_DAC_OVERRIDE. So this is a
+// detached, read-only copy of dir's mount (see openReadOnlyTree) when the
+// kernel and runsc's privileges allow it, and dir itself otherwise.
+func openRestoreDir(dir string) (int, error) {
+	dirFD, err := openReadOnlyTree(dir)
+	if err == nil {
+		return dirFD, nil
+	}
+	log.Warningf("Checkpoint files in %q are not protected from modification by the sandbox: %v", dir, err)
+	return unix.Open(dir, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+}
+
+// openCheckpointFile opens the checkpoint file name in dir, relative to dirFD,
+// an FD for dir. The path can not lead out of dir, so the file is on dirFD's
+// mount.
+func openCheckpointFile(dirFD int, dir, name string, flags int) (*os.File, error) {
+	how := unix.OpenHow{
+		Flags:   uint64(flags | unix.O_CLOEXEC),
+		Resolve: unix.RESOLVE_BENEATH,
+	}
+	if flags&unix.O_CREAT != 0 {
+		how.Mode = 0644
+	}
+	fd, err := unix.Openat2(dirFD, name, &how)
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), filepath.Join(dir, name)), nil
+}
+
+func (s *Sandbox) setRestoreOptsForLocalCheckpointFiles(conf *config.Config, imagePath string, direct bool, opt *sentryapi.RestoreOpts) error {
+	dirFD, err := openRestoreDir(imagePath)
+	if err != nil {
+		return fmt.Errorf("opening checkpoint directory %q failed: %w", imagePath, err)
+	}
+	defer unix.Close(dirFD)
+
+	sf, err := openCheckpointFile(dirFD, imagePath, checkpointfiles.StateFileName, unix.O_RDONLY)
+	if err != nil {
+		return fmt.Errorf("opening state file %q failed: %w", path.Join(imagePath, checkpointfiles.StateFileName), err)
 	}
 	opt.FilePayload.Files = append(opt.FilePayload.Files, sf)
 
 	// If either the pages metadata file or pages file exist, both must exist,
 	// and we must pass them in.
-	pagesMetadataFileName := path.Join(imagePath, checkpointfiles.PagesMetadataFileName)
-	if pmf, err := os.Open(pagesMetadataFileName); err == nil {
+	if pmf, err := openCheckpointFile(dirFD, imagePath, checkpointfiles.PagesMetadataFileName, unix.O_RDONLY); err == nil {
 		opt.FilePayload.Files = append(opt.FilePayload.Files, pmf)
-		pagesFileName := path.Join(imagePath, checkpointfiles.PagesFileName)
-		pagesReadFlags := os.O_RDONLY
+		pagesReadFlags := unix.O_RDONLY
 		if direct {
 			// The contents are page-aligned, so it can be opened with O_DIRECT.
 			pagesReadFlags |= directIOFlag()
 		}
-		pf, err := os.OpenFile(pagesFileName, pagesReadFlags, 0)
+		pf, err := openCheckpointFile(dirFD, imagePath, checkpointfiles.PagesFileName, pagesReadFlags)
 		if err != nil {
-			return fmt.Errorf("opening pages file %q failed: %w", pagesFileName, err)
+			return fmt.Errorf("opening pages file %q failed: %w", path.Join(imagePath, checkpointfiles.PagesFileName), err)
 		}
 		opt.FilePayload.Files = append(opt.FilePayload.Files, pf)
 		opt.HavePagesFile = true
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("opening pages metadata file %q failed: %w", pagesMetadataFileName, err)
+	} else if !errors.Is(err, unix.ENOENT) {
+		return fmt.Errorf("opening pages metadata file %q failed: %w", path.Join(imagePath, checkpointfiles.PagesMetadataFileName), err)
 	} else {
 		log.Infof("Using single checkpoint file for sandbox %q", s.ID)
 	}
@@ -752,7 +801,7 @@ func (s *Sandbox) RestoreSubcontainer(spec *specs.Spec, conf *config.Config, cid
 	payload.Files = append(payload.Files, goferFiles...)
 
 	// Start running the container.
-	args := boot.StartArgs{
+	args := sentryapi.StartArgs{
 		Spec:                 spec,
 		Conf:                 conf,
 		CID:                  cid,
@@ -761,7 +810,7 @@ func (s *Sandbox) RestoreSubcontainer(spec *specs.Spec, conf *config.Config, cid
 		GoferMountConfs:      goferMountConf,
 		FilePayload:          payload,
 	}
-	if err := s.call(boot.ContMgrRestoreSubcontainer, &args, nil); err != nil {
+	if err := s.call(sentryapi.ContMgrRestoreSubcontainer, &args, nil); err != nil {
 		return fmt.Errorf("starting sub-container %v: %w", spec.Process.Args, err)
 	}
 	return nil
@@ -772,7 +821,7 @@ func (s *Sandbox) RestoreSubcontainer(spec *specs.Spec, conf *config.Config, cid
 func (s *Sandbox) Processes(cid string) ([]*control.Process, error) {
 	log.Debugf("Getting processes for container %q in sandbox %q", cid, s.ID)
 	var pl []*control.Process
-	if err := s.call(boot.ContMgrProcesses, &cid, &pl); err != nil {
+	if err := s.call(sentryapi.ContMgrProcesses, &cid, &pl); err != nil {
 		return nil, fmt.Errorf("retrieving process data from sandbox: %v", err)
 	}
 	return pl, nil
@@ -792,14 +841,14 @@ func (s *Sandbox) CreateTraceSession(config *seccheck.SessionConfig, force bool)
 		}
 	}()
 
-	arg := boot.CreateTraceSessionArgs{
+	arg := sentryapi.CreateTraceSessionArgs{
 		Config: *config,
 		Force:  force,
 		FilePayload: urpc.FilePayload{
 			Files: sinkFiles,
 		},
 	}
-	if err := s.call(boot.ContMgrCreateTraceSession, &arg, nil); err != nil {
+	if err := s.call(sentryapi.ContMgrCreateTraceSession, &arg, nil); err != nil {
 		return fmt.Errorf("creating trace session: %w", err)
 	}
 	return nil
@@ -808,7 +857,7 @@ func (s *Sandbox) CreateTraceSession(config *seccheck.SessionConfig, force bool)
 // DeleteTraceSession deletes an existing trace session.
 func (s *Sandbox) DeleteTraceSession(name string) error {
 	log.Debugf("Deleting trace session %q in sandbox %q", name, s.ID)
-	if err := s.call(boot.ContMgrDeleteTraceSession, name, nil); err != nil {
+	if err := s.call(sentryapi.ContMgrDeleteTraceSession, name, nil); err != nil {
 		return fmt.Errorf("deleting trace session: %w", err)
 	}
 	return nil
@@ -818,7 +867,7 @@ func (s *Sandbox) DeleteTraceSession(name string) error {
 func (s *Sandbox) ListTraceSessions() ([]seccheck.SessionConfig, error) {
 	log.Debugf("Listing trace sessions in sandbox %q", s.ID)
 	var sessions []seccheck.SessionConfig
-	if err := s.call(boot.ContMgrListTraceSessions, nil, &sessions); err != nil {
+	if err := s.call(sentryapi.ContMgrListTraceSessions, nil, &sessions); err != nil {
 		return nil, fmt.Errorf("listing trace session: %w", err)
 	}
 	return sessions, nil
@@ -828,7 +877,7 @@ func (s *Sandbox) ListTraceSessions() ([]seccheck.SessionConfig, error) {
 func (s *Sandbox) ProcfsDump() ([]procfs.ProcessProcfsDump, error) {
 	log.Debugf("Procfs dump %q", s.ID)
 	var procfsDump []procfs.ProcessProcfsDump
-	if err := s.call(boot.ContMgrProcfsDump, nil, &procfsDump); err != nil {
+	if err := s.call(sentryapi.ContMgrProcfsDump, nil, &procfsDump); err != nil {
 		return nil, fmt.Errorf("getting sandbox %q stacks: %w", s.ID, err)
 	}
 	return procfsDump, nil
@@ -887,24 +936,24 @@ func (s *Sandbox) Execute(conf *config.Config, args *control.ExecArgs) (int32, e
 
 	// Send a message to the sandbox control server to start the container.
 	var pid int32
-	if err := s.call(boot.ContMgrExecuteAsync, args, &pid); err != nil {
+	if err := s.call(sentryapi.ContMgrExecuteAsync, args, &pid); err != nil {
 		return 0, fmt.Errorf("executing command %q in sandbox: %w", args, err)
 	}
 	return pid, nil
 }
 
 // Event retrieves stats about the sandbox such as memory and CPU utilization.
-func (s *Sandbox) Event(cid string) (*boot.EventOut, error) {
+func (s *Sandbox) Event(cid string) (*sentryapi.EventOut, error) {
 	log.Debugf("Getting events for container %q in sandbox %q", cid, s.ID)
-	var e boot.EventOut
-	if err := s.call(boot.ContMgrEvent, &cid, &e); err != nil {
+	var e sentryapi.EventOut
+	if err := s.call(sentryapi.ContMgrEvent, &cid, &e); err != nil {
 		return nil, fmt.Errorf("retrieving event data from sandbox: %w", err)
 	}
 	return &e, nil
 }
 
 // PortForward starts port forwarding to the sandbox.
-func (s *Sandbox) PortForward(opts *boot.PortForwardOpts) error {
+func (s *Sandbox) PortForward(opts *sentryapi.PortForwardOpts) error {
 	log.Debugf("Requesting port forward for container %q in sandbox %q: %+v", opts.ContainerID, s.ID, opts)
 	conn, err := s.sandboxConnect()
 	if err != nil {
@@ -912,7 +961,7 @@ func (s *Sandbox) PortForward(opts *boot.PortForwardOpts) error {
 	}
 	defer conn.Close()
 
-	if err := conn.Call(boot.ContMgrPortForward, opts, nil); err != nil {
+	if err := conn.Call(sentryapi.ContMgrPortForward, opts, nil); err != nil {
 		return fmt.Errorf("port forwarding to sandbox: %v", err)
 	}
 
@@ -983,8 +1032,7 @@ func (s *Sandbox) connError(err error) error {
 }
 
 type sandboxProcessEnvOptions struct {
-	enforceRelease bool
-	sentryUsesCgo  bool
+	sentryUsesCgo bool
 }
 
 func sandboxProcessEnv(conf *config.Config, opts sandboxProcessEnvOptions) []string {
@@ -1002,9 +1050,7 @@ func sandboxProcessEnv(conf *config.Config, opts sandboxProcessEnvOptions) []str
 			env = append(env, "TMPDIR="+tmpDir)
 		}
 	}
-	if opts.enforceRelease {
-		env = gvisorbinaries.WithEnforceRelease(env)
-	}
+	env = gvisorbinaries.WithEnforceRelease(env)
 	if opts.sentryUsesCgo {
 		// Platforms that use stub processes are not compatible with
 		// the glibc rseq, because they unmap everything from a process
@@ -1037,7 +1083,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	// a time. Try to make RLIMIT_MEMLOCK unlimited so that it can do so. runsc
 	// expects to run in a memory cgroup that limits its memory usage as
 	// required.
-	// This needs to be done before exec'ing `runsc boot`, as that subcommand
+	// This needs to be done before exec'ing the Sentry, as the Sentry
 	// runs as an unprivileged user that will not be able to call `setrlimit`
 	// by itself. Calling `setrlimit` here will have the side-effect of setting
 	// the limit on the currently-running `runsc` process as well, but that
@@ -1090,7 +1136,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	}
 	lfOpts.Command = "boot" // Revert command to "boot".
 
-	sentryBin := &gvisorbinaries.GvisorSentry
+	sentryBin := sentryBinary(conf)
 	// runsc cannot tell whether the Sentry sidecar uses cgo, so assume it
 	// does if runsc does: race builds pair a race runsc with a race Sentry.
 	// Caveats: a cgo runsc booting a pure Sentry (e.g. a cgo test binary)
@@ -1099,20 +1145,13 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	// so that Sentry's stubs would crash; no build pairs them today.
 	sentryUsesCgo := config.CgoEnabled
 	if conf.Network == config.NetworkPlugin {
-		sentryBin = &gvisorbinaries.GvisorSentryPluginStack
 		sentryUsesCgo = true
 	}
-	bootBinPath := specutils.ExePath
-	if p, err := sentryBin.Path(); err == nil {
-		log.Infof("Sidecar %q found: booting sandbox with %s", sentryBin.Name, p)
-		bootBinPath = p
-	} else if conf.SidecarUsagePolicy.AllowEmbeddedFallback() {
-		// A TTC install carries no sidecars: its runtime binary has the
-		// Sentry itself.
-		log.Infof("Sidecar %q not usable (%v): booting sandbox with %s itself", sentryBin.Name, err, bootBinPath)
-	} else {
-		return fmt.Errorf("sidecar %q not usable (%v) and --sidecar-usage-policy is set to STRICT", sentryBin.Name, err)
+	bootBinPath, err := sentryBin.Path()
+	if err != nil {
+		return fmt.Errorf("sidecar %q not usable: %w", sentryBin.Name, err)
 	}
+	log.Infof("Sidecar %q found: booting sandbox with %s", sentryBin.Name, bootBinPath)
 	// Open with `O_PATH`, which is sufficient for exec and makes the FD
 	// effectively execute-only (no read/write).
 	bootBin, err := os.OpenFile(bootBinPath, unix.O_PATH, 0)
@@ -1120,16 +1159,15 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		return fmt.Errorf("cannot open boot binary %q: %w", bootBinPath, err)
 	}
 	defer bootBin.Close()
-	// Without the prewarmer, as in a TTC install, the boot binary runs
-	// directly, and its FD table grows as it needs to.
+	// Without the prewarmer, as in a ttcd built without the sidecars it
+	// carries, the boot binary runs directly, and its FD table grows as it
+	// needs to.
 	cmdPath := bootBinPath
 	if prewarmerPath, err := gvisorbinaries.GvisorSentryPrewarmer.Path(); err == nil {
 		log.Infof("Sidecar %q found: prepending Sentry boot command with %s", gvisorbinaries.GvisorSentryPrewarmer.Name, prewarmerPath)
 		cmdPath = prewarmerPath
-	} else if conf.SidecarUsagePolicy.AllowEmbeddedFallback() {
-		log.Infof("Sidecar %q not usable (%v): executing the boot binary directly", gvisorbinaries.GvisorSentryPrewarmer.Name, err)
 	} else {
-		return fmt.Errorf("sidecar %q not usable: %w", gvisorbinaries.GvisorSentryPrewarmer.Name, err)
+		log.Infof("Sidecar %q not usable (%v): executing the boot binary directly", gvisorbinaries.GvisorSentryPrewarmer.Name, err)
 	}
 
 	// Relay all the config flags to the sandbox process.
@@ -1163,8 +1201,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	}
 
 	cmd.Env = sandboxProcessEnv(conf, sandboxProcessEnvOptions{
-		enforceRelease: bootBinPath != specutils.ExePath,
-		sentryUsesCgo:  sentryUsesCgo,
+		sentryUsesCgo: sentryUsesCgo,
 	})
 
 	// If there is a gofer, sends all socket ends to the sandbox.
@@ -1192,7 +1229,8 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	if err := donations.DonateLogFile("final-metrics-log-fd", conf.FinalMetricsLog, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, lfOpts); err != nil {
 		return fmt.Errorf("donating final metrics log file: %w", err)
 	}
-	if err := donations.DonateLogFile("rootfs-upper-tar-fd", specutils.RootfsTarUpperPath(args.Spec), os.O_RDONLY, lfOpts); err != nil {
+	rootfsTarPath := specutils.RootfsTarUpperPath(args.Spec)
+	if err := donations.DonateLogFile("rootfs-upper-tar-fd", rootfsTarPath, rootfsUpperTarFlags(rootfsTarPath), lfOpts); err != nil {
 		return fmt.Errorf("donating rootfs tar file: %w", err)
 	}
 	volumeRepositories, err := specutils.TTCVolumeRepositories(args.Spec)
@@ -1289,25 +1327,30 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		return err
 	}
 
-	gPlatform, err := platform.Lookup(conf.Platform)
+	gPlatform, err := platformdesc.Lookup(conf.Platform)
 	if err != nil {
 		return fmt.Errorf("cannot look up platform: %w", err)
 	}
-	if deviceFile, err := gPlatform.OpenDevice(conf.PlatformDevicePath); err != nil {
+	if deviceFile, err := gPlatform.OpenDevice(conf.PlatformDeviceFor(conf.Platform)); err != nil {
 		return fmt.Errorf("opening device file for platform %q: %v", conf.Platform, err)
 	} else if deviceFile != nil {
 		donations.DonateAndClose("device-fd", deviceFile.ReleaseToFile("device file"))
 	}
 
+	// The Go runtime keeps its cgroup's CPU limit file open for the lifetime
+	// of the process to keep GOMAXPROCS in sync with the limit. The sentry
+	// sets GOMAXPROCS itself, so do not hold a host FD that it does not need.
+	godebug := []string{"containermaxprocs=0"}
 	// TODO(b/151157106): syscall tests fail by timeout if asyncpreemptoff
 	// isn't set.
 	if conf.Platform == "kvm" || conf.Platform == "slimvm" {
-		cmd.Env = append(cmd.Env, "GODEBUG=asyncpreemptoff=1")
+		godebug = append(godebug, "asyncpreemptoff=1")
 	}
-
 	if conf.Network == config.NetworkPlugin {
-		cmd.Env = append(cmd.Env, "GODEBUG=cgocheck=0")
+		godebug = append(godebug, "cgocheck=0")
 	}
+	// Go only reads the first GODEBUG variable in the environment.
+	cmd.Env = append(cmd.Env, "GODEBUG="+strings.Join(godebug, ","))
 
 	// nss is the set of namespaces to join or create before starting the sandbox
 	// process. Mount, IPC and UTS namespaces from the host are not used as they
@@ -1407,6 +1450,9 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		} else if specutils.HasCapabilities(capability.CAP_SYS_ADMIN) || rootlessEUID {
 			log.Infof("Sandbox will be started in minimal chroot")
 			cmd.Args = append(cmd.Args, "--setup-root")
+			if err := donateProcUmounter(conf, &donations); err != nil {
+				return err
+			}
 		} else {
 			return fmt.Errorf("can't run sandbox process in minimal chroot since we don't have CAP_SYS_ADMIN")
 		}
@@ -1420,6 +1466,9 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 			log.Infof("Sandbox will be started in new user namespace")
 			nss = append(nss, specs.LinuxNamespace{Type: specs.UserNamespace})
 			cmd.Args = append(cmd.Args, "--setup-root")
+			if err := donateProcUmounter(conf, &donations); err != nil {
+				return err
+			}
 
 			const nobody = 65534
 			sandboxID := uint32(nobody)
@@ -1456,7 +1505,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 			// A sandbox process will construct an empty root for itself, so it has
 			// to have CAP_SYS_ADMIN and CAP_SYS_CHROOT capabilities.
 			if !legacyUserNamespaceRoot {
-				if err := addChrootAmbientCapabilities(cmd, gPlatform.Requirements().RequiresCapSysPtrace); err != nil {
+				if err := addChrootAmbientCapabilities(cmd, gPlatform.Requirements.RequiresCapSysPtrace); err != nil {
 					return err
 				}
 			}
@@ -1640,6 +1689,25 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	return nil
 }
 
+// donateProcUmounter donates the /proc unmounter sidecar binary to a sandbox
+// process that sets up its own root, which spawns it unless it runs rootless.
+func donateProcUmounter(conf *config.Config, donations *donation.Agency) error {
+	if conf.Rootless {
+		return nil
+	}
+	b := &gvisorbinaries.ProcUmounter
+	p, err := b.Path()
+	if err != nil {
+		return fmt.Errorf("sidecar %q not usable: %w", b.Name, err)
+	}
+	f, err := os.OpenFile(p, unix.O_PATH, 0)
+	if err != nil {
+		return fmt.Errorf("cannot open %q: %w", p, err)
+	}
+	donations.DonateAndClose("proc-umounter-fd", f)
+	return nil
+}
+
 // spawnFDParking starts the runsc-fd-parking sidecar, which holds
 // `ring` until the sandbox process `pid` has exited and thus keeps the
 // sandbox from being the last ref holder of the FDs pinned into the ring.
@@ -1768,7 +1836,7 @@ func (s *Sandbox) Wait(cid string) (unix.WaitStatus, error) {
 
 		// Try the Wait RPC to the sandbox.
 		var ws unix.WaitStatus
-		err = conn.Call(boot.ContMgrWait, &cid, &ws)
+		err = conn.Call(sentryapi.ContMgrWait, &cid, &ws)
 		conn.Close()
 		if err == nil {
 			if s.IsRootContainer(cid) {
@@ -1812,11 +1880,11 @@ func (s *Sandbox) Wait(cid string) (unix.WaitStatus, error) {
 func (s *Sandbox) WaitPID(cid string, pid int32) (unix.WaitStatus, error) {
 	log.Debugf("Waiting for PID %d in sandbox %q", pid, s.ID)
 	var ws unix.WaitStatus
-	args := &boot.WaitPIDArgs{
+	args := &sentryapi.WaitPIDArgs{
 		PID: pid,
 		CID: cid,
 	}
-	if err := s.call(boot.ContMgrWaitPID, args, &ws); err != nil {
+	if err := s.call(sentryapi.ContMgrWaitPID, args, &ws); err != nil {
 		return ws, fmt.Errorf("waiting on PID %d in sandbox %q: %w", pid, s.ID, err)
 	}
 	return ws, nil
@@ -1825,30 +1893,30 @@ func (s *Sandbox) WaitPID(cid string, pid int32) (unix.WaitStatus, error) {
 // WaitCheckpoint waits for the Kernel to have been successfully checkpointed.
 func (s *Sandbox) WaitCheckpoint() error {
 	log.Debugf("Waiting for checkpoint to complete in sandbox %q", s.ID)
-	return s.call(boot.ContMgrWaitCheckpoint, nil, nil)
+	return s.call(sentryapi.ContMgrWaitCheckpoint, nil, nil)
 }
 
 // WaitRestore waits for the Kernel to have been successfully restored.
 func (s *Sandbox) WaitRestore() error {
 	log.Debugf("Waiting for restore to complete in sandbox %q", s.ID)
-	return s.call(boot.ContMgrWaitRestore, nil, nil)
+	return s.call(sentryapi.ContMgrWaitRestore, nil, nil)
 }
 
 // WaitFSCheckpoint waits for a filesystem checkpoint to have successfully been
 // saved.
 func (s *Sandbox) WaitFSCheckpoint() error {
 	log.Debugf("Waiting for filesystem checkpoint to complete in sandbox %q", s.ID)
-	return s.call(boot.ContMgrWaitFSCheckpoint, nil, nil)
+	return s.call(sentryapi.ContMgrWaitFSCheckpoint, nil, nil)
 }
 
 // WaitFSRestore waits for filesystems to have been successfully restored from
 // checkpoint.
 func (s *Sandbox) WaitFSRestore(cid string) error {
 	log.Debugf("Waiting for filesystem restore to complete in container %q in sandbox %q", cid, s.ID)
-	args := boot.WaitFSRestoreArgs{
+	args := sentryapi.WaitFSRestoreArgs{
 		CID: cid,
 	}
-	return s.call(boot.ContMgrWaitFSRestore, &args, nil)
+	return s.call(sentryapi.ContMgrWaitFSRestore, &args, nil)
 }
 
 // IsRootContainer returns true if the specified container ID belongs to the
@@ -1887,17 +1955,17 @@ func (s *Sandbox) destroy() error {
 // returning.
 func (s *Sandbox) SignalContainer(cid string, sig unix.Signal, all bool) error {
 	log.Debugf("Signal sandbox %q", s.ID)
-	mode := boot.DeliverToProcess
+	mode := sentryapi.DeliverToProcess
 	if all {
-		mode = boot.DeliverToAllProcesses
+		mode = sentryapi.DeliverToAllProcesses
 	}
 
-	args := boot.SignalArgs{
+	args := sentryapi.SignalArgs{
 		CID:   cid,
 		Signo: int32(sig),
 		Mode:  mode,
 	}
-	if err := s.call(boot.ContMgrSignal, &args, nil); err != nil {
+	if err := s.call(sentryapi.ContMgrSignal, &args, nil); err != nil {
 		return fmt.Errorf("signaling container %q: %w", cid, err)
 	}
 	return nil
@@ -1910,18 +1978,18 @@ func (s *Sandbox) SignalContainer(cid string, sig unix.Signal, all bool) error {
 func (s *Sandbox) SignalProcess(cid string, pid int32, sig unix.Signal, fgProcess bool) error {
 	log.Debugf("Signal sandbox %q", s.ID)
 
-	mode := boot.DeliverToProcess
+	mode := sentryapi.DeliverToProcess
 	if fgProcess {
-		mode = boot.DeliverToForegroundProcessGroup
+		mode = sentryapi.DeliverToForegroundProcessGroup
 	}
 
-	args := boot.SignalArgs{
+	args := sentryapi.SignalArgs{
 		CID:   cid,
 		Signo: int32(sig),
 		PID:   pid,
 		Mode:  mode,
 	}
-	if err := s.call(boot.ContMgrSignal, &args, nil); err != nil {
+	if err := s.call(sentryapi.ContMgrSignal, &args, nil); err != nil {
 		return fmt.Errorf("signaling container %q PID %d: %v", cid, pid, err)
 	}
 	return nil
@@ -1932,13 +2000,13 @@ func (s *Sandbox) SignalProcess(cid string, pid int32, sig unix.Signal, fgProces
 func (s *Sandbox) SignalProcessGroup(cid string, pgid int32, sig unix.Signal) error {
 	log.Debugf("Signal sandbox %q process group %d", s.ID, pgid)
 
-	args := boot.SignalArgs{
+	args := sentryapi.SignalArgs{
 		CID:   cid,
 		Signo: int32(sig),
 		PID:   pgid,
-		Mode:  boot.DeliverToProcessGroup,
+		Mode:  sentryapi.DeliverToProcessGroup,
 	}
-	if err := s.call(boot.ContMgrSignal, &args, nil); err != nil {
+	if err := s.call(sentryapi.ContMgrSignal, &args, nil); err != nil {
 		return fmt.Errorf("signaling container %q PGID %d: %v", cid, pgid, err)
 	}
 	return nil
@@ -1957,7 +2025,7 @@ type CheckpointOpts struct {
 	SaveRestoreExecArgv        string
 	SaveRestoreExecTimeout     time.Duration
 	SaveRestoreExecContainerID string
-	SplitFSCheckpointPaths     []checkpoint.ResourceID
+	SplitFSCheckpointPaths     []string
 }
 
 // Checkpoint sends the checkpoint call for a container in the sandbox.
@@ -1965,7 +2033,16 @@ type CheckpointOpts struct {
 func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, opts CheckpointOpts) error {
 	log.Debugf("Checkpoint sandbox %q, imagePath %q, opts %+v", s.ID, imagePath, opts)
 
-	if len(opts.SplitFSCheckpointPaths) > 0 {
+	bundles, err := fscheckpoint.ParseBundles(opts.SplitFSCheckpointPaths)
+	if err != nil {
+		return fmt.Errorf("parsing filesystem checkpoint paths: %w", err)
+	}
+	for i := range bundles {
+		if bundles[i].Prefix == "" {
+			bundles[i].Prefix = checkpointfiles.FSCheckpointDir
+		}
+	}
+	if len(bundles) > 0 {
 		// Verify we are not using GCS/gofer.
 		gcsOptsPath := filepath.Join(imagePath, checkpointGCSOptsFileName)
 		if _, err := os.Stat(gcsOptsPath); err == nil {
@@ -1979,23 +2056,19 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 		Resume:                         opts.Resume,
 		CudaCheckpointPath:             opts.CudaCheckpointPath,
 		CudaCheckpointSequential:       opts.CudaCheckpointSequential,
-		SplitFSCheckpointPaths:         opts.SplitFSCheckpointPaths,
+		SplitFSCheckpointPaths:         bundles,
 		ExecOpts: control.SaveRestoreExecOpts{
 			Argv:        opts.SaveRestoreExecArgv,
 			Timeout:     opts.SaveRestoreExecTimeout,
 			ContainerID: opts.SaveRestoreExecContainerID,
 		},
 	}
-	defer func() {
-		for _, f := range opt.FilePayload.Files {
-			_ = f.Close()
-		}
-	}()
-	if err := s.setCheckpointOptsFiles(conf, imagePath, opts, &opt); err != nil {
+	defer opt.FilePayload.Close()
+	if err := s.setCheckpointOptsFiles(conf, imagePath, opts, bundles, &opt); err != nil {
 		return err
 	}
 
-	if err := s.call(boot.ContMgrCheckpoint, &opt, nil); err != nil {
+	if err := s.call(sentryapi.ContMgrCheckpoint, &opt, nil); err != nil {
 		if opt.UseCheckpointGofer {
 			if target := getGCSURIFromImagePath(imagePath); target != "" {
 				return fmt.Errorf("checkpointing container %q to %s: %w", cid, target, err)
@@ -2028,7 +2101,7 @@ func (s *Sandbox) CheckpointBranch(conf *config.Config, cid, branchID, imagePath
 			_ = file.Close()
 		}
 	}()
-	if err := s.setCheckpointOptsFiles(conf, imagePath, opts, &saveOpts); err != nil {
+	if err := s.setCheckpointOptsFiles(conf, imagePath, opts, nil /* bundles */, &saveOpts); err != nil {
 		return err
 	}
 	args := boot.BranchCheckpointArgs{SaveOpts: saveOpts, BranchID: branchID}
@@ -2038,13 +2111,13 @@ func (s *Sandbox) CheckpointBranch(conf *config.Config, cid, branchID, imagePath
 	return nil
 }
 
-func (s *Sandbox) setCheckpointOptsFiles(conf *config.Config, imagePath string, opts CheckpointOpts, opt *control.SaveOpts) error {
+func (s *Sandbox) setCheckpointOptsFiles(conf *config.Config, imagePath string, opts CheckpointOpts, bundles []fscheckpoint.Bundle, opt *control.SaveOpts) error {
 	clientSockFile, err := s.maybeStartCheckpointGoferAndGetSocket(conf, s.CgroupJSON.Cgroup, imagePath, "-allow-checkpoint-writes")
 	if err != nil {
 		return err
 	}
 	if clientSockFile == nil {
-		return setCheckpointOptsFilesForLocalCheckpoint(conf, imagePath, opts, opt)
+		return setCheckpointOptsFilesForLocalCheckpoint(conf, imagePath, opts, bundles, opt)
 	}
 	log.Infof("Saving to GCS via checkpoint gofer")
 	opt.FilePayload.Files = append(opt.FilePayload.Files, clientSockFile)
@@ -2053,7 +2126,7 @@ func (s *Sandbox) setCheckpointOptsFiles(conf *config.Config, imagePath string, 
 	return nil
 }
 
-func setCheckpointOptsFilesForLocalCheckpoint(conf *config.Config, imagePath string, opts CheckpointOpts, opt *control.SaveOpts) error {
+func setCheckpointOptsFilesForLocalCheckpoint(conf *config.Config, imagePath string, opts CheckpointOpts, bundles []fscheckpoint.Bundle, opt *control.SaveOpts) error {
 	files, err := createSaveFiles(imagePath, opts.Direct, opts.Compression)
 	if err != nil {
 		return err
@@ -2061,7 +2134,7 @@ func setCheckpointOptsFilesForLocalCheckpoint(conf *config.Config, imagePath str
 	opt.FilePayload.Files = files
 	opt.HavePagesFile = len(files) > 1
 
-	if len(opts.SplitFSCheckpointPaths) > 0 {
+	if len(bundles) > 0 {
 		cleanLocalFiles := cleanup.Make(func() {
 			for _, f := range files {
 				_ = f.Close()
@@ -2070,11 +2143,7 @@ func setCheckpointOptsFilesForLocalCheckpoint(conf *config.Config, imagePath str
 		})
 		defer cleanLocalFiles.Clean()
 
-		fsImagePath := filepath.Join(imagePath, checkpointfiles.FSCheckpointDir)
-		if err := os.MkdirAll(fsImagePath, 0755); err != nil {
-			return fmt.Errorf("creating fs checkpoint directory: %w", err)
-		}
-		fsFiles, err := openFSCheckpointLocalFiles(fsImagePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, opts.Direct)
+		fsFiles, err := createFSCheckpointLocalFiles(imagePath, bundles[0].Prefix, opts.Direct)
 		if err != nil {
 			return fmt.Errorf("creating fs checkpoint files: %w", err)
 		}
@@ -2133,7 +2202,64 @@ func createSaveFiles(path string, direct bool, compression statefile.Compression
 	return files, nil
 }
 
+// HasFSCheckpointManifest returns true if dir contains any filesystem
+// checkpoint manifest (fscheckpoint.pb, <prefix>_fscheckpoint.pb, or
+// <prefix>/fscheckpoint.pb).
+func HasFSCheckpointManifest(dir string) bool {
+	prefixes, err := discoverFSCheckpointPrefixes(dir)
+	return err == nil && len(prefixes) > 0
+}
+
+func discoverFSCheckpointPrefixes(dir string) ([]string, error) {
+	if dir == "" {
+		return nil, nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var prefixes []string
+	suffix := "_" + checkpointfiles.FSCheckpointManifestFileName
+	for _, e := range entries {
+		if e.IsDir() {
+			subManifest := filepath.Join(dir, e.Name(), checkpointfiles.FSCheckpointManifestFileName)
+			if _, err := os.Stat(subManifest); err == nil {
+				prefixes = append(prefixes, e.Name()+"/")
+			}
+			continue
+		}
+		if e.Name() == checkpointfiles.FSCheckpointManifestFileName {
+			prefixes = append(prefixes, "")
+		} else if pfx, ok := strings.CutSuffix(e.Name(), suffix); ok && pfx != "" {
+			prefixes = append(prefixes, pfx)
+		}
+	}
+	return prefixes, nil
+}
+
+func hasGCSOpts(imagePath string) bool {
+	_, err := os.Stat(filepath.Join(imagePath, checkpointGCSOptsFileName))
+	return err == nil
+}
+
+// isGCSRestorePath checks whether p refers to a GCS checkpoint directory
+// directly (isPrefixed=false) or to a <gcsdir>/<prefix> bundle path inside a
+// GCS checkpoint directory (isPrefixed=true).
+func isGCSRestorePath(p string) (isGCS bool, isPrefixed bool) {
+	fi, err := os.Stat(p)
+	if err == nil && fi.IsDir() {
+		return hasGCSOpts(p), false
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		return hasGCSOpts(filepath.Dir(strings.TrimSuffix(p, "/"))), true
+	}
+	return false, false
+}
+
 func (s *Sandbox) openFSRestoreFiles(conf *config.Config, imagePath string, direct bool, cmd *exec.Cmd) ([]*os.File, error) {
+	if isGCS, isPrefixed := isGCSRestorePath(imagePath); isGCS && isPrefixed {
+		return nil, fmt.Errorf("prefixed filesystem checkpoint restore (%q) is not supported with GCS checkpoint gofer", imagePath)
+	}
 	clientSockFile, err := s.maybeStartCheckpointGoferAndGetSocket(conf, s.CgroupJSON.Cgroup, imagePath, "-allow-fscheckpoint-reads")
 	if err != nil {
 		return nil, err
@@ -2147,7 +2273,42 @@ func (s *Sandbox) openFSRestoreFiles(conf *config.Config, imagePath string, dire
 }
 
 func openFSRestoreFilesForLocalCheckpoint(imagePath string, direct bool) ([]*os.File, error) {
-	return openFSCheckpointLocalFiles(imagePath, os.O_RDONLY, direct)
+	fi, err := os.Stat(imagePath)
+	if err == nil {
+		if !fi.IsDir() {
+			return nil, fmt.Errorf("fs restore image path %q is a file, expected a directory or <dir>/<prefix>", imagePath)
+		}
+		prefixes, err := discoverFSCheckpointPrefixes(imagePath)
+		if err != nil {
+			return nil, fmt.Errorf("reading fs restore directory %q: %w", imagePath, err)
+		}
+		if len(prefixes) > 1 {
+			return nil, fmt.Errorf("multiple filesystem checkpoint bundles found in %q", imagePath)
+		}
+		var prefix string
+		if len(prefixes) == 1 {
+			prefix = prefixes[0]
+		}
+		return openFSRestoreBundleFiles(imagePath, prefix, direct)
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("stat fs restore image path %q: %w", imagePath, err)
+	}
+	if strings.HasSuffix(imagePath, "/") {
+		return nil, fmt.Errorf("fs restore image directory %q does not exist: %w", imagePath, err)
+	}
+	return openFSRestoreBundleFiles(filepath.Dir(imagePath), filepath.Base(imagePath), direct)
+}
+
+// openFSRestoreBundleFiles opens the files of the filesystem checkpoint with
+// the given prefix in imagePath for a restore, through openRestoreDir.
+func openFSRestoreBundleFiles(imagePath, prefix string, direct bool) ([]*os.File, error) {
+	dirFD, err := openRestoreDir(imagePath)
+	if err != nil {
+		return nil, fmt.Errorf("opening fs checkpoint directory %q failed: %w", imagePath, err)
+	}
+	defer unix.Close(dirFD)
+	return openFSCheckpointLocalFiles(dirFD, imagePath, prefix, unix.O_RDONLY, direct)
 }
 
 // FSSaveOpts holds options to FSSave.
@@ -2161,28 +2322,34 @@ type FSSaveOpts struct {
 	// provided for parity with that feature.
 	ExitAfterSaving bool
 
-	// Paths is the list of paths inside the containers to save.
-	Paths []checkpoint.ResourceID
+	// Paths is the list of [<prefix>=][<container>:]<path> specifications to
+	// save. Both prefixed (e.g., "rootfs=/") and unprefixed (e.g., "/",
+	// "all-tmpfs", "c1:/data") formats are supported.
+	Paths []string
 }
 
 // FSSave sends the filesystem checkpointing call to the sandbox.
 func (s *Sandbox) FSSave(conf *config.Config, cid string, imagePath string, opts FSSaveOpts) error {
 	log.Debugf("Checkpoint filesystem for sandbox %q, imagePath %q, opts %+v", s.ID, imagePath, opts)
 
-	args := boot.FSSaveArgs{
-		ExitAfterSaving: opts.ExitAfterSaving,
-		Paths:           opts.Paths,
+	bundles, err := fscheckpoint.ParseBundles(opts.Paths)
+	if err != nil {
+		return fmt.Errorf("parsing filesystem checkpoint paths: %w", err)
 	}
-	defer func() {
-		for _, f := range args.FilePayload.Files {
-			_ = f.Close()
-		}
-	}()
-	if err := s.setFSSaveArgs(conf, imagePath, opts.Direct, &args); err != nil {
+	if len(bundles) == 0 {
+		bundles = []fscheckpoint.Bundle{{}}
+	}
+
+	args := sentryapi.FSSaveArgs{
+		ExitAfterSaving: opts.ExitAfterSaving,
+		Paths:           bundles,
+	}
+	defer args.FilePayload.Close()
+	if err := s.setFSSaveArgs(conf, imagePath, opts.Direct, bundles[0].Prefix, &args); err != nil {
 		return err
 	}
 
-	if err := s.call(boot.ContMgrFSSave, &args, nil); err != nil {
+	if err := s.call(sentryapi.ContMgrFSSave, &args, nil); err != nil {
 		if args.UseCheckpointGofer {
 			if target := getGCSURIFromImagePath(imagePath); target != "" {
 				return fmt.Errorf("checkpointing filesystem for container %q to %s: %w", cid, target, err)
@@ -2193,13 +2360,17 @@ func (s *Sandbox) FSSave(conf *config.Config, cid string, imagePath string, opts
 	return nil
 }
 
-func (s *Sandbox) setFSSaveArgs(conf *config.Config, imagePath string, direct bool, args *boot.FSSaveArgs) error {
+func (s *Sandbox) setFSSaveArgs(conf *config.Config, imagePath string, direct bool, prefix string, args *sentryapi.FSSaveArgs) error {
+	// TODO(b/541219576): Support prefixed filesystem checkpoint with GCS/gofer.
+	if prefix != "" && hasGCSOpts(imagePath) {
+		return fmt.Errorf("prefixed filesystem checkpoint is not supported with GCS/gofer")
+	}
 	clientSockFile, err := s.maybeStartCheckpointGoferAndGetSocket(conf, s.CgroupJSON.Cgroup, imagePath, "-allow-fscheckpoint-writes")
 	if err != nil {
 		return err
 	}
 	if clientSockFile == nil {
-		return setFSSaveArgsForLocalCheckpointFiles(conf, imagePath, direct, args)
+		return setFSSaveArgsForLocalCheckpointFiles(conf, imagePath, direct, prefix, args)
 	}
 	log.Infof("Saving filesystem checkpoint to GCS via checkpoint gofer")
 	args.FilePayload.Files = append(args.FilePayload.Files, clientSockFile)
@@ -2207,8 +2378,8 @@ func (s *Sandbox) setFSSaveArgs(conf *config.Config, imagePath string, direct bo
 	return nil
 }
 
-func setFSSaveArgsForLocalCheckpointFiles(conf *config.Config, imagePath string, direct bool, args *boot.FSSaveArgs) error {
-	files, err := openFSCheckpointLocalFiles(imagePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, direct)
+func setFSSaveArgsForLocalCheckpointFiles(conf *config.Config, imagePath string, direct bool, prefix string, args *sentryapi.FSSaveArgs) error {
+	files, err := createFSCheckpointLocalFiles(imagePath, prefix, direct)
 	if err != nil {
 		return err
 	}
@@ -2216,13 +2387,32 @@ func setFSSaveArgsForLocalCheckpointFiles(conf *config.Config, imagePath string,
 	return nil
 }
 
-func openFSCheckpointLocalFiles(imagePath string, openFlags int, direct bool) ([]*os.File, error) {
+// createFSCheckpointLocalFiles creates the files of the filesystem checkpoint
+// with the given prefix in imagePath.
+func createFSCheckpointLocalFiles(imagePath, prefix string, direct bool) ([]*os.File, error) {
+	if strings.HasSuffix(prefix, "/") {
+		subDir := filepath.Join(imagePath, prefix)
+		if err := os.MkdirAll(subDir, 0755); err != nil {
+			return nil, fmt.Errorf("creating fs checkpoint directory %q: %w", subDir, err)
+		}
+	}
+	dirFD, err := unix.Open(imagePath, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("opening fs checkpoint directory %q failed: %w", imagePath, err)
+	}
+	defer unix.Close(dirFD)
+	return openFSCheckpointLocalFiles(dirFD, imagePath, prefix, unix.O_CREAT|unix.O_EXCL|unix.O_RDWR, direct)
+}
+
+// openFSCheckpointLocalFiles opens the files of the filesystem checkpoint
+// with the given prefix in imagePath, relative to dirFD, an FD for imagePath.
+func openFSCheckpointLocalFiles(dirFD int, imagePath, prefix string, openFlags int, direct bool) ([]*os.File, error) {
 	var files [4]*os.File
 	closeCleanup := cleanup.Make(func() {
 		for _, f := range files {
 			if f != nil {
 				_ = f.Close()
-				if openFlags&os.O_CREATE != 0 {
+				if openFlags&unix.O_CREAT != 0 {
 					_ = os.Remove(f.Name())
 				}
 			}
@@ -2255,33 +2445,33 @@ func openFSCheckpointLocalFiles(imagePath string, openFlags int, direct bool) ([
 		maybeODirect = directIOFlag()
 	}
 
-	manifestFilePath := filepath.Join(imagePath, checkpointfiles.FSCheckpointManifestFileName)
-	manifestFile, err := os.OpenFile(manifestFilePath, openFlags, 0644)
+	manifestFileName := checkpointfiles.PrefixFileName(prefix, checkpointfiles.FSCheckpointManifestFileName)
+	manifestFile, err := openCheckpointFile(dirFD, imagePath, manifestFileName, openFlags)
 	if err != nil {
-		return nil, fmt.Errorf("opening manifest file %q: %w", manifestFilePath, err)
+		return nil, fmt.Errorf("opening manifest file %q: %w", filepath.Join(imagePath, manifestFileName), err)
 	}
 	files[0] = manifestFile
 
-	multiTarFilePath := filepath.Join(imagePath, checkpointfiles.FSCheckpointMultiTarFileName)
-	multiTarFile, err := os.OpenFile(multiTarFilePath, openFlags, 0644)
+	multiTarFileName := checkpointfiles.PrefixFileName(prefix, checkpointfiles.FSCheckpointMultiTarFileName)
+	multiTarFile, err := openCheckpointFile(dirFD, imagePath, multiTarFileName, openFlags)
 	if err != nil {
-		return nil, fmt.Errorf("opening multi-tar file %q: %w", multiTarFilePath, err)
+		return nil, fmt.Errorf("opening multi-tar file %q: %w", filepath.Join(imagePath, multiTarFileName), err)
 	}
 	files[1] = multiTarFile
 
-	pagesMetadataFilePath := filepath.Join(imagePath, checkpointfiles.PagesMetadataFileName)
-	pagesMetadataFile, err := os.OpenFile(pagesMetadataFilePath, openFlags, 0644)
+	pagesMetadataFileName := checkpointfiles.PrefixFileName(prefix, checkpointfiles.PagesMetadataFileName)
+	pagesMetadataFile, err := openCheckpointFile(dirFD, imagePath, pagesMetadataFileName, openFlags)
 	if err != nil {
-		return nil, fmt.Errorf("opening pages metadata file %q: %w", pagesMetadataFilePath, err)
+		return nil, fmt.Errorf("opening pages metadata file %q: %w", filepath.Join(imagePath, pagesMetadataFileName), err)
 	}
 	files[2] = pagesMetadataFile
 
-	pagesFilePath := filepath.Join(imagePath, checkpointfiles.PagesFileName)
-	pagesFileFD, err := unix.Open(pagesFilePath, openFlags|maybeODirect, 0644)
+	pagesFileName := checkpointfiles.PrefixFileName(prefix, checkpointfiles.PagesFileName)
+	pagesFile, err := openCheckpointFile(dirFD, imagePath, pagesFileName, openFlags|maybeODirect)
 	if err != nil {
-		return nil, fmt.Errorf("opening pages file %q: %w", pagesFilePath, err)
+		return nil, fmt.Errorf("opening pages file %q: %w", filepath.Join(imagePath, pagesFileName), err)
 	}
-	files[3] = os.NewFile(uintptr(pagesFileFD), pagesFilePath)
+	files[3] = pagesFile
 
 	closeCleanup.Release()
 	return files[:], nil
@@ -2398,7 +2588,7 @@ func (s *Sandbox) maybeStartCheckpointGoferAndGetSocket(conf *config.Config, cg 
 }
 
 func (s *Sandbox) maybeConfigureSandboxProcessForWorkloadTriggerSave(conf *config.Config, args *Args, cmd *exec.Cmd, donations *donation.Agency) error {
-	path, err := boot.GetAnnotationCheckpointPath(conf, args.Spec)
+	path, err := sentryapi.GetAnnotationCheckpointPath(conf, args.Spec)
 	if err != nil {
 		return err
 	}
@@ -2407,11 +2597,11 @@ func (s *Sandbox) maybeConfigureSandboxProcessForWorkloadTriggerSave(conf *confi
 		return nil
 	}
 
-	comp, err := boot.GetAnnotationCheckpointCompression(args.Spec)
+	comp, err := sentryapi.GetAnnotationCheckpointCompression(args.Spec)
 	if err != nil {
 		return err
 	}
-	direct := boot.GetAnnotationCheckpointDirect(args.Spec)
+	direct := sentryapi.GetAnnotationCheckpointDirect(args.Spec)
 
 	clientSockFile, err := s.maybeStartCheckpointGoferAndGetSocket(conf, s.CgroupJSON.Cgroup, path, "-allow-checkpoint-writes")
 	if err != nil {
@@ -2433,9 +2623,20 @@ func (s *Sandbox) maybeConfigureSandboxProcessForWorkloadTriggerSave(conf *confi
 }
 
 func (s *Sandbox) maybeConfigureSandboxProcessForWorkloadTriggerFSSave(conf *config.Config, args *Args, cmd *exec.Cmd, donations *donation.Agency) error {
-	path := boot.GetAnnotationFSCheckpointPath(args.Spec)
+	path := sentryapi.GetAnnotationFSCheckpointPath(args.Spec)
 	if len(path) == 0 {
 		return nil
+	}
+	bundles, err := fscheckpoint.ParseBundles(sentryapi.GetAnnotationFSCheckpointPaths(args.Spec))
+	if err != nil {
+		return fmt.Errorf("parsing dev.gvisor.internal.fscheckpoint.paths annotation: %w", err)
+	}
+	if len(bundles) == 0 {
+		bundles = []fscheckpoint.Bundle{{}}
+	}
+	// TODO(b/541219576): Support prefixed filesystem checkpoint with GCS/gofer.
+	if bundles[0].Prefix != "" && hasGCSOpts(path) {
+		return fmt.Errorf("prefixed filesystem checkpoint is not supported with GCS/gofer")
 	}
 
 	clientSockFile, err := s.maybeStartCheckpointGoferAndGetSocket(conf, s.CgroupJSON.Cgroup, path, "-allow-fscheckpoint-writes")
@@ -2447,7 +2648,7 @@ func (s *Sandbox) maybeConfigureSandboxProcessForWorkloadTriggerFSSave(conf *con
 		cmd.Args = append(cmd.Args, "-fs-save-checkpoint-gofer")
 		log.Infof("Enabling workload-trigger filesystem checkpoint saving to GCS via checkpoint gofer")
 	} else {
-		files, err := openFSCheckpointLocalFiles(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, boot.GetAnnotationFSCheckpointDirect(args.Spec))
+		files, err := createFSCheckpointLocalFiles(path, bundles[0].Prefix, sentryapi.GetAnnotationFSCheckpointDirect(args.Spec))
 		if err != nil {
 			return fmt.Errorf("failed to create auto fs save files: %w", err)
 		}
@@ -2460,7 +2661,7 @@ func (s *Sandbox) maybeConfigureSandboxProcessForWorkloadTriggerFSSave(conf *con
 // Pause sends the pause call for a container in the sandbox.
 func (s *Sandbox) Pause(cid string) error {
 	log.Debugf("Pause sandbox %q", s.ID)
-	if err := s.call(boot.ContMgrPause, nil, nil); err != nil {
+	if err := s.call(sentryapi.ContMgrPause, nil, nil); err != nil {
 		return fmt.Errorf("pausing container %q: %w", cid, err)
 	}
 	return nil
@@ -2469,7 +2670,7 @@ func (s *Sandbox) Pause(cid string) error {
 // Resume sends the resume call for a container in the sandbox.
 func (s *Sandbox) Resume(cid string) error {
 	log.Debugf("Resume sandbox %q", s.ID)
-	if err := s.call(boot.ContMgrResume, nil, nil); err != nil {
+	if err := s.call(sentryapi.ContMgrResume, nil, nil); err != nil {
 		return fmt.Errorf("resuming container %q: %w", cid, err)
 	}
 	return nil
@@ -2989,7 +3190,7 @@ func (s *Sandbox) Usage(Full bool) (control.MemoryUsage, error) {
 	log.Debugf("Usage sandbox %q", s.ID)
 	opts := control.MemoryUsageOpts{Full: Full}
 	var m control.MemoryUsage
-	if err := s.call(boot.UsageCollect, &opts, &m); err != nil {
+	if err := s.call(sentryapi.UsageCollect, &opts, &m); err != nil {
 		return control.MemoryUsage{}, fmt.Errorf("collecting usage: %w", err)
 	}
 	return m, nil
@@ -3000,7 +3201,7 @@ func (s *Sandbox) UsageFD() (*control.MemoryUsageRecord, error) {
 	log.Debugf("Usage sandbox %q", s.ID)
 	opts := control.MemoryUsageFileOpts{Version: 1}
 	var m control.MemoryUsageFile
-	if err := s.call(boot.UsageUsageFD, &opts, &m); err != nil {
+	if err := s.call(sentryapi.UsageUsageFD, &opts, &m); err != nil {
 		return nil, fmt.Errorf("collecting usage FD: %w", err)
 	}
 
@@ -3042,8 +3243,8 @@ func (s *Sandbox) ExportMetrics(opts control.MetricsExportOpts) (*prometheus.Sna
 	if s.Restored {
 		cpu, wall := s.TimeSaved()
 		if cpu == 0 && wall == 0 {
-			var savings boot.Savings
-			if err := s.call(boot.ContMgrGetSavings, nil, &savings); err != nil {
+			var savings sentryapi.Savings
+			if err := s.call(sentryapi.ContMgrGetSavings, nil, &savings); err != nil {
 				log.Warningf("Failed to get time saved metrics")
 			} else {
 				// Do not hold savingsMu across the RPC: another export may
@@ -3060,7 +3261,7 @@ func (s *Sandbox) ExportMetrics(opts control.MetricsExportOpts) (*prometheus.Sna
 	}
 
 	var data control.MetricsExportData
-	if err := s.call(boot.MetricsExport, &opts, &data); err != nil {
+	if err := s.call(sentryapi.MetricsExport, &opts, &data); err != nil {
 		return nil, err
 	}
 	// Since we do not trust the output of the sandbox as-is, double-check that the options were
@@ -3086,7 +3287,7 @@ func (s *Sandbox) IsRunning() (bool, error) {
 func (s *Sandbox) Stacks() (string, error) {
 	log.Debugf("Stacks sandbox %q", s.ID)
 	var stacks string
-	if err := s.call(boot.DebugStacks, nil, &stacks); err != nil {
+	if err := s.call(sentryapi.DebugStacks, nil, &stacks); err != nil {
 		return "", fmt.Errorf("getting sandbox %q stacks: %w", s.ID, err)
 	}
 	return stacks, nil
@@ -3102,7 +3303,7 @@ func (s *Sandbox) HeapProfile(f *os.File, delay time.Duration) error {
 		FilePayload: urpc.FilePayload{Files: []*os.File{f}},
 		Delay:       delay,
 	}
-	return s.call(boot.ProfileHeap, &opts, nil)
+	return s.call(sentryapi.ProfileHeap, &opts, nil)
 }
 
 // GoroutineProfile writes a goroutine stack dump to the given file.
@@ -3111,7 +3312,7 @@ func (s *Sandbox) GoroutineProfile(f *os.File) error {
 	opts := control.GoroutineProfileOpts{
 		FilePayload: urpc.FilePayload{Files: []*os.File{f}},
 	}
-	return s.call(boot.ProfileGoroutine, &opts, nil)
+	return s.call(sentryapi.ProfileGoroutine, &opts, nil)
 }
 
 // CPUProfile collects a CPU profile.
@@ -3121,7 +3322,7 @@ func (s *Sandbox) CPUProfile(f *os.File, duration time.Duration) error {
 		FilePayload: urpc.FilePayload{Files: []*os.File{f}},
 		Duration:    duration,
 	}
-	return s.call(boot.ProfileCPU, &opts, nil)
+	return s.call(sentryapi.ProfileCPU, &opts, nil)
 }
 
 // BlockProfile writes a block profile to the given file.
@@ -3131,7 +3332,7 @@ func (s *Sandbox) BlockProfile(f *os.File, duration time.Duration) error {
 		FilePayload: urpc.FilePayload{Files: []*os.File{f}},
 		Duration:    duration,
 	}
-	return s.call(boot.ProfileBlock, &opts, nil)
+	return s.call(sentryapi.ProfileBlock, &opts, nil)
 }
 
 // MutexProfile writes a mutex profile to the given file.
@@ -3141,7 +3342,7 @@ func (s *Sandbox) MutexProfile(f *os.File, duration time.Duration) error {
 		FilePayload: urpc.FilePayload{Files: []*os.File{f}},
 		Duration:    duration,
 	}
-	return s.call(boot.ProfileMutex, &opts, nil)
+	return s.call(sentryapi.ProfileMutex, &opts, nil)
 }
 
 // Trace collects an execution trace.
@@ -3151,13 +3352,13 @@ func (s *Sandbox) Trace(f *os.File, duration time.Duration) error {
 		FilePayload: urpc.FilePayload{Files: []*os.File{f}},
 		Duration:    duration,
 	}
-	return s.call(boot.ProfileTrace, &opts, nil)
+	return s.call(sentryapi.ProfileTrace, &opts, nil)
 }
 
 // ChangeLogging changes logging options.
 func (s *Sandbox) ChangeLogging(args control.LoggingArgs) error {
 	log.Debugf("Change logging start %q", s.ID)
-	if err := s.call(boot.LoggingChange, &args, nil); err != nil {
+	if err := s.call(sentryapi.LoggingChange, &args, nil); err != nil {
 		return fmt.Errorf("changing sandbox %q logging: %w", s.ID, err)
 	}
 	return nil
@@ -3187,7 +3388,7 @@ func (s *Sandbox) destroyContainer(cid string) error {
 	}
 
 	log.Debugf("Destroying container, cid: %s, sandbox: %s", cid, s.ID)
-	if err := s.call(boot.ContMgrDestroySubcontainer, &cid, nil); err != nil {
+	if err := s.call(sentryapi.ContMgrDestroySubcontainer, &cid, nil); err != nil {
 		return fmt.Errorf("destroying container %q: %w", cid, err)
 	}
 	return nil
@@ -3247,7 +3448,7 @@ func (s *Sandbox) configureStdios(conf *config.Config, stdios []*os.File) error 
 // platform does not need a device file, then nil is returned.
 // devicePath may be empty to use a sane platform-specific default.
 func deviceFileForPlatform(name, devicePath string) (*fd.FD, error) {
-	p, err := platform.Lookup(name)
+	p, err := platformdesc.Lookup(name)
 	if err != nil {
 		return nil, err
 	}
@@ -3273,8 +3474,16 @@ func getNvproxyDriverVersion(conf *config.Config) (string, error) {
 	}
 }
 
+// sentryBinary returns the Sentry sidecar binary that boots the sandbox.
+func sentryBinary(conf *config.Config) *gvisorbinaries.Binary {
+	if conf.Network == config.NetworkPlugin {
+		return &gvisorbinaries.GvisorSentryPluginStack
+	}
+	return &gvisorbinaries.GvisorSentry
+}
+
 // checkBinaryPermissions verifies that the required binary bits are set on
-// the runsc executable.
+// the Sentry executable, which re-executes itself as an unprivileged user.
 func checkBinaryPermissions(conf *config.Config) error {
 	// All platforms need the other exe bit
 	neededBits := os.FileMode(0001)
@@ -3283,12 +3492,12 @@ func checkBinaryPermissions(conf *config.Config) error {
 		neededBits |= os.FileMode(0004)
 	}
 
-	exePath, err := os.Executable()
+	exePath, err := sentryBinary(conf).Path()
 	if err != nil {
-		return fmt.Errorf("getting exe path: %v", err)
+		return fmt.Errorf("getting Sentry path: %v", err)
 	}
 
-	// Check the permissions of the runsc binary and print an error if it
+	// Check the permissions of the Sentry binary and print an error if it
 	// doesn't match expectations.
 	info, err := os.Stat(exePath)
 	if err != nil {
@@ -3312,7 +3521,7 @@ func (s *Sandbox) CgroupsReadControlFile(file control.CgroupControlFile) (string
 		},
 	}
 	var out control.CgroupsResults
-	if err := s.call(boot.CgroupsReadControlFiles, &args, &out); err != nil {
+	if err := s.call(sentryapi.CgroupsReadControlFiles, &args, &out); err != nil {
 		return "", err
 	}
 	if len(out.Results) != 1 {
@@ -3333,7 +3542,7 @@ func (s *Sandbox) CgroupsWriteControlFile(file control.CgroupControlFile, value 
 		},
 	}
 	var out control.CgroupsResults
-	if err := s.call(boot.CgroupsWriteControlFiles, &args, &out); err != nil {
+	if err := s.call(sentryapi.CgroupsWriteControlFiles, &args, &out); err != nil {
 		return err
 	}
 	if len(out.Results) != 1 {
@@ -3462,7 +3671,7 @@ func SetUserMappings(spec *specs.Spec, pid int) error {
 func (s *Sandbox) Mount(cid, fstype, src, dest string) error {
 	var files []*os.File
 	switch fstype {
-	case erofs.Name:
+	case "erofs":
 		if imageFile, err := os.Open(src); err != nil {
 			return fmt.Errorf("opening %s: %v", src, err)
 		} else {
@@ -3473,22 +3682,22 @@ func (s *Sandbox) Mount(cid, fstype, src, dest string) error {
 		return fmt.Errorf("unsupported filesystem type: %v", fstype)
 	}
 
-	args := boot.MountArgs{
+	args := sentryapi.MountArgs{
 		ContainerID: cid,
 		Source:      src,
 		Destination: dest,
 		FsType:      fstype,
 		FilePayload: urpc.FilePayload{Files: files},
 	}
-	return s.call(boot.ContMgrMount, &args, nil)
+	return s.call(sentryapi.ContMgrMount, &args, nil)
 }
 
 // ContainerRuntimeState returns the runtime state of a container.
-func (s *Sandbox) ContainerRuntimeState(cid string) (boot.ContainerRuntimeState, error) {
+func (s *Sandbox) ContainerRuntimeState(cid string) (sentryapi.ContainerRuntimeState, error) {
 	log.Debugf("ContainerRuntimeState, sandbox: %q, cid: %q", s.ID, cid)
-	var state boot.ContainerRuntimeState
-	if err := s.call(boot.ContMgrContainerRuntimeState, &cid, &state); err != nil {
-		return boot.RuntimeStateInvalid, fmt.Errorf("getting container state (CID: %q): %w", cid, err)
+	var state sentryapi.ContainerRuntimeState
+	if err := s.call(sentryapi.ContMgrContainerRuntimeState, &cid, &state); err != nil {
+		return sentryapi.RuntimeStateInvalid, fmt.Errorf("getting container state (CID: %q): %w", cid, err)
 	}
 	log.Debugf("ContainerRuntimeState, sandbox: %q, cid: %q, state: %v", s.ID, cid, state)
 	return state, nil
@@ -3503,7 +3712,7 @@ func (s *Sandbox) TarRootfsUpperLayer(containerID string, outFD *os.File) error 
 		ContainerID: containerID,
 		FilePayload: urpc.FilePayload{Files: []*os.File{outFD}},
 	}
-	if err := s.call(boot.FsTarRootfsUpperLayer, &opts, nil); err != nil {
+	if err := s.call(sentryapi.FsTarRootfsUpperLayer, &opts, nil); err != nil {
 		return fmt.Errorf("serializing rootfs upper layer to tar: %w", err)
 	}
 	return nil
@@ -3519,7 +3728,7 @@ func (s *Sandbox) ReadFile(containerID, path string, offset, size int64, outFD *
 		Size:        size,
 		FilePayload: urpc.FilePayload{Files: []*os.File{outFD}},
 	}
-	if err := s.call(boot.FsRead, &opts, nil); err != nil {
+	if err := s.call(sentryapi.FsRead, &opts, nil); err != nil {
 		return fmt.Errorf("reading file %q: %w", path, err)
 	}
 	return nil
@@ -3586,11 +3795,19 @@ func SetCloExeOnAllFDs() (retErr error) {
 
 // GetNetworkConfig returns the network links and routes config applied during
 // root container creation.
-func (s *Sandbox) GetNetworkConfig() (*boot.CreateLinksAndRoutesArgs, error) {
+func (s *Sandbox) GetNetworkConfig() (*sentryapi.CreateLinksAndRoutesArgs, error) {
 	log.Debugf("GetNetworkConfig, sandbox: %q", s.ID)
-	var networkArgs boot.CreateLinksAndRoutesArgs
-	if err := s.call(boot.ContMgrGetNetworkConfig, nil, &networkArgs); err != nil {
+	var networkArgs sentryapi.CreateLinksAndRoutesArgs
+	if err := s.call(sentryapi.ContMgrGetNetworkConfig, nil, &networkArgs); err != nil {
 		return nil, fmt.Errorf("error getting network config (CID: %q): %w", s.ID, err)
 	}
 	return &networkArgs, nil
+}
+
+func rootfsUpperTarFlags(p string) int {
+	flags := os.O_RDONLY
+	if !specutils.IsProcFDPath(p) {
+		flags |= unix.O_NOFOLLOW
+	}
+	return flags
 }

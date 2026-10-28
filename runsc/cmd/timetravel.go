@@ -39,6 +39,7 @@ import (
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
@@ -685,9 +686,9 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 	case "stats":
 		output, err = cont.Sandbox.FamilyResidentMemory(t.versions)
 	case "signal":
-		mode := boot.DeliverToProcess
+		mode := sentryapi.DeliverToProcess
 		if t.all {
-			mode = boot.DeliverToAllProcesses
+			mode = sentryapi.DeliverToAllProcesses
 		}
 		err = cont.Sandbox.SignalBranch(&boot.BranchSignalArgs{
 			BranchID: f.Arg(2),

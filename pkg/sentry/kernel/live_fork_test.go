@@ -172,7 +172,7 @@ func TestLiveForkFailureCleanup(t *testing.T) {
 			parent.Pause()
 
 			child, err := parent.LiveFork(parent.SupervisorContext(), kernel.LiveForkOptions{
-				Clocks: sentrytime.NewCalibratedClocks(),
+				Clocks: sentrytime.NewCalibratedClocks(false),
 				TestOnlyFailureInjector: func(completed kernel.LiveForkStage) error {
 					if completed == stage {
 						return errInjectedLiveForkFailure
@@ -190,7 +190,7 @@ func TestLiveForkFailureCleanup(t *testing.T) {
 			// A successful retry proves that save hooks, CoW transitions, owner
 			// references, and partial child state were all left reusable.
 			child, err = parent.LiveFork(parent.SupervisorContext(), kernel.LiveForkOptions{
-				Clocks: sentrytime.NewCalibratedClocks(),
+				Clocks: sentrytime.NewCalibratedClocks(false),
 			})
 			if err != nil {
 				t.Fatalf("LiveFork retry after %s: %v", stage, err)
@@ -222,7 +222,7 @@ func TestLiveForkTwoKernelsSharePlatformAndMemoryFile(t *testing.T) {
 
 	var metrics kernel.LiveForkMetrics
 	child, err := parent.LiveFork(parent.SupervisorContext(), kernel.LiveForkOptions{
-		Clocks:  sentrytime.NewCalibratedClocks(),
+		Clocks:  sentrytime.NewCalibratedClocks(false),
 		Metrics: &metrics,
 	})
 	if err != nil {
@@ -274,7 +274,7 @@ func TestDehydrationHoldsOnlyItsBranchsPages(t *testing.T) {
 	parent.SetHostMount(parent.PipeMount())
 	parent.Pause()
 	child, err := parent.LiveFork(parent.SupervisorContext(), kernel.LiveForkOptions{
-		Clocks: sentrytime.NewCalibratedClocks(),
+		Clocks: sentrytime.NewCalibratedClocks(false),
 	})
 	if err != nil {
 		parent.Release()
@@ -306,7 +306,7 @@ func TestDehydrationHoldsOnlyItsBranchsPages(t *testing.T) {
 	}
 	mf.DecRef(own)
 	restored, err := kernel.LoadDehydration(parent.SupervisorContext(), parent.Platform, dehydrated, kernel.DehydrationLoadOptions{
-		Clocks: sentrytime.NewCalibratedClocks(), BranchID: "dehydrated",
+		Clocks: sentrytime.NewCalibratedClocks(false), BranchID: "dehydrated",
 	})
 	if err != nil {
 		t.Fatalf("LoadDehydration: %v", err)
@@ -330,7 +330,7 @@ func TestLiveForkFlushesPlatformExecutionCaches(t *testing.T) {
 	parent.Pause()
 
 	child, err := parent.LiveFork(parent.SupervisorContext(), kernel.LiveForkOptions{
-		Clocks: sentrytime.NewCalibratedClocks(),
+		Clocks: sentrytime.NewCalibratedClocks(false),
 	})
 	if err != nil {
 		parent.Release()
@@ -354,7 +354,7 @@ func TestLiveForkRemoteMemoryFileLoopback(t *testing.T) {
 	targetMF := newRemoteKernelMemoryFile(t)
 
 	child, err := parent.LiveFork(parent.SupervisorContext(), kernel.LiveForkOptions{
-		Clocks:           sentrytime.NewCalibratedClocks(),
+		Clocks:           sentrytime.NewCalibratedClocks(false),
 		RemoteMemoryFile: targetMF,
 	})
 	if err != nil {
@@ -396,7 +396,7 @@ func TestLiveForkRemoteMemoryFileLoopback(t *testing.T) {
 		t.Fatalf("evicting distributed target memory: %v", err)
 	}
 	restored, err := kernel.LoadDehydration(parent.SupervisorContext(), parent.Platform, dehydrated, kernel.DehydrationLoadOptions{
-		Clocks: sentrytime.NewCalibratedClocks(), BranchID: "remote",
+		Clocks: sentrytime.NewCalibratedClocks(false), BranchID: "remote",
 	})
 	if err != nil {
 		t.Fatalf("rehydrating distributed target: %v", err)
@@ -405,7 +405,7 @@ func TestLiveForkRemoteMemoryFileLoopback(t *testing.T) {
 		t.Fatalf("starting rehydrated distributed target: %v", err)
 	}
 	grandchild, err := restored.LiveFork(restored.SupervisorContext(), kernel.LiveForkOptions{
-		Clocks: sentrytime.NewCalibratedClocks(),
+		Clocks: sentrytime.NewCalibratedClocks(false),
 	})
 	if err != nil {
 		t.Fatalf("live-forking rehydrated distributed target: %v", err)
@@ -449,7 +449,7 @@ func TestLiveForkRemoteMemoryFileTCP(t *testing.T) {
 		return &ownedKernelTCPReader{AsyncReader: reader, server: server, serveDone: serveDone}, nil
 	}
 	child, err := parent.LiveFork(parent.SupervisorContext(), kernel.LiveForkOptions{
-		Clocks:                  sentrytime.NewCalibratedClocks(),
+		Clocks:                  sentrytime.NewCalibratedClocks(false),
 		RemoteMemoryFile:        targetMF,
 		RemotePageReaderFactory: readerFactory,
 	})
@@ -508,7 +508,7 @@ func TestPortableDistributedForkCaptureLoadTCP(t *testing.T) {
 	child, err := kernel.LoadDistributedFork(parent.SupervisorContext(), parent.Platform, targetMF,
 		capture.KernelMetadata, capture.AllocatorMetadata, capture.LoadRanges, capture.MemoryBindings, ownedReader,
 		kernel.DistributedForkLoadOptions{
-			Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: "remote",
+			Clocks: sentrytime.NewCalibratedClocks(false), ChildBranchID: "remote",
 			FilesystemResources: capture.FilesystemResources, DemandOnly: true,
 		})
 	if err != nil {
@@ -561,7 +561,7 @@ func TestDistributedForkRepeatedImportSharesMemoryFile(t *testing.T) {
 		child, err := kernel.LoadDistributedFork(parent.SupervisorContext(), parent.Platform, targetMF,
 			capture.KernelMetadata, capture.AllocatorMetadata, capture.LoadRanges, capture.MemoryBindings, reader,
 			kernel.DistributedForkLoadOptions{
-				Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: id,
+				Clocks: sentrytime.NewCalibratedClocks(false), ChildBranchID: id,
 				FilesystemResources: capture.FilesystemResources, DemandOnly: true,
 			})
 		if err != nil {
@@ -710,7 +710,7 @@ func TestPortableDistributedForkKernelSubprocess(t *testing.T) {
 		child, err := kernel.LoadDistributedFork(platformOwner.SupervisorContext(), platformOwner.Platform, targetMF,
 			session.KernelMetadata, session.AllocatorMetadata, session.LoadRanges, session.MemoryBindings, reader,
 			kernel.DistributedForkLoadOptions{
-				Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: session.TargetBranchID,
+				Clocks: sentrytime.NewCalibratedClocks(false), ChildBranchID: session.TargetBranchID,
 				FilesystemResources: make(vfs.LiveForkFilesystemResources), DemandOnly: true,
 			})
 		if err != nil {
@@ -820,7 +820,7 @@ func TestLiveForkClonesPIDFDTarget(t *testing.T) {
 	pidfd.DecRef(parentTask)
 	parent.Pause()
 	child, err := parent.LiveFork(parent.SupervisorContext(), kernel.LiveForkOptions{
-		Clocks: sentrytime.NewCalibratedClocks(),
+		Clocks: sentrytime.NewCalibratedClocks(false),
 	})
 	if err != nil {
 		t.Fatalf("LiveFork with pidfd: %v", err)
@@ -863,7 +863,7 @@ func TestLiveForkRunningKernelRepeatedly(t *testing.T) {
 	parent.Pause()
 
 	first, err := parent.LiveFork(parent.SupervisorContext(), kernel.LiveForkOptions{
-		Clocks: sentrytime.NewCalibratedClocks(),
+		Clocks: sentrytime.NewCalibratedClocks(false),
 	})
 	if err != nil {
 		t.Fatalf("first LiveFork: %v", err)
@@ -879,7 +879,7 @@ func TestLiveForkRunningKernelRepeatedly(t *testing.T) {
 
 	parent.Pause()
 	second, err := parent.LiveFork(parent.SupervisorContext(), kernel.LiveForkOptions{
-		Clocks: sentrytime.NewCalibratedClocks(),
+		Clocks: sentrytime.NewCalibratedClocks(false),
 	})
 	if err != nil {
 		t.Fatalf("second LiveFork: %v", err)

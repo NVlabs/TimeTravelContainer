@@ -22,6 +22,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	runsccmd "gvisor.dev/gvisor/runsc/cmd"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
@@ -325,9 +326,9 @@ func embeddedRuntimeCommand(root string, args []string) ([]byte, bool, error) {
 		case signal < 0 && len(rest) == 3 && embeddedBranchActions[rest[1]] != nil:
 			action = embeddedBranchActions[rest[1]]
 		case signal >= 0 && len(rest) == 3 && rest[1] == "signal":
-			mode := boot.DeliverToProcess
+			mode := sentryapi.DeliverToProcess
 			if all {
-				mode = boot.DeliverToAllProcesses
+				mode = sentryapi.DeliverToAllProcesses
 			}
 			action = func(c *container.Container, branch string) (any, error) {
 				return nil, c.Sandbox.SignalBranch(&boot.BranchSignalArgs{BranchID: branch, CID: c.ID, Signo: int32(signal), Mode: mode})

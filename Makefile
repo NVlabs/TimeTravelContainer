@@ -61,15 +61,15 @@ help: ## Shows all targets and help from the Makefile (this message).
 		}'
 
 build: ## Builds the given $(TARGETS) with the given $(OPTIONS). E.g. make build TARGETS=runsc
-	@$(call build,$(OPTIONS) -- $(TARGETS),set($(TARGETS)))
+	@$(call build,$(OPTIONS) -- $(TARGETS),$(OPTIONS) -- $(call target_query,$(TARGETS)))
 .PHONY: build
 
 test: ## Tests the given $(TARGETS) with the given $(OPTIONS). E.g. make test TARGETS=pkg/buffer:buffer_test
 	@$(call test,$(OPTIONS) -- $(TARGETS))
 .PHONY: test
 
-copy: ## Copies the given $(TARGETS) to the given $(DESTINATION). E.g. make copy TARGETS="runsc runsc/ttc runsc/ttcd" DESTINATION=/tmp
-	@$(call copy,$(TARGETS),$(DESTINATION))
+copy: ## Copies the given $(TARGETS), built with the given $(OPTIONS), to the given $(DESTINATION). E.g. make copy TARGETS=runsc DESTINATION=/tmp
+	@$(call copy,$(OPTIONS) -- $(TARGETS),$(DESTINATION),$(OPTIONS) -- $(call target_query,$(TARGETS)))
 .PHONY: copy
 
 run: ## Runs the given $(TARGETS), built with $(OPTIONS), using $(ARGS). E.g. make run TARGETS=runsc ARGS=-version
@@ -250,7 +250,7 @@ nogo-tests:
 #
 # FIXME(gvisor.dev/issue/10045): Need to fix broken tests.
 unit-tests: ## Local package unit tests in pkg/..., tools/.., etc.
-	@$(call test,--test_tag_filters=-nogo$(COMMA)-requires-kvm --build_tag_filters=-network_plugins --test_env=CGROUPV2=$(CGROUPV2) -- //:all pkg/... tools/... runsc/... vdso/... sandboxexec/... test/trace/... -//pkg/metric:metric_test -//pkg/coretag:coretag_test -//tools/tracereplay:tracereplay_test -//test/trace:trace_test)
+	@$(call test,--test_tag_filters=-nogo$(COMMA)-requires-kvm --build_tag_filters=-network_plugins --test_env=CGROUPV2=$(CGROUPV2) -- //:all pkg/... tools/... runsc/... vdso/... sandboxexec/... examples/... test/trace/... -//pkg/metric:metric_test -//pkg/coretag:coretag_test -//tools/tracereplay:tracereplay_test -//test/trace:trace_test)
 .PHONY: unit-tests
 
 # See unit-tests: this includes runsc/container.
@@ -349,7 +349,8 @@ arm-qemu-smoke-test: $(RUNTIME_BIN) load-arm-qemu
 	export T=$$(mktemp -d --tmpdir release.XXXXXX); \
 	mkdir -p $$T/bin/arm64/ && \
 	cp $(RUNTIME_BIN) $$T/bin/arm64 && \
-	docker run --rm -v $$T/bin/arm64/runsc:/workdir/initramfs/runsc gvisor.dev/images/arm-qemu
+	cp -r --preserve=mode $(RUNTIME_DIR)/gvisor-bin $$T/bin/arm64 && \
+	docker run --rm -v $$T/bin/arm64/runsc:/workdir/initramfs/runsc -v $$T/bin/arm64/gvisor-bin:/workdir/initramfs/gvisor-bin gvisor.dev/images/arm-qemu
 .PHONY: arm-qemu-smoke-test
 
 simple-tests: unit-tests # Compatibility target.

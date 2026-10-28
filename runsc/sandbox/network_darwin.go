@@ -25,7 +25,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/urpc"
-	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/config"
 )
 
@@ -43,11 +43,11 @@ func setupNetwork(conn *urpc.Client, _ int, conf *config.Config, _ bool, isResto
 		} else if err != nil {
 			return fmt.Errorf("parsing TTC virtual NIC MAC address: %w", err)
 		}
-		link := boot.DefaultLoopbackLink
+		link := sentryapi.DefaultLoopbackLink
 		link.GVisorGRO = conf.GVisorGRO
-		if err := conn.Call(boot.ContMgrSetNetworkArgs, &boot.CreateLinksAndRoutesArgs{
-			LoopbackLinks: []boot.LoopbackLink{link},
-			TimeTravel: &boot.TimeTravelNetworkConfig{
+		if err := conn.Call(sentryapi.ContMgrSetNetworkArgs, &sentryapi.CreateLinksAndRoutesArgs{
+			LoopbackLinks: []sentryapi.LoopbackLink{link},
+			TimeTravel: &sentryapi.TimeTravelNetworkConfig{
 				NAT: conf.TimeTravelNetworkNAT, GuestIP: guestIP, GuestMAC: guestMAC,
 				InterfaceName: conf.TimeTravelNetworkInterface,
 			},
@@ -63,10 +63,10 @@ func setupNetwork(conn *urpc.Client, _ int, conf *config.Config, _ bool, isResto
 
 func createDefaultLoopbackInterface(conf *config.Config, conn *urpc.Client, isRestore bool) error {
 	log.Infof("Network is disabled; creating the Sentry loopback interface only")
-	link := boot.DefaultLoopbackLink
+	link := sentryapi.DefaultLoopbackLink
 	link.GVisorGRO = conf.GVisorGRO
-	if err := conn.Call(boot.ContMgrSetNetworkArgs, &boot.CreateLinksAndRoutesArgs{
-		LoopbackLinks: []boot.LoopbackLink{link},
+	if err := conn.Call(sentryapi.ContMgrSetNetworkArgs, &sentryapi.CreateLinksAndRoutesArgs{
+		LoopbackLinks: []sentryapi.LoopbackLink{link},
 		IsRestore:     isRestore,
 	}, nil); err != nil {
 		return fmt.Errorf("creating loopback link and routes: %w", err)

@@ -15,7 +15,11 @@ func mirrorMapping(source, length, destination uintptr) unix.Errno {
 	return errno
 }
 
-func advisePopulateWrite(address, length uintptr) unix.Errno {
-	_, _, errno := unix.Syscall(unix.SYS_MADVISE, address, length, unix.MADV_POPULATE_WRITE)
+func advisePopulate(address, length uintptr, write bool) unix.Errno {
+	advice := unix.MADV_POPULATE_READ
+	if write {
+		advice = unix.MADV_POPULATE_WRITE
+	}
+	_, _, errno := unix.Syscall(unix.SYS_MADVISE, address, length, uintptr(advice))
 	return errno
 }

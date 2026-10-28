@@ -53,7 +53,6 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	pkgcontext "gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/hostmm"
@@ -317,17 +316,6 @@ type constructor struct{}
 
 func (*constructor) New(opts platform.Options) (platform.Platform, error) {
 	return NewWithOptions(opts)
-}
-
-func (*constructor) OpenDevice(_ string) (*fd.FD, error) {
-	return nil, nil
-}
-
-// Flags implements platform.Constructor.Flags().
-func (*constructor) Requirements() platform.Requirements {
-	return platform.Requirements{
-		RequiresCapSysPtrace: true,
-	}
 }
 
 func init() {

@@ -6,6 +6,7 @@ package boot
 import (
 	"context"
 	"fmt"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"io"
 	"net"
 	"sync"
@@ -45,24 +46,17 @@ var (
 )
 
 // TimeTravelNetworkConfig configures TTC's rootless, in-process virtual NIC.
-// NAT controls whether the branch-local proxy may create outbound host sockets.
-type TimeTravelNetworkConfig struct {
-	NAT      bool
-	GuestIP  net.IP
-	GuestMAC net.HardwareAddr
-	// InterfaceName is the guest's name for the NIC. Empty names it eth0.
-	InterfaceName string
-}
+type TimeTravelNetworkConfig = sentryapi.TimeTravelNetworkConfig
 
-// interfaceName returns the guest's name for the NIC.
-func (c TimeTravelNetworkConfig) interfaceName() string {
+// timeTravelInterfaceName returns the guest's name for c's NIC.
+func timeTravelInterfaceName(c TimeTravelNetworkConfig) string {
 	if c.InterfaceName != "" {
 		return c.InterfaceName
 	}
 	return defaultTimeTravelNICName
 }
 
-func (c TimeTravelNetworkConfig) addresses() (tcpip.Address, tcpip.Address, tcpip.LinkAddress, tcpip.LinkAddress) {
+func timeTravelAddresses(c TimeTravelNetworkConfig) (tcpip.Address, tcpip.Address, tcpip.LinkAddress, tcpip.LinkAddress) {
 	guest := timeTravelGuestAddress
 	if ip := c.GuestIP.To4(); ip != nil {
 		guest = tcpip.AddrFromSlice(ip)
@@ -363,7 +357,7 @@ func (r *proxyRealm) installUDPForwarder(gateway *stack.Stack) {
 // destroyed should look like — from inside, a machine whose network has gone
 // quiet; from outside, a machine that was never there.
 func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetworkConfig, reset, quarantine bool) (retErr error) {
-	guestAddress, gatewayAddress, guestMAC, gatewayMAC := cfg.addresses()
+	guestAddress, gatewayAddress, guestMAC, gatewayMAC := timeTravelAddresses(cfg)
 	ensureTimeTravelIPTables(dst)
 	if reset {
 		dst.Stack.ResetConfig()
@@ -401,7 +395,7 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 		replacedRuntimeLink = true
 	} else {
 		if err := dst.Stack.CreateNICWithOptions(timeTravelNICID, ethernet.New(guestEP), stack.NICOptions{
-			Name:               cfg.interfaceName(),
+			Name:               timeTravelInterfaceName(cfg),
 			DeliverLinkPackets: true,
 		}); err != nil {
 			return fmt.Errorf("creating TTC guest NIC: %v", err)
@@ -518,7 +512,7 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 	}
 	dst.SetLiveForkQuarantine(quarantine)
 	dst.SetLiveForkNetworkHooks(hooks)
-	log.Infof("Configured TTC virtual NIC %s at %s/24, MAC %s (NAT=%t)", cfg.interfaceName(), guestAddress, net.HardwareAddr(guestMAC), cfg.NAT)
+	log.Infof("Configured TTC virtual NIC %s at %s/24, MAC %s (NAT=%t)", timeTravelInterfaceName(cfg), guestAddress, net.HardwareAddr(guestMAC), cfg.NAT)
 	return nil
 }
 

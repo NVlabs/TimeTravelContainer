@@ -29,6 +29,8 @@ go_test(
         "coretag_test.go",
     ],
     embed = [":coretag"],
+    pure = True,
+    tags = ["nogotsan"],
     deps = [
         "//pkg/hostos",
     ],

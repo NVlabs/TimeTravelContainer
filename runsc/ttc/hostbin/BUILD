@@ -64,10 +64,61 @@ genrule(
     }),
 )
 
+# The C sidecars that the Sentry and runsc execute (see
+# //runsc/gvisorbinaries), static and freestanding, gzip-compressed; empty
+# where ttcd carries none. ttcd is the Sentry sidecar itself.
+genrule(
+    name = "prewarmer_gz",
+    srcs = select({
+        ":carried_without_cgo": [],
+        ":carried": ["//runsc/prewarmer:prewarmer_binary"],
+        "//conditions:default": [],
+    }),
+    outs = ["gvisor-sentry-prewarmer.gz"],
+    cmd = select({
+        ":carried_without_cgo": ": > $@",
+        ":carried": "gzip -9 -n -c $(SRCS) > $@",
+        "//conditions:default": ": > $@",
+    }),
+)
+
+genrule(
+    name = "fdparking_gz",
+    srcs = select({
+        ":carried_without_cgo": [],
+        ":carried": ["//runsc/fdparking:fdparking_binary"],
+        "//conditions:default": [],
+    }),
+    outs = ["runsc-fd-parking.gz"],
+    cmd = select({
+        ":carried_without_cgo": ": > $@",
+        ":carried": "gzip -9 -n -c $(SRCS) > $@",
+        "//conditions:default": ": > $@",
+    }),
+)
+
+genrule(
+    name = "procumounter_gz",
+    srcs = select({
+        ":carried_without_cgo": [],
+        ":carried": ["//runsc/procumounter:procumounter_binary"],
+        "//conditions:default": [],
+    }),
+    outs = ["gvisor-proc-umounter.gz"],
+    cmd = select({
+        ":carried_without_cgo": ": > $@",
+        ":carried": "gzip -9 -n -c $(SRCS) > $@",
+        "//conditions:default": ": > $@",
+    }),
+)
+
 go_library(
     name = "hostbin",
     srcs = ["hostbin.go"],
     embedsrcs = [
+        "gvisor-proc-umounter.gz",
+        "gvisor-sentry-prewarmer.gz",
+        "runsc-fd-parking.gz",
         "ttc-cuda-checkpoint.gz",
         "ttc-gfx-renderer.gz",
     ],

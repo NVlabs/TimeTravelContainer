@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package kernfs_test
 
 import (
@@ -591,8 +594,9 @@ func TestProcessDeferredDecRefsClearsSliceForSave(t *testing.T) {
 	d.Invalidate(sys.Ctx)
 
 	// stateify encodes slice backing arrays up to cap(slice). Verify that
-	// state.Save clears the unused slice capacity (cap-len) so it does not
-	// traverse the destroyed dentry (whose test inode is not stateify-savable).
+	// processDeferredDecRefs clears the entries it drained, so that the save
+	// does not traverse the destroyed dentry (whose test inode is not
+	// stateify-savable) through the unused capacity.
 	var buf bytes.Buffer
 	if _, err := state.Save(sys.Ctx, &buf, &fs.Filesystem); err != nil {
 		t.Fatalf("state.Save(&fs.Filesystem) failed: %v", err)

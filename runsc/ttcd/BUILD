@@ -22,6 +22,8 @@ go_binary(
     x_defs = {"gvisor.dev/gvisor/runsc/version.version": "{STABLE_VERSION}"},
     deps = [
         "//runsc/cli/maincli",
+        "//runsc/cli/sentrycli",
+        "//runsc/gvisorbinaries",
         "//runsc/processutil",
         "//runsc/ttc/cmd",
         "//runsc/ttc/copyguest",
@@ -50,6 +52,8 @@ go_test(
     ),
     deps = [
         "//runsc/cli/maincli",
+        "//runsc/cli/sentrycli",
+        "//runsc/gvisorbinaries",
         "//runsc/processutil",
         "//runsc/ttc/cmd",
         "//runsc/ttc/copyguest",
