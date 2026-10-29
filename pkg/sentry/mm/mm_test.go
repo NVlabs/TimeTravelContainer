@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
@@ -2037,6 +2038,64 @@ func TestMRemapMappableOffsetOverflow(t *testing.T) {
 	// We remap with oldSize = PageSize, newSize = 3*PageSize.
 	if _, err := mm.MRemap(ctx, addr, pageSize, 3*pageSize, MRemapOpts{}); !linuxerr.Equals(linuxerr.EINVAL, err) {
 		t.Errorf("MRemap grow got err %v want EINVAL", err)
+	}
+}
+
+// An anonymous mapping grown in place keeps its fork and NUMA attributes and
+// stays one vma, as Linux's vma_expand() extends it: a MADV_DONTFORK mapping
+// grown in place was two vmas, the new one copied on fork, and a move of all
+// of it failed with EFAULT.
+func TestMRemapGrowInPlaceKeepsAttributes(t *testing.T) {
+	ctx := contexttest.Context(t)
+	mm := testMemoryManager(ctx, t)
+	defer mm.DecUsers(ctx)
+
+	// Map four pages and unmap the last two, leaving room to grow in place.
+	addr, err := mm.MMap(ctx, memmap.MMapOpts{
+		Length:   4 * pageSize,
+		Private:  true,
+		Perms:    hostarch.ReadWrite,
+		MaxPerms: hostarch.AnyAccess,
+	})
+	if err != nil {
+		t.Fatalf("MMap got err %v want nil", err)
+	}
+	if err := mm.MUnmap(ctx, addr+2*pageSizeAddr, 2*pageSize); err != nil {
+		t.Fatalf("MUnmap got err %v want nil", err)
+	}
+	if err := mm.SetDontFork(addr, 2*pageSize, true); err != nil {
+		t.Fatalf("SetDontFork got err %v want nil", err)
+	}
+	if err := mm.SetNumaPolicy(addr, 2*pageSize, linux.MPOL_BIND, 1); err != nil {
+		t.Fatalf("SetNumaPolicy got err %v want nil", err)
+	}
+
+	if got, err := mm.MRemap(ctx, addr, 2*pageSize, 4*pageSize, MRemapOpts{}); err != nil || got != addr {
+		t.Fatalf("MRemap(grow in place) got (%#x, %v) want (%#x, nil)", got, err, addr)
+	}
+	mm.mappingMu.RLock()
+	vseg := mm.vmas.FindSegment(addr)
+	end, v := vseg.End(), *vseg.ValuePtr()
+	mm.mappingMu.RUnlock()
+	if want := addr + 4*pageSizeAddr; end != want {
+		t.Errorf("vma at %#x ends at %#x, want %#x (one vma)", addr, end, want)
+	}
+	if !v.dontfork || v.numaPolicy != linux.MPOL_BIND || v.numaNodemask != 1 {
+		t.Errorf("grown vma dontfork=%t numaPolicy=%d numaNodemask=%d, want true, MPOL_BIND, 1", v.dontfork, v.numaPolicy, v.numaNodemask)
+	}
+
+	// A move of all of it needs it to be one vma.
+	dst, err := mm.MMap(ctx, memmap.MMapOpts{
+		Length:   4 * pageSize,
+		Private:  true,
+		Perms:    hostarch.ReadWrite,
+		MaxPerms: hostarch.AnyAccess,
+	})
+	if err != nil {
+		t.Fatalf("MMap(destination) got err %v want nil", err)
+	}
+	if got, err := mm.MRemap(ctx, addr, 4*pageSize, 4*pageSize, MRemapOpts{Move: MRemapMustMove, NewAddr: dst}); err != nil || got != dst {
+		t.Errorf("MRemap(move all) got (%#x, %v) want (%#x, nil)", got, err, dst)
 	}
 }
 

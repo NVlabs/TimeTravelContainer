@@ -534,6 +534,7 @@ func (mm *MemoryManager) MRemap(ctx context.Context, oldAddr hostarch.Addr, oldS
 			newOffset = vseg.mappableRange().End
 		}
 		mlockMode := vma.mlockMode
+		dontfork, numaPolicy, numaNodemask := vma.dontfork, vma.numaPolicy, vma.numaNodemask
 		var vseg vmaIterator
 		var ar hostarch.AddrRange
 		var err error
@@ -555,8 +556,16 @@ func (mm *MemoryManager) MRemap(ctx context.Context, oldAddr hostarch.Addr, oldS
 			NameMut:         vma.nameMut,
 		}, droppedIDs)
 		if err == nil {
+			// createVMALocked gives the new vma default fork and NUMA
+			// attributes. Take the grown vma's, as Linux's vma_expand()
+			// keeps them, and merge the two: a MADV_DONTFORK mapping grown
+			// in place was two vmas, the new one copied on fork, and a
+			// later mremap of all of it failed with EFAULT.
+			nv := vseg.ValuePtr()
+			nv.dontfork, nv.numaPolicy, nv.numaNodemask = dontfork, numaPolicy, numaNodemask
+			mm.vmas.MergeOutsideRange(ar)
 			if mlockMode == memmap.MLockEager {
-				mm.populateVMA(ctx, vseg, ar, memmap.PlatformEffectCommit)
+				mm.populateVMA(ctx, mm.vmas.FindSegment(ar.Start), ar, memmap.PlatformEffectCommit)
 			}
 			return oldAddr, nil
 		}
