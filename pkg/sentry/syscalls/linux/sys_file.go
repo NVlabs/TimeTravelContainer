@@ -1736,13 +1736,23 @@ func Fallocate(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintp
 	if size < 0 {
 		return 0, nil, linuxerr.EFBIG
 	}
+	// As Linux, refuse only an allocation that grows the file past
+	// RLIMIT_FSIZE (mm/shmem.c:shmem_fallocate() =>
+	// fs/attr.c:inode_newsize_ok()): one ending at the limit, or within the
+	// file, succeeds.
 	limit := limits.FromContext(t).Get(limits.FileSize).Cur
-	if uint64(size) >= limit {
-		t.SendSignal(&linux.SignalInfo{
-			Signo: int32(linux.SIGXFSZ),
-			Code:  linux.SI_USER,
-		})
-		return 0, nil, linuxerr.EFBIG
+	if uint64(size) > limit {
+		stat, err := file.Stat(t, vfs.StatOptions{Mask: linux.STATX_SIZE})
+		if err != nil {
+			return 0, nil, err
+		}
+		if uint64(size) > stat.Size {
+			t.SendSignal(&linux.SignalInfo{
+				Signo: int32(linux.SIGXFSZ),
+				Code:  linux.SI_USER,
+			})
+			return 0, nil, linuxerr.EFBIG
+		}
 	}
 
 	return 0, nil, file.Allocate(t, mode, uint64(offset), uint64(length))

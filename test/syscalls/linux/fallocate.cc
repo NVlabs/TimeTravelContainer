@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/falloc.h>
@@ -227,6 +232,41 @@ TEST_F(AllocateTest, FallocateRlimit) {
   timelimit.tv_sec = 10;
   EXPECT_EQ(sigtimedwait(&new_mask, nullptr, &timelimit), SIGXFSZ);
   ASSERT_THAT(sigprocmask(SIG_UNBLOCK, &new_mask, nullptr), SyscallSucceeds());
+}
+
+// As Linux's inode_newsize_ok(), only an allocation that grows the file past
+// RLIMIT_FSIZE fails: one ending at the limit, or inside a file already
+// longer than the limit, succeeds.
+TEST_F(AllocateTest, FallocateRlimitBoundary) {
+  struct rlimit initial_lim;
+  ASSERT_THAT(getrlimit(RLIMIT_FSIZE, &initial_lim), SyscallSucceeds());
+  auto cleanup = Cleanup([&initial_lim] {
+    EXPECT_THAT(setrlimit(RLIMIT_FSIZE, &initial_lim), SyscallSucceeds());
+  });
+  sigset_t new_mask;
+  sigemptyset(&new_mask);
+  sigaddset(&new_mask, SIGXFSZ);
+  sigprocmask(SIG_BLOCK, &new_mask, nullptr);
+  auto unblock = Cleanup([&new_mask] {
+    EXPECT_THAT(sigprocmask(SIG_UNBLOCK, &new_mask, nullptr),
+                SyscallSucceeds());
+  });
+
+  ASSERT_THAT(ftruncate(test_file_fd_.get(), 4096), SyscallSucceeds());
+  struct rlimit setlim = {};
+  setlim.rlim_cur = 1024;
+  setlim.rlim_max = RLIM_INFINITY;
+  ASSERT_THAT(setrlimit(RLIMIT_FSIZE, &setlim), SyscallSucceeds());
+
+  EXPECT_THAT(fallocate(test_file_fd_.get(), 0, 0, 1024), SyscallSucceeds());
+  EXPECT_THAT(fallocate(test_file_fd_.get(), 0, 1024, 2048),
+              SyscallSucceeds());
+  EXPECT_THAT(fallocate(test_file_fd_.get(), 0, 0, 4096), SyscallSucceeds());
+  EXPECT_THAT(fallocate(test_file_fd_.get(), 0, 4096, 1),
+              SyscallFailsWithErrno(EFBIG));
+  struct timespec timelimit = {};
+  timelimit.tv_sec = 10;
+  EXPECT_EQ(sigtimedwait(&new_mask, nullptr, &timelimit), SIGXFSZ);
 }
 
 TEST_F(AllocateTest, FallocateOtherFDs) {
