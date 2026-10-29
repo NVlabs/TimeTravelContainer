@@ -496,9 +496,20 @@ func effectiveShmSize(value *int64) (int64, error) {
 	return *value, nil
 }
 
+// Default open-file limits: Docker's on a systemd host, where containers
+// inherit the daemon's limits, systemd's 1024 soft and 524288 hard (Docker
+// 25 dropped LimitNOFILE=infinity from its units). A hard limit of 1024 kept
+// programs that raise their soft limit (Go's runtime, databases, stress-ng)
+// from going past 1024 files. Fixed rather than inherited, so a container's
+// limits are the same on every node its branches run on.
+const (
+	defaultNofileSoft = 1024
+	defaultNofileHard = 524288
+)
+
 func buildRlimits(configured []Ulimit) ([]specs.POSIXRlimit, error) {
 	byName := map[string]specs.POSIXRlimit{
-		"nofile": {Type: "RLIMIT_NOFILE", Hard: 1024, Soft: 1024},
+		"nofile": {Type: "RLIMIT_NOFILE", Hard: defaultNofileHard, Soft: defaultNofileSoft},
 	}
 	for _, limit := range configured {
 		resource, ok := ulimitResourceNames[limit.Name]

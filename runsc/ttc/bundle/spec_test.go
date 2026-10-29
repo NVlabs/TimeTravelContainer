@@ -1406,6 +1406,25 @@ func TestBuildSpecPreservesConfiguredTerminalType(t *testing.T) {
 	}
 }
 
+func TestBuildRlimitsDefaultNofile(t *testing.T) {
+	got, err := buildRlimits(nil)
+	if err != nil {
+		t.Fatalf("buildRlimits(nil): %v", err)
+	}
+	want := []specs.POSIXRlimit{{Type: "RLIMIT_NOFILE", Soft: 1024, Hard: 524288}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("default rlimits=%+v, want %+v", got, want)
+	}
+	got, err = buildRlimits([]Ulimit{{Name: "nofile", Soft: 64, Hard: 128}})
+	if err != nil {
+		t.Fatalf("buildRlimits(nofile=64:128): %v", err)
+	}
+	want = []specs.POSIXRlimit{{Type: "RLIMIT_NOFILE", Soft: 64, Hard: 128}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("configured rlimits=%+v, want %+v", got, want)
+	}
+}
+
 func hasNamespace(spec *specs.Spec, namespace specs.LinuxNamespaceType) bool {
 	if spec.Linux == nil {
 		return false
