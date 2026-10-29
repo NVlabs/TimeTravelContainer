@@ -12,12 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package kernel
 
 import (
 	goContext "context"
 	"fmt"
-	"math"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -106,7 +108,7 @@ func (f *FDTable) saveDescriptorTable() map[int32]descriptor {
 func (f *FDTable) loadDescriptorTable(_ goContext.Context, m map[int32]descriptor) {
 	ctx := context.Background()
 	f.initNoLeakCheck() // Initialize table.
-	f.fdBitmap = bitmap.New(uint32(math.MaxUint16))
+	f.fdBitmap = newFDBitmap()
 	for fd, d := range m {
 		if fd < 0 {
 			panic(fmt.Sprintf("FD is not supposed to be negative. FD: %d", fd))
@@ -144,12 +146,18 @@ func (k *Kernel) NewFDTable() *FDTable {
 
 // DecRef implements RefCounter.DecRef.
 //
-// If f reaches zero references, all of its file descriptors are removed.
+// If f reaches zero references, all of its file descriptors are removed, and
+// its storage released: an exited task keeps pointing at its table until it
+// is reaped, and the buckets and bitmap of every zombie's table stayed.
 func (f *FDTable) DecRef(ctx context.Context) {
 	f.FDTableRefs.DecRef(func() {
 		f.RemoveIf(ctx, func(*vfs.FileDescription, FDFlags) bool {
 			return true
 		})
+		f.mu.Lock()
+		f.initNoLeakCheck()
+		f.fdBitmap = bitmap.Bitmap{}
+		f.mu.Unlock()
 	})
 }
 

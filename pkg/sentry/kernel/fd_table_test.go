@@ -138,6 +138,43 @@ func TestFDTableRemoveOfUnopenedFDDoesNotGrow(t *testing.T) {
 	})
 }
 
+// A table starts with room for a bucket of descriptors and grows for more. Once
+// its last reference is dropped, as when a process exits, long before it is
+// reaped, it holds no storage for descriptors: every zombie and every process
+// of a fork kept 12 KiB.
+func TestFDTableStorage(t *testing.T) {
+	runTest(t, func(ctx context.Context, fdTable *FDTable, fd *vfs.FileDescription, limitSet *limits.LimitSet) {
+		if got := fdTable.fdBitmap.Size(); got != fdsPerBucket {
+			t.Errorf("a new table's bitmap has %d bits; want %d", got, fdsPerBucket)
+		}
+		if _, err := fdTable.NewFDs(ctx, 0, []*vfs.FileDescription{fd, fd, fd}, FDFlags{}); err != nil {
+			t.Fatal(err)
+		}
+		if fds, err := fdTable.NewFDs(ctx, 1500, []*vfs.FileDescription{fd}, FDFlags{}); err != nil || fds[0] != 1500 {
+			t.Fatalf("NewFDs(1500) = %v, %v; want 1500", fds, err)
+		}
+		if got := fdTable.GetLastFd(); got != 1500 {
+			t.Errorf("GetLastFd() = %d; want 1500", got)
+		}
+		if fds, err := fdTable.NewFDs(ctx, 0, []*vfs.FileDescription{fd}, FDFlags{}); err != nil || fds[0] != 3 {
+			t.Errorf("NewFDs(0) = %v, %v; want 3", fds, err)
+		}
+		fdTable.DecRef(ctx)
+		if n := len(*fdTable.slice.Load()); n != 0 {
+			t.Errorf("a released table holds %d buckets", n)
+		}
+		if got := fdTable.fdBitmap.Size(); got != 0 {
+			t.Errorf("a released table's bitmap has %d bits", got)
+		}
+		if got := fdTable.GetFDs(ctx); len(got) != 0 {
+			t.Errorf("a released table holds descriptors %v", got)
+		}
+		if got := fdTable.GetLastFd(); got != 0 {
+			t.Errorf("GetLastFd() of a released table = %d; want 0", got)
+		}
+	})
+}
+
 func TestFDTableOverLimit(t *testing.T) {
 	runTest(t, func(ctx context.Context, fdTable *FDTable, fd *vfs.FileDescription, _ *limits.LimitSet) {
 		if _, err := fdTable.NewFDs(ctx, maxFD, []*vfs.FileDescription{fd}, FDFlags{}); err == nil {

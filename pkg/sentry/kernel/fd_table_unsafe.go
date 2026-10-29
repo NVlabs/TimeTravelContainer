@@ -18,8 +18,6 @@
 package kernel
 
 import (
-	"math"
-
 	"gvisor.dev/gvisor/pkg/bitmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
@@ -49,7 +47,14 @@ func (f *FDTable) initNoLeakCheck() {
 func (f *FDTable) init() {
 	f.initNoLeakCheck()
 	f.InitRefs()
-	f.fdBitmap = bitmap.New(uint32(math.MaxUint16))
+	f.fdBitmap = newFDBitmap()
+}
+
+// newFDBitmap returns an fdBitmap for a bucket's worth of descriptors.
+// Bitmap.Add grows it for higher ones; sized for every possible descriptor
+// up front, it was 8 KiB of every process, zombies and forks included.
+func newFDBitmap() bitmap.Bitmap {
+	return bitmap.New(fdsPerBucket)
 }
 
 const (
