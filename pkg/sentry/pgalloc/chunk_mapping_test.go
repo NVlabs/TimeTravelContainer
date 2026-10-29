@@ -82,7 +82,7 @@ func TestChunkMappings(t *testing.T) {
 		t.Errorf("%d mappings of the file after 5 growths, want 5", got)
 	}
 	// A 2 MiB page in the last home maps its huge view.
-	page, err := mf.AllocateAt(slotRange(homes[2], pagesPerHugePage, pagesPerHugePage), AllocOpts{Kind: usage.Anonymous, Huge: true})
+	page, err := mf.AllocateAt(slotRange(homes[2], pagesPerHugePage(), pagesPerHugePage()), AllocOpts{Kind: usage.Anonymous, Huge: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +162,7 @@ func TestHugeView(t *testing.T) {
 	if _, ok := mf.HugePageMapping(base); ok {
 		t.Error("a base page has a huge mapping")
 	}
-	page, err := mf.AllocateAt(slotRange(home, 2*pagesPerHugePage, pagesPerHugePage), AllocOpts{Kind: usage.Anonymous, Huge: true, LogicalHugePages: true, ReaderFunc: fillReader(2)})
+	page, err := mf.AllocateAt(slotRange(home, 2*pagesPerHugePage(), pagesPerHugePage()), AllocOpts{Kind: usage.Anonymous, Huge: true, LogicalHugePages: true, ReaderFunc: fillReader(2)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +195,7 @@ func TestHugeView(t *testing.T) {
 	if err != nil || again != home {
 		t.Fatalf("ReserveHome: %v, %v, want the spared home %v", again, err, home)
 	}
-	page, err = mf.AllocateAt(slotRange(home, 2*pagesPerHugePage, pagesPerHugePage), AllocOpts{Kind: usage.Anonymous, Huge: true, LogicalHugePages: true, ReaderFunc: fillReader(4)})
+	page, err = mf.AllocateAt(slotRange(home, 2*pagesPerHugePage(), pagesPerHugePage()), AllocOpts{Kind: usage.Anonymous, Huge: true, LogicalHugePages: true, ReaderFunc: fillReader(4)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,7 +256,7 @@ func TestSparedHomeDropsPageTables(t *testing.T) {
 	const regions = 256
 	var pages []memmap.FileRange
 	for i := uint64(0); i < regions; i++ {
-		fr, err := mf.AllocateAt(slotRange(home, i*pagesPerHugePage+1, 1), AllocOpts{Kind: usage.Anonymous})
+		fr, err := mf.AllocateAt(slotRange(home, i*pagesPerHugePage()+1, 1), AllocOpts{Kind: usage.Anonymous})
 		if err != nil {
 			t.Fatal(err)
 		}

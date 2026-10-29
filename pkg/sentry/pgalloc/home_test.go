@@ -173,7 +173,7 @@ func TestHomeHugePage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fr := slotRange(home, 2*pagesPerHugePage, pagesPerHugePage)
+	fr := slotRange(home, 2*pagesPerHugePage(), pagesPerHugePage())
 	got, err := mf.AllocateAt(fr, AllocOpts{Kind: usage.Anonymous, Huge: true, LogicalHugePages: true, Mode: AllocateAndWritePopulate})
 	if err != nil || got != fr {
 		t.Fatalf("AllocateAt(%v) = %v, %v", fr, got, err)
@@ -186,7 +186,7 @@ func TestHomeHugePage(t *testing.T) {
 	for i := range src {
 		src[i] = 0x5a
 	}
-	copyFR := slotRange(home, 4*pagesPerHugePage, pagesPerHugePage)
+	copyFR := slotRange(home, 4*pagesPerHugePage(), pagesPerHugePage())
 	got, err = mf.AllocateAt(copyFR, AllocOpts{Kind: usage.Anonymous, Huge: true, LogicalHugePages: true, Mode: AllocateAndWritePopulate,
 		ReaderFunc: (&safemem.BlockSeqReader{Blocks: safemem.BlockSeqOf(safemem.BlockFromSafeSlice(src))}).ReadToBlocks})
 	if err != nil || got != copyFR || !pagesHold(t, mf, copyFR, 0x5a) {

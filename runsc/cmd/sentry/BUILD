@@ -101,8 +101,10 @@ deps_test(
     # The sentry binaries contain the sentry, and nothing else.
     # Keep this tight.
     allowed = [
+        "//runsc/autoplatform",
         "//runsc/cli",
         "//runsc/cli/sentrycli",
+        "//runsc/cmd/nvproxy",
         "//runsc/cmd/sandboxsetup",
         "//runsc/cmd/sentry/forwardcmd",
         "//runsc/cmd/sentry/sentrycmd",

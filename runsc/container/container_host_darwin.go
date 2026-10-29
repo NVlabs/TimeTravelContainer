@@ -39,5 +39,8 @@ func setGoferCommandCredential(*exec.Cmd, uint32, uint32) error {
 func disableGoferSetgroupsForIDMapping(*exec.Cmd) error {
 	return goferHostIsolationUnsupported()
 }
+func enableGoferSetgroupsForHostUDS(*exec.Cmd) error {
+	return goferHostIsolationUnsupported()
+}
 
 func hostSetOOMScoreAdj(int, int) error { return nil }

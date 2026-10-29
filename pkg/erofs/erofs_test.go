@@ -116,9 +116,8 @@ func TestInlineInodeStraddlingBlockBoundary(t *testing.T) {
 // the corresponding entry of blocks.
 func chunkImage(t *testing.T, format uint16, extended bool, size uint64, blocks []uint32) *Image {
 	t.Helper()
-	const page = hostarch.PageSize
-	data := make([]byte, 16*page)
-	sb := SuperBlock{Magic: SuperBlockMagicV1, BlockSizeBits: hostarch.PageShift, RootNid: 127, Blocks: 16, FeatureIncompat: FeatureIncompatChunkedFile}
+	data := make([]byte, 16*hostarch.PageSize)
+	sb := SuperBlock{Magic: SuperBlockMagicV1, BlockSizeBits: uint8(hostarch.PageShift), RootNid: 127, Blocks: 16, FeatureIncompat: FeatureIncompatChunkedFile}
 	sb.MarshalUnsafe(data[SuperBlockOffset:])
 	off := int(sb.RootNid) << InodeSlotBits
 	if extended {
@@ -165,8 +164,8 @@ func TestMapChunks(t *testing.T) {
 			for _, bits := range []uint16{0, 1, 2} {
 				name := fmt.Sprintf("indexes=%t/extended=%t/bits=%d", indexes != 0, extended, bits)
 				t.Run(name, func(t *testing.T) {
-					const page = hostarch.PageSize
-					chunk := uint64(page) << bits
+					page := uint64(hostarch.PageSize)
+					chunk := page << bits
 					blocksPerChunk := uint32(1) << bits
 					size := 5*chunk + 17
 					image := chunkImage(t, indexes|bits, extended, size, []uint32{4, 4 + blocksPerChunk, NullAddr, NullAddr, 12, 4})
@@ -219,12 +218,12 @@ func TestInvalidChunks(t *testing.T) {
 		inodeErr error
 		mapErr   error
 	}{
-		{name: "48-bit addresses", format: 0x40, size: hostarch.PageSize, inodeErr: linuxerr.ENOTSUP},
+		{name: "48-bit addresses", format: 0x40, size: uint64(hostarch.PageSize), inodeErr: linuxerr.ENOTSUP},
 		{name: "oversized file", size: math.MaxUint64, inodeErr: linuxerr.EUCLEAN},
 		{name: "truncated map", size: math.MaxInt64, off: math.MaxInt64 - 1, mapErr: linuxerr.EUCLEAN},
-		{name: "past image", size: hostarch.PageSize, blocks: []uint32{16}, mapErr: linuxerr.EUCLEAN},
-		{name: "truncated data", format: 1, size: 2 * hostarch.PageSize, blocks: []uint32{15}, mapErr: linuxerr.EUCLEAN},
-		{name: "large chunk", format: 31, size: hostarch.PageSize, blocks: []uint32{4}},
+		{name: "past image", size: uint64(hostarch.PageSize), blocks: []uint32{16}, mapErr: linuxerr.EUCLEAN},
+		{name: "truncated data", format: 1, size: 2 * uint64(hostarch.PageSize), blocks: []uint32{15}, mapErr: linuxerr.EUCLEAN},
+		{name: "large chunk", format: 31, size: uint64(hostarch.PageSize), blocks: []uint32{4}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			image := chunkImage(t, tc.format, true, tc.size, tc.blocks)
@@ -239,5 +238,43 @@ func TestInvalidChunks(t *testing.T) {
 				t.Errorf("MapBlocks(%d): %v, want %v", tc.off, err, tc.mapErr)
 			}
 		})
+	}
+}
+
+// TestBlockSizeBits checks that only block sizes from the host page size up to
+// 64 KiB are accepted, and that a bad size is rejected before the superblock
+// checksum is read.
+func TestBlockSizeBits(t *testing.T) {
+	open := func(bits uint8, compat uint32) error {
+		img := make([]byte, hostarch.PageSize)
+		sb := SuperBlock{Magic: SuperBlockMagicV1, BlockSizeBits: bits, Blocks: 1, FeatureCompat: compat}
+		sb.MarshalUnsafe(img[SuperBlockOffset:])
+		f, err := os.CreateTemp(t.TempDir(), "erofs")
+		if err != nil {
+			t.Fatalf("CreateTemp: %v", err)
+		}
+		if _, err := f.Write(img); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		// OpenImage takes ownership of f on success.
+		image, err := OpenImage(f)
+		if err != nil {
+			f.Close()
+			return err
+		}
+		image.Close()
+		return nil
+	}
+	for bits := uint8(hostarch.PageShift); bits <= maxBlockSizeBits; bits++ {
+		if err := open(bits, 0); err != nil {
+			t.Errorf("OpenImage with BlockSizeBits=%d: %v", bits, err)
+		}
+	}
+	for _, bits := range []uint8{uint8(hostarch.PageShift) - 1, maxBlockSizeBits + 1, 32, 40} {
+		for _, compat := range []uint32{0, FeatureCompatSuperBlockChecksum} {
+			if err := open(bits, compat); err == nil {
+				t.Errorf("OpenImage with BlockSizeBits=%d and FeatureCompat=%#x succeeded", bits, compat)
+			}
+		}
 	}
 }

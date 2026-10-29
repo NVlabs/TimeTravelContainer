@@ -49,7 +49,10 @@ import (
 	"gvisor.dev/gvisor/pkg/sync"
 )
 
-const pagesPerHugePage = hostarch.HugePageSize / hostarch.PageSize
+// pagesPerHugePage() returns the number of small pages in a huge page.
+func pagesPerHugePage() uint64 {
+	return uint64(hostarch.HugePageSize >> hostarch.PageShift)
+}
 
 // MemoryFile is a memmap.File whose pages may be allocated to arbitrary
 // users.
@@ -263,7 +266,7 @@ type MemoryFile struct {
 	knownCommittedBytes uint64
 	commitSeq           uint64
 	nextCommitScan      time.Time
-	ongoingCommitScan   atomic.Bool
+	ongoingCommitScan   atomicbitops.Bool
 	isSaving            bool
 
 	// accountedBytes is the span of memAcct, with the pages of home chunks
@@ -290,7 +293,7 @@ type MemoryFile struct {
 	// savable is true if this MemoryFile will be saved via SaveTo() during
 	// the kernel's SaveTo operation. It is set once, and read without mu by
 	// every pma that a save of an address space encodes.
-	savable atomic.Bool
+	savable atomicbitops.Bool
 
 	// destroyed is set by Destroy to instruct the releaser goroutine to
 	// release all MemoryFile resources and exit. destroyed is protected by mu.
@@ -496,8 +499,8 @@ func (f *MemoryFile) setLogicalPagesLocked(fr memmap.FileRange, info logicalPage
 // alignSequence returns the first sequence, from seq on, that a 2 MiB page can
 // start at; see logicalPageInfo.Huge.
 func alignSequence(seq uint64) uint64 {
-	if rem := seq % pagesPerHugePage; rem != 0 && seq <= math.MaxUint64-pagesPerHugePage {
-		return seq + pagesPerHugePage - rem
+	if rem := seq % pagesPerHugePage(); rem != 0 && seq <= math.MaxUint64-pagesPerHugePage() {
+		return seq + pagesPerHugePage() - rem
 	}
 	return seq
 }
@@ -677,7 +680,7 @@ func (f *MemoryFile) AdoptCOWIdentities(source *MemoryFile, sourceFR, targetFR m
 	}
 	// Aligning each 2 MiB page's version skips fewer than one version per
 	// base page.
-	if 2*pages+pagesPerHugePage > hugeSequenceBit-f.nextPageVersion {
+	if 2*pages+pagesPerHugePage() > hugeSequenceBit-f.nextPageVersion {
 		return fmt.Errorf("page version sequence exhausted for CoW range %v", targetFR)
 	}
 	// The pages that stay 2 MiB pages, as runs of the source's: those that
@@ -687,7 +690,7 @@ func (f *MemoryFile) AdoptCOWIdentities(source *MemoryFile, sourceFR, targetFR m
 	for _, run := range sourceRuns {
 		whole := memmap.FileRange{Start: hostarch.MustHugePageRoundUp(run.Range.Start), End: hostarch.HugePageRoundDown(run.Range.End)}
 		if !run.Huge || !aligned || whole.Start >= whole.End ||
-			(run.First.Sequence+(whole.Start-run.Range.Start)/hostarch.PageSize)%pagesPerHugePage != 0 || !f.isHugeLocked(memmap.FileRange{
+			(run.First.Sequence+(whole.Start-run.Range.Start)/hostarch.PageSize)%pagesPerHugePage() != 0 || !f.isHugeLocked(memmap.FileRange{
 			Start: targetFR.Start + (whole.Start - sourceFR.Start),
 			End:   targetFR.Start + (whole.End - sourceFR.Start),
 		}) {
@@ -1813,7 +1816,7 @@ func tryPopulate(b safemem.Block) bool {
 //   - fr.Length() > 0.
 //   - At least one reference must be held on all pages in fr.
 func (f *MemoryFile) Decommit(fr memmap.FileRange) {
-	if !fr.WellFormed() || fr.Length() == 0 || fr.Start%hostarch.PageSize != 0 || fr.End%hostarch.PageSize != 0 {
+	if !fr.WellFormed() || fr.Length() == 0 || !hostarch.IsPageAligned(fr.Start) || !hostarch.IsPageAligned(fr.End) {
 		panic(fmt.Sprintf("invalid range: %v", fr))
 	}
 
@@ -1925,7 +1928,7 @@ func (f *MemoryFile) OwnForWrite(fr memmap.FileRange) bool {
 //
 // Preconditions: f.mu must be locked.
 func (f *MemoryFile) renewPageVersionsLocked(fr memmap.FileRange) {
-	if pages := fr.Length()/hostarch.PageSize + pagesPerHugePage; pages > hugeSequenceBit-f.nextPageVersion {
+	if pages := fr.Length()/hostarch.PageSize + pagesPerHugePage(); pages > hugeSequenceBit-f.nextPageVersion {
 		panic(fmt.Sprintf("page version sequence exhausted for %v", fr))
 	}
 	f.splitPartlyCoveredHugePagesLocked(fr)
@@ -2278,14 +2281,14 @@ func (f *MemoryFile) releaseLocked(fr memmap.FileRange, kind releaseKind) {
 
 	firstHugeStart := hostarch.HugePageRoundDown(fr.Start)
 	lastHugeStart := hostarch.HugePageRoundDown(fr.End - 1)
-	firstHugeEnd := firstHugeStart + hostarch.HugePageSize
-	lastHugeEnd := lastHugeStart + hostarch.HugePageSize
+	firstHugeEnd := firstHugeStart + uint64(hostarch.HugePageSize)
+	lastHugeEnd := lastHugeStart + uint64(hostarch.HugePageSize)
 	if firstHugeStart == lastHugeStart {
 		// All of fr falls within a single huge page.
 		oldSubrel := f.subreleased[firstHugeStart]
-		incSubrel := fr.Length() / hostarch.PageSize
+		incSubrel := fr.Length() >> hostarch.PageShift
 		newSubrel := oldSubrel + incSubrel
-		if newSubrel == pagesPerHugePage {
+		if newSubrel == pagesPerHugePage() {
 			// Free this huge page.
 			//
 			// When a small page within a hugepage-backed allocation is
@@ -2329,9 +2332,9 @@ func (f *MemoryFile) releaseLocked(fr memmap.FileRange, kind releaseKind) {
 		freeFR.Start = firstHugeStart
 	} else {
 		oldSubrel := f.subreleased[firstHugeStart]
-		incSubrel := (firstHugeEnd - fr.Start) / hostarch.PageSize
+		incSubrel := (firstHugeEnd - fr.Start) >> hostarch.PageShift
 		newSubrel := oldSubrel + incSubrel
-		if newSubrel == pagesPerHugePage {
+		if newSubrel == pagesPerHugePage() {
 			if oldSubrel != 0 {
 				delete(f.subreleased, firstHugeStart)
 			}
@@ -2347,9 +2350,9 @@ func (f *MemoryFile) releaseLocked(fr memmap.FileRange, kind releaseKind) {
 		freeFR.End = lastHugeEnd
 	} else {
 		oldSubrel := f.subreleased[lastHugeStart]
-		incSubrel := (fr.End - lastHugeStart) / hostarch.PageSize
+		incSubrel := (fr.End - lastHugeStart) >> hostarch.PageShift
 		newSubrel := oldSubrel + incSubrel
-		if newSubrel == pagesPerHugePage {
+		if newSubrel == pagesPerHugePage() {
 			if oldSubrel != 0 {
 				delete(f.subreleased, lastHugeStart)
 			}
@@ -2940,8 +2943,8 @@ func (f *MemoryFile) updateUsageLocked(memCgIDs map[uint32]struct{}) error {
 					}
 				}
 				commitFR := memmap.FileRange{
-					Start: chunkFR.Start + uint64(i*hostarch.PageSize),
-					End:   chunkFR.Start + uint64(j*hostarch.PageSize),
+					Start: chunkFR.Start + uint64(i)<<hostarch.PageShift,
+					End:   chunkFR.Start + uint64(j)<<hostarch.PageShift,
 				}
 				// Advance maseg to commitFR.Start.
 				for maseg.Ok() && maseg.End() <= commitFR.Start {

@@ -40,6 +40,7 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -3201,7 +3202,7 @@ func (f *SandboxFamily) destroy(id string, reclaimFilesystem bool) error {
 }
 
 // Processes returns processes from one branch's kernel task graph.
-func (f *SandboxFamily) Processes(id, cid string, out *[]*control.Process) error {
+func (f *SandboxFamily) Processes(id, cid string, out *[]*controlapi.Process) error {
 	b, done, err := f.beginControl(id)
 	if err != nil {
 		return err
@@ -3211,7 +3212,7 @@ func (f *SandboxFamily) Processes(id, cid string, out *[]*control.Process) error
 }
 
 // RootfsSize returns branch-local logical writable-layer usage.
-func (f *SandboxFamily) RootfsSize(id, cid string, out *control.RootfsSize) error {
+func (f *SandboxFamily) RootfsSize(id, cid string, out *controlapi.RootfsSize) error {
 	b, done, err := f.beginControl(id)
 	if err != nil {
 		return err

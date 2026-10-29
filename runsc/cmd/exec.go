@@ -36,7 +36,7 @@ import (
 	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot"
@@ -223,7 +223,7 @@ func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		}
 	}()
 
-	e.FilePayload = control.NewFilePayload(fdMap, execFile)
+	e.FilePayload = controlapi.NewFilePayload(fdMap, execFile)
 
 	// containerd expects an actual process to represent the container being
 	// executed. If detach was specified, starts a child in non-detach mode,
@@ -293,7 +293,7 @@ func ExecInProcess(conf *config.Config, args []string, stdin, stdout, stderr, ex
 		}
 		fdMap = map[int]*os.File{0: stdin, 1: stdout, 2: stderr}
 	}
-	e.FilePayload = control.NewFilePayload(fdMap, execFile)
+	e.FilePayload = controlapi.NewFilePayload(fdMap, execFile)
 	if ex.detach {
 		return 0, ex.startManagedDetached(conf, c, e)
 	}
@@ -302,7 +302,7 @@ func ExecInProcess(conf *config.Config, args []string, stdin, stdout, stderr, ex
 
 // prepare loads the container and builds, from the command's flags, the
 // arguments of the process to execute in it.
-func (ex *Exec) prepare(conf *config.Config, f *flag.FlagSet) (*container.Container, *control.ExecArgs, error) {
+func (ex *Exec) prepare(conf *config.Config, f *flag.FlagSet) (*container.Container, *controlapi.ExecArgs, error) {
 	c, err := ex.loadContainer(conf, f, container.LoadOpts{SkipCheck: ex.allowStoppedSandbox})
 	if err != nil {
 		return nil, nil, fmt.Errorf("loading container failed: %v", err)
@@ -356,7 +356,7 @@ func (ex *Exec) prepare(conf *config.Config, f *flag.FlagSet) (*container.Contai
 
 // execManagedDetached creates a managed Sentry-owned session without leaving a
 // host shim attached to its console. TTC starts the sole persistent drainer.
-func (ex *Exec) execManagedDetached(conf *config.Config, c *container.Container, e *control.ExecArgs, waitStatus *unix.WaitStatus) subcommands.ExitStatus {
+func (ex *Exec) execManagedDetached(conf *config.Config, c *container.Container, e *controlapi.ExecArgs, waitStatus *unix.WaitStatus) subcommands.ExitStatus {
 	if err := ex.startManagedDetached(conf, c, e); err != nil {
 		return util.Errorf("%v", err)
 	}
@@ -364,7 +364,7 @@ func (ex *Exec) execManagedDetached(conf *config.Config, c *container.Container,
 	return subcommands.ExitSuccess
 }
 
-func (ex *Exec) startManagedDetached(conf *config.Config, c *container.Container, e *control.ExecArgs) error {
+func (ex *Exec) startManagedDetached(conf *config.Config, c *container.Container, e *controlapi.ExecArgs) error {
 	pid, err := c.Execute(conf, e)
 	if err != nil {
 		return fmt.Errorf("executing managed detached process: %v", err)
@@ -377,7 +377,7 @@ func (ex *Exec) startManagedDetached(conf *config.Config, c *container.Container
 	return nil
 }
 
-func (ex *Exec) exec(conf *config.Config, c *container.Container, e *control.ExecArgs, waitStatus *unix.WaitStatus) subcommands.ExitStatus {
+func (ex *Exec) exec(conf *config.Config, c *container.Container, e *controlapi.ExecArgs, waitStatus *unix.WaitStatus) subcommands.ExitStatus {
 	ws, err := ex.run(conf, c, e)
 	if err != nil {
 		return util.Errorf("%v", err)
@@ -387,7 +387,7 @@ func (ex *Exec) exec(conf *config.Config, c *container.Container, e *control.Exe
 }
 
 // run starts the process and waits for it to exit.
-func (ex *Exec) run(conf *config.Config, c *container.Container, e *control.ExecArgs) (unix.WaitStatus, error) {
+func (ex *Exec) run(conf *config.Config, c *container.Container, e *controlapi.ExecArgs) (unix.WaitStatus, error) {
 	// Start the new process and get its pid.
 	pid, err := c.Execute(conf, e)
 	if err != nil {
@@ -463,7 +463,7 @@ func (ex *Exec) run(conf *config.Config, c *container.Container, e *control.Exec
 	return ws, nil
 }
 
-func (ex *Exec) startInternalConsole(c *container.Container, e *control.ExecArgs) (<-chan error, func(), error) {
+func (ex *Exec) startInternalConsole(c *container.Container, e *controlapi.ExecArgs) (<-chan error, func(), error) {
 	branchID := e.BranchID
 	if branchID == "" {
 		branchID = boot.DefaultBranchID
@@ -681,7 +681,7 @@ func (ex *Exec) execChildAndWait(waitStatus *unix.WaitStatus) subcommands.ExitSt
 
 // parseArgs parses exec information from the command line or a JSON file
 // depending on whether the --process flag was used.
-func (ex *Exec) parseArgs(f *flag.FlagSet, p *specs.Process, enableRaw bool) (*control.ExecArgs, error) {
+func (ex *Exec) parseArgs(f *flag.FlagSet, p *specs.Process, enableRaw bool) (*controlapi.ExecArgs, error) {
 	if ex.execPath != "" && ex.execFD >= 0 {
 		return nil, fmt.Errorf("--exec-path and --exec-fd are mutually exclusive")
 	}
@@ -705,7 +705,7 @@ func (ex *Exec) parseArgs(f *flag.FlagSet, p *specs.Process, enableRaw bool) (*c
 	return e, err
 }
 
-func (ex *Exec) argsFromCLI(p *specs.Process, argv []string, enableRaw bool) (*control.ExecArgs, error) {
+func (ex *Exec) argsFromCLI(p *specs.Process, argv []string, enableRaw bool) (*controlapi.ExecArgs, error) {
 	extraKGIDs := make([]auth.KGID, 0, len(p.User.AdditionalGids)+len(ex.extraKGIDs))
 	for _, kgid := range p.User.AdditionalGids {
 		extraKGIDs = append(extraKGIDs, auth.KGID(kgid))
@@ -746,7 +746,7 @@ func (ex *Exec) argsFromCLI(p *specs.Process, argv []string, enableRaw bool) (*c
 		return nil, fmt.Errorf("capabilities error: %v", err)
 	}
 
-	return &control.ExecArgs{
+	return &controlapi.ExecArgs{
 		Filename:         ex.execPath,
 		Argv:             argv,
 		Envv:             envv,
@@ -771,7 +771,7 @@ func (ex *Exec) stdioIsPty() bool {
 	return true
 }
 
-func (ex *Exec) argsFromProcessFile(specProc *specs.Process, enableRaw bool) (*control.ExecArgs, error) {
+func (ex *Exec) argsFromProcessFile(specProc *specs.Process, enableRaw bool) (*controlapi.ExecArgs, error) {
 	f, err := os.Open(ex.processPath)
 	if err != nil {
 		return nil, fmt.Errorf("error opening process file: %s, %v", ex.processPath, err)
@@ -802,7 +802,7 @@ func validateProcessSpec(p *specs.Process) error {
 
 // argsFromProcess performs all the non-IO conversion from the Process struct
 // to ExecArgs.
-func argsFromProcess(specProc *specs.Process, p *specs.Process, enableRaw bool) (*control.ExecArgs, error) {
+func argsFromProcess(specProc *specs.Process, p *specs.Process, enableRaw bool) (*controlapi.ExecArgs, error) {
 	// Create capabilities.
 	procCaps := p.Capabilities
 	if procCaps == nil {
@@ -826,7 +826,7 @@ func argsFromProcess(specProc *specs.Process, p *specs.Process, enableRaw bool) 
 		extraKGIDs = append(extraKGIDs, auth.KGID(GID))
 	}
 
-	return &control.ExecArgs{
+	return &controlapi.ExecArgs{
 		Argv:             p.Args,
 		Envv:             p.Env,
 		WorkingDirectory: p.Cwd,

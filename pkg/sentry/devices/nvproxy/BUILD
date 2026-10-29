@@ -69,6 +69,7 @@ go_library(
         "seccomp_filters_darwin.go",
         "uvm.go",
         "uvm_mmap.go",
+        "uvm_tools.go",
         "uvm_unsafe.go",
         "version.go",
     ],

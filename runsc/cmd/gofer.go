@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strconv"
+	"syscall"
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -369,6 +370,8 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		util.Fatalf("failed to open /proc/self/fd: %v", err)
 	}
 
+	canSetGroups := specutils.SetgroupsAllowed()
+
 	// Look up our own caps (needs procfs).
 	var resolvedCaps *sandboxsetup.ResolvedThreadCaps
 	if g.applyCaps {
@@ -420,11 +423,32 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		}
 		log.Infof("Process chroot'd to %q", root)
 	}
+
+	// Drop all supplementary groups (syscall.Setgroups applies to every thread)
+	// so that an application with none matches ours and connects to host
+	// sockets without a dedicated thread. If that is not permitted, e.g. rootless
+	// with a non-zero sandbox UID, keep them and stop offering
+	// ConnectWithGroups, whose per-thread setgroups(2) would fail the same way.
+	if canSetGroups && conf.GetHostUDS().AllowOpen() {
+		switch err := syscall.Setgroups(nil); err {
+		case nil:
+		case unix.EPERM:
+			log.Warningf("Not permitted to drop supplementary groups, keeping them and not offering ConnectWithGroups")
+			canSetGroups = false
+		default:
+			util.Fatalf("dropping supplementary groups: %v", err)
+		}
+	}
+
 	ruid := unix.Getuid()
 	euid := unix.Geteuid()
 	rgid := unix.Getgid()
 	egid := unix.Getegid()
-	log.Debugf("Process running as uid=%d euid=%d gid=%d egid=%d", ruid, euid, rgid, egid)
+	groups, err := unix.Getgroups()
+	if err != nil {
+		util.Fatalf("reading supplementary groups: %v", err)
+	}
+	log.Debugf("Process running as uid=%d euid=%d gid=%d egid=%d groups=%v canSetGroups=%t", ruid, euid, rgid, egid, groups, canSetGroups)
 
 	// Initialize filters.
 	opts := filter.Options{
@@ -434,6 +458,7 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		DirectFS:         conf.DirectFS,
 		LisafsNeeded:     lisafsNeeded,
 		CgoEnabled:       config.CgoEnabled,
+		VendorSyscalls:   filter.HostVendorSyscalls(),
 	}
 	for _, e := range extension.Registered() {
 		opts.ExtraRules = append(opts.ExtraRules, e.SeccompRules())
@@ -442,7 +467,7 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		util.Fatalf("installing seccomp filters: %v", err)
 	}
 
-	return g.serve(spec, conf, root, ruid, euid, rgid, egid, virtualOwners, lazyFiles)
+	return g.serve(spec, conf, root, ruid, euid, rgid, egid, groups, canSetGroups, virtualOwners, lazyFiles)
 }
 
 func loadRootfsLazyFiles(spec *specs.Spec, packFD, rootFD, stateFD int, prefix string) (*ttcpack.LazyDirectory, error) {
@@ -516,7 +541,7 @@ func goferMountPath(conf *config.Config, source, destination string) string {
 	}
 	return destination
 }
-func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid int, euid int, rgid int, egid int, virtualOwners *ownership.Manifest, lazyFiles *ttcpack.LazyDirectory) subcommands.ExitStatus {
+func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid int, euid int, rgid int, egid int, groups []int, canSetGroups bool, virtualOwners *ownership.Manifest, lazyFiles *ttcpack.LazyDirectory) subcommands.ExitStatus {
 	type connectionConfig struct {
 		sock          *unet.Socket
 		mountPath     string
@@ -602,6 +627,8 @@ func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid i
 		EUID:                 euid,
 		RGID:                 rgid,
 		EGID:                 egid,
+		Groups:               groups,
+		CanSetGroups:         canSetGroups,
 		TrustedRootOwnership: conf.UnsafeNoHostIsolation,
 	}
 	// The dev gofer connection exists to open host device files on behalf of

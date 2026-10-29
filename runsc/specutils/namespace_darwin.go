@@ -52,6 +52,10 @@ func SetUIDGIDMappings(cmd *exec.Cmd, s *specs.Spec) {}
 
 func HasCapabilities(cs ...capability.Cap) bool { return false }
 
+// SetgroupsAllowed reports that a Darwin gofer does not take an application's
+// supplementary groups: Darwin has no per-thread groups.
+func SetgroupsAllowed() bool { return false }
+
 // Darwin has no Linux user namespace in which to acquire capabilities.
 func MaybeRunAsRoot() error { return nil }
 

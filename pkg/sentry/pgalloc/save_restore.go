@@ -223,7 +223,7 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		// (1) All of decommitPendingFR lies within a single huge page.
 		// (2) decommitPendingFR.End is hugepage-aligned iff
 		// decommitPendingFR.Length() == 0.
-		end := off + hostarch.PageSize
+		end := off + uint64(hostarch.PageSize)
 		if decommitPendingFR.End == off {
 			// Merge with the existing range. By invariants, the page {off,
 			// end} must be within the same huge page as the rest of
@@ -491,6 +491,7 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 			}); err != nil {
 				return err
 			}
+			bytesSaved += maFR.Length()
 		}
 		durPages := time.Duration(gohacks.Nanotime() - timePagesStart)
 		log.Infof("MemoryFile(%p): saved pages in %s (%d bytes, %.3f MB/s)", f, durPages, bytesSaved, float64(bytesSaved)*1e-6/durPages.Seconds())

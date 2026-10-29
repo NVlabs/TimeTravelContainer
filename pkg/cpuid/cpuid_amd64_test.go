@@ -192,6 +192,52 @@ func TestHasFeature(t *testing.T) {
 	}
 }
 
+func TestFeatureNames(t *testing.T) {
+	// SPEC_CTRL does not appear in cpuinfo, so FlagString omits it but
+	// FeatureNames must include it. Block 7 comes after block 1 in
+	// linuxBlockOrder, so it must also come last regardless of insertion order.
+	fs := makeFeatureSet(X86FeatureSPEC_CTRL, X86FeaturePAE, X86FeatureFPU)
+	if got, want := fs.FeatureNames(), []string{"fpu", "pae", "spec_ctrl"}; !slices.Equal(got, want) {
+		t.Errorf("FeatureNames() = %v, want %v", got, want)
+	}
+	if got, want := fs.FlagString(), "fpu pae"; got != want {
+		t.Errorf("FlagString() = %q, want %q", got, want)
+	}
+	if got := makeFeatureSet().FeatureNames(); len(got) != 0 {
+		t.Errorf("FeatureNames() of empty set = %v, want empty", got)
+	}
+}
+
+func TestFeatureMask(t *testing.T) {
+	// X86FeatureSSE3 is block 0 bit 0; X86FeatureFPU is block 1 bit 0;
+	// X86FeaturePAE is block 1 bit 6; X86FeatureSPEC_CTRL is block 7 bit 26;
+	// X86FeatureAVX_VNNI is block 8 bit 4.
+	fs := makeFeatureSet(X86FeatureSSE3, X86FeatureFPU, X86FeaturePAE, X86FeatureSPEC_CTRL, X86FeatureAVX_VNNI)
+	const wantMask = "0x00000001,0x00000041,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x04000000,0x00000010"
+	if got := fs.FeatureMaskString(); got != wantMask {
+		t.Errorf("FeatureMaskString() = %q, want %q", got, wantMask)
+	}
+	names := fs.FeatureNames()
+	gotFromNames, err := FeatureMaskStringFromNames(names)
+	if err != nil {
+		t.Fatalf("FeatureMaskStringFromNames(%v) unexpected error: %v", names, err)
+	}
+	if gotFromNames != wantMask {
+		t.Errorf("FeatureMaskStringFromNames(%v) = %q, want %q", names, gotFromNames, wantMask)
+	}
+
+	const wantEmptyMask = "0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000,0x00000000"
+	if got := makeFeatureSet().FeatureMaskString(); got != wantEmptyMask {
+		t.Errorf("FeatureMaskString() of empty set = %q, want %q", got, wantEmptyMask)
+	}
+	if got, err := FeatureMaskStringFromNames(nil); err != nil || got != wantEmptyMask {
+		t.Errorf("FeatureMaskStringFromNames(nil) = (%q, %v), want (%q, nil)", got, err, wantEmptyMask)
+	}
+	if _, err := FeatureMaskStringFromNames([]string{"fpu", "nonexistent"}); err == nil {
+		t.Errorf("FeatureMaskStringFromNames with unknown feature succeeded, want error")
+	}
+}
+
 func TestAdd(t *testing.T) {
 	// Test a basic insertion into the FeatureSet.
 	testFeatures := makeFeatureSet(X86FeatureCLFSH)
@@ -257,6 +303,38 @@ func TestRemove(t *testing.T) {
 	testFeatures.Function.(Static).Remove(X86FeatureRDRAND)
 	if !testFeatures.HasFeature(X86FeatureFPU) {
 		t.Errorf("Remove failed, got %q want %q", testFeatures.FlagString(), justFPU.FlagString())
+	}
+}
+
+func TestNormalizeHidesAMX(t *testing.T) {
+	amx := []Feature{X86FeatureAMX_BF16, X86FeatureAMX_TILE, X86FeatureAMX_INT8}
+	s := make(Static)
+	for _, f := range append([]Feature{X86FeatureXSAVE}, amx...) {
+		s.Add(f)
+	}
+	xsave := In{Eax: uint32(xSaveInfo)}
+	s.Set(xsave, Out{Eax: uint32(XSAVEFeatureAVX | XCR0AmxCfgMask | XCR0AmxDataMask)})
+	avx := In{Eax: uint32(xSaveInfo), Ecx: 2}
+	s.Set(avx, Out{Eax: 256, Ebx: 576})
+	s.Set(In{Eax: uint32(xSaveInfo), Ecx: amxTileCfgComponent}, Out{Eax: 64, Ebx: 2752})
+	s.Set(In{Eax: uint32(xSaveInfo), Ecx: amxTileDataComponent}, Out{Eax: 8192, Ebx: 2816})
+
+	fs := s.ToFeatureSet()
+	for _, f := range amx {
+		if fs.HasFeature(f) {
+			t.Errorf("%v is advertised", f)
+		}
+	}
+	if got, want := fs.Query(xsave).Eax, uint32(XSAVEFeatureAVX); got != want {
+		t.Errorf("XCR0 bits: got %#x, want %#x", got, want)
+	}
+	if got, want := fs.Query(avx), (Out{Eax: 256, Ebx: 576}); got != want {
+		t.Errorf("AVX subleaf: got %+v, want %+v", got, want)
+	}
+	for _, i := range []uint32{amxTileCfgComponent, amxTileDataComponent} {
+		if got := fs.Query(In{Eax: uint32(xSaveInfo), Ecx: i}); got != (Out{}) {
+			t.Errorf("AMX subleaf %d: got %+v, want zero", i, got)
+		}
 	}
 }
 

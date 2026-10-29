@@ -44,6 +44,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -528,8 +529,17 @@ type Kernel struct {
 	// Names are preserved between save/restore session, while IDs can change.
 	//
 	// Mapping: cid -> name.
-	// It's protected by extMu.
+	//
+	// +checklocks:extMu
 	containerNames map[string]string
+
+	// containerEnvs stores the initial environment variables of each container
+	// based on its container ID.
+	//
+	// Mapping: cid -> env.
+	//
+	// +checklocks:extMu
+	containerEnvs map[string][]string
 
 	// Lock order: checkpointMu precedes CheckpointWait.mu.
 	checkpointMu sync.Mutex `state:"nosave"`
@@ -790,7 +800,10 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 	k.MmapRndBits.Store(MmapRndBitsMin)
 	k.MmapRndCompatBits.Store(MmapRndCompatBitsMin)
 	k.ebpf.Init()
+	k.extMu.Lock()
 	k.containerNames = make(map[string]string)
+	k.containerEnvs = make(map[string][]string)
+	k.extMu.Unlock()
 	k.CheckpointWait.k = k
 
 	ctx := k.SupervisorContext()
@@ -912,6 +925,11 @@ func (k *Kernel) quiescePausedAnd(ctx context.Context, f func() error) error {
 	k.mf.StartEvictions()
 	k.mf.WaitForEvictions()
 
+	// A live fork, a dehydration or a distributed fork, like a checkpoint
+	// (see SaveTo), resumes the tasks it quiesced in syscalls with a
+	// restart_syscall that their guest did not issue.
+	k.armSeccompRestartSyscallBypasses()
+
 	return f()
 }
 
@@ -957,6 +975,10 @@ func savePrivateMFs(ctx context.Context, w io.Writer, mfsToSave map[checkpoint.R
 // +checklocksexclude:k.runningTasksMu
 // +checklocksexclude:k.tasks.mu
 func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages, resume bool, fsOpts *FSSaveOpts) error {
+	// The bypass is part of the saved task state, so it is armed before the
+	// state is written and covers both resuming after the save and restoring.
+	k.armSeccompRestartSyscallBypasses()
+
 	stateFileCleanup := cleanup.Make(func() { stateFile.Close() })
 	defer stateFileCleanup.Clean()
 
@@ -1014,10 +1036,13 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 	}
 
 	mfsToSaveActual := mfsToSave
-	var matchCtx *fsCheckpointMatchContext
+	var matchCtxs []*fsCheckpointMatchContext
 	if fsOpts != nil {
-		matchCtx = k.newFSCheckpointMatchContext(ctx, fsOpts.Paths)
-		mfsToSaveActual = filterMFsToSave(mfsToSave, matchCtx)
+		matchCtxs = make([]*fsCheckpointMatchContext, len(fsOpts.Bundles))
+		for i := range fsOpts.Bundles {
+			matchCtxs[i] = k.newFSCheckpointMatchContext(ctx, fsOpts.Bundles[i].Paths)
+		}
+		mfsToSaveActual = filterMFsToSave(mfsToSave, matchCtxs)
 	}
 
 	parallelMFSave := pagesMetadata != nil
@@ -1073,8 +1098,10 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 
 	if fsOpts != nil {
 		fsSaveStart := time.Now()
-		if err := k.fsSaveLocked(ctx, fsOpts, mfsToSave, matchCtx); err != nil {
-			return fmt.Errorf("failed to save split filesystem: %w", err)
+		for i := range fsOpts.Bundles {
+			if err := k.fsSaveLocked(ctx, &fsOpts.Bundles[i], fsOpts.RunscVersion, mfsToSave, matchCtxs[i]); err != nil {
+				return fmt.Errorf("failed to save split filesystem bundle %d: %w", i, err)
+			}
 		}
 		log.Infof("Split filesystem save took [%s].", time.Since(fsSaveStart))
 		fsCleanup.Release()
@@ -1183,6 +1210,27 @@ func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata
 	}
 	log.Infof("Memory files save took [%s].", time.Since(memoryStart))
 	return nil
+}
+
+// armSeccompRestartSyscallBypasses arms Task.bypassSeccompRestartSyscall for
+// every task that a checkpoint quiesced outside an internal stop.
+//
+// Preconditions: The kernel must be paused.
+//
+// +checklocksexclude:k.tasks.mu
+func (k *Kernel) armSeccompRestartSyscallBypasses() {
+	k.tasks.mu.RLock()
+	defer k.tasks.mu.RUnlock()
+	if k.tasks.Root == nil {
+		return
+	}
+	for t := range k.tasks.Root.tids {
+		t.tg.signalHandlers.mu.Lock()
+		if t.stop == nil {
+			t.armSeccompRestartSyscallBypass()
+		}
+		t.tg.signalHandlers.mu.Unlock()
+	}
 }
 
 // Preconditions: The kernel must be paused.
@@ -1764,6 +1812,12 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 	}
 
 	// Success.
+	if args.Origin != OriginExec {
+		if k.containerEnvs == nil {
+			k.containerEnvs = make(map[string][]string)
+		}
+		k.containerEnvs[args.ContainerID] = slices.Clone(args.Envv)
+	}
 	cu.Release()
 	tgid := k.tasks.Root.IDOfThreadGroup(tg)
 	// A namespace with a reserved init TID never gets a global init.
@@ -3061,6 +3115,16 @@ func (k *Kernel) RestoreContainerMapping(containerIDs map[string]string) {
 	k.extMu.Lock()
 	defer k.extMu.Unlock()
 
+	newContainerEnvs := make(map[string][]string, len(k.containerEnvs))
+	for oldCID, env := range k.containerEnvs {
+		if name, ok := k.containerNames[oldCID]; ok {
+			if newCID, ok := containerIDs[name]; ok {
+				newContainerEnvs[newCID] = env
+			}
+		}
+	}
+	k.containerEnvs = newContainerEnvs
+
 	// Delete mapping from old session and replace with new values.
 	k.containerNames = make(map[string]string)
 	for name, cid := range containerIDs {
@@ -3080,11 +3144,35 @@ func (k *Kernel) EBPF() *ebpf.Registry {
 	return &k.ebpf
 }
 
-func filterMFsToSave(mfsToSave map[checkpoint.ResourceID]*pgalloc.MemoryFile, matchCtx *fsCheckpointMatchContext) map[checkpoint.ResourceID]*pgalloc.MemoryFile {
+// SetContainerEnv sets the environment variables for a given container ID.
+func (k *Kernel) SetContainerEnv(cid string, env []string) {
+	k.extMu.Lock()
+	defer k.extMu.Unlock()
+	if k.containerEnvs == nil {
+		k.containerEnvs = make(map[string][]string)
+	}
+	k.containerEnvs[cid] = slices.Clone(env)
+}
+
+// SpecEnviron returns the environment variables for a given container ID.
+func (k *Kernel) SpecEnviron(cid string) []string {
+	k.extMu.Lock()
+	defer k.extMu.Unlock()
+	return slices.Clone(k.containerEnvs[cid])
+}
+
+func filterMFsToSave(mfsToSave map[checkpoint.ResourceID]*pgalloc.MemoryFile, matchCtxs []*fsCheckpointMatchContext) map[checkpoint.ResourceID]*pgalloc.MemoryFile {
 	mfsToSaveActual := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile)
 	for id, mf := range mfsToSave {
-		_, isTmpfs := matchCtx.tmpfsResourceIDs[id]
-		if !matchesPaths(id, matchCtx.pathsMap, isTmpfs) {
+		matched := false
+		for _, matchCtx := range matchCtxs {
+			_, isTmpfs := matchCtx.tmpfsResourceIDs[id]
+			if matchesPaths(id, matchCtx.pathsMap, isTmpfs) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
 			mfsToSaveActual[id] = mf
 		}
 	}

@@ -596,7 +596,9 @@ type Args struct {
 	// If SaveCheckpointGofer is true, Args.SaveFDs contains only one FD, which
 	// is a socket connected to a checkpoint gofer.
 	SaveCheckpointGofer bool
-	// FSRestoreFDs are FDs used for filesystem checkpoint restore.
+	// FSRestoreFDs are FDs used for filesystem checkpoint restore. For local
+	// checkpoints, contains 4 FDs (manifest, multi-tar, pages metadata, pages)
+	// per bundle.
 	FSRestoreFDs []*fd.FD
 	// If FSRestoreCheckpointGofer is true, Args.FSRestoreFDs contains only one
 	// FD, which is a socket connected to a checkpoint gofer.
@@ -816,7 +818,7 @@ func New(args Args) (*Loader, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to set up filesystem checkpoint restore: %w", err)
 		}
-		fsr, err := startFSRestore(&fsrOpts)
+		fsr, err := startFSRestore(fsrOpts)
 		if err != nil {
 			return nil, fmt.Errorf("failed to start filesystem checkpoint restore: %w", err)
 		}
@@ -952,7 +954,7 @@ func New(args Args) (*Loader, error) {
 		}
 		unix.Close(args.CPUDMALatencyFD)
 	}
-	p, err := createPlatform(args.Conf, args.NumCPU, args.Device, args.ID, args.StartupTimer, &l.pinRing)
+	p, err := createPlatform(args.Conf, args.NumCPU, args.Device, args.ID, args.StartupTimer, &l.pinRing, 0 /* tscOffset */)
 	if err != nil {
 		return nil, fmt.Errorf("creating platform: %w", err)
 	}
@@ -1543,10 +1545,10 @@ func (l *Loader) restoredKernelPlatform() (platform.Platform, error) {
 	if l.root.conf.Platform == "kvm" {
 		return l.k.Platform, nil
 	}
-	return createPlatform(l.root.conf, l.root.applicationCores, nil, l.sandboxID, nil, nil)
+	return createPlatform(l.root.conf, l.root.applicationCores, nil, l.sandboxID, nil, nil, 0 /* tscOffset */)
 }
 
-func createPlatform(conf *config.Config, numCPU int, deviceFile *fd.FD, sandboxID string, startupTimer *timing.Timer, pinRing *pinring.PinRing) (platform.Platform, error) {
+func createPlatform(conf *config.Config, numCPU int, deviceFile *fd.FD, sandboxID string, startupTimer *timing.Timer, pinRing *pinring.PinRing, tscOffset uint64) (platform.Platform, error) {
 	platformName := conf.Platform
 	p, err := platform.Lookup(conf.Platform)
 	if err != nil {
@@ -1554,16 +1556,32 @@ func createPlatform(conf *config.Config, numCPU int, deviceFile *fd.FD, sandboxI
 	}
 
 	log.Infof("Platform: %s", platformName)
-	return p.New(platform.Options{
+	plat, err := p.New(platform.Options{
 		DeviceFile:             deviceFile,
 		DisableSyscallPatching: platformName == "systrap" && conf.SystrapDisableSyscallPatching,
 		DisableFastPath:        platformName == "systrap" && conf.SystrapDisableFastPath,
 		ApplicationCores:       numCPU,
 		UseCPUNums:             platformName == "kvm" && conf.UseCPUNums,
+		TSCOffset:              tscOffset,
 		SandboxID:              sandboxID,
 		StartupTimer:           startupTimer,
 		PinRing:                pinRing,
 	})
+	if err != nil {
+		return nil, err
+	}
+	// Sentry timekeeping must run in the same TSC domain as the guest, so
+	// publish the offset the platform actually applied. Platforms that cannot
+	// offset the guest TSC leave the sentry in the host TSC domain, and the
+	// caller is responsible for warning about the resulting time jump.
+	var offset int64
+	if top, ok := plat.(platform.TSCAdjustablePlatform); ok {
+		offset = int64(top.TSCOffset())
+	}
+	if err := time.SetTSCOffset(offset); err != nil {
+		return nil, fmt.Errorf("platform %q: %w", platformName, err)
+	}
+	return plat, nil
 }
 
 func createMemoryFile(appHugePages bool, hostTHP HostTHP) (*pgalloc.MemoryFile, error) {
@@ -1757,6 +1775,7 @@ func (l *Loader) installSeccompFilters() error {
 			ControllerFD:          uint32(l.ctrl.srv.FD()),
 			CgoEnabled:            config.CgoEnabled,
 			PluginNetwork:         l.root.conf.Network == config.NetworkPlugin,
+			VendorSyscalls:        filter.HostVendorSyscalls(),
 		}
 		if err := filter.Install(opts, l.startupTimer); err != nil {
 			return fmt.Errorf("installing seccomp filters: %w", err)
@@ -3403,29 +3422,6 @@ func unnamedContainerNumber(containerName string) (int, bool) {
 	}
 	n, err := strconv.Atoi(s)
 	return n, err == nil
-}
-
-// +checklocksexclude:l.mu
-func (l *Loader) getContainerSpec(containerName string) *specs.Spec {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.containerSpecs[containerName]
-}
-
-// SpecEnviron returns the environment variables for the given container from
-// the container spec it was created with.
-//
-// +checklocksexclude:l.mu
-func (l *Loader) SpecEnviron(containerName string) []string {
-	spec := l.getContainerSpec(containerName)
-	if spec == nil {
-		log.Warningf("Container spec not found for container %q", containerName)
-		return nil
-	}
-	if spec.Process == nil {
-		return nil
-	}
-	return spec.Process.Env
 }
 
 // +checklocksexclude:l.mu

@@ -519,6 +519,11 @@ afterTrailingSymlink:
 		goto afterTrailingSymlink
 	}
 	if linuxerr.Equals(linuxerr.ENOENT, err) {
+		// tmpfs never calls VFS.InvalidateDentry(), so parentDir.dentry can
+		// only be dead if it was deleted.
+		if parentDir.dentry.vfsd.IsDead() {
+			return nil, linuxerr.ENOENT
+		}
 		// Already checked for searchability above; now check for writability.
 		if err := parentDir.inode.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
 			return nil, err
@@ -820,9 +825,9 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	} else {
 		return lookupErr
 	}
-	// tmpfs never calls VFS.InvalidateDentry(), so newParentDir.dentry can
-	// only be dead if it was deleted.
-	if newParentDir.dentry.vfsd.IsDead() {
+	// tmpfs never calls VFS.InvalidateDentry(), so oldParentDir.dentry and
+	// newParentDir.dentry can only be dead if they were deleted.
+	if oldParentDir.dentry.vfsd.IsDead() || newParentDir.dentry.vfsd.IsDead() {
 		return linuxerr.ENOENT
 	}
 

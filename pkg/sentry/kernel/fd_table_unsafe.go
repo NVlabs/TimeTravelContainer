@@ -91,6 +91,7 @@ func (f *FDTable) CurrentMaxFDs() int {
 
 // set sets the file description referred to by fd to file. If file is non-nil,
 // f takes a reference on it. If file is nil, the file entry at fd is cleared.
+// Clearing an entry does not allocate table storage.
 // If set replaces an existing file description that is different from `file`,
 // it returns it with the FDTable's reference transferred to the caller, which
 // must call f.drop on the returned file after unlocking f.mu.

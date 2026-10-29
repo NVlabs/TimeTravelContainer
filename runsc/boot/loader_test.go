@@ -48,6 +48,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/eventfd"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/pipefs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/signalfd"
@@ -464,12 +465,12 @@ func TestRunInternalTTYLiveFork(t *testing.T) {
 			}
 			return nil
 		}
-		_, err := l.executeAsync(&control.ExecArgs{
+		_, err := l.executeAsync(&control.ExecArgs{ExecArgs: controlapi.ExecArgs{
 			BranchID: DefaultBranchID, Filename: "/bin/sleep", Argv: []string{"/bin/sleep", "30"},
 			Envv: []string{"PATH=/bin:/usr/bin"}, WorkingDirectory: "/",
 			KUID: auth.RootKUID, KGID: auth.RootKGID, ExecID: execID,
 			InternalConsoleID: consoleID, ContainerID: l.sandboxID,
-		})
+		}})
 		l.family.testOnlyExecFailureInjector = nil
 		if !errors.Is(err, injected) {
 			t.Fatalf("exec failure at %s: got %v", stage, err)
@@ -488,12 +489,12 @@ func TestRunInternalTTYLiveFork(t *testing.T) {
 		transientExecID    = "transient-exec"
 		transientConsoleID = "transient-console"
 	)
-	if _, err := l.executeAsync(&control.ExecArgs{
+	if _, err := l.executeAsync(&control.ExecArgs{ExecArgs: controlapi.ExecArgs{
 		BranchID: DefaultBranchID, Filename: "/bin/true", Argv: []string{"/bin/true"},
 		Envv: []string{"PATH=/bin:/usr/bin"}, WorkingDirectory: "/",
 		KUID: auth.RootKUID, KGID: auth.RootKGID, ExecID: transientExecID,
 		InternalConsoleID: transientConsoleID, ContainerID: l.sandboxID,
-	}); err != nil {
+	}}); err != nil {
 		t.Fatalf("executing transient session: %v", err)
 	}
 	if status, err := l.family.WaitExecSession(&ExecSessionArgs{BranchID: DefaultBranchID, ExecID: transientExecID}, nil); err != nil || status != 0 {
@@ -525,13 +526,13 @@ func TestRunInternalTTYLiveFork(t *testing.T) {
 		}
 		return nil
 	}
-	_, err = l.executeAsync(&control.ExecArgs{
+	_, err = l.executeAsync(&control.ExecArgs{ExecArgs: controlapi.ExecArgs{
 		Filename: "/bin/sleep", Argv: []string{"/bin/sleep", "30"},
 		Envv: []string{"PATH=/bin:/usr/bin"}, WorkingDirectory: "/",
 		KUID: auth.RootKUID, KGID: auth.RootKGID,
 		ContainerID: l.sandboxID,
-		FilePayload: control.NewFilePayload(map[int]*os.File{0: stdinFile, 1: outputFile, 2: outputFile}, nil),
-	})
+		FilePayload: controlapi.NewFilePayload(map[int]*os.File{0: stdinFile, 1: outputFile, 2: outputFile}, nil),
+	}})
 	l.family.testOnlyExecFailureInjector = nil
 	if !errors.Is(err, injectedImportFailure) {
 		t.Fatalf("donated-FD post-import failure: %v", err)
@@ -562,7 +563,7 @@ func TestRunInternalTTYLiveFork(t *testing.T) {
 		execSessionID = "exec-one"
 		execConsoleID = "exec-console"
 	)
-	execPID, err := l.executeAsync(&control.ExecArgs{
+	execPID, err := l.executeAsync(&control.ExecArgs{ExecArgs: controlapi.ExecArgs{
 		BranchID:          DefaultBranchID,
 		Filename:          "/bin/sleep",
 		Argv:              []string{"/bin/sleep", "30"},
@@ -574,7 +575,7 @@ func TestRunInternalTTYLiveFork(t *testing.T) {
 		InternalConsoleID: execConsoleID,
 		StdioIsPty:        true,
 		ContainerID:       l.sandboxID,
-	})
+	}})
 	if err != nil {
 		t.Fatalf("executing process with an internal PTY: %v", err)
 	}
@@ -600,7 +601,7 @@ func TestRunInternalTTYLiveFork(t *testing.T) {
 		pipeExecSessionID = "pipe-exec"
 		pipeExecConsoleID = "pipe-exec-console"
 	)
-	pipeExecPID, err := l.executeAsync(&control.ExecArgs{
+	pipeExecPID, err := l.executeAsync(&control.ExecArgs{ExecArgs: controlapi.ExecArgs{
 		BranchID:          DefaultBranchID,
 		Filename:          "/bin/sleep",
 		Argv:              []string{"/bin/sleep", "30"},
@@ -611,7 +612,7 @@ func TestRunInternalTTYLiveFork(t *testing.T) {
 		ExecID:            pipeExecSessionID,
 		InternalConsoleID: pipeExecConsoleID,
 		ContainerID:       l.sandboxID,
-	})
+	}})
 	if err != nil {
 		t.Fatalf("executing process with internal pipes: %v", err)
 	}
@@ -649,7 +650,7 @@ func TestRunInternalTTYLiveFork(t *testing.T) {
 	if len(legacyExecIDs) != 0 {
 		t.Fatalf("managed main-branch execs leaked into legacy Loader.processes: %+v", legacyExecIDs)
 	}
-	if _, err := l.executeAsync(&control.ExecArgs{
+	if _, err := l.executeAsync(&control.ExecArgs{ExecArgs: controlapi.ExecArgs{
 		BranchID:          DefaultBranchID,
 		Filename:          "/bin/sleep",
 		Argv:              []string{"/bin/sleep", "30"},
@@ -660,7 +661,7 @@ func TestRunInternalTTYLiveFork(t *testing.T) {
 		ExecID:            execSessionID,
 		InternalConsoleID: "duplicate-exec-console",
 		ContainerID:       l.sandboxID,
-	}); err == nil {
+	}}); err == nil {
 		t.Fatal("duplicate managed exec session ID was accepted")
 	}
 
@@ -2104,7 +2105,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	if err := l.family.Resume(childInfo.ID); err != nil {
 		t.Fatalf("resuming child: %v", err)
 	}
-	var childProcesses []*control.Process
+	var childProcesses []*controlapi.Process
 	if err := l.family.Processes(childInfo.ID, l.root.cid, &childProcesses); err != nil {
 		t.Fatalf("listing child processes: %v", err)
 	}

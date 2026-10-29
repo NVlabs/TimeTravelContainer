@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/bits"
 	"os"
 	"runtime"
 	"slices"
@@ -39,6 +40,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/proc"
@@ -74,6 +76,17 @@ const (
 	// branch checkpoint. Its presence distinguishes TTC restoration from the
 	// upstream behavior that terminates restored exec processes.
 	TTCExecSessionsKey = "ttc_exec_sessions"
+
+	// TSC snapshot metadata keys. These are written by the save side in
+	// pkg/sentry/state and consumed by computeTSCOffset.
+	//
+	// The cycle is in the guest TSC domain, i.e. it is the TSC value the
+	// application observed at save time, including any guest TSC offset
+	// applied by the platform. This keeps the application TSC continuous
+	// across repeated save/restore cycles.
+	metadataTSCSnapshotCycleKey        = "gvisor_tsc_snapshot_cycle"
+	metadataTSCSnapshotFrequencyKey    = "gvisor_tsc_snapshot_frequency"
+	metadataTSCSnapshotRealtimeNsecKey = "gvisor_tsc_snapshot_realtime_nsec"
 
 	// annotationCheckpointResume indicates whether the sandbox should continue running after the
 	// checkpoint. Optional, defaults to false.
@@ -153,7 +166,7 @@ func (l *Loader) SaveAsync() (err error) {
 
 // saveOptsFromSpec returns the saveOpts based on annotations from the spec. `fds` are
 // no longer needed and can be closed after this is called.
-func saveOptsFromSpec(spec *specs.Spec, fds []*fd.FD, useCheckpointGofer bool) (*control.SaveOpts, error) {
+func saveOptsFromSpec(spec *specs.Spec, fds []*fd.FD, useCheckpointGofer bool) (*controlapi.SaveOpts, error) {
 	// Convert the FDs to files which is required by the saveOpts.
 	files := make([]*os.File, len(fds))
 	for i, fd := range fds {
@@ -169,7 +182,7 @@ func saveOptsFromSpec(spec *specs.Spec, fds []*fd.FD, useCheckpointGofer bool) (
 		return nil, err
 	}
 
-	saveOpts := &control.SaveOpts{
+	saveOpts := &controlapi.SaveOpts{
 		AppMFExcludeCommittedZeroPages: specutils.AnnotationToBool(spec, annotationCheckpointExcludeCommittedZeroPages),
 		FilePayload: urpc.FilePayload{
 			Files: files,
@@ -190,14 +203,14 @@ func saveOptsFromSpec(spec *specs.Spec, fds []*fd.FD, useCheckpointGofer bool) (
 	}
 
 	if spec.Annotations[annotationSaveRestoreExecArgv] != "" {
-		saveRestoreExecTimeout := control.DefaultSaveRestoreExecTimeout
+		saveRestoreExecTimeout := controlapi.DefaultSaveRestoreExecTimeout
 		if spec.Annotations[annotationSaveRestoreExecTimeout] != "" {
 			saveRestoreExecTimeout, err = time2.ParseDuration(spec.Annotations[annotationSaveRestoreExecTimeout])
 			if err != nil {
 				return nil, fmt.Errorf("failed to parse save-restore-exec-timeout: %w", err)
 			}
 		}
-		saveOpts.ExecOpts = control.SaveRestoreExecOpts{
+		saveOpts.ExecOpts = controlapi.SaveRestoreExecOpts{
 			Argv:    spec.Annotations[annotationSaveRestoreExecArgv],
 			Timeout: saveRestoreExecTimeout,
 		}
@@ -385,6 +398,7 @@ func (r *restorer) restore(l *Loader) error {
 	}
 	r.timer.Reached("specs validated")
 
+	tscOffset, willJumpBackwards := r.computeTSCOffset()
 	var (
 		p        platform.Platform
 		reusable platform.RestoreReuser
@@ -393,10 +407,17 @@ func (r *restorer) restore(l *Loader) error {
 	if candidate, ok := l.k.Platform.(platform.RestoreReuser); ok {
 		reusable = candidate
 	} else {
-		p, err = createPlatform(l.root.conf, l.root.applicationCores, r.deviceFile, l.sandboxID, r.timer, &l.pinRing)
+		p, err = createPlatform(l.root.conf, l.root.applicationCores, r.deviceFile, l.sandboxID, r.timer, &l.pinRing, tscOffset)
 		if err != nil {
 			return fmt.Errorf("creating platform: %v", err)
 		}
+	}
+	runs := p
+	if reusable != nil {
+		runs = reusable
+	}
+	if _, ok := runs.(platform.TSCAdjustablePlatform); !ok && willJumpBackwards {
+		log.Warningf("Platform %q does not support TSC offsetting; host TSC is behind snapshot base cycle, timestamps will go backwards", l.root.conf.Platform)
 	}
 
 	// Start the old watchdog before replacing it with a new one below.
@@ -451,6 +472,10 @@ func (r *restorer) restore(l *Loader) error {
 				l.hostinetNetSNMPFile = nil
 			}
 		}()
+	}
+
+	if err := l.pinRing.Finalize(); err != nil {
+		log.Warningf("Cannot pin files to the pin ring: %v. This slows down gVisor sandbox teardown.", err)
 	}
 
 	// Seccomp filters have to be applied before vfs restore and before parsing
@@ -684,6 +709,11 @@ func (r *restorer) restore(l *Loader) error {
 	}
 
 	l.k.RestoreContainerMapping(l.containerIDs)
+	for cid, spec := range specsByCID {
+		if spec != nil && spec.Process != nil {
+			l.k.SetContainerEnv(cid, spec.Process.Env)
+		}
+	}
 	if ttcCheckpoint {
 		if err := l.family.RestoreLoaderExecSessions(restoredExecSessions); err != nil {
 			return fmt.Errorf("restoring TTC exec sessions: %w", err)
@@ -818,7 +848,80 @@ func (r *restorer) calculateWallTimeSavings(s *sentryapi.Savings) error {
 	return nil
 }
 
-func (l *Loader) save(o *control.SaveOpts) error {
+// computeTSCOffset returns the guest TSC offset to apply on restore, and whether
+// timestamps will go backwards if the offset is not applied (i.e. host TSC is
+// behind the snapshot base cycle).
+//
+// If the snapshot captured TSC timekeeping parameters and host timekeeping
+// parameters are available, the offset is computed based on elapsed real
+// time and host TSC cycle delta.
+func (r *restorer) computeTSCOffset() (uint64, bool) {
+	cycleStr, ok := r.metadata[metadataTSCSnapshotCycleKey]
+	if !ok {
+		return 0, false
+	}
+	freqStr, ok := r.metadata[metadataTSCSnapshotFrequencyKey]
+	if !ok {
+		return 0, false
+	}
+	realtimeStr, ok := r.metadata[metadataTSCSnapshotRealtimeNsecKey]
+	if !ok {
+		return 0, false
+	}
+
+	baseCycle, err := strconv.ParseUint(cycleStr, 10, 64)
+	if err != nil {
+		log.Warningf("Failed to parse snapshot TSC cycle %q: %v", cycleStr, err)
+		return 0, false
+	}
+	baseFreq, err := strconv.ParseUint(freqStr, 10, 64)
+	if err != nil {
+		log.Warningf("Failed to parse snapshot TSC frequency %q: %v", freqStr, err)
+		return 0, false
+	}
+	baseRealtime, err := strconv.ParseUint(realtimeStr, 10, 64)
+	if err != nil {
+		log.Warningf("Failed to parse snapshot TSC realtime %q: %v", realtimeStr, err)
+		return 0, false
+	}
+
+	curCycle, curRealtime, ok := hostTSCRealtime()
+	if !ok {
+		return 0, false
+	}
+
+	offset, ok := tscOffsetFromSnapshot(baseCycle, baseFreq, baseRealtime, curCycle, curRealtime)
+	if !ok {
+		return 0, false
+	}
+	log.Infof("Computed snapshot TSC offset: %d", offset)
+	return offset, curCycle < baseCycle
+}
+
+// tscOffsetFromSnapshot returns the guest TSC offset that places the guest TSC
+// at baseCycle plus the cycles elapsed at baseFreq since baseRealtime, given
+// that the host TSC reads curCycle at curRealtime. It returns false if the
+// elapsed cycle count does not fit in 64 bits.
+func tscOffsetFromSnapshot(baseCycle, baseFreq, baseRealtime, curCycle, curRealtime uint64) (uint64, bool) {
+	const nsPerSec = 1_000_000_000
+	deltaNs := int64(curRealtime) - int64(baseRealtime)
+	if deltaNs < 0 {
+		log.Warningf("Realtime clock (%d ns) is behind the snapshot realtime (%d ns), assuming no time passed", curRealtime, baseRealtime)
+		deltaNs = 0
+	}
+	// deltaNs * baseFreq overflows 64 bits after only a few seconds, so
+	// compute it with a 128-bit intermediate.
+	hi, lo := bits.Mul64(uint64(deltaNs), baseFreq)
+	if hi >= nsPerSec {
+		log.Warningf("Elapsed TSC cycles overflow: %d ns at %d Hz", deltaNs, baseFreq)
+		return 0, false
+	}
+	deltaCycles, _ := bits.Div64(hi, lo, nsPerSec)
+	oldMachineCycles := baseCycle + deltaCycles
+	return oldMachineCycles - curCycle, true
+}
+
+func (l *Loader) save(o *controlapi.SaveOpts) error {
 	saveOpts, err := control.ConvertToStateSaveOpts(o)
 	if err != nil {
 		l.k.OnCheckpointAttempt(err)
@@ -833,13 +936,13 @@ func (l *Loader) save(o *control.SaveOpts) error {
 }
 
 // saveWithOpts saves the kernel with the given options.
-func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *control.SaveRestoreExecOpts) (err error) {
+func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *controlapi.SaveRestoreExecOpts) (err error) {
 	return l.saveKernelWithOpts(l.k, l.watchdog, nil, saveOpts, execOpts)
 }
 
 // saveKernelWithOpts writes one selected Kernel. Branch selection happens
 // before this function; live fork continues to use its in-memory state pipe.
-func (l *Loader) saveKernelWithOpts(k *kernel.Kernel, dog *watchdog.Watchdog, execSessions []ExecSessionInfo, saveOpts *state.SaveOpts, execOpts *control.SaveRestoreExecOpts) (err error) {
+func (l *Loader) saveKernelWithOpts(k *kernel.Kernel, dog *watchdog.Watchdog, execSessions []ExecSessionInfo, saveOpts *state.SaveOpts, execOpts *controlapi.SaveRestoreExecOpts) (err error) {
 	// Fully serialize save operations, including post-save cleanup. See
 	// Loader.saveMu.
 	l.saveMu.Lock()
@@ -884,6 +987,9 @@ func (l *Loader) saveKernelWithOpts(k *kernel.Kernel, dog *watchdog.Watchdog, ex
 	if l.noRootContainer.enabled {
 		saveOpts.Metadata[noRootContainerKey] = "true"
 	}
+
+	// Save the sandbox's CPU features.
+	saveOpts.Metadata[sentryapi.CPUFeaturesKey] = strings.Join(l.k.FeatureSet().FeatureNames(), ",")
 
 	// Save container specs.
 	specsStr, err := specutils.ConvertSpecsToString(l.GetContainerSpecs())

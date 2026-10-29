@@ -29,6 +29,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/runsc/specutils"
 )
 
 func containerHostSocketPair() ([2]int, error) {
@@ -44,6 +45,17 @@ func setGoferCommandCredential(cmd *exec.Cmd, uid, gid uint32) error {
 
 func disableGoferSetgroupsForIDMapping(cmd *exec.Cmd) error {
 	cmd.SysProcAttr.GidMappingsEnableSetgroups = false
+	return nil
+}
+
+// enableGoferSetgroupsForHostUDS lets a gofer whose user namespace maps its
+// groups call setgroups(2), where the namespace allows it: connecting to a host
+// socket applies the application's supplementary groups. Allowing it also
+// makes os/exec start the gofer with no supplementary groups.
+func enableGoferSetgroupsForHostUDS(cmd *exec.Cmd) error {
+	if len(cmd.SysProcAttr.GidMappings) > 0 && specutils.SetgroupsAllowed() {
+		cmd.SysProcAttr.GidMappingsEnableSetgroups = true
+	}
 	return nil
 }
 

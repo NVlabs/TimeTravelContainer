@@ -28,6 +28,7 @@ import (
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/devices/memdev"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/fdcollector"
@@ -206,24 +207,21 @@ func invokeCudaCheckpoint(sctx context.Context, k *kernel.Kernel, proc *Proc, cu
 		mntns.DecRef(ctx)
 	})
 	args := &ExecArgs{
-		Filename: cudaCheckpointPath,
-		Argv: []string{
-			"cuda-checkpoint",
-			opFlag,
-			"--pid",
-			strconv.FormatInt(int64(pid), 10),
+		ExecArgs: controlapi.ExecArgs{
+			Filename: cudaCheckpointPath,
+			Argv: []string{
+				"cuda-checkpoint",
+				opFlag,
+				"--pid",
+				strconv.FormatInt(int64(pid), 10),
+			},
+			ContainerID: contID,
 		},
-		ContainerID:    contID,
 		MountNamespace: mntns,
 		PIDNamespace:   leader.PIDNamespace(),
 	}
-	// Provision environment variables from leader's container spec. The
-	// kernel of a live fork's branch has no saver, and gives cuda-checkpoint
-	// none.
-	contName := k.ContainerName(contID)
-	if saver := k.Saver(); saver != nil {
-		args.Envv = saver.SpecEnviron(contName)
-	}
+	// Provision environment variables from leader's container spec.
+	args.Envv = k.SpecEnviron(contID)
 
 	// Provide standard streams to cuda-checkpoint. Use /dev/null as stdin
 	// and direct cuda-checkpoint's stdout/stderr to a pipe.

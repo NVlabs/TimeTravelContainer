@@ -46,6 +46,10 @@ const rootMode = linux.FileMode(0755)
 // absent. See fs/devpts/inode.c:DEVPTS_DEFAULT_MODE.
 const defaultReplicaMode = linux.FileMode(0600)
 
+// defaultPtmxMode is the mode of ptmx when the ptmxmode mount option is absent.
+// See fs/devpts/inode.c:DEVPTS_DEFAULT_PTMX_MODE.
+const defaultPtmxMode = linux.FileMode(0000)
+
 // FilesystemType implements vfs.FilesystemType.
 //
 // +stateify savable
@@ -83,7 +87,7 @@ func (fstype *FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Vir
 	mopts := vfs.GenericParseMountOptions(opts.Data)
 	fsOpts := fileSystemOpts{
 		mode:     defaultReplicaMode,
-		ptmxMode: 0666,
+		ptmxMode: defaultPtmxMode,
 		uid:      creds.EffectiveKUID,
 		gid:      creds.EffectiveKGID,
 	}

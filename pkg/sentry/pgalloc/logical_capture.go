@@ -49,8 +49,8 @@ type CapturedPageBinding struct {
 // logicalPageInfo.Huge).
 func ValidHugePageBinding(b *CapturedPageBinding) bool {
 	return b.Huge && hostarch.IsHugePageAligned(b.OldOffset) && hostarch.IsPageAligned(b.StreamOffset) &&
-		b.Page.Sequence%pagesPerHugePage == 0 && b.Version.Sequence%pagesPerHugePage == 0 &&
-		b.Page.Sequence <= math.MaxUint64-pagesPerHugePage && b.Version.Sequence <= math.MaxUint64-pagesPerHugePage
+		b.Page.Sequence%pagesPerHugePage() == 0 && b.Version.Sequence%pagesPerHugePage() == 0 &&
+		b.Page.Sequence <= math.MaxUint64-pagesPerHugePage() && b.Version.Sequence <= math.MaxUint64-pagesPerHugePage()
 }
 
 // Length returns the number of bytes that b binds.
@@ -74,14 +74,14 @@ func BasePageBindings(bindings []CapturedPageBinding) []CapturedPageBinding {
 	if huge == 0 {
 		return bindings
 	}
-	result := make([]CapturedPageBinding, 0, len(bindings)+huge*(pagesPerHugePage-1))
+	result := make([]CapturedPageBinding, 0, len(bindings)+huge*int(pagesPerHugePage()-1))
 	for _, binding := range bindings {
 		if !binding.Huge {
 			result = append(result, binding)
 			continue
 		}
 		binding.Huge = false
-		for k := uint64(0); k < pagesPerHugePage; k++ {
+		for k := uint64(0); k < pagesPerHugePage(); k++ {
 			page := binding
 			page.OldOffset += k * hostarch.PageSize
 			page.StreamOffset += k * hostarch.PageSize

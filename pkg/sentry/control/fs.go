@@ -30,6 +30,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/control/api"
 	"gvisor.dev/gvisor/pkg/fspath"
+	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -42,14 +43,9 @@ type Fs struct {
 	Kernel *kernel.Kernel
 }
 
-// RootfsSize is logical writable-layer usage for a container root filesystem.
-type RootfsSize struct {
-	WritableBytes uint64 `json:"writable_bytes"`
-}
-
 // RootfsUpperLayerSize returns allocated bytes in the container writable
 // overlay upper without walking, serializing, or faulting in file contents.
-func RootfsUpperLayerSize(k *kernel.Kernel, containerID string, out *RootfsSize) error {
+func RootfsUpperLayerSize(k *kernel.Kernel, containerID string, out *controlapi.RootfsSize) error {
 	f := Fs{Kernel: k}
 	ctx := k.SupervisorContext()
 	mntns, err := f.mountNamespaceForContainer(containerID)
@@ -99,15 +95,6 @@ func TarFilesystemMountNamespace(k *kernel.Kernel, mntns *vfs.MountNamespace, pa
 	return nil
 }
 
-// TarRootfsUpperLayerOpts contains options for the TarRootfsUpperLayer RPC.
-type TarRootfsUpperLayerOpts struct {
-	// ContainerID identifies which container's rootfs upper layer should be
-	// serialized.
-	ContainerID string
-	// FilePayload contains the destination for output.
-	urpc.FilePayload
-}
-
 // Returns a referenced mount namespace for the given container ID,
 // or the root container if no ID is provided. Caller must DecRef the
 // returned mntns when done.
@@ -125,7 +112,7 @@ func (f *Fs) mountNamespaceForContainer(containerID string) (*vfs.MountNamespace
 
 // TarRootfsUpperLayer is a RPC stub which serializes the rootfs upper layer to
 // a tar file. When the rootfs is not an overlayfs, it returns an error.
-func (f *Fs) TarRootfsUpperLayer(o *TarRootfsUpperLayerOpts, _ *struct{}) error {
+func (f *Fs) TarRootfsUpperLayer(o *controlapi.TarRootfsUpperLayerOpts, _ *struct{}) error {
 	if len(o.FilePayload.Files) != 1 {
 		return ErrInvalidFiles
 	}

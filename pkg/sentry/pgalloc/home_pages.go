@@ -301,11 +301,11 @@ func (f *MemoryFile) updateHomePagesLocked(fr memmap.FileRange, fn func(off, n u
 		end := min(fr.End, start+hostarch.HugePageSize)
 		lo, hi := (off-start)/hostarch.PageSize, (end-start)/hostarch.PageSize
 		blk := hc.block(b)
-		if blk != nil && len(blk.runs) == 1 && lo == 0 && hi == pagesPerHugePage && blk.runs[0].start == 0 && blk.runs[0].end == pagesPerHugePage {
+		if blk != nil && len(blk.runs) == 1 && lo == 0 && hi == pagesPerHugePage() && blk.runs[0].start == 0 && uint64(blk.runs[0].end) == pagesPerHugePage() {
 			// A block of one run, all of which changes as one, as a fork's
 			// references over a block written whole do.
 			r := &blk.runs[0]
-			ps := fn(start, pagesPerHugePage, r.ps)
+			ps := fn(start, pagesPerHugePage(), r.ps)
 			if ps.free() {
 				hc.setBlock(b, nil)
 			} else {

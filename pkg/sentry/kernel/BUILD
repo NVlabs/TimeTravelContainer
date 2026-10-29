@@ -466,6 +466,7 @@ go_test(
         "kernel_restore_test.go",
         "memory_limit_test.go",
         "pending_signals_test.go",
+        "seccomp_cache_test.go",
         "syslog_test.go",
         "table_test.go",
         "task_signals_test.go",
@@ -475,6 +476,7 @@ go_test(
     deps = [
         "//pkg/abi",
         "//pkg/abi/linux",
+        "//pkg/bpf",
         "//pkg/context",
         "//pkg/cputopology",
         "//pkg/errors/linuxerr",

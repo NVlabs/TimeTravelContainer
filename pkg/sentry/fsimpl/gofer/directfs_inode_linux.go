@@ -185,7 +185,7 @@ func (fs *filesystem) newDirectfsDentry(controlFD int) (*dentry, error) {
 					mode:      atomicbitops.FromUint32(uint32(stat.Mode)),
 					uid:       atomicbitops.FromUint32(uint32(fs.opts.dfltuid)),
 					gid:       atomicbitops.FromUint32(uint32(fs.opts.dfltgid)),
-					blockSize: atomicbitops.FromUint32(hostarch.PageSize),
+					blockSize: atomicbitops.FromUint32(uint32(hostarch.PageSize)),
 					readFD:    atomicbitops.FromInt32(-1),
 					writeFD:   atomicbitops.FromInt32(-1),
 					mmapFD:    atomicbitops.FromInt32(-1),
@@ -881,13 +881,13 @@ func (i *directfsInode) getDirentsLocked(recordDirent func(name string, key inoK
 }
 
 // Precondition: fs.renameMu is locked.
-func (i *directfsInode) connect(ctx context.Context, sockType linux.SockType, euid lisafs.UID, egid lisafs.GID, d *dentry) (int, error) {
+func (i *directfsInode) connect(ctx context.Context, sockType linux.SockType, euid lisafs.UID, egid lisafs.GID, groups []lisafs.GID, d *dentry) (int, error) {
 	// There are no filesystems mounted in the sandbox process's mount namespace.
 	// So we can't perform absolute path traversals. So fallback to using lisafs.
 	if err := i.ensureLisafsControlFD(ctx, d); err != nil {
 		return -1, err
 	}
-	return i.controlFDLisa.Connect(ctx, sockType, euid, egid)
+	return i.controlFDLisa.Connect(ctx, sockType, euid, egid, groups)
 }
 
 func (i *directfsInode) readlink() (string, error) {

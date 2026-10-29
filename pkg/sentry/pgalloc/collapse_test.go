@@ -48,7 +48,7 @@ func TestCollapseHuge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fr := slotRange(home, pagesPerHugePage, pagesPerHugePage)
+	fr := slotRange(home, pagesPerHugePage(), pagesPerHugePage())
 	if mf.SlotsFull(fr) {
 		t.Fatal("empty slots are full")
 	}
@@ -80,7 +80,7 @@ func TestCollapseHuge(t *testing.T) {
 			t.Fatalf("base page %d is %v version %v, not consecutive from %v version %v", i, ids[i], versions[i], ids[0], versions[0])
 		}
 	}
-	if ids[0].Sequence%pagesPerHugePage != 0 || versions[0].Sequence%pagesPerHugePage != 0 {
+	if ids[0].Sequence%pagesPerHugePage() != 0 || versions[0].Sequence%pagesPerHugePage() != 0 {
 		t.Errorf("the 2 MiB page's identity %v and version %v are not aligned", ids[0], versions[0])
 	}
 	if !pagesHold(t, mf, fr, 5) {
@@ -90,7 +90,7 @@ func TestCollapseHuge(t *testing.T) {
 		t.Error("collapsed a 2 MiB page")
 	}
 
-	other := slotRange(home, 3*pagesPerHugePage, pagesPerHugePage)
+	other := slotRange(home, 3*pagesPerHugePage(), pagesPerHugePage())
 	fillSlotsInRandomOrder(t, mf, other, 6)
 	// A host without a free huge page may have one later.
 	restore := SetCollapseHostForTest(func(uintptr, memmap.FileRange) error { return unix.ENOMEM })

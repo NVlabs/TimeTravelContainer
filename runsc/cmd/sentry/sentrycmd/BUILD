@@ -14,6 +14,7 @@ go_library(
         "boot.go",
         "chroot.go",
         "chroot_darwin.go",
+        "nvproxy.go",
         "parentdeath_darwin.go",
         "parentdeath_linux.go",
         "syscalls.go",

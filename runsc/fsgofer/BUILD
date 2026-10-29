@@ -72,3 +72,14 @@ go_test(
     library = ":fsgofer",
     deps = ["//pkg/lisafs"],
 )
+
+go_test(
+    name = "groups_test",
+    size = "small",
+    srcs = ["groups_test.go"],
+    embed = [":fsgofer"],
+    deps = [
+        "//pkg/lisafs",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)

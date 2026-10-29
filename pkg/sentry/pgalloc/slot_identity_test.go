@@ -51,12 +51,12 @@ func TestHomeSlotIdentities(t *testing.T) {
 			t.Fatalf("slot %d's identity is %v, want sequence %d", slot, id, window+slot)
 		}
 	}
-	huge, err := mf.AllocateAt(slotRange(home, pagesPerHugePage, pagesPerHugePage), AllocOpts{Kind: usage.Anonymous, Huge: true, LogicalHugePages: true})
+	huge, err := mf.AllocateAt(slotRange(home, pagesPerHugePage(), pagesPerHugePage()), AllocOpts{Kind: usage.Anonymous, Huge: true, LogicalHugePages: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if id := pageID(t, mf, huge.Start); id.Sequence != window+pagesPerHugePage || !mf.IsHugePages(huge) {
-		t.Errorf("the 2 MiB page at slot %d has identity %v (2 MiB page: %t), want sequence %d", pagesPerHugePage, id, mf.IsHugePages(huge), window+pagesPerHugePage)
+	if id := pageID(t, mf, huge.Start); id.Sequence != window+pagesPerHugePage() || !mf.IsHugePages(huge) {
+		t.Errorf("the 2 MiB page at slot %d has identity %v (2 MiB page: %t), want sequence %d", pagesPerHugePage(), id, mf.IsHugePages(huge), window+pagesPerHugePage())
 	}
 
 	again := slotRange(home, 120, 1)

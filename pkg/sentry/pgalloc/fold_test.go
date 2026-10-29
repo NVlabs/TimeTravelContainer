@@ -113,7 +113,7 @@ func TestMovePages2MiB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	src, err := mf.AllocateAt(slotRange(layer, pagesPerHugePage, pagesPerHugePage), AllocOpts{Kind: usage.Anonymous, Huge: true, LogicalHugePages: true})
+	src, err := mf.AllocateAt(slotRange(layer, pagesPerHugePage(), pagesPerHugePage()), AllocOpts{Kind: usage.Anonymous, Huge: true, LogicalHugePages: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +122,7 @@ func TestMovePages2MiB(t *testing.T) {
 	}
 	fillPages(t, mf, src, 9)
 	ids, versions := pageIdentities(t, mf, src)
-	dst := slotRange(home, pagesPerHugePage, pagesPerHugePage)
+	dst := slotRange(home, pagesPerHugePage(), pagesPerHugePage())
 	if err := mf.MovePages(src, dst); err != nil {
 		t.Fatalf("MovePages: %v", err)
 	}

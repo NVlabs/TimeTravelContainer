@@ -101,12 +101,12 @@ func (f *MemoryFile) CollapseHuge(fr memmap.FileRange) (collapsed, retry bool) {
 //
 // Preconditions: f.mu must be locked.
 func (f *MemoryFile) collapseIdentitiesLocked(fr memmap.FileRange) {
-	if 2*pagesPerHugePage > hugeSequenceBit-f.nextPageVersion || 2*pagesPerHugePage > hugeSequenceBit-f.nextLogicalPage {
+	if 2*pagesPerHugePage() > hugeSequenceBit-f.nextPageVersion || 2*pagesPerHugePage() > hugeSequenceBit-f.nextLogicalPage {
 		panic(fmt.Sprintf("page sequence exhausted collapsing %v", fr))
 	}
 	runs := f.logicalPageRangesLocked(fr)
 	first := LogicalPageID{}
-	whole := len(runs) != 0 && runs[0].Range.Start == fr.Start && runs[0].First.Sequence%pagesPerHugePage == 0
+	whole := len(runs) != 0 && runs[0].Range.Start == fr.Start && runs[0].First.Sequence%pagesPerHugePage() == 0
 	at := fr.Start
 	for _, run := range runs {
 		want := runs[0].First.Sequence + (run.Range.Start-fr.Start)/hostarch.PageSize
@@ -120,7 +120,7 @@ func (f *MemoryFile) collapseIdentitiesLocked(fr memmap.FileRange) {
 	} else {
 		f.nextLogicalPage = alignSequence(f.nextLogicalPage)
 		first = LogicalPageID{Allocator: f.logicalAllocator, Sequence: f.nextLogicalPage}
-		f.nextLogicalPage += pagesPerHugePage
+		f.nextLogicalPage += pagesPerHugePage()
 	}
 	f.setLogicalPagesLocked(fr, logicalPageInfo{
 		Allocator:            first.Allocator,

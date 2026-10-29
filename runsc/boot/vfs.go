@@ -1127,7 +1127,12 @@ func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo,
 
 	// Find filesystem name and FS specific data field.
 	switch m.mount.Type {
-	case devpts.Name, dev.Name, cgroup2fs.Name:
+	case devpts.Name:
+		// /dev/ptmx is a symlink to pts/ptmx, so make ptmx usable by everyone, as
+		// container runtimes do. Linux and devpts default ptmxmode to 0000.
+		data = []string{"ptmxmode=0666"}
+
+	case dev.Name, cgroup2fs.Name:
 		// Nothing to do.
 
 	case sentryapi.Nonefs:
@@ -1306,24 +1311,22 @@ func createPrivateMemoryFile(file *os.File, resourceID checkpoint.ResourceID, ci
 	cleanFile := cleanup.Make(func() { file.Close() })
 	defer cleanFile.Clean()
 
-	pagesMetadataReader, pagesFileOffset, onLoadEnd, err := fsr.memoryFileLoadArgs(resourceID, cid)
+	pagesMetadataReader, loadOpts, err := fsr.memoryFileLoadArgs(resourceID, cid)
 	if err != nil {
 		return nil, false, err
 	}
 	loaded := pagesMetadataReader != nil
 	mf, err := createEmptyPrivateMemoryFile(file, resourceID)
 	if err != nil {
-		onLoadEnd(err)
+		if loadOpts != nil && loadOpts.DoneCallback != nil {
+			loadOpts.DoneCallback(err)
+		}
 		return nil, false, err
 	}
 	cleanFile.Release()
 	if loaded {
 		log.Infof("Loading filesystem checkpoint data for %q", resourceID)
-		if err := mf.LoadFrom(context.Background(), pagesMetadataReader, &pgalloc.LoadOpts{
-			PagesFile:       fsr.apfl,
-			PagesFileOffset: pagesFileOffset,
-			DoneCallback:    onLoadEnd,
-		}); err != nil {
+		if err := mf.LoadFrom(context.Background(), pagesMetadataReader, loadOpts); err != nil {
 			mf.Destroy()
 			return nil, false, err
 		}
@@ -1961,6 +1964,9 @@ func createDeviceFiles(ctx context.Context, creds *auth.Credentials, info *conta
 			{Path: "/dev/nvidiactl", Type: "c", Major: nvgpu.NV_MAJOR_DEVICE_NUMBER, Minor: nvgpu.NV_MINOR_DEVICE_NUMBER_CONTROL_DEVICE},
 			{Path: "/dev/nvidia-uvm", Type: "c", Major: int64(info.nvproxyDevInfo.UVMDevMajor), Minor: nvgpu.NVIDIA_UVM_PRIMARY_MINOR_NUMBER},
 		}
+		if info.nvproxyDevInfo.HaveUVMTools {
+			nvidiaDevs = append(nvidiaDevs, specs.LinuxDevice{Path: "/dev/nvidia-uvm-tools", Type: "c", Major: int64(info.nvproxyDevInfo.UVMDevMajor), Minor: nvgpu.NVIDIA_UVM_TOOLS_MINOR_NUMBER})
+		}
 		// There is no nvidia-container-cli flag to enable fabric-imex-mgmt, so
 		// we never create a /dev/nvidia-caps/nvidia-cap# file for it here.
 		devClient := devutil.GoferClientFromContext(ctx)
@@ -2026,10 +2032,10 @@ func createDeviceFile(ctx context.Context, creds *auth.Credentials, info *contai
 			}
 			log.Infof("Switching %v device major number from %d to %d", devSpec.Path, devSpec.Major, major)
 		}
-	} else if devSpec.Path == "/dev/nvidia-uvm" {
+	} else if devSpec.Path == "/dev/nvidia-uvm" || devSpec.Path == "/dev/nvidia-uvm-tools" {
 		if info.nvproxyDevInfo.UVMDevMajor != 0 && major != info.nvproxyDevInfo.UVMDevMajor {
 			major = info.nvproxyDevInfo.UVMDevMajor
-			log.Infof("Switching /dev/nvidia-uvm device major number from %d to %d", devSpec.Major, major)
+			log.Infof("Switching %s device major number from %d to %d", devSpec.Path, devSpec.Major, major)
 		}
 	} else if strings.HasPrefix(devSpec.Path, "/dev/nvidia-caps/") {
 		if info.nvproxyDevInfo.CapsDevMajor != 0 && major != info.nvproxyDevInfo.CapsDevMajor {

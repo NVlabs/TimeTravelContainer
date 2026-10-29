@@ -59,7 +59,8 @@ type taskSeccomp struct {
 	cacheAuditNumber uint32
 }
 
-// copy returns a copy of this `taskSeccomp`.
+// copy returns a copy of this taskSeccomp, including its cache. Cache lookups
+// check cacheAuditNumber before using entries for the current architecture.
 func (ts *taskSeccomp) copy() *taskSeccomp {
 	return &taskSeccomp{
 		filters:          append(([]bpf.Program)(nil), ts.filters...),
@@ -336,9 +337,7 @@ func (t *Task) AppendSyscallFilter(p bpf.Program, syncAll bool) error {
 				if currentNoNewPrivs {
 					ot.SetNoNewPrivs()
 				}
-				seccompCopy := newSeccomp.copy()
-				seccompCopy.populateCache(ot)
-				ot.seccomp.Store(seccompCopy)
+				ot.seccomp.Store(newSeccomp.copy())
 			}
 		}
 	}

@@ -44,7 +44,7 @@ func FSOpen(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr,
 		return 0, nil, linuxerr.EPERM
 	}
 
-	fsname, err := t.CopyInString(fsnameAddr, hostarch.PageSize)
+	fsname, err := t.CopyInString(fsnameAddr, int(hostarch.PageSize))
 	if err != nil {
 		return 0, nil, err
 	}
@@ -78,7 +78,7 @@ func paramFromFSConfigArgs(t *kernel.Task, cmd uint32, valueAddr hostarch.Addr, 
 		if aux != 0 {
 			return nil, linuxerr.EINVAL
 		}
-		str, err := t.CopyInString(valueAddr, hostarch.PageSize)
+		str, err := t.CopyInString(valueAddr, int(hostarch.PageSize))
 		if err != nil {
 			return nil, err
 		}
@@ -138,7 +138,7 @@ func FSConfig(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintpt
 
 	if param != nil {
 		// FSCONFIG_SET_*: copy in the key and set the parameter
-		key, err := t.CopyInString(keyAddr, hostarch.PageSize)
+		key, err := t.CopyInString(keyAddr, int(hostarch.PageSize))
 		if err != nil {
 			return 0, nil, err
 		}
@@ -352,7 +352,7 @@ func OpenTree(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintpt
 		// OPEN_TREE_CLONE: clone the mount tree into an anonymous mount ns
 
 		// Fetch the path's mount vd
-		fromVd, err := vfsObj.GetDentryAt(t, t.Credentials(), &from.pop, &vfs.GetDentryOptions{CheckSearchable: true})
+		fromVd, err := vfsObj.GetDentryAt(t, t.Credentials(), &from.pop, &vfs.GetDentryOptions{})
 		if err != nil {
 			return 0, nil, err
 		}

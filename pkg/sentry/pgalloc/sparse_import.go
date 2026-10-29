@@ -89,7 +89,7 @@ func (f *MemoryFile) InstallRemoteBindings(bindings []CapturedPageBinding, kind 
 			binary.BigEndian.PutUint64(encoded[:], binding.Version.Sequence)
 			hash.Write(encoded[:])
 			install := SparseChunkInstall{Kind: kind, MemCgID: memCgID, Huge: true, Runs: []SparseChunkRun{{
-				Position: 0, Pages: pagesPerHugePage, Page: binding.Page, Version: binding.Version,
+				Position: 0, Pages: uint16(pagesPerHugePage()), Page: binding.Page, Version: binding.Version,
 			}}}
 			copy(install.Object[:], hash.Sum(nil))
 			installs = append(installs, install)
@@ -267,10 +267,10 @@ func validHugeSparseChunkRuns(runs []SparseChunkRun) bool {
 		return false
 	}
 	run := runs[0]
-	return run.Position == 0 && run.Pages == pagesPerHugePage &&
+	return run.Position == 0 && uint64(run.Pages) == pagesPerHugePage() &&
 		run.Page.Allocator != (LogicalAllocatorID{}) && run.Version.Allocator != (LogicalAllocatorID{}) &&
-		run.Page.Sequence%pagesPerHugePage == 0 && run.Version.Sequence%pagesPerHugePage == 0 &&
-		run.Page.Sequence <= math.MaxUint64-pagesPerHugePage && run.Version.Sequence <= math.MaxUint64-pagesPerHugePage
+		run.Page.Sequence%pagesPerHugePage() == 0 && run.Version.Sequence%pagesPerHugePage() == 0 &&
+		run.Page.Sequence <= math.MaxUint64-pagesPerHugePage() && run.Version.Sequence <= math.MaxUint64-pagesPerHugePage()
 }
 
 type sparseResidentChunk struct {

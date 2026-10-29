@@ -78,6 +78,7 @@ func (nvp *nvproxy) validateLiveFork() error {
 var (
 	_ vfs.LiveForkFileDescription     = (*frontendFD)(nil)
 	_ vfs.LiveForkFileDescription     = (*uvmFD)(nil)
+	_ vfs.LiveForkFileDescription     = (*uvmToolsFD)(nil)
 	_ memmap.LiveForkMappingValidator = (*frontendFD)(nil)
 	_ memmap.LiveForkMappingValidator = (*uvmFD)(nil)
 	_ memmap.LiveForkUnsharedFile     = (*frontendFDMemmapFile)(nil)
@@ -92,6 +93,11 @@ func (fd *frontendFD) ValidateLiveFork() ([]*vfs.FileDescription, error) {
 
 // ValidateLiveFork implements vfs.LiveForkFileDescription.ValidateLiveFork.
 func (fd *uvmFD) ValidateLiveFork() ([]*vfs.FileDescription, error) {
+	return nil, fd.dev.nvp.validateLiveFork()
+}
+
+// ValidateLiveFork implements vfs.LiveForkFileDescription.ValidateLiveFork.
+func (fd *uvmToolsFD) ValidateLiveFork() ([]*vfs.FileDescription, error) {
 	return nil, fd.dev.nvp.validateLiveFork()
 }
 
@@ -222,4 +228,11 @@ func (fd *uvmFD) lose() {
 	fd.lost = true
 	fd.hostFD = -1
 	fd.memmapFile.SetFD(-1)
+}
+
+// lose makes fd lost: its calls fail. The host driver's event trackers, whose
+// buffers it pinned, are the source's.
+func (fd *uvmToolsFD) lose() {
+	fd.lost = true
+	fd.hostFD = -1
 }

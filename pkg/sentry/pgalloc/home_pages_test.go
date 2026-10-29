@@ -134,7 +134,7 @@ func (m *homeModel) checkTableLocked(step string) {
 		}
 		for i := range blk.runs {
 			r := &blk.runs[i]
-			if r.start >= r.end || uint64(r.end) > pagesPerHugePage || r.ps.free() || (i > 0 && blk.runs[i-1].end > r.start) {
+			if r.start >= r.end || uint64(r.end) > pagesPerHugePage() || r.ps.free() || (i > 0 && blk.runs[i-1].end > r.start) {
 				m.t.Fatalf("%s: block %d has run %d %+v after %+v", step, b, i, *r, blk.runs[max(i-1, 0)])
 			}
 			if i > 0 && blk.runs[i-1].continuedBy(r) {
@@ -143,12 +143,12 @@ func (m *homeModel) checkTableLocked(step string) {
 		}
 		if blk.huge {
 			first := blk.page(0)
-			for k := uint64(0); k < pagesPerHugePage; k++ {
+			for k := uint64(0); k < pagesPerHugePage(); k++ {
 				if ps := blk.page(k); !ps.inUse() || ps.context() != first.context() || ps.id != first.id+k || ps.ver != first.ver+k {
 					m.t.Fatalf("%s: block %d is a 2 MiB page, but page %d is %+v after %+v", step, b, k, ps, first)
 				}
 			}
-			if first.id%pagesPerHugePage != 0 || first.ver%pagesPerHugePage != 0 {
+			if first.id%pagesPerHugePage() != 0 || first.ver%pagesPerHugePage() != 0 {
 				m.t.Fatalf("%s: block %d is a 2 MiB page whose sequences %d and %d are not aligned", step, b, first.id, first.ver)
 			}
 		}
@@ -168,13 +168,13 @@ func (m *homeModel) roundTrip(step string) {
 	m.t.Helper()
 	m.mf.mu.Lock()
 	hc := m.mf.homes[m.home.Start/chunkSize]
-	before := make([]pageState, blocksPerHome*pagesPerHugePage)
+	before := make([]pageState, blocksPerHome*pagesPerHugePage())
 	huge := make([]bool, blocksPerHome)
 	for b := uint64(0); b < blocksPerHome; b++ {
 		if blk := hc.block(b); blk != nil {
 			huge[b] = blk.huge
-			for k := uint64(0); k < pagesPerHugePage; k++ {
-				before[b*pagesPerHugePage+k] = blk.page(k)
+			for k := uint64(0); k < pagesPerHugePage(); k++ {
+				before[b*pagesPerHugePage()+k] = blk.page(k)
 			}
 		}
 	}
@@ -198,16 +198,16 @@ func (m *homeModel) roundTrip(step string) {
 			m.mf.mu.Unlock()
 			m.t.Fatalf("%s: block %d's 2 MiB page did not survive the sets", step, b)
 		}
-		for k := uint64(0); k < pagesPerHugePage; k++ {
+		for k := uint64(0); k < pagesPerHugePage(); k++ {
 			var ps pageState
 			if blk != nil {
 				ps = blk.page(k)
 			}
 			// commitSeq is per block, and may go back to 0 in the sets only for
 			// pages known to be committed; nothing else may change.
-			if ps != before[b*pagesPerHugePage+k] {
+			if ps != before[b*pagesPerHugePage()+k] {
 				m.mf.mu.Unlock()
-				m.t.Fatalf("%s: page %d of block %d is %+v after the sets, %+v before", step, k, b, ps, before[b*pagesPerHugePage+k])
+				m.t.Fatalf("%s: page %d of block %d is %+v after the sets, %+v before", step, k, b, ps, before[b*pagesPerHugePage()+k])
 			}
 		}
 	}
@@ -237,7 +237,8 @@ func testHomePagesModel(t *testing.T, seed int64) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const pages = 8 * pagesPerHugePage
+	hugePages := int(pagesPerHugePage())
+	pages := 8 * hugePages
 	m := &homeModel{t: t, mf: mf, home: home, pages: make([]modelPage, pages), versions: make(map[PageVersionID]bool)}
 	// Waste stays waste until the model releases it.
 	mf.mu.Lock()
@@ -251,7 +252,7 @@ func testHomePagesModel(t *testing.T, seed int64) {
 	// time in eight, and a few pages otherwise.
 	span := func() (int, int) {
 		if rng.Intn(8) == 0 {
-			return rng.Intn(pages/pagesPerHugePage) * pagesPerHugePage, pagesPerHugePage
+			return rng.Intn(pages/hugePages) * hugePages, hugePages
 		}
 		n := 1 + rng.Intn(24)
 		return rng.Intn(pages - n), n
@@ -277,7 +278,7 @@ func testHomePagesModel(t *testing.T, seed int64) {
 	}{
 		{name: "allocate", weight: 3, fn: func(page, n int) bool {
 			fr := m.slots(page, n)
-			huge := n == pagesPerHugePage && rng.Intn(2) == 0
+			huge := n == hugePages && rng.Intn(2) == 0
 			opts := AllocOpts{Kind: usage.Anonymous, Huge: huge, LogicalHugePages: huge}
 			if rng.Intn(2) == 0 {
 				// As a copy is: filled, and given identities of no slot.
@@ -391,19 +392,19 @@ func testHomePagesModel(t *testing.T, seed int64) {
 			return true
 		}},
 		{name: "collapse", weight: 2, fn: func(int, int) bool {
-			page := rng.Intn(pages/pagesPerHugePage) * pagesPerHugePage
-			fr := m.slots(page, pagesPerHugePage)
-			if !m.all(page, pagesPerHugePage, func(p *modelPage) bool { return p.refs <= 1 }) || mf.IsHugePages(fr) {
+			page := rng.Intn(pages/hugePages) * hugePages
+			fr := m.slots(page, hugePages)
+			if !m.all(page, hugePages, func(p *modelPage) bool { return p.refs <= 1 }) || mf.IsHugePages(fr) {
 				return false
 			}
 			// Its unused pages are written first, as faults would write them.
-			for k := page; k < page+pagesPerHugePage; {
+			for k := page; k < page+hugePages; {
 				if m.pages[k].refs != 0 {
 					k++
 					continue
 				}
 				j := k
-				for j < page+pagesPerHugePage && m.pages[j].refs == 0 {
+				for j < page+hugePages && m.pages[j].refs == 0 {
 					j++
 				}
 				if _, err := mf.AllocateAt(m.slots(k, j-k), AllocOpts{Kind: usage.Anonymous}); err != nil {
@@ -483,7 +484,7 @@ func TestHomePagesRuns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	block := slotRange(home, 0, pagesPerHugePage)
+	block := slotRange(home, 0, pagesPerHugePage())
 	if _, err := mf.AllocateAt(block, AllocOpts{Kind: usage.Anonymous}); err != nil {
 		t.Fatal(err)
 	}
@@ -530,7 +531,7 @@ func TestHomePagesForkLoop(t *testing.T) {
 		t.Fatal(err)
 	}
 	const blocks = 16
-	all := slotRange(parent, 0, blocks*pagesPerHugePage)
+	all := slotRange(parent, 0, blocks*pagesPerHugePage())
 	for start := all.Start; start < all.End; start += hostarch.HugePageSize {
 		if _, err := mf.AllocateAt(memmap.FileRange{Start: start, End: start + hostarch.HugePageSize}, AllocOpts{Kind: usage.Anonymous}); err != nil {
 			t.Fatal(err)
@@ -562,7 +563,7 @@ func TestHomePagesForkLoop(t *testing.T) {
 		// The child copies a few pages, and drops its references to them.
 		copied := make(map[int]bool)
 		for len(copied) < 8 {
-			copied[rng.Intn(blocks*pagesPerHugePage)] = true
+			copied[rng.Intn(blocks*int(pagesPerHugePage()))] = true
 		}
 		var copies []memmap.FileRange
 		for k := range copied {
@@ -579,8 +580,8 @@ func TestHomePagesForkLoop(t *testing.T) {
 		// It exits: its references to the rest go, a run at a time, as its
 		// pmas held them, and its copies.
 		start := 0
-		for k := 0; k <= blocks*pagesPerHugePage; k++ {
-			if k == blocks*pagesPerHugePage || copied[k] {
+		for k := 0; k <= blocks*int(pagesPerHugePage()); k++ {
+			if k == blocks*int(pagesPerHugePage()) || copied[k] {
 				if k > start {
 					mf.DecRef(slotRange(parent, uint64(start), uint64(k-start)))
 				}
@@ -604,9 +605,9 @@ func TestHomePagesSaveLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	huge := slotRange(home, 0, pagesPerHugePage)
-	small := slotRange(home, pagesPerHugePage+3, 5)
-	shared := slotRange(home, 3*pagesPerHugePage, 9)
+	huge := slotRange(home, 0, pagesPerHugePage())
+	small := slotRange(home, pagesPerHugePage()+3, 5)
+	shared := slotRange(home, 3*pagesPerHugePage(), 9)
 	for _, fr := range []memmap.FileRange{huge, small, shared} {
 		opts := AllocOpts{Kind: usage.Anonymous}
 		if fr == huge {
@@ -619,8 +620,8 @@ func TestHomePagesSaveLoad(t *testing.T) {
 	}
 	source.IncRef(shared, 0)
 	// One page of the shared run is copied, and written in place.
-	source.DecRef(slotRange(home, 3*pagesPerHugePage+4, 1))
-	if !source.OwnForWrite(slotRange(home, 3*pagesPerHugePage+4, 1)) {
+	source.DecRef(slotRange(home, 3*pagesPerHugePage()+4, 1))
+	if !source.OwnForWrite(slotRange(home, 3*pagesPerHugePage()+4, 1)) {
 		t.Fatal("a page held alone was not owned")
 	}
 	all := memmap.FileRange{Start: home.Start, End: shared.End}
@@ -668,8 +669,8 @@ func TestHomePagesSaveLoad(t *testing.T) {
 		}
 	}
 	target.mu.Lock()
-	unique := target.hasUniqueRefLocked(slotRange(home, 3*pagesPerHugePage+4, 1))
-	sharedRefs := !target.hasUniqueRefLocked(slotRange(home, 3*pagesPerHugePage, 4))
+	unique := target.hasUniqueRefLocked(slotRange(home, 3*pagesPerHugePage()+4, 1))
+	sharedRefs := !target.hasUniqueRefLocked(slotRange(home, 3*pagesPerHugePage(), 4))
 	inSets := !target.logicalPages.IsEmptyRange(home) || !target.memAcct.IsEmptyRange(home)
 	target.mu.Unlock()
 	if !unique || !sharedRefs {

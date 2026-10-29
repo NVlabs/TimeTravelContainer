@@ -67,8 +67,8 @@ func TestHugeAllocationIs2MiBPages(t *testing.T) {
 	if len(runs) != 1 || !runs[0].Huge {
 		t.Fatalf("2 MiB pages %v have runs %+v, want one run of 2 MiB pages", fr, runs)
 	}
-	if runs[0].First.Sequence%pagesPerHugePage != 0 || runs[0].FirstVersion.Sequence%pagesPerHugePage != 0 {
-		t.Fatalf("2 MiB pages start at identity %+v and version %+v, want multiples of %d", runs[0].First, runs[0].FirstVersion, pagesPerHugePage)
+	if runs[0].First.Sequence%pagesPerHugePage() != 0 || runs[0].FirstVersion.Sequence%pagesPerHugePage() != 0 {
+		t.Fatalf("2 MiB pages start at identity %+v and version %+v, want multiples of %d", runs[0].First, runs[0].FirstVersion, pagesPerHugePage())
 	}
 	if hp, ok := f.HugePageAt(fr.Start + hugepage + 5*page); !ok || hp != (memmap.FileRange{Start: fr.Start + hugepage, End: fr.End}) {
 		t.Fatalf("HugePageAt(%#x) = %v, %t; want the second 2 MiB page of %v", fr.Start+hugepage+5*page, hp, ok, fr)
@@ -103,14 +103,14 @@ func TestOwnForWriteOf2MiBPages(t *testing.T) {
 		t.Fatal("OwnForWrite refused a 2 MiB page held alone")
 	}
 	if runs := f.LogicalPageRanges(first); len(runs) != 1 || !runs[0].Huge || runs[0].FirstVersion == versions[0] ||
-		runs[0].FirstVersion.Sequence%pagesPerHugePage != 0 {
-		t.Fatalf("an owned 2 MiB page has runs %+v, want one 2 MiB page with a new version, a multiple of %d", runs, pagesPerHugePage)
+		runs[0].FirstVersion.Sequence%pagesPerHugePage() != 0 {
+		t.Fatalf("an owned 2 MiB page has runs %+v, want one 2 MiB page with a new version, a multiple of %d", runs, pagesPerHugePage())
 	}
 	gotIDs, gotVersions := basePageVersions(t, f, fr)
 	if !reflect.DeepEqual(gotIDs, ids) {
 		t.Fatal("OwnForWrite changed identities")
 	}
-	if !reflect.DeepEqual(gotVersions[pagesPerHugePage:], versions[pagesPerHugePage:]) {
+	if !reflect.DeepEqual(gotVersions[pagesPerHugePage():], versions[pagesPerHugePage():]) {
 		t.Fatal("owning one 2 MiB page renewed its neighbour's version")
 	}
 
@@ -129,9 +129,9 @@ func TestOwnForWriteOf2MiBPages(t *testing.T) {
 	if !reflect.DeepEqual(gotIDs, ids) {
 		t.Fatal("splitting a 2 MiB page changed identities")
 	}
-	for i := pagesPerHugePage; i < 2*pagesPerHugePage; i++ {
-		if owned := i == pagesPerHugePage+4 || i == pagesPerHugePage+5; owned == (gotVersions[i] == renewed[i]) {
-			t.Fatalf("base page %d of the split page has version %+v, had %+v; owned: %t", i-pagesPerHugePage, gotVersions[i], renewed[i], owned)
+	for i := pagesPerHugePage(); i < 2*pagesPerHugePage(); i++ {
+		if owned := i == pagesPerHugePage()+4 || i == pagesPerHugePage()+5; owned == (gotVersions[i] == renewed[i]) {
+			t.Fatalf("base page %d of the split page has version %+v, had %+v; owned: %t", i-pagesPerHugePage(), gotVersions[i], renewed[i], owned)
 		}
 	}
 }
@@ -176,7 +176,7 @@ func TestAdoptCOWIdentitiesOf2MiBPages(t *testing.T) {
 		t.Fatal(err)
 	}
 	if runs := f.LogicalPageRanges(whole); len(runs) != 1 || !runs[0].Huge || runs[0].First != ids[0] ||
-		runs[0].FirstVersion == versions[0] || runs[0].FirstVersion.Sequence%pagesPerHugePage != 0 {
+		runs[0].FirstVersion == versions[0] || runs[0].FirstVersion.Sequence%pagesPerHugePage() != 0 {
 		t.Fatalf("a whole copy of 2 MiB page %+v (version %+v) has runs %+v, want one 2 MiB page with its identity and a new version", ids[0], versions[0], runs)
 	}
 
@@ -323,8 +323,8 @@ func TestHugePageSnapshotLayoutBinds2MiBPagesWhole(t *testing.T) {
 		t.Fatalf("2 MiB page binding %+v, want offset %#x, page %+v, version %+v and 2 references", b, hp.Start, ids[0], versions[0])
 	}
 	expanded := BasePageBindings(layout.Bindings)
-	if len(expanded) != pagesPerHugePage+2 {
-		t.Fatalf("%d base pages, want %d", len(expanded), pagesPerHugePage+2)
+	if len(expanded) != int(pagesPerHugePage())+2 {
+		t.Fatalf("%d base pages, want %d", len(expanded), pagesPerHugePage()+2)
 	}
 	for _, binding := range expanded {
 		if k := (binding.OldOffset - hp.Start) / page; binding.OldOffset >= hp.Start && binding.OldOffset < hp.End &&
@@ -332,8 +332,8 @@ func TestHugePageSnapshotLayoutBinds2MiBPagesWhole(t *testing.T) {
 			t.Fatalf("base page %d of the 2 MiB page is bound as %+v", k, binding)
 		}
 	}
-	if base, err := capture.SnapshotLayout(); err != nil || len(base.Bindings) != pagesPerHugePage+2 {
-		t.Fatalf("a dehydration's capture has %d bindings (%v), want %d base pages", len(base.Bindings), err, pagesPerHugePage+2)
+	if base, err := capture.SnapshotLayout(); err != nil || len(base.Bindings) != int(pagesPerHugePage())+2 {
+		t.Fatalf("a dehydration's capture has %d bindings (%v), want %d base pages", len(base.Bindings), err, pagesPerHugePage()+2)
 	}
 
 	ordered, err := layout.ChunkOrdered()
@@ -368,9 +368,9 @@ func TestHugePageSnapshotLayoutBinds2MiBPagesWhole(t *testing.T) {
 func TestInstallRemoteBindingsInstalls2MiBPagesWhole(t *testing.T) {
 	var allocator LogicalAllocatorID
 	allocator[0] = 5
-	page2M := LogicalPageID{Allocator: allocator, Sequence: 3 * pagesPerHugePage}
-	version2M := PageVersionID{Allocator: allocator, Sequence: 7 * pagesPerHugePage}
-	smallPage := LogicalPageID{Allocator: allocator, Sequence: 9*pagesPerHugePage + 1}
+	page2M := LogicalPageID{Allocator: allocator, Sequence: 3 * pagesPerHugePage()}
+	version2M := PageVersionID{Allocator: allocator, Sequence: 7 * pagesPerHugePage()}
+	smallPage := LogicalPageID{Allocator: allocator, Sequence: 9*pagesPerHugePage() + 1}
 	bindings := []CapturedPageBinding{
 		{OldOffset: 4 * hugepage, StreamOffset: 0, References: 1, Page: page2M, Version: version2M, Huge: true},
 		{OldOffset: 0, StreamOffset: hugepage, References: 1, Page: smallPage, Version: PageVersionID{Allocator: allocator, Sequence: 99}},
