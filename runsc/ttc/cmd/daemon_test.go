@@ -3249,6 +3249,59 @@ func TestStandaloneCPUProfileIsImmutable(t *testing.T) {
 	}
 }
 
+// TestNamedCPUProfileAcrossBuilds checks that a daemon that names its root's
+// CPU profile adopts it as recorded, though this build resolves the name to
+// more features, as a later build that knows more of a host's features does,
+// and that an explicit profile still asks for its features.
+func TestNamedCPUProfileAcrossBuilds(t *testing.T) {
+	current, err := resolveDaemonCPUProfile("host", "", "systrap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(current.Features) < 2 {
+		t.Skipf("host profile has too few features: %v", current.Features)
+	}
+	older := current
+	older.Features = slices.Clone(current.Features[:len(current.Features)-1])
+
+	root := t.TempDir()
+	if err := writeDurableJSON(filepath.Join(root, ".ttc-cpu-profile.json"), older); err != nil {
+		t.Fatal(err)
+	}
+	if adopted, err := applyStandaloneCPUProfile(root, "host", "", "systrap", true); err != nil || !reflect.DeepEqual(adopted, older) {
+		t.Fatalf("host profile of an older build=(%+v, %v), want %+v", adopted, err, older)
+	}
+	if _, err := applyStandaloneCPUProfile(root, "portable", "", "systrap", true); err == nil || !strings.Contains(err.Error(), "differs") {
+		t.Fatalf("other named profile error=%v", err)
+	}
+
+	clusterRoot := t.TempDir()
+	first := defaultDaemonClusterOptions()
+	first.CPUProfileSet, first.ResolvedCPU = true, older
+	if pending, err := applyImmutableClusterConfig(clusterRoot, &first); err != nil || pending != nil {
+		t.Fatalf("creating the cluster=(%+v, %v)", pending, err)
+	}
+	later := defaultDaemonClusterOptions()
+	later.CPUProfileSet, later.ResolvedCPU = true, current
+	if pending, err := applyImmutableClusterConfig(clusterRoot, &later); err != nil || pending != nil || !reflect.DeepEqual(later.ResolvedCPU, older) {
+		t.Fatalf("a later build's node=(%+v, %v), profile %+v, want %+v", pending, err, later.ResolvedCPU, older)
+	}
+
+	if runtime.GOARCH != "amd64" {
+		return
+	}
+	explicit := t.TempDir()
+	if _, err := applyStandaloneCPUProfile(explicit, "explicit", "fpu,sse,sse2", "systrap", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := applyStandaloneCPUProfile(explicit, "explicit", "sse2,fpu,sse", "systrap", true); err != nil {
+		t.Fatalf("the same explicit features in another order: %v", err)
+	}
+	if _, err := applyStandaloneCPUProfile(explicit, "explicit", "fpu,sse", "systrap", true); err == nil || !strings.Contains(err.Error(), "differs") {
+		t.Fatalf("other explicit features error=%v", err)
+	}
+}
+
 func TestPortableCPUProfileIsHostIndependent(t *testing.T) {
 	profile, err := resolveDaemonCPUProfile("portable", "", "systrap")
 	if err != nil {

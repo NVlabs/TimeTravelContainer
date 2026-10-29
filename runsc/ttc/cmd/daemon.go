@@ -5721,7 +5721,7 @@ func applyImmutableClusterConfig(sharedRoot string, opts *daemonClusterOptions) 
 	if got.Version != immutableClusterConfigVersion(got.CPUProfile) {
 		return nil, fmt.Errorf("unsupported immutable cluster configuration version %d", got.Version)
 	}
-	if opts.CPUProfileSet && (got.CPUProfile.Mode != want.CPUProfile.Mode || !slices.Equal(got.CPUProfile.Features, want.CPUProfile.Features)) {
+	if opts.CPUProfileSet && !requestsCPUProfile(want.CPUProfile, got.CPUProfile) {
 		return nil, fmt.Errorf("requested CPU profile differs from immutable cluster profile %q", got.CPUProfile.Mode)
 	}
 	if opts.NoCPUIDFaulting && !got.CPUProfile.NoCPUIDFaulting {
@@ -5730,17 +5730,14 @@ func applyImmutableClusterConfig(sharedRoot string, opts *daemonClusterOptions) 
 	if opts.CPUTopologySet && got.CPUProfile.cpuTopologyMode() != opts.CPUTopology {
 		return nil, fmt.Errorf("--cpu-topology %s differs from this cluster's CPU topology, %s, which its first daemon recorded", opts.CPUTopology, got.CPUProfile.cpuTopologyMode())
 	}
+	// A node adopts its cluster's immutable CPU profile, which a node that
+	// names one asks for (requestsCPUProfile), as recorded: the features a
+	// later build would resolve, whether the cluster waives CPUID faulting,
+	// and its CPU topology. Whether the node's CPU can run it,
+	// validateDaemonCPUProfile judges, and whether the host's layout is the
+	// one the cluster records, resolveDaemonCPUTopology.
 	compareWant := want
-	if !opts.CPUProfileSet {
-		compareWant.CPUProfile = got.CPUProfile
-	}
-	// Whether the cluster waives CPUID faulting a node adopts; whether the
-	// node's CPU is the one the cluster records, validateDaemonCPUProfile
-	// judges.
-	compareWant.CPUProfile.NoCPUIDFaulting, compareWant.CPUProfile.CPUID = got.CPUProfile.NoCPUIDFaulting, got.CPUProfile.CPUID
-	// A node adopts its cluster's CPU topology; whether the host's layout is
-	// the one the cluster records, resolveDaemonCPUTopology judges.
-	compareWant.CPUProfile.Topology, compareWant.CPUProfile.TopologyFingerprint = got.CPUProfile.Topology, got.CPUProfile.TopologyFingerprint
+	compareWant.CPUProfile = got.CPUProfile
 	compareWant.Version = immutableClusterConfigVersion(compareWant.CPUProfile)
 	var pending *daemonImmutableClusterConfig
 	if !equalImmutableClusterConfig(got, compareWant) {

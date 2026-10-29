@@ -372,10 +372,30 @@ func applyStandaloneCPUProfile(root, mode, features, runtimePlatform string, exp
 	if err := validateDaemonCPUProfile(stored, runtimePlatform); err != nil {
 		return daemonCPUProfile{}, err
 	}
-	if explicitlySet && (requested.Mode != stored.Mode || !slices.Equal(requested.Features, stored.Features) || requested.XsaveABI != stored.XsaveABI) {
+	if explicitlySet && !requestsCPUProfile(requested, stored) {
 		return daemonCPUProfile{}, fmt.Errorf("requested CPU profile differs from immutable profile %q stored in TTC_ROOT", stored.Mode)
 	}
 	return stored, nil
+}
+
+// requestsCPUProfile reports whether requested, a --cpu-profile as this build
+// resolves it, asks for stored, the immutable profile of a root. A named
+// profile (host, portable) asks for whatever it was when the root was made: a
+// later build may know more of the host's features, or a different portable
+// baseline, and the stored profile stays the root's, which
+// validateDaemonCPUProfile checks the host can still run. An explicit profile
+// asks for its features.
+func requestsCPUProfile(requested, stored daemonCPUProfile) bool {
+	if requested.Mode != stored.Mode {
+		return false
+	}
+	if requested.Mode != "explicit" {
+		return true
+	}
+	want, have := slices.Clone(requested.Features), slices.Clone(stored.Features)
+	slices.Sort(want)
+	slices.Sort(have)
+	return slices.Equal(want, have)
 }
 
 func (p daemonCPUProfile) annotation() string {
