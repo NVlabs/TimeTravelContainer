@@ -62,7 +62,7 @@ Some files carry the "BSD" license, noted at the top of each file:
 
 ### Go
 
-The Go standard library and runtime, go1.26.3, are linked into `ttc` and `ttcd`: BSD-3-Clause, with Google's patent grant.
+The Go standard library and runtime, go1.27.3, are linked into `ttc` and `ttcd`: BSD-3-Clause, with Google's patent grant.
 
 ### Modified components
 
@@ -99,6 +99,8 @@ Every module `go.mod` requires. `ttc` and `ttcd` link those their packages impor
 |---|---|---|---|
 | cloud.google.com/go/auth | v0.20.0 | Apache-2.0 | direct |
 | cloud.google.com/go/auth/oauth2adapt | v0.2.8 | Apache-2.0 | direct |
+| cloud.google.com/go/compute/metadata | v0.9.0 | Apache-2.0 | direct |
+| cloud.google.com/go/firestore | v1.22.0 | Apache-2.0 | direct |
 | cloud.google.com/go/storage | v1.62.1 | Apache-2.0 | direct |
 | github.com/BurntSushi/toml | v1.4.1-0.20240526193622-a339e1f7089c | MIT | direct |
 | github.com/cenkalti/backoff | v2.2.1+incompatible | MIT | direct |
@@ -122,7 +124,9 @@ Every module `go.mod` requires. `ttc` and `ttcd` link those their packages impor
 | github.com/gofrs/flock | v0.8.0 | BSD-3-Clause | direct |
 | github.com/gogo/protobuf | v1.3.2 | BSD-3-Clause | direct |
 | github.com/google/btree | v1.1.2 | Apache-2.0 | direct |
+| github.com/google/go-github/v84 | v84.0.0 | BSD-3-Clause | direct |
 | github.com/google/subcommands | v1.0.2-0.20190508160503-636abe8753b8 | Apache-2.0 | direct |
+| github.com/googleapis/gax-go/v2 | v2.21.0 | BSD-3-Clause | direct |
 | github.com/klauspost/compress | v1.18.0 | Apache-2.0 AND MIT AND BSD-3-Clause | direct |
 | github.com/mattbaird/jsonpatch | v0.0.0-20171005235357-81af80346b1a | Apache-2.0 | direct |
 | github.com/moby/sys/capability | v0.4.0 | BSD-2-Clause | direct |
@@ -131,11 +135,11 @@ Every module `go.mod` requires. `ttc` and `ttcd` link those their packages impor
 | github.com/sirupsen/logrus | v1.9.3 | MIT | direct |
 | github.com/vishvananda/netlink | v1.3.1-0.20250303224720-0e7078ed04c8 | Apache-2.0 | direct |
 | golang.org/x/exp | v0.0.0-20250711185948-6ae5c78190dc | BSD-3-Clause | direct |
-| golang.org/x/mod | v0.34.0 | BSD-3-Clause | direct |
-| golang.org/x/sync | v0.20.0 | BSD-3-Clause | direct |
-| golang.org/x/sys | v0.43.0 | BSD-3-Clause | direct |
+| golang.org/x/mod | v0.41.0 | BSD-3-Clause | direct |
+| golang.org/x/sync | v0.23.0 | BSD-3-Clause | direct |
+| golang.org/x/sys | v0.48.0 | BSD-3-Clause | direct |
 | golang.org/x/time | v0.15.0 | BSD-3-Clause | direct |
-| golang.org/x/tools | v0.43.0 | BSD-3-Clause | direct |
+| golang.org/x/tools | v0.51.0 | BSD-3-Clause | direct |
 | google.golang.org/api | v0.274.0 | BSD-3-Clause | direct |
 | google.golang.org/grpc | v1.80.0 | Apache-2.0 | direct |
 | google.golang.org/protobuf | v1.36.11 | BSD-3-Clause | direct |
@@ -144,8 +148,8 @@ Every module `go.mod` requires. `ttc` and `ttcd` link those their packages impor
 | k8s.io/client-go | v0.32.3 | Apache-2.0 | direct |
 | cel.dev/expr | v0.25.1 | Apache-2.0 | indirect |
 | cloud.google.com/go | v0.123.0 | Apache-2.0 | indirect |
-| cloud.google.com/go/compute/metadata | v0.9.0 | Apache-2.0 | indirect |
 | cloud.google.com/go/iam | v1.7.0 | Apache-2.0 | indirect |
+| cloud.google.com/go/longrunning | v0.9.0 | Apache-2.0 | indirect |
 | cloud.google.com/go/monitoring | v1.24.3 | Apache-2.0 | indirect |
 | github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp | v1.31.0 | Apache-2.0 | indirect |
 | github.com/GoogleCloudPlatform/opentelemetry-operations-go/exporter/metric | v0.55.0 | Apache-2.0 | indirect |
@@ -172,11 +176,11 @@ Every module `go.mod` requires. `ttc` and `ttcd` link those their packages impor
 | github.com/golang/protobuf | v1.5.4 | BSD-3-Clause | indirect |
 | github.com/google/gnostic-models | v0.6.8 | Apache-2.0 | indirect |
 | github.com/google/go-cmp | v0.7.0 | BSD-3-Clause | indirect |
+| github.com/google/go-querystring | v1.2.0 | BSD-3-Clause | indirect |
 | github.com/google/gofuzz | v1.2.0 | Apache-2.0 | indirect |
 | github.com/google/s2a-go | v0.1.9 | Apache-2.0 | indirect |
 | github.com/google/uuid | v1.6.0 | BSD-3-Clause | indirect |
 | github.com/googleapis/enterprise-certificate-proxy | v0.3.14 | Apache-2.0 | indirect |
-| github.com/googleapis/gax-go/v2 | v2.21.0 | BSD-3-Clause | indirect |
 | github.com/josharian/intern | v1.0.0 | MIT | indirect |
 | github.com/json-iterator/go | v1.1.12 | MIT | indirect |
 | github.com/mailru/easyjson | v0.7.7 | MIT | indirect |
@@ -206,11 +210,12 @@ Every module `go.mod` requires. `ttc` and `ttcd` link those their packages impor
 | go.opentelemetry.io/otel/sdk | v1.43.0 | Apache-2.0 AND BSD-3-Clause | indirect |
 | go.opentelemetry.io/otel/sdk/metric | v1.43.0 | Apache-2.0 AND BSD-3-Clause | indirect |
 | go.opentelemetry.io/otel/trace | v1.43.0 | Apache-2.0 AND BSD-3-Clause | indirect |
-| golang.org/x/crypto | v0.49.0 | BSD-3-Clause | indirect |
-| golang.org/x/net | v0.52.0 | BSD-3-Clause | indirect |
+| golang.org/x/crypto | v0.57.0 | BSD-3-Clause | indirect |
+| golang.org/x/net | v0.60.0 | BSD-3-Clause | indirect |
 | golang.org/x/oauth2 | v0.36.0 | BSD-3-Clause | indirect |
-| golang.org/x/term | v0.42.0 | BSD-3-Clause | indirect |
-| golang.org/x/text | v0.36.0 | BSD-3-Clause | indirect |
+| golang.org/x/telemetry | v0.0.0-20260924152758-ed294f943157 | BSD-3-Clause | indirect |
+| golang.org/x/term | v0.46.0 | BSD-3-Clause | indirect |
+| golang.org/x/text | v0.42.0 | BSD-3-Clause | indirect |
 | google.golang.org/genproto | v0.0.0-20260319201613-d00831a3d3e7 | Apache-2.0 | indirect |
 | google.golang.org/genproto/googleapis/api | v0.0.0-20260401024825-9d38bb4040a9 | Apache-2.0 | indirect |
 | google.golang.org/genproto/googleapis/rpc | v0.0.0-20260401024825-9d38bb4040a9 | Apache-2.0 | indirect |
@@ -230,7 +235,7 @@ Components whose license or notice files differ only in spacing share one copy o
 
 ### BSD-3-Clause
 
-Of Go standard library and runtime go1.26.3 (LICENSE); golang.org/x/exp v0.0.0-20250711185948-6ae5c78190dc (LICENSE); golang.org/x/mod v0.34.0 (LICENSE); golang.org/x/sync v0.20.0 (LICENSE); golang.org/x/sys v0.43.0 (LICENSE); golang.org/x/time v0.15.0 (LICENSE); golang.org/x/tools v0.43.0 (LICENSE); golang.org/x/crypto v0.49.0 (LICENSE); golang.org/x/net v0.52.0 (LICENSE); golang.org/x/oauth2 v0.36.0 (LICENSE); golang.org/x/term v0.42.0 (LICENSE); golang.org/x/text v0.36.0 (LICENSE).
+Of Go standard library and runtime go1.27.3 (LICENSE); golang.org/x/exp v0.0.0-20250711185948-6ae5c78190dc (LICENSE); golang.org/x/mod v0.41.0 (LICENSE); golang.org/x/sync v0.23.0 (LICENSE); golang.org/x/sys v0.48.0 (LICENSE); golang.org/x/time v0.15.0 (LICENSE); golang.org/x/tools v0.51.0 (LICENSE); golang.org/x/crypto v0.57.0 (LICENSE); golang.org/x/net v0.60.0 (LICENSE); golang.org/x/oauth2 v0.36.0 (LICENSE); golang.org/x/telemetry v0.0.0-20260924152758-ed294f943157 (LICENSE); golang.org/x/term v0.46.0 (LICENSE); golang.org/x/text v0.42.0 (LICENSE).
 
 ````text
 Copyright 2009 The Go Authors.
@@ -264,7 +269,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ### Patent grant
 
-Of Go standard library and runtime go1.26.3 (PATENTS); golang.org/x/exp v0.0.0-20250711185948-6ae5c78190dc (PATENTS); golang.org/x/mod v0.34.0 (PATENTS); golang.org/x/sync v0.20.0 (PATENTS); golang.org/x/sys v0.43.0 (PATENTS); golang.org/x/time v0.15.0 (PATENTS); golang.org/x/tools v0.43.0 (PATENTS); google.golang.org/protobuf v1.36.11 (PATENTS); golang.org/x/crypto v0.49.0 (PATENTS); golang.org/x/net v0.52.0 (PATENTS); golang.org/x/term v0.42.0 (PATENTS); golang.org/x/text v0.36.0 (PATENTS).
+Of Go standard library and runtime go1.27.3 (PATENTS); golang.org/x/exp v0.0.0-20250711185948-6ae5c78190dc (PATENTS); golang.org/x/mod v0.41.0 (PATENTS); golang.org/x/sync v0.23.0 (PATENTS); golang.org/x/sys v0.48.0 (PATENTS); golang.org/x/time v0.15.0 (PATENTS); golang.org/x/tools v0.51.0 (PATENTS); google.golang.org/protobuf v1.36.11 (PATENTS); golang.org/x/crypto v0.57.0 (PATENTS); golang.org/x/net v0.60.0 (PATENTS); golang.org/x/telemetry v0.0.0-20260924152758-ed294f943157 (PATENTS); golang.org/x/term v0.46.0 (PATENTS); golang.org/x/text v0.42.0 (PATENTS).
 
 ````text
 Additional IP Rights Grant (Patents)
@@ -319,7 +324,7 @@ Full license text of these licenses is available at:
 
 ### Apache-2.0
 
-Of Vulkan-Headers 1.4.357 (LICENSES/Apache-2.0.txt); MoltenVK 1.4.2 (LICENSE); SPIRV-Cross 6c09849fe88c (LICENSE); SPIRV-Tools 0d6fd73ca738 (LICENSE); Vulkan-Headers e3b1eec08173 (LICENSES/Apache-2.0.txt); cloud.google.com/go/auth v0.20.0 (LICENSE); cloud.google.com/go/auth/oauth2adapt v0.2.8 (LICENSE); cloud.google.com/go/storage v1.62.1 (LICENSE); github.com/containerd/cgroups/v3 v3.0.5 (LICENSE); github.com/containerd/fifo v1.1.0 (LICENSE); github.com/containerd/go-runc v1.1.0 (LICENSE); github.com/containerd/ttrpc v1.2.7 (LICENSE); github.com/google/btree v1.1.2 (LICENSE); github.com/google/subcommands v1.0.2-0.20190508160503-636abe8753b8 (LICENSE); google.golang.org/grpc v1.80.0 (LICENSE); k8s.io/api v0.32.3 (LICENSE); k8s.io/apimachinery v0.32.3 (LICENSE); k8s.io/client-go v0.32.3 (LICENSE); cel.dev/expr v0.25.1 (LICENSE); cloud.google.com/go v0.123.0 (LICENSE); cloud.google.com/go/compute/metadata v0.9.0 (LICENSE); cloud.google.com/go/iam v1.7.0 (LICENSE); cloud.google.com/go/monitoring v1.24.3 (LICENSE); github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp v1.31.0 (LICENSE); github.com/GoogleCloudPlatform/opentelemetry-operations-go/exporter/metric v0.55.0 (LICENSE); github.com/GoogleCloudPlatform/opentelemetry-operations-go/internal/resourcemapping v0.55.0 (LICENSE); github.com/cncf/xds/go v0.0.0-20251210132809-ee656c7534f5 (LICENSE); github.com/envoyproxy/protoc-gen-validate v1.3.0 (LICENSE); github.com/go-jose/go-jose/v4 v4.1.4 (LICENSE); github.com/go-logr/stdr v1.2.2 (LICENSE); github.com/go-openapi/jsonpointer v0.21.0 (LICENSE); github.com/go-openapi/jsonreference v0.20.2 (LICENSE); github.com/go-openapi/swag v0.23.0 (LICENSE); github.com/google/gnostic-models v0.6.8 (LICENSE); github.com/google/gofuzz v1.2.0 (LICENSE); github.com/google/s2a-go v0.1.9 (LICENSE.md); github.com/googleapis/enterprise-certificate-proxy v0.3.14 (LICENSE); github.com/moby/sys/mountinfo v0.7.2 (LICENSE); github.com/moby/sys/userns v0.1.0 (LICENSE); github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd (LICENSE); github.com/modern-go/reflect2 v1.0.2 (LICENSE); github.com/spiffe/go-spiffe/v2 v2.6.0 (LICENSE); go.opencensus.io v0.24.0 (LICENSE); go.opentelemetry.io/auto/sdk v1.2.1 (LICENSE); google.golang.org/genproto v0.0.0-20260319201613-d00831a3d3e7 (LICENSE); google.golang.org/genproto/googleapis/api v0.0.0-20260401024825-9d38bb4040a9 (LICENSE); google.golang.org/genproto/googleapis/rpc v0.0.0-20260401024825-9d38bb4040a9 (LICENSE); k8s.io/kube-openapi v0.0.0-20241105132330-32ad38e42d3f (LICENSE); k8s.io/utils v0.0.0-20241104100929-3ea5e8cea738 (LICENSE).
+Of Vulkan-Headers 1.4.357 (LICENSES/Apache-2.0.txt); MoltenVK 1.4.2 (LICENSE); SPIRV-Cross 6c09849fe88c (LICENSE); SPIRV-Tools 0d6fd73ca738 (LICENSE); Vulkan-Headers e3b1eec08173 (LICENSES/Apache-2.0.txt); cloud.google.com/go/auth v0.20.0 (LICENSE); cloud.google.com/go/auth/oauth2adapt v0.2.8 (LICENSE); cloud.google.com/go/compute/metadata v0.9.0 (LICENSE); cloud.google.com/go/firestore v1.22.0 (LICENSE); cloud.google.com/go/storage v1.62.1 (LICENSE); github.com/containerd/cgroups/v3 v3.0.5 (LICENSE); github.com/containerd/fifo v1.1.0 (LICENSE); github.com/containerd/go-runc v1.1.0 (LICENSE); github.com/containerd/ttrpc v1.2.7 (LICENSE); github.com/google/btree v1.1.2 (LICENSE); github.com/google/subcommands v1.0.2-0.20190508160503-636abe8753b8 (LICENSE); google.golang.org/grpc v1.80.0 (LICENSE); k8s.io/api v0.32.3 (LICENSE); k8s.io/apimachinery v0.32.3 (LICENSE); k8s.io/client-go v0.32.3 (LICENSE); cel.dev/expr v0.25.1 (LICENSE); cloud.google.com/go v0.123.0 (LICENSE); cloud.google.com/go/iam v1.7.0 (LICENSE); cloud.google.com/go/longrunning v0.9.0 (LICENSE); cloud.google.com/go/monitoring v1.24.3 (LICENSE); github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp v1.31.0 (LICENSE); github.com/GoogleCloudPlatform/opentelemetry-operations-go/exporter/metric v0.55.0 (LICENSE); github.com/GoogleCloudPlatform/opentelemetry-operations-go/internal/resourcemapping v0.55.0 (LICENSE); github.com/cncf/xds/go v0.0.0-20251210132809-ee656c7534f5 (LICENSE); github.com/envoyproxy/protoc-gen-validate v1.3.0 (LICENSE); github.com/go-jose/go-jose/v4 v4.1.4 (LICENSE); github.com/go-logr/stdr v1.2.2 (LICENSE); github.com/go-openapi/jsonpointer v0.21.0 (LICENSE); github.com/go-openapi/jsonreference v0.20.2 (LICENSE); github.com/go-openapi/swag v0.23.0 (LICENSE); github.com/google/gnostic-models v0.6.8 (LICENSE); github.com/google/gofuzz v1.2.0 (LICENSE); github.com/google/s2a-go v0.1.9 (LICENSE.md); github.com/googleapis/enterprise-certificate-proxy v0.3.14 (LICENSE); github.com/moby/sys/mountinfo v0.7.2 (LICENSE); github.com/moby/sys/userns v0.1.0 (LICENSE); github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd (LICENSE); github.com/modern-go/reflect2 v1.0.2 (LICENSE); github.com/spiffe/go-spiffe/v2 v2.6.0 (LICENSE); go.opencensus.io v0.24.0 (LICENSE); go.opentelemetry.io/auto/sdk v1.2.1 (LICENSE); google.golang.org/genproto v0.0.0-20260319201613-d00831a3d3e7 (LICENSE); google.golang.org/genproto/googleapis/api v0.0.0-20260401024825-9d38bb4040a9 (LICENSE); google.golang.org/genproto/googleapis/rpc v0.0.0-20260401024825-9d38bb4040a9 (LICENSE); k8s.io/kube-openapi v0.0.0-20241105132330-32ad38e42d3f (LICENSE); k8s.io/utils v0.0.0-20241104100929-3ea5e8cea738 (LICENSE).
 
 ````text
                                  Apache License
@@ -1746,6 +1751,74 @@ copyright notice, this list of conditions and the following disclaimer
 in the documentation and/or other materials provided with the
 distribution.
     * Neither the name of Google Inc. nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+````
+
+### BSD-3-Clause
+
+Of github.com/google/go-github/v84 v84.0.0 (LICENSE).
+
+````text
+Copyright (c) 2013 The go-github AUTHORS. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+   * Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+   * Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following disclaimer
+in the documentation and/or other materials provided with the
+distribution.
+   * Neither the name of Google Inc. nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+````
+
+### BSD-3-Clause
+
+Of github.com/googleapis/gax-go/v2 v2.21.0 (LICENSE).
+
+````text
+Copyright 2016, Google Inc.
+All rights reserved.
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+   * Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+   * Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following disclaimer
+in the documentation and/or other materials provided with the
+distribution.
+   * Neither the name of Google Inc. nor the names of its
 contributors may be used to endorse or promote products derived from
 this software without specific prior written permission.
 
@@ -3281,10 +3354,10 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ### BSD-3-Clause
 
-Of github.com/google/uuid v1.6.0 (LICENSE).
+Of github.com/google/go-querystring v1.2.0 (LICENSE).
 
 ````text
-Copyright (c) 2009,2014 Google Inc. All rights reserved.
+Copyright (c) 2013 Google. All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are
@@ -3315,11 +3388,11 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ### BSD-3-Clause
 
-Of github.com/googleapis/gax-go/v2 v2.21.0 (LICENSE).
+Of github.com/google/uuid v1.6.0 (LICENSE).
 
 ````text
-Copyright 2016, Google Inc.
-All rights reserved.
+Copyright (c) 2009,2014 Google Inc. All rights reserved.
+
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are
 met:
