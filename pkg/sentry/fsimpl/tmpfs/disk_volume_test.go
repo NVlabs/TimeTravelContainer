@@ -130,6 +130,79 @@ func TestDiskVolumeErrorNeverLeaksUnknownSyscallError(t *testing.T) {
 	}
 }
 
+// sync(2) fsyncs on the host only the files that a writable mapping may have
+// written since a sync last took them, and every file once after a restore or
+// a live fork; the writes of the others mark their objects dirty, and the
+// repository syncs those.
+func TestDiskVolumeSyncTakesMappedFiles(t *testing.T) {
+	manager, err := ttcvolume.OpenManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenManager: %v", err)
+	}
+	repository, err := manager.Create("sync-mapped-test")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer repository.Close()
+	ino, err := repository.CreateRegular(ttcvolume.MainBranch, ttcvolume.RootInode, "mapped", 0644, 0, 0)
+	if err != nil {
+		t.Fatalf("CreateRegular: %v", err)
+	}
+	if _, _, err := repository.WriteAt(ttcvolume.MainBranch, ino, make([]byte, hostarch.PageSize), 0); err != nil {
+		t.Fatalf("WriteAt: %v", err)
+	}
+	fs := &filesystem{
+		diskVolume:    &diskVolumeState{Repository: repository, Branch: ttcvolume.MainBranch},
+		liveForkFiles: make(map[*regularFile]struct{}),
+	}
+	file := &regularFile{}
+	file.inode.fs = fs
+	file.inode.impl = file
+	file.inode.ino = ino
+	file.inode.mode.Store(uint32(linux.S_IFREG | 0644))
+	file.inode.nlink.Store(1)
+	file.size.Store(hostarch.PageSize)
+	fs.liveForkFiles[file] = struct{}{}
+	defer file.releaseDiskMap()
+
+	if file.takeDiskMappedWrites() {
+		t.Error("a file never mapped writable is taken")
+	}
+	ctx := contexttest.Context(t)
+	ms := &recordingMappingSpace{}
+	ar := hostarch.AddrRange{Start: 0x10000, End: 0x10000 + hostarch.PageSize}
+	if err := file.AddMapping(ctx, ms, ar, 0, false); err != nil {
+		t.Fatalf("AddMapping: %v", err)
+	}
+	if file.takeDiskMappedWrites() {
+		t.Error("a file mapped read-only is taken")
+	}
+	file.RemoveMapping(ctx, ms, ar, 0, false)
+	if err := file.AddMapping(ctx, ms, ar, 0, true); err != nil {
+		t.Fatalf("AddMapping: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		if !file.takeDiskMappedWrites() {
+			t.Errorf("sync %d does not take a file mapped writable", i)
+		}
+	}
+	if err := fs.syncDiskData(); err != nil {
+		t.Fatalf("syncDiskData: %v", err)
+	}
+	file.RemoveMapping(ctx, ms, ar, 0, true)
+	if !file.takeDiskMappedWrites() {
+		t.Error("the first sync after a writable mapping went away does not take the file")
+	}
+	if file.takeDiskMappedWrites() {
+		t.Error("a file unmapped and taken since is taken again")
+	}
+	// What a restore or a live fork loads may hold unsynced mapped writes.
+	file.diskMappedWrites.Store(true)
+	if !file.takeDiskMappedWrites() {
+		t.Error("a loaded file is not taken")
+	}
+}
+
 func TestDiskVolumeMmapCoWClosesStaleIOObject(t *testing.T) {
 	manager, err := ttcvolume.OpenManager(t.TempDir())
 	if err != nil {

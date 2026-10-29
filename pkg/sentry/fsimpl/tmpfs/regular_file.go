@@ -73,6 +73,11 @@ type regularFile struct {
 	// by diskMapMu, so that Translate may read it.
 	writableMappingPages uint64
 
+	// diskMappedWrites is true if a file of a TTC volume has had a writable
+	// mapping since a sync last took it (see takeDiskMappedWrites): writes
+	// through one reach the host file without marking its object dirty.
+	diskMappedWrites atomicbitops.Bool `state:"nosave"`
+
 	// dataMu protects the fields below.
 	dataMu sync.RWMutex `state:"nosave"`
 
@@ -247,6 +252,9 @@ func (rf *regularFile) afterLoad(ctx goContext.Context) {
 		rf.diskIOFile = nil
 		rf.diskIOObject = ""
 		rf.diskIOWritable = false
+		// A live fork's source may have written the file through a mapping
+		// and not synced it: the copy's first sync takes it.
+		rf.diskMappedWrites.Store(true)
 		// VMAs are restored from state, without AddMapping: count their
 		// writable mappings as it would have.
 		rf.writableMappingPages = 0
@@ -895,6 +903,7 @@ func (rf *regularFile) AddMapping(ctx context.Context, ms memmap.MappingSpace, a
 		if !writable {
 			return nil
 		}
+		rf.diskMappedWrites.Store(true)
 		rf.diskMapMu.Lock()
 		pagesBefore := rf.writableMappingPages
 		rf.writableMappingPages += uint64(ar.Length() / hostarch.PageSize)
@@ -946,6 +955,8 @@ func (rf *regularFile) RemoveMapping(ctx context.Context, ms memmap.MappingSpace
 	rf.mappings.RemoveMapping(ms, ar, offset, writable)
 	if rf.inode.fs.diskVolume != nil {
 		if writable {
+			// The mapping may have written since a sync took the file.
+			rf.diskMappedWrites.Store(true)
 			rf.diskMapMu.Lock()
 			pagesBefore := rf.writableMappingPages
 			rf.writableMappingPages -= uint64(ar.Length() / hostarch.PageSize)

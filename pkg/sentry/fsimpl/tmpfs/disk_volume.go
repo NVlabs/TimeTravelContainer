@@ -731,11 +731,12 @@ func (fs *filesystem) flushDiskWriteMetadataRaw() error {
 	return nil
 }
 
-// syncDiskData synchronizes the data objects represented by live regular-file
-// inodes. This includes MAP_SHARED writes, which can modify the donated host
-// mapping without passing through regularFileFD.PWrite. Namespace-created
-// objects that have already left the runtime inode cache remain covered by the
-// repository's dirty-object set.
+// syncDiskData synchronizes the data objects of live regular files written
+// through MAP_SHARED mappings, which modify the donated host mapping without
+// passing through regularFileFD.PWrite. Writes, truncations and allocations
+// mark their objects dirty, and the repository's dirty-object set covers
+// those. It synchronized every live file, opening and fsyncing each on the
+// host: a sync(2) cost as much again for every file a process held open.
 func (fs *filesystem) syncDiskData() error {
 	if fs.diskVolume == nil {
 		return nil
@@ -747,9 +748,26 @@ func (fs *filesystem) syncDiskData() error {
 	}
 	fs.liveForkMu.Unlock()
 	for _, file := range files {
+		if !file.takeDiskMappedWrites() {
+			continue
+		}
 		if err := fs.diskVolume.Repository.SyncData(fs.diskVolume.Branch, file.inode.ino, false); err != nil && !diskInodeReaped(&file.inode, err) {
+			// A later sync must take the file again.
+			file.diskMappedWrites.Store(true)
 			return diskVolumeError("sync regular-file data", err)
 		}
 	}
 	return nil
+}
+
+// takeDiskMappedWrites returns true if rf may hold bytes written through a
+// writable mapping that no sync has taken: it has one, or had one since a
+// sync last took it.
+func (rf *regularFile) takeDiskMappedWrites() bool {
+	if rf.diskMappedWrites.Swap(false) {
+		return true
+	}
+	rf.diskMapMu.Lock()
+	defer rf.diskMapMu.Unlock()
+	return rf.writableMappingPages != 0
 }
