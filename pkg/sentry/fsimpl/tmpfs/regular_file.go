@@ -1193,7 +1193,7 @@ func (fd *regularFileFD) OnClose(context.Context) error {
 
 // Sync synchronizes data before publishing the size and timestamps that make
 // those bytes reachable after restart.
-func (fd *regularFileFD) Sync(_ context.Context, opts vfs.SyncOptions) error {
+func (fd *regularFileFD) Sync(ctx context.Context, opts vfs.SyncOptions) error {
 	f := fd.inode().impl.(*regularFile)
 	if f.inode.fs.diskVolume == nil {
 		return nil
@@ -1214,7 +1214,12 @@ func (fd *regularFileFD) Sync(_ context.Context, opts vfs.SyncOptions) error {
 	// This file's metadata and names, not the repository's every dirty
 	// object: fsync(2) promises this file, and sync(2) is the call that
 	// promises everything.
-	if err := f.inode.fs.diskVolume.Repository.SyncBranchMetadata(f.inode.fs.diskVolume.Branch); err != nil {
+	if err := waitOutHandoff(ctx, func() error {
+		return f.inode.fs.diskVolume.Repository.SyncBranchMetadata(f.inode.fs.diskVolume.Branch)
+	}); err != nil {
+		if linuxerr.Equals(linuxerr.ERESTARTNOINTR, err) {
+			return err
+		}
 		reportDiskVolumeFailure("sync filesystem metadata", err)
 		return diskVolumeError("sync filesystem metadata", err)
 	}
@@ -1613,7 +1618,9 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 			if err := f.flushDiskMetadataLocked(); err != nil {
 				return done, offset + done, err
 			}
-			if err := f.inode.fs.diskVolume.Repository.SyncBranchMetadata(f.inode.fs.diskVolume.Branch); err != nil {
+			if err := waitOutHandoffUninterruptibly(func() error {
+				return f.inode.fs.diskVolume.Repository.SyncBranchMetadata(f.inode.fs.diskVolume.Branch)
+			}); err != nil {
 				return done, offset + done, diskVolumeError("sync filesystem metadata", err)
 			}
 		}

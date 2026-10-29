@@ -650,7 +650,7 @@ func (fs *filesystem) Release(ctx context.Context) {
 			if err := fs.syncDiskData(); err != nil {
 				ctx.Warningf("syncing TTC volume data during filesystem release: %v", err)
 			}
-			if err := fs.diskVolume.Repository.SyncMetadata(); err != nil {
+			if err := waitOutHandoffUninterruptibly(fs.diskVolume.Repository.SyncMetadata); err != nil {
 				ctx.Warningf("syncing TTC volume metadata during filesystem release: %v", err)
 			}
 		}
@@ -1654,14 +1654,16 @@ func (fd *fileDescription) SetPosixACL(ctx context.Context, t vfs.ACLType, acl *
 }
 
 // Sync implements vfs.FileDescriptionImpl.Sync.
-func (fd *fileDescription) Sync(_ context.Context, opts vfs.SyncOptions) error {
+func (fd *fileDescription) Sync(ctx context.Context, opts vfs.SyncOptions) error {
 	if fs := fd.filesystem(); fs.diskVolume != nil {
 		if _, ok := fd.inode().impl.(*regularFile); ok {
 			return diskVolumeError("sync inode data", fs.diskVolume.Repository.SyncData(fs.diskVolume.Branch, fd.inode().ino, opts.DataOnly))
 		}
 		// A directory's fsync promises its entries, which are this branch's
 		// published namespace; no file's data rides along.
-		return diskVolumeError("sync inode metadata", fs.diskVolume.Repository.SyncBranchMetadata(fs.diskVolume.Branch))
+		return diskVolumeError("sync inode metadata", waitOutHandoff(ctx, func() error {
+			return fs.diskVolume.Repository.SyncBranchMetadata(fs.diskVolume.Branch)
+		}))
 	}
 	return nil
 }

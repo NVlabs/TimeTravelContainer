@@ -3845,3 +3845,32 @@ func TestAddBytes(t *testing.T) {
 		}
 	}
 }
+
+// A guest's durability barrier waits out an authority handoff: it runs again
+// while the snapshot ledger is frozen, returns any other error at once, and
+// stops when its wait does, as when the guest is interrupted.
+func TestWaitOutAuthorityHandoff(t *testing.T) {
+	frozen := fmt.Errorf("publishing: %w", ttcsnapshot.ErrSnapshotLedgerFrozen)
+	tries, waits := 0, 0
+	barrier := func() error {
+		tries++
+		if tries < 3 {
+			return frozen
+		}
+		return nil
+	}
+	wait := func(time.Duration) error { waits++; return nil }
+	if err := WaitOutAuthorityHandoff(barrier, wait); err != nil || tries != 3 || waits != 2 {
+		t.Errorf("WaitOutAuthorityHandoff() = %v after %d tries and %d waits; want nil after 3 and 2", err, tries, waits)
+	}
+	other := errors.New("disk failed")
+	tries = 0
+	if err := WaitOutAuthorityHandoff(func() error { tries++; return other }, wait); err != other || tries != 1 {
+		t.Errorf("WaitOutAuthorityHandoff() = %v after %d tries; want %v after 1", err, tries, other)
+	}
+	stop := errors.New("interrupted")
+	tries = 0
+	if err := WaitOutAuthorityHandoff(func() error { tries++; return frozen }, func(time.Duration) error { return stop }); err != stop || tries != 1 {
+		t.Errorf("WaitOutAuthorityHandoff() = %v after %d tries; want %v after 1", err, tries, stop)
+	}
+}

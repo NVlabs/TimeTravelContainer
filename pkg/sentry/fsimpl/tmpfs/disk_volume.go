@@ -391,6 +391,30 @@ func pageRoundedDiskBytes(size uint64) uint64 {
 	return (size + hostarch.PageSize - 1) &^ (hostarch.PageSize - 1)
 }
 
+// waitOutHandoff runs barrier, a repository durability barrier for a guest's
+// fsync or sync, waiting out an authority handoff, which refuses to publish
+// metadata for its moment (see ttcvolume.WaitOutAuthorityHandoff): on a
+// cluster, a guest's fsync failed with EIO while a checkpoint of its branch
+// was handed to another node. A stop interrupts the wait, as for a fork, and
+// the syscall restarts: the barrier is idempotent.
+func waitOutHandoff(ctx context.Context, barrier func() error) error {
+	return ttcvolume.WaitOutAuthorityHandoff(barrier, func(interval time.Duration) error {
+		if _, err := ctx.BlockWithTimeout(nil, true, interval); err != nil && !linuxerr.Equals(linuxerr.ETIMEDOUT, err) {
+			return linuxerr.ERESTARTNOINTR
+		}
+		return nil
+	})
+}
+
+// waitOutHandoffUninterruptibly is waitOutHandoff for a barrier that cannot
+// restart, such as an O_SYNC write's, which has written.
+func waitOutHandoffUninterruptibly(barrier func() error) error {
+	return ttcvolume.WaitOutAuthorityHandoff(barrier, func(interval time.Duration) error {
+		time.Sleep(interval)
+		return nil
+	})
+}
+
 // diskBytesLog logs disk byte accounting that went wrong.
 var diskBytesLog = log.BasicRateLimitedLogger(time.Minute)
 

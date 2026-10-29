@@ -70,7 +70,7 @@ func (fs *filesystem) Sync(ctx context.Context) error {
 		if err := fs.syncDiskData(); err != nil {
 			return err
 		}
-		return diskVolumeError("sync filesystem metadata", fs.diskVolume.Repository.SyncMetadata())
+		return diskVolumeError("sync filesystem metadata", waitOutHandoff(ctx, fs.diskVolume.Repository.SyncMetadata))
 	}
 	return nil
 }

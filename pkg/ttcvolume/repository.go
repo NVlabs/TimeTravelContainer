@@ -4319,16 +4319,35 @@ func (r *Repository) releaseGraphObservation(pins []string) error {
 }
 
 func retryFrozenGraphObservation(operation func() error) error {
+	return WaitOutAuthorityHandoff(operation, func(interval time.Duration) error {
+		time.Sleep(interval)
+		return nil
+	})
+}
+
+// WaitOutAuthorityHandoff runs barrier, a durability barrier over mutations
+// already applied, such as a guest's fsync or sync, again for as long as an
+// authority handoff has frozen the snapshot ledger, up to
+// graphObservationHandoffTimeout. It calls wait between tries, and returns
+// what wait returns to stop. The barrier publishes the branch's batched
+// metadata, which the frozen ledger refuses for the moment of the handoff;
+// the mutations stay applied and batched (see the bounded flush of
+// commitMetadata), so a later try publishes them. A guest's fsync on one
+// node failed with EIO while a checkpoint of its branch was handed to
+// another.
+func WaitOutAuthorityHandoff(barrier func() error, wait func(time.Duration) error) error {
 	deadline := time.Now().Add(graphObservationHandoffTimeout)
 	for {
-		err := operation()
+		err := barrier()
 		if err == nil || !errors.Is(err, ttcsnapshot.ErrSnapshotLedgerFrozen) {
 			return err
 		}
 		if !time.Now().Before(deadline) {
 			return fmt.Errorf("waiting for snapshot authority handoff: %w", err)
 		}
-		time.Sleep(graphObservationRetryInterval)
+		if err := wait(graphObservationRetryInterval); err != nil {
+			return err
+		}
 	}
 }
 
