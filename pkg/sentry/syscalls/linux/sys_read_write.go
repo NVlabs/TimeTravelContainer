@@ -599,8 +599,17 @@ func Readahead(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintp
 		return 0, nil, linuxerr.EINVAL
 	}
 
-	// Return EINVAL; if the underlying file type does not support readahead,
-	// then Linux will return EINVAL to indicate as much. In the future, we
-	// may extend this function to actually support readahead hints.
-	return 0, nil, linuxerr.EINVAL
+	// Linux starts reading a regular file's or block device's pages into its
+	// page cache, and refuses other files with EINVAL (mm/readahead.c:
+	// ksys_readahead()). The Sentry fills its caches as files are read, so
+	// the hint starts nothing; it was refused for every file, which
+	// programs that check it treat as an error.
+	stat, err := file.Stat(t, vfs.StatOptions{Mask: linux.STATX_TYPE})
+	if err != nil {
+		return 0, nil, err
+	}
+	if typ := stat.Mode & linux.S_IFMT; typ != linux.S_IFREG && typ != linux.S_IFBLK {
+		return 0, nil, linuxerr.EINVAL
+	}
+	return 0, nil, nil
 }
