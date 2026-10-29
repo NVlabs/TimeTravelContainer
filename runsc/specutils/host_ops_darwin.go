@@ -7,6 +7,7 @@ package specutils
 
 import (
 	"fmt"
+	"os"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -79,3 +80,22 @@ func safeMount(src, dst, fstype string, flags uintptr, data, procPath string) er
 }
 
 func hostOOMScoreAdj(int) (int, error) { return 0, nil }
+
+// specCopyFile returns an unlinked file holding data. macOS has neither memfds
+// nor file seals, so the copy is not sealed; only the processes that it is
+// passed to can reach it.
+func specCopyFile(data []byte) (*os.File, error) {
+	f, err := os.CreateTemp("", "config.json-")
+	if err != nil {
+		return nil, fmt.Errorf("cannot create spec copy: %w", err)
+	}
+	if err := os.Remove(f.Name()); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("cannot unlink spec copy: %w", err)
+	}
+	if _, err := f.WriteAt(data, 0); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("cannot write spec copy: %w", err)
+	}
+	return f, nil
+}

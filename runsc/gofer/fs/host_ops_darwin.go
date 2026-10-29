@@ -243,3 +243,10 @@ func statDeviceMajor(stat unix.Stat_t) uint32 {
 func statDeviceMinor(stat unix.Stat_t) uint32 {
 	return unix.Minor(uint64(uint32(stat.Dev)))
 }
+
+// isThreadGroupLeader is never asked on macOS, whose gofer does not set a
+// connection's supplementary groups (specutils.SetgroupsAllowed). No thread
+// counts as the leader, so that connectOnItsOwnThread could not recurse.
+func isThreadGroupLeader() bool {
+	return false
+}

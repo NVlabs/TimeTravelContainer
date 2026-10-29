@@ -52,7 +52,7 @@ func socketType(packet bool) int {
 // socket creates a new host socket.
 func socket(packet bool) (int, error) {
 	// Make a new socket.
-	fd, err := unix.Socket(unix.AF_UNIX, socketType(packet)|unix.SOCK_CLOEXEC, 0)
+	fd, err := hostSocket(packet)
 	if err != nil {
 		return 0, err
 	}

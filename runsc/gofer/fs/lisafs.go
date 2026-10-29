@@ -1188,12 +1188,6 @@ func connectOnItsOwnThread(gids []int, connect func() (int, error), done chan co
 	done <- connectResult{sock: sock, err: err}
 }
 
-// isThreadGroupLeader returns true if the calling thread is the thread group
-// leader, whose thread ID is the process ID.
-func isThreadGroupLeader() bool {
-	return unix.Gettid() == unix.Getpid()
-}
-
 func groupsAlreadySet(want, have []int) bool {
 	if slices.Contains(have, overflowGID) {
 		return false

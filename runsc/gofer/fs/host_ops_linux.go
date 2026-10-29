@@ -170,3 +170,9 @@ func statDeviceMajor(stat unix.Stat_t) uint32 {
 func statDeviceMinor(stat unix.Stat_t) uint32 {
 	return uint32(unix.Minor(stat.Dev))
 }
+
+// isThreadGroupLeader returns true if the calling thread is the thread group
+// leader, whose thread ID is the process ID.
+func isThreadGroupLeader() bool {
+	return unix.Gettid() == unix.Getpid()
+}

@@ -47,7 +47,7 @@ func validateHostConfig(c *Config) error {
 	if c.Rootless {
 		return fmt.Errorf("--rootless is a Linux host-isolation mode; use --unsafe-no-host-isolation on macOS")
 	}
-	if c.SystemdCgroup || c.MountCgroupV2 {
+	if c.SystemdCgroup || c.InSandboxCgroup == InSandboxCgroupV2 {
 		return fmt.Errorf("native macOS does not support host cgroup configuration")
 	}
 	return nil

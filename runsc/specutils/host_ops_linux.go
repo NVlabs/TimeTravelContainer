@@ -225,3 +225,21 @@ func hostOOMScoreAdj(pid int) (int, error) {
 	}
 	return strconv.Atoi(strings.TrimSpace(string(data)))
 }
+
+// specCopyFile returns a sealed memfd holding data.
+func specCopyFile(data []byte) (*os.File, error) {
+	fd, err := unix.MemfdCreate("config.json", unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING)
+	if err != nil {
+		return nil, fmt.Errorf("cannot create memfd: %w", err)
+	}
+	f := os.NewFile(uintptr(fd), "config.json")
+	if _, err := f.WriteAt(data, 0); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("cannot write spec copy: %w", err)
+	}
+	if _, err := unix.FcntlInt(f.Fd(), unix.F_ADD_SEALS, unix.F_SEAL_SEAL|unix.F_SEAL_SHRINK|unix.F_SEAL_GROW|unix.F_SEAL_WRITE); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("cannot seal spec copy: %w", err)
+	}
+	return f, nil
+}

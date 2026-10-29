@@ -11,6 +11,18 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func hostSocket(packet bool) (int, error) {
+	// Darwin has no SOCK_CLOEXEC. Hold ForkLock until the socket is
+	// close-on-exec so a concurrent fork cannot inherit it.
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
+	fd, err := unix.Socket(unix.AF_UNIX, socketType(packet), 0)
+	if err == nil {
+		unix.CloseOnExec(fd)
+	}
+	return fd, err
+}
+
 func hostSocketPair(packet bool) ([2]int, error) {
 	// Darwin has no SOCK_CLOEXEC. Hold ForkLock until both ends are
 	// close-on-exec so a concurrent fork cannot inherit them.

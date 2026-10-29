@@ -9,6 +9,7 @@ go_library(
     name = "pinring",
     srcs = [
         "pinring.go",
+        "pinring_darwin.go",
         "pinring_unsafe.go",
     ],
     importpath = "gvisor.dev/gvisor/pkg/pinring",

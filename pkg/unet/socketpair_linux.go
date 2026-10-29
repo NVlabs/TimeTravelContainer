@@ -7,6 +7,10 @@ package unet
 
 import "golang.org/x/sys/unix"
 
+func hostSocket(packet bool) (int, error) {
+	return unix.Socket(unix.AF_UNIX, socketType(packet)|unix.SOCK_CLOEXEC, 0)
+}
+
 func hostSocketPair(packet bool) ([2]int, error) {
 	return unix.Socketpair(unix.AF_UNIX, socketType(packet)|unix.SOCK_CLOEXEC, 0)
 }

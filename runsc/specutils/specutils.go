@@ -298,26 +298,14 @@ func absPath(base, rel string) string {
 
 // CopySpec returns a sealed (read-only) copy of the given OCI runtime spec,
 // encoded as JSON. It can be passed around between processes to ensure they
-// all see the same spec as the caller.
+// all see the same spec as the caller. macOS cannot seal it (see
+// specCopyFile).
 func CopySpec(spec *specs.Spec) (*os.File, error) {
 	data, err := json.Marshal(spec)
 	if err != nil {
 		return nil, fmt.Errorf("cannot encode spec: %w", err)
 	}
-	fd, err := unix.MemfdCreate("config.json", unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING)
-	if err != nil {
-		return nil, fmt.Errorf("cannot create memfd: %w", err)
-	}
-	f := os.NewFile(uintptr(fd), "config.json")
-	if _, err := f.WriteAt(data, 0); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("cannot write spec copy: %w", err)
-	}
-	if _, err := unix.FcntlInt(f.Fd(), unix.F_ADD_SEALS, unix.F_SEAL_SEAL|unix.F_SEAL_SHRINK|unix.F_SEAL_GROW|unix.F_SEAL_WRITE); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("cannot seal spec copy: %w", err)
-	}
-	return f, nil
+	return specCopyFile(data)
 }
 
 // SpecOpts says how to read a spec.
