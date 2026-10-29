@@ -19,6 +19,7 @@ import (
 	"io"
 	"io/fs"
 	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -4252,7 +4253,7 @@ func (r *Repository) BranchUsage(branchID string) (uint64, uint64, error) {
 	for _, inode := range state.inodes {
 		if inode.Type == "regular" && inode.Size > 0 {
 			size := uint64(inode.Size)
-			bytes += (size + pageSize - 1) &^ (pageSize - 1)
+			bytes = AddBytes(bytes, (size+pageSize-1)&^(pageSize-1))
 		}
 	}
 	return uint64(len(state.inodes)), bytes, nil
@@ -4398,18 +4399,27 @@ func (r *Repository) BranchSetUsage(branchIDs []string) (result BranchSetDataUsa
 		usage := BranchDataUsage{ID: id, Inodes: snapshot.inodes}
 		for object, size := range snapshot.objects {
 			if objectBranches[object] > 1 {
-				usage.SharedBytes += size
+				usage.SharedBytes = AddBytes(usage.SharedBytes, size)
 			} else {
-				usage.PrivateBytes += size
+				usage.PrivateBytes = AddBytes(usage.PrivateBytes, size)
 			}
 		}
-		usage.TotalBytes = usage.PrivateBytes + usage.SharedBytes
+		usage.TotalBytes = AddBytes(usage.PrivateBytes, usage.SharedBytes)
 		result.Branches = append(result.Branches, usage)
 	}
 	for _, size := range objectSizes {
-		result.UniqueBytes += size
+		result.UniqueBytes = AddBytes(result.UniqueBytes, size)
 	}
 	return result, nil
+}
+
+// AddBytes returns a+b, or math.MaxUint64 if that is more: the logical sizes
+// of sparse files, which may be 8 EiB each, sum past 2^64 bytes.
+func AddBytes(a, b uint64) uint64 {
+	if a+b < a {
+		return math.MaxUint64
+	}
+	return a + b
 }
 
 // BranchDiff returns paths changed by branchID relative to the immutable graph

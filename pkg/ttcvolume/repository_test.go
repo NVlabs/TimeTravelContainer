@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -3828,5 +3829,19 @@ func TestReadOriginReferencesFollowsTheGraph(t *testing.T) {
 	}
 	if len(references) != 0 {
 		t.Fatalf("after the pin went, references %v", references)
+	}
+}
+
+// Sums of file sizes saturate rather than wrap: sparse files may be 8 EiB.
+func TestAddBytes(t *testing.T) {
+	for _, test := range []struct{ a, b, want uint64 }{
+		{1, 2, 3},
+		{1 << 62, 1 << 62, 1 << 63},
+		{1 << 63, 1 << 63, math.MaxUint64},
+		{math.MaxUint64, 1, math.MaxUint64},
+	} {
+		if got := AddBytes(test.a, test.b); got != test.want {
+			t.Errorf("AddBytes(%d, %d) = %d; want %d", test.a, test.b, got, test.want)
+		}
 	}
 }

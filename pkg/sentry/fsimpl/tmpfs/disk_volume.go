@@ -21,9 +21,11 @@ import (
 	"errors"
 	"fmt"
 	stdfs "io/fs"
+	"math"
 	"os"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -265,6 +267,7 @@ func (fs *filesystem) loadDiskVolume(ctx context.Context) (*dentry, error) {
 		}
 		fs.inodesUsed.Store(inodes)
 		fs.diskBytes.Store(bytes)
+		fs.diskBytesSaturated.Store(bytes == math.MaxUint64)
 		return &rootDir.dentry, nil
 	}
 	return fs.newDentry(rootInode), nil
@@ -388,6 +391,14 @@ func pageRoundedDiskBytes(size uint64) uint64 {
 	return (size + hostarch.PageSize - 1) &^ (hostarch.PageSize - 1)
 }
 
+// diskBytesLog logs disk byte accounting that went wrong.
+var diskBytesLog = log.BasicRateLimitedLogger(time.Minute)
+
+// adjustDiskBytes accounts a regular file changing size from oldSize to
+// newSize. The sum saturates rather than wrapping, as five sparse files of 4
+// EiB, which a guest truncates files to in a moment, wrapped it. A file then
+// shrinking by more than the sum panicked, which took down every branch of
+// the family: the sum is only reported (AllocatedBytes), so it stops at zero.
 func (fs *filesystem) adjustDiskBytes(oldSize, newSize uint64) {
 	oldBytes := pageRoundedDiskBytes(oldSize)
 	newBytes := pageRoundedDiskBytes(newSize)
@@ -398,13 +409,18 @@ func (fs *filesystem) adjustDiskBytes(oldSize, newSize uint64) {
 		current := fs.diskBytes.Load()
 		var next uint64
 		if newBytes > oldBytes {
-			next = current + newBytes - oldBytes
+			next = ttcvolume.AddBytes(current, newBytes-oldBytes)
+			if next == math.MaxUint64 {
+				fs.diskBytesSaturated.Store(true)
+			}
 		} else {
 			delta := oldBytes - newBytes
-			if delta > current {
-				panic(fmt.Sprintf("ttcvol disk byte accounting underflow: current=%d delta=%d", current, delta))
+			if delta > current && !fs.diskBytesSaturated.Load() {
+				// Short of a sum that saturated, files account more
+				// than they added.
+				diskBytesLog.Warningf("ttcvol disk byte accounting: a file shrank by %d bytes, with %d bytes accounted", delta, current)
 			}
-			next = current - delta
+			next = current - min(delta, current)
 		}
 		if fs.diskBytes.CompareAndSwap(current, next) {
 			return

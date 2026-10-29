@@ -174,6 +174,10 @@ type filesystem struct {
 	// data pages are owned by host files, not the tmpfs MemoryFile.
 	diskBytes atomicbitops.Uint64
 
+	// diskBytesSaturated is true once diskBytes saturated; see
+	// adjustDiskBytes.
+	diskBytesSaturated atomicbitops.Bool `state:"nosave"`
+
 	// inodesUsed is the number of inodes used by this filesystem.
 	inodesUsed atomicbitops.Uint64
 

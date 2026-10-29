@@ -6,6 +6,7 @@ package tmpfs
 import (
 	"bytes"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -22,6 +23,34 @@ import (
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
+
+// The sum of a volume's file sizes saturates: five sparse files of 4 EiB
+// wrapped it, and shrinking them then panicked. Once nothing is left, neither
+// is the sum.
+func TestDiskBytesSaturate(t *testing.T) {
+	var fs filesystem
+	fs.adjustDiskBytes(0, 8192)
+	for range 5 {
+		fs.adjustDiskBytes(0, 1<<62)
+	}
+	if got := fs.diskBytes.Load(); got != math.MaxUint64 {
+		t.Fatalf("five files of 4 EiB account %d bytes; want %d", got, uint64(math.MaxUint64))
+	}
+	for range 5 {
+		fs.adjustDiskBytes(1<<62, 0)
+	}
+	fs.adjustDiskBytes(8192, 0)
+	if got := fs.diskBytes.Load(); got != 0 {
+		t.Errorf("no files account %d bytes", got)
+	}
+	// Short of saturating, the sum is exact.
+	fs.adjustDiskBytes(0, 1)
+	fs.adjustDiskBytes(0, 1<<40+1)
+	fs.adjustDiskBytes(1<<40+1, 4096)
+	if got, want := fs.diskBytes.Load(), uint64(2*4096); got != want {
+		t.Errorf("the sum is %d; want %d", got, want)
+	}
+}
 
 func TestMaterializationDoesNotLockUnrelatedFile(t *testing.T) {
 	fs := &filesystem{diskVolume: &diskVolumeState{}}
