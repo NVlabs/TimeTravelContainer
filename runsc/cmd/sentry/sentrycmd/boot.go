@@ -150,6 +150,10 @@ type Boot struct {
 	memoryStatFD        int
 	memorySwapCurrentFD int
 
+	// hostMeminfoFD is the host's /proc/meminfo, from which the Sentry learns
+	// how much swap the host has free.
+	hostMeminfoFD int
+
 	// applyCaps determines if capabilities defined in the spec should be applied
 	// to the process.
 	applyCaps bool
@@ -328,6 +332,7 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&b.memoryCurrentFD, "memory-current-fd", -1, "the sandbox cgroup's memory.current file")
 	f.IntVar(&b.memoryStatFD, "memory-stat-fd", -1, "the sandbox cgroup's memory.stat file")
 	f.IntVar(&b.memorySwapCurrentFD, "memory-swap-current-fd", -1, "the sandbox cgroup's memory.swap.current file")
+	f.IntVar(&b.hostMeminfoFD, "host-meminfo-fd", -1, "the host's /proc/meminfo")
 	f.Var(&b.goferFilestoreFDs, "gofer-filestore-fds", "FDs to the regular files that will back the overlayfs or tmpfs mount if a gofer mount is to be overlaid.")
 	f.Var(&b.ttcVolumeFDs, "ttc-volume-fds", "ordered TTC managed-volume repository directory FDs")
 	f.IntVar(&b.gfxFD, "ttc-gfx-fd", -1, "the Sentry's connection to the GPU renderers' broker")
@@ -743,6 +748,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		MemoryCurrentFD:     b.memoryCurrentFD,
 		MemoryStatFD:        b.memoryStatFD,
 		MemorySwapCurrentFD: b.memorySwapCurrentFD,
+		HostMeminfoFD:       b.hostMeminfoFD,
 		GoferFilestoreFDs:   b.goferFilestoreFDs.GetArray(),
 		GoferMountConfs:     b.goferMountConfs.GetArray(),
 		NumCPU:              b.cpuNum,

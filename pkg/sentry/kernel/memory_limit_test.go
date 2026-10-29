@@ -66,8 +66,8 @@ func TestMemoryLimiterCheck(t *testing.T) {
 	setCgroupFile(t, current, fmt.Sprintf("%d\n", 150*mib))
 	setCgroupFile(t, stat, fmt.Sprintf("anon %d\nfile %d\nactive_file %d\ninactive_file %d\nshmem %d\nslab_reclaimable %d\n", 60*mib, 80*mib, 16*mib, 8*mib, 50*mib, 6*mib))
 	setCgroupFile(t, swap, fmt.Sprintf("%d\n", 50*mib))
-	if used, err := l.used(); err != nil || used != 170*mib {
-		t.Fatalf("used() = %d MiB, %v; want 170 MiB", used/mib, err)
+	if used, swap, err := l.used(); err != nil || used != 170*mib || swap != 50*mib {
+		t.Fatalf("used() = %d MiB, %d MiB of swap, %v; want 170 MiB, 50 MiB of swap", used/mib, swap/mib, err)
 	}
 	if !l.check() {
 		t.Fatal("check() says a family 54 MiB short of its limit is over it")
@@ -91,6 +91,113 @@ func TestMemoryLimiterCheck(t *testing.T) {
 	setCgroupFile(t, current, fmt.Sprintf("%d\n", 208*mib))
 	if l.check() {
 		t.Error("check() says a family 4 MiB over its limit less the slack is within it")
+	}
+}
+
+// A cgroup that may swap holds no more than the swap free on the host lets it:
+// its memory limit, the swap it holds and the host's free swap but the slack,
+// if less than its limit. With unlimited swap, that is all it holds.
+func TestMemoryLimiterTotal(t *testing.T) {
+	const mib = 1 << 20
+	current, stat, swap, meminfo := cgroupFile(t), cgroupFile(t), cgroupFile(t), cgroupFile(t)
+	setMeminfo := func(freeMiB uint64) {
+		setCgroupFile(t, meminfo, fmt.Sprintf("MemTotal:       16000000 kB\nSwapCached:        12345 kB\nSwapTotal:       4019196 kB\nSwapFree:      %8d kB\nZswap:                 0 kB\n", freeMiB<<10))
+	}
+	for _, test := range []struct {
+		name    string
+		limit   MemoryLimit
+		swapMiB uint64
+		freeMiB uint64
+		want    uint64
+	}{
+		{
+			name:    "host swap short of the limit",
+			limit:   MemoryLimit{Total: 2048 * mib, Memory: 1024 * mib},
+			swapMiB: 100,
+			freeMiB: 300,
+			want:    1424 * mib,
+		},
+		{
+			name:    "host swap enough for the limit",
+			limit:   MemoryLimit{Total: 2048 * mib, Memory: 1024 * mib},
+			swapMiB: 100,
+			freeMiB: 2000,
+			want:    2048 * mib,
+		},
+		{
+			name:  "no host swap",
+			limit: MemoryLimit{Total: 2048 * mib, Memory: 1024 * mib},
+			want:  1024 * mib,
+		},
+		{
+			name:    "unlimited swap",
+			limit:   MemoryLimit{Total: math.MaxUint64, Memory: 1024 * mib},
+			swapMiB: 700,
+			freeMiB: 300,
+			want:    2024 * mib,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			test.limit.Current, test.limit.Stat, test.limit.SwapCurrent, test.limit.HostMeminfo = current, stat, swap, meminfo
+			l := &memoryLimiter{limit: &test.limit, slack: 10 * mib}
+			setMeminfo(test.freeMiB + 10)
+			if got, err := l.total(test.swapMiB * mib); err != nil || got != test.want {
+				t.Errorf("total() = %d MiB, %v; want %d MiB", got/mib, err, test.want/mib)
+			}
+		})
+	}
+	// Without the host's meminfo, or swap, the cgroup's limit is all there is.
+	l := &memoryLimiter{limit: &MemoryLimit{Total: 2048 * mib, Memory: 1024 * mib, Current: current, Stat: stat, SwapCurrent: swap}}
+	if got, err := l.total(0); err != nil || got != 2048*mib {
+		t.Errorf("total() without meminfo = %d MiB, %v; want 2048 MiB", got/mib, err)
+	}
+	setCgroupFile(t, meminfo, "MemTotal:       16000000 kB\n")
+	l.limit.HostMeminfo = meminfo
+	if _, err := l.total(0); err == nil {
+		t.Error("total() with a meminfo without SwapFree succeeded")
+	}
+}
+
+// A family whose cgroup can hold less than its limit, as the host has little
+// swap free, is over its limit once it holds what its cgroup can, less the
+// slack, which is at most an eighth of that.
+func TestMemoryLimiterCheckHostSwap(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "memory-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mf, err := pgalloc.NewMemoryFile(file, pgalloc.MemoryFileOpts{
+		DelayedEviction:         pgalloc.DelayedEvictionDisabled,
+		DisableIMAWorkAround:    true,
+		DisableMemoryAccounting: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mf.Destroy()
+	const mib = 1 << 20
+	current, stat, swap, meminfo := cgroupFile(t), cgroupFile(t), cgroupFile(t), cgroupFile(t)
+	l := &memoryLimiter{
+		mf:      mf,
+		limit:   &MemoryLimit{Total: 2048 * mib, Memory: 256 * mib, Current: current, Stat: stat, SwapCurrent: swap, HostMeminfo: meminfo},
+		slack:   64 * mib,
+		kernels: make(map[*Kernel]struct{}),
+	}
+	// 256 MiB of memory and 100 MiB of swap, with 104 MiB of swap free on the
+	// host, 40 MiB of it beyond the slack: the cgroup can hold 396 MiB, and
+	// the family is over its limit from an eighth of that short of it, 346.5
+	// MiB.
+	setCgroupFile(t, current, fmt.Sprintf("%d\n", 256*mib))
+	setCgroupFile(t, stat, "anon 0\nactive_file 0\ninactive_file 0\nslab_reclaimable 0\n")
+	setCgroupFile(t, swap, fmt.Sprintf("%d\n", 100*mib))
+	setCgroupFile(t, meminfo, fmt.Sprintf("SwapTotal: %d kB\nSwapFree: %d kB\n", 4096<<10, 104<<10))
+	if used, total, within := l.checkUsed(); within || used != 356*mib || total != 396*mib {
+		t.Errorf("checkUsed() = %d MiB of %d MiB, within %t; want 356 MiB of 396 MiB, over", used/mib, total/mib, within)
+	}
+	// With 2 GiB of swap free, the limit is the cgroup's.
+	setCgroupFile(t, meminfo, fmt.Sprintf("SwapTotal: %d kB\nSwapFree: %d kB\n", 4096<<10, 2048<<10))
+	if used, total, within := l.checkUsed(); !within || total != 2048*mib {
+		t.Errorf("checkUsed() = %d MiB of %d MiB, within %t; want within 2048 MiB", used/mib, total/mib, within)
 	}
 }
 

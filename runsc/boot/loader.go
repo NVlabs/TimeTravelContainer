@@ -561,6 +561,9 @@ type Args struct {
 	MemoryCurrentFD     int
 	MemoryStatFD        int
 	MemorySwapCurrentFD int
+	// HostMeminfoFD is the host's /proc/meminfo, from which the Sentry learns
+	// how much swap the host has free, or -1.
+	HostMeminfoFD int
 	// GoferFilestoreFDs are FDs to the regular files that will back the tmpfs or
 	// overlayfs mount for certain gofer mounts.
 	GoferFilestoreFDs []int

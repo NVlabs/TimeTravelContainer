@@ -21,13 +21,22 @@ import (
 // MemoryLimit is the memory limit of the host cgroup that holds the Sentry and
 // its application processes; see SetMemoryLimit.
 type MemoryLimit struct {
-	// Total is the most memory and swap the cgroup may hold.
+	// Total is the most memory and swap the cgroup may hold, or
+	// math.MaxUint64 if its swap is unlimited.
 	Total uint64
+
+	// Memory is the most memory the cgroup may hold, swap aside.
+	Memory uint64
 
 	// Current, Stat and SwapCurrent are the cgroup's memory.current,
 	// memory.stat and memory.swap.current files. SwapCurrent is nil if Total
 	// limits memory alone.
 	Current, Stat, SwapCurrent *os.File
+
+	// HostMeminfo is the host's /proc/meminfo, or nil. With it, a cgroup that
+	// may swap holds no more than the swap free on the host lets it; see
+	// memoryLimiter.total.
+	HostMeminfo *os.File
 }
 
 const (
@@ -274,16 +283,17 @@ func (k *Kernel) waitForMemory(t *Task) {
 }
 
 // used returns what the cgroup holds that counts against its limit: its memory
-// and swap, but the file cache and slab its memory reclaim may take.
-func (l *memoryLimiter) used() (uint64, error) {
+// and swap, but the file cache and slab its memory reclaim may take. It also
+// returns the swap.
+func (l *memoryLimiter) used() (uint64, uint64, error) {
 	current, err := readCgroupUint(l.limit.Current)
 	if err != nil {
-		return 0, fmt.Errorf("reading memory.current: %w", err)
+		return 0, 0, fmt.Errorf("reading memory.current: %w", err)
 	}
 	var stat [16 << 10]byte
 	n, err := l.limit.Stat.ReadAt(stat[:], 0)
 	if err != nil && n == 0 {
-		return 0, fmt.Errorf("reading memory.stat: %w", err)
+		return 0, 0, fmt.Errorf("reading memory.stat: %w", err)
 	}
 	var reclaimable uint64
 	for _, line := range bytes.Split(stat[:n], []byte{'\n'}) {
@@ -295,20 +305,74 @@ func (l *memoryLimiter) used() (uint64, error) {
 		case "active_file", "inactive_file", "slab_reclaimable":
 			v, err := strconv.ParseUint(string(value), 10, 64)
 			if err != nil {
-				return 0, fmt.Errorf("parsing memory.stat %s: %w", key, err)
+				return 0, 0, fmt.Errorf("parsing memory.stat %s: %w", key, err)
 			}
 			reclaimable += v
 		}
 	}
 	used := current - min(reclaimable, current)
+	var swap uint64
 	if l.limit.SwapCurrent != nil {
-		swap, err := readCgroupUint(l.limit.SwapCurrent)
+		swap, err = readCgroupUint(l.limit.SwapCurrent)
 		if err != nil {
-			return 0, fmt.Errorf("reading memory.swap.current: %w", err)
+			return 0, 0, fmt.Errorf("reading memory.swap.current: %w", err)
 		}
 		used += swap
 	}
-	return used, nil
+	return used, swap, nil
+}
+
+// total returns the most memory and swap the cgroup can hold, holding swap
+// already: its limit, or, if the host has less swap free than the cgroup may
+// yet use, its memory limit, the swap it holds and the host's free swap but
+// the slack. Docker's default swap limit is as much again as the memory
+// limit, which a host with little swap cannot give: a family limited to 8 GiB
+// on a host with 3 GiB of swap free filled its cgroup at 11 GiB, long before
+// the 16 GiB the Sentry kept it within, and the host's out-of-memory killer
+// killed the Sentry, every branch with it. The swap held back is for what
+// the cgroup's kernel memory grows by while the family is over its limit,
+// besides the slack it has for that: four processes at once filling a cgroup
+// that way left the host 10 MiB of swap with a slack of 24 MiB, and the host
+// kills once it has none.
+func (l *memoryLimiter) total(swap uint64) (uint64, error) {
+	if l.limit.HostMeminfo == nil || l.limit.SwapCurrent == nil {
+		return l.limit.Total, nil
+	}
+	free, err := readMeminfo(l.limit.HostMeminfo, "SwapFree")
+	if err != nil {
+		return 0, fmt.Errorf("reading the host's free swap: %w", err)
+	}
+	free -= min(free, l.slack)
+	if l.limit.Memory+swap+free < l.limit.Total {
+		return l.limit.Memory + swap + free, nil
+	}
+	return l.limit.Total, nil
+}
+
+// readMeminfo returns the field of a /proc/meminfo, in bytes.
+func readMeminfo(f *os.File, field string) (uint64, error) {
+	var buf [8 << 10]byte
+	n, err := f.ReadAt(buf[:], 0)
+	if err != nil && n == 0 {
+		return 0, err
+	}
+	for _, line := range bytes.Split(buf[:n], []byte{'\n'}) {
+		key, value, ok := bytes.Cut(line, []byte{':'})
+		if !ok || string(key) != field {
+			continue
+		}
+		// As in "SwapFree:        3036312 kB".
+		fields := bytes.Fields(value)
+		if len(fields) != 2 || string(fields[1]) != "kB" {
+			return 0, fmt.Errorf("parsing %s %q", field, value)
+		}
+		kib, err := strconv.ParseUint(string(fields[0]), 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("parsing %s: %w", field, err)
+		}
+		return kib << 10, nil
+	}
+	return 0, fmt.Errorf("no %s", field)
 }
 
 func readCgroupUint(f *os.File) (uint64, error) {
@@ -323,39 +387,43 @@ func readCgroupUint(f *os.File) (uint64, error) {
 // check returns false if the family is over its limit. Otherwise it lets the
 // family allocate as much as its cgroup may still hold before it checks again.
 func (l *memoryLimiter) check() bool {
-	_, within := l.checkUsed()
+	_, _, within := l.checkUsed()
 	return within
 }
 
 // checkUsed is check, and also returns what the cgroup holds that counts
-// against its limit.
-func (l *memoryLimiter) checkUsed() (uint64, bool) {
+// against its limit, and the limit; see total.
+func (l *memoryLimiter) checkUsed() (uint64, uint64, bool) {
 	l.checkMu.Lock()
 	defer l.checkMu.Unlock()
 	l.mu.Lock()
 	failed := l.failed
 	l.mu.Unlock()
 	if failed {
-		return 0, true
+		return 0, 0, true
 	}
-	used, err := l.used()
+	used, swap, err := l.used()
+	var total uint64
+	if err == nil {
+		total, err = l.total(swap)
+	}
 	if err != nil {
-		log.Warningf("Leaving the memory limit of %d MiB to the host: %v", l.limit.Total>>20, err)
+		log.Warningf("Leaving the memory limit of %d MiB to the host: %v", l.limit.Memory>>20, err)
 		l.mu.Lock()
 		l.failed = true
 		l.mu.Unlock()
 		l.mf.SetCommitLimit(0)
-		return 0, true
+		return 0, 0, true
 	}
-	threshold := l.limit.Total - l.slack
+	threshold := total - min(l.slack, total/8)
 	if used >= threshold {
-		return used, false
+		return used, total, false
 	}
 	l.mf.SetCommitLimit(l.mf.AccountedBytes() + threshold - used)
 	l.mu.Lock()
 	l.gaveUp = false
 	l.mu.Unlock()
-	return used, true
+	return used, total, true
 }
 
 // outOfMemory starts bringing the family back within its limit, unless it is
@@ -385,16 +453,16 @@ func (l *memoryLimiter) reclaim(done chan struct{}) {
 		close(done)
 	}()
 	for {
-		used, within := l.checkUsed()
+		used, total, within := l.checkUsed()
 		if within {
 			return
 		}
 		now := time.Now()
 		if r.stalled(now, used, allExited(victims), l.mf.HasWaste()) {
-			killed := l.kill()
+			killed := l.kill(total)
 			if len(killed) == 0 {
 				// Nothing more to kill: the host's limit decides.
-				log.Warningf("Out of memory, with no process to kill: leaving the limit of %d MiB to the host", l.limit.Total>>20)
+				log.Warningf("Out of memory, with no process to kill: leaving the limit of %d MiB to the host", total>>20)
 				l.mu.Lock()
 				l.gaveUp = true
 				l.mu.Unlock()
@@ -482,11 +550,11 @@ func allExited(tgs []*ThreadGroup) bool {
 	return true
 }
 
-// kill kills the process Linux's out-of-memory killer would: the one with the
-// most memory resident, as its oom_score_adj weighs it, of those it may kill,
-// in Kernels that are not paused, and every other process sharing its memory.
-// It returns them.
-func (l *memoryLimiter) kill() []*ThreadGroup {
+// kill kills the process Linux's out-of-memory killer would, with the cgroup
+// holding no more than total: the one with the most memory resident, as its
+// oom_score_adj weighs it, of those it may kill, in Kernels that are not
+// paused, and every other process sharing its memory. It returns them.
+func (l *memoryLimiter) kill(total uint64) []*ThreadGroup {
 	l.mu.Lock()
 	kernels := make([]*Kernel, 0, len(l.kernels))
 	for k := range l.kernels {
@@ -536,7 +604,7 @@ func (l *memoryLimiter) kill() []*ThreadGroup {
 			continue
 		}
 		rss := c.mm.ResidentSetSize()
-		if points := int64(rss) + int64(c.adj)*int64(l.limit.Total/1000); points > victimPoints {
+		if points := int64(rss) + int64(c.adj)*int64(total/1000); points > victimPoints {
 			victim, victimRSS, victimPoints = c, rss, points
 		}
 	}
@@ -551,6 +619,6 @@ func (l *memoryLimiter) kill() []*ThreadGroup {
 			killed = append(killed, c.tg)
 		}
 	}
-	log.Warningf("Out of memory: killed process %d with %d MiB resident, and %d others sharing its memory, to keep within the limit of %d MiB", victim.tg.ID(), victimRSS>>20, len(killed)-1, l.limit.Total>>20)
+	log.Warningf("Out of memory: killed process %d with %d MiB resident, and %d others sharing its memory, to keep within the limit of %d MiB", victim.tg.ID(), victimRSS>>20, len(killed)-1, total>>20)
 	return killed
 }

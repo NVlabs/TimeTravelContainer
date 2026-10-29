@@ -966,15 +966,23 @@ func (s *Sandbox) ProcfsDump() ([]procfs.ProcessProcfsDump, error) {
 }
 
 // donateMemoryCgroupFiles donates the memory.current, memory.stat and, if
-// swap is accounted, memory.swap.current files of the cgroup v2 at path, so
-// that the Sentry may keep within the cgroup's limit (see
-// kernel.SetMemoryLimit).
+// swap is accounted, memory.swap.current files of the cgroup v2 at path, with
+// the host's /proc/meminfo for the swap it has free, so that the Sentry may
+// keep within the cgroup's limit (see kernel.SetMemoryLimit).
 func donateMemoryCgroupFiles(donations *donation.Agency, path string) error {
 	var files []*os.File
-	for _, name := range []string{"memory.current", "memory.stat", "memory.swap.current"} {
-		f, err := os.Open(filepath.Join(path, name))
+	for _, name := range []string{
+		filepath.Join(path, "memory.current"),
+		filepath.Join(path, "memory.stat"),
+		// Missing where the kernel does not account swap to cgroups.
+		filepath.Join(path, "memory.swap.current"),
+		"/proc/meminfo",
+	} {
+		f, err := os.Open(name)
 		if err != nil {
-			if name == "memory.swap.current" && errors.Is(err, os.ErrNotExist) {
+			if len(files) >= 2 {
+				// The Sentry keeps a limit on memory alone without the rest.
+				log.Infof("The Sentry will not see swap: %v", err)
 				break
 			}
 			for _, f := range files {
@@ -986,8 +994,11 @@ func donateMemoryCgroupFiles(donations *donation.Agency, path string) error {
 	}
 	donations.DonateAndClose("memory-current-fd", files[0])
 	donations.DonateAndClose("memory-stat-fd", files[1])
-	if len(files) == 3 {
+	if len(files) > 2 {
 		donations.DonateAndClose("memory-swap-current-fd", files[2])
+	}
+	if len(files) > 3 {
+		donations.DonateAndClose("host-meminfo-fd", files[3])
 	}
 	return nil
 }

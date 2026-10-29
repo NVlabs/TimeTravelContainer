@@ -213,6 +213,7 @@ go_test(
         "distributed_fork_test.go",
         "fscheckpoint_test.go",
         "lifecyclecpus_test.go",
+        "memory_limit_test.go",
         "mount_hints_test.go",
         "restore_test.go",
         "seccomp_test.go",
