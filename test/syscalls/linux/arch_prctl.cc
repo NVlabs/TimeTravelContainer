@@ -97,7 +97,7 @@ TEST(ArchPrctlTest, GetSetFS) {
               SyscallFailsWithErrno(EPERM));
 }
 
-TEST(ArchPrctlTest, GetSetGS) {
+TEST(ArchPrctlTest, GetSetGSReadsBack) {
   uintptr_t orig;
   const int get_result =
       arch_prctl(ARCH_GET_GS, reinterpret_cast<uintptr_t>(&orig));
