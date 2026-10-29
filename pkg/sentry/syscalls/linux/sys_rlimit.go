@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package linux
 
 import (
@@ -99,6 +102,12 @@ var setableLimits = map[limits.LimitType]struct{}{
 	limits.ProcessCount:      {},
 	limits.RealTimePriority:  {},
 	limits.MessageQueueBytes: {},
+	// Linux sets every resource's limit; RLIMIT_LOCKS has been ignored since
+	// 2.4.25. Refusing these failed programs that set them all.
+	limits.Locks:          {},
+	limits.SignalsPending: {},
+	limits.Nice:           {},
+	limits.Rttime:         {},
 }
 
 func prlimit64(t *kernel.Task, resource limits.LimitType, newLim *limits.Limit) (limits.Limit, error) {

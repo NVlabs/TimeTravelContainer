@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include <errno.h>
 #include <linux/capability.h>
 #include <signal.h>
@@ -207,6 +212,18 @@ TEST(RlimitTest, SetRlimitMsgqueue) {
   EXPECT_THAT(getrlimit(RLIMIT_MSGQUEUE, &got), SyscallSucceeds());
   EXPECT_EQ(got.rlim_cur, rl.rlim_cur);
   EXPECT_EQ(got.rlim_max, rl.rlim_max);
+}
+
+// Linux sets every resource's limit, including those it no longer enforces
+// (RLIMIT_LOCKS since 2.4.25).
+TEST(RlimitTest, SetRlimitEveryResource) {
+  for (int resource : {RLIMIT_LOCKS, RLIMIT_SIGPENDING, RLIMIT_NICE,
+                       RLIMIT_RTTIME}) {
+    struct rlimit rl;
+    ASSERT_THAT(getrlimit(resource, &rl), SyscallSucceeds());
+    EXPECT_THAT(setrlimit(resource, &rl), SyscallSucceeds())
+        << "resource " << resource;
+  }
 }
 
 TEST(RlimitTest, ParseProcPidLimits) {
