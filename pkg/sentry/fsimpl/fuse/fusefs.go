@@ -472,7 +472,7 @@ func (fs *filesystem) newInode(ctx context.Context, out linux.FUSEEntryOut) (ker
 	i.attrMu.Lock()
 	defer i.attrMu.Unlock()
 
-	creds := auth.Credentials{EffectiveKGID: auth.KGID(attr.UID), EffectiveKUID: auth.KUID(attr.UID)}
+	creds := auth.Credentials{FilesystemKUID: auth.KUID(attr.UID), FilesystemKGID: auth.KGID(attr.GID)}
 	i.init(&creds, linux.UNNAMED_MAJOR, fs.devMinor, out.NodeID, linux.FileMode(attr.Mode), attr.Nlink)
 	if linux.FileMode(attr.Mode).FileType() == linux.ModeRegular {
 		i.cache = fs.fileCache(out.NodeID, out.Generation)

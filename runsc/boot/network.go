@@ -22,10 +22,10 @@ import (
 	"io"
 	"net"
 	"os"
-	"runtime"
 	"syscall"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/gomaxprocs"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netfilter"
@@ -233,7 +233,7 @@ func (n *Network) CreateLinksAndRoutes(args *sentryapi.CreateLinksAndRoutesArgs,
 			case config.QDiscNone:
 			case config.QDiscFIFO:
 				log.Infof("Enabling FIFO QDisc on %q", link.Name)
-				qDisc = fifo.New(linkEP, runtime.GOMAXPROCS(0), 1000)
+				qDisc = fifo.New(linkEP, gomaxprocs.Base(), 1000)
 			case config.QDiscTBF:
 				log.Infof("Enabling TBF QDisc on %q rate=%d burst=%d", link.Name, link.TBFRate, link.TBFBurst)
 				var err error
@@ -334,7 +334,7 @@ func (n *Network) CreateLinksAndRoutes(args *sentryapi.CreateLinksAndRoutesArgs,
 		case config.QDiscNone:
 		case config.QDiscFIFO:
 			log.Infof("Enabling FIFO QDisc on %q", link.Name)
-			qDisc = fifo.New(linkEP, runtime.GOMAXPROCS(0), 1000)
+			qDisc = fifo.New(linkEP, gomaxprocs.Base(), 1000)
 		case config.QDiscTBF:
 			log.Infof("Enabling TBF QDisc on %q rate=%d burst=%d", link.Name, link.TBFRate, link.TBFBurst)
 			var err error

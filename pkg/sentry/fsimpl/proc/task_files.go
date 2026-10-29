@@ -282,7 +282,7 @@ type commInode struct {
 
 func (fs *filesystem) newComm(ctx context.Context, task *kernel.Task, ino uint64, perm linux.FileMode) kernfs.Inode {
 	inode := &commInode{task: task}
-	inode.DynamicBytesFile.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, &commData{task: task}, perm)
+	inode.DynamicBytesFile.Init(ctx, taskOwnerCreds(task), linux.UNNAMED_MAJOR, fs.devMinor, ino, &commData{task: task}, perm)
 	return inode
 }
 
@@ -496,7 +496,7 @@ type memInode struct {
 func (fs *filesystem) newMemInode(ctx context.Context, task *kernel.Task, ino uint64, perm linux.FileMode) kernfs.Inode {
 	// Note: credentials are overridden by taskOwnedInode.
 	inode := &memInode{task: task}
-	inode.init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, perm)
+	inode.init(ctx, taskOwnerCreds(task), linux.UNNAMED_MAJOR, fs.devMinor, ino, perm)
 	return &taskOwnedInode{Inode: inode, owner: task}
 }
 
@@ -513,9 +513,9 @@ func (f *memInode) init(ctx context.Context, creds *auth.Credentials, devMajor, 
 func (f *memInode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	m := getMM(f.task)
 	for {
-		// TODO(gvisor.dev/issue/260): Add check for PTRACE_MODE_ATTACH_FSCREDS
-		// Permission to read this file is governed by PTRACE_MODE_ATTACH_FSCREDS
-		// Since we dont implement setfsuid/setfsgid we can just use PTRACE_MODE_ATTACH
+		// TODO(gvisor.dev/issue/260): Permission to read this file is governed by
+		// PTRACE_MODE_ATTACH_FSCREDS, which checks the filesystem IDs; this uses
+		// the real IDs of PTRACE_MODE_ATTACH_REALCREDS instead.
 		if !kernel.ContextCanTrace(ctx, f.task, true) {
 			return nil, linuxerr.EACCES
 		}
@@ -995,7 +995,7 @@ func (fs *filesystem) newStatusInode(ctx context.Context, task *kernel.Task, pid
 		task:  task,
 		pidns: pidns,
 	}
-	inode.InodeAttrs.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeRegular|perm)
+	inode.InodeAttrs.Init(ctx, taskOwnerCreds(task), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeRegular|perm)
 	return &taskOwnedInode{Inode: inode, owner: task}
 }
 
@@ -1060,9 +1060,11 @@ func (s *statusFD) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	ruid := creds.RealKUID.In(s.userns).OrOverflow()
 	euid := creds.EffectiveKUID.In(s.userns).OrOverflow()
 	suid := creds.SavedKUID.In(s.userns).OrOverflow()
+	fsuid := creds.FilesystemKUID.In(s.userns).OrOverflow()
 	rgid := creds.RealKGID.In(s.userns).OrOverflow()
 	egid := creds.EffectiveKGID.In(s.userns).OrOverflow()
 	sgid := creds.SavedKGID.In(s.userns).OrOverflow()
+	fsgid := creds.FilesystemKGID.In(s.userns).OrOverflow()
 	var fds int
 	var vss, rss, data uint64
 	s.task.WithMuLocked(func(t *kernel.Task) {
@@ -1075,10 +1077,8 @@ func (s *statusFD) Generate(ctx context.Context, buf *bytes.Buffer) error {
 		rss = mm.ResidentSetSize()
 		data = mm.VirtualDataSize()
 	}
-	// Filesystem user/group IDs aren't implemented; effective UID/GID are used
-	// instead.
-	fmt.Fprintf(buf, "Uid:\t%d\t%d\t%d\t%d\n", ruid, euid, suid, euid)
-	fmt.Fprintf(buf, "Gid:\t%d\t%d\t%d\t%d\n", rgid, egid, sgid, egid)
+	fmt.Fprintf(buf, "Uid:\t%d\t%d\t%d\t%d\n", ruid, euid, suid, fsuid)
+	fmt.Fprintf(buf, "Gid:\t%d\t%d\t%d\t%d\n", rgid, egid, sgid, fsgid)
 	fmt.Fprintf(buf, "FDSize:\t%d\n", fds)
 	buf.WriteString("Groups:\t")
 	// There is a space between each pair of supplemental GIDs, as well as an
@@ -1229,7 +1229,7 @@ func (fs *filesystem) newExeSymlink(ctx context.Context, task *kernel.Task, ino 
 		fs:   fs,
 		task: task,
 	}
-	inode.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
+	inode.Init(ctx, taskOwnerCreds(task), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
 	return inode
 }
 
@@ -1307,7 +1307,7 @@ func (fs *filesystem) newCwdSymlink(ctx context.Context, task *kernel.Task, ino 
 		fs:   fs,
 		task: task,
 	}
-	inode.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
+	inode.Init(ctx, taskOwnerCreds(task), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
 	return inode
 }
 
@@ -1374,7 +1374,7 @@ func (fs *filesystem) newRootSymlink(ctx context.Context, task *kernel.Task, ino
 		fs:   fs,
 		task: task,
 	}
-	inode.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
+	inode.Init(ctx, taskOwnerCreds(task), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
 	return inode
 }
 
@@ -1516,7 +1516,7 @@ func (fs *filesystem) newNamespaceSymlink(ctx context.Context, task *kernel.Task
 	inode := &namespaceSymlink{task: task, nsType: nsType}
 
 	// Note: credentials are overridden by taskOwnedInode.
-	inode.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, "")
+	inode.Init(ctx, taskOwnerCreds(task), linux.UNNAMED_MAJOR, fs.devMinor, ino, "")
 
 	taskInode := &taskOwnedInode{Inode: inode, owner: task}
 	return taskInode
@@ -1530,7 +1530,7 @@ func (fs *filesystem) newFakeNamespaceSymlink(ctx context.Context, task *kernel.
 
 	inode := &namespaceSymlink{task: task}
 	// Note: credentials are overridden by taskOwnedInode.
-	inode.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, target)
+	inode.Init(ctx, taskOwnerCreds(task), linux.UNNAMED_MAJOR, fs.devMinor, ino, target)
 
 	taskInode := &taskOwnedInode{Inode: inode, owner: task}
 	return taskInode

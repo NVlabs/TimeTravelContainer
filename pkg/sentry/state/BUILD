@@ -26,6 +26,7 @@ go_library(
         "//pkg/sentry/platform",
         "//pkg/sentry/state/stateio",
         "//pkg/sentry/time",
+        "//pkg/sentry/vfs",
         "//pkg/sentry/watchdog",
         "//pkg/state/statefile",
         "@org_golang_x_sys//unix:go_default_library",

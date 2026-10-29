@@ -24,6 +24,7 @@ import (
 	"maps"
 	"os"
 	"runtime"
+	runtimedebug "runtime/debug"
 	"strconv"
 	"strings"
 	gtime "time"
@@ -69,8 +70,16 @@ import (
 	_ "gvisor.dev/gvisor/pkg/sentry/platform/platforms" // register all platforms.
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
+	"gvisor.dev/gvisor/pkg/sentry/socket/hostinet" // Top-level inet provider.
 	"gvisor.dev/gvisor/pkg/sentry/socket/netfilter"
+	_ "gvisor.dev/gvisor/pkg/sentry/socket/netlink" // Register supported socket providers.
+	_ "gvisor.dev/gvisor/pkg/sentry/socket/netlink/netfilter"
+	rdmanetlink "gvisor.dev/gvisor/pkg/sentry/socket/netlink/rdma"
+	_ "gvisor.dev/gvisor/pkg/sentry/socket/netlink/route"
+	_ "gvisor.dev/gvisor/pkg/sentry/socket/netlink/uevent"
+	"gvisor.dev/gvisor/pkg/sentry/socket/netstack" // Top-level inet provider.
 	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
+	_ "gvisor.dev/gvisor/pkg/sentry/socket/unix"
 	"gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/sentry/uniqueid"
@@ -97,22 +106,10 @@ import (
 	"gvisor.dev/gvisor/runsc/boot/filter"
 	pf "gvisor.dev/gvisor/runsc/boot/portforward"
 	"gvisor.dev/gvisor/runsc/boot/pprof"
+	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/profile"
 	"gvisor.dev/gvisor/runsc/specutils"
-
-	// Top-level inet providers.
-	"gvisor.dev/gvisor/pkg/sentry/socket/hostinet"
-	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
-
-	// Include other supported socket providers.
-	_ "gvisor.dev/gvisor/pkg/sentry/socket/netlink"
-	_ "gvisor.dev/gvisor/pkg/sentry/socket/netlink/netfilter"
-	rdmanetlink "gvisor.dev/gvisor/pkg/sentry/socket/netlink/rdma"
-	_ "gvisor.dev/gvisor/pkg/sentry/socket/netlink/route"
-	_ "gvisor.dev/gvisor/pkg/sentry/socket/netlink/uevent"
-	_ "gvisor.dev/gvisor/pkg/sentry/socket/unix"
-	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 )
 
 type containerInfo struct {
@@ -302,7 +299,18 @@ type Loader struct {
 	cpuQuota  int64
 	cpuPeriod int64
 
+	// lifecycleCPUs are the CPUs that checkpoint and restore can use.
+	lifecycleCPUs lifecycleCPUs
+
 	hostTHP HostTHP
+
+	// startupHeapReleasePending is true while a goroutine waits to return
+	// the free Sentry heap memory to the host. See
+	// Loader.releaseStartupHeapWhenIdle.
+	startupHeapReleasePending atomicbitops.Bool
+
+	// freeOSMemory is runtimedebug.FreeOSMemory, replaced in tests.
+	freeOSMemory func()
 
 	// saveMu serializes save operations. Saves can be requested concurrently:
 	// autosave in save-resume mode is triggered by any task executing the
@@ -417,6 +425,10 @@ type Loader struct {
 
 	// hostinetNetSNMPFile is the pre-opened /proc/net/snmp file for hostinet restore.
 	hostinetNetSNMPFile *os.File
+
+	// hostinetPortRange is read before restore installs seccomp filters. A nil
+	// value means no destination host configuration is awaiting transfer.
+	hostinetPortRange *[2]uint16
 }
 
 // noRootContainer is the state of a sandbox with no root container.
@@ -558,6 +570,9 @@ type Args struct {
 	GoferMountConfs []specutils.GoferMountConf
 	// NumCPU is the number of CPUs to create inside the sandbox.
 	NumCPU int
+	// LifecycleNumCPU is the number of CPUs that the sandbox can use during
+	// checkpoint and restore. `NumCPU` takes precedence if larger.
+	LifecycleNumCPU int
 	// CPUQuota and CPUPeriod are the raw host CFS settings that should be
 	// reflected by sandbox cgroupfs.
 	CPUQuota  int64
@@ -741,10 +756,6 @@ func New(args Args) (*Loader, error) {
 		metric.StopProfilingMetrics()
 	}
 
-	// Initialize seccheck points.
-	seccheck.Initialize()
-	args.StartupTimer.Reached("seccheck initialized")
-
 	// We initialize the rand package now to make sure /dev/urandom is pre-opened
 	// on kernels that do not support getrandom(2).
 	if err := rand.Init(); err != nil {
@@ -781,7 +792,8 @@ func New(args Args) (*Loader, error) {
 
 	eid := execID{cid: args.ID}
 	l := &Loader{
-		sandboxID: args.ID,
+		sandboxID:    args.ID,
+		freeOSMemory: runtimedebug.FreeOSMemory,
 		noRootContainer: noRootContainer{
 			enabled: args.NoRootContainer,
 			exit:    make(chan struct{}),
@@ -803,12 +815,17 @@ func New(args Args) (*Loader, error) {
 		fsSaveFDs:             args.FSSaveFDs,
 		fsSaveCheckpointGofer: args.FSSaveCheckpointGofer,
 	}
+	l.restoreDone = sync.NewCond(&l.mu)
 
 	if args.NumCPU == 0 {
 		args.NumCPU = runtime.NumCPU()
 	}
-	log.Infof("CPUs: %d", args.NumCPU)
 	gomaxprocs.SetBase(args.NumCPU)
+	l.lifecycleCPUs.init(args.LifecycleNumCPU, args.NumCPU)
+	log.Infof("CPUs: %d, lifecycle CPUs: %d", args.NumCPU, l.lifecycleCPUs.num)
+	if len(args.FSRestoreFDs) != 0 || args.RootfsUpperTarFD >= 0 {
+		l.lifecycleCPUs.holdForRestore()
+	}
 	args.StartupTimer.Reached("GOMAXPROCS set")
 
 	// Start filesystem checkpoint restore as soon as possible to maximize
@@ -1282,13 +1299,6 @@ func New(args Args) (*Loader, error) {
 	}
 	l.ctrl = ctrl
 
-	// Only start serving after Loader is set to controller and controller is set
-	// to Loader, because they are both used in the urpc methods.
-	if err := ctrl.srv.StartServing(); err != nil {
-		return nil, fmt.Errorf("starting control server: %w", err)
-	}
-	args.StartupTimer.Reached("control server started")
-
 	keepTTCVolumeRepositories = true
 	return l, nil
 }
@@ -1310,6 +1320,13 @@ func (l *Loader) setLoaderKernel(k *kernel.Kernel, dog *watchdog.Watchdog) {
 	}
 }
 
+// StartControlServer starts serving control RPCs, including those that might
+// have been backlogged while the sandbox was booting.
+func (l *Loader) StartControlServer() {
+	l.ctrl.srv.StartServing()
+	l.startupTimer.Reached("control server started")
+}
+
 // ConfigureNetwork implements inet.NetworkArgs.ConfigureNetwork.
 //
 // Startup calls this directly before installing seccomp filters. Restore
@@ -1324,9 +1341,12 @@ func (l *Loader) ConfigureNetwork(s inet.Stack) error {
 
 func (l *Loader) configureNetwork(k *kernel.Kernel, s inet.Stack) error {
 	if h, ok := s.(*hostinet.Stack); ok {
-		h.SetFiles(l.hostinetNetDevFile, l.hostinetNetSNMPFile)
-		l.hostinetNetDevFile = nil
-		l.hostinetNetSNMPFile = nil
+		if l.hostinetPortRange != nil {
+			h.SetHostConfig(l.hostinetNetDevFile, l.hostinetNetSNMPFile, *l.hostinetPortRange)
+			l.hostinetNetDevFile = nil
+			l.hostinetNetSNMPFile = nil
+			l.hostinetPortRange = nil
+		}
 		return nil
 	}
 	// Restored netstack state intentionally omits host-local packet-filter
@@ -1801,6 +1821,25 @@ func (l *Loader) Run() error {
 	return nil
 }
 
+// startupHeapReleaseIdleDelay is how long the application must stay idle
+// before the Sentry returns its free startup heap memory to the host.
+const startupHeapReleaseIdleDelay = 250 * gtime.Millisecond
+
+// releaseStartupHeapWhenIdle returns the free Sentry heap memory to the host
+// when the application is next idle for startupHeapReleaseIdleDelay. If a
+// release is already pending, it does nothing.
+func (l *Loader) releaseStartupHeapWhenIdle() {
+	if !l.startupHeapReleasePending.CompareAndSwap(false, true) {
+		return
+	}
+	k := l.k
+	go func() {
+		k.WaitForIdle(startupHeapReleaseIdleDelay)
+		l.startupHeapReleasePending.Store(false)
+		l.freeOSMemory()
+	}()
+}
+
 // +checklocksexclude:l.mu
 func (l *Loader) run() error {
 	if l.root.conf.Network == config.NetworkHost {
@@ -1982,11 +2021,16 @@ func (l *Loader) run() error {
 	switch l.state {
 	case created:
 		l.state = started
+		l.releaseStartupHeapWhenIdle()
 	case restoringUnstarted:
 		if l.distributedRestore || l.dehydrationRestore {
+			// TTC's restores are complete when the Loader runs.
 			l.state = restored
 			l.restoreDone.Broadcast()
+			l.releaseStartupHeapWhenIdle()
 		} else {
+			// A restored sandbox releases its startup heap once the restore is
+			// complete, in containerManager.onRestoreDone.
 			l.state = restoringStarted
 		}
 	default:
@@ -2055,6 +2099,7 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 				if l.noRootContainer.enabled && eid.cid == l.sandboxID {
 					log.Debugf("Joining sandbox PID namespace named %q", ns.Path)
 					pidns = l.k.RootPIDNamespace()
+					pidns.IncRef()
 					break
 				}
 			}

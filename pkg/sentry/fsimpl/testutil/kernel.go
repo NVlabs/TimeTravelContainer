@@ -28,6 +28,7 @@ import (
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/memutil"
+	cgroup2fs "gvisor.dev/gvisor/pkg/sentry/fsimpl/cgroup2fs" // Required by Kernel.Init.
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -38,13 +39,9 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/platform/platformdesc"
-	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-
-	// Cgroup2fs is required by Kernel.Init.
-	cgroup2fs "gvisor.dev/gvisor/pkg/sentry/fsimpl/cgroup2fs"
 )
 
 var (
@@ -55,7 +52,6 @@ var (
 // Boot initializes a new bare bones kernel for test.
 func Boot() (*kernel.Kernel, error) {
 	cpuid.Initialize()
-	seccheck.Initialize()
 
 	if err := usage.Init(); err != nil {
 		return nil, fmt.Errorf("setting up memory accounting: %v", err)

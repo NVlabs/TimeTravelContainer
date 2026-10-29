@@ -40,7 +40,6 @@ import (
 
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/abi/linux/errno"
 	"gvisor.dev/gvisor/pkg/context"
@@ -1596,12 +1595,12 @@ func (s *sock) getSockOptIPv6(t *kernel.Task, ep commonEndpoint, name int, outPt
 		return a.(*linux.SockAddrInet6), nil
 
 	case linux.IP6T_SO_GET_INFO:
-		if outLen < linux.SizeOfIPTGetinfo {
-			return nil, syserr.ErrInvalidArgument
-		}
-
 		if !s.HasCapability(linux.CAP_NET_ADMIN, t) {
 			return nil, syserr.ErrNotPermitted
+		}
+
+		if outLen != linux.SizeOfIPTGetinfo {
+			return nil, syserr.ErrInvalidArgument
 		}
 
 		stk := inet.StackFromContext(t)
@@ -1834,12 +1833,12 @@ func (s *sock) getSockOptIP(t *kernel.Task, ep commonEndpoint, name int, outPtr 
 		return a.(*linux.SockAddrInet), nil
 
 	case linux.IPT_SO_GET_INFO:
-		if outLen < linux.SizeOfIPTGetinfo {
-			return nil, syserr.ErrInvalidArgument
-		}
-
 		if !s.HasCapability(linux.CAP_NET_ADMIN, t) {
 			return nil, syserr.ErrNotPermitted
+		}
+
+		if outLen != linux.SizeOfIPTGetinfo {
+			return nil, syserr.ErrInvalidArgument
 		}
 
 		stk := inet.StackFromContext(t)
@@ -3708,14 +3707,14 @@ func setInterfaceAddrIoctl(ctx context.Context, t *kernel.Task, arg int, ifr *li
 			if bytes.Equal(current.Addr, value) {
 				return nil
 			}
-			if err := stk.RemoveInterfaceAddr(index, *current); err != nil {
+			if err := stk.RemoveInterfaceAddr(ctx, index, *current); err != nil {
 				return syserr.FromError(err)
 			}
 		}
 		if binary.BigEndian.Uint32(value) == 0 {
 			return nil
 		}
-		return syserr.FromError(stk.AddInterfaceAddr(index, inet.InterfaceAddr{
+		return syserr.FromError(stk.AddInterfaceAddr(ctx, index, inet.InterfaceAddr{
 			Family:    linux.AF_INET,
 			PrefixLen: prefix,
 			Addr:      value,
@@ -3732,12 +3731,12 @@ func setInterfaceAddrIoctl(ctx context.Context, t *kernel.Task, arg int, ifr *li
 		if current.PrefixLen == prefix {
 			return nil
 		}
-		if err := stk.RemoveInterfaceAddr(index, *current); err != nil {
+		if err := stk.RemoveInterfaceAddr(ctx, index, *current); err != nil {
 			return syserr.FromError(err)
 		}
 		addr := *current
 		addr.PrefixLen = prefix
-		return syserr.FromError(stk.AddInterfaceAddr(index, addr))
+		return syserr.FromError(stk.AddInterfaceAddr(ctx, index, addr))
 	}
 }
 

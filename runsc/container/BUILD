@@ -19,6 +19,7 @@ go_library(
         "null_netns.go",
         "null_netns_darwin.go",
         "state_file.go",
+        "state_held.go",
         "status.go",
     ],
     visibility = [
@@ -120,6 +121,17 @@ go_test(
         "@org_golang_google_protobuf//proto:go_default_library",
         "@org_golang_google_protobuf//types/known/emptypb:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+go_test(
+    name = "modify_test",
+    srcs = ["modify_test.go"],
+    embed = [":container"],
+    deps = [
+        "//runsc/sandbox",
+        "//runsc/specutils",
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
     ],
 )
 

@@ -18,7 +18,7 @@
 package vfs
 
 import (
-	goContext "context"
+	gocontext "context"
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -37,14 +37,11 @@ import (
 //
 // +stateify savable
 type FileLocks struct {
-	// locks holds the file's locks once one is taken or tested. Few files
-	// see a lock, and every inode embeds FileLocks: holding the locks'
-	// sets and queues inline took 784 bytes of each.
+	// locks is nil until the first lock request. Most files are never
+	// locked, so this keeps FileLocks small in memory and in checkpoints.
 	locks atomic.Pointer[fileLocks] `state:".(*fileLocks)"`
 }
 
-// fileLocks is what FileLocks holds once a lock is taken or tested.
-//
 // +stateify savable
 type fileLocks struct {
 	// bsd is a set of BSD-style advisory file wide locks, see flock(2).
@@ -54,25 +51,29 @@ type fileLocks struct {
 	posix fslock.Locks
 }
 
-// get returns fl's locks, allocating them if it has none.
-func (fl *FileLocks) get() *fileLocks {
-	if locks := fl.locks.Load(); locks != nil {
-		return locks
-	}
-	if locks := new(fileLocks); fl.locks.CompareAndSwap(nil, locks) {
-		return locks
-	}
-	return fl.locks.Load()
-}
-
-// saveLocks is called by stateify.
 func (fl *FileLocks) saveLocks() *fileLocks {
 	return fl.locks.Load()
 }
 
-// loadLocks is called by stateify.
-func (fl *FileLocks) loadLocks(_ goContext.Context, locks *fileLocks) {
-	fl.locks.Store(locks)
+func (fl *FileLocks) loadLocks(_ gocontext.Context, l *fileLocks) {
+	fl.locks.Store(l)
+}
+
+// get returns fl.locks, and allocates it if it is nil.
+func (fl *FileLocks) get() *fileLocks {
+	if l := fl.locks.Load(); l != nil {
+		return l
+	}
+	l := &fileLocks{}
+	if fl.locks.CompareAndSwap(nil, l) {
+		return l
+	}
+	return fl.locks.Load()
+}
+
+// peek returns fl.locks, which is nil if no lock was ever requested.
+func (fl *FileLocks) peek() *fileLocks {
+	return fl.locks.Load()
 }
 
 // LockBSD tries to acquire a BSD-style lock on the entire file.
@@ -88,8 +89,8 @@ func (fl *FileLocks) LockBSD(ctx context.Context, uid fslock.UniqueID, ownerID i
 // This operation is always successful, even if there did not exist a lock on
 // the requested region held by uid in the first place.
 func (fl *FileLocks) UnlockBSD(uid fslock.UniqueID) {
-	if locks := fl.locks.Load(); locks != nil {
-		locks.bsd.UnlockRegion(uid, fslock.LockRange{0, fslock.LockEOF})
+	if l := fl.peek(); l != nil {
+		l.bsd.UnlockRegion(uid, fslock.LockRange{0, fslock.LockEOF})
 	}
 }
 
@@ -107,14 +108,18 @@ func (fl *FileLocks) LockPOSIX(ctx context.Context, uid fslock.UniqueID, ownerPI
 // This operation is always successful, even if there did not exist a lock on
 // the requested region held by uid in the first place.
 func (fl *FileLocks) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, r fslock.LockRange) error {
-	if locks := fl.locks.Load(); locks != nil {
-		locks.posix.UnlockRegion(uid, r)
+	if l := fl.peek(); l != nil {
+		l.posix.UnlockRegion(uid, r)
 	}
 	return nil
 }
 
 // TestPOSIX returns information about whether the specified lock can be held, in the style of the F_GETLK fcntl.
 func (fl *FileLocks) TestPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, r fslock.LockRange) (linux.Flock, error) {
+	l := fl.peek()
+	if l == nil {
+		return linux.Flock{Type: linux.F_UNLCK}, nil
+	}
 	_, ofd := uid.(*FileDescription)
-	return fl.get().posix.TestRegion(ctx, uid, t, r, ofd), nil
+	return l.posix.TestRegion(ctx, uid, t, r, ofd), nil
 }

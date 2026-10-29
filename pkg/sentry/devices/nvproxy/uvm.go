@@ -79,6 +79,7 @@ type uvmFD struct {
 	vfs.DentryMetadataFileDescriptionImpl
 	vfs.NoLockFD
 	memmap.MappableNoTrackMappings
+	memmap.MappableNoHugepages
 
 	dev           *uvmDevice
 	containerName string

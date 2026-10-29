@@ -60,7 +60,7 @@ func (mm *MemoryManager) PageNode(ctx context.Context, addr hostarch.Addr, alloc
 			return 0, err
 		}
 	}
-	if err := pseg.getInternalMappingsLocked(); err != nil {
+	if err := pseg.ensureInternalMappingsLocked(); err != nil {
 		return 0, err
 	}
 	ims := mm.internalMappingsLocked(pseg, ar)

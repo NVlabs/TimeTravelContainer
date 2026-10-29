@@ -127,6 +127,13 @@ func (proc *Proc) execAsync(args *ExecArgs, hooks ExecAsyncHooks) (*kernel.Threa
 	if pidns == nil {
 		pidns = proc.Kernel.RootPIDNamespace()
 	}
+	if args.NewPIDNamespace {
+		// Like clone(CLONE_NEWPID), the new process becomes PID 1 of the child
+		// namespace. Its thread group takes its own reference on the namespace.
+		sctx := proc.Kernel.SupervisorContext()
+		pidns = pidns.NewChild(sctx, proc.Kernel, pidns.UserNamespace())
+		defer pidns.DecRef(sctx)
+	}
 	limitSet := args.Limits
 	if limitSet == nil {
 		limitSet = limits.NewLimitSet()

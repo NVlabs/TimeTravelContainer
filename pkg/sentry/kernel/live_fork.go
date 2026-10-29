@@ -356,7 +356,7 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			saveCtx = context.WithValue(saveCtx, vfs.CtxLiveForkLoads, opts.batchLoads)
 		}
 		vfsPreparationStarted := time.Now()
-		if err := k.vfs.PrepareSave(saveCtx); err != nil {
+		if err := k.vfs.PrepareSave(saveCtx, vfs.PrepareSaveOptions{}); err != nil {
 			return fmt.Errorf("preparing VFS for live fork: %w", err)
 		}
 		if opts.Metrics != nil {
@@ -776,7 +776,7 @@ func (k *Kernel) captureLiveForkMetadata(fsResources vfs.LiveForkFilesystemResou
 			vfs.CtxLiveForkBranchesPrepared:    true,
 			vfs.CtxLiveForkLoads:               loads,
 		})
-		if err := k.vfs.PrepareSave(saveCtx); err != nil {
+		if err := k.vfs.PrepareSave(saveCtx, vfs.PrepareSaveOptions{}); err != nil {
 			return fmt.Errorf("preparing primary VFS for sibling capture: %w", err)
 		}
 		defer k.vfs.BeforeResume(saveCtx)

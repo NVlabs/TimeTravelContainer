@@ -463,6 +463,8 @@ go_test(
         "cpu_topology_test.go",
         "distributed_fork_test.go",
         "fd_table_test.go",
+        "kcov_test.go",
+        "kernel_idle_test.go",
         "kernel_restore_test.go",
         "memory_limit_test.go",
         "pending_signals_test.go",

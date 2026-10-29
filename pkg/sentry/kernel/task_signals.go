@@ -716,7 +716,9 @@ func (tg *ThreadGroup) applySignalSideEffectsLocked(sig linux.Signal) {
 			tg.exitStatus = linux.WaitStatusTerminationSignal(linux.SIGKILL)
 		}
 		for t := tg.tasks.Front(); t != nil; t = t.Next() {
-			t.killLocked()
+			// The list contains tasks in tg; checklocks cannot infer
+			// that t uses the signal mutex required by this helper.
+			t.killLocked() // +checklocksignore
 		}
 	}
 }
@@ -736,7 +738,9 @@ func (tg *ThreadGroup) wakeFrozenTasksForFatalSignalLocked(sig linux.Signal) {
 	}
 	for t := tg.tasks.Front(); t != nil; t = t.Next() {
 		if _, ok := t.stop.(*frozenStop); ok {
-			t.endInternalStopLocked()
+			// The list contains tasks in tg; checklocks cannot infer
+			// that t uses the signal mutex required by this helper.
+			t.endInternalStopLocked() // +checklocksignore
 		}
 	}
 }
@@ -1071,7 +1075,9 @@ func (t *Task) initiateGroupStop(info *linux.SignalInfo) {
 		if t2.ptraceSeized {
 			t2.trapNotifyPending = true
 			if s, ok := t2.stop.(*ptraceStop); ok && s.listen {
-				t2.endInternalStopLocked()
+				// The list contains tasks in t.tg; checklocks cannot infer
+				// that t2 uses the signal mutex held above.
+				t2.endInternalStopLocked() // +checklocksignore
 			}
 		}
 		t2.interrupt()
@@ -1103,14 +1109,16 @@ func (tg *ThreadGroup) endGroupStopLocked(broadcast bool) {
 	tg.leader.Debugf("Ending %s group stop with %d threads pending", completeStr, tg.groupStopPendingCount)
 	for t := tg.tasks.Front(); t != nil; t = t.Next() {
 		t.groupStopPending = false
+		// The list contains tasks in tg; checklocks cannot infer that t
+		// uses the signal mutex required by this helper for either stop.
 		if t.ptraceSeized {
 			t.trapNotifyPending = true
 			if s, ok := t.stop.(*ptraceStop); ok && s.listen {
-				t.endInternalStopLocked()
+				t.endInternalStopLocked() // +checklocksignore
 			}
 		} else {
 			if _, ok := t.stop.(*groupStop); ok {
-				t.endInternalStopLocked()
+				t.endInternalStopLocked() // +checklocksignore
 				// t may still be effectively frozen but couldn't enter
 				// frozenStop while parked (single t.stop slot); nudge it to recheck.
 				if t.freezeOrdered {
@@ -1353,7 +1361,8 @@ func (*runInterrupt) execute(t *Task) taskRunState {
 	if canDeliver {
 		if info := t.dequeueSignalLocked(mask); info != nil {
 			if err := t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch()); err != nil {
-				t.PrepareGroupExit(linux.WaitStatusTerminationSignal(linux.SIGILL))
+				t.prepareGroupExitLocked(linux.WaitStatusTerminationSignal(linux.SIGILL))
+				t.tg.signalHandlers.mu.Unlock()
 				return (*runExit)(nil)
 			}
 

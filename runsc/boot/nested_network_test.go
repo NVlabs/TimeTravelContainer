@@ -129,7 +129,7 @@ func TestNestedLoopbackBubblewrapSequence(t *testing.T) {
 	s := newNestedTestStack(t)
 	// Bubblewrap adds 127.0.0.1/8 with NLM_F_EXCL while the device is down,
 	// then brings it up. The kernel then adds only ::1.
-	if err := s.AddInterfaceAddr(linux.LOOPBACK_IFINDEX, inet.InterfaceAddr{Family: linux.AF_INET, PrefixLen: 8, Addr: []byte{127, 0, 0, 1}}); err != nil {
+	if err := s.AddInterfaceAddr(context.Background(), linux.LOOPBACK_IFINDEX, inet.InterfaceAddr{Family: linux.AF_INET, PrefixLen: 8, Addr: []byte{127, 0, 0, 1}}); err != nil {
 		t.Fatalf("adding 127.0.0.1/8 to the down loopback device: %v", err)
 	}
 	setLoopbackFlags(t, s, linux.IFF_UP, linux.IFF_UP)

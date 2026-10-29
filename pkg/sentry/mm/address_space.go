@@ -44,6 +44,12 @@ func (mm *MemoryManager) UsesAddressSpace(as platform.AddressSpace) bool {
 	return mm.as == as
 }
 
+// asyncLoadMapUnit bounds the ranges that are mapped at once while async page
+// loading is in progress, in order to avoid calling
+// platform.AddressSpace.MapFile() => mf.DataFD() or mf.MapInternal() with
+// unnecessarily large ranges, resulting in unnecessarily long waits.
+const asyncLoadMapUnit = 32 << 20
+
 // mapASLocked maps addresses in ar into mm.as.
 //
 // Preconditions:
@@ -120,7 +126,7 @@ func (mm *MemoryManager) mapASWindowLocked(ctx context.Context, pseg pmaIterator
 		if unit := mf.AsyncLoadingMapUnit(pseg.ValuePtr().off + uint64(max(ar.Start, pseg.Start())-pseg.Start())); unit != 0 {
 			setMapUnit(unit)
 		} else {
-			setMapUnit(32 << 20)
+			setMapUnit(asyncLoadMapUnit)
 		}
 	}
 	if window.Length() == 0 && mm.homeOwner != 0 {

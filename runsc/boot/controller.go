@@ -362,6 +362,7 @@ func (cm *containerManager) StartRoot(cid *string, _ *struct{}) error {
 	if state != created && !(state == restoringUnstarted && (cm.l.distributedRestore || cm.l.dehydrationRestore)) {
 		return fmt.Errorf("sandbox is not in created state, cannot start root container: state=%s", state)
 	}
+	defer cm.l.lifecycleCPUs.releaseForRestore()
 	// Tell the root container to start and wait for the result.
 	return cm.onStart()
 }
@@ -540,6 +541,7 @@ func (cm *containerManager) StartSubcontainer(args *sentryapi.StartArgs, _ *stru
 		return err
 	}
 	log.Debugf("Container started, cid: %s", args.CID)
+	cm.l.releaseStartupHeapWhenIdle()
 	return nil
 }
 
@@ -578,6 +580,8 @@ func (cm *containerManager) ExecuteAsync(args *control.ExecArgs, pid *int32) err
 func (cm *containerManager) Checkpoint(o *controlapi.SaveOpts, _ *struct{}) error {
 	log.Debugf("containerManager.Checkpoint")
 	o.RunscVersion = version.Version()
+	cm.l.lifecycleCPUs.hold()
+	defer cm.l.lifecycleCPUs.release()
 	return cm.l.save(o)
 }
 
@@ -626,7 +630,7 @@ type FilesystemBranchSnapshotArgs struct {
 // The container's current kernel is destroyed, a restore environment is
 // created, and the kernel is recreated with the restore state file. The
 // container then sends the signal to start.
-func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retErr error) {
+func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, reply *sentryapi.RestoreReply) (retErr error) {
 	timer := starttime.Timer("Restore")
 	timer.Reached("cm.Restore RPC")
 	log.Debugf("containerManager.Restore")
@@ -644,6 +648,7 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 			cm.onRestoreFailed(fmt.Errorf("Restore failed: %w", retErr))
 		}
 	}()
+	cm.l.lifecycleCPUs.holdForRestore()
 
 	// If filesystem restore files were donated to the loader during sandbox
 	// creation, we must perform a split filesystem restore. Restoring a split
@@ -659,7 +664,13 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 		return fmt.Errorf("at least one file must be passed to Restore")
 	}
 
-	stateFile, pagesMetadata, pagesFile, err := getRestoreReaders(o)
+	readerCPUs := cm.l.lifecycleCPUs.num
+	if o.Background {
+		// Most page reads run after the application starts, under its CPU
+		// limit.
+		readerCPUs = cm.l.root.applicationCores
+	}
+	stateFile, pagesMetadata, pagesFile, err := getRestoreReaders(o, readerCPUs)
 	if err != nil {
 		return err
 	}
@@ -695,7 +706,9 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 
 	if o.HavePagesFile {
 		// This immediately starts loading the main MemoryFile asynchronously.
-		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, cm.restorer.mainMF, timer.Fork("PagesFileLoader")) // transfers ownership
+		// For background restore, throttle page loading until the kernel is
+		// restored, so that restore does not wait behind page reads.
+		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, cm.restorer.mainMF, timer.Fork("PagesFileLoader"), pgalloc.AsyncPagesFileLoadOpts{Throttled: o.Background}) // transfers ownership
 		pagesMetadata = nil
 		pagesFile = nil
 		timer.Reached("created async MF loader")
@@ -708,7 +721,6 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 	stateFile = nil
 	timer.Reached("created statefile reader")
 
-	cm.l.restoreDone = sync.NewCond(&cm.l.mu)
 	cm.l.state = restoringUnstarted
 
 	// Release `cm.l.mu`.
@@ -771,17 +783,20 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 		return fmt.Errorf("checkpoint taken with no-root-container=%t cannot be restored with no-root-container=%t", saved, cm.l.noRootContainer.enabled)
 	}
 	timer.Reached("restorer initialized")
-	return cm.restorer.restoreContainerInfo(cm.l, &cm.l.root)
+	reply.KernelStarted, err = cm.restorer.restoreContainerInfo(cm.l, &cm.l.root)
+	return err
 }
 
-func getRestoreReaders(o *sentryapi.RestoreOpts) (io.ReadCloser, io.ReadCloser, stateio.AsyncReader, error) {
+// getRestoreReaders returns readers for the checkpoint files
+// (appropriate for `cpus` CPUs).
+func getRestoreReaders(o *sentryapi.RestoreOpts, cpus int) (io.ReadCloser, io.ReadCloser, stateio.AsyncReader, error) {
 	if o.UseCheckpointGofer {
 		return getRestoreReadersForCheckpointGofer(o)
 	}
-	return getRestoreReadersForLocalCheckpointFiles(o)
+	return getRestoreReadersForLocalCheckpointFiles(o, cpus)
 }
 
-func getRestoreReadersForLocalCheckpointFiles(o *sentryapi.RestoreOpts) (io.ReadCloser, io.ReadCloser, stateio.AsyncReader, error) {
+func getRestoreReadersForLocalCheckpointFiles(o *sentryapi.RestoreOpts, cpus int) (io.ReadCloser, io.ReadCloser, stateio.AsyncReader, error) {
 	stateFile, err := o.ReleaseFD(0)
 	if err != nil {
 		return nil, nil, nil, err
@@ -816,7 +831,7 @@ func getRestoreReadersForLocalCheckpointFiles(o *sentryapi.RestoreOpts) (io.Read
 	// compressio.Reader or compressio.NewSimpleReader().
 	return stateFile,
 		stateio.NewBufioReadCloser(pagesMetadataFile),
-		stateio.NewPagesFileFDReaderDefault(int32(pagesFile.Release())),
+		stateio.NewPagesFileFDReaderDefault(int32(pagesFile.Release()), cpus),
 		nil
 }
 
@@ -870,6 +885,7 @@ func getRestoreReadersForCheckpointGofer(o *sentryapi.RestoreOpts) (io.ReadClose
 }
 
 func (cm *containerManager) onRestoreFailed(err error) {
+	cm.l.lifecycleCPUs.releaseForRestore()
 	cm.l.mu.Lock()
 	cm.l.state = restoreFailed
 	cm.l.restoreErr = err
@@ -885,9 +901,10 @@ func (cm *containerManager) onRestoreDone(s sentryapi.Savings) {
 	cm.l.mu.Unlock()
 	cm.l.restoreDone.Broadcast()
 	cm.restorer = nil
+	cm.l.releaseStartupHeapWhenIdle()
 }
 
-func (cm *containerManager) RestoreSubcontainer(args *sentryapi.StartArgs, _ *struct{}) (retErr error) {
+func (cm *containerManager) RestoreSubcontainer(args *sentryapi.StartArgs, reply *sentryapi.RestoreReply) (retErr error) {
 	log.Debugf("containerManager.RestoreSubcontainer, cid: %s, args: %+v", args.CID, args)
 	cm.l.mu.Lock()
 	state := cm.l.state
@@ -967,7 +984,7 @@ func (cm *containerManager) RestoreSubcontainer(args *sentryapi.StartArgs, _ *st
 		return fmt.Errorf("error dup'ing gofer files: %w", err)
 	}
 
-	err = cm.restorer.restoreSubcontainer(args.Spec, args.Conf, cm.l, args.CID, stdios, goferFDs, goferFilestoreFDs, devGoferFD, args.GoferMountConfs)
+	reply.KernelStarted, err = cm.restorer.restoreSubcontainer(args.Spec, args.Conf, cm.l, args.CID, stdios, goferFDs, goferFilestoreFDs, devGoferFD, args.GoferMountConfs)
 	if err != nil {
 		log.Debugf("containerManager.RestoreSubcontainer failed, cid: %s, args: %+v, err: %v", args.CID, args, err)
 		return err

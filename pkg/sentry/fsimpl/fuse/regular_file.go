@@ -790,6 +790,11 @@ func (fd *regularFileFD) readToBlocksAt(ctx context.Context, dsts safemem.BlockS
 	return copied, err
 }
 
+// MayUseHugepages implements memmap.Mappable.MayUseHugepages.
+func (*regularFileFD) MayUseHugepages() bool {
+	return false
+}
+
 // InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable. Cached
 // pages and dirty state are serializable Sentry memory. In particular, this
 // method must not issue FUSE requests: save runs after guest tasks, including

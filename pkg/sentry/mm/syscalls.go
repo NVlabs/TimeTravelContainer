@@ -533,6 +533,7 @@ func (mm *MemoryManager) MRemap(ctx context.Context, oldAddr hostarch.Addr, oldS
 		if vma.mappable != nil {
 			newOffset = vseg.mappableRange().End
 		}
+		mlockMode := vma.mlockMode
 		var vseg vmaIterator
 		var ar hostarch.AddrRange
 		var err error
@@ -554,7 +555,7 @@ func (mm *MemoryManager) MRemap(ctx context.Context, oldAddr hostarch.Addr, oldS
 			NameMut:         vma.nameMut,
 		}, droppedIDs)
 		if err == nil {
-			if vma.mlockMode == memmap.MLockEager {
+			if mlockMode == memmap.MLockEager {
 				mm.populateVMA(ctx, vseg, ar, memmap.PlatformEffectCommit)
 			}
 			return oldAddr, nil
@@ -570,7 +571,13 @@ func (mm *MemoryManager) MRemap(ctx context.Context, oldAddr hostarch.Addr, oldS
 	var newAR hostarch.AddrRange
 	switch opts.Move {
 	case MRemapMayMove:
-		newAddr, err := mm.findAvailableLocked(newSize, findAvailableOpts{})
+		vma := vseg.ValuePtr()
+		newAddr, err := mm.findAvailableLocked(newSize, findAvailableOpts{
+			Mappable:  vma.mappable,
+			Offset:    vma.off + uint64(oldAddr-vseg.Start()),
+			GrowsDown: vma.growsDown,
+			Stack:     vma.isStack,
+		})
 		if err != nil {
 			return 0, err
 		}
@@ -591,10 +598,15 @@ func (mm *MemoryManager) MRemap(ctx context.Context, oldAddr hostarch.Addr, oldS
 		}
 
 		// Check that the new region is valid.
+		vma := vseg.ValuePtr()
 		_, err := mm.findAvailableLocked(newSize, findAvailableOpts{
-			Addr:  newAddr,
-			Fixed: true,
-			Unmap: true,
+			Mappable:  vma.mappable,
+			Offset:    vma.off + uint64(oldAddr-vseg.Start()),
+			Addr:      newAddr,
+			Fixed:     true,
+			Unmap:     true,
+			GrowsDown: vma.growsDown,
+			Stack:     vma.isStack,
 		})
 		if err != nil {
 			return 0, err

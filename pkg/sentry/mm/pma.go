@@ -583,7 +583,7 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 						copyAR = pseg.Range().Intersect(ar)
 					}
 					// Get internal mappings from the pma to copy from.
-					if err := pseg.getInternalMappingsLocked(); err != nil {
+					if err := pseg.ensureInternalMappingsLocked(); err != nil {
 						return pstart, pseg.PrevGap(), err
 					}
 					// Copy the pmas that follow in ar along with it, when they
@@ -599,7 +599,7 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 					}
 					copyAR.End = min(copyAR.End, limit)
 					for next := pseg.NextSegment(); next.Ok() && next.Start() == copyAR.End && copyAR.End < limit; next = next.NextSegment() {
-						if !mm.isPMACopyOnWriteLocked(vseg, next) || next.getInternalMappingsLocked() != nil {
+						if !mm.isPMACopyOnWriteLocked(vseg, next) || next.ensureInternalMappingsLocked() != nil {
 							break
 						}
 						copyAR.End = min(next.End(), limit)
@@ -908,7 +908,7 @@ func (mm *MemoryManager) breakHugePageCOWLocked(ctx context.Context, block hosta
 	for seg := first; seg.Ok() && seg.Start() < block.End; seg = seg.NextSegment() {
 		// A part that mm owns, which a device's DMA may use, stays; see
 		// prepareLiveFork.
-		if !seg.ValuePtr().needCOW || seg.getInternalMappingsLocked() != nil {
+		if !seg.ValuePtr().needCOW || seg.ensureInternalMappingsLocked() != nil {
 			return pmaIterator{}, false
 		}
 	}
@@ -1435,28 +1435,58 @@ func (mm *MemoryManager) findOrSeekPrevUpperBoundPMA(addr hostarch.Addr, pgap pm
 	return mm.pmas.UpperBoundSegment(addr)
 }
 
-// getInternalMappingsLocked ensures that pseg.ValuePtr().internalMappings is
-// non-empty. The generated iterator identifies a set node and index, not its
-// MemoryManager, so checklocks cannot name the owning mutex.
+// getInternalMappingsLocked returns internal mappings for addresses in ar.
+// Unless async page loading is in progress and the pma is larger than
+// `asyncLoadMapUnit`, it caches internal mappings for the whole pma in
+// pseg.ValuePtr().internalMappings (see ensureInternalMappingsLocked). The
+// generated iterator identifies a set node and index, not its MemoryManager,
+// so checklocks cannot name the owning mutex.
 //
-// Preconditions: the owning MemoryManager's activeMu is held for writing.
-func (pseg pmaIterator) getInternalMappingsLocked() error {
+// Preconditions:
+//   - The owning MemoryManager's activeMu is held for writing.
+//   - pseg.Range().IsSupersetOf(ar).
+//   - ar.Length() != 0.
+func (pseg pmaIterator) getInternalMappingsLocked(ar hostarch.AddrRange) (safemem.BlockSeq, error) {
 	pma := pseg.ValuePtr()
 	if pma.internalMappings.IsEmpty() {
-		// This must use maxPerms (instead of perms) because some permission
-		// constraints are only visible to vmas; for example, mappings of
-		// read-only files have vma.maxPerms.Write unset, but this may not be
-		// visible to the memmap.Mappable.
-		perms := pma.maxPerms
-		// We will never execute application code through an internal mapping.
-		perms.Execute = false
-		ims, err := memmap.MapInternalForPMA(pma.file, pseg.fileRange(), perms)
+		if mf, ok := pma.file.(*pgalloc.MemoryFile); ok && mf.IsAsyncLoading() && pseg.Range().Length() > asyncLoadMapUnit {
+			// Mapping the whole pma would wait for all of it to load.
+			return memmap.MapInternalForPMA(pma.file, pseg.fileRangeOf(ar), internalMappingPerms(pma))
+		}
+		if err := pseg.ensureInternalMappingsLocked(); err != nil {
+			return safemem.BlockSeq{}, err
+		}
+	}
+	return pma.internalMappings.DropFirst64(uint64(ar.Start - pseg.Start())).TakeFirst64(uint64(ar.Length())), nil
+}
+
+// ensureInternalMappingsLocked ensures that pseg.ValuePtr().internalMappings
+// holds internal mappings for the whole pma, which internalMappingsLocked
+// reads.
+//
+// Preconditions: The owning MemoryManager's activeMu is held for writing.
+func (pseg pmaIterator) ensureInternalMappingsLocked() error {
+	pma := pseg.ValuePtr()
+	if pma.internalMappings.IsEmpty() {
+		ims, err := memmap.MapInternalForPMA(pma.file, pseg.fileRange(), internalMappingPerms(pma))
 		if err != nil {
 			return err
 		}
 		pma.internalMappings = ims
 	}
 	return nil
+}
+
+// internalMappingPerms returns the permissions of internal mappings of pma.
+func internalMappingPerms(pma *pma) hostarch.AccessType {
+	// This must use maxPerms (instead of perms) because some permission
+	// constraints are only visible to vmas; for example, mappings of
+	// read-only files have vma.maxPerms.Write unset, but this may not be
+	// visible to the memmap.Mappable.
+	perms := pma.maxPerms
+	// We will never execute application code through an internal mapping.
+	perms.Execute = false
+	return perms
 }
 
 func (pseg pmaIterator) fileRange() memmap.FileRange {

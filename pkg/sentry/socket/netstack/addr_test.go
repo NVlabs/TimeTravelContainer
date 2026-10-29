@@ -67,9 +67,10 @@ type addrSubscriber struct {
 
 func (*addrSubscriber) OnInterfaceChangeEvent(context.Context, int32, inet.Interface) {}
 func (*addrSubscriber) OnInterfaceDeleteEvent(context.Context, int32, inet.Interface) {}
-func (s *addrSubscriber) OnInterfaceAddrEvent(_ context.Context, idx int32, addr inet.InterfaceAddr, added bool) {
+func (s *addrSubscriber) OnAddressEvent(_ context.Context, idx int32, _ inet.Interface, addr inet.InterfaceAddr, added bool) {
 	s.events = append(s.events, addrEvent{idx, string(addr.Addr), added})
 }
+func (*addrSubscriber) OnRouteEvent(context.Context, inet.Route, bool, uint16) {}
 
 // TestInterfaceAddrEvents checks that the stack tells subscribers of the
 // addresses that interfaces gain and lose, as netlink listeners learn them.
@@ -84,10 +85,10 @@ func TestInterfaceAddrEvents(t *testing.T) {
 	s.AddInterfaceEventSubscriber(sub)
 
 	addr := inet.InterfaceAddr{Family: linux.AF_INET, PrefixLen: 8, Addr: []byte{10, 0, 2, 15}}
-	if err := s.AddInterfaceAddr(1, addr); err != nil {
+	if err := s.AddInterfaceAddr(context.Background(), 1, addr); err != nil {
 		t.Fatalf("AddInterfaceAddr: %v", err)
 	}
-	if err := s.RemoveInterfaceAddr(1, addr); err != nil {
+	if err := s.RemoveInterfaceAddr(context.Background(), 1, addr); err != nil {
 		t.Fatalf("RemoveInterfaceAddr: %v", err)
 	}
 	want := []addrEvent{

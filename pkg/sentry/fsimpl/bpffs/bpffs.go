@@ -56,8 +56,8 @@ func (fstype *FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Vir
 	// Linux ignores options that it doesn't know.
 	mopts := vfs.GenericParseMountOptions(opts.Data)
 	mode := linux.FileMode(0777 | linux.S_ISVTX)
-	uid := creds.EffectiveKUID
-	gid := creds.EffectiveKGID
+	uid := creds.FilesystemKUID
+	gid := creds.FilesystemKGID
 	if s, ok := mopts["mode"]; ok {
 		m, err := strconv.ParseUint(s, 8, 32)
 		if err != nil {
@@ -199,7 +199,7 @@ func (d *dirInode) NewDir(ctx context.Context, name string, opts vfs.MkdirOption
 	creds := auth.CredentialsFromContext(ctx)
 	return d.OrderedChildren.Inserter(name, func() kernfs.Inode {
 		d.IncLinks(1)
-		return d.fs.newDir(ctx, creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode)
+		return d.fs.newDir(ctx, creds.FilesystemKUID, creds.FilesystemKGID, opts.Mode)
 	})
 }
 

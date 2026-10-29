@@ -489,20 +489,42 @@ func (s *Socket) HandleInterfaceDeleteEvent(ctx context.Context, idx int32, i in
 	s.SendResponse(ctx, ms)
 }
 
-// HandleInterfaceAddrEvent implements inet.NetlinkSocket.HandleInterfaceAddrEvent.
-func (s *Socket) HandleInterfaceAddrEvent(ctx context.Context, idx int32, addr inet.InterfaceAddr, added bool) {
+// HandleAddressEvent implements inet.NetlinkSocket.HandleAddressEvent.
+func (s *Socket) HandleAddressEvent(ctx context.Context, idx int32, i inet.Interface, a inet.InterfaceAddr, added bool) {
 	routeProtocol, ok := s.protocol.(RouteProtocol)
 	if !ok {
 		panic(fmt.Sprintf("Non-ROUTE netlink socket (protocol %d) cannot handle address events", s.Protocol()))
 	}
 
-	// Multicast messages from the kernel leave hdr->nlmsg_pid at 0.
-	ms := nlmsg.NewMessageSet(0 /*portID*/, 0 /*seq*/)
-	label := ""
-	if stack := inet.StackFromContext(ctx); stack != nil {
-		label = stack.Interfaces()[idx].Name
+	typ := uint16(linux.RTM_NEWADDR)
+	if !added {
+		typ = linux.RTM_DELADDR
 	}
-	routeProtocol.AddAddrMessage(ms, idx, addr, label, added)
+	// IPv4 notifications carry the requester's port ID and sequence number
+	// (rtmsg_ifa); IPv6 notifications leave both 0 (inet6_ifa_notify).
+	var origin inet.NetlinkOrigin
+	if a.Family == linux.AF_INET {
+		origin = inet.NetlinkOriginFromContext(ctx)
+	}
+	ms := nlmsg.NewMessageSet(origin.PortID, origin.Seq)
+	routeProtocol.AddAddrMessage(ms, typ, idx, i, a)
+	s.SendResponse(ctx, ms)
+}
+
+// HandleRouteEvent implements inet.NetlinkSocket.HandleRouteEvent.
+func (s *Socket) HandleRouteEvent(ctx context.Context, rt inet.Route, added bool, nlFlags uint16) {
+	routeProtocol, ok := s.protocol.(RouteProtocol)
+	if !ok {
+		panic(fmt.Sprintf("Non-ROUTE netlink socket (protocol %d) cannot handle route events", s.Protocol()))
+	}
+
+	typ := uint16(linux.RTM_NEWROUTE)
+	if !added {
+		typ = linux.RTM_DELROUTE
+	}
+	origin := inet.NetlinkOriginFromContext(ctx)
+	ms := nlmsg.NewMessageSet(origin.PortID, origin.Seq)
+	routeProtocol.AddRouteMessage(ms, typ, nlFlags, rt, nil /* prefSrc */)
 	s.SendResponse(ctx, ms)
 }
 
@@ -1013,7 +1035,7 @@ func (s *Socket) SendResponse(ctx context.Context, ms *nlmsg.MessageSet) *syserr
 		})
 
 		// Add the dump_done_errno payload.
-		m.Put(primitive.AllocateInt64(0))
+		m.Put(primitive.AllocateInt32(0))
 
 		if err := s.sendBufs(ctx, [][]byte{m.Finalize()}, cms, 0 /* srcPort */); err != nil {
 			return err

@@ -2264,7 +2264,7 @@ func (f *SandboxFamily) SnapshotFilesystemBranch(id string, resource checkpoint.
 		}
 	}
 	ctx := context.WithValues(b.k.SupervisorContext(), ctxValues)
-	if err := b.k.VFS().PrepareSave(ctx); err != nil {
+	if err := b.k.VFS().PrepareSave(ctx, vfs.PrepareSaveOptions{}); err != nil {
 		_ = transactions.Abort()
 		return fmt.Errorf("preparing filesystem resource %q: %w", resource, err)
 	}

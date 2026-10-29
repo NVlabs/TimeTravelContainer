@@ -258,7 +258,7 @@ nogo-tests:
 #
 # FIXME(gvisor.dev/issue/10045): Need to fix broken tests.
 unit-tests: ## Local package unit tests in pkg/..., tools/.., etc.
-	@$(call test,--test_tag_filters=-nogo$(COMMA)-requires-kvm --build_tag_filters=-network_plugins --test_env=CGROUPV2=$(CGROUPV2) -- //:all pkg/... tools/... runsc/... vdso/... sandboxexec/... examples/... test/trace/... -//pkg/metric:metric_test -//pkg/coretag:coretag_test)
+	@$(call test,--test_tag_filters=-nogo$(COMMA)-requires-kvm --build_tag_filters=-network_plugins --test_env=CGROUPV2=$(CGROUPV2) -- //:all pkg/... tools/... runsc/... vdso/... sandboxexec/... examples/... test/trace/...)
 .PHONY: unit-tests
 
 # See unit-tests: this includes runsc/container.
@@ -463,6 +463,8 @@ sandbox-posture-tests: load-basic_alpine $(RUNTIME_BIN)
 	@$(call sudo,test/root:root_test,--runtime=$(RUNTIME)-posture-nodirectfs-hostnet --directfs=false --network=host $(POSTURE_TEST_ARGS) $(ARGS))
 	@$(call install_runtime,$(RUNTIME)-posture-kvm,--platform=kvm)
 	@$(call sudo,test/root:root_test,--runtime=$(RUNTIME)-posture-kvm --platform=kvm $(POSTURE_TEST_ARGS) $(ARGS))
+	@$(call install_runtime,$(RUNTIME)-posture-coretags,--enable-core-tags)
+	@$(call sudo,test/root:root_test,--runtime=$(RUNTIME)-posture-coretags --enable-core-tags $(POSTURE_TEST_ARGS) $(ARGS))
 .PHONY: sandbox-posture-tests
 
 root-tests: load-basic_alpine $(RUNTIME_BIN)
@@ -853,15 +855,15 @@ syzkaller-smoke-test: $(SYZKALLER_TARBALL)
 ##
 ## Lint targets.
 ##
-##   These run the source-level linters that live outside the Bazel build.
+##   These run source-level formatting and lint checks.
 ##   Deep Go analysis is owned by gVisor nogo.
 ##
-lint: ## Runs the source linters.
-	@tools/lint.sh
+lint: ensure-bazel-server ## Runs the source linters.
+	@$(call wrapper,tools/lint.sh)
 .PHONY: lint
 
-lint-fix: ## Reformats sources in place.
-	@tools/lint.sh --fix
+lint-fix: ensure-bazel-server ## Reformats sources in place.
+	@$(call wrapper,tools/lint.sh --fix)
 .PHONY: lint-fix
 
 lint-cc: ensure-bazel-server ## Runs clang-tidy over the C++ sources; needs bazel for compile_commands.json.

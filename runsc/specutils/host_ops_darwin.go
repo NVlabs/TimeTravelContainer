@@ -10,9 +10,34 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/runsc/processutil"
 )
 
-func waitForNonChildExit(pid int, timeout time.Duration) error {
+// IsProcessRunning returns true if the process with the given PID is running,
+// rather than a zombie. Darwin has no process identities: identity is
+// ignored.
+func IsProcessRunning(pid int, _ uint64) (bool, error) {
+	return processutil.IsRunning(pid), nil
+}
+
+// ProcessIdentity returns 0: Darwin has no stable process identities.
+func ProcessIdentity(int) (uint64, error) {
+	return 0, nil
+}
+
+// KillProcess sends SIGKILL to the process with the given PID, if it exists.
+// Darwin has no process identities: identity is ignored.
+func KillProcess(pid int, _ uint64) error {
+	if err := unix.Kill(pid, unix.SIGKILL); err != nil && err != unix.ESRCH {
+		return fmt.Errorf("cannot kill process %d: %w", pid, err)
+	}
+	return nil
+}
+
+// WaitForNonChildExit waits for the process with the given PID to exit, up to
+// `timeout`. `pid` must not be a child of the current process. Darwin has no
+// process identities: identity is ignored.
+func WaitForNonChildExit(pid int, _ uint64, timeout time.Duration) error {
 	if pid <= 0 {
 		return fmt.Errorf("invalid pid: %d", pid)
 	}

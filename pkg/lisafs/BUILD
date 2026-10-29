@@ -119,6 +119,7 @@ go_library(
         "//pkg/fdnotifier",
         "//pkg/flipcall",
         "//pkg/fspath",
+        "//pkg/gomaxprocs",
         "//pkg/hostarch",
         "//pkg/log",
         "//pkg/marshal/primitive",

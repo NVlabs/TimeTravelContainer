@@ -177,6 +177,7 @@ go_path(
         "//pkg/tcpip/sample/tun_tcp_echo",
         "//pkg/tcpip/transport/tcpconntrack",
         "//runsc/checkpointgofer/gcs",
+        "//runsc/coretagprime",
         "//runsc/metricserver",
         "//sandboxexec/sandbox",
         "//tools/xdp/cmd",
@@ -251,3 +252,8 @@ exports_files([
     "go.sum",
     "go.mod",
 ])
+
+exports_files(
+    [".clang-format"],
+    visibility = ["//tools:__pkg__"],
+)

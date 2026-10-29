@@ -25,7 +25,11 @@ func (b *runtimeBackend) applicationHugePages(id string) (mapped, huge uint64, o
 	if !embeddedRuntime(b.runsc) {
 		return 0, 0, false
 	}
-	c, err := container.Load(b.root, container.FullID{SandboxID: id, ContainerID: id}, container.LoadOpts{Exact: true, SkipCheck: true, TryLock: container.TryAcquire})
+	full := container.FullID{SandboxID: id, ContainerID: id}
+	if held, err := container.StateFileHeld(b.root, full); err != nil || held {
+		return 0, 0, false
+	}
+	c, err := container.Load(b.root, full, container.LoadOpts{Exact: true, SkipCheck: true, ReadOnly: true})
 	if err != nil || c.Status == container.Stopped || c.SandboxPid() <= 0 {
 		return 0, 0, false
 	}

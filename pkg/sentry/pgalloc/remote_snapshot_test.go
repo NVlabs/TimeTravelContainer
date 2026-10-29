@@ -1541,7 +1541,7 @@ func TestCloneMemoryFileMetadataForRemote(t *testing.T) {
 	}
 	reader := NewLoopbackRemoteReader(snapshot, 2*hostarch.PageSize, 4, 2)
 	loaderDone := make(chan error, 1)
-	pages, err := StartAsyncPagesFileLoad(reader, func(err error) { loaderDone <- err }, nil)
+	pages, err := StartAsyncPagesFileLoad(reader, func(err error) { loaderDone <- err }, nil, AsyncPagesFileLoadOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}

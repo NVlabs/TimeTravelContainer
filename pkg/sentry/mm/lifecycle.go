@@ -196,7 +196,7 @@ func (mm *MemoryManager) prepareLiveFork(key uint64) (*LiveForkPMASnapshot, erro
 //
 // Preconditions: mm.activeMu is locked for writing.
 func (mm *MemoryManager) copyForLiveForkLocked(pseg pmaIterator) (liveForkPMAEntry, error) {
-	if err := pseg.getInternalMappingsLocked(); err != nil {
+	if err := pseg.ensureInternalMappingsLocked(); err != nil {
 		return liveForkPMAEntry{}, err
 	}
 	ar := pseg.Range()
@@ -584,11 +584,12 @@ func (mm *MemoryManager) Fork(ctx context.Context) (*MemoryManager, error) {
 // +checklocks:mm.activeMu
 // +checklocks:mm2.activeMu
 func (mm *MemoryManager) forkCopyPMALocked(mm2 *MemoryManager, srcpseg pmaIterator, dstpgap pmaGapIterator, memCgID uint32) (pmaGapIterator, error) {
-	if err := srcpseg.getInternalMappingsLocked(); err != nil {
+	copyAR := srcpseg.Range()
+	ims, err := srcpseg.getInternalMappingsLocked(copyAR)
+	if err != nil {
 		return dstpgap, err
 	}
-	copyAR := srcpseg.Range()
-	reader := safemem.BlockSeqReader{Blocks: mm.internalMappingsLocked(srcpseg, copyAR)}
+	reader := safemem.BlockSeqReader{Blocks: ims}
 	huge := mm.mf.HugepagesEnabled() && copyAR.IsHugePageAligned()
 	fr, err := mm.mf.Allocate(uint64(copyAR.Length()), pgalloc.AllocOpts{
 		Kind:       usage.Anonymous,

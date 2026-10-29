@@ -30,7 +30,6 @@ import (
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
-
 	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/ttcpack"
@@ -42,9 +41,9 @@ import (
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/flag"
-	"gvisor.dev/gvisor/runsc/fsgofer"
-	"gvisor.dev/gvisor/runsc/fsgofer/extension"
-	"gvisor.dev/gvisor/runsc/fsgofer/filter"
+	fsgofer "gvisor.dev/gvisor/runsc/gofer/fs"
+	"gvisor.dev/gvisor/runsc/gofer/fs/extension"
+	"gvisor.dev/gvisor/runsc/gofer/fs/filter"
 	"gvisor.dev/gvisor/runsc/gvisorbinaries"
 	"gvisor.dev/gvisor/runsc/profile"
 	"gvisor.dev/gvisor/runsc/specutils"
@@ -240,30 +239,38 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	g.syncFDs.syncChroot()
 	g.syncFDs.syncUsernsForRootless(uint32(g.uid), uint32(g.gid))
 
-	goferToHostRPCSock, err := unet.NewSocket(g.goferToHostRPCFD)
-	if err != nil {
-		util.Fatalf("creating rpc socket: %v", err)
+	// Only pass the FD if the gofer will actually need it.
+	var goferToHostRPC *urpc.Client
+	var mountOpener sandboxsetup.MountOpener
+	if g.goferToHostRPCFD >= 0 {
+		goferToHostRPCSock, err := unet.NewSocket(g.goferToHostRPCFD)
+		if err != nil {
+			util.Fatalf("creating rpc socket: %v", err)
+		}
+		goferToHostRPC = urpc.NewClient(goferToHostRPCSock)
+		mountOpener = makeRPCMountOpener(goferToHostRPC)
 	}
 
-	goferToHostRPC := urpc.NewClient(goferToHostRPCSock)
-	defer goferToHostRPC.Close()
-
+	var umounter *os.File
+	spawnUnmounter := g.setUpRoot && willReexec && !conf.AllowRunAsCurrentUserWithoutChroot()
 	if g.setUpRoot {
 		// The /proc unmounter binary must be opened before SetupRootFS pivots
 		// away from the host filesystem.
-		var umounter *os.File
-		spawnUnmounter := willReexec && !conf.AllowRunAsCurrentUserWithoutChroot()
 		if spawnUnmounter {
 			umounter = openProcUmounter()
 		}
-		if err := sandboxsetup.SetupRootFS(spec, conf, g.mountConfs, g.devIoFD, makeRPCMountOpener(goferToHostRPC), containerID, g.bundleDir); err != nil {
+		if err := sandboxsetup.SetupRootFS(spec, conf, g.mountConfs, g.devIoFD, mountOpener, containerID, g.bundleDir); err != nil {
 			util.Fatalf("Error setting up root FS: %v", err)
 		}
-		if spawnUnmounter {
-			cleanupUnmounter := g.syncFDs.spawnProcUnmounter(umounter)
-			umounter.Close()
-			defer cleanupUnmounter()
-		}
+	}
+	// No longer needed past rootfs setup.
+	if goferToHostRPC != nil {
+		goferToHostRPC.Close()
+	}
+	if spawnUnmounter {
+		cleanupUnmounter := g.syncFDs.spawnProcUnmounter(umounter)
+		umounter.Close()
+		defer cleanupUnmounter()
 	}
 	extensionPrepare, err := extension.PrepareGofer(extension.GoferPrepareContext{
 		Spec:        spec,
@@ -304,6 +311,7 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 			overrides["ttc-lazy-state-fd"] = strconv.Itoa(stateFD)
 			overrides["ttc-lazy-prefix"] = prefix
 		}
+		overrides["rpc-fd"] = "-1" // Skip the `goferToHostRPCFD >= 0` branch on re-exec.
 		for key, value := range extensionPrepare.FlagOverrides {
 			overrides[key] = value
 		}
@@ -312,11 +320,6 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		panic("unreachable")
 	}
 	// No re-exec from here on out.
-
-	// This can't happen until after setCapsAndCallSelf(), since otherwise the
-	// re-executed gofer may reuse goferToHostRPCFD's file descriptor for an
-	// unrelated file.
-	goferToHostRPC.Close()
 
 	// The spec descriptor is needed across the optional capability-changing
 	// re-exec above, but the decoded spec is authoritative after that point.

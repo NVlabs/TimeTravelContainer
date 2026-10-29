@@ -35,6 +35,8 @@ import (
 //
 // +stateify savable
 type SpecialMappable struct {
+	memmap.MappableNoHugepages
+
 	SpecialMappableRefs
 
 	mf   *pgalloc.MemoryFile `state:"nosave"`

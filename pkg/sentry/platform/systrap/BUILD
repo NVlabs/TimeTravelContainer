@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+load("//pkg/seccomp/precompiledseccomp:defs.bzl", "precompiled_seccomp_rules")
 load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
@@ -32,6 +33,14 @@ go_template_instance(
     },
 )
 
+precompiled_seccomp_rules(
+    name = "stubfilter_precompiled",
+    out = "stubfilter_precompiled.go",
+    out_package_name = "systrap",
+    programs_to_compile_go_import = "gvisor.dev/gvisor/pkg/sentry/platform/systrap/stubfilter",
+    programs_to_compile_go_library = "//pkg/sentry/platform/systrap/stubfilter",
+)
+
 go_library(
     name = "systrap",
     srcs = [
@@ -52,6 +61,7 @@ go_library(
         "stub_death.go",
         "stub_defs.go",
         "stub_unsafe.go",
+        "stubfilter_precompiled.go",
         "subprocess.go",
         "subprocess_amd64.go",
         "subprocess_arm64.go",
@@ -66,8 +76,6 @@ go_library(
         "syscall_thread_defs_unsafe.go",
         "syscall_thread_unsafe.go",
         "sysmsg_thread.go",
-        "sysmsg_thread_amd64.go",
-        "sysmsg_thread_arm64.go",
         "sysmsg_thread_unsafe.go",
         "systrap.go",
         "systrap_amd64.go",
@@ -84,6 +92,7 @@ go_library(
         "//pkg/bpf",
         "//pkg/context",
         "//pkg/cpuid",
+        "//pkg/gomaxprocs",
         "//pkg/hostarch",
         "//pkg/hostsyscall",
         "//pkg/log",
@@ -101,6 +110,7 @@ go_library(
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/platform",
         "//pkg/sentry/platform/interrupt",
+        "//pkg/sentry/platform/systrap/stubfilter",
         "//pkg/sentry/platform/systrap/sysmsg",
         "//pkg/sentry/platform/systrap/usertrap",
         "//pkg/sentry/usage",
@@ -117,20 +127,28 @@ go_test(
     srcs = [
         "context_queue_test.go",
         "shared_context_test.go",
+        "stubfilter_test.go",
         "systrap_test.go",
     ],
     embed = [":systrap"],
+    # Stub processes unmap glibc's registered rseq area, so disable
+    # registration at process startup, as runsc does for the sentry.
+    env = {"GLIBC_TUNABLES": "glibc.pthread.rseq=0"},
     deps = [
+        "//pkg/bpf",
         "//pkg/context",
         "//pkg/cpuid",
         "//pkg/hostarch",
         "//pkg/hostsyscall",
         "//pkg/pool",
         "//pkg/safemem",
+        "//pkg/seccomp",
+        "//pkg/seccomp/precompiledseccomp",
         "//pkg/sentry/arch",
         "//pkg/sentry/memmap",
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/platform",
+        "//pkg/sentry/platform/systrap/stubfilter",
         "//pkg/sentry/platform/systrap/sysmsg",
         "//pkg/sentry/platform/systrap/testutil",
         "//pkg/sentry/usage",

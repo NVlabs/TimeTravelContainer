@@ -327,19 +327,19 @@ func (p *Protocol) dumpAddrs(ctx context.Context, s *netlink.Socket, msg *nlmsg.
 	for _, id := range stack.InterfaceIDs() {
 		iface := interfaces[id]
 		for _, a := range ifAddrs[id] {
-			p.AddAddrMessage(ms, id, a, iface.Name, true /* added */)
+			p.AddAddrMessage(ms, linux.RTM_NEWADDR, id, iface, a)
 		}
 	}
 
 	return nil
 }
 
+// AddAddrMessage appends an RTM_NEWADDR or RTM_DELADDR (typ) message for the
+// address a of interface i into the message set. It produces the same layout
+// as the RTM_GETADDR dump.
+//
 // AddAddrMessage implements netlink.RouteProtocol.AddAddrMessage.
-func (p *Protocol) AddAddrMessage(ms *nlmsg.MessageSet, idx int32, a inet.InterfaceAddr, label string, added bool) {
-	typ := uint16(linux.RTM_NEWADDR)
-	if !added {
-		typ = linux.RTM_DELADDR
-	}
+func (p *Protocol) AddAddrMessage(ms *nlmsg.MessageSet, typ uint16, idx int32, i inet.Interface, a inet.InterfaceAddr) {
 	m := ms.AddMessage(linux.NetlinkMessageHeader{
 		Type: typ,
 	})
@@ -365,8 +365,8 @@ func (p *Protocol) AddAddrMessage(ms *nlmsg.MessageSet, idx int32, a inet.Interf
 	m.PutAttr(linux.IFA_CACHEINFO, primitive.AsByteSlice(cacheInfo))
 	// Linux always sends IFA_FLAGS, and Android's netlink parsers require it.
 	m.PutAttr(linux.IFA_FLAGS, primitive.AllocateUint32(flags))
-	if label != "" {
-		m.PutAttrString(linux.IFA_LABEL, label)
+	if i.Name != "" {
+		m.PutAttrString(linux.IFA_LABEL, i.Name)
 	}
 
 	// TODO(gvisor.dev/issue/578): There are many more attributes.
@@ -502,7 +502,7 @@ func (p *Protocol) newRoute(ctx context.Context, s *netlink.Socket, msg *nlmsg.M
 	if msg.Header().Flags&linux.NLM_F_REQUEST != linux.NLM_F_REQUEST {
 		return syserr.ErrProtocolNotSupported
 	}
-	return stack.NewRoute(ctx, msg)
+	return stack.NewRoute(withOrigin(ctx, s, msg), msg)
 }
 
 // deleteRoute handles RTM_DELROUTE requests.
@@ -514,7 +514,7 @@ func (p *Protocol) deleteRoute(ctx context.Context, s *netlink.Socket, msg *nlms
 	if msg.Header().Flags&linux.NLM_F_REQUEST != linux.NLM_F_REQUEST {
 		return syserr.ErrProtocolNotSupported
 	}
-	return stack.RemoveRoute(ctx, msg)
+	return stack.RemoveRoute(withOrigin(ctx, s, msg), msg)
 }
 
 // dumpRoutes handles RTM_GETROUTE requests.
@@ -551,51 +551,71 @@ func (p *Protocol) dumpRoutes(ctx context.Context, s *netlink.Socket, msg *nlmsg
 	}
 
 	for _, rt := range routeTables {
-		m := ms.AddMessage(linux.NetlinkMessageHeader{
-			Type: linux.RTM_NEWROUTE,
-		})
-
-		m.Put(&linux.RouteMessage{
-			Family: rt.Family,
-			DstLen: rt.DstLen,
-			SrcLen: rt.SrcLen,
-			TOS:    rt.TOS,
-
-			// Always return the main table since we don't have multiple
-			// routing tables.
-			Table:    linux.RT_TABLE_MAIN,
-			Protocol: rt.Protocol,
-			Scope:    rt.Scope,
-			Type:     rt.Type,
-
-			Flags: rt.Flags,
-		})
-
-		if rt.DstLen > 0 {
-			m.PutAttr(linux.RTA_DST, primitive.AsByteSlice(rt.DstAddr))
-		}
-		if rt.SrcLen > 0 {
-			m.PutAttr(linux.RTA_SRC, primitive.AsByteSlice(rt.SrcAddr))
-		}
-		if rt.OutputInterface != 0 {
-			m.PutAttr(linux.RTA_OIF, primitive.AllocateInt32(rt.OutputInterface))
-			if !ms.Multi || (rt.Flags&linux.RTM_F_CLONED) != 0 {
-				for _, a := range stack.InterfaceAddrs()[rt.OutputInterface] {
-					if a.Family == rt.Family {
-						m.PutAttr(linux.RTA_PREFSRC, primitive.AsByteSlice(a.Addr))
-						break
-					}
+		var prefSrc []byte
+		if rt.OutputInterface != 0 && (!ms.Multi || (rt.Flags&linux.RTM_F_CLONED) != 0) {
+			for _, a := range stack.InterfaceAddrs()[rt.OutputInterface] {
+				if a.Family == rt.Family {
+					prefSrc = a.Addr
+					break
 				}
 			}
 		}
-		if len(rt.GatewayAddr) > 0 {
-			m.PutAttr(linux.RTA_GATEWAY, primitive.AsByteSlice(rt.GatewayAddr))
-		}
-
-		// TODO(gvisor.dev/issue/578): There are many more attributes.
+		p.AddRouteMessage(ms, linux.RTM_NEWROUTE, 0, rt, prefSrc)
 	}
 
 	return nil
+}
+
+// AddRouteMessage appends an RTM_NEWROUTE or RTM_DELROUTE (typ) message for rt
+// into the message set. It produces the same layout as the
+// RTM_GETROUTE dump. RTA_PREFSRC is added if prefSrc is non-empty.
+// AddRouteMessage implements netlink.RouteProtocol.AddRouteMessage.
+func (p *Protocol) AddRouteMessage(ms *nlmsg.MessageSet, typ uint16, nlFlags uint16, rt inet.Route, prefSrc []byte) {
+	m := ms.AddMessage(linux.NetlinkMessageHeader{
+		Type:  typ,
+		Flags: nlFlags,
+	})
+
+	m.Put(&linux.RouteMessage{
+		Family: rt.Family,
+		DstLen: rt.DstLen,
+		SrcLen: rt.SrcLen,
+		TOS:    rt.TOS,
+
+		// Always return the main table since we don't have multiple
+		// routing tables.
+		Table:    linux.RT_TABLE_MAIN,
+		Protocol: rt.Protocol,
+		Scope:    rt.Scope,
+		Type:     rt.Type,
+
+		Flags: rt.Flags,
+	})
+
+	if rt.DstLen > 0 {
+		m.PutAttr(linux.RTA_DST, primitive.AsByteSlice(rt.DstAddr))
+	}
+	if rt.SrcLen > 0 {
+		m.PutAttr(linux.RTA_SRC, primitive.AsByteSlice(rt.SrcAddr))
+	}
+	if rt.OutputInterface != 0 {
+		m.PutAttr(linux.RTA_OIF, primitive.AllocateInt32(rt.OutputInterface))
+		if len(prefSrc) > 0 {
+			m.PutAttr(linux.RTA_PREFSRC, primitive.AsByteSlice(prefSrc))
+		}
+	}
+	if len(rt.GatewayAddr) > 0 {
+		m.PutAttr(linux.RTA_GATEWAY, primitive.AsByteSlice(rt.GatewayAddr))
+	}
+
+	// TODO(gvisor.dev/issue/578): There are many more attributes.
+}
+
+// withOrigin returns a context under which changes made while handling msg are
+// announced to multicast groups with the requester's port ID and sequence
+// number, like rtmsg_ifa() and rtnl_notify().
+func withOrigin(ctx context.Context, s *netlink.Socket, msg *nlmsg.Message) context.Context {
+	return inet.WithNetlinkOrigin(ctx, inet.NetlinkOrigin{PortID: s.GetPortID(), Seq: msg.Header().Seq})
 }
 
 // newAddr handles RTM_NEWADDR requests.
@@ -626,7 +646,7 @@ func (p *Protocol) newAddr(ctx context.Context, s *netlink.Socket, msg *nlmsg.Me
 		// and ignore the IFA_ADDRESS.
 		switch ahdr.Type {
 		case linux.IFA_LOCAL:
-			err := stack.AddInterfaceAddr(int32(ifa.Index), inet.InterfaceAddr{
+			err := stack.AddInterfaceAddr(withOrigin(ctx, s, msg), int32(ifa.Index), inet.InterfaceAddr{
 				Family:    ifa.Family,
 				PrefixLen: ifa.PrefixLen,
 				Flags:     ifa.Flags,
@@ -681,7 +701,7 @@ func (p *Protocol) delAddr(ctx context.Context, s *netlink.Socket, msg *nlmsg.Me
 		// remove the address and ignore the IFA_ADDRESS.
 		switch ahdr.Type {
 		case linux.IFA_LOCAL:
-			err := stack.RemoveInterfaceAddr(int32(ifa.Index), inet.InterfaceAddr{
+			err := stack.RemoveInterfaceAddr(withOrigin(ctx, s, msg), int32(ifa.Index), inet.InterfaceAddr{
 				Family:    ifa.Family,
 				PrefixLen: ifa.PrefixLen,
 				Flags:     ifa.Flags,

@@ -514,6 +514,11 @@ func (p *proc) Translate(ctx context.Context, required, optional memmap.Mappable
 	}}, nil
 }
 
+// MayUseHugepages implements memmap.Mappable.MayUseHugepages.
+func (*proc) MayUseHugepages() bool {
+	return false
+}
+
 // InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable. The
 // proc's memory is not saved, so translations to it must not be: the child
 // of a live fork would read the source's buffer, which only the source

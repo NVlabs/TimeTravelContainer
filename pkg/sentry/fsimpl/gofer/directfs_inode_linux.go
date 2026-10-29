@@ -28,7 +28,6 @@ import (
 	"path/filepath"
 
 	"golang.org/x/sys/unix"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/cleanup"
@@ -172,8 +171,12 @@ func (fs *filesystem) newDirectfsDentry(controlFD int) (*dentry, error) {
 	// This also avoids a correctness issue when a directory is bind-mounted on the host:
 	// different paths (e.g., /mnt/ and /mnt/a/b/c if /mnt/a/b/c is a bind mount of /mnt/)
 	// can return the same device ID and inode number from a stat call.
+	var cacheHit bool
 	temp.d.inode = fs.getOrCreateInode(inoKey /* dontCache = */, isDir,
-		func() { _ = unix.Close(controlFD) },
+		func() {
+			cacheHit = true
+			_ = unix.Close(controlFD)
+		},
 		func() *inode {
 			temp.i = directfsInode{
 				inode: inode{
@@ -237,6 +240,12 @@ func (fs *filesystem) newDirectfsDentry(controlFD int) (*dentry, error) {
 			}
 			return inode
 		})
+	if cacheHit && !temp.d.inode.cachedMetadataAuthoritative() {
+		i := temp.d.inode.impl.(*directfsInode)
+		i.metadataMu.Lock()
+		i.updateMetadataFromStatxLocked(&stat)
+		i.metadataMu.Unlock()
+	}
 
 	temp.d.init()
 	// If this dentry adopted a cached inode that already carries a bound-socket
@@ -778,7 +787,7 @@ func (i *directfsInode) mknod(ctx context.Context, name string, creds *auth.Cred
 	if err := unix.Mknodat(i.controlFD, name, uint32(opts.Mode), 0); err != nil {
 		return nil, err
 	}
-	return i.getCreatedChild(name, creds.EffectiveKUID, creds.EffectiveKGID, false /* isDir */, true /* createDentry */, d)
+	return i.getCreatedChild(name, creds.FilesystemKUID, creds.FilesystemKGID, false /* isDir */, true /* createDentry */, d)
 }
 
 // Precondition: opts.Endpoint != nil and is transport.HostBoundEndpoint type.
@@ -789,7 +798,7 @@ func (i *directfsInode) bindAt(ctx context.Context, name string, creds *auth.Cre
 		return nil, err
 	}
 	sockType := opts.Endpoint.(transport.Endpoint).Type()
-	childInode, boundSocketFD, err := i.controlFDLisa.BindAt(ctx, sockType, name, opts.Mode, lisafs.UID(creds.EffectiveKUID), lisafs.GID(creds.EffectiveKGID))
+	childInode, boundSocketFD, err := i.controlFDLisa.BindAt(ctx, sockType, name, opts.Mode, lisafs.UID(creds.FilesystemKUID), lisafs.GID(creds.FilesystemKGID))
 	if err != nil {
 		return nil, err
 	}
@@ -843,7 +852,7 @@ func (i *directfsInode) symlink(name, target string, creds *auth.Credentials, d 
 	if err := unix.Symlinkat(target, i.controlFD, name); err != nil {
 		return nil, err
 	}
-	return i.getCreatedChild(name, creds.EffectiveKUID, creds.EffectiveKGID, false /* isDir */, true /* createDentry */, d)
+	return i.getCreatedChild(name, creds.FilesystemKUID, creds.FilesystemKGID, false /* isDir */, true /* createDentry */, d)
 }
 
 func (i *directfsInode) openCreate(name string, accessFlags uint32, mode linux.FileMode, uid auth.KUID, gid auth.KGID, createDentry bool, d *dentry) (*dentry, handle, error) {
@@ -1043,4 +1052,4 @@ func checkSupportedFileType(mode uint32) error {
 	}
 }
 
-// LINT.ThenChange(../../../../runsc/fsgofer/lisafs.go)
+// LINT.ThenChange(../../../../runsc/gofer/fs/lisafs.go)

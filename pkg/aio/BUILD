@@ -36,6 +36,7 @@ go_test(
     embed = [":aio"],
     deps = [
         "//pkg/bitmap",
+        "//pkg/gomaxprocs",
         "//pkg/rand",
         "@org_golang_x_sys//unix:go_default_library",
     ],

@@ -84,13 +84,12 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/unimpl"
+	uspb "gvisor.dev/gvisor/pkg/sentry/unimpl/unimplemented_syscall_go_proto"
 	"gvisor.dev/gvisor/pkg/sentry/uniqueid"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/state"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/timing"
-
-	uspb "gvisor.dev/gvisor/pkg/sentry/unimpl/unimplemented_syscall_go_proto"
 )
 
 // UserCounters is a set of user counters.
@@ -974,7 +973,7 @@ func savePrivateMFs(ctx context.Context, w io.Writer, mfsToSave map[checkpoint.R
 // +checklocksexclude:k.extMu
 // +checklocksexclude:k.runningTasksMu
 // +checklocksexclude:k.tasks.mu
-func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages, resume bool, fsOpts *FSSaveOpts) error {
+func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages, resume bool, fsOpts *FSSaveOpts, vfsOpts vfs.PrepareSaveOptions) error {
 	// The bypass is part of the saved task state, so it is armed before the
 	// state is written and covers both resuming after the save and restoring.
 	k.armSeccompRestartSyscallBypasses()
@@ -1001,14 +1000,14 @@ func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCl
 	defer fsCleanup.Clean()
 
 	return k.quiescePausedAnd(ctx, func() error {
-		return k.saveToLocked(ctx, stateFile, pagesMetadata, pagesFile, appMFExcludeCommittedZeroPages, resume, fsOpts, &stateFileCleanup, &pagesCleanup, &fsCleanup)
+		return k.saveToLocked(ctx, stateFile, pagesMetadata, pagesFile, appMFExcludeCommittedZeroPages, resume, fsOpts, vfsOpts, &stateFileCleanup, &pagesCleanup, &fsCleanup)
 	})
 }
 
 // saveToLocked saves the kernel state while the kernel is paused and quiesced.
 //
 // Preconditions: The kernel must be paused and quiesced.
-func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages, resume bool, fsOpts *FSSaveOpts, stateFileCleanup, pagesCleanup, fsCleanup *cleanup.Cleanup) error {
+func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages, resume bool, fsOpts *FSSaveOpts, vfsOpts vfs.PrepareSaveOptions, stateFileCleanup, pagesCleanup, fsCleanup *cleanup.Cleanup) error {
 	saveStart := time.Now()
 
 	if err := k.flushPlatformForStateCapture(ctx); err != nil {
@@ -1026,7 +1025,7 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 	// Prepare filesystems for saving. This must be done after
 	// invalidateUnsavableMappings(), since dropping memory mappings may
 	// affect filesystem state (e.g. page cache reference counts).
-	if err := k.vfs.PrepareSave(vfsCtx); err != nil {
+	if err := k.vfs.PrepareSave(vfsCtx, vfsOpts); err != nil {
 		return err
 	}
 	// Mark all to-be-saved MemoryFiles as savable to inform kernel save below.
@@ -1055,7 +1054,7 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 		mfSaveWg.Add(1)
 		go func() {
 			defer mfSaveWg.Done()
-			mfSaveErr = k.saveMemoryFiles(ctx, nil, pagesMetadata, pagesFile, mfsToSaveActual, appMFExcludeCommittedZeroPages) // transfers ownership
+			mfSaveErr = k.saveMemoryFiles(ctx, nil, pagesMetadata, pagesFile, mfsToSaveActual, appMFExcludeCommittedZeroPages, resume) // transfers ownership
 		}()
 		pagesCleanup.Release()
 		// Defer a Wait() so we wait for k.saveMemoryFiles() to complete even if we
@@ -1120,7 +1119,7 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 			return mfSaveErr
 		}
 	} else {
-		mfSaveErr = k.saveMemoryFiles(ctx, stateFile, nil, nil, mfsToSaveActual, appMFExcludeCommittedZeroPages)
+		mfSaveErr = k.saveMemoryFiles(ctx, stateFile, nil, nil, mfsToSaveActual, appMFExcludeCommittedZeroPages, resume)
 		if mfSaveErr != nil {
 			return mfSaveErr
 		}
@@ -1148,7 +1147,7 @@ func (k *Kernel) BeforeResume(ctx context.Context) {
 // pagesFile must be non-nil, saveMemoryFiles takes ownership of both
 // pagesMetadata and pagesFile (even if it returns a non-nil error), and
 // MemoryFile state will be saved to pagesMetadata and pagesFile.
-func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, mfsToSave map[checkpoint.ResourceID]*pgalloc.MemoryFile, appMFExcludeCommittedZeroPages bool) error {
+func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, mfsToSave map[checkpoint.ResourceID]*pgalloc.MemoryFile, appMFExcludeCommittedZeroPages, resume bool) error {
 	memoryStart := time.Now()
 
 	pmw := w
@@ -1161,6 +1160,7 @@ func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata
 
 	mfOpts := pgalloc.SaveOpts{
 		ExcludeCommittedZeroPages: appMFExcludeCommittedZeroPages,
+		ExitAfterSaving:           !resume,
 	}
 	var (
 		asyncPageSaveWg      sync.WaitGroup
@@ -1709,6 +1709,7 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 	args.StartupTimeline.Reached("FS context created")
 
 	tg := k.NewThreadGroup(args.PIDNamespace, NewSignalHandlers(), linux.SIGCHLD, args.Limits)
+	tg.containerInit = args.Origin != OriginExec
 	cu := cleanup.Make(func() {
 		tg.Release(ctx)
 	})
@@ -2120,6 +2121,45 @@ func (k *Kernel) WaitForTaskActivity(stop <-chan struct{}) bool {
 		return true
 	case <-stop:
 		return false
+	}
+}
+
+// WaitForIdle blocks until no task has run for at least d, while the kernel
+// is not paused.
+//
+// The kernel is idle when the CPU clock ticker stops, which happens at the
+// first CPU clock tick at which no task is running. So WaitForIdle may return
+// up to one CPU clock tick later than d after the last task stops running. A
+// kernel that is not started is idle.
+//
+// +checklocksexclude:k.runningTasksMu
+func (k *Kernel) WaitForIdle(d time.Duration) {
+	timer := time.NewTimer(d)
+	timer.Stop()
+	for {
+		k.runningTasksMu.Lock()
+		for k.cpuClockTickerRunning {
+			k.cpuClockTickerStopCond.Wait()
+		}
+		// No task is running. incRunningTasks closes this channel, with
+		// runningTasksMu locked, when a task starts running.
+		activity := k.taskActivityCh
+		k.runningTasksMu.Unlock()
+
+		timer.Reset(d)
+		select {
+		case <-activity:
+			timer.Stop()
+			continue
+		case <-timer.C:
+		}
+		if k.IsPaused() {
+			// All tasks are stopped, which makes the kernel idle until
+			// it is resumed.
+			k.WaitForTaskActivity(nil)
+			continue
+		}
+		return
 	}
 }
 
@@ -3159,6 +3199,19 @@ func (k *Kernel) SpecEnviron(cid string) []string {
 	k.extMu.Lock()
 	defer k.extMu.Unlock()
 	return slices.Clone(k.containerEnvs[cid])
+}
+
+// SpecEnvironByName returns the environment variables for the container with
+// the given name.
+func (k *Kernel) SpecEnvironByName(containerName string) []string {
+	k.extMu.Lock()
+	defer k.extMu.Unlock()
+	for cid, name := range k.containerNames {
+		if name == containerName {
+			return slices.Clone(k.containerEnvs[cid])
+		}
+	}
+	return nil
 }
 
 func filterMFsToSave(mfsToSave map[checkpoint.ResourceID]*pgalloc.MemoryFile, matchCtxs []*fsCheckpointMatchContext) map[checkpoint.ResourceID]*pgalloc.MemoryFile {

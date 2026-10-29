@@ -687,7 +687,7 @@ func TestGuestRAMMemoryFileAsyncSaveRestoreUsesLeasedMappings(t *testing.T) {
 	}
 
 	target := newMemoryFile()
-	loader, err := pgalloc.StartAsyncPagesFileLoad(stateio.NewIOReader(bytes.NewReader(pages.Bytes()), 4*GuestFrameSize, 4, 2), nil, nil)
+	loader, err := pgalloc.StartAsyncPagesFileLoad(stateio.NewIOReader(bytes.NewReader(pages.Bytes()), 4*GuestFrameSize, 4, 2), nil, nil, pgalloc.AsyncPagesFileLoadOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1424,7 +1424,7 @@ func TestGuestRAMAsyncLoadWithPendingExclusion(t *testing.T) {
 		permits:  make(chan struct{}),
 	}
 	target := newGuestRAMTestMemoryFile(t, ram)
-	loader, err := pgalloc.StartAsyncPagesFileLoad(stateio.NewIOReader(reader, GuestFrameSize, 1, 2), nil, nil)
+	loader, err := pgalloc.StartAsyncPagesFileLoad(stateio.NewIOReader(reader, GuestFrameSize, 1, 2), nil, nil, pgalloc.AsyncPagesFileLoadOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1508,7 +1508,7 @@ func TestGuestRAMAsyncSaveWithPendingExclusion(t *testing.T) {
 	waitForError(t, destroyed, "Destroy")
 
 	target := newGuestRAMTestMemoryFile(t, ram)
-	loader, err := pgalloc.StartAsyncPagesFileLoad(stateio.NewIOReader(bytes.NewReader(pages.Bytes()), 4*GuestFrameSize, 4, 2), nil, nil)
+	loader, err := pgalloc.StartAsyncPagesFileLoad(stateio.NewIOReader(bytes.NewReader(pages.Bytes()), 4*GuestFrameSize, 4, 2), nil, nil, pgalloc.AsyncPagesFileLoadOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}

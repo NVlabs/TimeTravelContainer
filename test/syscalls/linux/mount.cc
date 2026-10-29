@@ -31,6 +31,7 @@
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/sysmacros.h>
+#include <sys/types.h>
 #include <sys/un.h>
 #include <sys/vfs.h>
 #include <sys/wait.h>
@@ -43,12 +44,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
-#include <iostream>
-#include <memory>
-#include <ostream>
 #include <string>
-#include <tuple>
-#include <utility>
 #include <vector>
 
 #include "gmock/gmock.h"
@@ -57,13 +53,10 @@
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
-#include "absl/strings/str_format.h"
-#include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
 #include "absl/strings/substitute.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
-#include "test/util/capability_util.h"
 #include "test/util/cleanup.h"
 #include "test/util/eventfd_util.h"
 #include "test/util/file_descriptor.h"
@@ -2919,6 +2912,134 @@ TEST(MountTest, LockedMountFlagsAreInheritedByBind) {
     // The bind mount itself was created in this namespace, so unlike the mount
     // it was cloned from, it can be unmounted.
     TEST_CHECK_SUCCESS(umount2(target_path.c_str(), MNT_DETACH));
+  };
+  EXPECT_THAT(InForkedUserMountNamespace([] {}, child),
+              IsPosixErrorOkAndHolds(0));
+}
+
+// Linux's clone_private_mount() refuses an overlay layer that has a locked
+// mount at or below it, or whose mount is in another mount namespace. See
+// https://github.com/torvalds/linux/commit/427215d85e8d, which first
+// appears in Linux 5.14.
+TEST(MountTest, LockedMountStopsOverlayLowerdir) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  if (!IsRunningOnGvisor()) {
+    auto version = ASSERT_NO_ERRNO_AND_VALUE(GetKernelVersion());
+    SKIP_IF(version.major < 5 || (version.major == 5 && version.minor < 14));
+  }
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const Cleanup dir_mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", dir.path(), kTmpfs, 0, "", MNT_DETACH));
+  const std::string layer = JoinPath(dir.path(), "layer");
+  const std::string hidden = JoinPath(layer, "hidden");
+  const std::string other = JoinPath(dir.path(), "other");
+  const std::string merged = JoinPath(dir.path(), "merged");
+  for (const std::string& path : {layer, hidden, other, merged}) {
+    ASSERT_THAT(mkdir(path.c_str(), 0755), SyscallSucceeds());
+  }
+  const Cleanup hidden_mount =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount("", hidden, kTmpfs, 0, "", MNT_DETACH));
+  const std::string refused_opts = "lowerdir=" + layer + ":" + other;
+  const std::string admitted_opts = "lowerdir=" + hidden + ":" + other;
+
+  const std::function<void()> child = [&] {
+    TEST_CHECK_ERRNO(
+        mount("overlay", merged.c_str(), "overlay", 0, refused_opts.c_str()),
+        EINVAL);
+    TEST_CHECK_SUCCESS(
+        mount("overlay", merged.c_str(), "overlay", 0, admitted_opts.c_str()));
+    TEST_CHECK_SUCCESS(umount2(merged.c_str(), 0));
+  };
+  EXPECT_THAT(InForkedUserMountNamespace([] {}, child),
+              IsPosixErrorOkAndHolds(0));
+}
+
+TEST(MountTest, LockedMountStopsOverlayUpperdir) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  if (!IsRunningOnGvisor()) {
+    auto version = ASSERT_NO_ERRNO_AND_VALUE(GetKernelVersion());
+    SKIP_IF(version.major < 5 || (version.major == 5 && version.minor < 14));
+  }
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const Cleanup dir_mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", dir.path(), kTmpfs, 0, "", MNT_DETACH));
+  const std::string lower = JoinPath(dir.path(), "lower");
+  const std::string upper = JoinPath(dir.path(), "upper");
+  const std::string hidden = JoinPath(upper, "hidden");
+  const std::string work = JoinPath(dir.path(), "work");
+  const std::string merged = JoinPath(dir.path(), "merged");
+  for (const std::string& path : {lower, upper, hidden, work, merged}) {
+    ASSERT_THAT(mkdir(path.c_str(), 0755), SyscallSucceeds());
+  }
+  const Cleanup hidden_mount =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount("", hidden, kTmpfs, 0, "", MNT_DETACH));
+  const std::string opts = "lowerdir=" + lower + ",upperdir=" + upper +
+                           ",workdir=" + work + ",userxattr";
+
+  const std::function<void()> child = [&] {
+    TEST_CHECK_ERRNO(
+        mount("overlay", merged.c_str(), "overlay", 0, opts.c_str()), EINVAL);
+  };
+  EXPECT_THAT(InForkedUserMountNamespace([] {}, child),
+              IsPosixErrorOkAndHolds(0));
+}
+
+TEST(MountTest, LockedMountStopsOverlayOfSysfs) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  if (!IsRunningOnGvisor()) {
+    auto version = ASSERT_NO_ERRNO_AND_VALUE(GetKernelVersion());
+    SKIP_IF(version.major < 5 || (version.major == 5 && version.minor < 14));
+  }
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const Cleanup dir_mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", dir.path(), kTmpfs, 0, "", MNT_DETACH));
+  const std::string sys = JoinPath(dir.path(), "sys");
+  const std::string other = JoinPath(dir.path(), "other");
+  const std::string merged = JoinPath(dir.path(), "merged");
+  for (const std::string& path : {sys, other, merged}) {
+    ASSERT_THAT(mkdir(path.c_str(), 0755), SyscallSucceeds());
+  }
+  const Cleanup sys_mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("sysfs", sys, "sysfs", 0, "", MNT_DETACH));
+  const Cleanup kernel_mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", JoinPath(sys, "kernel"), kTmpfs, 0, "", MNT_DETACH));
+  const std::string opts = "lowerdir=" + sys + ":" + other;
+
+  const std::function<void()> child = [&] {
+    TEST_CHECK_ERRNO(
+        mount("overlay", merged.c_str(), "overlay", 0, opts.c_str()), EINVAL);
+  };
+  EXPECT_THAT(InForkedUserMountNamespace([] {}, child),
+              IsPosixErrorOkAndHolds(0));
+}
+
+TEST(MountTest, OverlayRefusesLayerFromAnotherMountNamespace) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  if (!IsRunningOnGvisor()) {
+    auto version = ASSERT_NO_ERRNO_AND_VALUE(GetKernelVersion());
+    SKIP_IF(version.major < 5 || (version.major == 5 && version.minor < 14));
+  }
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const Cleanup dir_mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", dir.path(), kTmpfs, 0, "", MNT_DETACH));
+  const std::string layer = JoinPath(dir.path(), "layer");
+  const std::string other = JoinPath(dir.path(), "other");
+  const std::string merged = JoinPath(dir.path(), "merged");
+  for (const std::string& path : {layer, other, merged}) {
+    ASSERT_THAT(mkdir(path.c_str(), 0755), SyscallSucceeds());
+  }
+  const FileDescriptor layer_fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(layer, O_RDONLY | O_DIRECTORY));
+  const std::string opts =
+      absl::StrCat("lowerdir=/proc/self/fd/", layer_fd.get(), ":", other);
+
+  const std::function<void()> child = [&] {
+    TEST_CHECK_ERRNO(
+        mount("overlay", merged.c_str(), "overlay", 0, opts.c_str()), EINVAL);
   };
   EXPECT_THAT(InForkedUserMountNamespace([] {}, child),
               IsPosixErrorOkAndHolds(0));

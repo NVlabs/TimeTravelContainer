@@ -903,6 +903,7 @@ syscall_test(
 syscall_test(
     size = "large",
     add_hostinet = True,
+    limit_ephemeral_ports = True,
     shard_count = most_shards,
     # Takes too long for TSAN. Creates a lot of TCP sockets.
     tags = ["nogotsan"],
@@ -1304,6 +1305,7 @@ syscall_test(
 
 syscall_test(
     test = "//test/syscalls/linux:uidgid_test",
+    use_tmpfs = True,  # uidgid tests chown files to scratch IDs.
 )
 
 syscall_test(

@@ -146,7 +146,7 @@ deps_test(
         "//runsc/sandbox",
 
         # Gofers:
-        "//runsc/fsgofer",
+        "//runsc/gofer",
 
         # Other sidecar binaries:
         "//runsc/checkpointgofer",

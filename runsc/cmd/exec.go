@@ -105,6 +105,10 @@ type Exec struct {
 	// execPath is the path of the program to execute. If empty, the program is
 	// resolved from argv[0]. Mutually exclusive with --exec-fd.
 	execPath string
+
+	// newPIDNS runs the process as PID 1 of a new PID namespace that is a
+	// child of the container's PID namespace.
+	newPIDNS bool
 }
 
 // Name implements subcommands.Command.Name.
@@ -161,11 +165,12 @@ func (ex *Exec) SetFlags(f *flag.FlagSet) {
 	f.BoolVar(&ex.pausedManagement, "paused-management", false, "TTC-internal: run a management helper while existing branch tasks remain paused")
 	f.BoolVar(&ex.allowStoppedSandbox, "ttc-allow-stopped-sandbox", false, "TTC-internal: connect to a rehydrated family after its original OCI init exited")
 	f.StringVar(&ex.execPath, "exec-path", "", "path of the program to execute; if unset, it is resolved from argv[0]. Mutually exclusive with --exec-fd")
+	f.BoolVar(&ex.newPIDNS, "new-pidns", false, "run the process as PID 1 of a new PID namespace; when it exits, all processes left in that namespace are killed")
 }
 
 // FetchSpec implements util.SubCommand.FetchSpec.
 func (ex *Exec) FetchSpec(conf *config.Config, f *flag.FlagSet) (string, *specs.Spec, error) {
-	c, err := ex.loadContainer(conf, f, container.LoadOpts{SkipCheck: ex.allowStoppedSandbox})
+	c, err := ex.loadContainer(conf, f, container.LoadOpts{ReadOnly: true, SkipCheck: ex.allowStoppedSandbox})
 	if err != nil {
 		return "", nil, fmt.Errorf("loading container: %w", err)
 	}
@@ -183,6 +188,7 @@ func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	if err != nil {
 		util.Fatalf("%v", err)
 	}
+	e.NewPIDNamespace = ex.newPIDNS
 
 	log.Debugf("Exec arguments: %+v", e)
 	log.Debugf("Exec capabilities: %+v", e.Capabilities)
@@ -303,7 +309,7 @@ func ExecInProcess(conf *config.Config, args []string, stdin, stdout, stderr, ex
 // prepare loads the container and builds, from the command's flags, the
 // arguments of the process to execute in it.
 func (ex *Exec) prepare(conf *config.Config, f *flag.FlagSet) (*container.Container, *controlapi.ExecArgs, error) {
-	c, err := ex.loadContainer(conf, f, container.LoadOpts{SkipCheck: ex.allowStoppedSandbox})
+	c, err := ex.loadContainer(conf, f, container.LoadOpts{ReadOnly: true, SkipCheck: ex.allowStoppedSandbox})
 	if err != nil {
 		return nil, nil, fmt.Errorf("loading container failed: %v", err)
 	}
@@ -711,9 +717,9 @@ func (ex *Exec) argsFromCLI(p *specs.Process, argv []string, enableRaw bool) (*c
 		extraKGIDs = append(extraKGIDs, auth.KGID(kgid))
 	}
 	for _, s := range ex.extraKGIDs {
-		kgid, err := strconv.Atoi(s)
+		kgid, err := strconv.ParseUint(s, 10, 32)
 		if err != nil {
-			return nil, fmt.Errorf("parsing GID: %s, %v", s, err)
+			return nil, fmt.Errorf("parsing GID %q: %w", s, err)
 		}
 		extraKGIDs = append(extraKGIDs, auth.KGID(kgid))
 	}
@@ -932,16 +938,16 @@ func (u *user) Get() any {
 // Set implements flag.Value.Set. Set(String()) should be idempotent.
 func (u *user) Set(s string) error {
 	parts := strings.SplitN(s, ":", 2)
-	kuid, err := strconv.Atoi(parts[0])
+	kuid, err := strconv.ParseUint(parts[0], 10, 32)
 	if err != nil {
-		return fmt.Errorf("couldn't parse UID: %s", parts[0])
+		return fmt.Errorf("parsing UID %q: %w", parts[0], err)
 	}
 	u.kuid = auth.KUID(kuid)
 	u.kuidSet = true
 	if len(parts) > 1 {
-		kgid, err := strconv.Atoi(parts[1])
+		kgid, err := strconv.ParseUint(parts[1], 10, 32)
 		if err != nil {
-			return fmt.Errorf("couldn't parse GID: %s", parts[1])
+			return fmt.Errorf("parsing GID %q: %w", parts[1], err)
 		}
 		u.kgid = auth.KGID(kgid)
 		u.kgidSet = true

@@ -115,6 +115,11 @@ type SaveOpts struct {
 	// but may instead improve SaveTo() and LoadFrom() time, and checkpoint
 	// size, if the application has many committed zero pages.
 	ExcludeCommittedZeroPages bool
+
+	// If ExitAfterSaving is true, the sentry exits soon after SaveTo()
+	// returns, so SaveTo() may leave zero pages that are already committed on
+	// the host in place rather than decommit them.
+	ExitAfterSaving bool
 }
 
 // SaveTo writes f's state to the given stream.
@@ -181,11 +186,13 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		newCommittedBytes       uint64
 		alreadyUncommittedBytes uint64
 		newUncommittedBytes     uint64
+		queuedPageBytes         uint64
 	)
 	asyncWritePages := func(fr memmap.FileRange) {}
 	if amfs != nil {
 		asyncWritePages = func(fr memmap.FileRange) {
 			amount := fr.Length()
+			queuedPageBytes += amount
 			amfs.pf.mu.Lock()
 			amfs.pf.unsaved.PushBack(apsRange{
 				amfs:      amfs,
@@ -319,6 +326,10 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 	}
 	f.isSaving = true
 	defer func() { f.isSaving = false }()
+	// An f.updateUsageLocked() that is still in progress skips merging the
+	// segments it split in f.memAcct, since we hold an iterator into it
+	// across f.mu unlocks below.
+	f.memAcct.MergeAll()
 	// Reset f.commitSeq and memAcctInfo.commitSeq to 0 to make more segments
 	// in f.memAcct mergeable. This is safe because f.updateUsageLocked() is
 	// excluded by f.isSaving being set to true.
@@ -438,7 +449,7 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 	}
 
 	durScan := time.Duration(gohacks.Nanotime() - timeScanStart)
-	log.Infof("MemoryFile(%p): save scanning took %s for %d allocated bytes: %d bytes of zero pages (%d bytes expected, decommitted in %d syscalls, + %d bytes new), %d bytes of non-zero pages (%d bytes expected + %d bytes new); ExcludeCommittedZeroPages=%v",
+	log.Infof("MemoryFile(%p): save scanning took %s for %d allocated bytes: %d bytes of zero pages (%d bytes expected, decommitted in %d syscalls, + %d bytes new), %d bytes of non-zero pages (%d bytes expected + %d bytes new); ExcludeCommittedZeroPages=%v ExitAfterSaving=%v",
 		f,
 		durScan,
 		allocatedBytes,
@@ -449,10 +460,16 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		alreadyCommittedBytes+newCommittedBytes,
 		alreadyCommittedBytes,
 		newCommittedBytes,
-		opts.ExcludeCommittedZeroPages)
+		opts.ExcludeCommittedZeroPages,
+		opts.ExitAfterSaving)
 
 	// Save metadata.
 	timeMetadataStart := gohacks.Nanotime()
+	if amfs != nil && queuedPageBytes != f.knownCommittedBytes {
+		// MemoryFiles share a pages file, so a mismatch shifts the
+		// PagesFileOffset used to restore every subsequent MemoryFile.
+		return fmt.Errorf("async page save queued %d bytes, but metadata describes %d bytes", queuedPageBytes, f.knownCommittedBytes)
+	}
 	if _, err := state.Save(ctx, w, &memoryFileSaved{
 		unwasteSmall:     &f.unwasteSmall,
 		unwasteHuge:      &f.unwasteHuge,
@@ -1349,6 +1366,10 @@ type AsyncPagesFileLoad struct {
 	prefetchAheadBytes  atomic.Uint64
 	prefetchBehindBytes atomic.Uint64
 
+	// If throttled is true, a read of pages without waiters starts only when
+	// no other read is in flight.
+	throttled atomicbitops.Bool
+
 	// lfStatus communicates MemoryFile.LoadFrom() state to the async page
 	// loader goroutine.
 	lfStatus syncevent.Waiter
@@ -1630,6 +1651,10 @@ type AsyncPagesFileLoadOpts struct {
 	// used by TTC sparse backing reclamation; failures must be handled by the
 	// observer and do not invalidate resident memory.
 	RangeLoaded func(streamOffset, length uint64)
+
+	// If Throttled is true, reads of pages without waiters are throttled
+	// until AsyncPagesFileLoad.Unthrottle() is called.
+	Throttled bool
 }
 
 // AsyncPagesFileLoadStats is a point-in-time view of a remote or checkpoint
@@ -1693,12 +1718,11 @@ func (apfl *AsyncPagesFileLoad) Stats() AsyncPagesFileLoadStats {
 
 // StartAsyncPagesFileLoad constructs asynchronous loading state for the pages
 // file ar. It takes ownership of ar, even if it returns a non-nil error.
-func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), timeline *timing.Timeline) (*AsyncPagesFileLoad, error) {
-	return StartAsyncPagesFileLoadWithOpts(ar, doneCallback, timeline, AsyncPagesFileLoadOpts{})
+func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), timeline *timing.Timeline, opts AsyncPagesFileLoadOpts) (*AsyncPagesFileLoad, error) {
+	return StartAsyncPagesFileLoadWithOpts(ar, doneCallback, timeline, opts)
 }
 
-// StartAsyncPagesFileLoadWithOpts is equivalent to StartAsyncPagesFileLoad
-// with the given options.
+// StartAsyncPagesFileLoadWithOpts is StartAsyncPagesFileLoad.
 func StartAsyncPagesFileLoadWithOpts(ar stateio.AsyncReader, doneCallback func(error), timeline *timing.Timeline, opts AsyncPagesFileLoadOpts) (*AsyncPagesFileLoad, error) {
 	maxReadBytes := hostarch.PageRoundDown(ar.MaxReadBytes())
 	if maxReadBytes <= 0 {
@@ -1726,6 +1750,7 @@ func StartAsyncPagesFileLoadWithOpts(ar stateio.AsyncReader, doneCallback func(e
 		needsRegisterDestinationFD: ar.NeedRegisterDestinationFD(),
 		logicalChunkDemand:         opts.LogicalChunkDemand,
 		rangeLoaded:                opts.RangeLoaded,
+		throttled:                  atomicbitops.FromBool(opts.Throttled),
 		qavail:                     maxParallel,
 		opsBusy:                    bitmap.New(uint32(maxParallel)),
 		ops:                        make([]aplOp, maxParallel),
@@ -1759,6 +1784,14 @@ func StartAsyncPagesFileLoadWithOpts(ar stateio.AsyncReader, doneCallback func(e
 func (apfl *AsyncPagesFileLoad) IncOwner() {
 	if !apfl.tryIncOwner() {
 		panic("retaining released asynchronous page load")
+	}
+}
+
+// Unthrottle allows apfl to read pages without waiters at full parallelism.
+// It is idempotent.
+func (apfl *AsyncPagesFileLoad) Unthrottle() {
+	if apfl.throttled.Swap(false) {
+		apfl.lfStatus.Notify(aplLFPending)
 	}
 }
 
@@ -2914,7 +2947,10 @@ func (apfl *AsyncPagesFileLoad) main() {
 			apfl.amflsMu.Unlock()
 		}
 		// Fill remaining queue with reads for pages with no waiters.
-		if !readerSwitchPending && apfl.busyBacking == nil && apfl.canEnqueue() && !apfl.demandOnly.Load() {
+		// While throttled, a read of pages without waiters starts only when no
+		// other read is in flight.
+		throttled := apfl.throttled.Load()
+		if !readerSwitchPending && apfl.busyBacking == nil && apfl.canEnqueue() && !apfl.demandOnly.Load() && (!throttled || (apfl.qavail == maxParallel && apfl.curOp == nil)) {
 			apfl.amflsMu.Lock()
 			// Unawaited loads from earlier MemoryFiles are prioritized over
 			// unawaited loads from later MemoryFiles. Callers of
@@ -2955,12 +2991,13 @@ func (apfl *AsyncPagesFileLoad) main() {
 						amfl.f.mu.Unlock()
 						break amflsLoop
 					}
+					partial := n < ulFR.Length()
 					ulFR.End = ulFR.Start + n
 					ulseg = amfl.unloaded.SplitAfter(ulseg, ulFR.End)
 					ulseg.ValuePtr().started = true
 					amfl.minUnstarted = ulFR.End
 					amfl.f.incRefLocked(ulFR)
-					if !apfl.canEnqueue() {
+					if (throttled && partial) || !apfl.canEnqueue() {
 						apfl.mu.Unlock()
 						amfl.f.mu.Unlock()
 						break amflsLoop

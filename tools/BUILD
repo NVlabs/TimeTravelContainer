@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+load("@rules_python//python:py_test.bzl", "py_test")
 load("//tools:defs.bzl", "bzl_library", "gotsan_flag_values", "gotsan_values")
 
 package(
@@ -74,8 +75,19 @@ bzl_library(
 )
 
 exports_files([
+    "benchmark-umbrella-exports.patch",
     "build_cover.sh",
     "containerd-close-fsverity-probe.patch",
     "go_darwin_vm_hooks.patch",
     "go-allow-internal.patch",
 ])
+
+py_test(
+    name = "lint_test",
+    srcs = ["lint_test.py"],
+    args = ["$(rootpath :lint.sh)"],
+    data = [
+        "lint.sh",
+        "//:.clang-format",
+    ],
+)

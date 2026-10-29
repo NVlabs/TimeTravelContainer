@@ -295,6 +295,11 @@ func (r *resource) Translate(ctx context.Context, required, optional memmap.Mapp
 	}, err
 }
 
+// MayUseHugepages implements memmap.Mappable.MayUseHugepages.
+func (*resource) MayUseHugepages() bool {
+	return false
+}
+
 // InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable. No
 // translation of the resource can be saved: they map the renderer's memory,
 // which a save cannot encode.

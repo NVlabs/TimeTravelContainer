@@ -134,7 +134,7 @@ func (k *Kernel) WithDehydrationFilesystemResources(ctx context.Context, targetB
 			vfs.CtxLiveForkChildBranchID:       targetBranch,
 			vfs.CtxLiveForkBranchesPrepared:    true,
 		})
-		if err := k.vfs.PrepareSave(saveCtx); err != nil {
+		if err := k.vfs.PrepareSave(saveCtx, vfs.PrepareSaveOptions{}); err != nil {
 			return fmt.Errorf("preparing filesystem resources for dehydration peer restore: %w", err)
 		}
 		defer k.vfs.BeforeResume(saveCtx)
@@ -483,7 +483,7 @@ func (k *Kernel) CaptureDehydration(ctx context.Context, opts DehydrationCapture
 			vfs.CtxLiveForkChildBranchID:       opts.BranchID,
 			vfs.CtxLiveForkBranchesPrepared:    true,
 		})
-		if err := k.vfs.PrepareSave(saveCtx); err != nil {
+		if err := k.vfs.PrepareSave(saveCtx, vfs.PrepareSaveOptions{}); err != nil {
 			return fmt.Errorf("preparing VFS for dehydration: %w", err)
 		}
 		defer k.vfs.BeforeResume(saveCtx)

@@ -38,6 +38,7 @@ go_library(
         "//pkg/sentry/kernel/auth",
         "//runsc/config",
         "//runsc/flag",
+        "//runsc/processutil",
         "@com_github_cenkalti_backoff//:go_default_library",
         "@com_github_moby_sys_capability//:go_default_library",
         "@com_github_mohae_deepcopy//:go_default_library",
@@ -59,5 +60,6 @@ go_test(
         "//pkg/sentry/devices/nvproxy/nvconf",
         "//runsc/config",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )

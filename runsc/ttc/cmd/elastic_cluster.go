@@ -1757,7 +1757,11 @@ func (b *runtimeBackend) sandboxSentryRuns(id string) bool {
 	if !embeddedRuntime(b.runsc) {
 		return true
 	}
-	c, err := container.Load(b.root, container.FullID{SandboxID: id, ContainerID: id}, container.LoadOpts{Exact: true, SkipCheck: true, TryLock: container.TryAcquire})
+	full := container.FullID{SandboxID: id, ContainerID: id}
+	if held, err := container.StateFileHeld(b.root, full); err != nil || held {
+		return false
+	}
+	c, err := container.Load(b.root, full, container.LoadOpts{Exact: true, SkipCheck: true, ReadOnly: true})
 	if err != nil {
 		return false
 	}
@@ -1769,9 +1773,9 @@ func (b *runtimeBackend) sandboxSentryRuns(id string) bool {
 // process still exists. It intentionally does not contact the Sentry: a
 // correctly lease-fenced Sentry may be SIGSTOPped until placement recovery is
 // complete, but its PID remains valid execution state. If only is not nil,
-// the runtime's own sandboxes it does not name are passed over: loading a
-// sandbox's state takes its lock and decodes it, a quarter of a millisecond
-// that a family's reconciliation paid for every family on the node.
+// the runtime's own sandboxes it does not name are passed over: probing a
+// sandbox's lock and decoding its state cost a quarter of a millisecond that
+// a family's reconciliation paid for every family on the node.
 func (b *runtimeBackend) liveRuntimeSandboxes(only map[string]struct{}) (map[string]struct{}, error) {
 	result := make(map[string]struct{})
 	if !embeddedRuntime(b.runsc) {
@@ -1819,13 +1823,13 @@ func (b *runtimeBackend) liveRuntimeSandboxes(only map[string]struct{}) (map[str
 		// Only the state file is read: loading a sandbox otherwise asks its
 		// Sentry whether it runs, which a Sentry restoring a branch answers
 		// once it is done, and a fenced one not at all.
-		c, err := container.Load(b.root, id, container.LoadOpts{Exact: true, SkipCheck: true, TryLock: container.TryAcquire})
-		if errors.Is(err, container.ErrStateFileLocked) {
+		if held, err := container.StateFileHeld(b.root, id); err == nil && held {
 			// A runtime command holds the sandbox, as one creating it does:
 			// the sandbox is there, and its family busy.
 			result[id.SandboxID] = struct{}{}
 			continue
 		}
+		c, err := container.Load(b.root, id, container.LoadOpts{Exact: true, SkipCheck: true, ReadOnly: true})
 		if err != nil {
 			// Like runsc list, pass over one that cannot be loaded, as one
 			// being deleted.

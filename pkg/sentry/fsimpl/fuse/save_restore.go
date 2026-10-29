@@ -85,7 +85,7 @@ func (lc *lostHostConn) release(ctx context.Context) {
 func (*lostHostConn) interrupt(*futureResponse) {}
 
 // PrepareSave implements vfs.FilesystemImplSaveRestoreExtension.PrepareSave.
-func (fs *filesystem) PrepareSave(ctx context.Context) error {
+func (fs *filesystem) PrepareSave(ctx context.Context, _ vfs.PrepareSaveOptions) error {
 	if pgalloc.IsLiveForkSource(ctx) {
 		// Before a live fork, revoke file-backed translations and mark every
 		// cached page for lazy branch-local CoW on its next fault. The source

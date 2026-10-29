@@ -12,6 +12,7 @@ go_library(
     name = "sandbox",
     force_add_state_pkg = True,
     srcs = [
+        "cpulimits.go",
         "gfx.go",
         "network.go",
         "network_darwin.go",

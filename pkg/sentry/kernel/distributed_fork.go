@@ -181,7 +181,7 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 			vfs.CtxLiveForkTransactions:        fsTransactions,
 			vfs.CtxLiveForkFilesystemOrigins:   opts.FilesystemOrigins,
 		})
-		if err := k.vfs.PrepareSave(saveCtx); err != nil {
+		if err := k.vfs.PrepareSave(saveCtx, vfs.PrepareSaveOptions{}); err != nil {
 			return fmt.Errorf("preparing VFS for distributed fork: %w", err)
 		}
 		defer k.vfs.BeforeResume(saveCtx)

@@ -29,17 +29,140 @@ import (
 
 	"github.com/cenkalti/backoff"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/runsc/processutil"
 )
 
-func waitForNonChildExit(pid int, timeout time.Duration) error {
+// PIDFS_MAGIC is the filesystem magic of pidfs, whose inode numbers identify
+// processes.
+const PIDFS_MAGIC = 0x50494446
+
+// IsProcessRunning returns true if the process with the given PID and
+// ProcessIdentity is running, rather than a zombie. Nonpositive PIDs and
+// processes that no longer exist return false.
+func IsProcessRunning(pid int, identity uint64) (bool, error) {
 	if pid <= 0 {
-		return fmt.Errorf("invalid pid: %d", pid)
+		return false, nil
 	}
+	pidfd, err := OpenProcess(pid, identity)
+	if err == unix.ESRCH {
+		return false, nil
+	}
+	if err == unix.ENOSYS {
+		// No pidfds (Linux < 5.3): the PID alone, and /proc for zombies.
+		return processutil.IsRunning(pid), nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("cannot open pidfd for process %d: %w", pid, err)
+	}
+	defer unix.Close(pidfd)
+
+	pfds := []unix.PollFd{{Fd: int32(pidfd), Events: unix.POLLIN}}
+	for {
+		n, err := unix.Poll(pfds, 0)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return false, fmt.Errorf("polling pidfd for process %d: %w", pid, err)
+		}
+		// A pidfd becomes readable (POLLIN) when the process exits (including when it is a zombie).
+		return n == 0, nil
+	}
+}
+
+// ProcessIdentity returns an identifier of the process with the given PID
+// that is stable and unique. Returns 0 on hosts without `pidfs`, or without
+// pidfds.
+func ProcessIdentity(pid int) (uint64, error) {
+	pidfd, err := OpenProcess(pid, 0)
+	if err == unix.ENOSYS {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("cannot open pidfd for process %d: %w", pid, err)
+	}
+	defer unix.Close(pidfd)
+	return pidfdIdentity(pidfd)
+}
+
+func pidfdIdentity(pidfd int) (uint64, error) {
+	var fs unix.Statfs_t
+	if err := unix.Fstatfs(pidfd, &fs); err != nil {
+		return 0, fmt.Errorf("cannot statfs pidfd: %w", err)
+	}
+	if fs.Type != PIDFS_MAGIC {
+		return 0, nil
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(pidfd, &st); err != nil {
+		return 0, fmt.Errorf("cannot stat pidfd: %w", err)
+	}
+	return st.Ino, nil
+}
+
+// OpenProcess returns a pidfd for the process with the given PID and
+// identity, or `unix.ESRCH` if there is no such process, or `unix.ENOSYS` if
+// the host has no pidfds (Linux < 5.3).
+// If `identity` is 0, is matches any process with the given PID.
+func OpenProcess(pid int, identity uint64) (int, error) {
 	pidfd, err := unix.PidfdOpen(pid, 0)
+	if err == unix.EINVAL {
+		return -1, unix.ESRCH // pid is a thread, not a process.
+	}
+	if err != nil || identity == 0 {
+		return pidfd, err
+	}
+	got, err := pidfdIdentity(pidfd)
+	if err == nil && got != identity {
+		err = unix.ESRCH
+	}
+	if err != nil {
+		unix.Close(pidfd)
+		return -1, err
+	}
+	return pidfd, nil
+}
+
+// KillProcess sends SIGKILL to the process with the given PID and
+// ProcessIdentity, if it exists.
+// If `identity` is zero, the process with PID `pid` is killed regardless
+// of its identity, as it is on hosts without pidfds.
+func KillProcess(pid int, identity uint64) error {
+	pidfd, err := OpenProcess(pid, identity)
 	if err == unix.ESRCH {
 		return nil
 	}
+	if err == unix.ENOSYS {
+		if err := unix.Kill(pid, unix.SIGKILL); err != nil && err != unix.ESRCH {
+			return fmt.Errorf("cannot kill process %d: %w", pid, err)
+		}
+		return nil
+	}
 	if err != nil {
+		return fmt.Errorf("cannot open pidfd for process %d: %w", pid, err)
+	}
+	defer unix.Close(pidfd)
+	if err := unix.PidfdSendSignal(pidfd, unix.SIGKILL, nil, 0); err != nil && err != unix.ESRCH {
+		return fmt.Errorf("cannot kill process %d: %w", pid, err)
+	}
+	return nil
+}
+
+// WaitForNonChildExit waits for the process with the given PID and
+// `identity` to exit, up to `timeout`.
+// If `identity` is zero, match processes on `pid` alone.
+// `pid` must not be a child of the current process.
+// Returns immediately if the process does not exist.
+func WaitForNonChildExit(pid int, identity uint64, timeout time.Duration) error {
+	if pid <= 0 {
+		return fmt.Errorf("invalid pid: %d", pid)
+	}
+	pidfd, err := OpenProcess(pid, identity)
+	if err == unix.ESRCH {
+		return nil // Already gone.
+	}
+	if err == unix.ENOSYS {
+		// No pidfds (Linux < 5.3). Fall back to polling.
 		b := backoff.WithMaxRetries(backoff.NewConstantBackOff(10*time.Millisecond), uint64(timeout/(10*time.Millisecond)))
 		return backoff.Retry(func() error {
 			if err := unix.Kill(pid, 0); err == nil {
@@ -47,6 +170,9 @@ func waitForNonChildExit(pid int, timeout time.Duration) error {
 			}
 			return nil
 		}, b)
+	}
+	if err != nil {
+		return fmt.Errorf("cannot open pidfd for process %d: %w", pid, err)
 	}
 	defer unix.Close(pidfd)
 	deadline := time.Now().Add(timeout)
@@ -64,7 +190,7 @@ func waitForNonChildExit(pid int, timeout time.Duration) error {
 			return fmt.Errorf("polling pidfd for process %d: %v", pid, err)
 		}
 		if n > 0 {
-			return nil
+			return nil // The pidfd becomes "readable" when the process exits.
 		}
 	}
 }

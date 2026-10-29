@@ -66,10 +66,15 @@ type RouteProtocol interface {
 	// AddDelLinkMessage is called when an interface is deleted by the stack.
 	AddDelLinkMessage(ms *nlmsg.MessageSet, idx int32, i inet.Interface)
 
-	// AddAddrMessage appends an RTM_NEWADDR message for an address of the
-	// given interface into the message set, or with added false, an
-	// RTM_DELADDR message.
-	AddAddrMessage(ms *nlmsg.MessageSet, idx int32, addr inet.InterfaceAddr, label string, added bool)
+	// AddAddrMessage appends an RTM_NEWADDR or RTM_DELADDR (typ) message for
+	// address a of interface i. It is the rough equivalent of Linux's
+	// inet_fill_ifaddr() and inet6_fill_ifaddr().
+	AddAddrMessage(ms *nlmsg.MessageSet, typ uint16, idx int32, i inet.Interface, a inet.InterfaceAddr)
+
+	// AddRouteMessage appends an RTM_NEWROUTE or RTM_DELROUTE (typ) message
+	// for rt, with the given NLM_F_* flags and optional RTA_PREFSRC. It is the
+	// rough equivalent of Linux's fib_dump_info() and rt6_fill_node().
+	AddRouteMessage(ms *nlmsg.MessageSet, typ uint16, nlFlags uint16, rt inet.Route, prefSrc []byte)
 }
 
 // Provider is a function that creates a new Protocol for a specific netlink
