@@ -256,8 +256,13 @@ void __export_sighandler(int signo, siginfo_t* siginfo, void* _ucontext) {
   enum context_state ctx_state = CONTEXT_STATE_INVALID;
   long fs_base = 0;
   // Syscall-patched contexts use GS for sysmsg. Guest-GS contexts instead
-  // carry the application's GS base in ptregs.
-  uint64_t gs_base = (uint64_t)sysmsg;
+  // carry the application's GS base in ptregs. With FSGSBASE, read what GS
+  // is rather than assume sysmsg: an application changes it with wrgsbase,
+  // which nothing traps, as stress-ng's random opcodes do, and the stub then
+  // resumed contexts with that GS, whose first patched syscall faulted in
+  // the usertrap trampoline. Without FSGSBASE, only the Sentry changes it.
+  uint64_t gs_base =
+      __export_arch_state.fsgsbase ? get_gsbase() : (uint64_t)sysmsg;
 
   if (thread_state == THREAD_STATE_INITIALIZING) {
     record_frame(sysmsg, ucontext, siginfo);
