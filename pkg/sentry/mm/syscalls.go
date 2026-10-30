@@ -1262,10 +1262,13 @@ func (mm *MemoryManager) Decommit(addr hostarch.Addr, length uint64) error {
 	//	- If at least one byte in ar is not covered by a vma, decommit the rest
 	//	but return ENOMEM.
 	//
-	//	- If we would invalidate only part of a huge page backing a private
-	//	anonymous mapping that we own (is not copy-on-write), use
-	//	MemoryFile.Decommit() instead to keep the allocated huge page intact for
-	//	future use.
+	//	- Pages of a private anonymous mapping that we own (are not
+	//	copy-on-write) are decommitted in place with MemoryFile.Decommit(), as
+	//	Linux zaps them under an unchanged mapping. Unmapping them from the
+	//	AddressSpace would cut a hole in the host mapping of their run of homes,
+	//	splitting it in two, and the host allows a process only so many
+	//	mappings (vm.max_map_count): a heap discarding every other page of 64
+	//	MiB took 8,192 more of its stub's.
 	didUnmapAS := false
 	pseg := mm.pmas.LowerBoundSegment(ar.Start)
 	vseg := mm.vmas.LowerBoundSegment(ar.Start)
@@ -1287,62 +1290,15 @@ func (mm *MemoryManager) Decommit(addr hostarch.Addr, length uint64) error {
 			}
 		}
 		for pseg.Ok() && pseg.Start() < vsegAR.End {
-			pma := pseg.ValuePtr()
-			if vma.mappable == nil && pma.huge && !mm.isPMACopyOnWriteLocked(vseg, pseg) {
-				psegAR := pseg.Range().Intersect(vsegAR)
-				if !psegAR.IsHugePageAligned() {
-					firstHugeStart := psegAR.Start.HugeRoundDown()
-					firstHugeEnd := firstHugeStart + hostarch.Addr(hostarch.HugePageSize)
-					lastWholeHugeEnd := psegAR.End.HugeRoundDown()
-					if firstHugeStart != psegAR.Start {
-						// psegAR.Start is not hugepage-aligned.
-						if psegAR.End <= firstHugeEnd {
-							// All of psegAR falls within a single huge page.
-							mm.decommitInPlaceLocked(pseg, psegAR)
-							pseg = pseg.NextSegment()
-							continue
-						}
-						if firstHugeEnd == lastWholeHugeEnd && lastWholeHugeEnd != psegAR.End {
-							// All of psegAR falls within two huge pages, and
-							// psegAR.End is also not hugepage-aligned. The
-							// logic below would handle this correctly, but
-							// would make two separate calls to
-							// MemoryFile.Decommit() for the first and last
-							// huge pages respectively.
-							mm.decommitInPlaceLocked(pseg, psegAR)
-							pseg = pseg.NextSegment()
-							continue
-						}
-						mm.decommitInPlaceLocked(pseg, hostarch.AddrRange{psegAR.Start, firstHugeEnd})
-						psegAR.Start = firstHugeEnd
-					}
-					// Drop whole huge pages between psegAR.Start (which after the above
-					// is either firstHugeStart or firstHugeEnd) and lastWholeHugeEnd
-					// normally.
-					if psegAR.Start < lastWholeHugeEnd {
-						pseg = mm.pmas.Isolate(pseg, hostarch.AddrRange{psegAR.Start, lastWholeHugeEnd})
-						pma = pseg.ValuePtr()
-						if !didUnmapAS {
-							// Unmap all of ar, not just pseg.Range(), to minimize host
-							// syscalls. AddressSpace mappings must be removed before
-							// pma.file.DecRef().
-							mm.unmapASLocked(ar)
-							didUnmapAS = true
-						}
-						pma.file.DecRef(pseg.fileRange())
-						mm.removeRSSLocked(pseg.Range())
-						pseg = mm.pmas.Remove(pseg).NextSegment()
-					}
-					if lastWholeHugeEnd != psegAR.End {
-						// psegAR.End is not hugepage-aligned.
-						mm.decommitInPlaceLocked(pseg, hostarch.AddrRange{lastWholeHugeEnd, psegAR.End})
-						pseg = pseg.NextSegment()
-					}
-					continue
-				}
+			if vma.mappable == nil && !mm.isPMACopyOnWriteLocked(vseg, pseg) {
+				// A huge page that this covers in part splits into base
+				// pages; see MemoryFile.Decommit.
+				mm.decommitInPlaceLocked(pseg, pseg.Range().Intersect(vsegAR))
+				pseg = pseg.NextSegment()
+				continue
 			}
 			pseg = mm.pmas.Isolate(pseg, vsegAR)
-			pma = pseg.ValuePtr()
+			pma := pseg.ValuePtr()
 			if !didUnmapAS {
 				// Unmap all of ar, not just pseg.Range(), to minimize host
 				// syscalls. AddressSpace mappings must be removed before
@@ -1374,9 +1330,9 @@ func (mm *MemoryManager) Decommit(addr hostarch.Addr, length uint64) error {
 	return nil
 }
 
-// decommitInPlaceLocked decommits the pages that pseg maps at ar, part of a
-// huge page that mm keeps allocated, and notes their 2 MiB as a candidate for
-// collapse once they are written again.
+// decommitInPlaceLocked decommits the pages that pseg maps at ar, which mm
+// owns, keeping pseg and its AddressSpace mapping, and notes their 2 MiB as a
+// candidate for collapse once they are written again.
 //
 // Preconditions: mm.activeMu must be locked for writing.
 func (mm *MemoryManager) decommitInPlaceLocked(pseg pmaIterator, ar hostarch.AddrRange) {
