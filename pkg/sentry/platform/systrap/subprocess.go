@@ -1218,14 +1218,31 @@ func (s *subprocess) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRa
 
 // Unmap implements platform.AddressSpace.Unmap.
 func (s *subprocess) Unmap(addr hostarch.Addr, length uint64) {
-	_, err := s.syscall(
-		unix.SYS_MUNMAP,
-		arch.SyscallArgument{Value: uintptr(addr)},
-		arch.SyscallArgument{Value: uintptr(length)})
+	err := s.munmap(addr, length)
+	if err == unix.ENOMEM {
+		// Unmapping part of a host mapping splits it in two, which the host
+		// refuses to a process that has as many mappings as it allows
+		// (vm.max_map_count). Unmap all of the application's addresses
+		// instead, which splits none: they are only a cache of the address
+		// space's mappings, which faults map again.
+		err = s.munmap(0, uint64(stubStart))
+		if err == nil && maximumUserAddress != stubEnd {
+			err = s.munmap(hostarch.Addr(stubEnd), uint64(maximumUserAddress-stubEnd))
+		}
+	}
 	if err != nil && err != errDeadSubprocess {
 		// We never expect this to happen.
 		panic(fmt.Sprintf("munmap(%x, %x)) failed: %v", addr, length, err))
 	}
+}
+
+// munmap unmaps length bytes at addr in s's stub.
+func (s *subprocess) munmap(addr hostarch.Addr, length uint64) error {
+	_, err := s.syscall(
+		unix.SYS_MUNMAP,
+		arch.SyscallArgument{Value: uintptr(addr)},
+		arch.SyscallArgument{Value: uintptr(length)})
+	return err
 }
 
 func (s *subprocess) PullFullState(c *platformContext, ac *arch.Context64) error {
