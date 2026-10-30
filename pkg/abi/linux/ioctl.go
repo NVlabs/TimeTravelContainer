@@ -101,6 +101,7 @@ const (
 
 // ioctl(2) requests provided by uapi/asm-generic/sockios.h
 const (
+	SIOCATMARK = 0x8905
 	SIOCGSTAMP = 0x8906
 )
 

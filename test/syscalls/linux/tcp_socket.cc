@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include <fcntl.h>
 
 #ifdef __linux__
@@ -821,6 +826,27 @@ TEST_P(TcpSocketTest, TcpInqSetSockOpt) {
   EXPECT_THAT(getsockopt(accepted_.get(), SOL_TCP, TCP_INQ, &val, &slen),
               SyscallSucceedsWithValue(0));
   ASSERT_EQ(val, 0);
+}
+
+// Without urgent data, a TCP socket's read position is not at an urgent mark.
+// Linux answers SIOCATMARK for TCP only.
+TEST_P(TcpSocketTest, SIOCATMARKWithoutUrgentData) {
+  char buf[16] = {};
+  ASSERT_THAT(RetryEINTR(write)(connected_.get(), buf, sizeof(buf)),
+              SyscallSucceedsWithValue(sizeof(buf)));
+  int at_mark = -1;
+  ASSERT_THAT(ioctl(accepted_.get(), SIOCATMARK, &at_mark), SyscallSucceeds());
+  EXPECT_EQ(at_mark, 0);
+  ASSERT_THAT(RetryEINTR(read)(accepted_.get(), buf, sizeof(buf)),
+              SyscallSucceedsWithValue(sizeof(buf)));
+  at_mark = -1;
+  ASSERT_THAT(ioctl(accepted_.get(), SIOCATMARK, &at_mark), SyscallSucceeds());
+  EXPECT_EQ(at_mark, 0);
+
+  FileDescriptor udp =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(GetParam(), SOCK_DGRAM, 0));
+  EXPECT_THAT(ioctl(udp.get(), SIOCATMARK, &at_mark),
+              SyscallFailsWithErrno(ENOTTY));
 }
 
 TEST_P(TcpSocketTest, TcpInq) {

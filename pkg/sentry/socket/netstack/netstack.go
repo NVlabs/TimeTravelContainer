@@ -3526,6 +3526,16 @@ func (s *sock) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args ar
 		vP := primitive.Int32(v)
 		_, err := vP.CopyOut(t, args[2].Pointer())
 		return 0, err
+
+	case linux.SIOCATMARK:
+		// Linux answers it for TCP sockets only. netstack keeps no urgent
+		// data, so the read position is never at an urgent mark.
+		if s.skType != linux.SOCK_STREAM {
+			break
+		}
+		atMark := primitive.Int32(0)
+		_, err := atMark.CopyOut(t, args[2].Pointer())
+		return 0, err
 	}
 
 	return Ioctl(ctx, s.Endpoint, uio, sysno, args)
