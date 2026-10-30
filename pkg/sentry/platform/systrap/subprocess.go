@@ -609,12 +609,40 @@ func (s *subprocess) destroy() {
 		s.syscallThread.thread.kill()
 	}
 	s.aliveMu.Unlock()
-	go func() { // S/R-SAFE: platform-related.
+	reaperOnce.Do(func() {
+		go reapDestroyed() // S/R-SAFE: platform-related.
+	})
+	destroyed <- destroyedSubprocess{s: s, killed: killed}
+}
+
+// destroyedSubprocess is a subprocess that destroy queued for
+// reapDestroyed; killed is whether destroy killed its stub.
+type destroyedSubprocess struct {
+	s      *subprocess
+	killed bool
+}
+
+var (
+	// destroyed queues the subprocesses that destroy killed for
+	// reapDestroyed.
+	destroyed = make(chan destroyedSubprocess, 4096)
+
+	// reaperOnce starts reapDestroyed.
+	reaperOnce sync.Once
+)
+
+// reapDestroyed reaps the stubs of destroyed subprocesses one at a time, and
+// frees what the Sentry kept for them: a goroutine waiting for each stub
+// would hold a host thread, of which Go allows a process 10,000, and
+// thousands of processes may exit at once.
+func reapDestroyed() {
+	for d := range destroyed {
+		s := d.s
 		if s.syscallThread != nil {
-			// Wait for the stub killed above. One that died before was
-			// reaped by alive, unless it is a zombie still.
+			// Wait for the stub that destroy killed. One that died before
+			// was reaped by alive, unless it is a zombie still.
 			options := unix.WNOHANG
-			if killed {
+			if d.killed {
 				options = 0
 			}
 			wstatus := unix.WaitStatus(0)
@@ -626,7 +654,7 @@ func (s *subprocess) destroy() {
 		}
 		s.freeSentryMemory()
 		close(s.requests)
-	}()
+	}
 }
 
 // withAliveRLock executes fn while holding aliveMu.RLock(), ensuring the subprocess is alive.
