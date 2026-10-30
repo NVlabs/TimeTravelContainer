@@ -104,6 +104,7 @@ go_library(
         "//pkg/sentry/fsimpl/iouringfs",
         "//pkg/sentry/fsimpl/lock",
         "//pkg/sentry/fsimpl/mountfd",
+        "//pkg/sentry/fsimpl/mqfs",
         "//pkg/sentry/fsimpl/overlay",
         "//pkg/sentry/fsimpl/pipefs",
         "//pkg/sentry/fsimpl/signalfd",

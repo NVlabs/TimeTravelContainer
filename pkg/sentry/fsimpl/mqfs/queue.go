@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package mqfs
 
 import (
@@ -147,4 +150,14 @@ func (fd *queueFD) EventUnregister(e *waiter.Entry) {
 // Epollable implements FileDescriptionImpl.Epollable.
 func (fd *queueFD) Epollable() bool {
 	return true
+}
+
+// QueueOf returns the message queue that fd describes, or nil if fd describes
+// no message queue.
+func QueueOf(fd *vfs.FileDescription) *mq.Queue {
+	qfd, ok := fd.Impl().(*queueFD)
+	if !ok {
+		return nil
+	}
+	return qfd.inode.(*queueInode).queue
 }

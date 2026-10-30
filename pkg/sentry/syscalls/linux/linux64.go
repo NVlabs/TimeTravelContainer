@@ -277,10 +277,10 @@ var AMD64 = &kernel.SyscallTable{
 		239: syscalls.PartiallySupported("get_mempolicy", GetMempolicy, "Stub implementation.", nil),
 		240: syscalls.Supported("mq_open", MqOpen),
 		241: syscalls.Supported("mq_unlink", MqUnlink),
-		242: syscalls.ErrorWithEvent("mq_timedsend", linuxerr.ENOSYS, "", []string{"gvisor.dev/issue/136"}),    // TODO(b/29354921)
-		243: syscalls.ErrorWithEvent("mq_timedreceive", linuxerr.ENOSYS, "", []string{"gvisor.dev/issue/136"}), // TODO(b/29354921)
-		244: syscalls.ErrorWithEvent("mq_notify", linuxerr.ENOSYS, "", []string{"gvisor.dev/issue/136"}),       // TODO(b/29354921)
-		245: syscalls.ErrorWithEvent("mq_getsetattr", linuxerr.ENOSYS, "", []string{"gvisor.dev/issue/136"}),   // TODO(b/29354921)
+		242: syscalls.Supported("mq_timedsend", MqTimedsend),
+		243: syscalls.Supported("mq_timedreceive", MqTimedreceive),
+		244: syscalls.PartiallySupported("mq_notify", MqNotify, "SIGEV_THREAD is not supported.", nil),
+		245: syscalls.Supported("mq_getsetattr", MqGetsetattr),
 		246: syscalls.CapError("kexec_load", linux.CAP_SYS_BOOT, "", nil),
 		247: syscalls.Supported("waitid", Waitid),
 		248: syscalls.Error("add_key", linuxerr.EACCES, "Not available to user.", nil),
@@ -593,10 +593,10 @@ var ARM64 = &kernel.SyscallTable{
 		179: syscalls.PartiallySupported("sysinfo", Sysinfo, "Fields loads, sharedram, bufferram, totalswap, freeswap, totalhigh, freehigh not supported.", nil),
 		180: syscalls.Supported("mq_open", MqOpen),
 		181: syscalls.Supported("mq_unlink", MqUnlink),
-		182: syscalls.ErrorWithEvent("mq_timedsend", linuxerr.ENOSYS, "", []string{"gvisor.dev/issue/136"}),    // TODO(b/29354921)
-		183: syscalls.ErrorWithEvent("mq_timedreceive", linuxerr.ENOSYS, "", []string{"gvisor.dev/issue/136"}), // TODO(b/29354921)
-		184: syscalls.ErrorWithEvent("mq_notify", linuxerr.ENOSYS, "", []string{"gvisor.dev/issue/136"}),       // TODO(b/29354921)
-		185: syscalls.ErrorWithEvent("mq_getsetattr", linuxerr.ENOSYS, "", []string{"gvisor.dev/issue/136"}),   // TODO(b/29354921)
+		182: syscalls.Supported("mq_timedsend", MqTimedsend),
+		183: syscalls.Supported("mq_timedreceive", MqTimedreceive),
+		184: syscalls.PartiallySupported("mq_notify", MqNotify, "SIGEV_THREAD is not supported.", nil),
+		185: syscalls.Supported("mq_getsetattr", MqGetsetattr),
 		186: syscalls.Supported("msgget", Msgget),
 		187: syscalls.Supported("msgctl", Msgctl),
 		188: syscalls.Supported("msgrcv", Msgrcv),

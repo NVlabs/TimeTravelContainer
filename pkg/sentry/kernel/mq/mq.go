@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package mq provides an implementation for POSIX message queues.
 package mq
 
@@ -147,7 +150,7 @@ func (r *Registry) FindOrCreate(ctx context.Context, opts OpenOpts, mode linux.F
 
 	// Construct status flags.
 	var flags uint32
-	if opts.Block {
+	if !opts.Block {
 		flags = linux.O_NONBLOCK
 	}
 	switch opts.Access {
@@ -275,6 +278,10 @@ type Queue struct {
 
 	// byteCount is the number of bytes of data in all messages in the queue.
 	byteCount uint64
+
+	// receivers is the number of receivers waiting for a message. A task
+	// waiting in a checkpoint restarts its wait, and counts itself again.
+	receivers int64 `state:"nosave"`
 }
 
 // View is a view into a message queue. Views should only be used in file
@@ -356,10 +363,43 @@ type Message struct {
 //
 // +stateify savable
 type Subscriber struct {
-	// TODO: Add fields when mq_notify(2) is implemented.
-
 	// pid is the PID of the registered task.
 	pid int32
+
+	// target is the thread group that the notification signals.
+	target NotificationTarget
+
+	// userNS is the user namespace of the registered task.
+	userNS *auth.UserNamespace
+
+	// method is how the subscriber is notified: linux.SIGEV_NONE or
+	// linux.SIGEV_SIGNAL.
+	method int32
+
+	// signal and value are the number and the value of the signal of a
+	// linux.SIGEV_SIGNAL notification.
+	signal int32
+	value  uint64
+}
+
+// NotificationTarget is the thread group that a Subscriber notifies, a
+// *kernel.ThreadGroup.
+type NotificationTarget interface {
+	SendSignal(info *linux.SignalInfo) error
+}
+
+// NewSubscriber returns a Subscriber for the thread group with ID pid,
+// target, in user namespace userNS, to be notified by method; for
+// linux.SIGEV_SIGNAL, with the given signal and value.
+func NewSubscriber(pid int32, target NotificationTarget, userNS *auth.UserNamespace, method, signal int32, value uint64) *Subscriber {
+	return &Subscriber{pid: pid, target: target, userNS: userNS, method: method, signal: signal, value: value}
+}
+
+// Notification returns how s is notified: by method, and for
+// linux.SIGEV_SIGNAL, with a signal of the given number and value sent to
+// target, in user namespace userNS.
+func (s *Subscriber) Notification() (target NotificationTarget, userNS *auth.UserNamespace, method, signal int32, value uint64) {
+	return s.target, s.userNS, s.method, s.signal, s.value
 }
 
 // Generate implements vfs.DynamicBytesSource.Generate. Queue is used as a
@@ -375,7 +415,10 @@ func (q *Queue) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	)
 	if q.subscriber != nil {
 		pid = q.subscriber.pid
-		// TODO: add method and sigNumber when mq_notify(2) is implemented.
+		method = int(q.subscriber.method)
+		if q.subscriber.method == linux.SIGEV_SIGNAL {
+			sigNumber = int(q.subscriber.signal)
+		}
 	}
 
 	fmt.Fprintf(buf, "QSIZE:%-10d NOTIFY:%-5d SIGNO:%-5d NOTIFY_PID:%-6d\n",
@@ -424,4 +467,107 @@ func (q *Queue) EventUnregister(e *waiter.Entry) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.queue.EventUnregister(e)
+}
+
+// MaxMessageSize returns the size of the largest message that q holds.
+func (q *Queue) MaxMessageSize() uint64 {
+	return q.maxMessageSize
+}
+
+// Attr returns q's attributes, for mq_getsetattr(2), but its flags, which are
+// the file description's.
+func (q *Queue) Attr() linux.MqAttr {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return linux.MqAttr{
+		MqMaxmsg:  q.maxMessageCount,
+		MqMsgsize: int64(q.maxMessageSize),
+		MqCurmsgs: q.messageCount,
+	}
+}
+
+// Send adds a message of text with priority to q, unless q is full, when it
+// fails with linuxerr.ErrWouldBlock. Like Linux, it ends q's notification
+// registration and returns it, for the caller to notify, when the message
+// makes q nonempty and no receiver is waiting.
+//
+// Preconditions: len(text) <= q.MaxMessageSize(); priority <
+// linux.MQ_PRIO_MAX.
+func (q *Queue) Send(text string, priority uint32) (*Subscriber, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.messageCount >= q.maxMessageCount {
+		return nil, linuxerr.ErrWouldBlock
+	}
+	msg := &Message{Text: text, Size: uint64(len(text)), Priority: priority}
+	// Messages are ordered by priority, and by their arrival within one.
+	at := q.messages.Back()
+	for at != nil && at.Priority < priority {
+		at = at.Prev()
+	}
+	if at == nil {
+		q.messages.PushFront(msg)
+	} else {
+		q.messages.InsertAfter(at, msg)
+	}
+	q.messageCount++
+	q.byteCount += msg.Size
+	var notify *Subscriber
+	if q.messageCount == 1 && q.receivers == 0 {
+		notify, q.subscriber = q.subscriber, nil
+	}
+	q.queue.Notify(waiter.ReadableEvents)
+	return notify, nil
+}
+
+// Receive removes and returns q's message of the highest priority that came
+// first, unless q is empty, when it fails with linuxerr.ErrWouldBlock.
+func (q *Queue) Receive() (*Message, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	msg := q.messages.Front()
+	if msg == nil {
+		return nil, linuxerr.ErrWouldBlock
+	}
+	q.messages.Remove(msg)
+	q.messageCount--
+	q.byteCount -= msg.Size
+	q.queue.Notify(waiter.WritableEvents)
+	return msg, nil
+}
+
+// WaitToReceive counts a receiver waiting for a message from q, until the
+// function that it returns is called: a message sent meanwhile is for a
+// receiver, so it notifies no subscriber.
+func (q *Queue) WaitToReceive() func() {
+	q.mu.Lock()
+	q.receivers++
+	q.mu.Unlock()
+	return func() {
+		q.mu.Lock()
+		q.receivers--
+		q.mu.Unlock()
+	}
+}
+
+// Subscribe registers sub for q's notification, unless one is registered
+// already, when it fails with EBUSY.
+func (q *Queue) Subscribe(sub *Subscriber) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.subscriber != nil {
+		return linuxerr.EBUSY
+	}
+	q.subscriber = sub
+	return nil
+}
+
+// Unsubscribe ends the notification registration of the thread group with ID
+// pid, if it has q's.
+func (q *Queue) Unsubscribe(pid int32) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.subscriber != nil && q.subscriber.pid == pid {
+		q.subscriber = nil
+	}
 }
