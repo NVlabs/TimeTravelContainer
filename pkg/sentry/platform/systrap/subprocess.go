@@ -1203,11 +1203,19 @@ func (s *subprocess) syscall(sysno uintptr, args ...arch.SyscallArgument) (uintp
 
 // MapFile implements platform.AddressSpace.MapFile.
 func (s *subprocess) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRange, at hostarch.AccessType, precommit bool) error {
-	fd, err := memmap.PinDataFD(f, fr)
+	var (
+		fd  int
+		err error
+	)
+	if mf, ok := f.(*pgalloc.MemoryFile); ok {
+		// Application memory, whose descriptor stays open.
+		fd, err = mf.DataFD(fr)
+	} else if fd, err = memmap.PinDataFD(f, fr); err == nil {
+		defer memmap.UnpinDataFD(f)
+	}
 	if err != nil {
 		return err
 	}
-	defer memmap.UnpinDataFD(f)
 	var flags int
 	if precommit {
 		flags |= unix.MAP_POPULATE
@@ -1247,11 +1255,8 @@ func (s *subprocess) Unmap(addr hostarch.Addr, length uint64) {
 		// (vm.max_map_count). Unmap all of the application's addresses
 		// instead, which splits none: they are only a cache of the address
 		// space's mappings, which faults map again.
-		err = s.munmap(0, uint64(stubStart))
-		if err == nil && maximumUserAddress != stubEnd {
-			err = s.munmap(hostarch.Addr(stubEnd), uint64(maximumUserAddress-stubEnd))
-		}
-		s.hostMaps.clearLocked()
+		err = s.unmapApplicationAddresses()
+		s.hostMaps.resetLocked()
 	} else {
 		s.hostMaps.unmappedLocked(ar)
 	}
@@ -1259,6 +1264,16 @@ func (s *subprocess) Unmap(addr hostarch.Addr, length uint64) {
 		// We never expect this to happen.
 		panic(fmt.Sprintf("munmap(%x, %x)) failed: %v", addr, length, err))
 	}
+}
+
+// unmapApplicationAddresses unmaps all of the application's addresses in s's
+// stub, which splits none of its mappings.
+func (s *subprocess) unmapApplicationAddresses() error {
+	err := s.munmap(0, uint64(stubStart))
+	if err == nil && maximumUserAddress != stubEnd {
+		err = s.munmap(hostarch.Addr(stubEnd), uint64(maximumUserAddress-stubEnd))
+	}
+	return err
 }
 
 // munmap unmaps length bytes at addr in s's stub.

@@ -30,6 +30,10 @@ import (
 // refuse a process at its limit. Where the host merges less, the stub has
 // more mappings than the set counts, and if it reaches the limit, mm unmaps
 // all of the address space (see mm.MemoryManager.mapFileLocked).
+//
+// Every fault of every stub records what it maps, so the common cases cost one
+// lookup of the set: a mapping of addresses that the stub has not mapped, as
+// a fault makes, and an unmapping of addresses that it has not.
 
 const (
 	// maxHostMappingReserve is the most mappings that the budget leaves to
@@ -104,11 +108,17 @@ func (hostMappingSetFunctions) ClearValue(*hostMapping) {
 // remain would merge in the set and not in the host, which is the safe way
 // to be wrong.
 func (hostMappingSetFunctions) Merge(ar1 hostarch.AddrRange, m1 hostMapping, ar2 hostarch.AddrRange, m2 hostMapping) (hostMapping, bool) {
-	if m1.fd != m2.fd || m1.at != m2.at || m1.off+uint64(ar1.Length()) != m2.off {
+	if !merges(ar1, &m1, &m2) {
 		return hostMapping{}, false
 	}
 	m1.mapped = max(m1.mapped, m2.mapped)
 	return m1, true
+}
+
+// merges returns whether the host merges m1, which maps ar1, with m2, which
+// maps the addresses that follow ar1.
+func merges(ar1 hostarch.AddrRange, m1, m2 *hostMapping) bool {
+	return m1.fd == m2.fd && m1.at == m2.at && m1.off+uint64(ar1.Length()) == m2.off
 }
 
 func (hostMappingSetFunctions) Split(ar hostarch.AddrRange, m hostMapping, split hostarch.Addr) (hostMapping, hostMapping) {
@@ -157,15 +167,39 @@ func (h *hostMappings) aroundLocked(ar hostarch.AddrRange) int {
 	return n
 }
 
+// resetLocked records that the stub has no mappings of application
+// addresses.
+//
+// +checklocks:h.mu
+func (h *hostMappings) resetLocked() {
+	h.set.RemoveAll()
+	h.addLocked(-h.count)
+}
+
 // mappedLocked records that the stub has mapped ar to fd at offset off with
 // access at.
 //
 // +checklocks:h.mu
 func (h *hostMappings) mappedLocked(ar hostarch.AddrRange, fd int, off uint64, at hostarch.AccessType) {
 	h.clock++
+	m := hostMapping{fd: int32(fd), at: at, off: off, mapped: h.clock}
+	if seg, gap := h.set.Find(ar.Start); !seg.Ok() && gap.End() >= ar.End {
+		// Addresses that the stub had not mapped: one mapping more, less
+		// each neighbor that it merges with.
+		n := 1
+		if prev := gap.PrevSegment(); prev.Ok() && prev.End() == ar.Start && merges(prev.Range(), prev.ValuePtr(), &m) {
+			n--
+		}
+		if next := gap.NextSegment(); next.Ok() && next.Start() == ar.End && merges(ar, &m, next.ValuePtr()) {
+			n--
+		}
+		h.set.Insert(gap, ar, m)
+		h.addLocked(n)
+		return
+	}
 	before := h.aroundLocked(ar)
 	gap := h.set.RemoveRange(ar)
-	h.set.Insert(gap, ar, hostMapping{fd: int32(fd), at: at, off: off, mapped: h.clock})
+	h.set.Insert(gap, ar, m)
 	h.addLocked(h.aroundLocked(ar) - before)
 }
 
@@ -183,18 +217,27 @@ func (h *hostMappings) addLocked(n int) {
 //
 // +checklocks:h.mu
 func (h *hostMappings) unmappedLocked(ar hostarch.AddrRange) {
-	before := h.aroundLocked(ar)
-	h.set.RemoveRange(ar)
-	h.addLocked(h.aroundLocked(ar) - before)
-}
-
-// clearLocked records that the stub has no mappings of application
-// addresses.
-//
-// +checklocks:h.mu
-func (h *hostMappings) clearLocked() {
-	h.set.RemoveAll()
-	h.addLocked(-h.count)
+	seg, gap := h.set.Find(ar.Start)
+	if !seg.Ok() && gap.End() >= ar.End {
+		return // The stub had not mapped them.
+	}
+	if h.set.FirstSegment().Start() >= ar.Start && h.set.LastSegment().End() <= ar.End {
+		// All of them, as when an address space goes.
+		h.resetLocked()
+		return
+	}
+	// One mapping less for each that it removes, but one more for each that
+	// it cuts at an end, which keeps its part outside ar: a mapping cut at
+	// both ends becomes two.
+	n := 0
+	if seg.Ok() && seg.Start() < ar.Start {
+		n++
+	}
+	if last := h.set.FindSegment(ar.End - 1); last.Ok() && last.End() > ar.End {
+		n++
+	}
+	h.set.RemoveRangeWith(ar, func(hostMappingIterator) { n-- })
+	h.addLocked(n)
 }
 
 // ageClasses is the number of classes of mappings, in the order that eviction

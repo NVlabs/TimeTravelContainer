@@ -204,3 +204,30 @@ func TestHostMappingsEvictSmallFirst(t *testing.T) {
 		t.Errorf("the large mapping, made first, was unmapped before small ones made after it")
 	}
 }
+
+// BenchmarkHostMappingsMapped measures what recording a mapping costs: pages
+// that merge with what they adjoin, as a fault of private memory in homes
+// maps, and pages that do not, as copies after a live fork map.
+func BenchmarkHostMappingsMapped(b *testing.B) {
+	for _, merge := range []bool{true, false} {
+		b.Run(map[bool]string{true: "merging", false: "apart"}[merge], func(b *testing.B) {
+			var h hostMappings
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			const pages = 1 << 18
+			for i := 0; i < b.N; i++ {
+				page := uint64(i % pages)
+				if page == 0 {
+					h.resetLocked()
+				}
+				addr := hostarch.Addr(0x10000000) + hostarch.Addr(2*page)*hostarch.PageSize
+				off := uint64(0)
+				if merge {
+					addr = hostarch.Addr(0x10000000) + hostarch.Addr(page)*hostarch.PageSize
+					off = page * hostarch.PageSize
+				}
+				h.mappedLocked(hostarch.AddrRange{addr, addr + hostarch.PageSize}, 3, off, hostarch.ReadWrite)
+			}
+		})
+	}
+}
