@@ -1197,10 +1197,11 @@ func (s *subprocess) syscall(sysno uintptr, args ...arch.SyscallArgument) (uintp
 
 // MapFile implements platform.AddressSpace.MapFile.
 func (s *subprocess) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRange, at hostarch.AccessType, precommit bool) error {
-	fd, err := f.DataFD(fr)
+	fd, err := memmap.PinDataFD(f, fr)
 	if err != nil {
 		return err
 	}
+	defer memmap.UnpinDataFD(f)
 	var flags int
 	if precommit {
 		flags |= unix.MAP_POPULATE

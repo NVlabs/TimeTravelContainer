@@ -12341,7 +12341,20 @@ func (b *runtimeBackend) configuredRunscArgsForNetworkConfig(networkMode string,
 			args = append(args, "--ttc-network-interface="+networkInterface)
 		}
 	}
-	return args
+	return append(args, testOnlyRunscFlags()...)
+}
+
+// testOnlyRunscFlags returns the runsc flags in TTC_TESTONLY_RUNSC_FLAGS that
+// tests may set: limits that stand in for the host's where they are lower,
+// so that tests reach them, which they cannot set on the host.
+func testOnlyRunscFlags() []string {
+	var flags []string
+	for _, flag := range strings.Fields(os.Getenv("TTC_TESTONLY_RUNSC_FLAGS")) {
+		if strings.HasPrefix(flag, "--fdlimit=") {
+			flags = append(flags, flag)
+		}
+	}
+	return flags
 }
 
 // withRuntimeDiagnostics has the Sentry that args launch write its panics to

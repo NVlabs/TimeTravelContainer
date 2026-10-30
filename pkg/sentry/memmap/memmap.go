@@ -588,6 +588,32 @@ type File interface {
 	FD() int
 }
 
+// DataFDPinner is implemented by Files whose descriptor the Sentry may close
+// while it is idle, to stay within the host's limit on descriptors, and open
+// again when it is next used (see fdbudget). PinDataFD is DataFD, but the
+// descriptor stays open until UnpinDataFD, which must be called exactly once
+// after a PinDataFD that succeeded.
+type DataFDPinner interface {
+	PinDataFD(fr FileRange) (int, error)
+	UnpinDataFD()
+}
+
+// PinDataFD returns file.DataFD(fr), which stays open until
+// UnpinDataFD(file) if file may close it (see DataFDPinner).
+func PinDataFD(file File, fr FileRange) (int, error) {
+	if p, ok := file.(DataFDPinner); ok {
+		return p.PinDataFD(fr)
+	}
+	return file.DataFD(fr)
+}
+
+// UnpinDataFD releases what PinDataFD(file, ...) pinned.
+func UnpinDataFD(file File) {
+	if p, ok := file.(DataFDPinner); ok {
+		p.UnpinDataFD()
+	}
+}
+
 // InternalMappingLease pins a host mapping returned by
 // MapInternalWithLease. Release must be called exactly once after the caller
 // has stopped using every Block in the mapping. A nil lease denotes a mapping

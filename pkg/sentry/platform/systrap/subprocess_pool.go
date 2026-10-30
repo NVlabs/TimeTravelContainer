@@ -58,6 +58,32 @@ func (p *subprocessPool) markAvailable(s *subprocess) bool {
 	return true
 }
 
+// shrink destroys up to n of the subprocesses that the pool has kept longest,
+// and returns how many it destroyed: each holds a host file descriptor, its
+// syscall thread's seccomp notifications, which the Sentry needs when it nears
+// its limit on them (see fdbudget.AddShrinker).
+func (p *subprocessPool) shrink(n int) int {
+	if !p.mu.TryLock() {
+		return 0
+	}
+	n = min(n, len(p.available))
+	victims := make([]*subprocess, n)
+	copy(victims, p.available)
+	kept := copy(p.available, p.available[n:])
+	clear(p.available[kept:])
+	p.available = p.available[:kept]
+	p.mu.Unlock()
+	for _, s := range victims {
+		s.destroy()
+		// The reaper closes it once it has reaped the stub; the budget
+		// needs it now, and the killed stub has no use for it.
+		if t := s.syscallThread; t != nil && t.seccompNotify != nil {
+			t.seccompNotify.Close()
+		}
+	}
+	return n
+}
+
 func (p *subprocessPool) fetchAvailable() *subprocess {
 	p.mu.Lock()
 	defer p.mu.Unlock()

@@ -30,6 +30,7 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
+	"gvisor.dev/gvisor/pkg/sentry/fdbudget"
 	"gvisor.dev/gvisor/pkg/sentry/fsmetric"
 	"gvisor.dev/gvisor/pkg/sentry/fsutil"
 	"gvisor.dev/gvisor/pkg/sentry/hostfd"
@@ -142,6 +143,12 @@ type regularFile struct {
 	diskIOFile     *os.File   `state:"nosave"`
 	diskIOObject   string     `state:"nosave"`
 	diskIOWritable bool       `state:"nosave"`
+
+	// diskIOEntry registers diskIOFile with the Sentry's budget of host
+	// file descriptors, which closes it when the Sentry nears its limit and
+	// nothing uses it (see CloseIdleFD); the next read or write opens it
+	// again.
+	diskIOEntry fdbudget.Entry `state:"nosave"`
 
 	// diskMetadataDirty is set after data writes change branch-visible inode
 	// metadata such as size or timestamps. Publishing the immutable repository
@@ -468,7 +475,7 @@ func (rf *regularFile) privatizeDiskMapLocked() error {
 		// object.
 		rf.diskIOStale.Store(true)
 	}
-	m, err := newDiskMapping(file)
+	m, err := newDiskMapping(file, volume.Repository, meta.Object)
 	if err != nil {
 		return err
 	}
@@ -517,6 +524,7 @@ func (rf *regularFile) openDiskIOLocked(writable bool, onCoW func()) (*os.File, 
 		rf.invalidateDiskIOLocked()
 	}
 	if rf.diskIOFile != nil && (!writable || rf.diskIOWritable) {
+		rf.diskIOEntry.Used()
 		return rf.diskIOFile, false, nil
 	}
 	rf.invalidateDiskIOLocked()
@@ -529,6 +537,7 @@ func (rf *regularFile) openDiskIOLocked(writable bool, onCoW func()) (*os.File, 
 	rf.setDiskIOObjectLocked(meta.Object)
 	rf.diskIOWritable = writable
 	rf.inode.fs.markDiskForkFile(rf)
+	fdbudget.Opened(&rf.diskIOEntry, rf, int(file.Fd()))
 	return file, cloned, nil
 }
 
@@ -537,9 +546,28 @@ func (rf *regularFile) invalidateDiskIOLocked() {
 	if rf.diskIOFile != nil {
 		_ = rf.diskIOFile.Close()
 		rf.diskIOFile = nil
+		fdbudget.Closed(&rf.diskIOEntry)
 	}
 	rf.setDiskIOObjectLocked("")
 	rf.diskIOWritable = false
+}
+
+// CloseIdleFD implements fdbudget.Holder.CloseIdleFD for the descriptor of
+// the I/O cache, unless a read or write is using it. It leaves the cache's
+// object in the file's index (see setDiskIOObjectLocked), whose lock it may
+// not wait for: an invalidation of the object finds no descriptor to close,
+// and the next open updates the index.
+func (rf *regularFile) CloseIdleFD() bool {
+	if !rf.diskIOMu.TryLock() {
+		return false
+	}
+	defer rf.diskIOMu.Unlock()
+	if rf.diskIOFile != nil {
+		_ = rf.diskIOFile.Close()
+		rf.diskIOFile = nil
+		rf.diskIOWritable = false
+	}
+	return true
 }
 
 func (rf *regularFile) invalidateDiskIO() {

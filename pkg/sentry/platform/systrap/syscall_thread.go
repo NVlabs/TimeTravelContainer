@@ -12,9 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package systrap
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"sync/atomic"
@@ -27,6 +31,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/fdbudget"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform/systrap/sysmsg"
@@ -102,7 +107,18 @@ func (t *syscallThread) init(seccompNotify bool) error {
 	}
 
 	if seccompNotify && seccompNotifyIsSupported {
-		if t.seccompNotify, err = t.installSeccompNotify(); err != nil {
+		t.seccompNotify, err = t.installSeccompNotify()
+		if err != nil && fdbudget.Retry(err) {
+			t.seccompNotify, err = t.installSeccompNotify()
+		}
+		if errors.Is(err, unix.EMFILE) || errors.Is(err, unix.ENFILE) {
+			// With no host descriptor to spare for the notifications, the
+			// thread waits on a futex, as the pool's source does: slower,
+			// but the guest's process does not fail for the host's limit.
+			futexSyscallThreadLogger.Infof("No host file descriptor for a stub's seccomp notifications (%v); its syscall thread waits on a futex", err)
+			err = nil
+		}
+		if err != nil {
 			t.destroy()
 			return fmt.Errorf("failed to install seccomp notify rules: %w", err)
 		}
@@ -161,6 +177,8 @@ func (t *syscallThread) installSeccompNotify() (*os.File, error) {
 	if errno != 0 {
 		t.thread.Debugf("failed to set SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP")
 	}
+	// Stubs share the Sentry's descriptor table.
+	fdbudget.Note(int(fd))
 	return os.NewFile(fd, "seccomp_notify"), nil
 }
 
@@ -201,6 +219,8 @@ func (t *syscallThread) attach() error {
 const maxErrno = 4095
 
 var stubSyscallErrorLogger = log.BasicRateLimitedLogger(time.Minute)
+
+var futexSyscallThreadLogger = log.BasicRateLimitedLogger(time.Minute)
 
 func (t *syscallThread) syscall(sysno uintptr, args ...arch.SyscallArgument) (uintptr, error) {
 	if t.subproc.dead.Load() {

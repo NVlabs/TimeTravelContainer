@@ -54,6 +54,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/devices/rdmaproxy/cxproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/rdmaproxy/efaproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/rdmaproxy/genericproxy"
+	"gvisor.dev/gvisor/pkg/sentry/fdbudget"
 	"gvisor.dev/gvisor/pkg/sentry/fdimport"
 	cgroup2fs "gvisor.dev/gvisor/pkg/sentry/fsimpl/cgroup2fs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/devpts"
@@ -963,6 +964,10 @@ func New(args Args) (*Loader, error) {
 	}
 	setApplicationMemoryHomes(args.Conf)
 	limitSandboxMemory(&args)
+	// Idle host file descriptors close when the Sentry nears the host's
+	// limit on them, which guests then never run into.
+	fdbudget.Init()
+	ttcvolume.FDShortageHook = fdbudget.Retry
 
 	// Create kernel and platform.
 	l.pinRing.FD = args.PinRingFD

@@ -924,5 +924,36 @@ func (r *Repository) openObject(id string, flags int) (*os.File, error) {
 	if err != nil || parsed.Kind != ttcsnapshot.ObjectKindFile {
 		return nil, fmt.Errorf("invalid whole-file object ID %q", id)
 	}
-	return r.data.OpenFile(parsed, flags, -1)
+	file, err := r.data.OpenFile(parsed, flags, -1)
+	if err != nil && retryOpen(err) {
+		file, err = r.data.OpenFile(parsed, flags, -1)
+	}
+	return file, err
+}
+
+// OpenObject opens the host file of object, a whole-file object of r, for
+// writing too if writable is set. It takes no lock of r: the Sentry opens
+// again, under its memory locks, objects whose mappings it holds (whose
+// objects r keeps until the Sentry drops them, see CoWCallback), after it
+// closed their descriptors to stay within its limit on them.
+func (r *Repository) OpenObject(object string, writable bool) (*os.File, error) {
+	flags := os.O_RDONLY
+	if writable {
+		flags = os.O_RDWR
+	}
+	return r.openObject(object, flags)
+}
+
+// FDShortageHook, if set, is called when the host refuses the process another
+// file descriptor (EMFILE, or ENFILE) as a repository opens one of its files,
+// and reports whether to try again. The Sentry sets it to close descriptors
+// that it does not use (see fdbudget).
+var FDShortageHook func(error) bool
+
+// retryOpen reports whether to try again an open that failed with err.
+func retryOpen(err error) bool {
+	if hook := FDShortageHook; hook != nil {
+		return hook(err)
+	}
+	return false
 }

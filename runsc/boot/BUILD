@@ -101,6 +101,7 @@ go_library(
         "//pkg/sentry/devices/tpuproxy/vfio",
         "//pkg/sentry/devices/ttydev",
         "//pkg/sentry/devices/tundev",
+        "//pkg/sentry/fdbudget",
         "//pkg/sentry/fdimport",
         "//pkg/sentry/fscheckpoint",
         "//pkg/sentry/fsimpl/binderfs",

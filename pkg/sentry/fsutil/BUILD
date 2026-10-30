@@ -144,6 +144,7 @@ go_library(
         "//pkg/log",
         "//pkg/safemem",
         "//pkg/sentry/arch",
+        "//pkg/sentry/fdbudget",
         "//pkg/sentry/ktime",
         "//pkg/sentry/memmap",
         "//pkg/sentry/mm",
@@ -164,13 +165,17 @@ go_test(
     srcs = [
         "dirty_set_test.go",
         "file_range_set_test.go",
+        "mmap_cached_file_test.go",
     ],
     embed = [":fsutil"],
     deps = [
         "//pkg/hostarch",
+        "//pkg/safemem",
         "//pkg/sentry/contexttest",
+        "//pkg/sentry/fdbudget",
         "//pkg/sentry/memmap",
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/usage",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )

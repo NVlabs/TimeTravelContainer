@@ -68,6 +68,7 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/fdbudget"
 	"gvisor.dev/gvisor/pkg/sentry/hostmm"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
@@ -358,6 +359,7 @@ func New(opts platform.Options) (*Systrap, error) {
 		maxSysmsgThreads = gomaxprocs.Base()
 		// Account for syscall thread.
 		maxChildThreads = maxSysmsgThreads + 1
+		fdbudget.AddShrinker(globalPool.shrink)
 	}
 
 	mf, err := createMemoryFile()

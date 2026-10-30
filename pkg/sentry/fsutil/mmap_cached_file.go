@@ -25,7 +25,9 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/safemem"
+	"gvisor.dev/gvisor/pkg/sentry/fdbudget"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sync"
 )
 
 // MmapCachedFile implements MmapFile. It differs from MmapPreciseFile in the
@@ -65,6 +67,22 @@ type MmapCachedFile struct {
 	// mappings maps chunk start offsets to mappings of those chunks.
 	// +checklocks:mapsMu
 	mappings map[uint64]mapping `state:"nosave"`
+
+	// fdMu excludes closing an idle descriptor (CloseIdleFD) while a caller
+	// maps it: MapInternal, and address spaces (PinDataFD). It precedes
+	// mapsMu.
+	fdMu sync.RWMutex `state:"nosave"`
+
+	// reopen, if set, opens the file again, so that the Sentry's budget of
+	// host file descriptors may close f's descriptor while it is idle (see
+	// SetReopen). evicted is set while it has. Both are protected by fdMu;
+	// mayEvict is set once reopen is.
+	reopen   func() (int, error) `state:"nosave"`
+	evicted  bool                `state:"nosave"`
+	mayEvict atomicbitops.Bool   `state:"nosave"`
+
+	// fdEntry registers f's descriptor with the budget while reopen is set.
+	fdEntry fdbudget.Entry `state:"nosave"`
 }
 
 // chunkShift returns the binary log of the chunk size, which is the huge page
@@ -138,6 +156,8 @@ func (f *MmapCachedFile) ResetFD() {
 }
 
 func (f *MmapCachedFile) resetFD(fd int) {
+	f.fdMu.Lock()
+	defer f.fdMu.Unlock()
 	f.mapsMu.Lock()
 	for chunkStart, m := range f.mappings {
 		f.unmapAndRemove(chunkStart, m)
@@ -147,13 +167,117 @@ func (f *MmapCachedFile) resetFD(fd int) {
 	if oldFD >= 0 {
 		unix.Close(oldFD)
 	}
+	// A new descriptor is of another object, which reopen does not open.
+	f.dropReopenLocked()
 }
 
 func (f *MmapCachedFile) close() {
-	if fd := f.fd.RacyLoad(); fd >= 0 {
+	f.fdMu.Lock()
+	defer f.fdMu.Unlock()
+	if fd := f.fd.Load(); fd >= 0 {
 		unix.Close(int(fd))
-		f.fd.RacyStore(-1)
+		f.fd.Store(-1)
 	}
+	f.dropReopenLocked()
+}
+
+// SetReopen makes f's descriptor one that the Sentry's budget of host file
+// descriptors may close while it is idle, to stay within the host's limit on
+// them: reopen opens the file again when f next needs a descriptor, to map a
+// chunk that it has not mapped (MapInternal) or to map the file into an
+// address space (PinDataFD). Mappings of the file outlast its descriptor.
+//
+// Preconditions: SetFD has been called with a valid descriptor.
+func (f *MmapCachedFile) SetReopen(reopen func() (int, error)) {
+	f.fdMu.Lock()
+	defer f.fdMu.Unlock()
+	// The descriptor is registered while it is open and reopen is set.
+	registered := f.reopen != nil && !f.evicted
+	f.reopen = reopen
+	f.mayEvict.Store(true)
+	if fd := f.fd.Load(); fd >= 0 && !registered {
+		fdbudget.Opened(&f.fdEntry, f, int(fd))
+	}
+}
+
+// dropReopenLocked forgets reopen, and f's descriptor, which is closed or
+// replaced, with the budget.
+//
+// +checklocks:f.fdMu
+func (f *MmapCachedFile) dropReopenLocked() {
+	if f.reopen != nil {
+		fdbudget.Closed(&f.fdEntry)
+	}
+	f.reopen = nil
+	f.evicted = false
+}
+
+// CloseIdleFD implements fdbudget.Holder.CloseIdleFD.
+func (f *MmapCachedFile) CloseIdleFD() bool {
+	if !f.fdMu.TryLock() {
+		return false
+	}
+	defer f.fdMu.Unlock()
+	if fd := f.fd.Load(); fd >= 0 && f.reopen != nil {
+		unix.Close(int(fd))
+		f.fd.Store(-1)
+		f.evicted = true
+	}
+	return true
+}
+
+// PinDataFD implements memmap.DataFDPinner.PinDataFD.
+func (f *MmapCachedFile) PinDataFD(fr memmap.FileRange) (int, error) {
+	return f.pinFD()
+}
+
+// UnpinDataFD implements memmap.DataFDPinner.UnpinDataFD.
+func (f *MmapCachedFile) UnpinDataFD() {
+	f.fdMu.RUnlock()
+}
+
+// pinFD returns f's descriptor, opening it again if the budget closed it,
+// which stays open until f.fdMu.RUnlock.
+func (f *MmapCachedFile) pinFD() (int, error) {
+	for {
+		f.fdMu.RLock()
+		fd := f.fd.Load()
+		if fd >= 0 {
+			if f.reopen != nil {
+				f.fdEntry.Used()
+			}
+			return int(fd), nil
+		}
+		evicted := f.evicted
+		f.fdMu.RUnlock()
+		if !evicted {
+			return -1, unix.EBADF
+		}
+		if err := f.reopenFD(); err != nil {
+			return -1, err
+		}
+	}
+}
+
+// reopenFD opens f's descriptor again, after the budget closed it.
+func (f *MmapCachedFile) reopenFD() error {
+	f.fdMu.Lock()
+	defer f.fdMu.Unlock()
+	if !f.evicted {
+		return nil
+	}
+	fd, err := f.reopen()
+	if err != nil && fdbudget.Retry(err) {
+		fd, err = f.reopen()
+	}
+	if err != nil {
+		log.Warningf("fsutil.MmapCachedFile: opening a file again: %v", err)
+		return err
+	}
+	f.fd.Store(int32(fd))
+	f.evicted = false
+	fdbudget.Opened(&f.fdEntry, f, fd)
+	return nil
 }
 
 // MappableRelease implements MmapFile.MappableRelease.
@@ -290,6 +414,15 @@ func (f *MmapCachedFile) unmapAndRemove(chunkStart uint64, m mapping) {
 
 // MapInternal implements memmap.File.MapInternal.
 func (f *MmapCachedFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (safemem.BlockSeq, error) {
+	// A descriptor that the budget may close is pinned to map chunks;
+	// chunks mapped already need none, and stay mapped while the caller
+	// holds references to their pages.
+	if f.mayEvict.Load() && !f.chunksMapped(fr, at.Write) {
+		if _, err := f.pinFD(); err != nil {
+			return safemem.BlockSeq{}, err
+		}
+		defer f.fdMu.RUnlock()
+	}
 	chunks := ((fr.End + chunkMask()) >> chunkShift()) - (fr.Start >> chunkShift())
 	f.mapsMu.Lock()
 	defer f.mapsMu.Unlock()
@@ -308,12 +441,26 @@ func (f *MmapCachedFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType
 	return safemem.BlockSeqFromSlice(blocks), err
 }
 
+// chunksMapped returns whether every chunk of fr is mapped, for writing if
+// write is set.
+func (f *MmapCachedFile) chunksMapped(fr memmap.FileRange, write bool) bool {
+	f.mapsMu.Lock()
+	defer f.mapsMu.Unlock()
+	for chunkStart := fr.Start &^ chunkMask(); chunkStart < fr.End; chunkStart += chunkSize() {
+		m, ok := f.mappings[chunkStart]
+		if !ok || write && !m.writable {
+			return false
+		}
+		if chunkStart+chunkSize() == 0 {
+			break
+		}
+	}
+	return true
+}
+
 // +checklocks:f.mapsMu
 func (f *MmapCachedFile) forEachMappingBlockLocked(fr memmap.FileRange, write bool, fn func(safemem.Block)) error {
 	fd := f.fd.Load()
-	if fd < 0 {
-		return unix.EBADF
-	}
 	prot := unix.PROT_READ
 	if write {
 		prot |= unix.PROT_WRITE
@@ -324,6 +471,9 @@ func (f *MmapCachedFile) forEachMappingBlockLocked(fr memmap.FileRange, write bo
 	}
 	for {
 		m, ok := f.mappings[chunkStart]
+		if (!ok || write && !m.writable) && fd < 0 {
+			return unix.EBADF
+		}
 		if !ok {
 			addr, _, errno := unix.Syscall6(
 				unix.SYS_MMAP,
@@ -406,12 +556,15 @@ func (f *MmapCachedFile) RegenerateMappings() error {
 	return nil
 }
 
-// DataFD implements memmap.File.DataFD.
+// DataFD implements memmap.File.DataFD. A descriptor that the budget may
+// close (see SetReopen) is valid only until it does: callers that map it
+// pin it instead (see memmap.PinDataFD).
 func (f *MmapCachedFile) DataFD(fr memmap.FileRange) (int, error) {
-	fd := f.FD()
-	if fd < 0 {
-		return -1, unix.EBADF
+	fd, err := f.pinFD()
+	if err != nil {
+		return -1, err
 	}
+	f.fdMu.RUnlock()
 	return fd, nil
 }
 

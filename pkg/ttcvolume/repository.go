@@ -5095,6 +5095,9 @@ func (r *Repository) openFile(name string, flags int, mode fs.FileMode) (*os.Fil
 		return nil, err
 	}
 	fd, err := unix.Openat(int(r.dir.Fd()), name, flags|unix.O_CLOEXEC|unix.O_NOFOLLOW, uint32(mode.Perm()))
+	if err != nil && retryOpen(err) {
+		fd, err = unix.Openat(int(r.dir.Fd()), name, flags|unix.O_CLOEXEC|unix.O_NOFOLLOW, uint32(mode.Perm()))
+	}
 	if err != nil {
 		return nil, err
 	}

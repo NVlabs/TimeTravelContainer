@@ -56,17 +56,35 @@ var diskMappings = struct {
 	m  map[diskMappingKey]*diskMapping
 }{m: make(map[diskMappingKey]*diskMapping)}
 
-// newDiskMapping returns a mapping of file, which it takes.
-func newDiskMapping(file *os.File) (*diskMapping, error) {
-	// file's finalizer would close its descriptor.
-	fd, err := unix.Dup(int(file.Fd()))
-	file.Close()
+// newDiskMapping returns a mapping of file, which it takes, the host file of
+// object, of repo.
+func newDiskMapping(file *os.File, repo *ttcvolume.Repository, object string) (*diskMapping, error) {
+	fd, err := takeFD(file)
 	if err != nil {
 		return nil, err
 	}
 	m := &diskMapping{}
 	m.SetFD(fd)
+	// The Sentry may close the descriptor while it is idle, to stay within
+	// the host's limit on them, and open the object again when it next maps
+	// it: the object is the same while the mapping is of it, and a mapping
+	// of a sealed object maps it only for reading.
+	m.SetReopen(func() (int, error) {
+		file, err := repo.OpenObject(object, !m.shared.Load())
+		if err != nil {
+			return -1, err
+		}
+		return takeFD(file)
+	})
 	return m, nil
+}
+
+// takeFD returns a descriptor of file, which it closes: file's finalizer
+// would close its own.
+func takeFD(file *os.File) (int, error) {
+	fd, err := unix.Dup(int(file.Fd()))
+	file.Close()
+	return fd, err
 }
 
 // LiveForkShared implements memmap.LiveForkSharedFile.LiveForkShared.
@@ -88,7 +106,7 @@ func acquireSharedDiskMapping(repo *ttcvolume.Repository, object string, file *o
 		return m, nil
 	}
 	diskMappings.mu.Unlock()
-	m, err := newDiskMapping(file)
+	m, err := newDiskMapping(file, repo, object)
 	if err != nil {
 		return nil, err
 	}
