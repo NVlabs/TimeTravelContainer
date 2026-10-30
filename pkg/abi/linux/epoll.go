@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package linux
 
 // Event masks.
@@ -39,6 +42,10 @@ const (
 	// EP_PRIVATE_BITS is fs/eventpoll.c:EP_PRIVATE_BITS, the set of all bits
 	// in an epoll event mask that correspond to flags rather than I/O events.
 	EP_PRIVATE_BITS = EPOLLEXCLUSIVE | EPOLLWAKEUP | EPOLLONESHOT | EPOLLET
+
+	// EPOLLEXCLUSIVE_OK_BITS is fs/eventpoll.c:EPOLLEXCLUSIVE_OK_BITS, the
+	// set of all bits that EPOLL_CTL_ADD accepts along with EPOLLEXCLUSIVE.
+	EPOLLEXCLUSIVE_OK_BITS = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLWAKEUP | EPOLLET | EPOLLEXCLUSIVE
 )
 
 // Operation flags.

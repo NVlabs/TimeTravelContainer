@@ -257,8 +257,14 @@ func (ep *EpollInstance) AddInterest(file *FileDescription, num int32, event lin
 		return linuxerr.EPERM
 	}
 
-	// Check for cyclic polling if necessary.
+	// Linux: fs/eventpoll.c:do_epoll_ctl() refuses an exclusive wakeup for
+	// a nested epoll instance or along with other flags.
 	subep, _ := file.impl.(*EpollInstance)
+	if event.Events&linux.EPOLLEXCLUSIVE != 0 && (subep != nil || event.Events&^linux.EPOLLEXCLUSIVE_OK_BITS != 0) {
+		return linuxerr.EINVAL
+	}
+
+	// Check for cyclic polling if necessary.
 	if subep != nil {
 		epollCycleMu.Lock()
 		// epollCycleMu must be locked for the rest of AddInterest to ensure
@@ -342,6 +348,13 @@ func (ep *EpollInstance) mightPollRecursive(ep2 *EpollInstance, remainingRecursi
 //
 // Preconditions: A reference must be held on file.
 func (ep *EpollInstance) ModifyInterest(file *FileDescription, num int32, event linux.EpollEvent) error {
+	// Linux: fs/eventpoll.c:do_epoll_ctl() makes a wakeup exclusive only when
+	// it adds a file, so it refuses EPOLLEXCLUSIVE here, and any change to an
+	// interest added with it.
+	if event.Events&linux.EPOLLEXCLUSIVE != 0 {
+		return linuxerr.EINVAL
+	}
+
 	ep.interestMu.Lock()
 	defer ep.interestMu.Unlock()
 
@@ -352,6 +365,9 @@ func (ep *EpollInstance) ModifyInterest(file *FileDescription, num int32, event 
 	}]
 	if !ok {
 		return linuxerr.ENOENT
+	}
+	if epi.mask&linux.EPOLLEXCLUSIVE != 0 {
+		return linuxerr.EINVAL
 	}
 
 	// Update epi for the next call to ep.ReadEvents().

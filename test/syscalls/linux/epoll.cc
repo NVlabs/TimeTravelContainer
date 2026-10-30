@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -562,6 +567,71 @@ TEST(EpollTest, CycleOfThreeDisallowed) {
   event.data.u64 = kMagicConstant;
   EXPECT_THAT(epoll_ctl(epollfd2.get(), EPOLL_CTL_ADD, epollfd.get(), &event),
               SyscallFailsWithErrno(ELOOP));
+}
+
+// EPOLLEXCLUSIVE may not wake a nested epoll instance.
+TEST(EpollTest, ExclusiveOfEpollDisallowed) {
+  auto epollfd = ASSERT_NO_ERRNO_AND_VALUE(NewEpollFD());
+  auto epollfd1 = ASSERT_NO_ERRNO_AND_VALUE(NewEpollFD());
+
+  struct epoll_event event;
+  event.events = EPOLLIN | EPOLLEXCLUSIVE;
+  event.data.u64 = kMagicConstant;
+  EXPECT_THAT(epoll_ctl(epollfd.get(), EPOLL_CTL_ADD, epollfd1.get(), &event),
+              SyscallFailsWithErrno(EINVAL));
+
+  // The refused add registered nothing.
+  event.events = EPOLLIN;
+  EXPECT_THAT(epoll_ctl(epollfd.get(), EPOLL_CTL_ADD, epollfd1.get(), &event),
+              SyscallSucceeds());
+}
+
+// EPOLLEXCLUSIVE accepts only some other flags.
+TEST(EpollTest, ExclusiveFlags) {
+  auto epollfd = ASSERT_NO_ERRNO_AND_VALUE(NewEpollFD());
+  auto eventfd = ASSERT_NO_ERRNO_AND_VALUE(NewEventFD());
+
+  struct epoll_event event;
+  event.data.u64 = kMagicConstant;
+  for (uint32_t flag : {EPOLLONESHOT, EPOLLPRI, EPOLLRDHUP, EPOLLRDNORM}) {
+    event.events = EPOLLIN | EPOLLEXCLUSIVE | flag;
+    EXPECT_THAT(epoll_ctl(epollfd.get(), EPOLL_CTL_ADD, eventfd.get(), &event),
+                SyscallFailsWithErrno(EINVAL))
+        << "flag " << flag;
+  }
+  event.events = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLEXCLUSIVE;
+  EXPECT_THAT(epoll_ctl(epollfd.get(), EPOLL_CTL_ADD, eventfd.get(), &event),
+              SyscallSucceeds());
+}
+
+// EPOLL_CTL_MOD can neither set EPOLLEXCLUSIVE nor change an interest added
+// with it.
+TEST(EpollTest, ExclusiveNotModifiable) {
+  auto epollfd = ASSERT_NO_ERRNO_AND_VALUE(NewEpollFD());
+  auto eventfd = ASSERT_NO_ERRNO_AND_VALUE(NewEventFD());
+  auto eventfd1 = ASSERT_NO_ERRNO_AND_VALUE(NewEventFD());
+
+  struct epoll_event event;
+  event.data.u64 = kMagicConstant;
+  event.events = EPOLLIN | EPOLLEXCLUSIVE;
+  ASSERT_THAT(epoll_ctl(epollfd.get(), EPOLL_CTL_ADD, eventfd.get(), &event),
+              SyscallSucceeds());
+  event.events = EPOLLIN;
+  EXPECT_THAT(epoll_ctl(epollfd.get(), EPOLL_CTL_MOD, eventfd.get(), &event),
+              SyscallFailsWithErrno(EINVAL));
+
+  // EPOLLEXCLUSIVE fails EPOLL_CTL_MOD before the lookup of the interest.
+  event.events = EPOLLIN | EPOLLEXCLUSIVE;
+  EXPECT_THAT(epoll_ctl(epollfd.get(), EPOLL_CTL_MOD, eventfd1.get(), &event),
+              SyscallFailsWithErrno(EINVAL));
+  ASSERT_NO_ERRNO(
+      RegisterEpollFD(epollfd.get(), eventfd1.get(), EPOLLIN, kMagicConstant));
+  EXPECT_THAT(epoll_ctl(epollfd.get(), EPOLL_CTL_MOD, eventfd1.get(), &event),
+              SyscallFailsWithErrno(EINVAL));
+
+  // An exclusive interest can still be removed.
+  EXPECT_THAT(epoll_ctl(epollfd.get(), EPOLL_CTL_DEL, eventfd.get(), nullptr),
+              SyscallSucceeds());
 }
 
 TEST(EpollTest, CloseFile) {
