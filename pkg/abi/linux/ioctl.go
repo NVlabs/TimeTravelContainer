@@ -29,6 +29,10 @@ const (
 	TCSETSW2    = 0x402c542c
 	TCSETSF     = 0x00005404
 	TCSETSF2    = 0x402c542d
+	TCGETA      = 0x00005405
+	TCSETA      = 0x00005406
+	TCSETAW     = 0x00005407
+	TCSETAF     = 0x00005408
 	TCSBRK      = 0x00005409
 	TIOCEXCL    = 0x0000540c
 	TIOCNXCL    = 0x0000540d
@@ -73,6 +77,10 @@ const (
 	FIOGETOWN   = 0x00008903
 	SIOCGPGRP   = 0x00008904
 )
+
+// TIOCGLCKTRMIOS is the ioctl(2) request, provided by asm-generic/ioctls.h,
+// that gets the termios bits a tty locks.
+const TIOCGLCKTRMIOS = 0x00005456
 
 // ioctl(2) requests provided by uapi/linux/sockios.h
 const (

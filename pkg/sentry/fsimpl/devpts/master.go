@@ -225,6 +225,24 @@ func (mfd *masterFileDescription) Ioctl(ctx context.Context, io usermem.IO, sysn
 		// N.B. TCSETSF2 on the master actually affects the configuration
 		// of the replica end and flushes the replica input queue.
 		return mfd.t.ld.setTermios2(t, args, true /* flushInput */)
+	case linux.TIOCOUTQ:
+		// Linux counts no pending output of a pty's: like it, report none.
+		pending := primitive.Int32(0)
+		_, err := pending.CopyOut(t, args[2].Pointer())
+		return 0, err
+	case linux.TIOCGLCKTRMIOS:
+		// No termios bits are locked.
+		var locked linux.Termios
+		_, err := locked.CopyOut(t, args[2].Pointer())
+		return 0, err
+	case linux.TCGETA:
+		// N.B. Like TCGETS, TCGETA returns the replica's termios.
+		return mfd.t.ld.getTermio(t, args)
+	case linux.TCSETA, linux.TCSETAW:
+		// N.B. Like TCSETS, TCSETA changes the replica's termios.
+		return mfd.t.ld.setTermio(t, args, false /* flushInput */)
+	case linux.TCSETAF:
+		return mfd.t.ld.setTermio(t, args, true /* flushInput */)
 	case linux.TCSBRK:
 		// TCSBRK with arg != 0 is tcdrain, which waits for output to
 		// drain. For a pty with no real hardware, this is a no-op.

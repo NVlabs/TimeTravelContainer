@@ -200,6 +200,17 @@ func (l *lineDiscipline) getTermios2(task *kernel.Task, args arch.SyscallArgumen
 	return 0, err
 }
 
+// getTermio gets the linux.Termio for the tty.
+//
+// +checklocksexclude:l.termiosMu
+func (l *lineDiscipline) getTermio(task *kernel.Task, args arch.SyscallArguments) (uintptr, error) {
+	l.termiosMu.RLock()
+	defer l.termiosMu.RUnlock()
+	t := l.termios.ToTermio()
+	_, err := t.CopyOut(task, args[2].Pointer())
+	return 0, err
+}
+
 // setTermios2 sets a linux.KernelTermios for the tty.
 //
 // +checklocksexclude:l.termiosMu
@@ -212,33 +223,9 @@ func (l *lineDiscipline) setTermios2(task *kernel.Task, args arch.SyscallArgumen
 	if _, err := t.CopyIn(task, args[2].Pointer()); err != nil {
 		return 0, err
 	}
-	if flushInput {
-		if err := l.tcFlush(replicaEndpoint, linux.TCIFLUSH); err != nil {
-			return 0, err
-		}
-	}
-
-	l.termiosMu.Lock()
-	oldCanonEnabled := l.termios.LEnabled(linux.ICANON)
-	l.termios = t
-	l.termiosGeneration++
-
-	// If canonical mode is turned off, move bytes from inQueue's wait
-	// buffer to its read buffer. Anything already in the read buffer is
-	// now readable.
-	if oldCanonEnabled && !l.termios.LEnabled(linux.ICANON) {
-		l.inQueue.mu.Lock()
-		l.inQueue.pushWaitBufLocked(l)
-		l.inQueue.readable = len(l.inQueue.readBuf) > 0
-		l.inQueue.mu.Unlock()
-		l.termiosMu.Unlock()
-		l.replicaWaiter.Notify(waiter.ReadableEvents)
-	} else {
-		l.termiosMu.Unlock()
-	}
-	l.notifyObservation()
-
-	return 0, nil
+	return 0, l.updateTermios(flushInput, func(termios *linux.KernelTermios) {
+		*termios = t
+	})
 }
 
 // setTermios sets a linux.Termios for the tty.
@@ -254,15 +241,46 @@ func (l *lineDiscipline) setTermios(task *kernel.Task, args arch.SyscallArgument
 	if _, err := t.CopyIn(task, args[2].Pointer()); err != nil {
 		return 0, err
 	}
+	return 0, l.updateTermios(flushInput, func(termios *linux.KernelTermios) {
+		termios.FromTermios(t)
+	})
+}
+
+// setTermio sets what a linux.Termio holds of the tty's termios.
+//
+// +checklocksexclude:l.termiosMu
+// +checklocksexclude:l.inQueue.mu
+// +checklocksexclude:l.outQueue.mu
+// +checklocksexclude:l.masterWaiter.mu
+// +checklocksexclude:l.replicaWaiter.mu
+func (l *lineDiscipline) setTermio(task *kernel.Task, args arch.SyscallArguments, flushInput bool) (uintptr, error) {
+	var t linux.Termio
+	if _, err := t.CopyIn(task, args[2].Pointer()); err != nil {
+		return 0, err
+	}
+	return 0, l.updateTermios(flushInput, func(termios *linux.KernelTermios) {
+		termios.FromTermio(t)
+	})
+}
+
+// updateTermios changes the tty's termios with update, having first discarded
+// the pending input if flushInput.
+//
+// +checklocksexclude:l.termiosMu
+// +checklocksexclude:l.inQueue.mu
+// +checklocksexclude:l.outQueue.mu
+// +checklocksexclude:l.masterWaiter.mu
+// +checklocksexclude:l.replicaWaiter.mu
+func (l *lineDiscipline) updateTermios(flushInput bool, update func(*linux.KernelTermios)) error {
 	if flushInput {
 		if err := l.tcFlush(replicaEndpoint, linux.TCIFLUSH); err != nil {
-			return 0, err
+			return err
 		}
 	}
 
 	l.termiosMu.Lock()
 	oldCanonEnabled := l.termios.LEnabled(linux.ICANON)
-	l.termios.FromTermios(t)
+	update(&l.termios)
 	l.termiosGeneration++
 
 	// If canonical mode is turned off, move bytes from inQueue's wait
@@ -279,8 +297,7 @@ func (l *lineDiscipline) setTermios(task *kernel.Task, args arch.SyscallArgument
 		l.termiosMu.Unlock()
 	}
 	l.notifyObservation()
-
-	return 0, nil
+	return nil
 }
 
 // +checklocksexclude:l.sizeMu

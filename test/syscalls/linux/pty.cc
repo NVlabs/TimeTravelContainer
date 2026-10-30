@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/capability.h>
@@ -1013,6 +1018,64 @@ TEST_F(PtyTest, TermiosAffectsReplica) {
   EXPECT_THAT(ioctl(replica_.get(), TCGETS, &replica_termios),
               SyscallSucceeds());
   EXPECT_EQ(master_termios, replica_termios);
+}
+
+// System V's TCGETA and TCSETA and its kin get and set the low 16 bits of the
+// termios flags, the line discipline and the first NCC control characters,
+// through either end.
+TEST_F(PtyTest, Termio) {
+  struct kernel_termios t = {};
+  ASSERT_THAT(ioctl(replica_.get(), TCGETS, &t), SyscallSucceeds());
+  t.c_lflag |= EXTPROC;  // High bits that TCSETA keeps.
+  t.c_cc[VEOL] = 'e';    // Not among the first NCC.
+  ASSERT_THAT(ioctl(replica_.get(), TCSETS, &t), SyscallSucceeds());
+
+  struct termio tio = {};
+  ASSERT_THAT(ioctl(replica_.get(), TCGETA, &tio), SyscallSucceeds());
+  EXPECT_EQ(tio.c_iflag, t.c_iflag & 0xffff);
+  EXPECT_EQ(tio.c_oflag, t.c_oflag & 0xffff);
+  EXPECT_EQ(tio.c_cflag, t.c_cflag & 0xffff);
+  EXPECT_EQ(tio.c_lflag, t.c_lflag & 0xffff);
+  EXPECT_EQ(tio.c_line, t.c_line);
+  for (int i = 0; i < NCC; i++) {
+    EXPECT_EQ(tio.c_cc[i], t.c_cc[i]) << "c_cc[" << i << "]";
+  }
+
+  tio.c_lflag &= ~ECHO;
+  tio.c_cc[VINTR] = 'x';
+  for (unsigned long request : {TCSETA, TCSETAW, TCSETAF}) {
+    ASSERT_THAT(ioctl(replica_.get(), request, &tio), SyscallSucceeds());
+    struct kernel_termios got = {};
+    ASSERT_THAT(ioctl(replica_.get(), TCGETS, &got), SyscallSucceeds());
+    EXPECT_EQ(got.c_lflag, t.c_lflag & ~ECHO) << "request " << request;
+    EXPECT_EQ(got.c_cc[VINTR], 'x') << "request " << request;
+    EXPECT_EQ(got.c_cc[VEOL], 'e') << "request " << request;
+  }
+
+  tio.c_cc[VINTR] = 'y';
+  ASSERT_THAT(ioctl(master_.get(), TCSETA, &tio), SyscallSucceeds());
+  struct termio from_master = {};
+  ASSERT_THAT(ioctl(master_.get(), TCGETA, &from_master), SyscallSucceeds());
+  EXPECT_EQ(from_master.c_cc[VINTR], 'y');
+  ASSERT_THAT(ioctl(replica_.get(), TCGETA, &tio), SyscallSucceeds());
+  EXPECT_EQ(tio.c_cc[VINTR], 'y');
+}
+
+// Like Linux, report no pending output of a pty's, and no locked termios bits.
+TEST_F(PtyTest, OutqAndLockedTermios) {
+  constexpr char kData[] = "unread";
+  ASSERT_THAT(WriteFd(replica_.get(), kData, sizeof(kData)),
+              SyscallSucceedsWithValue(sizeof(kData)));
+  for (int fd : {master_.get(), replica_.get()}) {
+    int outq = -1;
+    ASSERT_THAT(ioctl(fd, TIOCOUTQ, &outq), SyscallSucceeds());
+    EXPECT_EQ(outq, 0);
+    struct kernel_termios locked;
+    memset(&locked, 0xff, sizeof(locked));
+    ASSERT_THAT(ioctl(fd, TIOCGLCKTRMIOS, &locked), SyscallSucceeds());
+    struct kernel_termios zero = {};
+    EXPECT_EQ(memcmp(&locked, &zero, sizeof(locked)), 0);
+  }
 }
 
 // The master end of the pty has termios:

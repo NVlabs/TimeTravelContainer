@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package linux
 
 import (
@@ -110,6 +113,50 @@ func (t *KernelTermios) FromTermios(term Termios) {
 	t.LocalFlags = term.LocalFlags
 	t.LineDiscipline = term.LineDiscipline
 	t.ControlCharacters = term.ControlCharacters
+}
+
+// NCC is the number of control characters in a Termio.
+const NCC = 8
+
+// Termio is struct termio, defined in uapi/asm-generic/termios.h: the terminal
+// attributes of System V's ioctls, TCGETA and TCSETA and its kin.
+//
+// +marshal
+type Termio struct {
+	_                 structs.HostLayout
+	InputFlags        uint16
+	OutputFlags       uint16
+	ControlFlags      uint16
+	LocalFlags        uint16
+	LineDiscipline    uint8
+	ControlCharacters [NCC]uint8
+	_                 uint8
+}
+
+// ToTermio returns what a Termio holds of t: the low 16 bits of its flags,
+// its line discipline and its first NCC control characters.
+func (t *KernelTermios) ToTermio() Termio {
+	term := Termio{
+		InputFlags:     uint16(t.InputFlags),
+		OutputFlags:    uint16(t.OutputFlags),
+		ControlFlags:   uint16(t.ControlFlags),
+		LocalFlags:     uint16(t.LocalFlags),
+		LineDiscipline: t.LineDiscipline,
+	}
+	copy(term.ControlCharacters[:], t.ControlCharacters[:NCC])
+	return term
+}
+
+// FromTermio sets what a Termio holds of t, as
+// drivers/tty/tty_ioctl.c:user_termio_to_kernel_termios() does: the high 16
+// bits of its flags and its other control characters stay.
+func (t *KernelTermios) FromTermio(term Termio) {
+	t.InputFlags = t.InputFlags&^0xffff | uint32(term.InputFlags)
+	t.OutputFlags = t.OutputFlags&^0xffff | uint32(term.OutputFlags)
+	t.ControlFlags = t.ControlFlags&^0xffff | uint32(term.ControlFlags)
+	t.LocalFlags = t.LocalFlags&^0xffff | uint32(term.LocalFlags)
+	t.LineDiscipline = term.LineDiscipline
+	copy(t.ControlCharacters[:NCC], term.ControlCharacters[:])
 }
 
 // IsTerminating returns whether c is a line terminating character.
