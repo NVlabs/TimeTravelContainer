@@ -69,8 +69,10 @@ type syscallThread struct {
 	stackRange memmap.FileRange
 
 	// sentryAddr is the address of the shared memory region in the Sentry
-	// address space.
-	sentryAddr uintptr
+	// address space, and sentryAddrOwn is set if the Sentry maps it with a
+	// mapping of its own (see sentryMapping).
+	sentryAddr    uintptr
+	sentryAddrOwn bool
 	// stubAddr is the address of the shared memory region in the stub
 	// address space.
 	stubAddr uintptr
@@ -125,18 +127,13 @@ func (t *syscallThread) init(seccompNotify bool) error {
 	}
 
 	// Map the stack into the sentry.
-	sentryAddr, errno := hostsyscall.RawSyscall6(
-		unix.SYS_MMAP,
-		0,
-		syscallThreadMessageSize,
-		unix.PROT_WRITE|unix.PROT_READ,
-		unix.MAP_SHARED|unix.MAP_FILE,
-		uintptr(t.subproc.memoryFile.FD()), uintptr(fr.Start))
-	if errno != 0 {
+	sentryAddr, own, err := sentryMapping(t.subproc.memoryFile, fr)
+	if err != nil {
 		t.destroy()
-		return fmt.Errorf("mmap failed: %v", errno)
+		return fmt.Errorf("mmap failed: %v", err)
 	}
 	t.sentryAddr = sentryAddr
+	t.sentryAddrOwn = own
 
 	t.initRequestReplyAddresses(sentryAddr)
 	return nil
@@ -144,14 +141,7 @@ func (t *syscallThread) init(seccompNotify bool) error {
 
 func (t *syscallThread) destroy() {
 	if t.sentryAddr != 0 {
-		errno := hostsyscall.RawSyscallErrno(
-			unix.SYS_MUNMAP,
-			t.sentryAddr,
-			syscallThreadMessageSize,
-			0)
-		if errno != 0 {
-			panic(fmt.Sprintf("mumap failed: %v", errno))
-		}
+		unmapFromSentry(t.sentryAddr, syscallThreadMessageSize, t.sentryAddrOwn)
 	}
 	if t.stubAddr != 0 {
 		_, err := t.thread.syscallIgnoreInterrupt(&t.thread.initRegs, unix.SYS_MUNMAP,

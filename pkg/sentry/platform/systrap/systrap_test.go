@@ -219,40 +219,37 @@ func children(t *testing.T) (int, int) {
 	return n, zombies
 }
 
-// mappedBytes returns the size of this process's memory mappings.
-func mappedBytes(t *testing.T) uint64 {
+// mappings returns how many memory mappings this process has.
+func mappings(t *testing.T) int {
 	t.Helper()
 	data, err := os.ReadFile("/proc/self/maps")
 	if err != nil {
 		t.Fatal(err)
 	}
-	var total uint64
-	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
-		var start, end uint64
-		if _, err := fmt.Sscanf(line, "%x-%x", &start, &end); err != nil {
-			t.Fatalf("parsing %q: %v", line, err)
-		}
-		total += end - start
-	}
-	return total
+	return len(strings.Split(strings.TrimSpace(string(data)), "\n"))
 }
 
 // The pool keeps a bounded number of released subprocesses: the stubs of the
-// others are killed and reaped, and the Sentry's mappings of their memory go.
+// others are killed and reaped. The Sentry reaches the memory it shares with
+// stubs through its own mapping of their memory file, not a mapping for each
+// stub, of which the host allows a process only so many.
 func TestPoolDestroysExcessSubprocesses(t *testing.T) {
 	s, err := New(platform.Options{DisableSyscallPatching: true, DisableFastPath: true})
 	if err != nil {
 		t.Fatalf("failed to create Systrap platform: %v", err)
 	}
 	const excess = 16
+	before := mappings(t)
 	ases := make([]platform.AddressSpace, maxAvailableSubprocesses+excess)
 	for i := range ases {
 		if ases[i], err = s.NewAddressSpace(); err != nil {
 			t.Fatalf("NewAddressSpace %d: %v", i, err)
 		}
 	}
+	if added := mappings(t) - before; added > len(ases)/8 {
+		t.Errorf("%d subprocesses added %d mappings to the Sentry", len(ases), added)
+	}
 	stubs, _ := children(t)
-	mapped := mappedBytes(t)
 	for _, as := range ases {
 		as.Release()
 	}
@@ -270,9 +267,5 @@ func TestPoolDestroysExcessSubprocesses(t *testing.T) {
 	}
 	if left > stubs-excess || zombies != 0 {
 		t.Errorf("%d children, %d of them zombies, after destroying %d of %d stubs", left, zombies, excess, stubs)
-	}
-	// Each destroyed subprocess had its thread contexts mapped, at least.
-	if got := mappedBytes(t); got > mapped-excess*uint64(stubContextRegionLen) {
-		t.Errorf("%d bytes mapped after destroying %d subprocesses, from %d", got, excess, mapped)
 	}
 }

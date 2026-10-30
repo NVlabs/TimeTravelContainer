@@ -19,6 +19,7 @@ package fsutil
 
 import (
 	"fmt"
+	"math"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
@@ -26,6 +27,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/fdbudget"
+	"gvisor.dev/gvisor/pkg/sentry/hostmm"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sync"
 )
@@ -44,7 +46,6 @@ import (
 // +stateify savable
 type MmapCachedFile struct {
 	memmap.DefaultMemoryType
-	memmap.NoBufferedIOFallback
 
 	// fd is the file descriptor.
 	fd atomicbitops.Int32
@@ -111,6 +112,40 @@ func chunkMask() uint64 {
 
 func pagesInChunk(fr memmap.FileRange, chunkStart uint64) int64 {
 	return int64(fr.Intersect(memmap.FileRange{Start: chunkStart, End: chunkStart + chunkSize()}).Length() >> hostarch.PageShift)
+}
+
+// cachedChunks counts the Sentry's mappings of chunks of MmapCachedFiles.
+var cachedChunks atomicbitops.Int64
+
+var chunkBudget struct {
+	bounded atomicbitops.Bool
+	once    sync.Once
+	n       int64
+}
+
+// BoundChunkMappings makes MmapCachedFiles keep at most chunkMappingBudget
+// chunks mapped in the Sentry. The Sentry calls it on platforms whose address
+// spaces map files themselves; one whose address spaces map the Sentry's
+// mappings of files (KVM) needs every chunk that its guests map.
+func BoundChunkMappings() {
+	chunkBudget.bounded.Store(true)
+}
+
+// chunkMappingBudget returns how many chunks MmapCachedFiles may keep mapped
+// in the Sentry, if BoundChunkMappings was called: a quarter of the mappings
+// that the host allows a process, as application memory may take another
+// quarter (see pgalloc's homes). Past it, MapInternal declines to map more
+// chunks (memmap.BufferedIOFallbackErr), and the Sentry reads and writes what
+// it would have mapped with buffered I/O: slower, but its guests do not fail
+// for the host's limit.
+func chunkMappingBudget() int64 {
+	if !chunkBudget.bounded.Load() {
+		return math.MaxInt64
+	}
+	chunkBudget.once.Do(func() {
+		chunkBudget.n = int64(hostmm.MaxMapCount() / 4)
+	})
+	return chunkBudget.n
 }
 
 // +stateify savable
@@ -410,6 +445,7 @@ func (f *MmapCachedFile) unmapAndRemove(chunkStart uint64, m mapping) {
 		log.Warningf("fsutil.MmapCachedFile: failed to unmap mapping %#x for chunk %#x: %v", m.addr, chunkStart, errno)
 	}
 	delete(f.mappings, chunkStart)
+	cachedChunks.Add(-1)
 }
 
 // MapInternal implements memmap.File.MapInternal.
@@ -474,6 +510,9 @@ func (f *MmapCachedFile) forEachMappingBlockLocked(fr memmap.FileRange, write bo
 		if (!ok || write && !m.writable) && fd < 0 {
 			return unix.EBADF
 		}
+		if !ok && cachedChunks.Load() >= chunkMappingBudget() {
+			return memmap.BufferedIOFallbackErr{}
+		}
 		if !ok {
 			addr, _, errno := unix.Syscall6(
 				unix.SYS_MMAP,
@@ -486,6 +525,7 @@ func (f *MmapCachedFile) forEachMappingBlockLocked(fr memmap.FileRange, write bo
 			if errno != 0 {
 				return errno
 			}
+			cachedChunks.Add(1)
 			m = mapping{addr, write}
 			f.mappings[chunkStart] = m
 		} else if write && !m.writable {
@@ -566,6 +606,77 @@ func (f *MmapCachedFile) DataFD(fr memmap.FileRange) (int, error) {
 	}
 	f.fdMu.RUnlock()
 	return fd, nil
+}
+
+// BufferReadAt implements memmap.File.BufferReadAt, for chunks that
+// MapInternal does not map (see chunkMappingBudget). It reads what a mapping
+// of the file would: zeroes past the file's end in the page that holds it,
+// and a fault past that page.
+func (f *MmapCachedFile) BufferReadAt(off uint64, dst []byte) (uint64, error) {
+	fd, err := f.pinFD()
+	if err != nil {
+		return 0, err
+	}
+	defer f.fdMu.RUnlock()
+	done := uint64(0)
+	for done < uint64(len(dst)) {
+		n, err := unix.Pread(fd, dst[done:], int64(off+done))
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return done, err
+		}
+		if n == 0 {
+			end := min(uint64(len(dst)), pageRoundUp(off+done)-off)
+			clear(dst[done:end])
+			if done = end; done < uint64(len(dst)) {
+				return done, unix.EFAULT
+			}
+			break
+		}
+		done += uint64(n)
+	}
+	return done, nil
+}
+
+// BufferWriteAt implements memmap.File.BufferWriteAt, for chunks that
+// MapInternal does not map (see chunkMappingBudget). It writes what a mapping
+// of the file would: nothing past the file's end, which it does not extend,
+// and a fault past the page that holds it.
+func (f *MmapCachedFile) BufferWriteAt(off uint64, src []byte) (uint64, error) {
+	fd, err := f.pinFD()
+	if err != nil {
+		return 0, err
+	}
+	defer f.fdMu.RUnlock()
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return 0, err
+	}
+	size := uint64(stat.Size)
+	length := uint64(len(src))
+	if mapped := pageRoundUp(size); off+length > mapped {
+		length = mapped - min(off, mapped)
+		err = unix.EFAULT
+	}
+	written := min(length, size-min(off, size))
+	for done := uint64(0); done < written; {
+		n, werr := unix.Pwrite(fd, src[done:written], int64(off+done))
+		if werr == unix.EINTR {
+			continue
+		}
+		if werr != nil {
+			return done, werr
+		}
+		done += uint64(n)
+	}
+	return length, err
+}
+
+// pageRoundUp returns off rounded up to a page boundary.
+func pageRoundUp(off uint64) uint64 {
+	return (off + hostarch.PageSize - 1) &^ (hostarch.PageSize - 1)
 }
 
 // FD implements memmap.File.FD.

@@ -13,6 +13,7 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/fdbudget"
+	"gvisor.dev/gvisor/pkg/sentry/hostmm"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 )
 
@@ -146,4 +147,81 @@ func TestMmapCachedFileReleasedWhileClosed(t *testing.T) {
 	}
 	// Nothing of it remains for the budget to close.
 	evictAll()
+}
+
+// Past the budget of chunk mappings, MapInternal declines to map more chunks
+// of files, and buffered I/O reads and writes what it would have mapped.
+func TestMmapCachedFileChunkBudget(t *testing.T) {
+	BoundChunkMappings()
+	chunkMappingBudget()
+	before := cachedChunks.Load()
+	chunkBudget.n = before + 1
+	t.Cleanup(func() {
+		chunkBudget.bounded.Store(false)
+		chunkBudget.n = int64(hostmm.MaxMapCount() / 4)
+	})
+	f, _, release := newReopenableFile(t, 2*int(chunkSize()))
+	if got := readChunk(t, f, 0); got != 0 {
+		t.Errorf("page 0 reads %d, want 0", got)
+	}
+	page := uint64(chunkSize()/hostarch.PageSize) + 5
+	fr := memmap.FileRange{page * hostarch.PageSize, (page + 1) * hostarch.PageSize}
+	if _, err := f.MapInternal(fr, hostarch.Read); err != (memmap.BufferedIOFallbackErr{}) {
+		t.Fatalf("MapInternal of a chunk past the budget: %v, want BufferedIOFallbackErr", err)
+	}
+	buf := make([]byte, hostarch.PageSize)
+	if n, err := f.BufferReadAt(fr.Start, buf); err != nil || n != hostarch.PageSize || !bytes.Equal(buf, bytes.Repeat([]byte{byte(page)}, hostarch.PageSize)) {
+		t.Errorf("BufferReadAt: %d bytes, %v; want the page's", n, err)
+	}
+	if _, err := f.BufferWriteAt(fr.Start+7, []byte{0xee}); err != nil {
+		t.Errorf("BufferWriteAt: %v", err)
+	}
+	if _, err := f.BufferReadAt(fr.Start+7, buf[:1]); err != nil || buf[0] != 0xee {
+		t.Errorf("BufferReadAt after BufferWriteAt reads %#x (%v), want 0xee", buf[0], err)
+	}
+	// Past the file's end, buffered I/O faults, as a mapping would.
+	if _, err := f.BufferReadAt(2*chunkSize()-1, buf[:2]); err == nil {
+		t.Errorf("BufferReadAt past the end of the file succeeded")
+	}
+	release()
+	if after := cachedChunks.Load(); after != before {
+		t.Errorf("%d chunks mapped after the file's release, want %d", after, before)
+	}
+}
+
+// Buffered I/O of a file whose end is not at a page boundary reads and writes
+// what a mapping of it would: zeroes past the end in the page that holds it,
+// writes there that do not extend the file, and faults past that page.
+func TestMmapCachedFileBufferedEOF(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "f")
+	const size = hostarch.PageSize + 100
+	if err := os.WriteFile(path, bytes.Repeat([]byte{0xab}, size), 0600); err != nil {
+		t.Fatal(err)
+	}
+	fd, err := unix.Open(path, unix.O_RDWR|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &MmapCachedFile{}
+	f.SetFD(fd)
+	defer f.MappableRelease()
+	buf := make([]byte, hostarch.PageSize)
+	if n, err := f.BufferReadAt(hostarch.PageSize, buf); err != nil || n != hostarch.PageSize {
+		t.Fatalf("BufferReadAt of the last page: %d bytes, %v", n, err)
+	}
+	if !bytes.Equal(buf[:100], bytes.Repeat([]byte{0xab}, 100)) || !bytes.Equal(buf[100:], make([]byte, hostarch.PageSize-100)) {
+		t.Errorf("the last page reads other than the file's 100 bytes and zeroes")
+	}
+	if _, err := f.BufferReadAt(2*hostarch.PageSize, buf[:1]); err == nil {
+		t.Errorf("BufferReadAt past the last page succeeded")
+	}
+	if n, err := f.BufferWriteAt(hostarch.PageSize+90, bytes.Repeat([]byte{0xcd}, 20)); err != nil || n != 20 {
+		t.Errorf("BufferWriteAt across the end of the file: %d bytes, %v", n, err)
+	}
+	if data, err := os.ReadFile(path); err != nil || len(data) != size || data[size-1] != 0xcd || data[size-11] != 0xab {
+		t.Errorf("after a write across its end, the file is %d bytes (%v), want %d with the write's first 10", len(data), err, size)
+	}
+	if _, err := f.BufferWriteAt(2*hostarch.PageSize-1, []byte{1, 2}); err == nil {
+		t.Errorf("BufferWriteAt past the last page succeeded")
+	}
 }

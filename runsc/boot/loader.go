@@ -61,6 +61,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/user"
+	"gvisor.dev/gvisor/pkg/sentry/fsutil"
 	"gvisor.dev/gvisor/pkg/sentry/hostmm"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -974,6 +975,10 @@ func New(args Args) (*Loader, error) {
 		hostmm.LimitMaxMapCount(limit)
 	}
 	hostmm.MaxMapCount()
+	if p := args.Conf.Platform; p == "systrap" || p == "ptrace" {
+		// The Sentry's mappings of files are its own, not its guests'.
+		fsutil.BoundChunkMappings()
+	}
 
 	// Create kernel and platform.
 	l.pinRing.FD = args.PinRingFD

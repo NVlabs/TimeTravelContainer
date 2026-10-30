@@ -30,6 +30,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
@@ -63,10 +64,15 @@ func (s *subprocess) getThreadContextFromID(cid uint64) *sysmsg.ThreadContext {
 	return (*sysmsg.ThreadContext)(unsafe.Pointer(tcSlot))
 }
 
-func mmapContextQueueForSentry(memoryFile *pgalloc.MemoryFile, opts pgalloc.AllocOpts) (memmap.FileRange, *contextQueue) {
-	fr, err := memoryFile.Allocate(uint64(stubContextQueueRegionLen), opts)
-	if err != nil {
-		panic("failed to allocate a new subprocess context memory region")
+// sentryMapping returns the address in the Sentry of fr, a range of the stubs'
+// memory file that the caller holds: in the Sentry's own mapping of the file,
+// so that each stub costs the Sentry no host mapping of its own, of which the
+// host allows a process only so many (vm.max_map_count). Where fr spans two of
+// the file's mappings, it maps fr alone, and returns true: unmapFromSentry
+// then unmaps it.
+func sentryMapping(memoryFile *pgalloc.MemoryFile, fr memmap.FileRange) (uintptr, bool, error) {
+	if bs, err := memoryFile.MapInternal(fr, hostarch.ReadWrite); err == nil && bs.NumBlocks() == 1 {
+		return bs.Head().Addr(), false, nil
 	}
 	addr, errno := hostsyscall.RawSyscall6(
 		unix.SYS_MMAP,
@@ -76,10 +82,33 @@ func mmapContextQueueForSentry(memoryFile *pgalloc.MemoryFile, opts pgalloc.Allo
 		unix.MAP_SHARED|unix.MAP_FILE,
 		uintptr(memoryFile.FD()), uintptr(fr.Start))
 	if errno != 0 {
-		panic(fmt.Sprintf("mmap failed for subprocess context memory region: %v", errno))
+		return 0, false, errno
+	}
+	return addr, true, nil
+}
+
+// unmapFromSentry undoes sentryMapping, which returned addr and own, for a
+// range of length bytes.
+func unmapFromSentry(addr, length uintptr, own bool) {
+	if !own {
+		return
+	}
+	if errno := hostsyscall.RawSyscallErrno(unix.SYS_MUNMAP, addr, length, 0); errno != 0 {
+		panic(fmt.Sprintf("munmap(%#x, %#x) failed: %v", addr, length, errno))
+	}
+}
+
+func mmapContextQueueForSentry(memoryFile *pgalloc.MemoryFile, opts pgalloc.AllocOpts) (memmap.FileRange, *contextQueue, bool) {
+	fr, err := memoryFile.Allocate(uint64(stubContextQueueRegionLen), opts)
+	if err != nil {
+		panic("failed to allocate a new subprocess context memory region")
+	}
+	addr, own, err := sentryMapping(memoryFile, fr)
+	if err != nil {
+		panic(fmt.Sprintf("mmap failed for subprocess context memory region: %v", err))
 	}
 
-	return fr, (*contextQueue)(unsafe.Pointer(addr))
+	return fr, (*contextQueue)(unsafe.Pointer(addr)), own
 }
 
 // freeSentryMemory unmaps from the Sentry and frees the memory that it shares
@@ -97,17 +126,17 @@ func (s *subprocess) freeSentryMemory() {
 			t.seccompNotify.Close()
 		}
 		if t.sentryAddr != 0 {
-			hostsyscall.RawSyscallErrno(unix.SYS_MUNMAP, t.sentryAddr, syscallThreadMessageSize, 0)
+			unmapFromSentry(t.sentryAddr, syscallThreadMessageSize, t.sentryAddrOwn)
 			s.memoryFile.DecRef(t.stackRange)
 		}
 	}
 	if s.contextQueue != nil {
-		hostsyscall.RawSyscallErrno(unix.SYS_MUNMAP, uintptr(unsafe.Pointer(s.contextQueue)), stubContextQueueRegionLen, 0)
+		unmapFromSentry(uintptr(unsafe.Pointer(s.contextQueue)), stubContextQueueRegionLen, s.contextQueueOwn)
 		s.memoryFile.DecRef(s.contextQueueFR)
 		s.contextQueue = nil
 	}
 	if s.threadContextRegion != 0 {
-		hostsyscall.RawSyscallErrno(unix.SYS_MUNMAP, s.threadContextRegion, stubContextRegionLen, 0)
+		unmapFromSentry(s.threadContextRegion, stubContextRegionLen, s.threadContextRegionOwn)
 		s.memoryFile.DecRef(s.threadContextFR)
 		s.threadContextRegion = 0
 	}

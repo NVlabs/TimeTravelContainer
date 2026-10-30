@@ -26,10 +26,7 @@ import (
 )
 
 func (p *sysmsgThread) unmapStackFromSentry() {
-	errno := hostsyscall.RawSyscallErrno(unix.SYS_MUNMAP, sysmsg.MsgToStackAddr(uintptr(unsafe.Pointer(p.msg))), sysmsg.PerThreadSharedStackSize, 0)
-	if errno != 0 {
-		panic("failed to unmap: " + errno.Error())
-	}
+	unmapFromSentry(sysmsg.MsgToStackAddr(uintptr(unsafe.Pointer(p.msg))), sysmsg.PerThreadSharedStackSize, p.stackOwn)
 }
 
 func (p *sysmsgThread) setMsg(addr uintptr) {

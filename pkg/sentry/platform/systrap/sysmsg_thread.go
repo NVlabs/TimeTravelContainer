@@ -49,6 +49,10 @@ type sysmsgThread struct {
 	// stackRange is a sysmsg stack in the memory file.
 	stackRange memmap.FileRange
 
+	// stackOwn is set if the Sentry maps the stack with a mapping of its
+	// own (see sentryMapping).
+	stackOwn bool
+
 	// fpuStateToMsgOffset is the offset of a thread fpu state relative to sysmsg.
 	fpuStateToMsgOffset uint64
 }

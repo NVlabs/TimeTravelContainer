@@ -595,9 +595,14 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 						// see writeFaultRangeLocked.
 						copyAR = pseg.Range().Intersect(ar)
 					}
-					// Get internal mappings from the pma to copy from.
+					// Get internal mappings from the pma to copy from, or read
+					// a file that the Sentry does not map.
+					buffered := false
 					if err := pseg.ensureInternalMappingsLocked(); err != nil {
-						return pstart, pseg.PrevGap(), err
+						if _, ok := err.(memmap.BufferedIOFallbackErr); !ok {
+							return pstart, pseg.PrevGap(), err
+						}
+						buffered = true
 					}
 					// Copy the pmas that follow in ar along with it, when they
 					// need copying too, into the same allocation. Page-sized
@@ -611,7 +616,7 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 						limit = boundary
 					}
 					copyAR.End = min(copyAR.End, limit)
-					for next := pseg.NextSegment(); next.Ok() && next.Start() == copyAR.End && copyAR.End < limit; next = next.NextSegment() {
+					for next := pseg.NextSegment(); !buffered && next.Ok() && next.Start() == copyAR.End && copyAR.End < limit; next = next.NextSegment() {
 						if !mm.isPMACopyOnWriteLocked(vseg, next) || next.ensureInternalMappingsLocked() != nil {
 							break
 						}
@@ -619,14 +624,20 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 					}
 					// Copy contents.
 					huge := mm.mf.HugepagesEnabled() && copyAR.IsHugePageAligned()
-					reader := safemem.BlockSeqReader{Blocks: mm.internalMappingsLocked(pseg, copyAR)}
+					var readerFunc safemem.ReaderFunc
+					if buffered {
+						readerFunc = bufferedReader(oldpma.file, pseg.fileRangeOf(copyAR).Start)
+					} else {
+						reader := safemem.BlockSeqReader{Blocks: mm.internalMappingsLocked(pseg, copyAR)}
+						readerFunc = reader.ReadToBlocks
+					}
 					fr, err := mm.allocatePrivateLocked(copyAR, pgalloc.AllocOpts{
 						Kind:       usage.Anonymous,
 						MemCgID:    memCgID,
 						Mode:       pgalloc.AllocateAndWritePopulate,
 						Huge:       huge,
 						Dir:        allocDir,
-						ReaderFunc: reader.ReadToBlocks,
+						ReaderFunc: readerFunc,
 						// A copy goes where the page that the faulting task
 						// writes would, not where the original is.
 						Placement: placementOf(ctx, vma, copyAR.Start),
@@ -975,6 +986,22 @@ func (mm *MemoryManager) breakHugePageCOWLocked(ctx context.Context, block hosta
 		}).NextGap()
 	}
 	return mm.pmas.FindSegment(addr), true
+}
+
+// bufferedReader returns a reader of file from offset off that reads it with
+// buffered I/O, for a file whose pages the Sentry does not map (see
+// memmap.BufferedIOFallbackErr).
+func bufferedReader(file memmap.File, off uint64) safemem.ReaderFunc {
+	return func(dsts safemem.BlockSeq) (uint64, error) {
+		buf := make([]byte, dsts.NumBytes())
+		n, err := file.BufferReadAt(off, buf)
+		copied, copyErr := safemem.CopySeq(dsts, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buf[:n])))
+		off += copied
+		if err == nil {
+			err = copyErr
+		}
+		return copied, err
+	}
 }
 
 // densifiedBlocks counts the 2 MiB blocks that densifyBlockCOWLocked copied.

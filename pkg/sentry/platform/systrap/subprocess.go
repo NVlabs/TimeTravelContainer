@@ -167,6 +167,11 @@ type subprocess struct {
 	// contextQueueFR is the range of memoryFile that backs contextQueue.
 	contextQueueFR memmap.FileRange
 
+	// threadContextRegionOwn and contextQueueOwn are set if the Sentry maps
+	// those regions with mappings of their own (see sentryMapping).
+	threadContextRegionOwn bool
+	contextQueueOwn        bool
+
 	// memoryFile is used to allocate a sysmsg stack which is shared between a
 	// stub process and the Sentry.
 	memoryFile *pgalloc.MemoryFile
@@ -511,7 +516,7 @@ func (s *subprocess) mapSharedRegions() {
 	}
 
 	// Map shared regions into the sentry.
-	contextQueueFR, contextQueue := mmapContextQueueForSentry(s.memoryFile, opts)
+	contextQueueFR, contextQueue, contextQueueOwn := mmapContextQueueForSentry(s.memoryFile, opts)
 	contextQueue.init()
 
 	// Map thread context region into the syscall thread.
@@ -529,21 +534,16 @@ func (s *subprocess) mapSharedRegions() {
 
 	s.contextQueue = contextQueue
 	s.contextQueueFR = contextQueueFR
+	s.contextQueueOwn = contextQueueOwn
 
 	// Map thread context region into the sentry.
 	threadContextFR, err := s.memoryFile.Allocate(uint64(stubContextRegionLen), opts)
 	if err != nil {
 		panic("failed to allocate a new subprocess context memory region")
 	}
-	sentryThreadContextRegionAddr, errno := hostsyscall.RawSyscall6(
-		unix.SYS_MMAP,
-		0,
-		uintptr(threadContextFR.Length()),
-		unix.PROT_WRITE|unix.PROT_READ,
-		unix.MAP_SHARED|unix.MAP_FILE,
-		uintptr(s.memoryFile.FD()), uintptr(threadContextFR.Start))
-	if errno != 0 {
-		panic(fmt.Sprintf("mmap failed for subprocess context memory region: %v", errno))
+	sentryThreadContextRegionAddr, threadContextRegionOwn, err := sentryMapping(s.memoryFile, threadContextFR)
+	if err != nil {
+		panic(fmt.Sprintf("mmap failed for subprocess context memory region: %v", err))
 	}
 
 	// Map thread context region into the syscall thread.
@@ -560,6 +560,7 @@ func (s *subprocess) mapSharedRegions() {
 
 	s.threadContextRegion = sentryThreadContextRegionAddr
 	s.threadContextFR = threadContextFR
+	s.threadContextRegionOwn = threadContextRegionOwn
 }
 
 func (s *subprocess) mapPrivateRegions() {
@@ -1369,19 +1370,14 @@ func (s *subprocess) createSysmsgThreadLocked() error {
 	threadID := uint32(p.sysmsgStackID)
 
 	// Map the stack into the sentry.
-	sentryStackAddr, errno := hostsyscall.RawSyscall6(
-		unix.SYS_MMAP,
-		0,
-		sysmsg.PerThreadSharedStackSize,
-		unix.PROT_WRITE|unix.PROT_READ,
-		unix.MAP_SHARED|unix.MAP_FILE,
-		uintptr(s.memoryFile.FD()), uintptr(fr.Start))
-	if errno != 0 {
-		return fmt.Errorf("mmap failed: %w", errno)
+	sentryStackAddr, own, err := sentryMapping(s.memoryFile, fr)
+	if err != nil {
+		return fmt.Errorf("mmap failed: %w", err)
 	}
+	sysThread.stackOwn = own
 	defer func() {
 		if !success {
-			hostsyscall.RawSyscallErrno(unix.SYS_MUNMAP, sentryStackAddr, sysmsg.PerThreadSharedStackSize, 0)
+			unmapFromSentry(sentryStackAddr, sysmsg.PerThreadSharedStackSize, own)
 		}
 	}()
 
