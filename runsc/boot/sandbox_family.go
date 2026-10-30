@@ -651,6 +651,21 @@ type branchDehydration struct {
 	platform     platform.Platform
 	resume       bool
 	execSessions []ExecSessionInfo
+	// orphanRetention, if not nil, ends the retention of the unlinked files
+	// that image holds open (see RetainFilesystemOrphans).
+	orphanRetention func(reap bool) error
+}
+
+// endOrphanRetention ends the retention of the unlinked files that d's image
+// holds open, if any: reap is whether the image is discarded while the
+// branch's filesystem is kept, so that nothing will open them again.
+func (d *branchDehydration) endOrphanRetention(reap bool) error {
+	if d == nil || d.orphanRetention == nil {
+		return nil
+	}
+	end := d.orphanRetention
+	d.orphanRetention = nil
+	return end(reap)
 }
 
 // SandboxFamily owns all in-memory branches in one Sentry process. Branches
@@ -692,6 +707,7 @@ type SandboxFamily struct {
 	onLoaderKernelChanged          func(*kernel.Kernel, *watchdog.Watchdog)
 	forgetFilesystemBranch         func(string)
 	discardFilesystemBranch        func(string)
+	retainFilesystemOrphans        func(string) func(reap bool) error
 	reclaimFilesystemBranch        func(string) error
 	holdsTransactionSources        func() bool
 	// clockMonotonicRaw is whether the clocks of new branches' Kernels
@@ -757,6 +773,12 @@ type SandboxFamilyOptions struct {
 	// that ReclaimFilesystemBranch will follow: the filesystem's teardown need
 	// not make the branch's writes durable.
 	DiscardFilesystemBranch func(string)
+	// RetainFilesystemOrphans declares, before a dehydrated branch's Kernel is
+	// released, that the filesystem's teardown must leave the unlinked files
+	// that the dehydration image holds open in the branch. The function it
+	// returns ends that: when the branch has a Kernel again, or, reaping them,
+	// when its image is discarded while its filesystem is kept.
+	RetainFilesystemOrphans func(string) func(reap bool) error
 	// ReclaimFilesystemBranch removes the persistent filesystem root after a
 	// branch Kernel and all of its open file descriptions have been released.
 	// It also performs runtime-side graph collection when this is the only
@@ -829,6 +851,7 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 		onLoaderKernelChanged:          opts.OnLoaderKernelChanged,
 		forgetFilesystemBranch:         opts.ForgetFilesystemBranch,
 		discardFilesystemBranch:        opts.DiscardFilesystemBranch,
+		retainFilesystemOrphans:        opts.RetainFilesystemOrphans,
 		reclaimFilesystemBranch:        opts.ReclaimFilesystemBranch,
 		clockMonotonicRaw:              opts.ClockMonotonicRaw,
 		holdsTransactionSources:        opts.HoldsTransactionSources,
@@ -2543,6 +2566,12 @@ func (f *SandboxFamily) Dehydrate(id string, metadataFile *os.File) error {
 	if b.watchdog != nil {
 		b.watchdog.Stop()
 	}
+	// The image holds the branch's unlinked files open, which the teardown
+	// below releases: they must stay in the branch it rehydrates into.
+	var orphanRetention func(reap bool) error
+	if f.retainFilesystemOrphans != nil {
+		orphanRetention = f.retainFilesystemOrphans(filesystemBranch)
+	}
 	k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
 	k.Unpause()
 	k.WaitExited()
@@ -2562,6 +2591,7 @@ func (f *SandboxFamily) Dehydrate(id string, metadataFile *os.File) error {
 	b.watchdog = nil
 	b.dehydration = &branchDehydration{
 		image: image, platform: p, resume: wasRunning, execSessions: execSessions,
+		orphanRetention: orphanRetention,
 	}
 	var captures []*kernel.DehydrationCapture
 	for _, branch := range f.branches {
@@ -2574,19 +2604,21 @@ func (f *SandboxFamily) Dehydrate(id string, metadataFile *os.File) error {
 		_ = image.Close()
 		f.mu.Lock()
 		b.state = BranchFailed
+		d := b.dehydration
 		b.dehydration = nil
 		f.stateChanged.Broadcast()
 		f.mu.Unlock()
-		return fmt.Errorf("persisting dehydrated memory: %w", err)
+		return errors.Join(fmt.Errorf("persisting dehydrated memory: %w", err), d.endOrphanRetention(true))
 	}
 	if err := f.compactPlatformMemory(p, b); err != nil {
 		_ = image.Close()
 		f.mu.Lock()
 		b.state = BranchFailed
+		d := b.dehydration
 		b.dehydration = nil
 		f.stateChanged.Broadcast()
 		f.mu.Unlock()
-		return fmt.Errorf("compacting platform memory after dehydration: %w", err)
+		return errors.Join(fmt.Errorf("compacting platform memory after dehydration: %w", err), d.endOrphanRetention(true))
 	}
 	f.mu.Lock()
 	b.state = BranchDehydrated
@@ -2790,6 +2822,9 @@ func (f *SandboxFamily) Rehydrate(id string) error {
 		f.mu.Unlock()
 		return err
 	}
+	// The rehydrated Kernel holds the image's unlinked files, and reaps them
+	// when it releases them.
+	_ = d.endOrphanRetention(false)
 	if err := child.StartPaused(); err != nil {
 		child.Release()
 		f.mu.Lock()
@@ -3141,6 +3176,9 @@ func (f *SandboxFamily) destroy(id string, reclaimFilesystem bool) error {
 			mf.ReclaimUnusedSparseChunks()
 			mf.Destroy()
 		}
+		// Nothing opens the image's unlinked files again. A filesystem that
+		// stays must lose them now; one reclaimed loses them with the branch.
+		err = errors.Join(err, image.endOrphanRetention(!reclaimFilesystem))
 		if reclaimFilesystem {
 			err = errors.Join(err, f.reclaimReleasedFilesystem(b.filesystemBranch))
 		} else if f.forgetFilesystemBranch != nil {

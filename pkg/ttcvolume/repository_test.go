@@ -3493,6 +3493,80 @@ func TestWriteLayerTarPreservesVirtualMetadata(t *testing.T) {
 	}
 }
 
+// A dehydration image holds its branch's unlinked files open while the
+// teardown of the dehydrated runtime releases them: the branch keeps them
+// until a rehydrated runtime holds them again, or until the image is
+// discarded, when they are reaped.
+func TestRetainedOrphansOutliveTeardown(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("retain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	orphan := func(name string) uint64 {
+		t.Helper()
+		ino, err := repository.CreateRegular(MainBranch, RootInode, name, 0644, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		write(t, repository, MainBranch, ino, "held open", 0)
+		if err := repository.Unlink(MainBranch, RootInode, name); err != nil {
+			t.Fatal(err)
+		}
+		return ino
+	}
+	kept := func(ino uint64) bool {
+		t.Helper()
+		inode, err := repository.Inode(MainBranch, ino)
+		if errors.Is(err, os.ErrNotExist) {
+			return false
+		}
+		if err != nil || inode.Nlink != 0 {
+			t.Fatalf("orphan %d: %+v, %v", ino, inode, err)
+		}
+		return true
+	}
+
+	// Rehydration: the runtime holds the files again and reaps them itself.
+	rehydrated := orphan("rehydrated")
+	repository.RetainOrphans(MainBranch)
+	if err := repository.ReapOrphan(MainBranch, rehydrated); err != nil {
+		t.Fatal(err)
+	}
+	if !kept(rehydrated) {
+		t.Fatal("the teardown reaped an orphan that the image holds")
+	}
+	if err := repository.EndRetainOrphans(MainBranch, false); err != nil {
+		t.Fatal(err)
+	}
+	if !kept(rehydrated) {
+		t.Fatal("rehydration reaped an orphan that the runtime holds")
+	}
+	if err := repository.ReapOrphan(MainBranch, rehydrated); err != nil {
+		t.Fatal(err)
+	}
+	if kept(rehydrated) {
+		t.Fatal("the rehydrated runtime did not reap its released orphan")
+	}
+
+	// A discarded image: nothing opens the files again.
+	discarded := orphan("discarded")
+	repository.RetainOrphans(MainBranch)
+	if err := repository.ReapOrphan(MainBranch, discarded); err != nil {
+		t.Fatal(err)
+	}
+	if !kept(discarded) {
+		t.Fatal("the teardown reaped an orphan that the image holds")
+	}
+	if err := repository.EndRetainOrphans(MainBranch, true); err != nil {
+		t.Fatal(err)
+	}
+	if kept(discarded) {
+		t.Fatal("discarding the image left its orphan")
+	}
+}
+
 // A runtime deleting a branch marks it discarding first: its teardown then
 // reaps no orphans one by one, as the branch goes whole. The mark ends with
 // the removal, whether or not that succeeds, so a new branch of the same name

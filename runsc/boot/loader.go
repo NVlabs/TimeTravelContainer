@@ -1187,6 +1187,20 @@ func New(args Args) (*Loader, error) {
 				volume.repository.DiscardBranch(branch)
 			}
 		},
+		RetainFilesystemOrphans: func(branch string) func(bool) error {
+			repositories := make([]*ttcvolume.Repository, 0, len(l.ttcVolumeRepositories))
+			for _, volume := range l.ttcVolumeRepositories {
+				volume.repository.RetainOrphans(branch)
+				repositories = append(repositories, volume.repository)
+			}
+			return func(reap bool) error {
+				var err error
+				for _, repository := range repositories {
+					err = errors.Join(err, repository.EndRetainOrphans(branch, reap))
+				}
+				return err
+			}
+		},
 		ReclaimFilesystemBranch: func(branch string) error {
 			var result error
 			for source, volume := range l.ttcVolumeRepositories {

@@ -615,6 +615,88 @@ func TestSandboxFamilyDehydrateRehydrateForkedBranch(t *testing.T) {
 	}
 }
 
+// A dehydration image holds the branch's unlinked files open, so the teardown
+// of its Kernel must leave them in the filesystem branch: until rehydration,
+// or until the image is discarded, when only a filesystem that stays must lose
+// them.
+func TestSandboxFamilyDehydrationRetainsOrphans(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.Platform = &testMemoryCompactingPlatform{Platform: parent.Platform}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	if err := parent.StartPaused(); err != nil {
+		t.Fatalf("StartPaused: %v", err)
+	}
+	parent.Unpause()
+	var events []string
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{
+		LiveForkEligible: true,
+		RetainFilesystemOrphans: func(branch string) func(bool) error {
+			events = append(events, "retain "+branch)
+			return func(reap bool) error {
+				events = append(events, fmt.Sprintf("end %s reap=%t", branch, reap))
+				return nil
+			}
+		},
+	})
+	defer func() {
+		family.DestroyNonLoaderBranches()
+		parent.Pause()
+		parent.Release()
+	}()
+	dehydrate := func(id string) {
+		t.Helper()
+		metadata, err := os.CreateTemp(t.TempDir(), "dehydration-*.state")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := family.Dehydrate(id, metadata); err != nil {
+			t.Fatalf("Dehydrate(%q): %v", id, err)
+		}
+	}
+	expect := func(want ...string) {
+		t.Helper()
+		if !slices.Equal(events, want) {
+			t.Fatalf("events=%q, want %q", events, want)
+		}
+		events = nil
+	}
+
+	filesystemBranches := make(map[string]string)
+	for _, id := range []string{"rehydrated", "stopped", "deleted"} {
+		if _, err := family.Fork(&ForkBranchArgs{ID: id, Paused: true}); err != nil {
+			t.Fatalf("Fork(%q): %v", id, err)
+		}
+		family.mu.Lock()
+		filesystemBranches[id] = family.branches[id].filesystemBranch
+		family.mu.Unlock()
+	}
+	dehydrate("rehydrated")
+	expect("retain " + filesystemBranches["rehydrated"])
+	if err := family.Rehydrate("rehydrated"); err != nil {
+		t.Fatalf("Rehydrate: %v", err)
+	}
+	expect("end " + filesystemBranches["rehydrated"] + " reap=false")
+
+	dehydrate("stopped")
+	expect("retain " + filesystemBranches["stopped"])
+	if err := family.Destroy("stopped"); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	expect("end " + filesystemBranches["stopped"] + " reap=true")
+
+	dehydrate("deleted")
+	expect("retain " + filesystemBranches["deleted"])
+	if err := family.DestroyAndReclaim("deleted"); err != nil {
+		t.Fatalf("DestroyAndReclaim: %v", err)
+	}
+	expect("end " + filesystemBranches["deleted"] + " reap=false")
+}
+
 func TestSandboxFamilyDehydrateLoaderTransfersRole(t *testing.T) {
 	parent, err := testutil.Boot()
 	if err != nil {

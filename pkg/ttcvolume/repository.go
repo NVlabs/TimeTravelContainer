@@ -396,6 +396,10 @@ type Repository struct {
 	// discarding holds the branches DiscardBranch marked. It is protected by
 	// branchMu.
 	discarding map[string]struct{}
+	// retainingOrphans holds the branches RetainOrphans marked, each with the
+	// unlinked inodes that ReapOrphan left in it since. It is protected by
+	// branchMu.
+	retainingOrphans map[string][]uint64
 	// remoteLifecycleMu serializes source attachment, repository-wide
 	// materialization, and close. A restore pin does not retain this mutex:
 	// AttachRemoteObjectSource must remain able to install the incoming sources.
@@ -2496,6 +2500,51 @@ func (r *Repository) endDiscard(id string) {
 	delete(r.discarding, id)
 }
 
+// RetainOrphans declares that a dehydration image of branch id holds its
+// unlinked files open: the teardown of the dehydrated runtime releases them,
+// but ReapOrphan must leave them in the branch, which the image rehydrates
+// into, until EndRetainOrphans.
+func (r *Repository) RetainOrphans(id string) {
+	r.branchMu.Lock()
+	defer r.branchMu.Unlock()
+	if r.retainingOrphans == nil {
+		r.retainingOrphans = make(map[string][]uint64)
+	}
+	if _, ok := r.retainingOrphans[id]; !ok {
+		r.retainingOrphans[id] = nil
+	}
+}
+
+// EndRetainOrphans ends RetainOrphans for branch id. A runtime that holds the
+// unlinked files again, rehydrated from the image, reaps them itself;
+// otherwise, if reap, EndRetainOrphans reaps those that ReapOrphan left.
+func (r *Repository) EndRetainOrphans(id string, reap bool) error {
+	r.branchMu.Lock()
+	inodes := r.retainingOrphans[id]
+	delete(r.retainingOrphans, id)
+	r.branchMu.Unlock()
+	if !reap {
+		return nil
+	}
+	var err error
+	for _, ino := range inodes {
+		err = errors.Join(err, r.ReapOrphan(id, ino))
+	}
+	return err
+}
+
+// retainOrphan reports whether branch id retains its orphans, and if so,
+// records ino among them.
+func (r *Repository) retainOrphan(id string, ino uint64) bool {
+	r.branchMu.Lock()
+	defer r.branchMu.Unlock()
+	inodes, ok := r.retainingOrphans[id]
+	if ok {
+		r.retainingOrphans[id] = append(inodes, ino)
+	}
+	return ok
+}
+
 // ForgetBranch releases process-local caches for a branch whose Kernel has
 // been released. It does not alter the persistent branch pointer; ttcd removes
 // that pointer separately, or a later rehydration reloads it on demand.
@@ -2527,7 +2576,7 @@ func (r *Repository) ReapOrphan(branchID string, ino uint64) error {
 	if ino == rootInode {
 		return errors.New("cannot reap the root inode")
 	}
-	if r.Discarding(branchID) {
+	if r.Discarding(branchID) || r.retainOrphan(branchID, ino) {
 		return nil
 	}
 	return r.withLock(func() error {
