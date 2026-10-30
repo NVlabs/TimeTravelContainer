@@ -12,13 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package systrap
 
 import (
+	"bytes"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 	pkgcontext "gvisor.dev/gvisor/pkg/context"
@@ -180,5 +188,91 @@ func TestSpinningQueueLayout(t *testing.T) {
 	queueStart := stubContextQueueRegion + stubContextQueueRegionLen
 	if stubSpinningThreadQueueAddr < queueStart || stubSpinningThreadQueueAddr+sysmsg.SpinningQueueMemSize > stubContextRegion {
 		t.Errorf("spinning queue %#x not in [%#x, %#x)", stubSpinningThreadQueueAddr, queueStart, stubContextRegion)
+	}
+}
+
+// children returns the number of this process's children, and how many of
+// them are zombies.
+func children(t *testing.T) (int, int) {
+	t.Helper()
+	stats, err := filepath.Glob("/proc/[0-9]*/stat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	self := strconv.Itoa(os.Getpid())
+	var n, zombies int
+	for _, path := range stats {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue // Exited meanwhile.
+		}
+		// The fields after the parenthesized command: state, then ppid.
+		fields := strings.Fields(string(data[bytes.LastIndexByte(data, ')')+1:]))
+		if len(fields) < 2 || fields[1] != self {
+			continue
+		}
+		n++
+		if fields[0] == "Z" {
+			zombies++
+		}
+	}
+	return n, zombies
+}
+
+// mappedBytes returns the size of this process's memory mappings.
+func mappedBytes(t *testing.T) uint64 {
+	t.Helper()
+	data, err := os.ReadFile("/proc/self/maps")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var total uint64
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var start, end uint64
+		if _, err := fmt.Sscanf(line, "%x-%x", &start, &end); err != nil {
+			t.Fatalf("parsing %q: %v", line, err)
+		}
+		total += end - start
+	}
+	return total
+}
+
+// The pool keeps a bounded number of released subprocesses: the stubs of the
+// others are killed and reaped, and the Sentry's mappings of their memory go.
+func TestPoolDestroysExcessSubprocesses(t *testing.T) {
+	s, err := New(platform.Options{DisableSyscallPatching: true, DisableFastPath: true})
+	if err != nil {
+		t.Fatalf("failed to create Systrap platform: %v", err)
+	}
+	const excess = 16
+	ases := make([]platform.AddressSpace, maxAvailableSubprocesses+excess)
+	for i := range ases {
+		if ases[i], err = s.NewAddressSpace(); err != nil {
+			t.Fatalf("NewAddressSpace %d: %v", i, err)
+		}
+	}
+	stubs, _ := children(t)
+	mapped := mappedBytes(t)
+	for _, as := range ases {
+		as.Release()
+	}
+	globalPool.mu.Lock()
+	pooled := len(globalPool.available)
+	globalPool.mu.Unlock()
+	if pooled != maxAvailableSubprocesses {
+		t.Errorf("pooled %d subprocesses, want %d", pooled, maxAvailableSubprocesses)
+	}
+	var left, zombies int
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if left, zombies = children(t); left <= stubs-excess && zombies == 0 {
+			break
+		}
+	}
+	if left > stubs-excess || zombies != 0 {
+		t.Errorf("%d children, %d of them zombies, after destroying %d of %d stubs", left, zombies, excess, stubs)
+	}
+	// Each destroyed subprocess had its thread contexts mapped, at least.
+	if got := mappedBytes(t); got > mapped-excess*uint64(stubContextRegionLen) {
+		t.Errorf("%d bytes mapped after destroying %d subprocesses, from %d", got, excess, mapped)
 	}
 }

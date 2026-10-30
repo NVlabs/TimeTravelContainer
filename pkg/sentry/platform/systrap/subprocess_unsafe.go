@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //go:build go1.18
 // +build go1.18
 
@@ -77,6 +80,37 @@ func mmapContextQueueForSentry(memoryFile *pgalloc.MemoryFile, opts pgalloc.Allo
 	}
 
 	return fr, (*contextQueue)(unsafe.Pointer(addr))
+}
+
+// freeSentryMemory unmaps from the Sentry and frees the memory that it shares
+// with the stub of s, which is dead.
+func (s *subprocess) freeSentryMemory() {
+	s.sysmsgThreadsMu.Lock()
+	for id, t := range s.sysmsgThreads {
+		t.unmapStackFromSentry()
+		s.memoryFile.DecRef(t.stackRange)
+		delete(s.sysmsgThreads, id)
+	}
+	s.sysmsgThreadsMu.Unlock()
+	if t := s.syscallThread; t != nil {
+		if t.seccompNotify != nil {
+			t.seccompNotify.Close()
+		}
+		if t.sentryAddr != 0 {
+			hostsyscall.RawSyscallErrno(unix.SYS_MUNMAP, t.sentryAddr, syscallThreadMessageSize, 0)
+			s.memoryFile.DecRef(t.stackRange)
+		}
+	}
+	if s.contextQueue != nil {
+		hostsyscall.RawSyscallErrno(unix.SYS_MUNMAP, uintptr(unsafe.Pointer(s.contextQueue)), stubContextQueueRegionLen, 0)
+		s.memoryFile.DecRef(s.contextQueueFR)
+		s.contextQueue = nil
+	}
+	if s.threadContextRegion != 0 {
+		hostsyscall.RawSyscallErrno(unix.SYS_MUNMAP, s.threadContextRegion, stubContextRegionLen, 0)
+		s.memoryFile.DecRef(s.threadContextFR)
+		s.threadContextRegion = 0
+	}
 }
 
 func saveFPState(ctx *sharedContext, ac *arch.Context64) {

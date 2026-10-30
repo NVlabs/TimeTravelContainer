@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package systrap
 
 import (
@@ -36,11 +39,23 @@ type subprocessPool struct {
 	available []*subprocess
 }
 
-func (p *subprocessPool) markAvailable(s *subprocess) {
+// maxAvailableSubprocesses is the most subprocesses that the pool keeps for
+// reuse. Each is a host process, with memory and mappings of the Sentry's, and
+// an application that once ran thousands of processes at a time otherwise left
+// as many for good.
+const maxAvailableSubprocesses = 512
+
+// markAvailable makes s available for reuse, unless the pool is full. It
+// returns whether it did.
+func (p *subprocessPool) markAvailable(s *subprocess) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if len(p.available) >= maxAvailableSubprocesses {
+		return false
+	}
 	p.available = append(p.available, s)
+	return true
 }
 
 func (p *subprocessPool) fetchAvailable() *subprocess {

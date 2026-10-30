@@ -159,6 +159,9 @@ type subprocess struct {
 	// ThreadContext region.
 	threadContextFR memmap.FileRange
 
+	// contextQueueFR is the range of memoryFile that backs contextQueue.
+	contextQueueFR memmap.FileRange
+
 	// memoryFile is used to allocate a sysmsg stack which is shared between a
 	// stub process and the Sentry.
 	memoryFile *pgalloc.MemoryFile
@@ -420,8 +423,7 @@ func newSubprocess(create func() (*thread, error), memoryFile *pgalloc.MemoryFil
 		// registers its contexts left.
 		if !sp.waitStubThreadsAsleep() {
 			log.Warningf("Stub threads of a pooled subprocess did not fall asleep; killing it")
-			sp.syscallThread.thread.kill()
-			sp.release()
+			sp.destroy()
 			continue
 		}
 		sp.memoryFile.Decommit(sp.threadContextFR)
@@ -462,13 +464,11 @@ func newSubprocess(create func() (*thread, error), memoryFile *pgalloc.MemoryFil
 
 	go func() { // S/R-SAFE: Platform-related.
 
-		// Wait for requests to create threads.
+		// Wait for requests to create threads, until the subprocess is
+		// destroyed.
 		for req := range requests {
 			sp.handlePtraceSyscallRequest(req)
 		}
-
-		// Requests should never be closed.
-		panic("unreachable")
 	}()
 
 	sp.unmap()
@@ -523,6 +523,7 @@ func (s *subprocess) mapSharedRegions() {
 	}
 
 	s.contextQueue = contextQueue
+	s.contextQueueFR = contextQueueFR
 
 	// Map thread context region into the sentry.
 	threadContextFR, err := s.memoryFile.Allocate(uint64(stubContextRegionLen), opts)
@@ -591,17 +592,41 @@ func (s *subprocess) Release() {
 }
 
 func (s *subprocess) release() {
-	if s.alive() {
-		globalPool.markAvailable(s)
+	if s.alive() && globalPool.markAvailable(s) {
 		return
 	}
-	if s.syscallThread != nil {
-		if s.syscallThread.seccompNotify != nil {
-			s.syscallThread.seccompNotify.Close()
-		}
-		wstatus := unix.WaitStatus(0)
-		unix.Wait4(int(s.syscallThread.thread.tid), &wstatus, unix.WNOHANG, nil)
+	s.destroy()
+}
+
+// destroy kills the stub of s, which no address space uses, reaps it, and then
+// frees the memory and the mappings that the Sentry keeps for it.
+func (s *subprocess) destroy() {
+	// Unlike kill, wake no contexts: none uses s, and waking them would touch
+	// every context's page of memory before it is freed.
+	s.aliveMu.Lock()
+	killed := s.dead.CompareAndSwap(false, true) && s.syscallThread != nil && s.syscallThread.thread != nil
+	if killed {
+		s.syscallThread.thread.kill()
 	}
+	s.aliveMu.Unlock()
+	go func() { // S/R-SAFE: platform-related.
+		if s.syscallThread != nil {
+			// Wait for the stub killed above. One that died before was
+			// reaped by alive, unless it is a zombie still.
+			options := unix.WNOHANG
+			if killed {
+				options = 0
+			}
+			wstatus := unix.WaitStatus(0)
+			for {
+				if _, err := unix.Wait4(int(s.syscallThread.thread.tid), &wstatus, options, nil); err != unix.EINTR {
+					break
+				}
+			}
+		}
+		s.freeSentryMemory()
+		close(s.requests)
+	}()
 }
 
 // withAliveRLock executes fn while holding aliveMu.RLock(), ensuring the subprocess is alive.
