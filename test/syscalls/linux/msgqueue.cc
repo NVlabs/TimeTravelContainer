@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include <errno.h>
 #include <linux/capability.h>
 #include <signal.h>
@@ -377,6 +382,29 @@ TEST(MsgqueueTest, MsgOpPermissions) {
         msgrcv(queue.get(), &buf, sizeof(buf.mtext), 0, MSG_COPY | IPC_NOWAIT),
         SyscallFailsWithErrno(EACCES));
   }
+}
+
+// IPC_SET can hand a queue to another owner, but its creator keeps the owner's
+// permissions.
+TEST(MsgqueueTest, CreatorKeepsAccess) {
+  AutoCapability cap(CAP_IPC_OWNER, false);
+  constexpr uid_t kScratchUID = 65534;
+  constexpr gid_t kScratchGID = 65534;
+
+  Queue queue = ASSERT_NO_ERRNO_AND_VALUE(Msgget(IPC_PRIVATE, 0600));
+  struct msqid_ds ds;
+  ASSERT_THAT(msgctl(queue.get(), IPC_STAT, &ds), SyscallSucceeds());
+  ds.msg_perm.uid = kScratchUID;
+  ds.msg_perm.gid = kScratchGID;
+  ASSERT_THAT(msgctl(queue.get(), IPC_SET, &ds), SyscallSucceeds());
+
+  msgbuf buf{1, "A message."};
+  EXPECT_THAT(msgsnd(queue.get(), &buf, sizeof(buf.mtext), 0),
+              SyscallSucceeds());
+  msgbuf rcv;
+  EXPECT_THAT(msgrcv(queue.get(), &rcv, sizeof(rcv.mtext), 1, 0),
+              SyscallSucceedsWithValue(sizeof(rcv.mtext)));
+  EXPECT_TRUE(buf == rcv);
 }
 
 // Test limits for messages and queues.

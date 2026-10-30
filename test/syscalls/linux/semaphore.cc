@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include <linux/capability.h>
 #include <sched.h>
 #include <signal.h>
@@ -644,6 +649,31 @@ TEST(SemaphoreTest, SemCtlIpcStat) {
   ASSERT_THAT(semctl(sem.get(), 0, IPC_SET, &semid_to_set), SyscallSucceeds());
   EXPECT_THAT(semctl(sem.get(), 0, IPC_STAT, &ds),
               SyscallFailsWithErrno(EACCES));
+}
+
+// IPC_SET can hand a set to another owner, but its creator keeps the owner's
+// permissions.
+TEST(SemaphoreTest, CreatorKeepsAccess) {
+  // Drop CAP_IPC_OWNER which allows us to bypass semaphore permissions.
+  AutoCapability cap(CAP_IPC_OWNER, false);
+  constexpr uid_t kScratchUID = 65534;
+  constexpr gid_t kScratchGID = 65534;
+
+  AutoSem sem(semget(IPC_PRIVATE, 1, 0600 | IPC_CREAT));
+  ASSERT_THAT(sem.get(), SyscallSucceeds());
+
+  struct semid_ds ds = {};
+  ds.sem_perm.uid = kScratchUID;
+  ds.sem_perm.gid = kScratchGID;
+  ds.sem_perm.mode = 0600;
+  ASSERT_THAT(semctl(sem.get(), 0, IPC_SET, &ds), SyscallSucceeds());
+
+  ASSERT_THAT(semctl(sem.get(), 0, IPC_STAT, &ds), SyscallSucceeds());
+  EXPECT_EQ(ds.sem_perm.uid, kScratchUID);
+  EXPECT_EQ(ds.sem_perm.cuid, getuid());
+  struct sembuf buf = {};
+  buf.sem_op = 1;
+  EXPECT_THAT(semop(sem.get(), &buf, 1), SyscallSucceeds());
 }
 
 // Calls semctl(semid, 0, cmd) until the returned value is >= target, an

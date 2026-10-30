@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package ipc defines functionality and utilities common to sysvipc mechanisms.
 //
 // Lock ordering: [shm/semaphore/msgqueue].Registry.mu -> Mechanism
@@ -127,10 +130,13 @@ func (o *Object) CheckOwnership(creds *auth.Credentials) bool {
 //
 // Preconditions: The containing mechanism's mutex must be held.
 func (o *Object) CheckPermissions(creds *auth.Credentials, req vfs.AccessTypes) bool {
+	// Like Linux, grant the owner's permissions to the creator as well, and
+	// the group's to members of either group: IPC_SET can hand an object to
+	// another owner, but its creator keeps access.
 	perms := uint16(o.Mode.Permissions())
-	if o.OwnerUID == creds.EffectiveKUID {
+	if o.OwnerUID == creds.EffectiveKUID || o.CreatorUID == creds.EffectiveKUID {
 		perms >>= 6
-	} else if creds.InGroup(o.OwnerGID) {
+	} else if creds.InGroup(o.OwnerGID) || creds.InGroup(o.CreatorGID) {
 		perms >>= 3
 	}
 

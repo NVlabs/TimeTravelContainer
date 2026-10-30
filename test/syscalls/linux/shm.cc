@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include <errno.h>
 #include <linux/capability.h>
 #include <stdio.h>
@@ -597,6 +602,25 @@ TEST(ShmTest, RmidOwnershipPermissionDenied) {
   ScopedThread([&] {
     drop_privs([&] { EXPECT_NO_ERRNO(shm.Rmid()); });
   }).Join();
+}
+
+// IPC_SET can hand a segment to another owner, but its creator keeps the
+// owner's permissions.
+TEST(ShmTest, CreatorKeepsAccess) {
+  AutoCapability cap(CAP_IPC_OWNER, false);
+
+  ShmSegment shm = ASSERT_NO_ERRNO_AND_VALUE(
+      Shmget(IPC_PRIVATE, kAllocSize, IPC_CREAT | 0600));
+  struct shmid_ds attr;
+  ASSERT_NO_ERRNO(Shmctl(shm.id(), IPC_STAT, &attr));
+  attr.shm_perm.uid = absl::GetFlag(FLAGS_scratch_uid);
+  attr.shm_perm.gid = absl::GetFlag(FLAGS_scratch_gid);
+  ASSERT_NO_ERRNO(Shmctl(shm.id(), IPC_SET, &attr));
+
+  char* addr = ASSERT_NO_ERRNO_AND_VALUE(Shmat(shm.id(), nullptr, 0));
+  addr[0] = 'x';
+  EXPECT_EQ(addr[0], 'x');
+  ASSERT_NO_ERRNO(Shmdt(addr));
 }
 
 }  // namespace
