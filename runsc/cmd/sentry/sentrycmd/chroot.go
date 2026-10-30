@@ -123,6 +123,12 @@ func setupMinimalProcfs(chroot string, timer *timing.Timer) error {
 			return fmt.Errorf("failed to copy %q -> %q: %w", f, filepath.Join(chroot, f), err)
 		}
 	}
+	// The host's limit on a process's mappings, which stubs keep within;
+	// they assume the default where the host does not show it.
+	const maxMapCount = "/proc/sys/vm/max_map_count"
+	if err := sandboxsetup.CopyFile(filepath.Join(chroot, maxMapCount), maxMapCount); err != nil {
+		log.Warningf("Failed to copy %q -> %q: %v", maxMapCount, filepath.Join(chroot, maxMapCount), err)
+	}
 	// Create symlink for /proc/self.
 	if err := os.Symlink(procSubmountDir+"/self", filepath.Join(procRoot, "self")); err != nil {
 		return fmt.Errorf("error creating symlink %q -> %q: %w", filepath.Join(procRoot, "self"), procSubmountDir+"/self", err)

@@ -305,6 +305,15 @@ func (u UseHostProcessMemoryBarrier) GlobalMemoryBarrier() error {
 	return u.MemBarrier.GlobalMemoryBarrier()
 }
 
+// MappingPressure is implemented by AddressSpaces that map with host mappings
+// of their own, of which the host lets a process have only so many.
+type MappingPressure interface {
+	// MappingPressure returns whether the address space has used much of
+	// its share of host mappings, so that mm should rather spend memory on
+	// fewer of them.
+	MappingPressure() bool
+}
+
 // MemoryManager represents an abstraction above the platform address space
 // which manages memory mappings and their contents.
 type MemoryManager interface {

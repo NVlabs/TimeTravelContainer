@@ -132,6 +132,11 @@ type subprocess struct {
 	platform.NoAddressSpaceIO
 	subprocessRefs
 
+	// hostMaps tracks the stub's host mappings of application addresses,
+	// which MapFile and Unmap make and remove, to keep them within the
+	// host's limit.
+	hostMaps hostMappings
+
 	// requests is used to signal creation of new threads.
 	requests chan any
 
@@ -1206,6 +1211,10 @@ func (s *subprocess) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRa
 	if precommit {
 		flags |= unix.MAP_POPULATE
 	}
+	ar := hostarch.AddrRange{addr, addr + hostarch.Addr(fr.Length())}
+	s.hostMaps.mu.Lock()
+	defer s.hostMaps.mu.Unlock()
+	s.hostMaps.makeRoomLocked(s, ar)
 	_, err = s.syscall(
 		unix.SYS_MMAP,
 		arch.SyscallArgument{Value: uintptr(addr)},
@@ -1214,11 +1223,22 @@ func (s *subprocess) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRa
 		arch.SyscallArgument{Value: uintptr(flags | unix.MAP_SHARED | unix.MAP_FIXED)},
 		arch.SyscallArgument{Value: uintptr(fd)},
 		arch.SyscallArgument{Value: uintptr(fr.Start)})
+	if err == nil {
+		s.hostMaps.mappedLocked(ar, fd, fr.Start, at)
+	} else {
+		// A failed mmap may have unmapped what it was to replace.
+		s.hostMaps.unmappedLocked(ar)
+	}
 	return err
 }
 
 // Unmap implements platform.AddressSpace.Unmap.
 func (s *subprocess) Unmap(addr hostarch.Addr, length uint64) {
+	ar := hostarch.AddrRange{addr, addr + hostarch.Addr(length)}
+	s.hostMaps.mu.Lock()
+	defer s.hostMaps.mu.Unlock()
+	// Unmapping part of a host mapping splits it in two.
+	s.hostMaps.makeRoomLocked(s, ar)
 	err := s.munmap(addr, length)
 	if err == unix.ENOMEM {
 		// Unmapping part of a host mapping splits it in two, which the host
@@ -1230,6 +1250,9 @@ func (s *subprocess) Unmap(addr hostarch.Addr, length uint64) {
 		if err == nil && maximumUserAddress != stubEnd {
 			err = s.munmap(hostarch.Addr(stubEnd), uint64(maximumUserAddress-stubEnd))
 		}
+		s.hostMaps.clearLocked()
+	} else {
+		s.hostMaps.unmappedLocked(ar)
 	}
 	if err != nil && err != errDeadSubprocess {
 		// We never expect this to happen.

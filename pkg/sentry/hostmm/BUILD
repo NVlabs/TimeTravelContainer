@@ -13,6 +13,7 @@ go_library(
     srcs = [
         "cgroup.go",
         "hostmm.go",
+        "max_map_count.go",
         "membarrier.go",
         "membarrier_darwin.go",
     ],

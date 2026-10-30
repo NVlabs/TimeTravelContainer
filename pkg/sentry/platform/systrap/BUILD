@@ -23,6 +23,26 @@ go_template_instance(
 )
 
 go_template_instance(
+    name = "host_mapping_set",
+    out = "host_mapping_set.go",
+    consts = {
+        "minDegree": "8",
+    },
+    imports = {
+        "hostarch": "gvisor.dev/gvisor/pkg/hostarch",
+    },
+    package = "systrap",
+    prefix = "hostMapping",
+    template = "//pkg/segment:generic_set",
+    types = {
+        "Key": "hostarch.Addr",
+        "Range": "hostarch.AddrRange",
+        "Value": "hostMapping",
+        "Functions": "hostMappingSetFunctions",
+    },
+)
+
+go_template_instance(
     name = "subprocess_refs",
     out = "subprocess_refs.go",
     package = "systrap",
@@ -50,6 +70,8 @@ go_library(
         "filters.go",
         "filters_amd64.go",
         "filters_arm64.go",
+        "host_mapping_set.go",
+        "host_mappings.go",
         "lib_amd64.s",
         "lib_arm64.s",
         "metrics.go",
@@ -127,6 +149,7 @@ go_test(
     size = "small",
     srcs = [
         "context_queue_test.go",
+        "host_mappings_test.go",
         "shared_context_test.go",
         "stubfilter_test.go",
         "systrap_test.go",

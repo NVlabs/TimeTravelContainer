@@ -61,6 +61,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/user"
+	"gvisor.dev/gvisor/pkg/sentry/hostmm"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -965,9 +966,14 @@ func New(args Args) (*Loader, error) {
 	setApplicationMemoryHomes(args.Conf)
 	limitSandboxMemory(&args)
 	// Idle host file descriptors close when the Sentry nears the host's
-	// limit on them, which guests then never run into.
+	// limit on them, and stubs unmap what faults mapped least recently when
+	// they near its limit on mappings, which guests then never run into.
 	fdbudget.Init()
 	ttcvolume.FDShortageHook = fdbudget.Retry
+	if limit := args.Conf.TestOnlyHostMappingLimit; limit > 0 {
+		hostmm.LimitMaxMapCount(limit)
+	}
+	hostmm.MaxMapCount()
 
 	// Create kernel and platform.
 	l.pinRing.FD = args.PinRingFD

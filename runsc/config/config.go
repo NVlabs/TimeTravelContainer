@@ -510,6 +510,11 @@ type Config struct {
 	// called. This is useful for tests exercising gVisor panic-reporting.
 	TestOnlyAFSSyscallPanic bool `flag:"TESTONLY-afs-syscall-panic"`
 
+	// TestOnlyHostMappingLimit should only be used in tests. If positive, it
+	// stands in for the host's limit on a process's mappings
+	// (vm.max_map_count) where that is higher, so that tests reach it.
+	TestOnlyHostMappingLimit int `flag:"TESTONLY-host-mapping-limit"`
+
 	// explicitlySet contains whether a flag was explicitly set on the command-line from which this
 	// Config was constructed. Nil when the Config was not initialized from a FlagSet.
 	explicitlySet map[string]struct{}

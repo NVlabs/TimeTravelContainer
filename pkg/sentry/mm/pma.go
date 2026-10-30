@@ -22,6 +22,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -30,6 +31,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 )
 
@@ -545,6 +547,17 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 							continue
 						}
 					}
+					// So is all of 2 MiB that pages that a fork shares and
+					// copies of others split into many host mappings, if the
+					// platform runs short of them.
+					if block, ok := mm.densifyBlockLocked(addr); ok {
+						if seg, ok := mm.densifyBlockCOWLocked(ctx, block, addr, memCgID, allocDir, &unmapAR, &pfdrs); ok {
+							remap.noteInserted(block)
+							pstart = pmaIterator{} // iterators invalidated
+							pseg, pgap = seg, pmaGapIterator{}
+							continue
+						}
+					}
 					var copyAR hostarch.AddrRange
 					if vma.effectivePerms.Execute {
 						// The majority of copy-on-write breaks on executable
@@ -961,6 +974,123 @@ func (mm *MemoryManager) breakHugePageCOWLocked(ctx context.Context, block hosta
 			huge:           huge,
 		}).NextGap()
 	}
+	return mm.pmas.FindSegment(addr), true
+}
+
+// densifiedBlocks counts the 2 MiB blocks that densifyBlockCOWLocked copied.
+var densifiedBlocks atomicbitops.Uint64
+
+// densifyMinPMAs is how many pmas must map 2 MiB of an address space for a
+// write that copies a page of it to copy all of it, when the platform runs
+// short of host mappings (see densifyBlockLocked).
+const densifyMinPMAs = 17
+
+// densifyBlockLocked returns the 2 MiB of the address space around addr if a
+// write that copies a page there should copy all of it, into one allocation
+// that one host mapping maps: if the platform maps each pma with a host
+// mapping of its own, and has used much of what the host allows it (see
+// platform.MappingPressure), and more than 16 pmas of private memory of
+// mm.mf map the 2 MiB whole. Pages that a fork still shares, and copies of
+// others, interleave so, each a mapping of its own. Copying the rest of them
+// spends up to 2 MiB of memory to save those mappings.
+//
+// Preconditions: mm.activeMu must be locked.
+func (mm *MemoryManager) densifyBlockLocked(addr hostarch.Addr) (hostarch.AddrRange, bool) {
+	if mp, ok := mm.as.(platform.MappingPressure); !ok || !mp.MappingPressure() {
+		return hostarch.AddrRange{}, false
+	}
+	block := hostarch.AddrRange{Start: addr.HugeRoundDown()}
+	end, ok := block.Start.AddLength(hostarch.HugePageSize)
+	if !ok {
+		return hostarch.AddrRange{}, false
+	}
+	block.End = end
+	n := 0
+	covered := block.Start
+	for seg := mm.pmas.FindSegment(block.Start); covered < block.End; seg = seg.NextSegment() {
+		if !seg.Ok() || seg.Start() > covered {
+			return hostarch.AddrRange{}, false
+		}
+		if p := seg.ValuePtr(); p.file != memmap.File(mm.mf) || !p.private {
+			return hostarch.AddrRange{}, false
+		}
+		covered = seg.End()
+		n++
+	}
+	return block, n >= densifyMinPMAs
+}
+
+// densifyBlockCOWLocked copies block, 2 MiB of the address space that pmas
+// of private memory of mm.mf map whole (see densifyBlockLocked), into one
+// allocation of 2 MiB: what a fork shares as copy-on-write, and what mm
+// holds alone, which goes with it. Each page takes its original's identity
+// and a new version, as a copy does. It returns the pma that then maps addr,
+// or false if it could not copy, for the caller to copy what it needs alone:
+// a page that a device's DMA uses, or that is still to be loaded, stays.
+//
+// Preconditions:
+//   - mm.mappingMu must be locked.
+//   - mm.activeMu must be locked for writing.
+//   - block.Contains(addr).
+//   - The caller unmaps *unmapAR from the AddressSpace and then releases
+//     *pfdrs.
+func (mm *MemoryManager) densifyBlockCOWLocked(ctx context.Context, block hostarch.AddrRange, addr hostarch.Addr, memCgID uint32, allocDir pgalloc.Direction, unmapAR *hostarch.AddrRange, pfdrs **pendingFileDecRefs) (pmaIterator, bool) {
+	first := mm.pmas.FindSegment(block.Start)
+	for seg := first; seg.Ok() && seg.Start() < block.End; seg = seg.NextSegment() {
+		fr := seg.fileRangeOf(seg.Range().Intersect(block))
+		if !seg.ValuePtr().needCOW && !mm.mf.Movable(fr) {
+			return pmaIterator{}, false
+		}
+		if seg.ensureInternalMappingsLocked() != nil {
+			return pmaIterator{}, false
+		}
+	}
+	reader := safemem.BlockSeqReader{Blocks: mm.internalMappingsLocked(first, block)}
+	fr, err := mm.allocatePrivateLocked(block, pgalloc.AllocOpts{
+		Kind:       usage.Anonymous,
+		MemCgID:    memCgID,
+		Mode:       pgalloc.AllocateAndWritePopulate,
+		Huge:       mm.mf.HugepagesEnabled(),
+		Dir:        allocDir,
+		ReaderFunc: reader.ReadToBlocks,
+		// A copy goes where the page that the faulting task writes would.
+		Placement: placementOf(ctx, mm.vmas.FindSegment(addr).ValuePtr(), addr),
+	})
+	if err != nil || fr.Length() != hostarch.HugePageSize {
+		if fr.Length() != 0 {
+			mm.mf.DecRef(fr)
+		}
+		return pmaIterator{}, false
+	}
+	if err := mm.adoptCOWIdentitiesLocked(first, block, fr); err != nil {
+		mm.mf.DecRef(fr)
+		return pmaIterator{}, false
+	}
+	// Replace the pmas with the copy, each part of it with the permissions
+	// of the vma it is in. This doesn't change RSS.
+	*unmapAR = joinAddrRanges(*unmapAR, block)
+	for seg := first; seg.Ok() && seg.Start() < block.End; seg = seg.NextSegment() {
+		*pfdrs = appendPendingCOWFileDecRef(*pfdrs, seg.ValuePtr().file, seg.fileRangeOf(seg.Range().Intersect(block)))
+	}
+	pgap := mm.pmas.RemoveRange(block)
+	for vseg := mm.vmas.FindSegment(block.Start); vseg.Ok() && vseg.Start() < block.End; vseg = vseg.NextSegment() {
+		ar := vseg.Range().Intersect(block)
+		vma := vseg.ValuePtr()
+		pgap = mm.pmas.Insert(pgap, ar, pma{
+			file:           mm.mf,
+			off:            fr.Start + uint64(ar.Start-block.Start),
+			translatePerms: hostarch.AnyAccess,
+			effectivePerms: vma.effectivePerms,
+			maxPerms:       vma.maxPerms,
+			private:        true,
+			huge:           mm.mf.HugepagesEnabled(),
+		}).NextGap()
+	}
+	if mm.homeOwner != 0 {
+		// Its 2 MiB is all mm's now.
+		mm.noteCollapsibleLocked(block, fr)
+	}
+	densifiedBlocks.Add(1)
 	return mm.pmas.FindSegment(addr), true
 }
 

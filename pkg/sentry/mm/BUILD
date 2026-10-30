@@ -192,6 +192,7 @@ go_test(
     name = "mm_test",
     size = "small",
     srcs = [
+        "densify_test.go",
         "fold_test.go",
         "home_test.go",
         "mm_test.go",

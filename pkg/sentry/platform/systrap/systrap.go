@@ -359,6 +359,7 @@ func New(opts platform.Options) (*Systrap, error) {
 		maxSysmsgThreads = gomaxprocs.Base()
 		// Account for syscall thread.
 		maxChildThreads = maxSysmsgThreads + 1
+		initHostMappingBudget()
 		fdbudget.AddShrinker(globalPool.shrink)
 	}
 

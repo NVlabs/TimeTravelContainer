@@ -12350,7 +12350,7 @@ func (b *runtimeBackend) configuredRunscArgsForNetworkConfig(networkMode string,
 func testOnlyRunscFlags() []string {
 	var flags []string
 	for _, flag := range strings.Fields(os.Getenv("TTC_TESTONLY_RUNSC_FLAGS")) {
-		if strings.HasPrefix(flag, "--fdlimit=") {
+		if strings.HasPrefix(flag, "--fdlimit=") || strings.HasPrefix(flag, "--TESTONLY-host-mapping-limit=") {
 			flags = append(flags, flag)
 		}
 	}

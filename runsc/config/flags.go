@@ -229,6 +229,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool("TESTONLY-afs-syscall-panic", false, "TEST ONLY; do not ever use! Used for tests exercising gVisor panic reporting.")
 	flagSet.String("TESTONLY-autosave-image-path", "", "TEST ONLY; enable auto save for syscall tests and set path for state file.")
 	flagSet.Bool("TESTONLY-autosave-resume", false, "TEST ONLY; enable auto save and resume for syscall tests and set path for state file.")
+	flagSet.Int("TESTONLY-host-mapping-limit", 0, "TEST ONLY; do not ever use! Stands in for the host's limit on a process's mappings (vm.max_map_count) where that is higher.")
 
 	RegisterDeprecatedFlags(flagSet)
 }
