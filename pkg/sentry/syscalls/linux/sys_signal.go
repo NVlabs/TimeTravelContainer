@@ -27,6 +27,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/signalfd"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 )
 
 // Kill implements linux syscall kill(2).
@@ -319,6 +320,7 @@ func RtSigtimedwait(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (
 	}
 
 	var timeout time.Duration
+	var deadline ktime.Time
 	if timespec != 0 {
 		d, err := copyTimespecIn(t, timespec)
 		if err != nil {
@@ -328,29 +330,70 @@ func RtSigtimedwait(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (
 			return 0, nil, linuxerr.EINVAL
 		}
 		timeout = time.Duration(d.ToNsecCapped())
+		deadline = t.Kernel().MonotonicClock().Now().Add(timeout)
 	} else {
 		timeout = time.Duration(math.MaxInt64)
 	}
 
 	si, err := t.Sigtimedwait(mask, timeout)
 	if err != nil {
-		// An untimed wait that a signal handler does not interrupt, as the
-		// sentry's pause for a checkpoint or a live fork does, restarts
-		// rather than fail with EINTR, which each waiting thread, such as
-		// every ART runtime's signal catcher, would retry at once.
-		if timespec == 0 && linuxerr.Equals(linuxerr.ErrInterrupted, err) {
-			err = linuxerr.ERESTARTNOHAND
+		// A wait that a signal handler does not interrupt, as the sentry's
+		// pause for a checkpoint or a live fork does, restarts, with the same
+		// deadline, rather than fail with EINTR, which each waiting thread,
+		// such as every ART runtime's signal catcher, would retry at once.
+		if linuxerr.Equals(linuxerr.ErrInterrupted, err) {
+			if timespec == 0 {
+				err = linuxerr.ERESTARTNOHAND
+			} else {
+				t.SetSyscallRestartBlock(&sigtimedwaitRestartBlock{
+					set:      mask,
+					siginfo:  siginfo,
+					deadline: deadline,
+				})
+				err = linuxerr.ERESTART_RESTARTBLOCK
+			}
 		}
 		return 0, nil, err
 	}
+	n, err := sigtimedwaitResult(t, si, siginfo)
+	return n, nil, err
+}
 
+// sigtimedwaitResult copies si out to siginfo, if not null, for the result
+// of rt_sigtimedwait(2).
+func sigtimedwaitResult(t *kernel.Task, si *linux.SignalInfo, siginfo hostarch.Addr) (uintptr, error) {
 	if siginfo != 0 {
 		si.FixSignalCodeForUser()
 		if _, err := si.CopyOut(t, siginfo); err != nil {
-			return 0, nil, err
+			return 0, err
 		}
 	}
-	return uintptr(si.Signo), nil, nil
+	return uintptr(si.Signo), nil
+}
+
+// sigtimedwaitRestartBlock restarts a timed rt_sigtimedwait(2) via
+// restart_syscall(2), until its deadline.
+//
+// +stateify savable
+type sigtimedwaitRestartBlock struct {
+	set      linux.SignalSet
+	siginfo  hostarch.Addr
+	deadline ktime.Time
+}
+
+// Restart implements kernel.SyscallRestartBlock.Restart.
+func (r *sigtimedwaitRestartBlock) Restart(t *kernel.Task) (uintptr, error) {
+	// A deadline in the past only takes a pending signal.
+	remaining := max(r.deadline.Sub(t.Kernel().MonotonicClock().Now()), 0)
+	si, err := t.Sigtimedwait(r.set, remaining)
+	if err != nil {
+		if linuxerr.Equals(linuxerr.ErrInterrupted, err) {
+			t.SetSyscallRestartBlock(r)
+			err = linuxerr.ERESTART_RESTARTBLOCK
+		}
+		return 0, err
+	}
+	return sigtimedwaitResult(t, si, r.siginfo)
 }
 
 // RtSigqueueinfo implements linux syscall rt_sigqueueinfo(2).

@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package linux
 
 import (
@@ -73,7 +76,18 @@ func Msgsnd(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr,
 		Type: int64(buf.Type),
 		Text: buf.Text,
 	}
-	return 0, nil, queue.Send(t, msg, wait, pid)
+	return 0, nil, restartInterruptedMsgWait(queue.Send(t, msg, wait, pid))
+}
+
+// restartInterruptedMsgWait returns err, but ERESTARTNOHAND for an
+// interrupted wait, as Linux's msgsnd(2) and msgrcv(2) do: such a wait
+// restarts unless a signal handler runs, as after the sentry's pause for a
+// checkpoint or a live fork.
+func restartInterruptedMsgWait(err error) error {
+	if linuxerr.Equals(linuxerr.ErrInterrupted, err) {
+		return linuxerr.ERESTARTNOHAND
+	}
+	return err
 }
 
 // Msgrcv implements msgrcv(2).
@@ -86,7 +100,7 @@ func Msgrcv(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr,
 
 	msg, err := receive(t, id, mType, size, flags)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, restartInterruptedMsgWait(err)
 	}
 
 	buf := linux.MsgBuf{

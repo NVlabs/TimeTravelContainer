@@ -12,11 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package linux
 
 import (
 	"math"
-	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
@@ -26,6 +28,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/ipc"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 )
 
 const opsMax = 500 // SEMOPM
@@ -80,13 +83,43 @@ func Semtimedop(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uint
 		return 0, nil, linuxerr.EINVAL
 	}
 
-	if err := semTimedOp(t, id, ops, true, timeout.ToDuration()); err != nil {
-		if linuxerr.Equals(linuxerr.ETIMEDOUT, err) {
-			return 0, nil, linuxerr.EAGAIN
-		}
-		return 0, nil, err
+	deadline := t.Kernel().MonotonicClock().Now().Add(timeout.ToDuration())
+	err := semTimedOp(t, id, ops, true, deadline)
+	if linuxerr.Equals(linuxerr.ErrInterrupted, err) {
+		t.SetSyscallRestartBlock(&semtimedopRestartBlock{
+			id:         id,
+			sembufAddr: sembufAddr,
+			nsops:      nsops,
+			deadline:   deadline,
+		})
+		err = linuxerr.ERESTART_RESTARTBLOCK
 	}
-	return 0, nil, nil
+	return 0, nil, err
+}
+
+// semtimedopRestartBlock restarts a semtimedop(2) via restart_syscall(2),
+// until its deadline.
+//
+// +stateify savable
+type semtimedopRestartBlock struct {
+	id         ipc.ID
+	sembufAddr hostarch.Addr
+	nsops      uint
+	deadline   ktime.Time
+}
+
+// Restart implements kernel.SyscallRestartBlock.Restart.
+func (r *semtimedopRestartBlock) Restart(t *kernel.Task) (uintptr, error) {
+	ops := make([]linux.Sembuf, r.nsops)
+	if _, err := linux.CopySembufSliceIn(t, r.sembufAddr, ops); err != nil {
+		return 0, err
+	}
+	err := semTimedOp(t, r.id, ops, true, r.deadline)
+	if linuxerr.Equals(linuxerr.ErrInterrupted, err) {
+		t.SetSyscallRestartBlock(r)
+		err = linuxerr.ERESTART_RESTARTBLOCK
+	}
+	return 0, err
 }
 
 // Semop handles: semop(int semid, struct sembuf *sops, size_t nsops)
@@ -106,10 +139,22 @@ func Semop(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 	if _, err := linux.CopySembufSliceIn(t, sembufAddr, ops); err != nil {
 		return 0, nil, err
 	}
-	return 0, nil, semTimedOp(t, id, ops, false, time.Second)
+	err := semTimedOp(t, id, ops, false, ktime.Time{})
+	if linuxerr.Equals(linuxerr.ErrInterrupted, err) {
+		err = linuxerr.ERESTARTNOHAND
+	}
+	return 0, nil, err
 }
 
-func semTimedOp(t *kernel.Task, id ipc.ID, ops []linux.Sembuf, haveTimeout bool, timeout time.Duration) error {
+// semTimedOp applies ops to the semaphore set id, waiting until they can
+// apply, until deadline if haveDeadline. Like Linux, it fails with EAGAIN
+// when deadline passes.
+//
+// Linux fails an interrupted wait with EINTR, and never restarts it, but it
+// waits on after a wakeup without a signal pending. The sentry's pause, for a
+// checkpoint or a live fork, has no signal for it, so callers restart a wait
+// that this interrupts unless a signal handler runs.
+func semTimedOp(t *kernel.Task, id ipc.ID, ops []linux.Sembuf, haveDeadline bool, deadline ktime.Time) error {
 	set := t.IPCNamespace().SemaphoreRegistry().FindByID(id)
 
 	if set == nil {
@@ -122,8 +167,11 @@ func semTimedOp(t *kernel.Task, id ipc.ID, ops []linux.Sembuf, haveTimeout bool,
 		if ch == nil || err != nil {
 			return err
 		}
-		if _, err = t.BlockWithTimeout(ch, haveTimeout, timeout); err != nil {
+		if err := t.BlockWithDeadline(ch, haveDeadline, deadline); err != nil {
 			set.AbortWait(num, ch)
+			if linuxerr.Equals(linuxerr.ETIMEDOUT, err) {
+				return linuxerr.EAGAIN
+			}
 			return err
 		}
 	}

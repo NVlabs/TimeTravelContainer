@@ -128,10 +128,9 @@ func EpollCtl(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintpt
 //
 // Linux fails an interrupted wait with EINTR. So does the sentry if a signal
 // handler runs. Otherwise, as after its pause for a checkpoint or a live
-// fork, it restarts the wait, with the same deadline, rather than have the
-// application retry it: after a pause, every waiting thread would do so at
-// once. A timed wait with a temporary signal mask still fails with EINTR,
-// since its restart would have to set the mask again.
+// fork, it restarts the wait, with the same deadline and signal mask, rather
+// than have the application retry it: after a pause, every waiting thread
+// would do so at once.
 func waitEpoll(t *kernel.Task, epfd int32, eventsAddr hostarch.Addr, maxEvents int, timeoutInNanos int64, tempMask bool) (uintptr, *kernel.SyscallControl, error) {
 	var deadline ktime.Time
 	if timeoutInNanos > 0 {
@@ -148,6 +147,17 @@ func waitEpoll(t *kernel.Task, epfd int32, eventsAddr hostarch.Addr, maxEvents i
 				eventsAddr: eventsAddr,
 				maxEvents:  maxEvents,
 				deadline:   deadline,
+			})
+			err = linuxerr.ERESTART_RESTARTBLOCK
+		default:
+			t.SetSyscallRestartBlock(&epollPwaitRestartBlock{
+				epollWaitRestartBlock: epollWaitRestartBlock{
+					epfd:       epfd,
+					eventsAddr: eventsAddr,
+					maxEvents:  maxEvents,
+					deadline:   deadline,
+				},
+				mask: t.SignalMask(),
 			})
 			err = linuxerr.ERESTART_RESTARTBLOCK
 		}
@@ -168,14 +178,37 @@ type epollWaitRestartBlock struct {
 
 // Restart implements kernel.SyscallRestartBlock.Restart.
 func (r *epollWaitRestartBlock) Restart(t *kernel.Task) (uintptr, error) {
+	return r.wait(t, r)
+}
+
+// wait waits until r's deadline, and has restart_syscall(2) run self if
+// interrupted again.
+func (r *epollWaitRestartBlock) wait(t *kernel.Task, self kernel.SyscallRestartBlock) (uintptr, error) {
 	// A deadline in the past times out at once.
 	remaining := max(r.deadline.Sub(t.Kernel().MonotonicClock().Now()).Nanoseconds(), 1)
 	n, err := epollWaitUntil(t, r.epfd, r.eventsAddr, r.maxEvents, remaining, r.deadline)
 	if linuxerr.Equals(linuxerr.ErrInterrupted, err) {
-		t.SetSyscallRestartBlock(r)
+		t.SetSyscallRestartBlock(self)
 		err = linuxerr.ERESTART_RESTARTBLOCK
 	}
 	return n, err
+}
+
+// epollPwaitRestartBlock restarts a timed epoll wait with a temporary signal
+// mask. The task restores its own mask before restart_syscall(2) runs, so the
+// restart sets the temporary one again.
+//
+// +stateify savable
+type epollPwaitRestartBlock struct {
+	epollWaitRestartBlock
+	mask linux.SignalSet
+}
+
+// Restart implements kernel.SyscallRestartBlock.Restart.
+func (r *epollPwaitRestartBlock) Restart(t *kernel.Task) (uintptr, error) {
+	t.SetSavedSignalMask(t.SignalMask())
+	t.SetSignalMask(r.mask)
+	return r.wait(t, r)
 }
 
 // epollWaitUntil reads epfd's ready events to eventsAddr. If there are none,
