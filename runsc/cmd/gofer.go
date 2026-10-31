@@ -30,6 +30,7 @@ import (
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/fdbudget"
 	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/ttcpack"
@@ -414,6 +415,9 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 			util.Fatalf("Failed to set RLIMIT_NOFILE: %v", err)
 		}
 	}
+	// The files of the mounts served cost descriptors that a guest must never
+	// find the limit of (see runsc/gofer/fs/budget.go).
+	fdbudget.Init()
 
 	if conf.UnsafeNoHostIsolation {
 		log.Warningf("Serving rootfs without chroot isolation from %q", root)

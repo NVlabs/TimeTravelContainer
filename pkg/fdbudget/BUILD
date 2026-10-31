@@ -11,7 +11,7 @@ package(
 go_library(
     name = "fdbudget",
     srcs = ["fdbudget.go"],
-    visibility = ["//pkg/sentry:internal"],
+    visibility = ["//:sandbox"],
     deps = [
         "//pkg/atomicbitops",
         "//pkg/log",

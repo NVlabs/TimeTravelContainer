@@ -21,10 +21,12 @@ import (
 	"fmt"
 	"strings"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/fdbudget"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/pkg/log"
@@ -229,6 +231,9 @@ func (i *lisafsInode) openHandle(ctx context.Context, flags uint32) (handle, err
 	openFD, hostFD, err := i.controlFD.OpenAt(ctx, flags)
 	if err != nil {
 		return noHandle, err
+	}
+	if i.isRegularFile() {
+		hostFD = i.fs.spareDonatedFD(hostFD)
 	}
 	return handle{
 		fdLisa: i.controlFD.Client().NewFD(openFD),
@@ -554,6 +559,7 @@ func (i *lisafsInode) openCreate(ctx context.Context, name string, flags uint32,
 	if err != nil {
 		return nil, noHandle, err
 	}
+	hostFD = i.fs.spareDonatedFD(hostFD)
 
 	h := handle{
 		fdLisa: i.fs.client.NewFD(openFD),
@@ -568,6 +574,22 @@ func (i *lisafsInode) openCreate(ctx context.Context, name string, flags uint32,
 		return nil, noHandle, err
 	}
 	return child, h, nil
+}
+
+// spareDonatedFD returns hostFD, a descriptor that the gofer donated for a
+// regular file, if the Sentry has one to spare, and otherwise closes it and
+// returns -1. A donated descriptor only speeds up I/O on the file, which works
+// without one, through the gofer and the page cache; the Sentry's last
+// descriptors are for what cannot do without (see package fdbudget). Doing
+// without one is a shortage that the dentry cache hears of, as of the gofer's,
+// so that idle dentries give back what they hold.
+func (fs *filesystem) spareDonatedFD(hostFD int) int {
+	if hostFD < 0 || !fdbudget.Near(hostFD) {
+		return hostFD
+	}
+	_ = unix.Close(hostFD)
+	fs.dentryCache.starved.Store(true)
+	return -1
 }
 
 // lisafsGetdentsCount is the number of bytes of dirents to read from the

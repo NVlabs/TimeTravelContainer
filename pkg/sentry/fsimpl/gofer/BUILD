@@ -105,6 +105,7 @@ go_library(
         "//pkg/context",
         "//pkg/errors/linuxerr",
         "//pkg/fd",
+        "//pkg/fdbudget",
         "//pkg/fdnotifier",
         "//pkg/fspath",
         "//pkg/fsutil",

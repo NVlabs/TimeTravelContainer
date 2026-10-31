@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package lisafs
 
 import (
@@ -200,6 +203,12 @@ func (n *Node) isDeleted() bool {
 	return n.deleted.Load() != 0
 }
 
+// IsDeleted returns whether the file that n stands for has been removed
+// through the server.
+func (n *Node) IsDeleted() bool {
+	return n.isDeleted()
+}
+
 func (n *Node) removeFD(fd *ControlFD) {
 	n.controlFDsMu.Lock()
 	defer n.controlFDsMu.Unlock()
@@ -218,6 +227,14 @@ func (n *Node) forEachFD(fn func(*ControlFD)) {
 	for fd := n.controlFDs.Front(); fd != nil; fd = fd.Next() {
 		fn(fd)
 	}
+}
+
+// ForEachControlFD calls fn on the implementation of every control FD open on
+// n, with n's list of them locked: fn must not open or destroy one.
+func (n *Node) ForEachControlFD(fn func(ControlFDImpl)) {
+	n.forEachFD(func(fd *ControlFD) {
+		fn(fd.impl)
+	})
 }
 
 // removeChildLocked removes child with given name from n and returns the

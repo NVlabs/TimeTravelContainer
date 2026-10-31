@@ -64,6 +64,12 @@ func openPathAt(dirFD int, name string) (int, error) {
 	return unix.Openat(dirFD, name, unix.O_PATH|openFlags, 0)
 }
 
+// openDirAt opens the directory name in dirFD only to walk through it,
+// refusing a symbolic link.
+func openDirAt(dirFD int, name string) (int, error) {
+	return unix.Openat(dirFD, name, unix.O_PATH|unix.O_DIRECTORY|openFlags, 0)
+}
+
 func mknodAt(dirFD int, name string, mode linux.FileMode, _, _ uint32) error {
 	return unix.Mknodat(dirFD, name, uint32(mode), 0)
 }

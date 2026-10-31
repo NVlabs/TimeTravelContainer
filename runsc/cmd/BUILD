@@ -62,6 +62,7 @@ go_library(
         "//pkg/abi/linux",
         "//pkg/cleanup",
         "//pkg/cpuid",
+        "//pkg/fdbudget",
         "//pkg/lisafs",
         "//pkg/log",
         "//pkg/ttcpack",

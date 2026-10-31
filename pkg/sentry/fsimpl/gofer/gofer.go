@@ -170,7 +170,8 @@ type dentryCache struct {
 	dentries dentryList `state:"nosave"`
 	// dentriesLen is the number of dentries in dentries.
 	dentriesLen uint64 `state:"nosave"`
-	// starved records that a gofer has said it has no file descriptors left.
+	// starved records that a gofer has said it has no file descriptors left,
+	// or that the Sentry has none to spare for what a gofer donated.
 	//
 	// Beside the cache rather than on the connection that was refused, because
 	// one gofer process serves every mount of a sandbox out of one descriptor

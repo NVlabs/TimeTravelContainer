@@ -1,18 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package fdbudget keeps the Sentry's host file descriptors within the host's
-// limit on them (RLIMIT_NOFILE), so that nothing a guest does runs into it.
+// Package fdbudget keeps a sandbox process's host file descriptors within the
+// host's limit on them (RLIMIT_NOFILE), so that nothing a guest does runs into
+// it.
 //
-// What guests open costs the Sentry host descriptors where it keeps host
-// objects for them, such as the data objects of TTC volume files, each of
-// which it can open again. Their holders register those descriptors
-// (Opened). When a descriptor that the Sentry opens shows it near its limit,
-// the budget asks idle resources that hold descriptors to release them (see
-// AddShrinker), and closes the least recently used registered descriptors
-// that are not in use, so that descriptors that the Sentry cannot open again
-// always find room. A holder opens a descriptor that the budget closed again
-// when it next needs it, as a fault brings back a page that was evicted.
+// What guests open costs the Sentry and the gofer host descriptors where they
+// keep host objects for them, such as the data objects of TTC volume files or
+// the files of a bind mount, each of which they can open again. Their holders
+// register those descriptors (Opened). When a descriptor that the process
+// opens shows it near its limit, the budget asks idle resources that hold
+// descriptors to release them (see AddShrinker), and closes the least
+// recently used registered descriptors that are not in use, so that
+// descriptors that the process cannot open again always find room. A holder
+// opens a descriptor that the budget closed again when it next needs it, as a
+// fault brings back a page that was evicted.
 package fdbudget
 
 import (
@@ -57,7 +59,7 @@ type Entry struct {
 
 const (
 	// maxReserve is the most descriptors that the budget keeps free for
-	// those that the Sentry cannot open again.
+	// those that the process cannot open again.
 	maxReserve = 1024
 
 	// minBatch is the fewest descriptors that an eviction closes, so that
@@ -87,7 +89,7 @@ var budget struct {
 }
 
 var (
-	// high is the lowest descriptor that shows the Sentry near its limit,
+	// high is the lowest descriptor that shows the process near its limit,
 	// or 0 while the limit is unknown. The host gives out the lowest free
 	// descriptor, so an open that returns high or above means that every
 	// descriptor below it is in use.
@@ -102,8 +104,8 @@ var (
 	reopens   atomicbitops.Uint64
 )
 
-// Init sets the budget from the Sentry's limit on host file descriptors. The
-// Sentry calls it once it has set that limit, while it may still read it.
+// Init sets the budget from the process's limit on host file descriptors. A
+// process calls it once it has set that limit, while it may still read it.
 func Init() {
 	var limit unix.Rlimit
 	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &limit); err != nil {
@@ -124,7 +126,7 @@ func SetLimit(n uint64) {
 }
 
 // Opened registers e, the entry of h, which has just opened descriptor fd, as
-// recently used. If fd shows the Sentry near its limit, it then closes
+// recently used. If fd shows the process near its limit, it then closes
 // descriptors that others hold and do not use.
 //
 // Preconditions: e is not registered.
@@ -141,15 +143,16 @@ func Opened(e *Entry, h Holder, fd int) {
 		e.evicted = false
 		reopens.Add(1)
 	}
-	if near(fd) {
+	if Near(fd) {
 		evictLocked(int(batch.Load()))
 	}
 }
 
-// Note records that the Sentry has opened descriptor fd, which it cannot open
-// again, and closes idle descriptors if fd shows the Sentry near its limit.
+// Note records that the process has opened descriptor fd, which it cannot
+// open again, and closes idle descriptors if fd shows the process near its
+// limit.
 func Note(fd int) {
-	if !near(fd) {
+	if !Near(fd) {
 		return
 	}
 	budget.mu.Lock()
@@ -157,8 +160,10 @@ func Note(fd int) {
 	budget.mu.Unlock()
 }
 
-// near returns whether descriptor fd shows the Sentry near its limit.
-func near(fd int) bool {
+// Near returns whether descriptor fd, which the process has just been given,
+// shows it near its limit: whether fd is one of those that the budget keeps
+// free for descriptors that cannot be opened again.
+func Near(fd int) bool {
 	h := high.Load()
 	return h > 0 && int64(fd) >= h
 }
@@ -182,7 +187,7 @@ func Closed(e *Entry) {
 }
 
 // Retry reports whether to try again an open that failed with err. If the
-// host refused the Sentry another descriptor (EMFILE, or ENFILE for the
+// host refused the process another descriptor (EMFILE, or ENFILE for the
 // host's limit on all processes), it closes idle descriptors first, and the
 // open is worth trying again if it closed any.
 func Retry(err error) bool {
@@ -207,7 +212,7 @@ func Retry(err error) bool {
 
 // AddShrinker registers shrink, which releases up to n idle resources that
 // hold descriptors, and returns how many it released. It is the budget's
-// first resort when the Sentry nears its limit. shrink runs with the budget's
+// first resort when the process nears its limit. shrink runs with the budget's
 // lock held, as Holder.CloseIdleFD does, and must follow its rules.
 func AddShrinker(shrink func(n int) int) {
 	budget.mu.Lock()
@@ -286,7 +291,7 @@ func evictLocked(n int) int {
 	}
 	if closed != 0 {
 		if evictions.Add(uint64(closed)) == uint64(closed) {
-			log.Infof("fdbudget: the Sentry nears its limit of host file descriptors; closed %d idle ones", closed)
+			log.Infof("fdbudget: the process nears its limit of host file descriptors; closed %d idle ones", closed)
 		} else {
 			log.Debugf("fdbudget: closed %d idle host file descriptors", closed)
 		}

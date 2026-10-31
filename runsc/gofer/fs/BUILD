@@ -11,6 +11,7 @@ package(
 go_library(
     name = "fs",
     srcs = [
+        "budget.go",
         "host_ops_darwin.go",
         "host_ops_linux.go",
         "lisafs.go",
@@ -21,6 +22,7 @@ go_library(
         "//pkg/atomicbitops",
         "//pkg/cleanup",
         "//pkg/fd",
+        "//pkg/fdbudget",
         "//pkg/fsutil",
         "//pkg/lisafs",
         "//pkg/log",
@@ -40,6 +42,32 @@ go_test(
         "//pkg/lisafs",
         "//pkg/lisafs/testsuite",
         "//pkg/log",
+    ],
+)
+
+go_test(
+    name = "budget_test",
+    size = "small",
+    srcs = ["budget_test.go"],
+    deps = [
+        ":fs",
+        "//pkg/context",
+        "//pkg/errors/linuxerr",
+        "//pkg/fdbudget",
+        "//pkg/lisafs",
+        "//pkg/lisafs/testsuite",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+go_test(
+    name = "budget_bench_test",
+    size = "small",
+    srcs = ["budget_bench_test.go"],
+    library = ":fs",
+    deps = [
+        "//pkg/fdbudget",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )
 

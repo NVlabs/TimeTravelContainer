@@ -1178,6 +1178,13 @@ become visible in every branch. Its source may be under an autofs map, as
 sandbox, so that the map mounts it, which a sandbox, in a mount namespace of
 its own, cannot have done.
 
+A guest may hold more of a bind's files open than the host lets TTC keep
+descriptors for. Near that limit, TTC closes descriptors that nothing is using
+and opens them again by path when they are next used. A file that something
+else on the host removes, renames or replaces while its descriptor is closed
+is then gone for the guest, which gets `ESTALE` for it, as an NFS client
+would.
+
 Use `:lazy_copy` (`cow` and `managed-cow` are its other names) for a writable
 view that live forks keep: a persistent, branch-local writable layer over the
 live host path.

@@ -944,7 +944,7 @@ func (r *Repository) OpenObject(object string, writable bool) (*os.File, error) 
 	return r.openObject(object, flags)
 }
 
-// FDShortageHook, if set, is called when the host refuses the process another
+// FDShortageHook is called, if set, when the host refuses the process another
 // file descriptor (EMFILE, or ENFILE) as a repository opens one of its files,
 // and reports whether to try again. The Sentry sets it to close descriptors
 // that it does not use (see fdbudget).
