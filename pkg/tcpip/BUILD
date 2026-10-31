@@ -39,6 +39,7 @@ go_library(
         "route_list.go",
         "sock_err_list.go",
         "socketops.go",
+        "state_migrations.go",
         "stdclock.go",
         "stdclock_state.go",
         "tcpip.go",

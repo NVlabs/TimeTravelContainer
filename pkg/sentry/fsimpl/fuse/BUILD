@@ -77,6 +77,7 @@ go_library(
         "request_response.go",
         "save_restore.go",
         "seqatomic_time_unsafe.go",
+        "state_migrations.go",
     ],
     marshal = True,
     visibility = ["//pkg/sentry:internal"],

@@ -21,6 +21,7 @@ go_library(
         "pids.go",
         "pids_mutex.go",
         "save_restore.go",
+        "state_migrations.go",
         "tasks_mutex.go",
         "tree_mutex.go",
         "xattr.go",

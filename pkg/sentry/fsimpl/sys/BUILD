@@ -28,6 +28,7 @@ go_library(
         "pci.go",
         "rdma.go",
         "save_restore.go",
+        "state_migrations.go",
         "sys.go",
         "topology.go",
         "virtgpu.go",

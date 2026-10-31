@@ -122,6 +122,7 @@ go_library(
         "kernfs.go",
         "save_restore.go",
         "slot_list.go",
+        "state_migrations.go",
         "static_directory_refs.go",
         "symlink.go",
         "synthetic_directory.go",

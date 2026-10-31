@@ -11,6 +11,7 @@ go_library(
         "icmp.go",
         "igmp.go",
         "ipv4.go",
+        "state_migrations.go",
         "stats.go",
     ],
     visibility = ["//visibility:public"],

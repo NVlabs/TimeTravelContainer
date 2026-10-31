@@ -67,6 +67,7 @@ go_library(
         "save_restore_unsafe.go",
         "seccomp_filters.go",
         "seccomp_filters_darwin.go",
+        "state_migrations.go",
         "uvm.go",
         "uvm_mmap.go",
         "uvm_tools.go",

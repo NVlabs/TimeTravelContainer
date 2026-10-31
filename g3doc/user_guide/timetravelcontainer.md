@@ -873,11 +873,11 @@ a live fork; internal sockets and pipes are retained when supported.
 
 A checkpoint holds the branch's own memory, only the pages it uses however
 much its family holds, as a dehydration of the branch; restore imports it and
-rehydrates it as `main`. Checkpoint files are intended to be restored by a
-compatible TTC build. They hold TTC's dehydration state, which is not a stable
-interchange format between arbitrary TTC or upstream gVisor versions, and a
-checkpoint made before TTC saved branches this way can be restored only by the
-build that made it. Compression defaults to fast DEFLATE and may be disabled:
+rehydrates it as `main`. A build restores the checkpoints, and rehydrates the
+dehydrated branches, that the builds before it made, back to TTC's daily of
+2026-10-23; an older build may refuse what a newer one made. A checkpoint made
+before TTC saved branches this way can be restored only by the build that made
+it. Compression defaults to fast DEFLATE and may be disabled:
 
 ```shell
 ttc checkpoint --compression none web@main raw-checkpoint.ttc

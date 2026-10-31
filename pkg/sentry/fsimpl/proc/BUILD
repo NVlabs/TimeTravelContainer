@@ -83,6 +83,7 @@ go_library(
         "keys.go",
         "nvproxy.go",
         "pressure.go",
+		"state_migrations.go",
         "subtasks.go",
         "subtasks_inode_refs.go",
         "sys_net_conf.go",

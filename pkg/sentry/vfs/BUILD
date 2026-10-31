@@ -170,6 +170,7 @@ go_library(
         "propagation.go",
         "resolving_path.go",
         "save_restore.go",
+        "state_migrations.go",
         "vfs.go",
         "virtual_filesystem_mutex.go",
         "write_count.go",

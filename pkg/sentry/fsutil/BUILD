@@ -133,6 +133,7 @@ go_library(
         "mmap_unsafe.go",
         "refs_mutex.go",
         "refs_set.go",
+        "state_migrations.go",
     ],
     visibility = ["//pkg/sentry:internal"],
     deps = [

@@ -52,6 +52,7 @@ go_library(
         "inode_refs.go",
         "regular_file.go",
         "save_restore.go",
+        "state_migrations.go",
     ],
     visibility = ["//pkg/sentry:internal"],
     deps = [

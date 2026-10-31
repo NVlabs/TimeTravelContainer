@@ -39,6 +39,7 @@ go_library(
         "device_mutex.go",
         "endpoint_mutex.go",
         "protocol.go",
+        "state_migrations.go",
         "tun_endpoint_refs.go",
         "tun_unsafe.go",
     ],

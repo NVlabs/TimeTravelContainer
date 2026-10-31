@@ -504,7 +504,7 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	for i := range args.ExecSessions {
 		args.ExecSessions[i].ContainerID = l.sandboxID
 	}
-	child.RegisterContainerName(l.sandboxID, l.root.containerName)
+	l.adoptContainer(child)
 	dogOpts := watchdog.DefaultOpts
 	if err := dogOpts.TaskTimeoutAction.Set(l.root.conf.WatchdogAction); err != nil {
 		return nil, err
@@ -793,7 +793,7 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (_
 		for _, task := range child.TaskSet().Root.Tasks() {
 			task.RestoreContainerID(l.sandboxID)
 		}
-		child.RegisterContainerName(l.sandboxID, l.root.containerName)
+		l.adoptContainer(child)
 		return child, nil
 	})
 	if err != nil {
@@ -991,7 +991,7 @@ func (l *Loader) restoreDistributedDurablePeer(args *DistributedForkRestoreArgs)
 		for _, task := range child.TaskSet().Root.Tasks() {
 			task.RestoreContainerID(l.sandboxID)
 		}
-		child.RegisterContainerName(l.sandboxID, l.root.containerName)
+		l.adoptContainer(child)
 		return child, nil
 	})
 	if err != nil {

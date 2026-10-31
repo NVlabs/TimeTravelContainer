@@ -92,6 +92,7 @@ go_library(
         "socket.go",
         "special_fd_list.go",
         "special_file.go",
+        "state_migrations.go",
         "string_list.go",
         "symlink.go",
         "time.go",

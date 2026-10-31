@@ -23,6 +23,7 @@ go_library(
     srcs = [
         "message_list.go",
         "mq.go",
+        "state_migrations.go",
     ],
     importpath = "gvisor.dev/gvisor/pkg/sentry/kernel/mq",
     visibility = ["//pkg/sentry:internal"],

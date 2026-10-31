@@ -102,6 +102,7 @@ go_library(
         "regular_file.go",
         "save_restore.go",
         "socket_file.go",
+        "state_migrations.go",
         "symlink.go",
         "tar.go",
         "tmpfs.go",

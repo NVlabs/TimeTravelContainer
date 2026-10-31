@@ -87,6 +87,7 @@ go_library(
         "queue_mutex.go",
         "queue_refs.go",
         "save_restore.go",
+        "state_migrations.go",
         "stream_queue_receiver_mutex.go",
         "transport_message_list.go",
         "unix.go",

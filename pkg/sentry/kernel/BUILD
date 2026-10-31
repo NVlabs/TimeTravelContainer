@@ -314,6 +314,7 @@ go_library(
         "signal.go",
         "signal_handlers.go",
         "signal_handlers_mutex.go",
+        "state_migrations.go",
         "syscalls.go",
         "syscalls_state.go",
         "syslog.go",

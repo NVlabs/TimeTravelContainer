@@ -10,6 +10,7 @@ go_library(
     srcs = [
         "erofs.go",
         "erofs_unsafe.go",
+        "state_migrations.go",
     ],
     importpath = "gvisor.dev/gvisor/pkg/erofs",
     marshal = True,

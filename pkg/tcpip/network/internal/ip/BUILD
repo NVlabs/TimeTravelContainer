@@ -12,6 +12,7 @@ go_library(
         "errors.go",
         "generic_multicast_protocol.go",
         "reject_with_reset.go",
+        "state_migrations.go",
         "stats.go",
     ],
     visibility = [

@@ -181,6 +181,7 @@ go_library(
         "snd.go",
         "snd_queue_mutex.go",
         "state.go",
+        "state_migrations.go",
         "tcp_endpoint_list.go",
         "tcp_segment_list.go",
         "tcp_segment_refs.go",

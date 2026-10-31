@@ -8,6 +8,7 @@ package(
 go_library(
     name = "stopfd",
     srcs = [
+        "state_migrations.go",
         "stopfd.go",
     ],
     visibility = ["//visibility:public"],

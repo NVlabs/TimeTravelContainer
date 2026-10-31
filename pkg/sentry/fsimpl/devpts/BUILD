@@ -25,6 +25,7 @@ go_library(
         "queue.go",
         "replica.go",
         "root_inode_refs.go",
+        "state_migrations.go",
         "terminal.go",
     ],
     visibility = ["//pkg/sentry:internal"],

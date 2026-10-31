@@ -311,7 +311,7 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 	for _, task := range child.TaskSet().Root.Tasks() {
 		task.RestoreContainerID(l.sandboxID)
 	}
-	child.RegisterContainerName(l.sandboxID, l.root.containerName)
+	l.adoptContainer(child)
 	dogOpts := watchdog.DefaultOpts
 	if err := dogOpts.TaskTimeoutAction.Set(l.root.conf.WatchdogAction); err != nil {
 		return nil, err
@@ -544,7 +544,7 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 		for _, task := range child.TaskSet().Root.Tasks() {
 			task.RestoreContainerID(l.sandboxID)
 		}
-		child.RegisterContainerName(l.sandboxID, l.root.containerName)
+		l.adoptContainer(child)
 		return child, nil
 	})
 	if err != nil {
@@ -690,4 +690,16 @@ func (f *SandboxFamily) restorePeer(id, parentID, filesystemBranch string, quara
 		f.watchExecSession(b.id, id, session)
 	}
 	return nil
+}
+
+// adoptContainer registers this sandbox's container in k, a kernel loaded from
+// a dehydration or received from a fork, under the sandbox's ID: its name, and
+// the environment of its spec, as upstream's restore sets it (restore.go).
+// The kernel's own record of it is under the ID of the sandbox that saved it,
+// and images of builds before 2026-10 hold none.
+func (l *Loader) adoptContainer(k *kernel.Kernel) {
+	k.RegisterContainerName(l.sandboxID, l.root.containerName)
+	if l.root.spec != nil && l.root.spec.Process != nil {
+		k.SetContainerEnv(l.sandboxID, l.root.spec.Process.Env)
+	}
 }

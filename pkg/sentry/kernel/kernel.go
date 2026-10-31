@@ -3179,6 +3179,18 @@ func (k *Kernel) ContainerName(cid string) string {
 	return k.containerNames[cid]
 }
 
+// ContainerNames returns the names of the kernel's containers.
+func (k *Kernel) ContainerNames() []string {
+	k.extMu.Lock()
+	defer k.extMu.Unlock()
+	names := make([]string, 0, len(k.containerNames))
+	for _, name := range k.containerNames {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names
+}
+
 // EBPF returns the kernel's eBPF state.
 func (k *Kernel) EBPF() *ebpf.Registry {
 	return &k.ebpf
@@ -3206,9 +3218,13 @@ func (k *Kernel) SpecEnviron(cid string) []string {
 func (k *Kernel) SpecEnvironByName(containerName string) []string {
 	k.extMu.Lock()
 	defer k.extMu.Unlock()
+	// A restored branch keeps the IDs of the sandboxes it ran in beside its
+	// current one, under the same name: the environment is any one's.
 	for cid, name := range k.containerNames {
 		if name == containerName {
-			return slices.Clone(k.containerEnvs[cid])
+			if env, ok := k.containerEnvs[cid]; ok {
+				return slices.Clone(env)
+			}
 		}
 	}
 	return nil

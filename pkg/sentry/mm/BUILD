@@ -150,6 +150,7 @@ go_library(
         "shm.go",
         "special_mappable.go",
         "special_mappable_refs.go",
+        "state_migrations.go",
         "syscalls.go",
         "vma.go",
         "vma_set.go",

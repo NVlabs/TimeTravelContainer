@@ -113,6 +113,7 @@ go_library(
         "rename_rwmutex.go",
         "req_file_fd_mutex.go",
         "save_restore.go",
+        "state_migrations.go",
     ],
     imports = [
         "gvisor.dev/gvisor/pkg/sentry/checkpoint",

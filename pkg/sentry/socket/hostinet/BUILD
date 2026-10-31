@@ -37,6 +37,7 @@ go_library(
         "stack.go",
         "stack_unsafe.go",
         "stack_unsafe_darwin.go",
+        "state_migrations.go",
     ],
     importpath = "gvisor.dev/gvisor/pkg/sentry/socket/hostinet",
     visibility = ["//pkg/sentry:internal"],

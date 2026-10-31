@@ -13,6 +13,7 @@ go_library(
         "ipv6.go",
         "mld.go",
         "ndp.go",
+        "state_migrations.go",
         "stats.go",
     ],
     visibility = ["//visibility:public"],
