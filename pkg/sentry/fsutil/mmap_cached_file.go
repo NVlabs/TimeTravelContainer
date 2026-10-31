@@ -47,6 +47,10 @@ import (
 type MmapCachedFile struct {
 	memmap.DefaultMemoryType
 
+	// NoBufferedIOFallback is unused, as MmapCachedFile has a buffered I/O
+	// fallback. It remains so that saved images keep this type's fields.
+	NoBufferedIOFallback memmap.NoBufferedIOFallback
+
 	// fd is the file descriptor.
 	fd atomicbitops.Int32
 
