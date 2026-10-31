@@ -53,6 +53,9 @@ func main() {
 	if len(os.Args) >= 2 && os.Args[1] == "_shared-memory-relay" {
 		os.Exit(cmd.RunSharedMemoryRelay(os.Args[2:], os.Stderr))
 	}
+	if len(os.Args) == 2 && os.Args[1] == "_state-schema" {
+		os.Exit(writeStateSchema(os.Stdout))
+	}
 	runscMode := os.Getenv("TTC_EMBEDDED_RUNTIME") == "1" || embeddedRuntimeArgv0(os.Args[0])
 	if len(os.Args) >= 2 && os.Args[1] == "runsc" {
 		runscMode = true

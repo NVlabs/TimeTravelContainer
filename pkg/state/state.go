@@ -82,6 +82,9 @@ type ErrState struct {
 
 // Error returns a sensible description of the state error.
 func (e *ErrState) Error() string {
+	if e.trace == "" {
+		return e.err.Error()
+	}
 	return fmt.Sprintf("%v:\n%s", e.err, e.trace)
 }
 
@@ -343,6 +346,13 @@ func safely(fn func()) (err error) {
 				es.err = e
 			} else {
 				es.err = fmt.Errorf("%v", r)
+			}
+			if IsSchemaError(es.err) {
+				// An image that this build cannot load is not a
+				// fault of the decoder's: where it noticed says
+				// nothing.
+				err = es
+				return
 			}
 
 			// Make a stack. We don't know how big it will be ahead

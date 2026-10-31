@@ -53,3 +53,10 @@ go_test(
         "//pkg/state/wire",
     ],
 )
+
+go_test(
+    name = "migrate_test",
+    size = "small",
+    srcs = ["migrate_test.go"],
+    deps = ["//pkg/state"],
+)

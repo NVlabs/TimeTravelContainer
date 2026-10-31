@@ -32,8 +32,22 @@ type typeEntry struct {
 // reconciledTypeEntry is a reconciled entry in the typeDatabase.
 type reconciledTypeEntry struct {
 	wire.Type
-	LocalType  reflect.Type
+	LocalType reflect.Type
+
+	// FieldOrder holds, for each local field, the index of the encoded
+	// field that holds its value, or -1 if an older build's image lacks it
+	// (see migration).
 	FieldOrder []int
+
+	// migration, if not nil, is how the local type loads from the older
+	// build's image: see migrate.go.
+	migration *Migration
+
+	// dropped are the indices of the encoded fields that migration drops.
+	dropped []int
+
+	// olds are the encoded fields whose values migration's fixes need.
+	olds []oldField
 }
 
 // typeEncodeDatabase is an internal TypeInfo database for encoding.
@@ -148,7 +162,10 @@ func (tbd *typeDecodeDatabase) LookupName(id typeID) string {
 
 // LookupType looks up the type by ID.
 func (tbd *typeDecodeDatabase) LookupType(id typeID) reflect.Type {
-	name := tbd.LookupName(id)
+	if reason := refusal(tbd.LookupName(id)); reason != "" {
+		panic(&SchemaError{Type: tbd.LookupName(id), Reason: reason})
+	}
+	name := currentName(tbd.LookupName(id))
 	typ, ok := globalTypeDatabase[name]
 	if !ok {
 		// If not available, see if it's primitive.
@@ -203,7 +220,7 @@ func (tbd *typeDecodeDatabase) Lookup(id typeID, typ reflect.Type) *reconciledTy
 		Failf("unsupported type %q during decode; can't reconcile", pending.Name)
 	}
 	name, fields := info.Name, info.Fields
-	if name != pending.Name {
+	if name != currentName(pending.Name) {
 		// Are these the same type? Print a helpful message as this may
 		// actually happen in practice if types change.
 		Failf("typeDatabase contains conflicting definitions for id %d: %s->%v (current) and %s->%v (existing)",
@@ -212,6 +229,23 @@ func (tbd *typeDecodeDatabase) Lookup(id typeID, typ reflect.Type) *reconciledTy
 	rte := &reconciledTypeEntry{
 		Type:      info,
 		LocalType: typ,
+	}
+	if name != pending.Name || !slices.Equal(fields, pending.Fields) && !sameFields(fields, pending.Fields) {
+		// An older build saved the type otherwise.
+		m := migrationFor(name, pending.Name, pending.Fields)
+		if m == nil && name == pending.Name {
+			m = implicitMigration(typ, name, fields, pending.Fields)
+		}
+		if m == nil {
+			panic(newSchemaError(pending.Name, fields, pending.Fields))
+		}
+		if m.Refuse != "" {
+			panic(&SchemaError{Type: pending.Name, Reason: m.Refuse})
+		}
+		rte.FieldOrder, rte.dropped, rte.olds = reconcileMigrated(m, typ, name, fields, pending.Fields)
+		rte.migration = m
+		tbd.byID[id-1] = rte
+		return rte
 	}
 	// If there are zero or one fields, then we skip allocating the field
 	// slice. There is special handling for decoding in this case. If the

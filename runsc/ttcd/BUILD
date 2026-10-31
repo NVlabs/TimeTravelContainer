@@ -13,6 +13,7 @@ go_binary(
     srcs = [
         "bundle_darwin.go",
         "main.go",
+        "schema.go",
     ],
     # Native macOS links Hypervisor.framework through the HVF backend. Linux
     # retains the repository's pure-Go default.
@@ -21,6 +22,7 @@ go_binary(
     visibility = ["//visibility:public"],
     x_defs = {"gvisor.dev/gvisor/runsc/version.version": "{STABLE_VERSION}"},
     deps = [
+        "//pkg/state",
         "//runsc/cli/maincli",
         "//runsc/cli/sentrycli",
         "//runsc/gvisorbinaries",
@@ -42,6 +44,7 @@ go_test(
     srcs = [
         "main.go",
         "main_test.go",
+        "schema.go",
     ] + select_system(
         darwin = ["info_plist_darwin_test.go"],
         linux = [],
@@ -51,6 +54,7 @@ go_test(
         linux = [],
     ),
     deps = [
+        "//pkg/state",
         "//runsc/cli/maincli",
         "//runsc/cli/sentrycli",
         "//runsc/gvisorbinaries",

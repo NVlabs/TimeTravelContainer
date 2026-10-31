@@ -147,6 +147,14 @@ type decodeState struct {
 	// registered yet. These will be decoded once interest in registered.
 	deferred map[objectID]wire.Object
 
+	// orphans are objects that fields which a migration drops referenced:
+	// unless something else references them, they are not decoded at all.
+	orphans []objectID
+
+	// fixAfterLoad are the migrations' fixes to run once everything has
+	// loaded.
+	fixAfterLoad []func()
+
 	// pending is the set of objects that are not yet complete.
 	pending odsList
 
@@ -353,7 +361,12 @@ func (od *objectDecoder) load(slot int, objPtr reflect.Value, wait bool, fn func
 	// is in terms of the local type, where the fields in the encoded
 	// object are in terms of the wire object's type, which might be in a
 	// different order (but will have the same fields).
-	v := *od.encoded.Field(od.rte.FieldOrder[slot])
+	j := od.rte.FieldOrder[slot]
+	if j < 0 {
+		// An older build's image lacks the field: its migration sets it.
+		return
+	}
+	v := *od.encoded.Field(j)
 	od.ds.decodeObject(od.ods, objPtr.Elem(), v)
 	if wait {
 		// Mark this individual object a blocker.
@@ -395,6 +408,31 @@ func (ds *decodeState) decodeStruct(ods *objectDecodeState, obj reflect.Value, e
 		ods:     ods,
 		rte:     rte,
 		encoded: encoded,
+	}
+	if m := rte.migration; m != nil {
+		for _, i := range rte.dropped {
+			ds.orphans = refsIn(*encoded.Field(i), ds.orphans)
+		}
+		var old map[string]any
+		for _, f := range rte.olds {
+			if old == nil {
+				old = make(map[string]any, len(rte.olds))
+			}
+			v := reflect.New(reflect.TypeOf(m.Old[f.name]).Elem())
+			w := *encoded.Field(f.index)
+			ds.decodeObject(ods, v.Elem(), w)
+			ds.waitObject(ods, w, nil)
+			old[f.name] = v.Interface()
+		}
+		ptr := obj.Addr().Interface()
+		if m.Fix != nil {
+			// Queued first, so that it runs before what the object's
+			// own loader queues.
+			od.afterLoad(func() { m.Fix(ptr, old) })
+		}
+		if m.FixAfterLoad != nil {
+			ds.fixAfterLoad = append(ds.fixAfterLoad, func() { m.FixAfterLoad(ptr, old) })
+		}
 	}
 	ds.stats.start(ods.typ)
 	defer ds.stats.done()
@@ -573,8 +611,14 @@ func (ds *decodeState) decodeObject(ods *objectDecodeState, obj reflect.Value, e
 		v := ds.register(x, obj.Type().Elem())
 		obj.Set(reflectValueRWAddr(v))
 	case wire.Bool:
+		if obj.Kind() != reflect.Bool && ds.coerce(ods, obj, x) {
+			break
+		}
 		obj.SetBool(bool(x))
 	case wire.Int:
+		if obj.Kind() == reflect.Struct && ds.coerce(ods, obj, x) {
+			break
+		}
 		obj.SetInt(int64(x))
 		if obj.Int() != int64(x) {
 			Failf("signed integer truncated from %v to %v", int64(x), obj.Int())
@@ -618,6 +662,9 @@ func (ds *decodeState) decodeObject(ods *objectDecodeState, obj reflect.Value, e
 	case *wire.Array:
 		ds.decodeArray(ods, obj, x)
 	case *wire.Struct:
+		if obj.Kind() == reflect.Pointer && ds.coerce(ods, obj, x) {
+			break
+		}
 		ds.decodeStruct(ods, obj, x)
 	case *wire.Map:
 		ds.decodeMap(ods, obj, x)
@@ -723,6 +770,10 @@ func (ds *decodeState) Load(obj reflect.Value) {
 			}
 		}
 	}); err != nil {
+		if IsSchemaError(err) {
+			// Which object it was says nothing more.
+			panic(err)
+		}
 		// Include as much information as we can, taking into account
 		// the possible state transitions above.
 		if ods != nil {
@@ -731,6 +782,17 @@ func (ds *decodeState) Load(obj reflect.Value) {
 			Failf("error decoding from %#v: %w", encoded, err)
 		} else {
 			Failf("general decoding error: %w", err)
+		}
+	}
+
+	// Objects that only fields which a migration dropped referenced are
+	// not needed, nor what only they referenced.
+	for len(ds.orphans) != 0 {
+		id := ds.orphans[len(ds.orphans)-1]
+		ds.orphans = ds.orphans[:len(ds.orphans)-1]
+		if encoded, ok := ds.deferred[id]; ok {
+			delete(ds.deferred, id)
+			ds.orphans = refsIn(encoded, ds.orphans)
 		}
 	}
 
@@ -776,6 +838,11 @@ func (ds *decodeState) Load(obj reflect.Value) {
 		}
 		buf.WriteString("}")
 		Failf("incomplete graph: %s", buf.String())
+	}
+
+	// What migrations set from other objects, now that every one is loaded.
+	for _, fix := range ds.fixAfterLoad {
+		fix()
 	}
 }
 
