@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Macro for precompiling seccomp-bpf programs."""
 
 load("//tools:defs.bzl", "go_binary", "select_arch", "target_emulator")
@@ -172,7 +175,10 @@ def precompiled_seccomp_rules(
     run_gen_cmd = (
         "GEN=$(location :" + name + "_gen_bin); " +
         "RUN=; " +
-        "if [ -n \"$$TARGET_ARCH\" ] && [ \"$$(uname -m)\" != \"$$TARGET_ARCH\" ]; then " +
+        # macOS calls aarch64 arm64.
+        "HOST_ARCH=$$(uname -m); " +
+        "if [ \"$$HOST_ARCH\" = arm64 ]; then HOST_ARCH=aarch64; fi; " +
+        "if [ -n \"$$TARGET_ARCH\" ] && [ \"$$HOST_ARCH\" != \"$$TARGET_ARCH\" ]; then " +
         "  RUN=\"$$EMULATOR\"; " +
         "fi; " +
         "$$RUN \"$$GEN\"" + out_args + " || { " +
