@@ -141,13 +141,13 @@ ttc exec "$CREATED_CONTAINER@main" test -f /created-import
 ttc stop "$CREATED_CONTAINER@main" >/dev/null
 ttc rm "$CREATED_CONTAINER" >/dev/null
 
-# A writable host path is a live read-only lower with a private persistent
+# A lazy_copy host path is a live read-only lower with a private persistent
 # ttcvol upper. Guest writes never reach the host, survive restart, and split
 # with the rest of the family during live fork.
 HOST_COW_SOURCE="$TTC_E2E_ROOT/host-cow-source"
 mkdir -p "$HOST_COW_SOURCE"
 printf 'host-lower\n' >"$HOST_COW_SOURCE/value"
-ttc run -d --name "$HOST_COW_CONTAINER" -v "$HOST_COW_SOURCE:/data" "$BUSYBOX_IMAGE" \
+ttc run -d --name "$HOST_COW_CONTAINER" -v "$HOST_COW_SOURCE:/data:lazy_copy" "$BUSYBOX_IMAGE" \
   sh -c 'while :; do sleep 60; done' >/dev/null
 [ "$(ttc exec "$HOST_COW_CONTAINER@main" cat /data/value)" = host-lower ] ||
   fail "writable host mount did not expose its lower"

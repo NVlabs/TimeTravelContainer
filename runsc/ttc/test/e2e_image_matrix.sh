@@ -553,7 +553,7 @@ LIFECYCLE_ID=$(ttc run --name "$LIFECYCLE" --detach --read-only \
   --tmpfs /state:mode=0755 \
   --volume "$HOST_FIXTURE:/host-fixture:ro" \
   --mount "type=bind,source=$HOST_FIXTURE_TWO,target=/host-fixture-two,readonly,immutable-source" \
-  --mount "type=bind,source=$HOST_COW_FIXTURE,target=/cow-host" \
+  --mount "type=bind,source=$HOST_COW_FIXTURE,target=/cow-host,lazy-copy" \
   --tmpfs /scratch:mode=0700,size=1m \
   --mount type=proc,target=/alt-proc,readonly \
   --mount type=proc,target=/repeat-proc,readonly \
