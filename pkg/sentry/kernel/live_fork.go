@@ -1223,6 +1223,11 @@ func (k *Kernel) captureFilesystemMemory(ctx context.Context, capture *pgalloc.M
 		if err := tmpfs.CaptureMemoryFileRanges(fs, capture); err != nil {
 			return fmt.Errorf("capturing filesystem %T memory: %w", fs.Impl(), err)
 		}
+		if capturer, ok := fs.Impl().(vfs.MemoryFileRangeCapturer); ok {
+			if err := capturer.CaptureMemoryFileRanges(capture); err != nil {
+				return fmt.Errorf("capturing filesystem %T memory: %w", fs.Impl(), err)
+			}
+		}
 	}
 	return nil
 }

@@ -411,6 +411,24 @@ func (fs *filesystem) Release(ctx context.Context) {
 	fs.Filesystem.Release(ctx)
 }
 
+// CaptureMemoryFileRanges implements vfs.MemoryFileRangeCapturer: the pages of
+// the filesystem's file caches, which a restored copy takes references on.
+func (fs *filesystem) CaptureMemoryFileRanges(capture *pgalloc.MemoryRangeCapture) error {
+	fs.cacheMu.Lock()
+	defer fs.cacheMu.Unlock()
+	for _, cache := range fs.fileCaches {
+		cache.dataMu.RLock()
+		for seg := cache.data.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+			if err := capture.RecordOwned(cache, fs.mf, seg.FileRange()); err != nil {
+				cache.dataMu.RUnlock()
+				return err
+			}
+		}
+		cache.dataMu.RUnlock()
+	}
+	return nil
+}
+
 func (fs *filesystem) fileCache(nodeID, generation uint64) *fileCache {
 	key := fileCacheKey{nodeID: nodeID, generation: generation}
 	fs.cacheMu.Lock()

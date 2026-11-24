@@ -359,10 +359,11 @@ type LiveForkFileDescription interface {
 	ValidateLiveFork() (referenced []*FileDescription, err error)
 }
 
-// MemoryFileRangeCapturer is implemented by file descriptions whose saved
-// object graph directly owns application MemoryFile ranges independently of
-// resident PMAs. Implementations should use MemoryRangeCapture.RecordOwned so
-// alternate graph paths to the same object are deduplicated.
+// MemoryFileRangeCapturer is implemented by file descriptions, and filesystems,
+// whose saved object graph directly owns application MemoryFile ranges
+// independently of resident PMAs, as a filesystem's page caches do.
+// Implementations should use MemoryRangeCapture.RecordOwned so alternate graph
+// paths to the same object are deduplicated.
 type MemoryFileRangeCapturer interface {
 	CaptureMemoryFileRanges(capture *pgalloc.MemoryRangeCapture) error
 }
