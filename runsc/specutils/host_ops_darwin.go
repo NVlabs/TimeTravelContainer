@@ -81,21 +81,29 @@ func safeMount(src, dst, fstype string, flags uintptr, data, procPath string) er
 
 func hostOOMScoreAdj(int) (int, error) { return 0, nil }
 
-// specCopyFile returns an unlinked file holding data. macOS has neither memfds
-// nor file seals, so the copy is not sealed; only the processes that it is
-// passed to can reach it.
+// specCopyFile returns an unlinked file holding data, through a read-only
+// descriptor. macOS has neither memfds nor file seals: only the processes that
+// the copy is passed to can reach it, and they cannot write it.
 func specCopyFile(data []byte) (*os.File, error) {
-	f, err := os.CreateTemp("", "config.json-")
+	w, err := os.CreateTemp("", "config.json-")
 	if err != nil {
 		return nil, fmt.Errorf("cannot create spec copy: %w", err)
 	}
-	if err := os.Remove(f.Name()); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("cannot unlink spec copy: %w", err)
-	}
-	if _, err := f.WriteAt(data, 0); err != nil {
-		f.Close()
+	defer w.Close()
+	name := w.Name()
+	if _, err := w.WriteAt(data, 0); err != nil {
+		os.Remove(name)
 		return nil, fmt.Errorf("cannot write spec copy: %w", err)
 	}
-	return f, nil
+	r, err := os.Open(name)
+	if rmErr := os.Remove(name); rmErr != nil {
+		if r != nil {
+			r.Close()
+		}
+		return nil, fmt.Errorf("cannot unlink spec copy: %w", rmErr)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("cannot open spec copy: %w", err)
+	}
+	return r, nil
 }
