@@ -8,10 +8,8 @@
 package hvf
 
 import (
-	"fmt"
 	"runtime"
 
-	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	sentryplatform "gvisor.dev/gvisor/pkg/sentry/platform"
 	hvfbackend "gvisor.dev/gvisor/pkg/sentry/platform/hvf"
@@ -59,15 +57,6 @@ func (*constructor) New(opts sentryplatform.Options) (sentryplatform.Platform, e
 	}
 	return vmplatform.New(config)
 }
-
-func (*constructor) OpenDevice(devicePath string) (*fd.FD, error) {
-	if devicePath != "" {
-		return nil, fmt.Errorf("HVF does not use a platform device path")
-	}
-	return nil, nil
-}
-
-func (*constructor) Requirements() sentryplatform.Requirements { return sentryplatform.Requirements{} }
 
 func (*constructor) PrecompiledSeccompInfo() []sentryplatform.SeccompInfo { return nil }
 

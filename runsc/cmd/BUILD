@@ -25,6 +25,8 @@ go_library(
         "forward.go",
         "fscheckpoint.go",
         "gofer.go",
+        "host_ops_darwin.go",
+        "host_ops_linux.go",
         "install.go",
         "install_sidecars.go",
         "kill.go",

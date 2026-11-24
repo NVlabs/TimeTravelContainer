@@ -5,6 +5,21 @@
 
 package sandboxsetup
 
-import specs "github.com/opencontainers/runtime-spec/specs-go"
+import (
+	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/pkg/timing"
+)
 
-func ApplyCapsAllThreads(caps *specs.LinuxCapabilities) error { return nil }
+// ResolvedThreadCaps are the capabilities to apply to every thread: Darwin
+// has no Linux capabilities, so there are none.
+type ResolvedThreadCaps struct{}
+
+// ResolveThreadCaps resolves no capabilities.
+func ResolveThreadCaps(*specs.LinuxCapabilities, *timing.Timer) (*ResolvedThreadCaps, error) {
+	return &ResolvedThreadCaps{}, nil
+}
+
+// Apply applies no capabilities.
+func (*ResolvedThreadCaps) Apply(*timing.Timer) error { return nil }
+
+func ApplyCapsAllThreads(*specs.LinuxCapabilities, *timing.Timer) error { return nil }

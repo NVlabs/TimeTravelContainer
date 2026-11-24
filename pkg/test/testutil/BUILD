@@ -17,6 +17,7 @@ go_library(
     importpath = "gvisor.dev/gvisor/pkg/test/testutil",
     visibility = ["//:sandbox"],
     deps = [
+        "//pkg/abi/linux",
         "//pkg/rand",
         "//pkg/sync",
         "//runsc/config",

@@ -763,7 +763,7 @@ func openProcUmounter() *os.File {
 	if err != nil {
 		util.Fatalf("sidecar %q not usable: %v", b.Name, err)
 	}
-	f, err := os.OpenFile(p, unix.O_PATH, 0)
+	f, err := os.OpenFile(p, pathOnlyFlag, 0)
 	if err != nil {
 		util.Fatalf("cannot open %q: %v", p, err)
 	}

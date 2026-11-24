@@ -41,6 +41,7 @@ import (
 	"github.com/cenkalti/backoff"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/runsc/config"
@@ -294,7 +295,7 @@ func isCgroupV2() bool {
 	if err := unix.Statfs("/sys/fs/cgroup", &st); err != nil {
 		return false
 	}
-	return st.Type == unix.CGROUP2_SUPER_MAGIC
+	return st.Type == linux.CGROUP2_SUPER_MAGIC
 }
 
 // ConfigForBenchmark returns the default configuration to use in benchmarks.

@@ -7,6 +7,7 @@ package container
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"syscall"
 
@@ -28,6 +29,15 @@ func containerHostSocketPair() ([2]int, error) {
 }
 
 func setGoferParentDeathSignal(*exec.Cmd) {}
+
+// openBeneath opens name in the directory dirFD through no symbolic link:
+// macOS has no openat2(2), but name is one component.
+func openBeneath(dirFD int, name string, flags int, mode uint32) (int, error) {
+	return unix.Openat(dirFD, name, flags|unix.O_NOFOLLOW_ANY, mode)
+}
+
+// setCloneIntoCgroup does nothing: macOS has no cgroups to start a process in.
+func setCloneIntoCgroup(*unix.SysProcAttr, *os.File) {}
 
 func goferHostIsolationUnsupported() error {
 	return fmt.Errorf("Linux gofer credential isolation is unavailable on native macOS: %w", unix.EOPNOTSUPP)

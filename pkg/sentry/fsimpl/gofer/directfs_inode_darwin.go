@@ -117,7 +117,7 @@ func (i *directfsInode) openCreate(string, uint32, linux.FileMode, auth.KUID, au
 func (i *directfsInode) getDirentsLocked(func(string, inoKey, uint8), *dentry) error {
 	return linuxerr.EOPNOTSUPP
 }
-func (i *directfsInode) connect(context.Context, linux.SockType, lisafs.UID, lisafs.GID, *dentry) (int, error) {
+func (i *directfsInode) connect(context.Context, linux.SockType, lisafs.UID, lisafs.GID, []lisafs.GID, *dentry) (int, error) {
 	return -1, linuxerr.EOPNOTSUPP
 }
 func (i *directfsInode) readlink() (string, error) { return "", linuxerr.EOPNOTSUPP }

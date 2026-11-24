@@ -12,3 +12,9 @@ import "golang.org/x/sys/unix"
 func isCgroup2FS(_ *unix.Statfs_t) bool {
 	return false
 }
+
+// cannotCloneIntoCgroupReason says why no process is cloned into a cgroup:
+// Darwin has none, nor clone3(2).
+var cannotCloneIntoCgroupReason = func() string {
+	return "the host has no cgroups"
+}

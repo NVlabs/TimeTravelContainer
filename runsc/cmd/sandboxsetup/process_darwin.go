@@ -69,8 +69,9 @@ func SyncUsernsForRootless(fd int, uid, gid uint32) {
 	}
 }
 
-func ExecProcUmounter() (*exec.Cmd, *os.File) { return nil, nil }
-func UmountProc(syncFD int)                   {}
+func ExecProcUmounter(*os.File) (*exec.Cmd, *os.File) { return nil, nil }
+func UmountProc(syncFD int)                           {}
+func UmountProcInProcess()                            {}
 func UmountProcFile(syncFile *os.File) {
 	if syncFile != nil {
 		_ = syncFile.Close()

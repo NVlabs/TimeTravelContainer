@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 load("//tools:defs.bzl", "go_library")
 
 package(
@@ -10,6 +13,8 @@ go_library(
     srcs = [
         "platformdesc.go",
         "platformdesc_amd64.go",
+        "platformdesc_darwin.go",
+        "register.go",
     ],
     visibility = ["//pkg/sentry:internal"],
     deps = [

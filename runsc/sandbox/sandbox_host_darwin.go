@@ -7,7 +7,11 @@ package sandbox
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"slices"
+	"strings"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
@@ -56,6 +60,45 @@ func startSandboxProcess(cmd *exec.Cmd, nss []specs.LinuxNamespace) error {
 }
 
 func directIOFlag() int { return 0 }
+
+// pathOnlyFlag opens a descriptor to exec its file, or to open files beneath
+// it: macOS has no O_PATH, so it reads.
+const pathOnlyFlag = unix.O_RDONLY
+
+// setCloneIntoCgroup does nothing: macOS has no cgroups to start a process in.
+func setCloneIntoCgroup(*unix.SysProcAttr, *os.File) {}
+
+// pidfdOpen reports that macOS has no process descriptors; it has no ring of
+// pinned files for runsc-fd-parking to hold either.
+func pidfdOpen(int) (int, error) { return -1, unix.EOPNOTSUPP }
+
+// openReadOnlyTree reports that macOS has no detached mounts to make
+// read-only.
+func openReadOnlyTree(string) (int, error) {
+	return -1, unix.EOPNOTSUPP
+}
+
+// openRestoreDir returns an FD for the checkpoint directory dir, through which
+// the files handed to the sandbox for a restore are opened. macOS has no
+// detached read-only mount to protect them with; the sandbox runs as the
+// daemon's user, whose files they are.
+func openRestoreDir(dir string) (int, error) {
+	return unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+}
+
+// openCheckpointFile opens the checkpoint file name in dir, relative to dirFD,
+// an FD for dir, through no symbolic link and no "..", so that the path can
+// not lead out of dir: macOS has no openat2(2)'s RESOLVE_BENEATH.
+func openCheckpointFile(dirFD int, dir, name string, flags int) (*os.File, error) {
+	if slices.Contains(strings.Split(name, "/"), "..") {
+		return nil, unix.EXDEV
+	}
+	fd, err := unix.Openat(dirFD, name, flags|unix.O_CLOEXEC|unix.O_NOFOLLOW_ANY, 0644)
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), filepath.Join(dir, name)), nil
+}
 
 func hostFDDirectory() string { return "/dev/fd" }
 

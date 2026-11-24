@@ -27,11 +27,11 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/platform/platformdesc"
 )
 
 // Name is the name of the platform in the platform registry.
@@ -171,16 +171,6 @@ func (*constructor) New(platform.Options) (platform.Platform, error) {
 	return New(), nil
 }
 
-// OpenDevice implements platform.Constructor.OpenDevice.
-func (*constructor) OpenDevice(string) (*fd.FD, error) {
-	return nil, nil
-}
-
-// Requirements implements platform.Constructor.Requirements.
-func (*constructor) Requirements() platform.Requirements {
-	return platform.Requirements{}
-}
-
 // PrecompiledSeccompInfo implements platform.Constructor.PrecompiledSeccompInfo.
 func (*constructor) PrecompiledSeccompInfo() []platform.SeccompInfo {
 	return nil
@@ -188,4 +178,5 @@ func (*constructor) PrecompiledSeccompInfo() []platform.SeccompInfo {
 
 func init() {
 	platform.Register(Name, &constructor{})
+	platformdesc.Register(Name, platformdesc.Desc{})
 }

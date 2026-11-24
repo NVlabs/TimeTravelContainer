@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package bwrap implements a bubblewrap-compatible command line for running
 // commands in a gVisor sandbox.
 package bwrap
@@ -450,7 +453,7 @@ func mkdir(path string, perms uint32, uid, gid int) error {
 	if err := unix.Stat(path, &st); err != nil {
 		return err
 	}
-	return unix.Chmod(path, perms|st.Mode&unix.S_ISGID)
+	return unix.Chmod(path, perms|uint32(st.Mode)&unix.S_ISGID)
 }
 
 // do runs the command in a gVisor sandbox and records its exit status.

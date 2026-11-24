@@ -43,3 +43,8 @@ type goferToHostRPC struct{ goferPID int }
 func (*goferToHostRPC) OpenMount(*OpenMountArgs, *OpenMountResult) error {
 	return fmt.Errorf("host mount RPC is unavailable on native macOS: %w", unix.EOPNOTSUPP)
 }
+
+// goferWillNeedHostRPC returns false: a Darwin gofer opens its mounts itself.
+func goferWillNeedHostRPC(*specs.Spec) (bool, error) {
+	return false, nil
+}

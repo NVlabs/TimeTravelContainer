@@ -38,6 +38,25 @@ func containerHostSocketPair() ([2]int, error) {
 
 func setGoferParentDeathSignal(cmd *exec.Cmd) { cmd.SysProcAttr.Pdeathsig = unix.SIGKILL }
 
+// openBeneath opens name in the directory dirFD, through no symbolic link and
+// across no mount.
+func openBeneath(dirFD int, name string, flags int, mode uint32) (int, error) {
+	return unix.Openat2(dirFD, name, &unix.OpenHow{
+		Flags:   uint64(flags),
+		Mode:    uint64(mode),
+		Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS | unix.RESOLVE_NO_XDEV,
+	})
+}
+
+// setCloneIntoCgroup has the process that attr starts begin in the cgroup
+// that fd opens, if any.
+func setCloneIntoCgroup(attr *unix.SysProcAttr, fd *os.File) {
+	if fd != nil {
+		attr.UseCgroupFD = true
+		attr.CgroupFD = int(fd.Fd())
+	}
+}
+
 func setGoferCommandCredential(cmd *exec.Cmd, uid, gid uint32) error {
 	cmd.SysProcAttr.Credential = &syscall.Credential{Uid: uid, Gid: gid}
 	return nil

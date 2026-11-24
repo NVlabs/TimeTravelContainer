@@ -21,9 +21,11 @@ package container
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -226,4 +228,29 @@ func (rpc *goferToHostRPC) OpenMount(reqArg *OpenMountArgs, res *OpenMountResult
 	rpc.openMountRequests <- &req
 	err := <-req.done
 	return err
+}
+
+// goferWillNeedHostRPC returns whether the gofer may need its setup process,
+// e.g. to open mounts that it cannot open itself (which need capabilities in
+// the initial user namespace, or different permissions).
+func goferWillNeedHostRPC(spec *specs.Spec) (bool, error) {
+	if slices.ContainsFunc(spec.Mounts, func(m specs.Mount) bool {
+		return specutils.IsIDMappedMount(m) || strings.HasPrefix(m.Source, "/proc/")
+	}) {
+		return true, nil
+	}
+	allIDs := []specs.LinuxIDMapping{{ContainerID: 0, HostID: 0, Size: math.MaxUint32}}
+	for _, mapFileName := range []string{"uid_map", "gid_map"} {
+		mappings, err := getIdentityMapping(mapFileName)
+		if err != nil {
+			return false, err
+		}
+		if !slices.Equal(mappings, allIDs) {
+			return true, nil
+		}
+	}
+	if _, ok := specutils.GetNS(specs.UserNamespace, spec); ok {
+		return !slices.Equal(spec.Linux.UIDMappings, allIDs) || !slices.Equal(spec.Linux.GIDMappings, allIDs), nil
+	}
+	return false, nil
 }

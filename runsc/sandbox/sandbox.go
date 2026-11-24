@@ -761,56 +761,6 @@ func (s *Sandbox) setRestoreOpts(conf *config.Config, imagePath string, directIO
 	return nil
 }
 
-// openReadOnlyTree returns an FD for a detached, read-only copy of the mount
-// of dir, rooted at dir. Files opened through it refer to a read-only mount,
-// so they can not be opened for writing again, by anyone, through any path.
-// The copy stays alive as long as any file opened through it does.
-func openReadOnlyTree(dir string) (int, error) {
-	treeFD, err := unix.OpenTree(unix.AT_FDCWD, dir, unix.OPEN_TREE_CLONE|unix.OPEN_TREE_CLOEXEC)
-	if err != nil {
-		return -1, err
-	}
-	attr := unix.MountAttr{Attr_set: unix.MOUNT_ATTR_RDONLY}
-	if err := unix.MountSetattr(treeFD, "", unix.AT_EMPTY_PATH, &attr); err != nil {
-		unix.Close(treeFD)
-		return -1, err
-	}
-	return treeFD, nil
-}
-
-// openRestoreDir returns an FD for the checkpoint directory dir through which
-// the files handed to the sandbox for a restore are opened. The sandbox only
-// reads them and must not be able to modify them, which file permissions do
-// not guarantee since it may run as root with CAP_DAC_OVERRIDE. So this is a
-// detached, read-only copy of dir's mount (see openReadOnlyTree) when the
-// kernel and runsc's privileges allow it, and dir itself otherwise.
-func openRestoreDir(dir string) (int, error) {
-	dirFD, err := openReadOnlyTree(dir)
-	if err == nil {
-		return dirFD, nil
-	}
-	log.Warningf("Checkpoint files in %q are not protected from modification by the sandbox: %v", dir, err)
-	return unix.Open(dir, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
-}
-
-// openCheckpointFile opens the checkpoint file name in dir, relative to dirFD,
-// an FD for dir. The path can not lead out of dir, so the file is on dirFD's
-// mount.
-func openCheckpointFile(dirFD int, dir, name string, flags int) (*os.File, error) {
-	how := unix.OpenHow{
-		Flags:   uint64(flags | unix.O_CLOEXEC),
-		Resolve: unix.RESOLVE_BENEATH,
-	}
-	if flags&unix.O_CREAT != 0 {
-		how.Mode = 0644
-	}
-	fd, err := unix.Openat2(dirFD, name, &how)
-	if err != nil {
-		return nil, err
-	}
-	return os.NewFile(uintptr(fd), filepath.Join(dir, name)), nil
-}
-
 // openPagesFile opens the checkpoint pages file for reading. Its contents are
 // page-aligned, so it can be opened with O_DIRECT.
 func openPagesFile(dirFD int, imagePath string, directIO DirectIO) (*os.File, error) {
@@ -1247,7 +1197,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args) error {
 	log.Infof("Sidecar %q found: booting sandbox with %s", sentryBin.Name, bootBinPath)
 	// Open with `O_PATH`, which is sufficient for exec and makes the FD
 	// effectively execute-only (no read/write).
-	bootBin, err := os.OpenFile(bootBinPath, unix.O_PATH, 0)
+	bootBin, err := os.OpenFile(bootBinPath, pathOnlyFlag, 0)
 	if err != nil {
 		return fmt.Errorf("cannot open boot binary %q: %w", bootBinPath, err)
 	}
@@ -1273,10 +1223,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args) error {
 		// when re-parented.
 		Setsid: true,
 	}
-	if args.CloneIntoCgroupFD != nil {
-		cmd.SysProcAttr.UseCgroupFD = true
-		cmd.SysProcAttr.CgroupFD = int(args.CloneIntoCgroupFD.Fd())
-	}
+	setCloneIntoCgroup(cmd.SysProcAttr, args.CloneIntoCgroupFD)
 
 	// A Sentry hosts the entire TTC sandbox family, not one host process per
 	// guest PID. Give its host-visible command line the stable family name.
@@ -1797,7 +1744,7 @@ func donateProcUmounter(conf *config.Config, donations *donation.Agency) error {
 	if err != nil {
 		return fmt.Errorf("sidecar %q not usable: %w", b.Name, err)
 	}
-	f, err := os.OpenFile(p, unix.O_PATH, 0)
+	f, err := os.OpenFile(p, pathOnlyFlag, 0)
 	if err != nil {
 		return fmt.Errorf("cannot open %q: %w", p, err)
 	}
@@ -1810,7 +1757,7 @@ func donateProcUmounter(conf *config.Config, donations *donation.Agency) error {
 // sandbox from being the last ref holder of the FDs pinned into the ring.
 // See `//pkg/pinring` and `//runsc/fdparking`.
 func spawnFDParking(ring *os.File, pid int) error {
-	pidfd, err := unix.PidfdOpen(pid, 0)
+	pidfd, err := pidfdOpen(pid)
 	if err != nil {
 		return fmt.Errorf("pidfd_open(%d): %w", pid, err)
 	}
@@ -2610,7 +2557,7 @@ func createFSCheckpointLocalFiles(imagePath, prefix string, direct bool) ([]*os.
 			return nil, fmt.Errorf("creating fs checkpoint directory %q: %w", subDir, err)
 		}
 	}
-	dirFD, err := unix.Open(imagePath, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	dirFD, err := unix.Open(imagePath, pathOnlyFlag|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("opening fs checkpoint directory %q failed: %w", imagePath, err)
 	}
@@ -2782,10 +2729,7 @@ func (s *Sandbox) maybeStartCheckpointGoferAndGetSocket(conf *config.Config, cg 
 			// SIGHUP and SIGCONT when re-parented.
 			Setsid: true,
 		}
-		if cloneIntoCgroupFD != nil {
-			sysProcAttr.UseCgroupFD = true
-			sysProcAttr.CgroupFD = int(cloneIntoCgroupFD.Fd())
-		}
+		setCloneIntoCgroup(sysProcAttr, cloneIntoCgroupFD)
 		_, err := gvisorbinaries.CheckpointGofer.ForkExec(gvisorbinaries.Options{
 			Argv:        argv,
 			Envv:        env,

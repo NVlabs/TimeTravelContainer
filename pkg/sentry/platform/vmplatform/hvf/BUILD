@@ -18,7 +18,6 @@ go_library(
     ],
     visibility = ["//pkg/sentry:internal"],
     deps = [
-        "//pkg/fd",
         "//pkg/hostarch",
         "//pkg/sentry/platform",
         "//pkg/sentry/platform/hvf",

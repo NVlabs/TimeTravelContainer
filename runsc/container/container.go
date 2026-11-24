@@ -22,7 +22,6 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
-	"math"
 	"os"
 	"os/exec"
 	"path"
@@ -1431,11 +1430,7 @@ func (c *Container) createGoferFilestoreInSelf(goferRootfs string, mountSrc stri
 	}
 	defer unix.Close(dirFD)
 
-	filestoreFD, err := unix.Openat2(dirFD, fileName, &unix.OpenHow{
-		Flags:   uint64(createFlags),
-		Mode:    0666,
-		Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS | unix.RESOLVE_NO_XDEV,
-	})
+	filestoreFD, err := openBeneath(dirFD, fileName, createFlags, 0666)
 	if err != nil {
 		if err == unix.EEXIST {
 			// Note that if the same submount is mounted multiple times within the
@@ -1786,10 +1781,7 @@ func (c *Container) createGoferProcess(conf *config.Config, specFile *os.File, m
 		// will also be forwarded by this process, resulting in duplicate signals.
 		Setsid: true,
 	}
-	if cloneIntoCgroupFD != nil {
-		cmd.SysProcAttr.UseCgroupFD = true
-		cmd.SysProcAttr.CgroupFD = int(cloneIntoCgroupFD.Fd())
-	}
+	setCloneIntoCgroup(cmd.SysProcAttr, cloneIntoCgroupFD)
 
 	// Set Args[0] to make easier to spot the gofer process. Otherwise it's
 	// shown as `exe`.
@@ -2544,31 +2536,6 @@ func modifySpecForDirectfs(conf *config.Config, spec *specs.Spec) error {
 	spec.Linux.GIDMappings = gidMappings
 	logIDMappings(gidMappings, "GID")
 	return nil
-}
-
-// goferWillNeedHostRPC returns whether the gofer may need its setup process,
-// e.g. to open mounts that it cannot open itself (which need capabilities in
-// the initial user namespace, or different permissions).
-func goferWillNeedHostRPC(spec *specs.Spec) (bool, error) {
-	if slices.ContainsFunc(spec.Mounts, func(m specs.Mount) bool {
-		return specutils.IsIDMappedMount(m) || strings.HasPrefix(m.Source, "/proc/")
-	}) {
-		return true, nil
-	}
-	allIDs := []specs.LinuxIDMapping{{ContainerID: 0, HostID: 0, Size: math.MaxUint32}}
-	for _, mapFileName := range []string{"uid_map", "gid_map"} {
-		mappings, err := getIdentityMapping(mapFileName)
-		if err != nil {
-			return false, err
-		}
-		if !slices.Equal(mappings, allIDs) {
-			return true, nil
-		}
-	}
-	if _, ok := specutils.GetNS(specs.UserNamespace, spec); ok {
-		return !slices.Equal(spec.Linux.UIDMappings, allIDs) || !slices.Equal(spec.Linux.GIDMappings, allIDs), nil
-	}
-	return false, nil
 }
 
 func getIdentityMapping(mapFileName string) ([]specs.LinuxIDMapping, error) {

@@ -54,7 +54,9 @@ tests="
 //runsc/ttcd/...
 "
 if [ "$os" = Darwin ]; then
-	tests="$tests //pkg/sentry/platform/hvf/..."
+	# The HVF platform, and its registration and description (runsc finds
+	# its platform by both).
+	tests="$tests //pkg/sentry/platform/hvf/... //pkg/sentry/platform/platforms/..."
 else
 	# The helpers that ttcd carries on Linux, which verify_binaries checks:
 	# of what its cache holds, Bazel fetches only what a build names.

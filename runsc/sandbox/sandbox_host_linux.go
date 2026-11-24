@@ -21,6 +21,7 @@ package sandbox
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -30,6 +31,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
 
@@ -39,6 +41,21 @@ func startSandboxProcess(cmd *exec.Cmd, nss []specs.LinuxNamespace) error {
 }
 
 func directIOFlag() int { return unix.O_DIRECT }
+
+// pathOnlyFlag opens a descriptor that only names its file: to exec it, or to
+// open files beneath it.
+const pathOnlyFlag = unix.O_PATH
+
+// setCloneIntoCgroup has the process that attr starts begin in the cgroup
+// that fd opens, if any.
+func setCloneIntoCgroup(attr *unix.SysProcAttr, fd *os.File) {
+	if fd != nil {
+		attr.UseCgroupFD = true
+		attr.CgroupFD = int(fd.Fd())
+	}
+}
+
+func pidfdOpen(pid int) (int, error) { return unix.PidfdOpen(pid, 0) }
 
 func hostFDDirectory() string { return "/proc/self/fd" }
 
@@ -102,4 +119,54 @@ func configureRootlessCommandCapabilities(cmd *exec.Cmd) error {
 		unix.CAP_SETPCAP,
 	}
 	return nil
+}
+
+// openReadOnlyTree returns an FD for a detached, read-only copy of the mount
+// of dir, rooted at dir. Files opened through it refer to a read-only mount,
+// so they can not be opened for writing again, by anyone, through any path.
+// The copy stays alive as long as any file opened through it does.
+func openReadOnlyTree(dir string) (int, error) {
+	treeFD, err := unix.OpenTree(unix.AT_FDCWD, dir, unix.OPEN_TREE_CLONE|unix.OPEN_TREE_CLOEXEC)
+	if err != nil {
+		return -1, err
+	}
+	attr := unix.MountAttr{Attr_set: unix.MOUNT_ATTR_RDONLY}
+	if err := unix.MountSetattr(treeFD, "", unix.AT_EMPTY_PATH, &attr); err != nil {
+		unix.Close(treeFD)
+		return -1, err
+	}
+	return treeFD, nil
+}
+
+// openRestoreDir returns an FD for the checkpoint directory dir through which
+// the files handed to the sandbox for a restore are opened. The sandbox only
+// reads them and must not be able to modify them, which file permissions do
+// not guarantee since it may run as root with CAP_DAC_OVERRIDE. So this is a
+// detached, read-only copy of dir's mount (see openReadOnlyTree) when the
+// kernel and runsc's privileges allow it, and dir itself otherwise.
+func openRestoreDir(dir string) (int, error) {
+	dirFD, err := openReadOnlyTree(dir)
+	if err == nil {
+		return dirFD, nil
+	}
+	log.Warningf("Checkpoint files in %q are not protected from modification by the sandbox: %v", dir, err)
+	return unix.Open(dir, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+}
+
+// openCheckpointFile opens the checkpoint file name in dir, relative to dirFD,
+// an FD for dir. The path can not lead out of dir, so the file is on dirFD's
+// mount.
+func openCheckpointFile(dirFD int, dir, name string, flags int) (*os.File, error) {
+	how := unix.OpenHow{
+		Flags:   uint64(flags | unix.O_CLOEXEC),
+		Resolve: unix.RESOLVE_BENEATH,
+	}
+	if flags&unix.O_CREAT != 0 {
+		how.Mode = 0644
+	}
+	fd, err := unix.Openat2(dirFD, name, &how)
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), filepath.Join(dir, name)), nil
 }
