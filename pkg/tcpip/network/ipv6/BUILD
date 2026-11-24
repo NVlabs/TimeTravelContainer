@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 load("//tools:defs.bzl", "go_library", "go_test")
 
 package(
@@ -11,6 +14,7 @@ go_library(
         "dhcpv6configurationfromndpra_string.go",
         "icmp.go",
         "ipv6.go",
+        "live_fork.go",
         "mld.go",
         "ndp.go",
         "state_migrations.go",

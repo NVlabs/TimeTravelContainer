@@ -173,5 +173,23 @@ func (s *Stack) PrepareLiveForkRestore() error {
 	}
 	s.SetRouteTable(config.routes)
 	s.nicIDGen.Store(config.nextNICID)
+	// The saved NICs, which those made here replace, own their addresses
+	// still.
+	for _, oldNIC := range config.nics {
+		for _, ep := range oldNIC.networkEndpoints {
+			if replaced, ok := ep.(ReplacedNetworkEndpoint); ok {
+				replaced.ReleaseAddresses()
+			}
+		}
+	}
 	return nil
+}
+
+// ReplacedNetworkEndpoint is a network endpoint of a saved NIC that
+// PrepareLiveForkRestore replaces with a NIC of its own.
+type ReplacedNetworkEndpoint interface {
+	// ReleaseAddresses gives up the references that the endpoint holds on
+	// its addresses, as their owner, and changes nothing that its
+	// replacement shares with it: the NIC's link endpoint, and the protocol.
+	ReleaseAddresses()
 }
