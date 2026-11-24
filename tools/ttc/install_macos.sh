@@ -21,9 +21,13 @@ case "$bazel_command" in
 esac
 
 "$bazel_command" build //runsc/ttc:ttc //runsc/ttcd:ttcd
+# ttcd builds with cgo, which the build's options turn off, in a configuration
+# of its own, whose outputs are not in bazel-bin: Bazel says where they are.
+ttc=$("$bazel_command" cquery --output=files //runsc/ttc:ttc 2>/dev/null)
+ttcd=$("$bazel_command" cquery --output=files //runsc/ttcd:ttcd 2>/dev/null)
 mkdir -p "$destination"
-/usr/bin/install -m 0755 "$repo_root/bazel-bin/runsc/ttc/ttc_/ttc" "$destination/ttc"
-/usr/bin/install -m 0755 "$repo_root/bazel-bin/runsc/ttcd/ttcd_/ttcd" "$destination/ttcd"
+/usr/bin/install -m 0755 "$repo_root/$ttc" "$destination/ttc"
+/usr/bin/install -m 0755 "$repo_root/$ttcd" "$destination/ttcd"
 /usr/bin/codesign --force --sign - \
 	--entitlements "$repo_root/runsc/hvf.entitlements" \
 	"$destination/ttcd"

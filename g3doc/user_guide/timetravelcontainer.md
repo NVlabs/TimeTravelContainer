@@ -247,14 +247,17 @@ with Bazel, as macOS binaries require, from the gVisor repository root run:
 bazel build //runsc/ttc:ttc //runsc/ttcd:ttcd
 ```
 
-The binaries are written to:
+Bazel prints where it wrote each binary:
 
-```text
-bazel-bin/runsc/ttc/ttc_/ttc
-bazel-bin/runsc/ttcd/ttcd_/ttcd
+```shell
+bazel cquery --output=files //runsc/ttc:ttc //runsc/ttcd:ttcd
 ```
 
-You can use them directly without installation:
+On Linux they are `bazel-bin/runsc/ttc/ttc_/ttc` and
+`bazel-bin/runsc/ttcd/ttcd_/ttcd`. On macOS, `ttcd` builds with cgo, which the
+build's options turn off, in a configuration of its own, whose outputs are under
+`bazel-out` but not in `bazel-bin`; ask Bazel rather than assume the path. You
+can use them directly without installation:
 
 ```shell
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc"
@@ -271,9 +274,9 @@ matching service/runtime:
 
 ```shell
 mkdir -p "$HOME/.local/bin"
-install -m 0755 bazel-bin/runsc/ttc/ttc_/ttc \
+install -m 0755 "$(bazel cquery --output=files //runsc/ttc:ttc 2>/dev/null)" \
   "$HOME/.local/bin/ttc"
-install -m 0755 bazel-bin/runsc/ttcd/ttcd_/ttcd \
+install -m 0755 "$(bazel cquery --output=files //runsc/ttcd:ttcd 2>/dev/null)" \
   "$HOME/.local/bin/ttcd"
 ```
 
@@ -1514,7 +1517,7 @@ bazel build //runsc/ttc:ttc //runsc/ttcd:ttcd \
   //runsc/ttc/test:e2e_image_matrix
 
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
-TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
+TTCD="$PWD/$(bazel cquery --output=files //runsc/ttcd:ttcd 2>/dev/null)" \
   "$PWD/runsc/ttc/test/e2e_image_matrix.sh"
 ```
 

@@ -129,6 +129,13 @@ run_bazel() {
 	"$BAZEL" $(bazel_startup) "$command" $(bazel_flags) "$@"
 }
 
+# output_path prints the path, from the checkout, of the executable that
+# target built. A binary of a configuration of its own is not in bazel-bin:
+# on macOS, ttcd builds with cgo, which the build's options turn off.
+output_path() {
+	run_bazel cquery --output=files "$1" 2>/dev/null
+}
+
 setup() {
 	[ "$os" = Linux ] || fail "setup is for Linux jobs"
 	if [ "${RELEASE:-1}" != 1 ]; then
@@ -202,8 +209,8 @@ check() {
 # ttc-cuda-checkpoint; on macOS, a ttcd that is its renderer, and that loads
 # no library but Apple's.
 verify_binaries() {
-	ttc=bazel-bin/runsc/ttc/ttc_/ttc
-	ttcd=bazel-bin/runsc/ttcd/ttcd_/ttcd
+	ttc=$(output_path //runsc/ttc:ttc)
+	ttcd=$(output_path //runsc/ttcd:ttcd)
 	if [ "$os" = Linux ]; then
 		for binary in "$ttc" "$ttcd"; do
 			file -L "$binary" | grep -q 'statically linked' || fail "$binary is not static: $(file -L "$binary")"
@@ -305,7 +312,7 @@ release_build() {
 	stage=$out/stage
 	rm -rf "$stage"
 	mkdir -p "$stage"
-	cp bazel-bin/runsc/ttc/ttc_/ttc bazel-bin/runsc/ttcd/ttcd_/ttcd "$stage/"
+	cp "$(output_path //runsc/ttc:ttc)" "$(output_path //runsc/ttcd:ttcd)" "$stage/"
 	chmod 0755 "$stage/ttc" "$stage/ttcd"
 	cp LICENSE THIRD_PARTY_NOTICES.md "$stage/"
 	chmod 0644 "$stage/LICENSE" "$stage/THIRD_PARTY_NOTICES.md"

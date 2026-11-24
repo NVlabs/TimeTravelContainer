@@ -130,7 +130,7 @@ keeps, and needs the network to install the package:
 
 ```shell
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
-TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
+TTCD="$PWD/$(bazel cquery --output=files //runsc/ttcd:ttcd 2>/dev/null)" \
   "$PWD/runsc/ttc/test/e2e_fuse_lifecycle.sh"
 ```
 
@@ -170,7 +170,7 @@ container by hand.
 bazel build //runsc/ttc:ttc //runsc/ttcd:ttcd
 
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
-TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
+TTCD="$PWD/$(bazel cquery --output=files //runsc/ttcd:ttcd 2>/dev/null)" \
 TTC_GFX_GUEST_DRIVER=/path/to/dir/of/libvulkan_virtio.so \
   "$PWD/runsc/ttc/test/e2e_gfx.sh"
 ```
@@ -232,7 +232,7 @@ bazel build //runsc/ttc:ttc //runsc/ttcd:ttcd
 nvcc -O2 -o /tmp/cudaloop runsc/ttc/test/nvproxy/cudaloop.cu
 
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
-TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
+TTCD="$PWD/$(bazel cquery --output=files //runsc/ttcd:ttcd 2>/dev/null)" \
 CUDALOOP=/tmp/cudaloop \
   "$PWD/runsc/ttc/test/e2e_nvproxy.sh"
 ```
@@ -262,7 +262,7 @@ one to keep:
 
 ```shell
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
-TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
+TTCD="$PWD/$(bazel cquery --output=files //runsc/ttcd:ttcd 2>/dev/null)" \
   "$PWD/runsc/ttc/test/e2e_image_roundtrip.sh"
 ```
 
@@ -450,7 +450,7 @@ bazel build //runsc/ttc:ttc //runsc/ttcd:ttcd \
   //runsc/ttc/test:e2e_image_matrix
 
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
-TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
+TTCD="$PWD/$(bazel cquery --output=files //runsc/ttcd:ttcd 2>/dev/null)" \
   "$PWD/runsc/ttc/test/e2e_image_matrix.sh"
 ```
 
@@ -459,7 +459,7 @@ No-userns example:
 ```shell
 TTC_UNSAFE_NO_HOST_ISOLATION=1 \
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
-TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
+TTCD="$PWD/$(bazel cquery --output=files //runsc/ttcd:ttcd 2>/dev/null)" \
   "$PWD/runsc/ttc/test/e2e_image_matrix.sh"
 ```
 Use `TTC_E2E_ROOT` to retain the generated TTC state for inspection. Image
@@ -488,7 +488,7 @@ bazel build //runsc/ttc:ttc //runsc/ttcd:ttcd \
   //runsc/ttc/test:e2e_cp
 
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
-TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
+TTCD="$PWD/$(bazel cquery --output=files //runsc/ttcd:ttcd 2>/dev/null)" \
   "$PWD/runsc/ttc/test/e2e_cp.sh"
 ```
 
@@ -522,7 +522,7 @@ bazel build //runsc/ttc:ttc //runsc/ttcd:ttcd \
 
 TTC_UNSAFE_NO_HOST_ISOLATION=1 \
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
-TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
+TTCD="$PWD/$(bazel cquery --output=files //runsc/ttcd:ttcd 2>/dev/null)" \
   "$PWD/runsc/ttc/test/e2e_terminal.sh"
 ```
 
@@ -543,7 +543,7 @@ unmodified image. It never changes the host daemon configuration.
 ```shell
 bazel build //runsc/ttcd:ttcd //runsc/ttc/test:e2e_docker_main
 
-RUNSC="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
+RUNSC="$PWD/$(bazel cquery --output=files //runsc/ttcd:ttcd 2>/dev/null)" \
   "$PWD/runsc/ttc/test/e2e_docker_main.sh"
 ```
 
@@ -574,7 +574,7 @@ bazel build //runsc/ttc:ttc //runsc/ttcd:ttcd \
   //runsc/ttc/test:e2e_local_registry
 
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
-TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
+TTCD="$PWD/$(bazel cquery --output=files //runsc/ttcd:ttcd 2>/dev/null)" \
 REGISTRY_FIXTURE="$PWD/bazel-bin/runsc/ttc/test/registry_fixture/registry_fixture_/registry_fixture" \
 FIXTURE_BINARY="$PWD/bazel-bin/runsc/ttc/test/registry_fixture/guest/guest_fixture_/guest_fixture" \
   "$PWD/runsc/ttc/test/e2e_local_registry.sh"
