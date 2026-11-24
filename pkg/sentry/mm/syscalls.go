@@ -1264,11 +1264,15 @@ func (mm *MemoryManager) Decommit(addr hostarch.Addr, length uint64) error {
 	//
 	//	- Pages of a private anonymous mapping that we own (are not
 	//	copy-on-write) are decommitted in place with MemoryFile.Decommit(), as
-	//	Linux zaps them under an unchanged mapping. Unmapping them from the
-	//	AddressSpace would cut a hole in the host mapping of their run of homes,
-	//	splitting it in two, and the host allows a process only so many
-	//	mappings (vm.max_map_count): a heap discarding every other page of 64
-	//	MiB took 8,192 more of its stub's.
+	//	Linux zaps them under an unchanged mapping, where the MemoryFile keeps
+	//	their host mappings (MemoryFile.DecommitKeepsMappings). Unmapping them
+	//	from the AddressSpace would cut a hole in the host mapping of their run
+	//	of homes, splitting it in two, and the host allows a process only so
+	//	many mappings (vm.max_map_count): a heap discarding every other page of
+	//	64 MiB took 8,192 more of its stub's. A VM's guest RAM gives up a
+	//	decommitted page's frame, which the pma and its internal mappings would
+	//	go on referring to, so its pages are unmapped as any other.
+	inPlace := mm.mf.DecommitKeepsMappings()
 	didUnmapAS := false
 	pseg := mm.pmas.LowerBoundSegment(ar.Start)
 	vseg := mm.vmas.LowerBoundSegment(ar.Start)
@@ -1290,7 +1294,7 @@ func (mm *MemoryManager) Decommit(addr hostarch.Addr, length uint64) error {
 			}
 		}
 		for pseg.Ok() && pseg.Start() < vsegAR.End {
-			if vma.mappable == nil && !mm.isPMACopyOnWriteLocked(vseg, pseg) {
+			if inPlace && vma.mappable == nil && !mm.isPMACopyOnWriteLocked(vseg, pseg) {
 				// A huge page that this covers in part splits into base
 				// pages; see MemoryFile.Decommit.
 				mm.decommitInPlaceLocked(pseg, pseg.Range().Intersect(vsegAR))

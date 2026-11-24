@@ -1850,6 +1850,14 @@ func (f *MemoryFile) Decommit(fr memmap.FileRange) {
 	})
 }
 
+// DecommitKeepsMappings returns true if Decommit leaves the pages' host
+// mappings in place, reading zeroes, as a hole punched in a memfd does. A
+// backing, such as a VM's guest RAM, gives up the pages' frames instead, and
+// may release the host memory that held them.
+func (f *MemoryFile) DecommitKeepsMappings() bool {
+	return f.backing == nil
+}
+
 func (f *MemoryFile) commitFile(fr memmap.FileRange) error {
 	if f.backing != nil {
 		return f.backing.Commit(fr)
