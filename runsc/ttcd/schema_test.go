@@ -7,22 +7,25 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-// This build loads what every release in schemas/ saved: each savable type of
-// the release has the same fields here, or a migration that accounts for
-// every difference (see pkg/state/migrate.go).
+// This build loads what every release of its platform in schemas/ saved: each
+// savable type of the release has the same fields here, or a migration that
+// accounts for every difference (see pkg/state/migrate.go). A platform saves
+// types of its own, and images restore only on their own platform.
 func TestThisBuildLoadsEveryReleasesImages(t *testing.T) {
-	files, err := filepath.Glob("schemas/*.json")
+	platform := runtime.GOOS + "-" + runtime.GOARCH
+	files, err := filepath.Glob(filepath.Join("schemas", platform, "*.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(files) == 0 {
-		t.Fatal("no release schemas in schemas/")
+		t.Skipf("no release schemas of %s in schemas/%s", platform, platform)
 	}
 	for _, file := range files {
 		data, err := os.ReadFile(file)

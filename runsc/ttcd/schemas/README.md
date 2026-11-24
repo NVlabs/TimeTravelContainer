@@ -11,9 +11,15 @@ those builds saves: every savable type, by name, with the fields it saves and
 the types they are saved as. `TestThisBuildLoadsEveryReleasesImages` in this
 package checks that the current build loads every one of them.
 
+Each platform's builds save types of their own (the registers of their
+architecture, and what their host offers, such as nvproxy and systrap on
+Linux), and their images restore only on that platform. So the schemas are
+in a directory per platform, `GOOS-GOARCH`, and a build checks those of its
+own platform alone; a platform of none skips the test.
+
 - `daily-20261023.json`: pre-merge master, a9108907a (the dailies through
   20261023), the last build before TTC's merge of upstream gVisor through
-  2026-10-28.
+  2026-10-28, in `linux-amd64/` and `darwin-arm64/`.
 
 ## When the test fails
 
@@ -32,10 +38,11 @@ caught only here, by its saved type.
 
 ## At a release
 
-Add the release's schema, named after the release:
+Add the release's schema of each platform, named after the release, from
+that platform's ttcd:
 
 ```shell
-ttcd _state-schema > runsc/ttcd/schemas/RELEASE.json
+ttcd _state-schema > runsc/ttcd/schemas/$(go env GOOS)-$(go env GOARCH)/RELEASE.json
 ```
 
 It writes one type per line, sorted, so that two releases' schemas compare

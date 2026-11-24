@@ -50,7 +50,7 @@ go_test(
         darwin = ["info_plist_darwin_test.go"],
         linux = [],
     ),
-    data = glob(["schemas/*.json"]) + select_system(
+    data = glob(["schemas/*/*.json"]) + select_system(
         darwin = [":ttcd"],
         linux = [],
     ),
