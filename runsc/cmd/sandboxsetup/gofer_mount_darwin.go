@@ -114,7 +114,7 @@ func SetupMounts(conf *config.Config, _ []specs.Mount, _, _ string, _ []specutil
 
 // ShouldExposeNvidiaDevice reports whether path names a supported NVIDIA node.
 func ShouldExposeNvidiaDevice(path string) bool {
-	if path == "/dev/nvidiactl" || path == "/dev/nvidia-uvm" {
+	if path == "/dev/nvidiactl" || path == "/dev/nvidia-uvm" || path == "/dev/nvidia-uvm-tools" {
 		return true
 	}
 	return regexp.MustCompile(`^/dev/nvidia(\d+)$`).MatchString(path)

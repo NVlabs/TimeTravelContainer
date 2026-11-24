@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 load("//tools:defs.bzl", "cc_flags_supplier", "cc_toolchain", "go_test")
 
 package(
@@ -42,6 +45,7 @@ genrule(
         ":no_pie_cc_flags",
     ],
     visibility = ["//visibility:public"],
+    target_compatible_with = ["@platforms//os:linux"],
 )
 
 cc_flags_supplier(
@@ -58,4 +62,5 @@ go_test(
         "//pkg/test/testutil",
         "@org_golang_x_sys//unix:go_default_library",
     ],
+    target_compatible_with = ["@platforms//os:linux"],
 )

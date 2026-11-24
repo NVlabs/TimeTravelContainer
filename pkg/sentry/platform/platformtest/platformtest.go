@@ -81,7 +81,7 @@ func (*Platform) MaxUserAddress() hostarch.Addr {
 
 // NewAddressSpace implements platform.Platform.NewAddressSpace.
 func (*Platform) NewAddressSpace() (platform.AddressSpace, error) {
-	return addressSpace{}, nil
+	return &addressSpace{}, nil
 }
 
 // NewContext implements platform.Platform.NewContext.
@@ -99,27 +99,33 @@ func (*Platform) ConcurrencyCount() int {
 	return math.MaxInt
 }
 
-// addressSpace is a platform.AddressSpace that maps nothing.
+// addressSpace is a platform.AddressSpace that maps nothing. Each is an
+// object of its own, as a platform's address spaces are, which the Kernel
+// tells apart by identity.
 type addressSpace struct {
 	platform.NoAddressSpaceIO
+
+	// _ makes addressSpace of nonzero size: pointers to distinct values of
+	// zero size may be equal.
+	_ byte
 }
 
 // MapFile implements platform.AddressSpace.MapFile.
-func (addressSpace) MapFile(hostarch.Addr, memmap.File, memmap.FileRange, hostarch.AccessType, bool) error {
+func (*addressSpace) MapFile(hostarch.Addr, memmap.File, memmap.FileRange, hostarch.AccessType, bool) error {
 	return nil
 }
 
 // Unmap implements platform.AddressSpace.Unmap.
-func (addressSpace) Unmap(hostarch.Addr, uint64) {}
+func (*addressSpace) Unmap(hostarch.Addr, uint64) {}
 
 // Release implements platform.AddressSpace.Release.
-func (addressSpace) Release() {}
+func (*addressSpace) Release() {}
 
 // PreFork implements platform.AddressSpace.PreFork.
-func (addressSpace) PreFork() {}
+func (*addressSpace) PreFork() {}
 
 // PostFork implements platform.AddressSpace.PostFork.
-func (addressSpace) PostFork() {}
+func (*addressSpace) PostFork() {}
 
 // platformContext is a platform.Context that can't run application code.
 type platformContext struct {

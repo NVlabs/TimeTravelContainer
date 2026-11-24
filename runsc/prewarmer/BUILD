@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 load("//tools:defs.bzl", "cc_flags_supplier", "cc_toolchain", "go_binary", "go_test")
 
 package(
@@ -43,6 +46,7 @@ genrule(
         ":no_pie_cc_flags",
     ],
     visibility = ["//visibility:public"],
+    target_compatible_with = ["@platforms//os:linux"],
 )
 
 cc_flags_supplier(
@@ -56,6 +60,7 @@ go_test(
     srcs = ["prewarmer_single_page_test.go"],
     data = [":prewarmer_binary"],
     deps = ["//pkg/test/testutil"],
+    target_compatible_with = ["@platforms//os:linux"],
 )
 
 go_binary(
@@ -63,6 +68,7 @@ go_binary(
     srcs = ["fdtable_expander.go"],
     pure = True,
     deps = ["@org_golang_x_sys//unix:go_default_library"],
+    target_compatible_with = ["@platforms//os:linux"],
 )
 
 go_test(
@@ -75,4 +81,5 @@ go_test(
         "//:release",
     ],
     deps = ["//pkg/test/testutil"],
+    target_compatible_with = ["@platforms//os:linux"],
 )

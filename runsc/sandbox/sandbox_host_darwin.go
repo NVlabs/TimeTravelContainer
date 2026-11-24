@@ -73,9 +73,9 @@ func setCloneIntoCgroup(*unix.SysProcAttr, *os.File) {}
 func pidfdOpen(int) (int, error) { return -1, unix.EOPNOTSUPP }
 
 // openReadOnlyTree reports that macOS has no detached mounts to make
-// read-only.
+// read-only: no open_tree(2).
 func openReadOnlyTree(string) (int, error) {
-	return -1, unix.EOPNOTSUPP
+	return -1, unix.ENOSYS
 }
 
 // openRestoreDir returns an FD for the checkpoint directory dir, through which

@@ -230,6 +230,7 @@ go_test(
     ]),
     embed = [":boot"],
     deps = [
+        "//pkg/abi",
         "//pkg/abi/linux",
         "//pkg/bpf",
         "//pkg/context",
@@ -243,6 +244,7 @@ go_test(
         "//pkg/log",
         "//pkg/safemem",
         "//pkg/seccomp",
+        "//pkg/sentry/arch",
         "//pkg/sentry/checkpoint",
         "//pkg/sentry/fscheckpoint",
         "//pkg/sentry/fsimpl/erofs",

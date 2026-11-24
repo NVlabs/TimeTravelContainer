@@ -528,7 +528,7 @@ func TestRootfsUpperTarFlags(t *testing.T) {
 	}
 	defer f.Close()
 
-	procFDPath := fmt.Sprintf("/proc/self/fd/%d", f.Fd())
+	procFDPath := fmt.Sprintf("%s/%d", hostFDDirectory(), f.Fd())
 	dupFile, err := os.OpenFile(procFDPath, rootfsUpperTarFlags(procFDPath), 0644)
 	if err != nil {
 		t.Fatalf("os.OpenFile(%q, rootfsUpperTarFlags) error = %v, want nil", procFDPath, err)

@@ -53,6 +53,7 @@ go_test(
     size = "small",
     srcs = [
         "gofer_conf_test.go",
+        "process_linux_test.go",
         "specutils_test.go",
     ],
     embed = [":specutils"],

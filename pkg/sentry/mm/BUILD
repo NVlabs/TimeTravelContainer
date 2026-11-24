@@ -194,6 +194,8 @@ go_test(
     size = "small",
     srcs = [
         "densify_test.go",
+        "exhaustible_darwin_test.go",
+        "exhaustible_linux_test.go",
         "fold_test.go",
         "home_test.go",
         "mm_test.go",

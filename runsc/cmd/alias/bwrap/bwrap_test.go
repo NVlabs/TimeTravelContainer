@@ -12,11 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package bwrap
 
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -956,6 +960,9 @@ func TestMakeHostDirs(t *testing.T) {
 			// mkdir(2) passes a parent's setgid bit on to the new directory.
 			name: "CreatesUnderSetgidParent",
 			setup: func(t *testing.T, root string) string {
+				if runtime.GOOS != "linux" {
+					t.Skip("mkdir(2) passes a parent's setgid bit on only on Linux")
+				}
 				if err := os.Chmod(root, 0700|os.ModeSetgid); err != nil {
 					t.Fatal(err)
 				}

@@ -519,10 +519,7 @@ func TestHostFUSEWriteFile(t *testing.T) {
 func newTestHostFUSEConnectionWithReply(t *testing.T, backDir string, reply *linux.FUSEInitOut) (*hostConnection, *testFUSEServer, func()) {
 	t.Helper()
 
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET, 0)
-	if err != nil {
-		t.Fatalf("Socketpair: %v", err)
-	}
+	fds := fuseSocketpair(t)
 
 	server := newTestFUSEServer(fds[1], backDir)
 	server.initReply = reply

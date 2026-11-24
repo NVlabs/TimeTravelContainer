@@ -12,9 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package sandbox
 
 import (
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -71,7 +75,13 @@ func TestConcurrentExportSavings(t *testing.T) {
 		{name: "delayed-zero", delayedZero: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			socketPath := filepath.Join(t.TempDir(), "control.sock")
+			// A short path: macOS's socket addresses hold 104 bytes.
+			dir, err := os.MkdirTemp("/tmp", "ctl")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { os.RemoveAll(dir) })
+			socketPath := filepath.Join(dir, "control.sock")
 			server, err := controlserver.Create(socketPath)
 			if err != nil {
 				t.Fatal(err)

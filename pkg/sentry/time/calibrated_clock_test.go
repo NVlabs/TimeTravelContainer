@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package time
 
 import (
@@ -28,6 +31,14 @@ func newTestCalibratedClock(samples []sample, cycles []TSCValue) *CalibratedCloc
 	return &CalibratedClock{
 		ref: newTestSampler(samples, cycles),
 	}
+}
+
+// reanchorsOnReset returns whether c is ready again as soon as it resets: on a
+// platform whose counter has an architected frequency, it re-anchors at once
+// (see platformInitialClockParameters).
+func reanchorsOnReset(c *CalibratedClock) bool {
+	_, ok := platformInitialClockParameters(c.ref.clockID)
+	return ok
 }
 
 func TestConstantFrequency(t *testing.T) {
@@ -102,8 +113,8 @@ func TestGetTimeOverflow(t *testing.T) {
 	c.mu.RLock()
 	ready := c.ready
 	c.mu.RUnlock()
-	if ready {
-		t.Error("clock remains ready after time computation overflow")
+	if want := reanchorsOnReset(c); ready != want {
+		t.Errorf("clock ready after time computation overflow = %t, want %t", ready, want)
 	}
 }
 
@@ -128,10 +139,10 @@ func TestUpdateReportsCalibrationReset(t *testing.T) {
 	c.mu.RLock()
 	clockReady := c.ready
 	c.mu.RUnlock()
-	if got, want := clockReady, false; got != want {
+	if got, want := clockReady, reanchorsOnReset(c); got != want {
 		t.Fatalf("clock ready after rejected calibration = %t, want %t", got, want)
 	}
-	if got, want := ready, false; got != want {
+	if got, want := ready, reanchorsOnReset(c); got != want {
 		t.Errorf("Update ready after rejected calibration = %t, want %t", got, want)
 	}
 }

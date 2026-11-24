@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -241,6 +242,9 @@ func TestFoldWaitsAfterLeavingSharedPages(t *testing.T) {
 // alone, and a fold step collapses it into a 2 MiB page again, mapped by one
 // pma, with what it held.
 func TestCollapseRefilled2MiBPage(t *testing.T) {
+	if unix.Getpagesize() != hostarch.PageSize {
+		t.Skip("a host page holds several base pages, and is resident while any is")
+	}
 	defer func(age time.Duration) { collapseAge = age }(collapseAge)
 	var collapsed []memmap.FileRange
 	defer pgalloc.SetCollapseHostForTest(func(_ uintptr, fr memmap.FileRange) error {

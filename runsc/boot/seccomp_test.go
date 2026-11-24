@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package boot
 
 import (
@@ -21,9 +24,12 @@ import (
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/bpf"
 	"gvisor.dev/gvisor/pkg/seccomp"
+	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/runsc/config"
 )
 
@@ -35,6 +41,22 @@ func allowOnlySpec(syscall string) *specs.Spec {
 			Action: specs.ActAllow,
 		}},
 	}}}
+}
+
+// linuxSysno returns the number of the Linux syscall name on the host's
+// architecture, the guests': the host's own numbers are another system's on
+// macOS.
+func linuxSysno(t *testing.T, name string) uintptr {
+	t.Helper()
+	table, ok := kernel.LookupSyscallTable(abi.Linux, arch.Host)
+	if !ok {
+		t.Fatalf("no Linux syscall table of %v", arch.Host)
+	}
+	sysno, err := table.LookupNo(name)
+	if err != nil {
+		t.Fatalf("LookupNo(%q): %v", name, err)
+	}
+	return sysno
 }
 
 func runFilter(t *testing.T, p *bpf.Program, sysno uintptr) uint32 {
@@ -76,10 +98,10 @@ func TestOCISeccompProgramCache(t *testing.T) {
 		sysno uintptr
 		want  uint32
 	}{
-		{"getpid profile, getpid", getpid2, unix.SYS_GETPID, allow},
-		{"getpid profile, getppid", getpid2, unix.SYS_GETPPID, eperm},
-		{"getppid profile, getpid", getppid, unix.SYS_GETPID, eperm},
-		{"getppid profile, getppid", getppid, unix.SYS_GETPPID, allow},
+		{"getpid profile, getpid", getpid2, linuxSysno(t, "getpid"), allow},
+		{"getpid profile, getppid", getpid2, linuxSysno(t, "getppid"), eperm},
+		{"getppid profile, getpid", getppid, linuxSysno(t, "getpid"), eperm},
+		{"getppid profile, getppid", getppid, linuxSysno(t, "getppid"), allow},
 	} {
 		if got := runFilter(t, tc.p, tc.sysno); got != tc.want {
 			t.Errorf("%s: got %#x, want %#x", tc.name, got, tc.want)

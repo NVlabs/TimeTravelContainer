@@ -12,11 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package server
 
 import (
 	"fmt"
 	"math/rand"
+	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -36,6 +42,16 @@ func (*echo) Echo(arg *string, ret *string) error {
 // serving waits for it instead of failing or hanging.
 func TestCallBeforeServing(t *testing.T) {
 	addr := fmt.Sprintf("\x00control-server-test.%d", rand.Int63())
+	if runtime.GOOS != "linux" {
+		// Abstract socket names are Linux's. A path must be short: macOS's
+		// socket addresses hold 104 bytes.
+		dir, err := os.MkdirTemp("/tmp", "ctl")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.RemoveAll(dir) })
+		addr = filepath.Join(dir, "sock")
+	}
 	srv, err := Create(addr)
 	if err != nil {
 		t.Fatalf("Create(%q) failed: %v", addr, err)

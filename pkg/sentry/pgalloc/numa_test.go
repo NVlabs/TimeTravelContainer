@@ -6,6 +6,7 @@ package pgalloc
 import (
 	"bytes"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -140,6 +141,9 @@ func TestMemoryPolicyPlacement(t *testing.T) {
 // A sparse unit that a fault asks to place before it is loaded is bound once,
 // before its loader fills it.
 func TestPlaceUnloadedBindsAnUnloadedUnitOnce(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("binding memory to NUMA nodes is Linux's, as /proc/self/maps, which shows it")
+	}
 	const pagesPerChunk = SparseChunkBytes / hostarch.PageSize
 	source, sourceFR := newRemoteTestMemoryFile(t, pagesPerChunk)
 	fillRemoteTestRange(t, source, sourceFR, bytes.Repeat([]byte{7}, int(sourceFR.Length())))

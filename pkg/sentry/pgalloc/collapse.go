@@ -41,6 +41,8 @@ var noCollapse atomicbitops.Bool
 func SetCollapseHostForTest(fn func(fd uintptr, fr memmap.FileRange) error) func() {
 	old := collapseHost
 	collapseHost = func(fd uintptr, fr memmap.FileRange, _ uintptr) error { return fn(fd, fr) }
+	// An earlier collapse on a host of no huge pages turned collapse off.
+	noCollapse.Store(false)
 	return func() {
 		collapseHost = old
 		noCollapse.Store(false)
@@ -140,11 +142,14 @@ func (f *MemoryFile) Resident(fr memmap.FileRange) bool {
 		return false
 	}
 	resident := true
+	// mincore reports one byte per page of the host's, which may be larger
+	// than hostarch.PageSize: 16 KiB on macOS.
+	hostPageSize := unix.Getpagesize()
 	f.forEachMappingSlice(fr, func(s []byte) {
 		if !resident {
 			return
 		}
-		vec := make([]byte, (len(s)+hostarch.PageSize-1)/hostarch.PageSize)
+		vec := make([]byte, (len(s)+hostPageSize-1)/hostPageSize)
 		if mincore(s, vec) != nil {
 			resident = false
 			return

@@ -24,6 +24,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -296,6 +297,10 @@ func TestSaveToExitAfterSaving(t *testing.T) {
 			}
 			if got, want := f.knownCommittedBytes, uint64(hostarch.PageSize); got != want {
 				t.Errorf("knownCommittedBytes: got %d, want %d", got, want)
+			}
+			if runtime.GOOS != "linux" {
+				// Only Linux's MemoryFile punches holes in its host file.
+				return
 			}
 			off := int64(fr.Start) + 5*int64(hostarch.PageSize)
 			data, err := unix.Seek(f.FD(), off, unix.SEEK_DATA)

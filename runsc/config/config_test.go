@@ -20,6 +20,7 @@ package config
 import (
 	"fmt"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -115,6 +116,10 @@ func TestFromFlags(t *testing.T) {
 		t.Errorf("GoferNetworkNamespace=%v, want: %v", c.GoferNetworkNamespace, want)
 	}
 
+	if runtime.GOOS != "linux" {
+		// The rest is of the sandbox network, which macOS has not.
+		return
+	}
 	if err := testFlags.Lookup("network").Value.Set("sandbox"); err != nil {
 		t.Errorf("Flag set: %v", err)
 	}
@@ -382,6 +387,9 @@ func TestValidationFail(t *testing.T) {
 		name  string
 		flags map[string]string
 		error string
+		// linuxOnly is a case of Linux's own options, which macOS refuses
+		// before it gets to the case's error.
+		linuxOnly bool
 	}{
 		{
 			name: "shared+overlay",
@@ -497,7 +505,8 @@ func TestValidationFail(t *testing.T) {
 				"network-proxy-path": "/run/netproxy.sock",
 				"EXPERIMENTAL-xdp":   "ns",
 			},
-			error: "network-proxy-path flag is incompatible with XDP",
+			error:     "network-proxy-path flag is incompatible with XDP",
+			linuxOnly: true,
 		},
 		{
 			name: "platform_device_path:malformed-pair",
@@ -523,6 +532,9 @@ func TestValidationFail(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.linuxOnly && runtime.GOOS != "linux" {
+				t.Skip("macOS refuses Linux's own options first")
+			}
 			testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
 			RegisterFlags(testFlags)
 			for name, val := range tc.flags {
@@ -569,6 +581,9 @@ func TestPlatformDeviceFor(t *testing.T) {
 }
 
 func TestPlatformAutoAcceptsDevicePairs(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("--platform=auto chooses among Linux's platforms; macOS has HVF alone")
+	}
 	testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
 	RegisterFlags(testFlags)
 	for name, val := range map[string]string{

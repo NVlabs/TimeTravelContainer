@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -27,9 +28,13 @@ func init() {
 
 // openFDs counts this process's open descriptors.
 func openFDs(t *testing.T) int {
-	entries, err := os.ReadDir("/proc/self/fd")
+	dir := "/proc/self/fd"
+	if runtime.GOOS == "darwin" {
+		dir = "/dev/fd"
+	}
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		t.Fatalf("reading /proc/self/fd: %v", err)
+		t.Fatalf("reading %s: %v", dir, err)
 	}
 	return len(entries)
 }
