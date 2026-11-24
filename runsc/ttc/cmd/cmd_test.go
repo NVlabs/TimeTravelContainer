@@ -4225,6 +4225,66 @@ func TestRestartRunningExitedPausedAndDehydratedBranches(t *testing.T) {
 	}
 }
 
+// explicitStopBackend records the order of a paused branch's stop: the fence
+// on its console follower's exit report, the filesystem's preparation, the
+// discard that ends the init, and how the fence was finished.
+type explicitStopBackend struct {
+	*fakeBackend
+	events     []string
+	prepareErr error
+}
+
+func (b *explicitStopBackend) beginExplicitInitStop(target selector) (func(bool), error) {
+	b.events = append(b.events, "fence "+target.String())
+	return func(commit bool) {
+		b.events = append(b.events, fmt.Sprintf("finish %t", commit))
+	}, nil
+}
+
+func (b *explicitStopBackend) preparePausedStop(target selector) error {
+	b.events = append(b.events, "prepare")
+	if b.prepareErr != nil {
+		return b.prepareErr
+	}
+	return b.fakeBackend.preparePausedStop(target)
+}
+
+func (b *explicitStopBackend) discard(target selector) error {
+	b.events = append(b.events, "discard")
+	return b.fakeBackend.discard(target)
+}
+
+func (b *explicitStopBackend) start(target selector, detach, interactive bool) (int, error) {
+	b.events = append(b.events, "start")
+	return b.fakeBackend.start(target, detach, interactive)
+}
+
+// A restart's fresh start of a paused branch must not be discarded by the
+// late report of the old init's end, which the stop owns: it fences the
+// report before it discards the init.
+func TestStopPausedFencesConsoleExitReport(t *testing.T) {
+	paused := InspectInfo{TTC: TTCInspectInfo{Branches: []InspectBranch{{Metadata: Branch{ID: "child", State: "paused"}}}}}
+	b := &explicitStopBackend{fakeBackend: &fakeBackend{inspectInfo: paused}}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"restart", "web@child"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("restart status=%d stderr=%q", status, stderr.String())
+	}
+	if want := []string{"fence web@child", "prepare", "discard", "finish true", "start"}; !reflect.DeepEqual(b.events, want) {
+		t.Errorf("restart of a paused branch=%q, want %q", b.events, want)
+	}
+
+	// A stop that fails before it ends the init gives the fence up.
+	b = &explicitStopBackend{fakeBackend: &fakeBackend{inspectInfo: paused}, prepareErr: errors.New("sealing failed")}
+	stdout.Reset()
+	stderr.Reset()
+	if status := runCommand([]string{"stop", "web@child"}, &stdout, &stderr, b); status == 0 {
+		t.Fatal("stop succeeded although preparing the paused branch failed")
+	}
+	if want := []string{"fence web@child", "prepare", "finish false"}; !reflect.DeepEqual(b.events, want) {
+		t.Errorf("failed stop of a paused branch=%q, want %q", b.events, want)
+	}
+}
+
 func TestFreshStartPeers(t *testing.T) {
 	info := ttcbundle.ContainerInfo{Branches: []ttcbundle.BranchInfo{
 		{ID: "target", State: "exited"},

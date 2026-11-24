@@ -5410,10 +5410,27 @@ func stopBranchLifecycle(target branchOperationTarget, stopSignal, timeoutSecond
 		}
 		return stop.finish(stopDeadline(timeoutSeconds), backend)
 	case "paused":
+		// The discard ends the init, and its console follower then reports
+		// the exit as the branch's own, late: after a restart's fresh start,
+		// whose init that report's finalization discarded in turn. The stop
+		// owns the exit, as a running branch's does.
+		finishExplicitStop := func(bool) {}
+		if coordinator, ok := backend.(interface {
+			beginExplicitInitStop(selector) (func(bool), error)
+		}); ok {
+			finish, err := coordinator.beginExplicitInitStop(target.selector)
+			if err != nil {
+				return fmt.Errorf("coordinating explicit stop of %s: %w", target.selector, err)
+			}
+			finishExplicitStop = finish
+		}
 		if err := backend.preparePausedStop(target.selector); err != nil {
+			finishExplicitStop(false)
 			return fmt.Errorf("persisting paused filesystem state for %s: %w", target.selector, err)
 		}
-		if err := backend.discard(target.selector); err != nil {
+		err := backend.discard(target.selector)
+		finishExplicitStop(true)
+		if err != nil {
 			return fmt.Errorf("discarding execution state for %s: %w", target.selector, err)
 		}
 		return queueExit()
