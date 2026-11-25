@@ -168,25 +168,34 @@ setup() {
 
 # collect_test_results copies the JUnit reports of the tests that ran since
 # the marker, and the logs of those that failed, into ci-out, which the
-# pipeline keeps: bazel-testlogs lies outside the checkout, and on a runner
-# whose output base persists holds earlier jobs' results too.
+# pipeline keeps: Bazel's test logs lie outside the checkout, and on a runner
+# whose output base persists hold earlier jobs' results too. Each
+# configuration that tests build in has its own test logs: those of a test in
+# a configuration of its own, as a test with cgo is on macOS, are not in
+# bazel-testlogs.
 collect_test_results() {
 	marker=$1
-	testlogs=$("$BAZEL" $(bazel_startup) info $(bazel_flags) bazel-testlogs 2>/dev/null) || return 0
-	[ -d "$testlogs" ] || return 0
+	outputs=$("$BAZEL" $(bazel_startup) info $(bazel_flags) output_path 2>/dev/null) || return 0
+	[ -d "$outputs" ] || return 0
+	# Only this check's results stay. An earlier check by hand leaves its
+	# reports read-only, as Bazel makes them, and cp cannot replace them.
+	rm -rf "$out/junit" "$out/failed"
 	mkdir -p "$out/junit" "$out/failed"
-	(
-		cd "$testlogs"
-		find . -name test.xml -newer "$marker" | while read -r report; do
-			dir=$(dirname "$report")
-			mkdir -p "$out/junit/$dir"
-			cp "$report" "$out/junit/$dir/"
-			if grep -q '<failure' "$report" || grep -q '<error' "$report"; then
-				mkdir -p "$out/failed/$dir"
-				cp "$dir/test.log" "$out/failed/$dir/" 2>/dev/null || true
-			fi
-		done
-	)
+	for testlogs in "$outputs"/*/testlogs; do
+		[ -d "$testlogs" ] || continue
+		(
+			cd "$testlogs"
+			find . -name test.xml -newer "$marker" | while read -r report; do
+				dir=$(dirname "$report")
+				mkdir -p "$out/junit/$dir"
+				cp "$report" "$out/junit/$dir/"
+				if grep -q '<failure' "$report" || grep -q '<error' "$report"; then
+					mkdir -p "$out/failed/$dir"
+					cp "$dir/test.log" "$out/failed/$dir/" 2>/dev/null || true
+				fi
+			done
+		)
+	done
 }
 
 check() {
