@@ -20,9 +20,14 @@ package hvf
 #include <sys/mman.h>
 #include <string.h>
 
+// The Darwin VM tag of the memory that ttc_mmap_anon maps (vmMemoryTTCVM):
+// the third of the tags that Darwin leaves to applications. SDKs before
+// macOS 26's name only the first and the last of them.
+#define TTC_VM_TAG_VM (VM_MEMORY_APPLICATION_SPECIFIC_1 + 2)
+
 static void *ttc_mmap_anon(size_t length) {
 	void *p = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON,
-			VM_MAKE_TAG(VM_MEMORY_APPLICATION_SPECIFIC_3), 0);
+			VM_MAKE_TAG(TTC_VM_TAG_VM), 0);
 	return p == MAP_FAILED ? NULL : p;
 }
 

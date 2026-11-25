@@ -34,6 +34,13 @@ package hvf
 
 #include "pkg/sentry/platform/hvf/monitor/monitor_layout.h"
 
+// The Darwin VM tags of the native bridge's slabs (vmMemoryTTCBridge) and of
+// the memory that ttc_mmap_anon maps (vmMemoryTTCVM): the second and the
+// third of the tags that Darwin leaves to applications. SDKs before macOS
+// 26's name only the first and the last of them.
+#define TTC_VM_TAG_BRIDGE (VM_MEMORY_APPLICATION_SPECIFIC_1 + 1)
+#define TTC_VM_TAG_VM (VM_MEMORY_APPLICATION_SPECIFIC_1 + 2)
+
 #define TTC_RING0_BRIDGE_MAGIC UINT64_C(0x3145474449524354)
 #define TTC_RING0_HOST_STACK_SIZE (UINT64_C(64) << 10)
 
@@ -787,7 +794,7 @@ static struct ttc_ring0_bridge *ttc_ring0_bridge_storage_acquire(void) {
 		bridge = mmap(NULL, TTC_RING0_HOST_SLAB_SIZE,
 				PROT_READ | PROT_WRITE,
 				MAP_PRIVATE | MAP_ANON,
-				VM_MAKE_TAG(VM_MEMORY_APPLICATION_SPECIFIC_2), 0);
+				VM_MAKE_TAG(TTC_VM_TAG_BRIDGE), 0);
 		if (bridge == MAP_FAILED) return NULL;
 	}
 	__builtin_memset(bridge, 0, TTC_RING0_HOST_SLAB_SIZE);
@@ -2359,7 +2366,7 @@ static void ttc_ring0_host_entry(struct ttc_ring0_bridge *bridge) {
 					address - region.address <= region.length &&
 					length <= region.length - (address - region.address) &&
 					region.external_pager == 0 &&
-					region.user_tag == VM_MEMORY_APPLICATION_SPECIFIC_3 &&
+					region.user_tag == TTC_VM_TAG_VM &&
 					(region.protection & VM_PROT_READ) != 0;
 			if (!valid) {
 				// Rejection is an internal protocol result, not a safe point for
