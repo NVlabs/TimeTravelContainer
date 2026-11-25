@@ -43,7 +43,7 @@ jobs:
         run: |
           tools/ci/ci.sh release-plan
           cat release.env >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-notes
           path: release-notes.md
@@ -87,7 +87,7 @@ jobs:
           restore-keys: ttc-bazel-linux-${{ matrix.arch }}-v1-
       - run: tools/ci/ci.sh setup
       - run: tools/ci/ci.sh release-build
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ttc-linux-${{ matrix.arch }}
           path: ci-out/release/
@@ -114,7 +114,7 @@ jobs:
           key: ttc-bazel-darwin-arm64-v1-${{ github.sha }}
           restore-keys: ttc-bazel-darwin-arm64-v1-
       - run: tools/ci/ci.sh release-build
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ttc-darwin-arm64
           path: ci-out/release/
