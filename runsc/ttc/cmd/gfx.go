@@ -91,6 +91,9 @@ type gfxHost struct {
 	unconfined bool
 }
 
+// startGFXLauncher starts the GPU renderers' launcher; tests replace it.
+var startGFXLauncher = gfxrenderer.StartLauncher
+
 // startGFXHost settles how the daemon starts GPU renderers, before it
 // confines itself. On macOS, a daemon with host isolation starts a launcher
 // for them, if the renderer is installed.
@@ -107,7 +110,7 @@ func startGFXHost(unsafeNoHostIsolation bool, stderr io.Writer) gfxHost {
 		return gfxHost{err: err}
 	}
 	opts.Stderr = stderr
-	launcher, err := gfxrenderer.StartLauncher(opts)
+	launcher, err := startGFXLauncher(opts)
 	if err != nil {
 		return gfxHost{err: fmt.Errorf("starting the GPU renderers' launcher: %w", err)}
 	}

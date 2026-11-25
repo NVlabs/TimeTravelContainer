@@ -10,9 +10,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
+	"gvisor.dev/gvisor/runsc/ttc/gfxrenderer"
 	"gvisor.dev/gvisor/runsc/ttc/seatbelt"
 )
 
@@ -21,11 +23,19 @@ func init() {
 	// checks what a daemon applies.
 	applySeatbelt = func(string) error { return nil }
 	seatbeltConfined = func() bool { return false }
+	// Nor does a test start the GPU renderers' launcher, which is the
+	// daemon's own executable: a test's is the test binary, which would run
+	// the tests again.
+	startGFXLauncher = func(gfxrenderer.BrokerOptions) (*gfxrenderer.Launcher, error) {
+		return nil, errors.New("tests start no GPU renderers' launcher")
+	}
 }
 
 func TestDaemonConfinesItself(t *testing.T) {
-	originalApply, originalConfined := applySeatbelt, seatbeltConfined
-	t.Cleanup(func() { applySeatbelt, seatbeltConfined = originalApply, originalConfined })
+	originalApply, originalConfined, originalLauncher := applySeatbelt, seatbeltConfined, startGFXLauncher
+	t.Cleanup(func() {
+		applySeatbelt, seatbeltConfined, startGFXLauncher = originalApply, originalConfined, originalLauncher
+	})
 	var applied []string
 	applySeatbelt = func(profile string) error {
 		applied = append(applied, profile)
@@ -64,13 +74,26 @@ func TestDaemonConfinesItself(t *testing.T) {
 	}
 
 	// A daemon that cannot confine itself serves nothing, and touches no root.
-	applySeatbelt = func(string) error { return errors.New("Operation not permitted") }
+	// It starts the GPU renderers' launcher first, which the confinement
+	// would bar from the GPU.
+	var steps []string
+	startGFXLauncher = func(gfxrenderer.BrokerOptions) (*gfxrenderer.Launcher, error) {
+		steps = append(steps, "launcher")
+		return nil, errors.New("no launcher")
+	}
+	applySeatbelt = func(string) error {
+		steps = append(steps, "seatbelt")
+		return errors.New("Operation not permitted")
+	}
 	root := shortDaemonTestRoot(t)
 	t.Setenv("TTC_ROOT", root)
 	t.Setenv("TTC_LOCAL_ROOT", "")
 	var stdout, stderr bytes.Buffer
 	if status := RunDaemon(nil, &stdout, &stderr); status != 1 || !strings.Contains(stderr.String(), "--unsafe-no-host-isolation") {
 		t.Fatalf("daemon that cannot confine itself: status=%d stderr=%q", status, stderr.String())
+	}
+	if want := []string{"launcher", "seatbelt"}; !slices.Equal(steps, want) {
+		t.Errorf("daemon took steps %q, want %q", steps, want)
 	}
 	if _, err := os.Stat(filepath.Join(root, ".ttc-root-format")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("daemon that cannot confine itself prepared its root: %v", err)
