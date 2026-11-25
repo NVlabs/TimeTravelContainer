@@ -61,7 +61,7 @@ backends).
 
 ## Get Started
 
-**You can download the prebuilt binaries for your OS and CPU in [Releases](https://gitlab-master.nvidia.com/avr/TimeTravelContainer/-/releases)**
+**You can download the prebuilt binaries for your OS and CPU in [Releases](https://github.com/NVlabs/TimeTravelContainer/releases)**
 (automatic daily builds).
 
 TTC is delivered as two binaries. `ttc` is the CLI client and `ttcd` is
@@ -208,10 +208,6 @@ recovery, and nested execution.
 - [Security, performance, and compatibility audit (August 2026)](g3doc/proposals/timetravel_ttc_audit.md)
 - [Upstream gVisor documentation](https://gvisor.dev/docs/)
 
-## Releases
-
-See [Releases](g3doc/release.md).
-
 ## Contributing
 
 Commits must be signed off under the Developer Certificate of Origin; see
@@ -230,3 +226,19 @@ from The Go Authors:
 - `pkg/safecopy`: [BSD-3-Clause license](pkg/safecopy/LICENSE).
 - `pkg/sync`: [BSD-3-Clause license](pkg/sync/LICENSE).
 - `pkg/sentry/time`: [BSD-3-Clause license](pkg/sentry/time/LICENSE).
+
+## Citation
+
+``` bibtex
+@article{TTC,
+  title         = "{TimeTravelContainer}: A Live Forking Sandbox for Stateful
+                   Agent Exploration",
+  author        = "Guo, Zizheng and Zhang, Yanqing and Pinckney, Nathaniel and
+                   Yu, Cunxi and Khailany, Brucek",
+  month         =  nov,
+  year          =  2026,
+  archivePrefix = "arXiv",
+  primaryClass  = "cs.OS",
+  eprint        = "2611.32255"
+}
+```
