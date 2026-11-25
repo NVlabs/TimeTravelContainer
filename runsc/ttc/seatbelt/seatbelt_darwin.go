@@ -14,6 +14,14 @@ package seatbelt
 // applying a profile of one's own; declare it without the mark.
 int sandbox_init(const char *profile, uint64_t flags, char **errorbuf);
 void sandbox_free_error(char *errorbuf);
+
+// <sandbox.h> does not declare sandbox_check, which libsystem_sandbox
+// exports. Given no operation, it returns 1 for a confined process.
+int sandbox_check(pid_t pid, const char *operation, int type, ...);
+
+static int ttc_sandbox_confined(void) {
+	return sandbox_check(getpid(), NULL, 0);
+}
 */
 import "C"
 
@@ -27,7 +35,8 @@ import (
 
 // Apply confines this process, and every process it starts from then on, to
 // profile, which is in the Sandbox Profile Language. Nothing lifts the
-// confinement.
+// confinement. Profiles do not stack: in a process that is confined already,
+// Apply fails for another profile, and on macOS 15 for the same one too.
 func Apply(profile string) error {
 	text := C.CString(profile)
 	defer C.free(unsafe.Pointer(text))
@@ -40,6 +49,12 @@ func Apply(profile string) error {
 	}
 	defer C.sandbox_free_error(message)
 	return errors.New(C.GoString(message))
+}
+
+// Confined reports whether this process is confined to a profile: one that it
+// applied, or one that a process that started it was confined to.
+func Confined() bool {
+	return C.ttc_sandbox_confined() == 1
 }
 
 // BundleCacheDir returns the directory of the caches that Apple's frameworks

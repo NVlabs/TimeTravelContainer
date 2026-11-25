@@ -20,21 +20,38 @@ func init() {
 	// No test confines the test process itself; TestDaemonConfinesItself
 	// checks what a daemon applies.
 	applySeatbelt = func(string) error { return nil }
+	seatbeltConfined = func() bool { return false }
 }
 
 func TestDaemonConfinesItself(t *testing.T) {
-	original := applySeatbelt
-	t.Cleanup(func() { applySeatbelt = original })
+	originalApply, originalConfined := applySeatbelt, seatbeltConfined
+	t.Cleanup(func() { applySeatbelt, seatbeltConfined = originalApply, originalConfined })
 	var applied []string
 	applySeatbelt = func(profile string) error {
 		applied = append(applied, profile)
 		return nil
 	}
-	if err := enterDaemonHostIsolation(true); err != nil || len(applied) != 0 {
+	if err := enterDaemonHostIsolation(true, false); err != nil || len(applied) != 0 {
 		t.Fatalf("daemon without host isolation: err=%v, applied %d profiles, want none", err, len(applied))
 	}
-	if err := enterDaemonHostIsolation(false); err != nil || len(applied) != 1 || applied[0] != seatbelt.DaemonProfile {
+	if err := enterDaemonHostIsolation(false, false); err != nil || len(applied) != 1 || applied[0] != seatbelt.DaemonProfile {
 		t.Fatalf("daemon: err=%v, applied %d profiles, want seatbelt.DaemonProfile", err, len(applied))
+	}
+	// A control holder that its gateway confined applies nothing: profiles do
+	// not stack. One that runs unconfined confines itself, as does a daemon
+	// that is no control holder.
+	seatbeltConfined = func() bool { return true }
+	applied = nil
+	if err := enterDaemonHostIsolation(false, true); err != nil || len(applied) != 0 {
+		t.Fatalf("confined control holder: err=%v, applied %d profiles, want none", err, len(applied))
+	}
+	if err := enterDaemonHostIsolation(false, false); err != nil || len(applied) != 1 || applied[0] != seatbelt.DaemonProfile {
+		t.Fatalf("confined daemon: err=%v, applied %d profiles, want seatbelt.DaemonProfile", err, len(applied))
+	}
+	seatbeltConfined = func() bool { return false }
+	applied = nil
+	if err := enterDaemonHostIsolation(false, true); err != nil || len(applied) != 1 || applied[0] != seatbelt.DaemonProfile {
+		t.Fatalf("unconfined control holder: err=%v, applied %d profiles, want seatbelt.DaemonProfile", err, len(applied))
 	}
 	if got := daemonIsolationMode(false); got != "seatbelt" {
 		t.Errorf("daemonIsolationMode(false) = %q, want seatbelt", got)

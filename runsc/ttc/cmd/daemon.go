@@ -4245,7 +4245,7 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	gfx := startGFXHost(unsafeNoHostIsolation, stderr)
 	defer gfx.Close()
 	// Isolate the daemon before it touches its roots.
-	if err := enterDaemonHostIsolation(unsafeNoHostIsolation); err != nil {
+	if err := enterDaemonHostIsolation(unsafeNoHostIsolation, clusterOpts.ControlHolder); err != nil {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
 		return 1
 	}

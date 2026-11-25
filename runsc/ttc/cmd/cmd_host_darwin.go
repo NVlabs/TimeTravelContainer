@@ -83,13 +83,26 @@ const daemonNoHostIsolationWarning = "the macOS sandbox, Seatbelt, is disabled; 
 // preflightDaemonIsolation checks nothing: every macOS kernel has Seatbelt.
 func preflightDaemonIsolation(bool) error { return nil }
 
-// applySeatbelt confines this process to a profile; tests replace it.
-var applySeatbelt = seatbelt.Apply
+// applySeatbelt confines this process to a profile, and seatbeltConfined
+// reports whether it is confined; tests replace them.
+var (
+	applySeatbelt    = seatbelt.Apply
+	seatbeltConfined = seatbelt.Confined
+)
 
 // enterDaemonHostIsolation confines the daemon, and so every process it
 // starts, to seatbelt.DaemonProfile, unless unsafeNoHostIsolation.
-func enterDaemonHostIsolation(unsafeNoHostIsolation bool) error {
+//
+// A control holder that is confined already applies nothing: it has the
+// confinement of the gateway that started it, which is DaemonProfile when the
+// gateway has host isolation, as applying DaemonProfile fails in a process
+// that another profile confines. Profiles do not stack, and macOS 15 refuses
+// to apply even the same profile again.
+func enterDaemonHostIsolation(unsafeNoHostIsolation, controlHolder bool) error {
 	if unsafeNoHostIsolation {
+		return nil
+	}
+	if controlHolder && seatbeltConfined() {
 		return nil
 	}
 	if err := applySeatbelt(seatbelt.DaemonProfile); err != nil {

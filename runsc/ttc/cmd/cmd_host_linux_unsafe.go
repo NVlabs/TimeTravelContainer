@@ -92,7 +92,7 @@ const daemonHostIsolationMode = "rootless"
 const daemonNoHostIsolationWarning = "host namespace and chroot isolation is disabled; run trusted workloads only"
 
 // enterDaemonHostIsolation does nothing: runsc isolates each sandbox itself.
-func enterDaemonHostIsolation(bool) error { return nil }
+func enterDaemonHostIsolation(bool, bool) error { return nil }
 
 // runscNoHostIsolation reports whether runsc runs its sandboxes without host
 // isolation of its own.

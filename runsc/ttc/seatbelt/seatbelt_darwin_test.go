@@ -101,12 +101,28 @@ func TestHelperProcess(t *testing.T) {
 		}
 		os.Exit(0)
 	}
+	if os.Getenv(helperProfileEnv) == "inherited" {
+		if !Confined() {
+			fail("a process that a confined one started is not confined")
+		}
+		os.Exit(0)
+	}
 	if os.Getenv(helperProfileEnv) == "daemon" {
-		// A daemon started by a confined one confines itself again.
-		for i := 0; i < 2; i++ {
-			if err := Apply(DaemonProfile); err != nil {
-				fail("Apply(DaemonProfile): %v", err)
-			}
+		if Confined() {
+			fail("confined before Apply(DaemonProfile)")
+		}
+		if err := Apply(DaemonProfile); err != nil {
+			fail("Apply(DaemonProfile): %v", err)
+		}
+		if !Confined() {
+			fail("not confined after Apply(DaemonProfile)")
+		}
+		// A process that a confined daemon starts, such as a gateway's
+		// control holder, is confined too, and can tell.
+		inherited := exec.Command(os.Args[0], "-test.run=^TestHelperProcess$")
+		inherited.Env = append(os.Environ(), helperProfileEnv+"=inherited")
+		if output, err := inherited.CombinedOutput(); err != nil {
+			fail("a process that the confined one started: %v: %s", err, output)
 		}
 		if err := os.WriteFile(filepath.Join(dir, "written"), []byte("confined"), 0600); err != nil {
 			fail("writing a file: %v", err)
