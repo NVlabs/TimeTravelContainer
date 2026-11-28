@@ -176,6 +176,7 @@ go_test(
         "disk_volume_test.go",
         "pipe_test.go",
         "regular_file_test.go",
+        "rename_test.go",
         "stat_test.go",
         "tar_test.go",
         "tmpfs_test.go",

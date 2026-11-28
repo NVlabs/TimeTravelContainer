@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/capability.h>
@@ -203,6 +208,30 @@ TEST(RenameTest, FileOverwritesFile) {
   std::string f2_contents;
   ASSERT_NO_ERRNO(GetContents(f2.path(), &f2_contents));
   EXPECT_EQ("first", f2_contents);
+}
+
+// Two links of one file are one file: renaming either onto the other does
+// nothing, and both names stay (POSIX; Linux's vfs_rename compares inodes).
+// gnulib's configure checks this.
+TEST(RenameTest, FileOverItsOwnHardLink) {
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      dir.path(), "contents", TempPath::kDefaultFileMode));
+  const std::string other = JoinPath(dir.path(), "other");
+  ASSERT_THAT(link(file.path().c_str(), other.c_str()), SyscallSucceeds());
+  ASSERT_THAT(rename(file.path().c_str(), other.c_str()), SyscallSucceeds());
+  EXPECT_THAT(Links(file.path()), IsPosixErrorOkAndHolds(2));
+  EXPECT_THAT(Links(other), IsPosixErrorOkAndHolds(2));
+  const struct stat file_stat = ASSERT_NO_ERRNO_AND_VALUE(Stat(file.path()));
+  const struct stat other_stat = ASSERT_NO_ERRNO_AND_VALUE(Stat(other));
+  EXPECT_EQ(file_stat.st_dev, other_stat.st_dev);
+  EXPECT_EQ(file_stat.st_ino, other_stat.st_ino);
+
+  // Removing both names leaves nothing: the name can be made again.
+  ASSERT_THAT(unlink(other.c_str()), SyscallSucceeds());
+  ASSERT_THAT(unlink(file.path().c_str()), SyscallSucceeds());
+  EXPECT_THAT(Exists(file.path()), IsPosixErrorOkAndHolds(false));
+  ASSERT_NO_ERRNO(Open(file.path(), O_CREAT | O_EXCL | O_WRONLY, 0644));
 }
 
 TEST(RenameTest, DirectoryOverwritesDirectoryLinkCount) {

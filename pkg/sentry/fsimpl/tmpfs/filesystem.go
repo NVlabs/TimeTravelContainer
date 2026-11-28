@@ -834,8 +834,9 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	// Linux places this check before some of those above; we do it here for
 	// simplicity, under the assumption that applications are not intentionally
 	// doing noop renames expecting them to succeed where non-noop renames
-	// would fail.
-	if renamed == replaced {
+	// would fail. Two links of one file are one file: renaming either onto the
+	// other does nothing, as Linux's vfs_rename compares inodes.
+	if renamed == replaced || replaced != nil && renamed.inode == replaced.inode {
 		return nil
 	}
 	vfsObj := rp.VirtualFilesystem()

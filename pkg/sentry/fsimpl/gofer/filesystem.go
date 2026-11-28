@@ -1625,6 +1625,12 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if oldParent == newParent && oldName == newName {
 		return nil
 	}
+	// Two links of one file are one file: renaming either onto the other
+	// does nothing, as the host's rename does, so the dentries must stay as
+	// they are too.
+	if replaced != nil && (renamed.inode == replaced.inode || renamed.inode.inoKey != (inoKey{}) && renamed.inode.inoKey == replaced.inode.inoKey) {
+		return nil
+	}
 	mntns := vfs.MountNamespaceFromContext(ctx)
 	defer mntns.DecRef(ctx)
 	handle, err := vfsObj.PrepareRenameDentry(mntns, &renamed.vfsd, replacedVFSD)

@@ -1253,6 +1253,11 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if oldParent == newParent && oldName == newName {
 		return nil
 	}
+	// Two links of one file are one file: renaming either onto the other
+	// does nothing, as Linux's vfs_rename compares inodes.
+	if replaced != nil && renamed.ino.Load() == replaced.ino.Load() && renamed.devMajor.Load() == replaced.devMajor.Load() && renamed.devMinor.Load() == replaced.devMinor.Load() {
+		return nil
+	}
 
 	// renamed and oldParent need to be copied-up before they're renamed on the
 	// upper layer.
